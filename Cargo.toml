@@ -82,6 +82,7 @@ markdown = { version = "=1.0.0", features = ["serde"] }
 html5ever = "0.27"
 markup5ever_rcdom = "0.3"
 mathjax-svg-rs = "=0.4.0"
+mdns-sd = { version = "0.21.0", default-features = false }
 mermaid-rs-renderer = { version = "=0.3.1", default-features = false }
 pulldown-cmark = { version = "=0.13.0", default-features = false, features = ["html", "serde", "simd"] }
 pdfium-render = { version = "=0.9.3", default-features = false, features = ["pdfium_7881", "thread_safe"] }

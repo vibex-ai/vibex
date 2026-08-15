@@ -368,7 +368,7 @@ pub fn pairing_claim_request(
     })
 }
 
-fn validate_pairing_offer(offer: &RemotePairingOffer, now_ms: i64) -> BackendResult<()> {
+pub(crate) fn validate_pairing_offer(offer: &RemotePairingOffer, now_ms: i64) -> BackendResult<()> {
     if offer.summary.format_version != 1
         || offer
             .summary

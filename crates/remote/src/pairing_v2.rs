@@ -390,7 +390,7 @@ pub(super) fn validate_pairing_candidate(
     Ok(candidate)
 }
 
-fn validate_public_key(value: &str) -> VibexResult<()> {
+pub(super) fn validate_public_key(value: &str) -> VibexResult<()> {
     let decoded = URL_SAFE_NO_PAD.decode(value).map_err(|_| {
         remote_error(
             "remote_device_identity_key_invalid",

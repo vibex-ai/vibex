@@ -8,6 +8,7 @@ mod catalog;
 mod events;
 mod fixture;
 mod home_lock;
+mod lan_pairing;
 mod management;
 mod relay;
 mod remote_connectivity;
@@ -76,6 +77,7 @@ pub use events::{
 };
 pub use fixture::FixtureDesktopRuntime;
 pub use home_lock::{DESKTOP_RUNTIME_LOCK_FILE, DesktopHomeLock};
+pub use lan_pairing::{LAN_PAIRING_SERVICE_TYPE, LanPairingAdvertiser, MdnsLanPairingAdvertiser};
 pub use management::{
     BackupProgress, ExternalOpenUrl, ManagementMutationGuard, ProviderManagementFacade,
     validate_external_open_url,
@@ -94,8 +96,8 @@ pub use remote_connectivity::{
     RemoteConnectivityStore, RemoteMethodSnapshot, RemoteMethodState, RemoteRecoveryAction,
     RemoteRouteOwnership, RemoteTransitionKind, RemoteTransitionRecord, TAILSCALE_DEFAULT_PORT,
     TAILSCALE_FALLBACK_PORTS, TailscaleCli, TailscaleInspection, TailscalePublication,
-    TailscaleRoute, TailscaleSettings, TokioProcessRunner, normalize_https_origin,
-    parse_tailscale_inspection,
+    TailscaleRoute, TailscaleSettings, TokioProcessRunner, WebPkiDirectPublicationProbe,
+    normalize_https_origin, parse_tailscale_inspection,
 };
 pub use usage::AgentUsageService;
 pub use worktree::{WorktreeCoordinator, WorktreeCreateContext};

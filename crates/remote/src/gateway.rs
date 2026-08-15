@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Request, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::header::{
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN, HOST,
     ORIGIN, SEC_WEBSOCKET_PROTOCOL, VARY,
@@ -34,11 +34,13 @@ use vibex_core::{
     RemoteClaimPairingOfferRequest, RemoteClaimPairingOfferResponse, RemoteCloseCode,
     RemoteCloseReason, RemoteControlMessageV2, RemoteCreatePairingOfferRequest,
     RemoteCreatePairingOfferResponse, RemoteDeviceListResponse, RemoteDevicePermissionLevel,
-    RemoteDeviceRequest, RemoteEventV2, RemoteHello, RemoteJsonMessageV2, RemoteMutationContract,
-    RemoteOperationKind, RemotePairingCandidate, RemotePairingOfferSummary, RemotePairingTransport,
-    RemotePing, RemoteProtocolError, RemoteProtocolVersion, RemoteProtocolVersionRange,
-    RemoteResyncRequired, RemoteRetryClass, RemoteRpcRequestV2, RemoteRpcResponseV2,
-    RemoteRpcResultMetadata, RemoteServerInfoV2, RemoteSubscribeRequestV2,
+    RemoteDeviceRequest, RemoteEventV2, RemoteHello, RemoteJsonMessageV2,
+    RemoteLanPairingDiscoverySummary, RemoteLanPairingRequest, RemoteLanPairingRequestAccepted,
+    RemoteLanPairingStatusRequest, RemoteLanPairingStatusResponse, RemoteLanPairingWindowSnapshot,
+    RemoteMutationContract, RemoteOperationKind, RemotePairingCandidate, RemotePairingOfferSummary,
+    RemotePairingTransport, RemotePing, RemoteProtocolError, RemoteProtocolVersion,
+    RemoteProtocolVersionRange, RemoteResyncRequired, RemoteRetryClass, RemoteRpcRequestV2,
+    RemoteRpcResponseV2, RemoteRpcResultMetadata, RemoteServerInfoV2, RemoteSubscribeRequestV2,
     RemoteSubscriptionAcceptedV2, RemoteTimeoutClass, RemoteWsTicketRequest,
     RemoteWsTicketResponse, RequestId, TerminalId, VibexError, VibexResult, WorkspaceId,
     remote_permissions_for_level, unix_timestamp_ms,
@@ -47,6 +49,7 @@ use vibex_db::RemotePairingOfferRepository;
 use vibex_terminal::TerminalManager;
 use x25519_dalek::{PublicKey, StaticSecret};
 
+use super::lan_pairing::{LanPairingCoordinator, normalize_https_origin};
 use super::pairing_v2::secure_secret;
 use super::{
     RemoteDispatcher, RemoteIdentity, RemoteIdentityStore, RemoteRequestEnvelope,
@@ -67,6 +70,8 @@ const REMOTE_V2_SUBPROTOCOL: &str = "vibex-v2";
 const REMOTE_V2_TICKET_PREFIX: &str = "vibex-ticket.";
 const MAX_FILE_TRANSFER_BYTES: usize = 64 * 1024 * 1024;
 const FILE_TRANSFER_CHUNK_BYTES: usize = 64 * 1024;
+const LAN_PAIRING_MAX_CONCURRENT_REQUESTS: usize = 16;
+const LAN_PAIRING_MAX_BODY_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteGatewayDeploymentMode {
@@ -324,6 +329,8 @@ struct RemoteGatewayInner {
     idempotency: Arc<Mutex<HashMap<IdempotencyCacheKey, CachedRpcResponse>>>,
     domain_events: GatewayDomainEvents,
     pairing_routes: Arc<Mutex<RemoteGatewayPairingRoutes>>,
+    lan_pairing: Arc<LanPairingCoordinator>,
+    lan_pairing_requests: Arc<Semaphore>,
     session_epoch: AtomicU64,
 }
 
@@ -406,6 +413,8 @@ impl RemoteGateway {
                 idempotency: Arc::new(Mutex::new(HashMap::new())),
                 domain_events: GatewayDomainEvents::default(),
                 pairing_routes: Arc::new(Mutex::new(pairing_routes)),
+                lan_pairing: Arc::new(LanPairingCoordinator::default()),
+                lan_pairing_requests: Arc::new(Semaphore::new(LAN_PAIRING_MAX_CONCURRENT_REQUESTS)),
                 session_epoch: AtomicU64::new(0),
             }),
         }
@@ -450,6 +459,7 @@ impl RemoteGateway {
         }
         config.pairing_routes = config.pairing_routes.validated()?;
         config.validate()?;
+        self.cancel_lan_pairing_if_direct_unavailable(&config.pairing_routes)?;
         let _config_guard = self
             .inner
             .config_guard
@@ -475,6 +485,7 @@ impl RemoteGateway {
     /// remains disabled but the trust service still needs a route candidate.
     pub fn set_pairing_routes(&self, routes: RemoteGatewayPairingRoutes) -> VibexResult<()> {
         let routes = routes.validated()?;
+        self.cancel_lan_pairing_if_direct_unavailable(&routes)?;
         let _config_guard = self
             .inner
             .config_guard
@@ -524,6 +535,104 @@ impl RemoteGateway {
         )
     }
 
+    pub fn start_lan_pairing_window(
+        &self,
+        permission_level: RemoteDevicePermissionLevel,
+        ttl_ms: u32,
+        direct_origin: &str,
+    ) -> VibexResult<RemoteLanPairingWindowSnapshot> {
+        let direct_origin = normalize_https_origin(direct_origin)?;
+        let response = self.create_pairing_offer(RemoteCreatePairingOfferRequest {
+            permission_level,
+            ttl_ms: Some(ttl_ms),
+            direct_candidates: Vec::new(),
+            relay_candidate: None,
+        })?;
+        let offer_id = response.offer.summary.offer_id.clone();
+        match self.inner.lan_pairing.start(
+            response.offer,
+            &direct_origin,
+            &self.current_config().service.service_name,
+            unix_timestamp_ms(),
+        ) {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) => {
+                let _ = self.cancel_pairing_offer(RemoteCancelPairingOfferRequest { offer_id });
+                Err(error)
+            }
+        }
+    }
+
+    pub fn lan_pairing_window_status(&self) -> VibexResult<RemoteLanPairingWindowSnapshot> {
+        self.inner.lan_pairing.snapshot(unix_timestamp_ms())
+    }
+
+    pub fn approve_lan_pairing_request(
+        &self,
+        request_id: &RequestId,
+    ) -> VibexResult<RemoteLanPairingWindowSnapshot> {
+        self.inner
+            .lan_pairing
+            .approve(request_id, unix_timestamp_ms())
+    }
+
+    pub fn reject_lan_pairing_request(
+        &self,
+        request_id: &RequestId,
+    ) -> VibexResult<RemoteLanPairingWindowSnapshot> {
+        self.inner
+            .lan_pairing
+            .reject(request_id, unix_timestamp_ms())
+    }
+
+    pub fn cancel_lan_pairing_window(&self) -> VibexResult<()> {
+        let Some(offer_id) = self.inner.lan_pairing.active_offer_id() else {
+            return Ok(());
+        };
+        let cancellation = self.cancel_pairing_offer(RemoteCancelPairingOfferRequest {
+            offer_id: offer_id.clone(),
+        });
+        let _ = self.inner.lan_pairing.clear_offer(&offer_id);
+        match cancellation {
+            Ok(_) => Ok(()),
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "remote_pairing_offer_already_claimed"
+                        | "remote_pairing_offer_canceled"
+                        | "remote_pairing_offer_expired"
+                        | "remote_pairing_offer_unknown"
+                ) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn cancel_lan_pairing_if_direct_unavailable(
+        &self,
+        routes: &RemoteGatewayPairingRoutes,
+    ) -> VibexResult<()> {
+        let Some(origin) = self
+            .inner
+            .lan_pairing
+            .active_direct_origin(unix_timestamp_ms())
+        else {
+            return Ok(());
+        };
+        let still_available = routes.direct_candidates.iter().any(|candidate| {
+            candidate.transport == RemotePairingTransport::Direct
+                && normalize_https_origin(&candidate.url)
+                    .is_ok_and(|candidate_origin| candidate_origin == origin)
+        });
+        if still_available {
+            Ok(())
+        } else {
+            self.cancel_lan_pairing_window()
+        }
+    }
+
     pub fn pairing_offer_status(
         &self,
         offer_id: &RequestId,
@@ -545,7 +654,10 @@ impl RemoteGateway {
         request: RemoteCancelPairingOfferRequest,
     ) -> VibexResult<RemotePairingOfferSummary> {
         let connection = open_migrated_database(&self.inner.db_path)?;
-        RemoteTrustService::cancel_pairing_offer(&connection, request)
+        let offer_id = request.offer_id.clone();
+        let summary = RemoteTrustService::cancel_pairing_offer(&connection, request)?;
+        let _ = self.inner.lan_pairing.clear_offer(&offer_id);
+        Ok(summary)
     }
 
     pub fn relay_transport_private_key(&self) -> VibexResult<[u8; 32]> {
@@ -560,7 +672,10 @@ impl RemoteGateway {
         request: RemoteClaimPairingOfferRequest,
     ) -> VibexResult<RemoteClaimPairingOfferResponse> {
         let connection = open_migrated_database(&self.inner.db_path)?;
-        RemoteTrustService::claim_pairing_offer(&connection, request)
+        let offer_id = request.offer_id.clone();
+        let response = RemoteTrustService::claim_pairing_offer(&connection, request)?;
+        let _ = self.inner.lan_pairing.clear_offer(&offer_id);
+        Ok(response)
     }
 
     pub fn relay_handshake_context(
@@ -677,6 +792,8 @@ impl RemoteGateway {
             idempotency: self.inner.idempotency.clone(),
             domain_events: self.inner.domain_events.clone(),
             pairing_routes: self.inner.pairing_routes.clone(),
+            lan_pairing: self.inner.lan_pairing.clone(),
+            lan_pairing_requests: self.inner.lan_pairing_requests.clone(),
             session_epoch: context.session_epoch,
         };
         let auth = RemoteAuthContext {
@@ -1074,6 +1191,8 @@ impl RemoteGateway {
                 idempotency: self.inner.idempotency.clone(),
                 domain_events: self.inner.domain_events.clone(),
                 pairing_routes: self.inner.pairing_routes.clone(),
+                lan_pairing: self.inner.lan_pairing.clone(),
+                lan_pairing_requests: self.inner.lan_pairing_requests.clone(),
                 session_epoch: context.session_epoch,
             },
             WsTicketRecord {
@@ -1122,6 +1241,8 @@ impl RemoteGateway {
             idempotency: self.inner.idempotency.clone(),
             domain_events: self.inner.domain_events.clone(),
             pairing_routes: self.inner.pairing_routes.clone(),
+            lan_pairing: self.inner.lan_pairing.clone(),
+            lan_pairing_requests: self.inner.lan_pairing_requests.clone(),
             session_epoch: epoch,
         }))
     }
@@ -1174,6 +1295,7 @@ impl RemoteGateway {
     }
 
     pub async fn stop(&self) -> VibexResult<()> {
+        self.cancel_lan_pairing_window()?;
         let _guard = self.inner.lifecycle_guard.lock().await;
         self.inner.registry.disconnect_all(RemoteCloseReason {
             code: RemoteCloseCode::ServerShutdown,
@@ -1341,6 +1463,8 @@ struct GatewayState {
     idempotency: Arc<Mutex<HashMap<IdempotencyCacheKey, CachedRpcResponse>>>,
     domain_events: GatewayDomainEvents,
     pairing_routes: Arc<Mutex<RemoteGatewayPairingRoutes>>,
+    lan_pairing: Arc<LanPairingCoordinator>,
+    lan_pairing_requests: Arc<Semaphore>,
     session_epoch: u64,
 }
 
@@ -1436,12 +1560,19 @@ impl ConnectionRegistry {
 
 fn build_gateway_router(state: GatewayState) -> Router {
     let legacy = build_router_with_dispatcher(state.dispatcher.clone());
+    let lan_pairing = Router::new()
+        .route("/api/v2/pairing/lan", get(lan_pairing_discovery))
+        .route("/api/v2/pairing/lan/request", post(lan_pairing_request))
+        .route("/api/v2/pairing/lan/status", post(lan_pairing_status))
+        .layer(DefaultBodyLimit::max(LAN_PAIRING_MAX_BODY_BYTES))
+        .with_state(state.clone());
     let v2 = Router::new()
         .route("/api/v2/info", get(gateway_info))
         .route("/api/v2/pairing/claim", post(claim_pairing_offer))
         .route("/api/v2/ws-ticket", post(issue_ws_ticket))
         .route("/ws/v2", get(ws_v2))
-        .with_state(state.clone());
+        .with_state(state.clone())
+        .merge(lan_pairing);
     v2.merge(legacy).layer(middleware::from_fn_with_state(
         state.clone(),
         security_perimeter,
@@ -1455,6 +1586,9 @@ async fn gateway_info(State(state): State<GatewayState>) -> Response {
         "protocolRange": RemoteProtocolVersionRange::v2(),
         "wsPath": "/ws/v2",
         "pairingClaimPath": "/api/v2/pairing/claim",
+        "lanPairingDiscoveryPath": "/api/v2/pairing/lan",
+        "lanPairingRequestPath": "/api/v2/pairing/lan/request",
+        "lanPairingStatusPath": "/api/v2/pairing/lan/status",
         "wsTicketPath": "/api/v2/ws-ticket",
         "deploymentMode": match state.config.deployment_mode {
             RemoteGatewayDeploymentMode::Loopback => "loopback",
@@ -1470,6 +1604,55 @@ async fn gateway_info(State(state): State<GatewayState>) -> Response {
     .into_response()
 }
 
+async fn lan_pairing_discovery(State(state): State<GatewayState>) -> Response {
+    let _permit = match state.lan_pairing_requests.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return lan_pairing_busy_response(),
+    };
+    match state.lan_pairing.discovery(unix_timestamp_ms()) {
+        Ok(summary) => Json::<RemoteLanPairingDiscoverySummary>(summary).into_response(),
+        Err(error) => protocol_error_response(status_for_error(&error), error),
+    }
+}
+
+async fn lan_pairing_request(
+    State(state): State<GatewayState>,
+    Json(request): Json<RemoteLanPairingRequest>,
+) -> Response {
+    let _permit = match state.lan_pairing_requests.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return lan_pairing_busy_response(),
+    };
+    match state.lan_pairing.submit(request, unix_timestamp_ms()) {
+        Ok(accepted) => Json::<RemoteLanPairingRequestAccepted>(accepted).into_response(),
+        Err(error) => protocol_error_response(status_for_error(&error), error),
+    }
+}
+
+async fn lan_pairing_status(
+    State(state): State<GatewayState>,
+    Json(request): Json<RemoteLanPairingStatusRequest>,
+) -> Response {
+    let _permit = match state.lan_pairing_requests.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return lan_pairing_busy_response(),
+    };
+    match state.lan_pairing.status(request, unix_timestamp_ms()) {
+        Ok(status) => Json::<RemoteLanPairingStatusResponse>(status).into_response(),
+        Err(error) => protocol_error_response(status_for_error(&error), error),
+    }
+}
+
+fn lan_pairing_busy_response() -> Response {
+    protocol_error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        VibexError::conflict(
+            "remote_lan_pairing_request_limit",
+            "LAN pairing request concurrency limit was reached",
+        ),
+    )
+}
+
 async fn claim_pairing_offer(
     State(state): State<GatewayState>,
     Json(request): Json<RemoteClaimPairingOfferRequest>,
@@ -1478,8 +1661,12 @@ async fn claim_pairing_offer(
         Ok(connection) => connection,
         Err(error) => return protocol_error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
     };
+    let offer_id = request.offer_id.clone();
     match RemoteTrustService::claim_pairing_offer(&connection, request) {
-        Ok(response) => Json(response).into_response(),
+        Ok(response) => {
+            let _ = state.lan_pairing.clear_offer(&offer_id);
+            Json(response).into_response()
+        }
         Err(error) => protocol_error_response(status_for_error(&error), error),
     }
 }
@@ -3977,7 +4164,8 @@ mod tests {
         RemoteCreatePairingOfferRequest, RemoteDeviceCancelPairingOfferRequest,
         RemoteDeviceCreatePairingOfferRequest, RemoteDeviceListRequest, RemoteDeviceListResponse,
         RemoteDevicePermissionLevel, RemoteDeviceRequest, RemoteDeviceRevokeRequest,
-        RemoteMutationContract, RemotePairingOfferSummary, RemoteRevokeDeviceRequest,
+        RemoteLanPairingRequestState, RemoteMutationContract, RemotePairingOfferSummary,
+        RemoteRevokeDeviceRequest,
     };
     use vibex_db::{RemoteDeviceRepository, apply_migrations};
 
@@ -4690,6 +4878,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lan_pairing_http_routes_hide_offer_until_explicit_approval() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = RemoteGatewayConfig::loopback_enabled("127.0.0.1:1428");
+        config.pairing_routes.direct_candidates = vec![RemotePairingCandidate {
+            transport: RemotePairingTransport::Direct,
+            url: "https://desktop.example.test".into(),
+            relay_room_id: None,
+            relay_pc_peer_id: None,
+            relay_pc_public_key: None,
+        }];
+        let gateway = test_gateway(&directory, config);
+        let window = gateway
+            .start_lan_pairing_window(
+                RemoteDevicePermissionLevel::ReadOnly,
+                60_000,
+                "https://desktop.example.test",
+            )
+            .unwrap();
+        let router = gateway.router().unwrap();
+
+        let discovery = router
+            .clone()
+            .oneshot(
+                HttpRequest::get("/api/v2/pairing/lan")
+                    .header(HOST, "127.0.0.1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(discovery.status(), StatusCode::OK);
+        let body = to_bytes(discovery.into_body(), usize::MAX).await.unwrap();
+        let discovery: RemoteLanPairingDiscoverySummary = serde_json::from_slice(&body).unwrap();
+        assert_eq!(discovery, window.discovery);
+
+        let device_secret = StaticSecret::random_from_rng(OsRng);
+        let request_secret = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let request = RemoteLanPairingRequest {
+            window_id: discovery.window_id,
+            device_identity_public_key: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(PublicKey::from(&device_secret).as_bytes()),
+            display_name: "Integration Phone".into(),
+            client_nonce: "client-nonce-abcdefghijklmnop".into(),
+            request_secret: request_secret.clone(),
+            idempotency_key: RequestId::new().into_string(),
+        };
+        let accepted = router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/v2/pairing/lan/request")
+                    .header(HOST, "127.0.0.1")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let body = to_bytes(accepted.into_body(), usize::MAX).await.unwrap();
+        let accepted: RemoteLanPairingRequestAccepted = serde_json::from_slice(&body).unwrap();
+
+        let status_request = RemoteLanPairingStatusRequest {
+            request_id: accepted.request_id.clone(),
+            request_secret: request_secret.clone(),
+        };
+        let pending = router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/v2/pairing/lan/status")
+                    .header(HOST, "127.0.0.1")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&status_request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.status(), StatusCode::OK);
+        let body = to_bytes(pending.into_body(), usize::MAX).await.unwrap();
+        let pending: RemoteLanPairingStatusResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(pending.state, RemoteLanPairingRequestState::Pending);
+        assert!(pending.offer.is_none());
+
+        gateway
+            .approve_lan_pairing_request(&accepted.request_id)
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(510)).await;
+        let approved = router
+            .oneshot(
+                HttpRequest::post("/api/v2/pairing/lan/status")
+                    .header(HOST, "127.0.0.1")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&status_request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(approved.status(), StatusCode::OK);
+        let body = to_bytes(approved.into_body(), usize::MAX).await.unwrap();
+        let approved: RemoteLanPairingStatusResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(approved.state, RemoteLanPairingRequestState::Approved);
+        assert!(approved.offer.is_some());
+        assert!(!String::from_utf8_lossy(&body).contains(&request_secret));
+    }
+
+    #[tokio::test]
     async fn gateway_listener_start_stop_restart_releases_the_socket() {
         let directory = tempfile::tempdir().unwrap();
         let gateway = test_gateway(
@@ -4894,6 +5187,8 @@ mod tests {
             idempotency: gateway.inner.idempotency.clone(),
             domain_events: gateway.inner.domain_events.clone(),
             pairing_routes: gateway.inner.pairing_routes.clone(),
+            lan_pairing: gateway.inner.lan_pairing.clone(),
+            lan_pairing_requests: gateway.inner.lan_pairing_requests.clone(),
             session_epoch: epoch,
         }
     }

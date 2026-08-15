@@ -56,7 +56,7 @@ const PROJECTION_INVALIDATION_CHANNEL_COUNT: usize = 4;
 const RELAY_REMOTE_JSON_KIND: RelayFrameKind = RelayFrameKind::Command;
 
 #[cfg(target_os = "android")]
-fn remote_http_client() -> BackendResult<reqwest::Client> {
+pub(crate) fn remote_http_client() -> BackendResult<reqwest::Client> {
     let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS
         .iter()
         .map(|certificate| {
@@ -74,6 +74,7 @@ fn remote_http_client() -> BackendResult<reqwest::Client> {
         // normal chain, hostname, signature, and validity checks in rustls
         // without accepting invalid certificates.
         .tls_certs_only(roots)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| {
             BackendError::failed(
@@ -84,7 +85,7 @@ fn remote_http_client() -> BackendResult<reqwest::Client> {
 }
 
 #[cfg(not(target_os = "android"))]
-fn remote_http_client() -> BackendResult<reqwest::Client> {
+pub(crate) fn remote_http_client() -> BackendResult<reqwest::Client> {
     Ok(reqwest::Client::new())
 }
 
@@ -2956,7 +2957,9 @@ fn websocket_endpoint(base: &Url, path: &str) -> BackendResult<Url> {
     Ok(url)
 }
 
-async fn http_json<T: DeserializeOwned>(request: reqwest::RequestBuilder) -> BackendResult<T> {
+pub(crate) async fn http_json<T: DeserializeOwned>(
+    request: reqwest::RequestBuilder,
+) -> BackendResult<T> {
     let response = request
         .timeout(Duration::from_secs(30))
         .send()

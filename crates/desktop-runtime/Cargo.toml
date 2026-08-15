@@ -15,7 +15,9 @@ vibex-backup = { path = "../backup" }
 fs2 = "0.4"
 flate2 = "1"
 futures-util.workspace = true
+mdns-sd.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
 rusqlite = { version = "0.37", features = ["bundled"] }
 semver.workspace = true
 serde.workspace = true
@@ -40,6 +42,7 @@ vibex-git = { path = "../git" }
 vibex-relay = { path = "../relay" }
 vibex-remote = { path = "../remote" }
 vibex-terminal = { path = "../terminal" }
+webpki-root-certs.workspace = true
 zip.workspace = true
 
 [dev-dependencies]

@@ -12977,6 +12977,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:if-addrs@0.15.0:c19b7c6f923b580a",
+      "name": "if-addrs",
+      "version": "0.15.0",
+      "licenses": [
+        {
+          "expression": "MIT OR BSD-3-Clause"
+        }
+      ],
+      "purl": "pkg:cargo/if-addrs@0.15.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/messense/if-addrs"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:ignore@0.4.26:c19b7c6f923b580a",
       "name": "ignore",
       "version": "0.4.26",
@@ -14705,15 +14741,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:libc@0.2.186:c19b7c6f923b580a",
+      "bom-ref": "cargo:libc@0.2.189:c19b7c6f923b580a",
       "name": "libc",
-      "version": "0.2.186",
+      "version": "0.2.189",
       "licenses": [
         {
           "expression": "MIT OR Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/libc@0.2.186",
+      "purl": "pkg:cargo/libc@0.2.189",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -16068,6 +16104,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/RustCrypto/hashes"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:mdns-sd@0.21.0:c19b7c6f923b580a",
+      "name": "mdns-sd",
+      "version": "0.21.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/mdns-sd@0.21.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/keepsimple1/mdns-sd"
         }
       ]
     },
@@ -26364,6 +26436,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/rust-lang/rust-analyzer/tree/master/lib/smol_str"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:socket-pktinfo@0.4.1:c19b7c6f923b580a",
+      "name": "socket-pktinfo",
+      "version": "0.4.1",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/socket-pktinfo@0.4.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/pixsper/socket-pktinfo"
         }
       ]
     },
@@ -40355,7 +40463,7 @@
         "cargo:base64@0.22.1:c19b7c6f923b580a",
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
         "cargo:home@0.5.12:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:miow@0.6.1:c19b7c6f923b580a",
         "cargo:parking_lot@0.12.5:c19b7c6f923b580a",
@@ -40394,7 +40502,7 @@
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
         "cargo:cc@1.2.65:c19b7c6f923b580a",
         "cargo:jni@0.22.4:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:ndk-context@0.1.1:c19b7c6f923b580a",
         "cargo:ndk-sys@0.6.0+11769913:c19b7c6f923b580a",
@@ -40422,7 +40530,7 @@
     {
       "ref": "cargo:android_system_properties@0.1.5:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -40640,7 +40748,7 @@
       "dependsOn": [
         "cargo:glib-sys@0.18.1:c19b7c6f923b580a",
         "cargo:gobject-sys@0.18.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:system-deps@6.2.2:c19b7c6f923b580a"
       ]
     },
@@ -40649,7 +40757,7 @@
       "dependsOn": [
         "cargo:atk-sys@0.18.2:c19b7c6f923b580a",
         "cargo:glib@0.18.5:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -40796,7 +40904,7 @@
       "dependsOn": [
         "cargo:addr2line@0.25.1:c19b7c6f923b580a",
         "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:miniz_oxide@0.8.9:c19b7c6f923b580a",
         "cargo:object@0.37.3:c19b7c6f923b580a",
         "cargo:rustc-demangle@0.1.28:c19b7c6f923b580a",
@@ -41102,7 +41210,7 @@
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
         "cargo:cairo-sys-rs@0.18.2:c19b7c6f923b580a",
         "cargo:glib@0.18.5:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:once_cell@1.21.4:c19b7c6f923b580a",
         "cargo:thiserror@1.0.69:c19b7c6f923b580a"
       ]
@@ -41111,7 +41219,7 @@
       "ref": "cargo:cairo-sys-rs@0.18.2:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:glib-sys@0.18.1:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:system-deps@6.2.2:c19b7c6f923b580a"
       ]
     },
@@ -41160,7 +41268,7 @@
       "dependsOn": [
         "cargo:find-msvc-tools@0.1.9:c19b7c6f923b580a",
         "cargo:jobserver@0.1.34:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:shlex@2.0.1:c19b7c6f923b580a"
       ]
     },
@@ -41188,7 +41296,7 @@
     {
       "ref": "cargo:cgl@0.3.2:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -41232,7 +41340,7 @@
       "ref": "cargo:clang-sys@1.8.1:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:glob@0.3.3:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:libloading@0.8.9:c19b7c6f923b580a"
       ]
     },
@@ -41249,7 +41357,7 @@
         "cargo:block@0.1.6:c19b7c6f923b580a",
         "cargo:core-foundation@0.9.4:c19b7c6f923b580a",
         "cargo:core-graphics-types@0.1.3:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:objc@0.2.7:c19b7c6f923b580a"
       ]
     },
@@ -41260,7 +41368,7 @@
         "cargo:block@0.1.6:c19b7c6f923b580a",
         "cargo:core-foundation@0.10.1:c19b7c6f923b580a",
         "cargo:core-graphics-types@0.2.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:objc@0.2.7:c19b7c6f923b580a"
       ]
     },
@@ -41273,7 +41381,7 @@
         "cargo:core-foundation@0.9.4:c19b7c6f923b580a",
         "cargo:core-graphics@0.23.2:c19b7c6f923b580a",
         "cargo:foreign-types@0.5.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:objc@0.2.7:c19b7c6f923b580a"
       ]
     },
@@ -41286,7 +41394,7 @@
         "cargo:core-foundation@0.10.1:c19b7c6f923b580a",
         "cargo:core-graphics@0.24.0:c19b7c6f923b580a",
         "cargo:foreign-types@0.5.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:objc@0.2.7:c19b7c6f923b580a"
       ]
     },
@@ -41401,14 +41509,14 @@
       "ref": "cargo:core-foundation@0.10.1:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:core-foundation-sys@0.8.7:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
       "ref": "cargo:core-foundation@0.9.4:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:core-foundation-sys@0.8.7:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -41418,7 +41526,7 @@
         "cargo:core-foundation@0.9.4:c19b7c6f923b580a",
         "cargo:core-graphics-types@0.1.3:c19b7c6f923b580a",
         "cargo:foreign-types@0.5.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -41426,7 +41534,7 @@
       "dependsOn": [
         "cargo:bitflags@1.3.2:c19b7c6f923b580a",
         "cargo:core-foundation@0.9.4:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -41434,7 +41542,7 @@
       "dependsOn": [
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
         "cargo:core-foundation@0.10.1:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -41444,7 +41552,7 @@
         "cargo:block@0.1.6:c19b7c6f923b580a",
         "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
         "cargo:core-foundation@0.10.1:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -41454,7 +41562,7 @@
         "cargo:core-foundation@0.9.4:c19b7c6f923b580a",
         "cargo:core-graphics-types@0.1.3:c19b7c6f923b580a",
         "cargo:foreign-types@0.5.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -41464,7 +41572,7 @@
         "cargo:core-foundation@0.10.1:c19b7c6f923b580a",
         "cargo:core-graphics-types@0.2.0:c19b7c6f923b580a",
         "cargo:foreign-types@0.5.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -41473,7 +41581,7 @@
         "cargo:core-foundation@0.10.1:c19b7c6f923b580a",
         "cargo:core-graphics@0.24.0:c19b7c6f923b580a",
         "cargo:foreign-types@0.5.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -41483,7 +41591,7 @@
         "cargo:core-foundation@0.10.1:c19b7c6f923b580a",
         "cargo:core-graphics2@0.5.2:c19b7c6f923b580a",
         "cargo:io-surface@0.16.1:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:metal@0.33.0:c19b7c6f923b580a"
       ]
     },
@@ -41521,13 +41629,13 @@
     {
       "ref": "cargo:cpufeatures@0.2.17:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
       "ref": "cargo:cpufeatures@0.3.0:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -41676,7 +41784,7 @@
     {
       "ref": "cargo:dbus@0.9.11:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:libdbus-sys@0.2.7:c19b7c6f923b580a",
         "cargo:windows-sys@0.61.2:c19b7c6f923b580a"
       ]
@@ -41738,7 +41846,7 @@
     {
       "ref": "cargo:dirs-sys@0.5.0:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:option-ext@0.2.0:c19b7c6f923b580a",
         "cargo:redox_users@0.5.2:c19b7c6f923b580a",
         "cargo:windows-sys@0.61.2:c19b7c6f923b580a"
@@ -41755,7 +41863,7 @@
       "dependsOn": [
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
         "cargo:block2@0.6.2:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:objc2@0.6.4:c19b7c6f923b580a"
       ]
     },
@@ -41803,7 +41911,7 @@
       "ref": "cargo:dwrote@0.11.5:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:lazy_static@1.5.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:winapi@0.3.9:c19b7c6f923b580a",
         "cargo:wio@0.2.2:c19b7c6f923b580a"
       ]
@@ -41948,7 +42056,7 @@
     {
       "ref": "cargo:errno@0.3.14:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:windows-sys@0.61.2:c19b7c6f923b580a"
       ]
     },
@@ -42036,7 +42144,7 @@
     {
       "ref": "cargo:filedescriptor@0.8.3:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:thiserror@1.0.69:c19b7c6f923b580a",
         "cargo:winapi@0.3.9:c19b7c6f923b580a"
       ]
@@ -42045,7 +42153,7 @@
       "ref": "cargo:filetime@0.2.29:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -42162,14 +42270,14 @@
       "ref": "cargo:freetype-sys@0.20.1:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:cc@1.2.65:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:pkg-config@0.3.33:c19b7c6f923b580a"
       ]
     },
     {
       "ref": "cargo:fs2@0.4.3:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:winapi@0.3.9:c19b7c6f923b580a"
       ]
     },
@@ -42180,7 +42288,7 @@
     {
       "ref": "cargo:fsevent-sys@4.1.0:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -42281,7 +42389,7 @@
         "cargo:gio-sys@0.18.1:c19b7c6f923b580a",
         "cargo:glib-sys@0.18.1:c19b7c6f923b580a",
         "cargo:gobject-sys@0.18.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:system-deps@6.2.2:c19b7c6f923b580a"
       ]
     },
@@ -42291,7 +42399,7 @@
         "cargo:gdk-pixbuf-sys@0.18.0:c19b7c6f923b580a",
         "cargo:gio@0.18.4:c19b7c6f923b580a",
         "cargo:glib@0.18.5:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:once_cell@1.21.4:c19b7c6f923b580a"
       ]
     },
@@ -42303,7 +42411,7 @@
         "cargo:gio-sys@0.18.1:c19b7c6f923b580a",
         "cargo:glib-sys@0.18.1:c19b7c6f923b580a",
         "cargo:gobject-sys@0.18.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:pango-sys@0.18.0:c19b7c6f923b580a",
         "cargo:pkg-config@0.3.33:c19b7c6f923b580a",
         "cargo:system-deps@6.2.2:c19b7c6f923b580a"
@@ -42317,7 +42425,7 @@
         "cargo:gdk-sys@0.18.2:c19b7c6f923b580a",
         "cargo:gio@0.18.4:c19b7c6f923b580a",
         "cargo:glib@0.18.5:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:pango@0.18.3:c19b7c6f923b580a"
       ]
     },
@@ -42340,7 +42448,7 @@
       "dependsOn": [
         "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
         "cargo:js-sys@0.3.102:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:wasi@0.11.1+wasi-snapshot-preview1:c19b7c6f923b580a",
         "cargo:wasm-bindgen@0.2.125:c19b7c6f923b580a"
       ]
@@ -42350,7 +42458,7 @@
       "dependsOn": [
         "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
         "cargo:js-sys@0.3.102:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:r-efi@5.3.0:c19b7c6f923b580a",
         "cargo:wasip2@1.0.1+wasi-0.2.4:c19b7c6f923b580a",
         "cargo:wasm-bindgen@0.2.125:c19b7c6f923b580a"
@@ -42360,7 +42468,7 @@
       "ref": "cargo:getrandom@0.4.3:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:r-efi@6.0.0:c19b7c6f923b580a"
       ]
     },
@@ -42387,7 +42495,7 @@
       "dependsOn": [
         "cargo:glib-sys@0.18.1:c19b7c6f923b580a",
         "cargo:gobject-sys@0.18.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:system-deps@6.2.2:c19b7c6f923b580a",
         "cargo:winapi@0.3.9:c19b7c6f923b580a"
       ]
@@ -42401,7 +42509,7 @@
         "cargo:futures-util@0.3.32:c19b7c6f923b580a",
         "cargo:gio-sys@0.18.1:c19b7c6f923b580a",
         "cargo:glib@0.18.5:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:once_cell@1.21.4:c19b7c6f923b580a",
         "cargo:pin-project-lite@0.2.17:c19b7c6f923b580a",
         "cargo:smallvec@1.15.2:c19b7c6f923b580a",
@@ -42430,7 +42538,7 @@
     {
       "ref": "cargo:glib-sys@0.18.1:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:system-deps@6.2.2:c19b7c6f923b580a"
       ]
     },
@@ -42447,7 +42555,7 @@
         "cargo:glib-macros@0.18.5:c19b7c6f923b580a",
         "cargo:glib-sys@0.18.1:c19b7c6f923b580a",
         "cargo:gobject-sys@0.18.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:memchr@2.8.2:c19b7c6f923b580a",
         "cargo:once_cell@1.21.4:c19b7c6f923b580a",
         "cargo:smallvec@1.15.2:c19b7c6f923b580a",
@@ -42495,7 +42603,7 @@
       "ref": "cargo:gobject-sys@0.18.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:glib-sys@0.18.1:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:system-deps@6.2.2:c19b7c6f923b580a"
       ]
     },
@@ -42708,7 +42816,7 @@
         "cargo:gpui@0.2.2:639af286d43bf32b",
         "cargo:gpui_wgpu@0.1.0:694946df1c2f93ee",
         "cargo:jni@0.22.4:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:parking_lot@0.12.5:c19b7c6f923b580a",
         "cargo:raw-window-handle@0.6.2:c19b7c6f923b580a",
@@ -42752,7 +42860,7 @@
         "cargo:http_client@0.1.0:a2ee54afcd668cac",
         "cargo:image@0.25.10:c19b7c6f923b580a",
         "cargo:itertools@0.14.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:notify-rust@4.18.0:c19b7c6f923b580a",
         "cargo:oo7@0.6.0:c19b7c6f923b580a",
@@ -42808,7 +42916,7 @@
         "cargo:gpui_util@0.1.0:b9f3001c16e3909e",
         "cargo:image@0.25.10:c19b7c6f923b580a",
         "cargo:itertools@0.14.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:mach2@0.5.0:c19b7c6f923b580a",
         "cargo:media@0.1.0:fff3ea2cd108b5c9",
@@ -42971,7 +43079,7 @@
         "cargo:gio-sys@0.18.1:c19b7c6f923b580a",
         "cargo:glib-sys@0.18.1:c19b7c6f923b580a",
         "cargo:gobject-sys@0.18.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:pango-sys@0.18.0:c19b7c6f923b580a",
         "cargo:system-deps@6.2.2:c19b7c6f923b580a"
       ]
@@ -42999,7 +43107,7 @@
         "cargo:glib@0.18.5:c19b7c6f923b580a",
         "cargo:gtk-sys@0.18.2:c19b7c6f923b580a",
         "cargo:gtk3-macros@0.18.2:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:pango@0.18.3:c19b7c6f923b580a",
         "cargo:pkg-config@0.3.33:c19b7c6f923b580a"
       ]
@@ -43213,7 +43321,7 @@
         "cargo:http@1.4.2:c19b7c6f923b580a",
         "cargo:hyper@1.10.1:c19b7c6f923b580a",
         "cargo:ipnet@2.12.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:percent-encoding@2.3.2:c19b7c6f923b580a",
         "cargo:pin-project-lite@0.2.17:c19b7c6f923b580a",
         "cargo:socket2@0.6.4:c19b7c6f923b580a",
@@ -43351,6 +43459,13 @@
       ]
     },
     {
+      "ref": "cargo:if-addrs@0.15.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
+        "cargo:windows-sys@0.61.2:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:ignore@0.4.26:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:crossbeam-deque@0.8.6:c19b7c6f923b580a",
@@ -43439,7 +43554,7 @@
     {
       "ref": "cargo:inotify-sys@0.1.8:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -43447,7 +43562,7 @@
       "dependsOn": [
         "cargo:bitflags@1.3.2:c19b7c6f923b580a",
         "cargo:inotify-sys@0.1.8:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -43581,7 +43696,7 @@
       "ref": "cargo:jobserver@0.1.34:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:getrandom@0.3.4:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -43624,7 +43739,7 @@
     {
       "ref": "cargo:khronos-egl@6.0.0:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:libloading@0.8.9:c19b7c6f923b580a",
         "cargo:pkg-config@0.3.33:c19b7c6f923b580a"
       ]
@@ -43637,14 +43752,14 @@
       "ref": "cargo:kqueue-sys@1.1.2:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
       "ref": "cargo:kqueue@1.2.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:kqueue-sys@1.1.2:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -43705,7 +43820,7 @@
       "dependsOn": []
     },
     {
-      "ref": "cargo:libc@0.2.186:c19b7c6f923b580a",
+      "ref": "cargo:libc@0.2.189:c19b7c6f923b580a",
       "dependsOn": []
     },
     {
@@ -43742,7 +43857,7 @@
     {
       "ref": "cargo:libredox@0.1.17:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -43769,7 +43884,7 @@
       "ref": "cargo:linux-keyutils@0.2.5:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -43876,13 +43991,13 @@
     {
       "ref": "cargo:mach2@0.5.0:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
       "ref": "cargo:malloc_buf@0.0.6:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -43944,6 +44059,17 @@
       ]
     },
     {
+      "ref": "cargo:mdns-sd@0.21.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:fastrand@2.4.1:c19b7c6f923b580a",
+        "cargo:flume@0.12.0:c19b7c6f923b580a",
+        "cargo:if-addrs@0.15.0:c19b7c6f923b580a",
+        "cargo:mio@1.2.1:c19b7c6f923b580a",
+        "cargo:socket-pktinfo@0.4.1:c19b7c6f923b580a",
+        "cargo:socket2@0.6.4:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:media@0.1.0:fff3ea2cd108b5c9",
       "dependsOn": [
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
@@ -43963,7 +44089,7 @@
     {
       "ref": "cargo:memmap2@0.9.11:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -44023,7 +44149,7 @@
     {
       "ref": "cargo:mio@1.2.1:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:wasi@0.11.1+wasi-snapshot-preview1:c19b7c6f923b580a",
         "cargo:windows-sys@0.61.2:c19b7c6f923b580a"
@@ -44112,7 +44238,7 @@
       "dependsOn": [
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
         "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -44121,7 +44247,7 @@
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
         "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
         "cargo:cfg_aliases@0.2.1:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:memoffset@0.9.1:c19b7c6f923b580a"
       ]
     },
@@ -44183,7 +44309,7 @@
         "cargo:fsevent-sys@4.1.0:c19b7c6f923b580a",
         "cargo:inotify@0.10.2:c19b7c6f923b580a",
         "cargo:kqueue@1.2.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:mio@1.2.1:c19b7c6f923b580a",
         "cargo:notify-types@1.0.1:c19b7c6f923b580a",
@@ -44288,7 +44414,7 @@
       "ref": "cargo:num_cpus@1.17.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:hermit-abi@0.5.2:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -44310,7 +44436,7 @@
     {
       "ref": "cargo:num_threads@0.1.7:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -44330,7 +44456,7 @@
       "dependsOn": [
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
         "cargo:block2@0.5.1:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:objc2-core-data@0.2.2:c19b7c6f923b580a",
         "cargo:objc2-core-image@0.2.2:c19b7c6f923b580a",
         "cargo:objc2-foundation@0.2.2:c19b7c6f923b580a",
@@ -44343,7 +44469,7 @@
       "dependsOn": [
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
         "cargo:block2@0.6.2:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:objc2-cloud-kit@0.3.2:c19b7c6f923b580a",
         "cargo:objc2-core-data@0.3.2:c19b7c6f923b580a",
         "cargo:objc2-core-foundation@0.3.2:c19b7c6f923b580a",
@@ -44450,7 +44576,7 @@
       "dependsOn": [
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
         "cargo:block2@0.5.1:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:objc2@0.5.2:c19b7c6f923b580a"
       ]
     },
@@ -44459,7 +44585,7 @@
       "dependsOn": [
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
         "cargo:block2@0.6.2:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:objc2-core-foundation@0.3.2:c19b7c6f923b580a",
         "cargo:objc2@0.6.4:c19b7c6f923b580a"
       ]
@@ -44602,7 +44728,7 @@
       "ref": "cargo:open@5.3.6:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:is-wsl@0.4.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -44631,7 +44757,7 @@
       "dependsOn": [
         "cargo:glib-sys@0.18.1:c19b7c6f923b580a",
         "cargo:gobject-sys@0.18.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:system-deps@6.2.2:c19b7c6f923b580a"
       ]
     },
@@ -44640,7 +44766,7 @@
       "dependsOn": [
         "cargo:gio@0.18.4:c19b7c6f923b580a",
         "cargo:glib@0.18.5:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:once_cell@1.21.4:c19b7c6f923b580a",
         "cargo:pango-sys@0.18.0:c19b7c6f923b580a"
       ]
@@ -44660,7 +44786,7 @@
       "ref": "cargo:parking_lot_core@0.9.12:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:redox_syscall@0.5.18:c19b7c6f923b580a",
         "cargo:smallvec@1.15.2:c19b7c6f923b580a",
         "cargo:windows-link@0.2.1:c19b7c6f923b580a"
@@ -45138,7 +45264,7 @@
       "ref": "cargo:quinn-udp@0.5.14:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:cfg_aliases@0.2.1:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:once_cell@1.21.4:c19b7c6f923b580a",
         "cargo:socket2@0.6.4:c19b7c6f923b580a",
         "cargo:tracing@0.1.44:c19b7c6f923b580a",
@@ -45179,7 +45305,7 @@
     {
       "ref": "cargo:rand@0.8.6:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:rand_chacha@0.3.1:c19b7c6f923b580a",
         "cargo:rand_core@0.6.4:c19b7c6f923b580a"
       ]
@@ -45245,7 +45371,7 @@
         "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
         "cargo:interpolate_name@0.2.4:c19b7c6f923b580a",
         "cargo:itertools@0.14.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:libfuzzer-sys@0.4.13:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:maybe-rayon@0.1.1:c19b7c6f923b580a",
@@ -45468,7 +45594,7 @@
         "cargo:block2@0.6.2:c19b7c6f923b580a",
         "cargo:dispatch2@0.3.1:c19b7c6f923b580a",
         "cargo:js-sys@0.3.102:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:objc2-app-kit@0.3.2:c19b7c6f923b580a",
         "cargo:objc2-core-foundation@0.3.2:c19b7c6f923b580a",
@@ -45498,7 +45624,7 @@
         "cargo:cc@1.2.65:c19b7c6f923b580a",
         "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
         "cargo:getrandom@0.2.17:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:untrusted@0.9.0:c19b7c6f923b580a",
         "cargo:windows-sys@0.52.0:c19b7c6f923b580a"
       ]
@@ -45624,7 +45750,7 @@
       "ref": "cargo:rustix-openpty@0.2.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:errno@0.3.14:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:rustix@1.1.4:c19b7c6f923b580a"
       ]
     },
@@ -45633,7 +45759,7 @@
       "dependsOn": [
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
         "cargo:errno@0.3.14:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:linux-raw-sys@0.4.15:c19b7c6f923b580a",
         "cargo:windows-sys@0.59.0:c19b7c6f923b580a"
       ]
@@ -45643,7 +45769,7 @@
       "dependsOn": [
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
         "cargo:errno@0.3.14:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:linux-raw-sys@0.12.1:c19b7c6f923b580a",
         "cargo:windows-sys@0.61.2:c19b7c6f923b580a"
       ]
@@ -45852,7 +45978,7 @@
       "ref": "cargo:security-framework-sys@2.17.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:core-foundation-sys@0.8.7:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -45861,7 +45987,7 @@
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
         "cargo:core-foundation-sys@0.8.7:c19b7c6f923b580a",
         "cargo:core-foundation@0.9.4:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:security-framework-sys@2.17.0:c19b7c6f923b580a"
       ]
     },
@@ -45871,7 +45997,7 @@
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
         "cargo:core-foundation-sys@0.8.7:c19b7c6f923b580a",
         "cargo:core-foundation@0.10.1:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:security-framework-sys@2.17.0:c19b7c6f923b580a"
       ]
     },
@@ -46094,13 +46220,13 @@
       "ref": "cargo:signal-hook-registry@1.4.8:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:errno@0.3.14:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
       "ref": "cargo:signal-hook@0.4.4:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:signal-hook-registry@1.4.8:c19b7c6f923b580a"
       ]
     },
@@ -46203,9 +46329,17 @@
       ]
     },
     {
+      "ref": "cargo:socket-pktinfo@0.4.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
+        "cargo:socket2@0.6.4:c19b7c6f923b580a",
+        "cargo:windows-sys@0.61.2:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:socket2@0.6.4:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:windows-sys@0.61.2:c19b7c6f923b580a"
       ]
     },
@@ -46243,7 +46377,7 @@
       "dependsOn": [
         "cargo:cc@1.2.65:c19b7c6f923b580a",
         "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:psm@0.1.31:c19b7c6f923b580a",
         "cargo:windows-sys@0.61.2:c19b7c6f923b580a"
       ]
@@ -46461,14 +46595,14 @@
     {
       "ref": "cargo:sys-locale@0.3.2:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
       "ref": "cargo:sysinfo@0.31.4:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:core-foundation-sys@0.8.7:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:memchr@2.8.2:c19b7c6f923b580a",
         "cargo:ntapi@0.4.3:c19b7c6f923b580a",
         "cargo:rayon@1.12.0:c19b7c6f923b580a",
@@ -46479,7 +46613,7 @@
       "ref": "cargo:system-configuration-sys@0.6.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:core-foundation-sys@0.8.7:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -46526,7 +46660,7 @@
       "dependsOn": [
         "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
         "cargo:core-foundation-sys@0.8.7:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:objc@0.2.7:c19b7c6f923b580a"
       ]
     },
@@ -46538,7 +46672,7 @@
       "ref": "cargo:tar@0.4.46:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:filetime@0.2.29:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:xattr@1.6.1:c19b7c6f923b580a"
       ]
     },
@@ -46642,7 +46776,7 @@
       "ref": "cargo:time@0.3.55:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:deranged@0.5.8:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:num-conv@0.2.2:c19b7c6f923b580a",
         "cargo:num_threads@0.1.7:c19b7c6f923b580a",
         "cargo:powerfmt@0.2.0:c19b7c6f923b580a",
@@ -46755,7 +46889,7 @@
       "ref": "cargo:tokio@1.52.3:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:bytes@1.12.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:mio@1.2.1:c19b7c6f923b580a",
         "cargo:pin-project-lite@0.2.17:c19b7c6f923b580a",
         "cargo:signal-hook-registry@1.4.8:c19b7c6f923b580a",
@@ -47427,7 +47561,7 @@
         "cargo:async-trait@0.1.89:c19b7c6f923b580a",
         "cargo:base64@0.22.1:c19b7c6f923b580a",
         "cargo:command-group@5.0.1:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:semver@1.0.28:c19b7c6f923b580a",
         "cargo:serde@1.0.228:c19b7c6f923b580a",
         "cargo:serde_json@1.0.150:c19b7c6f923b580a",
@@ -47554,6 +47688,7 @@
         "cargo:semver@1.0.28:c19b7c6f923b580a",
         "cargo:serde@1.0.228:c19b7c6f923b580a",
         "cargo:serde_json@1.0.150:c19b7c6f923b580a",
+        "cargo:sha2@0.10.9:c19b7c6f923b580a",
         "cargo:thiserror@2.0.18:c19b7c6f923b580a",
         "cargo:uuid@1.23.3:c19b7c6f923b580a"
       ]
@@ -47590,8 +47725,10 @@
         "cargo:flate2@1.1.9:c19b7c6f923b580a",
         "cargo:fs2@0.4.3:c19b7c6f923b580a",
         "cargo:futures-util@0.3.32:c19b7c6f923b580a",
+        "cargo:mdns-sd@0.21.0:c19b7c6f923b580a",
         "cargo:reqwest@0.13.4:c19b7c6f923b580a",
         "cargo:rusqlite@0.37.0:c19b7c6f923b580a",
+        "cargo:rustls@0.23.41:c19b7c6f923b580a",
         "cargo:semver@1.0.28:c19b7c6f923b580a",
         "cargo:serde@1.0.228:c19b7c6f923b580a",
         "cargo:serde_json@1.0.150:c19b7c6f923b580a",
@@ -47616,6 +47753,7 @@
         "cargo:vibex-relay@0.1.0-rc.1:0c0a0267098c7864",
         "cargo:vibex-remote@0.1.0-rc.1:b2402acf3d0333d8",
         "cargo:vibex-terminal@0.1.0-rc.1:73363de7836b4dd0",
+        "cargo:webpki-root-certs@1.0.8:c19b7c6f923b580a",
         "cargo:zip@8.4.0:c19b7c6f923b580a"
       ]
     },
@@ -47806,13 +47944,13 @@
       "ref": "cargo:vswhom-sys@0.1.3:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:cc@1.2.65:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
       "ref": "cargo:vswhom@0.1.0:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:vswhom-sys@0.1.3:c19b7c6f923b580a"
       ]
     },
@@ -47830,7 +47968,7 @@
     {
       "ref": "cargo:wait-timeout@0.2.1:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a"
+        "cargo:libc@0.2.189:c19b7c6f923b580a"
       ]
     },
     {
@@ -48094,7 +48232,7 @@
         "cargo:hashbrown@0.16.1:c19b7c6f923b580a",
         "cargo:js-sys@0.3.102:c19b7c6f923b580a",
         "cargo:khronos-egl@6.0.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:libloading@0.8.9:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:naga@29.0.4:c19b7c6f923b580a",
@@ -48641,14 +48779,14 @@
     {
       "ref": "cargo:x11-clipboard@0.9.3:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:x11rb@0.13.2:c19b7c6f923b580a"
       ]
     },
     {
       "ref": "cargo:x11@2.21.0:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:pkg-config@0.3.33:c19b7c6f923b580a"
       ]
     },
@@ -48661,7 +48799,7 @@
       "dependsOn": [
         "cargo:as-raw-xcb-connection@1.0.1:c19b7c6f923b580a",
         "cargo:gethostname@1.1.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:rustix@1.1.4:c19b7c6f923b580a",
         "cargo:x11rb-protocol@0.13.2:c19b7c6f923b580a",
         "cargo:xcursor@0.3.10:c19b7c6f923b580a"
@@ -48679,7 +48817,7 @@
     {
       "ref": "cargo:xattr@1.6.1:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:rustix@1.1.4:c19b7c6f923b580a"
       ]
     },
@@ -48687,7 +48825,7 @@
       "ref": "cargo:xcb@1.7.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:bitflags@1.3.2:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:quick-xml@0.30.0:c19b7c6f923b580a",
         "cargo:x11@2.21.0:c19b7c6f923b580a"
       ]
@@ -48699,7 +48837,7 @@
     {
       "ref": "cargo:xdg-home@1.3.0:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:windows-sys@0.59.0:c19b7c6f923b580a"
       ]
     },
@@ -48719,7 +48857,7 @@
       "ref": "cargo:xkbcommon@0.8.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:as-raw-xcb-connection@1.0.1:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:memmap2@0.9.11:c19b7c6f923b580a",
         "cargo:xkeysym@0.2.1:c19b7c6f923b580a"
       ]
@@ -48749,7 +48887,7 @@
       "dependsOn": [
         "cargo:downcast-rs@2.0.2:c19b7c6f923b580a",
         "cargo:filedescriptor@0.8.3:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:libloading@0.8.9:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:nix@0.29.0:c19b7c6f923b580a",
@@ -48860,7 +48998,7 @@
         "cargo:futures-core@0.3.32:c19b7c6f923b580a",
         "cargo:futures-lite@2.6.1:c19b7c6f923b580a",
         "cargo:hex@0.4.3:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:ordered-stream@0.2.0:c19b7c6f923b580a",
         "cargo:rustix@1.1.4:c19b7c6f923b580a",
         "cargo:serde@1.0.228:c19b7c6f923b580a",
@@ -48935,7 +49073,7 @@
         "cargo:float-ord@0.3.2:c19b7c6f923b580a",
         "cargo:freetype-sys@0.20.1:c19b7c6f923b580a",
         "cargo:lazy_static@1.5.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.186:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:pathfinder_geometry@0.5.1:c19b7c6f923b580a",
         "cargo:pathfinder_simd@0.5.6:c19b7c6f923b580a",

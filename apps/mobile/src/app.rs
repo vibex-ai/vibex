@@ -19,22 +19,24 @@ use vibex_backend::{
 use vibex_core::{
     AgentSessionState, ContinueAgentTurnRequest, CreateAgentSessionRequest, ElicitationFieldKind,
     ElicitationResolutionAction, PermissionResolution, PermissionResponseKind,
-    PermissionRiskCategory, RenameAgentSessionRequest, RequestId, ResolvePermissionRequest,
-    RuntimeOptionAvailability, SendAgentMessageRequest, TimelinePayload, VibexSessionId,
-    WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation, unix_timestamp_ms,
+    PermissionRiskCategory, RemoteLanPairingRequestState, RenameAgentSessionRequest, RequestId,
+    ResolvePermissionRequest, RuntimeOptionAvailability, SendAgentMessageRequest, TimelinePayload,
+    VibexSessionId, WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation,
+    unix_timestamp_ms,
 };
 use vibex_desktop_model::{TimelineConversationTurn, TimelineRow, TimelineRowKind};
-use vibex_remote_client::WebRemoteBackend;
+use vibex_remote_client::{LanPairingSession, WebRemoteBackend};
 use vibex_ui::{
     AgentEventDecision, AgentMutationTicket, AgentWorkflowController, AsyncPhase,
     ElicitationFormDraft, ElicitationSurfaceModel, ShellKind,
 };
 
+use crate::discovery::{LanDiscoveryCandidate, LanDiscoveryEvent};
 use crate::input::{
     Backspace, Copy, Cut, Delete, Down, Enter, Left, Paste, Right, SelectAll, SelectDown,
     SelectLeft, SelectRight, SelectUp, TextInput, Up,
 };
-use crate::pairing::{MobileCredentialBundle, claim_pairing_link};
+use crate::pairing::{MobileCredentialBundle, claim_lan_pairing, claim_pairing_link};
 use crate::storage::CredentialStorage;
 use crate::workbench::{MobileWorkbench, WorkbenchSurface};
 use crate::{markdown, scanner, theme};
@@ -57,6 +59,33 @@ enum RootMode {
     Pairing,
     Connecting,
     Workspace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NearbyPairingState {
+    Idle,
+    Discovering,
+    Empty,
+    Validating {
+        display_name: String,
+    },
+    Waiting {
+        display_name: String,
+        verification_code: String,
+        expires_at_ms: i64,
+    },
+    PermissionDenied,
+    Rejected,
+    Expired,
+    Failed {
+        message: String,
+    },
+}
+
+enum LanPairingOutcome {
+    Bundle(Box<MobileCredentialBundle>),
+    Rejected,
+    Expired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +182,10 @@ pub struct MobileApp {
     elicitation_inputs: BTreeMap<String, Entity<TextInput>>,
     elicitation_draft: Option<ElicitationFormDraft>,
     pairing_busy: bool,
+    nearby_pairing_state: NearbyPairingState,
+    nearby_candidates: BTreeMap<String, LanDiscoveryCandidate>,
+    nearby_discovery_generation: u64,
+    lan_pairing_task: Option<Task<()>>,
     operation_busy: bool,
     new_session_busy: bool,
     session_action: Option<SessionActionPrompt>,
@@ -196,6 +229,10 @@ impl MobileApp {
             elicitation_inputs: BTreeMap::new(),
             elicitation_draft: None,
             pairing_busy: false,
+            nearby_pairing_state: NearbyPairingState::Idle,
+            nearby_candidates: BTreeMap::new(),
+            nearby_discovery_generation: 0,
+            lan_pairing_task: None,
             operation_busy: false,
             new_session_busy: false,
             session_action: None,
@@ -209,6 +246,7 @@ impl MobileApp {
             app.defer_bundle_install(bundle, cx);
         }
         app.start_scanner_result_stream(cx);
+        app.start_lan_discovery_event_stream(cx);
         app
     }
 
@@ -237,6 +275,10 @@ impl MobileApp {
     }
 
     fn install_bundle(&mut self, bundle: MobileCredentialBundle, cx: &mut Context<Self>) {
+        crate::discovery::stop();
+        self.lan_pairing_task = None;
+        self.nearby_candidates.clear();
+        self.nearby_pairing_state = NearbyPairingState::Idle;
         match bundle.backend() {
             Ok(backend) => {
                 if let Some(workbench) = self.workbench.take() {
@@ -375,12 +417,227 @@ impl MobileApp {
     }
 
     fn scan_pairing_code(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pairing_busy {
+        if self.pairing_busy && self.lan_pairing_task.is_none() {
             return;
         }
+        self.stop_nearby_pairing();
         window.hide_soft_keyboard();
         self.error = scanner::launch().err();
         cx.notify();
+    }
+
+    fn start_lan_discovery_event_stream(&mut self, cx: &mut Context<Self>) {
+        let mut events = crate::discovery::subscribe();
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            while let Some(event) = events.next().await {
+                if entity
+                    .update(cx, |this, cx| this.handle_lan_discovery_event(event, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        self.tasks.push(task);
+    }
+
+    fn handle_lan_discovery_event(&mut self, event: LanDiscoveryEvent, cx: &mut Context<Self>) {
+        if !matches!(
+            self.nearby_pairing_state,
+            NearbyPairingState::Discovering | NearbyPairingState::Empty
+        ) {
+            return;
+        }
+        match event {
+            LanDiscoveryEvent::Candidate(candidate) => {
+                self.nearby_candidates.insert(candidate.key(), candidate);
+                self.nearby_pairing_state = NearbyPairingState::Discovering;
+            }
+            LanDiscoveryEvent::Removed { service_instance } => {
+                self.nearby_candidates
+                    .retain(|_, candidate| candidate.service_instance != service_instance);
+                if self.nearby_candidates.is_empty() {
+                    self.nearby_pairing_state = NearbyPairingState::Empty;
+                }
+            }
+            LanDiscoveryEvent::PermissionDenied => {
+                crate::discovery::stop();
+                self.nearby_pairing_state = NearbyPairingState::PermissionDenied;
+            }
+            LanDiscoveryEvent::Failed(error) => {
+                crate::discovery::stop();
+                self.nearby_pairing_state = NearbyPairingState::Failed {
+                    message: error.message,
+                };
+            }
+        }
+        cx.notify();
+    }
+
+    fn start_nearby_pairing(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.stop_nearby_pairing();
+        self.error = None;
+        self.nearby_pairing_state = NearbyPairingState::Discovering;
+        self.nearby_discovery_generation = self.nearby_discovery_generation.wrapping_add(1);
+        let generation = self.nearby_discovery_generation;
+        if let Err(error) = crate::discovery::start() {
+            self.nearby_pairing_state = NearbyPairingState::Failed {
+                message: error.message,
+            };
+        } else {
+            let runner = gpui_tokio::Tokio::spawn(cx, async move {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            });
+            let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+                let _ = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    if this.nearby_discovery_generation == generation
+                        && this.nearby_candidates.is_empty()
+                        && matches!(this.nearby_pairing_state, NearbyPairingState::Discovering)
+                    {
+                        this.nearby_pairing_state = NearbyPairingState::Empty;
+                        cx.notify();
+                    }
+                });
+            });
+            self.tasks.push(task);
+        }
+        cx.notify();
+    }
+
+    fn cancel_nearby_pairing(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.stop_nearby_pairing();
+        cx.notify();
+    }
+
+    fn stop_nearby_pairing(&mut self) {
+        crate::discovery::stop();
+        self.nearby_discovery_generation = self.nearby_discovery_generation.wrapping_add(1);
+        self.lan_pairing_task = None;
+        self.nearby_candidates.clear();
+        self.nearby_pairing_state = NearbyPairingState::Idle;
+        self.pairing_busy = false;
+    }
+
+    fn select_nearby_candidate(&mut self, key: String, cx: &mut Context<Self>) {
+        if !matches!(
+            self.nearby_pairing_state,
+            NearbyPairingState::Discovering | NearbyPairingState::Empty
+        ) || self.pairing_busy
+        {
+            return;
+        }
+        let Some(candidate) = self.nearby_candidates.get(&key).cloned() else {
+            return;
+        };
+        crate::discovery::stop();
+        self.pairing_busy = true;
+        self.error = None;
+        self.nearby_pairing_state = NearbyPairingState::Validating {
+            display_name: candidate.display_name.clone(),
+        };
+        let display_name = candidate.display_name.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            LanPairingSession::start(candidate.origin, "Vibex Mobile").await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| match outcome {
+                Ok(Ok(session)) => {
+                    this.nearby_pairing_state = NearbyPairingState::Waiting {
+                        display_name,
+                        verification_code: session.verification_code().to_string(),
+                        expires_at_ms: session.expires_at_ms(),
+                    };
+                    this.start_lan_pairing_poll(session, cx);
+                    cx.notify();
+                }
+                Ok(Err(error)) => {
+                    this.pairing_busy = false;
+                    this.lan_pairing_task = None;
+                    this.nearby_pairing_state = NearbyPairingState::Failed {
+                        message: error.message,
+                    };
+                    cx.notify();
+                }
+                Err(_) => {
+                    this.pairing_busy = false;
+                    this.lan_pairing_task = None;
+                    this.nearby_pairing_state = NearbyPairingState::Failed {
+                        message: "Nearby pairing stopped unexpectedly".to_string(),
+                    };
+                    cx.notify();
+                }
+            });
+        });
+        self.lan_pairing_task = Some(task);
+        cx.notify();
+    }
+
+    fn start_lan_pairing_poll(&mut self, session: LanPairingSession, cx: &mut Context<Self>) {
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(700)).await;
+                let status = session.poll().await?;
+                match status.state {
+                    RemoteLanPairingRequestState::Pending => continue,
+                    RemoteLanPairingRequestState::Approved => {
+                        return claim_lan_pairing(&session, status)
+                            .await
+                            .map(Box::new)
+                            .map(LanPairingOutcome::Bundle);
+                    }
+                    RemoteLanPairingRequestState::Rejected => {
+                        return Ok(LanPairingOutcome::Rejected);
+                    }
+                    RemoteLanPairingRequestState::Expired
+                    | RemoteLanPairingRequestState::Claimed => {
+                        return Ok(LanPairingOutcome::Expired);
+                    }
+                    RemoteLanPairingRequestState::Unknown => {
+                        return Err(BackendError::failed(
+                            "remote_lan_pairing_state_unknown",
+                            "desktop returned an unknown LAN pairing state",
+                        ));
+                    }
+                }
+            }
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                this.pairing_busy = false;
+                this.lan_pairing_task = None;
+                match outcome {
+                    Ok(Ok(LanPairingOutcome::Bundle(bundle))) => match this.storage.save(&bundle) {
+                        Ok(()) => this.install_bundle(*bundle, cx),
+                        Err(error) => {
+                            this.nearby_pairing_state = NearbyPairingState::Failed {
+                                message: error.message,
+                            }
+                        }
+                    },
+                    Ok(Ok(LanPairingOutcome::Rejected)) => {
+                        this.nearby_pairing_state = NearbyPairingState::Rejected;
+                    }
+                    Ok(Ok(LanPairingOutcome::Expired)) => {
+                        this.nearby_pairing_state = NearbyPairingState::Expired;
+                    }
+                    Ok(Err(error)) => {
+                        this.nearby_pairing_state = NearbyPairingState::Failed {
+                            message: error.message,
+                        };
+                    }
+                    Err(_) => {
+                        this.nearby_pairing_state = NearbyPairingState::Failed {
+                            message: "Nearby pairing stopped unexpectedly".to_string(),
+                        };
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.lan_pairing_task = Some(task);
     }
 
     fn claim_scanned_pairing_link(&mut self, link: String, cx: &mut Context<Self>) {
@@ -1502,6 +1759,14 @@ impl MobileApp {
     }
 
     fn render_pairing(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let retry = matches!(
+            self.nearby_pairing_state,
+            NearbyPairingState::PermissionDenied
+                | NearbyPairingState::Rejected
+                | NearbyPairingState::Expired
+                | NearbyPairingState::Failed { .. }
+        );
+        let qr_enabled = !self.pairing_busy || self.lan_pairing_task.is_some();
         div()
             .size_full()
             .flex()
@@ -1514,11 +1779,11 @@ impl MobileApp {
                     .flex()
                     .flex_col()
                     .items_center()
-                    .mb(px(theme::SPACING_XL))
+                    .mb(px(theme::SPACING_LG))
                     .child(
                         svg()
                             .path("brand/logo.svg")
-                            .size(px(60.0))
+                            .size(px(44.0))
                             .text_color(theme::text_primary())
                             .mb(px(theme::SPACING_SM)),
                     )
@@ -1528,12 +1793,6 @@ impl MobileApp {
                             .font_weight(FontWeight::EXTRA_BOLD)
                             .text_color(theme::text_primary())
                             .child("Vibex"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(theme::FONT_BODY))
-                            .text_color(theme::text_muted())
-                            .child("Drive your desktop Agent sessions from anywhere."),
                     ),
             )
             .child(
@@ -1543,19 +1802,33 @@ impl MobileApp {
                     .flex()
                     .flex_col()
                     .gap(px(theme::SPACING_SM))
-                    .child(
-                        div()
-                            .text_size(px(theme::FONT_DETAIL))
-                            .text_color(theme::text_muted())
-                            .child("Scan the pairing QR code shown in Vibex desktop."),
-                    )
+                    .child(self.render_nearby_pairing(cx))
+                    .when(retry, |panel| {
+                        panel.child(
+                            div()
+                                .id("retry-nearby-pairing")
+                                .h(px(theme::TOUCH_TARGET))
+                                .rounded(px(theme::RADIUS_CONTROL))
+                                .border_1()
+                                .border_color(theme::border_default())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .active(|style| style.bg(theme::row_pressed_bg()))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(Self::start_nearby_pairing),
+                                )
+                                .child("Try Again"),
+                        )
+                    })
                     .when_some(self.error.as_ref(), |panel, error| {
                         panel.child(
                             div()
                                 .rounded(px(theme::RADIUS_CARD))
                                 .border_1()
                                 .border_color(rgb(theme::ACCENT_RED))
-                                .bg(theme::bg_card_dim())
                                 .p(px(theme::SPACING_MD))
                                 .text_size(px(theme::FONT_DETAIL))
                                 .text_color(rgb(theme::ACCENT_RED))
@@ -1567,14 +1840,15 @@ impl MobileApp {
                             .id("scan-pairing-qr")
                             .h(px(theme::TOUCH_TARGET))
                             .rounded(px(theme::RADIUS_CONTROL))
-                            .bg(rgb(theme::TEXT_PRIMARY))
-                            .text_color(rgb(theme::BG_PRIMARY))
+                            .border_1()
+                            .border_color(theme::border_default())
+                            .text_color(theme::text_primary())
                             .flex()
                             .items_center()
                             .justify_center()
                             .text_size(px(theme::FONT_HEADING))
                             .gap(px(theme::SPACING_SM))
-                            .when(!self.pairing_busy, |button| {
+                            .when(qr_enabled, |button| {
                                 button
                                     .cursor_pointer()
                                     .active(|style| style.opacity(0.7))
@@ -1587,15 +1861,241 @@ impl MobileApp {
                                 svg()
                                     .path("icons/scan-line.svg")
                                     .size(px(theme::ICON_MD))
-                                    .text_color(rgb(theme::BG_PRIMARY)),
+                                    .text_color(theme::text_primary()),
                             )
-                            .child(if self.pairing_busy {
+                            .child(if self.pairing_busy && self.lan_pairing_task.is_none() {
                                 "Pairing\u{2026}"
                             } else {
-                                "Scan QR Code"
+                                "Use QR Code"
                             }),
                     ),
             )
+    }
+
+    fn render_nearby_pairing(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        match &self.nearby_pairing_state {
+            NearbyPairingState::Idle => div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(theme::SPACING_SM))
+                .child(
+                    div()
+                        .text_size(px(theme::FONT_DETAIL))
+                        .text_color(theme::text_muted())
+                        .child("Pair with a Vibex desktop on this network."),
+                )
+                .child(
+                    div()
+                        .id("find-nearby-desktops")
+                        .h(px(theme::TOUCH_TARGET))
+                        .rounded(px(theme::RADIUS_CONTROL))
+                        .bg(rgb(theme::TEXT_PRIMARY))
+                        .text_color(rgb(theme::BG_PRIMARY))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(theme::SPACING_SM))
+                        .text_size(px(theme::FONT_HEADING))
+                        .cursor_pointer()
+                        .active(|style| style.opacity(0.7))
+                        .on_mouse_up(MouseButton::Left, cx.listener(Self::start_nearby_pairing))
+                        .child(
+                            svg()
+                                .path("icons/refresh.svg")
+                                .size(px(theme::ICON_MD))
+                                .text_color(rgb(theme::BG_PRIMARY)),
+                        )
+                        .child("Find Nearby Desktops"),
+                )
+                .into_any_element(),
+            NearbyPairingState::Discovering | NearbyPairingState::Empty => {
+                let candidates = self.nearby_candidates.values().cloned().collect::<Vec<_>>();
+                let empty = matches!(self.nearby_pairing_state, NearbyPairingState::Empty);
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme::SPACING_SM))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(theme::FONT_HEADING))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::text_primary())
+                                    .child("Nearby desktops"),
+                            )
+                            .child(
+                                div()
+                                    .id("stop-nearby-discovery")
+                                    .size(px(theme::TOUCH_TARGET))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(Self::cancel_nearby_pairing),
+                                    )
+                                    .child(
+                                        svg()
+                                            .path("icons/x.svg")
+                                            .size(px(theme::ICON_MD))
+                                            .text_color(theme::text_muted()),
+                                    ),
+                            ),
+                    )
+                    .when(candidates.is_empty(), |panel| {
+                        panel.child(
+                            div()
+                                .h(px(64.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(theme::FONT_DETAIL))
+                                .text_color(theme::text_muted())
+                                .child(if empty {
+                                    "No nearby desktops found"
+                                } else {
+                                    "Searching\u{2026}"
+                                }),
+                        )
+                    })
+                    .children(candidates.into_iter().map(|candidate| {
+                        let key = candidate.key();
+                        div()
+                            .id(format!("nearby:{key}"))
+                            .min_h(px(58.0))
+                            .px(px(theme::SPACING_MD))
+                            .border_b_1()
+                            .border_color(theme::border_subtle())
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.select_nearby_candidate(key.clone(), cx)
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_size(px(theme::FONT_HEADING))
+                                            .text_color(theme::text_primary())
+                                            .child(candidate.display_name),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(theme::FONT_MICRO))
+                                            .text_color(theme::text_muted())
+                                            .child("Vibex Remote v2"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(theme::FONT_CAPTION))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::text_primary())
+                                    .child("Pair"),
+                            )
+                    }))
+                    .into_any_element()
+            }
+            NearbyPairingState::Validating { display_name } => {
+                self.render_nearby_message(format!("Checking {display_name}\u{2026}"), false)
+            }
+            NearbyPairingState::Waiting {
+                display_name,
+                verification_code,
+                expires_at_ms,
+            } => {
+                let code = if verification_code.len() == 6 {
+                    format!("{} {}", &verification_code[..3], &verification_code[3..])
+                } else {
+                    verification_code.clone()
+                };
+                let remaining = expires_at_ms
+                    .saturating_sub(unix_timestamp_ms())
+                    .div_euclid(1_000)
+                    .max(0);
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(theme::SPACING_SM))
+                    .child(
+                        div()
+                            .text_size(px(theme::FONT_HEADING))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text_primary())
+                            .child(format!("Waiting for {display_name}")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(theme::FONT_DETAIL))
+                            .text_color(theme::text_muted())
+                            .child("Confirm the same code is shown on the desktop."),
+                    )
+                    .child(
+                        div()
+                            .h(px(58.0))
+                            .flex()
+                            .items_center()
+                            .text_size(px(30.0))
+                            .font_weight(FontWeight::EXTRA_BOLD)
+                            .text_color(theme::text_primary())
+                            .child(code),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(theme::FONT_MICRO))
+                            .text_color(theme::text_muted())
+                            .child(format!("Expires in {remaining}s")),
+                    )
+                    .into_any_element()
+            }
+            NearbyPairingState::PermissionDenied => self.render_nearby_message(
+                "Local network access is required to find nearby desktops.",
+                true,
+            ),
+            NearbyPairingState::Rejected => {
+                self.render_nearby_message("The desktop rejected this pairing request.", true)
+            }
+            NearbyPairingState::Expired => {
+                self.render_nearby_message("The nearby pairing window expired.", true)
+            }
+            NearbyPairingState::Failed { message } => {
+                self.render_nearby_message(message.clone(), true)
+            }
+        }
+    }
+
+    fn render_nearby_message(&self, message: impl Into<String>, error: bool) -> gpui::AnyElement {
+        div()
+            .w_full()
+            .min_h(px(72.0))
+            .p(px(theme::SPACING_MD))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(theme::FONT_DETAIL))
+            .text_color(theme::text_muted())
+            .when(error, |message| message.text_color(rgb(theme::ACCENT_RED)))
+            .child(message.into())
+            .into_any_element()
     }
 
     fn render_connecting(&self, cx: &mut Context<Self>) -> impl IntoElement {

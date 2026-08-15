@@ -6,13 +6,13 @@ use url::Url;
 use vibex_backend::{BackendError, BackendResult};
 use vibex_core::{
     DeviceId, RelayPeerId, RemoteAuthProof, RemoteClientType, RemoteDeviceStatus,
-    RemotePairingOffer, RemotePairingTransport, RequestId,
+    RemoteLanPairingStatusResponse, RemotePairingOffer, RemotePairingTransport, RequestId,
 };
 use vibex_remote_client::{
     AutoRemoteTransport, AutoRemoteTransportConfig, ClientDeviceIdentity, DirectCandidate,
-    PAIRING_FRAGMENT_PREFIX, PairingClaimRoute, PairingEntryHint, PairingEntryHintKind,
-    RelayClientConfig, RemoteClientConfig, RemoteCredentialRecord, WebRemoteBackend,
-    claim_pairing_offer, claim_pairing_offer_via_relay, pairing_claim_request,
+    LanPairingSession, PAIRING_FRAGMENT_PREFIX, PairingClaimRoute, PairingEntryHint,
+    PairingEntryHintKind, RelayClientConfig, RemoteClientConfig, RemoteCredentialRecord,
+    WebRemoteBackend, claim_pairing_offer, claim_pairing_offer_via_relay, pairing_claim_request,
     parse_pairing_offer_fragment, select_pairing_claim_route,
 };
 
@@ -273,6 +273,34 @@ pub async fn claim_pairing_link(link: String) -> BackendResult<MobileCredentialB
         client_type: RemoteClientType::Mobile,
         allow_insecure_local_dev: cfg!(debug_assertions),
         route: Some(route_bundle(&offer)),
+    };
+    bundle.validate()?;
+    Ok(bundle)
+}
+
+pub async fn claim_lan_pairing(
+    session: &LanPairingSession,
+    status: RemoteLanPairingStatusResponse,
+) -> BackendResult<MobileCredentialBundle> {
+    let claim = session.claim_approved(status).await?;
+    let bundle = MobileCredentialBundle {
+        schema_version: MOBILE_CREDENTIAL_SCHEMA_VERSION.to_string(),
+        record: RemoteCredentialRecord {
+            server_url: claim.origin,
+            auth: RemoteAuthProof {
+                device_id: claim.response.device.device_id,
+                auth_token: claim.response.device_grant_token,
+            },
+            device_identity_public_key: claim.identity.public_key_base64(),
+            server_identity_public_key: Some(
+                claim.offer.summary.server_identity_public_key.clone(),
+            ),
+        },
+        identity_private_key: claim.identity.private_key_base64(),
+        expected_server_id: claim.offer.summary.server_id.clone(),
+        client_type: RemoteClientType::Mobile,
+        allow_insecure_local_dev: false,
+        route: Some(route_bundle(&claim.offer)),
     };
     bundle.validate()?;
     Ok(bundle)

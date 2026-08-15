@@ -2,6 +2,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use sha2::{Digest, Sha256};
 
 use crate::{
     CorrelationId, DeviceId, ErrorCategory, EventId, RemoteActionClass, RemoteAuthProof,
@@ -31,6 +32,7 @@ pub const REMOTE_PROTOCOL_V2_MINOR: u16 = 0;
 pub const REMOTE_V2_BINARY_MAGIC: [u8; 4] = *b"VBX2";
 pub const REMOTE_V2_MAX_BINARY_HEADER_BYTES: usize = 64 * 1024;
 pub const REMOTE_V2_MAX_BINARY_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+pub const REMOTE_LAN_PAIRING_SCHEMA_VERSION: &str = "vibex-lan-pairing-discovery.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -782,6 +784,179 @@ pub struct RemotePairingOffer {
     pub one_time_challenge: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteLanPairingRequestState {
+    Pending,
+    Approved,
+    Rejected,
+    Expired,
+    Claimed,
+    Unknown,
+}
+
+impl_unknown_safe_enum!(
+    RemoteLanPairingRequestState,
+    "pending" => RemoteLanPairingRequestState::Pending,
+    "approved" => RemoteLanPairingRequestState::Approved,
+    "rejected" => RemoteLanPairingRequestState::Rejected,
+    "expired" => RemoteLanPairingRequestState::Expired,
+    "claimed" => RemoteLanPairingRequestState::Claimed,
+    "unknown" => RemoteLanPairingRequestState::Unknown,
+);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoteLanPairingDiscoverySummary {
+    pub schema_version: String,
+    pub window_id: RequestId,
+    pub server_id: String,
+    pub server_identity_public_key: String,
+    pub protocol_range: RemoteProtocolVersionRange,
+    pub permission_level: RemoteDevicePermissionLevel,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoteLanPairingRequest {
+    pub window_id: RequestId,
+    pub device_identity_public_key: String,
+    pub display_name: String,
+    pub client_nonce: String,
+    pub request_secret: String,
+    pub idempotency_key: String,
+}
+
+impl fmt::Debug for RemoteLanPairingRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteLanPairingRequest")
+            .field("window_id", &self.window_id)
+            .field("display_name", &self.display_name)
+            .field(
+                "has_device_identity_public_key",
+                &!self.device_identity_public_key.is_empty(),
+            )
+            .field("has_client_nonce", &!self.client_nonce.is_empty())
+            .field("has_request_secret", &!self.request_secret.is_empty())
+            .field("has_idempotency_key", &!self.idempotency_key.is_empty())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoteLanPairingRequestAccepted {
+    pub request_id: RequestId,
+    pub verification_code: String,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoteLanPairingStatusRequest {
+    pub request_id: RequestId,
+    pub request_secret: String,
+}
+
+impl fmt::Debug for RemoteLanPairingStatusRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteLanPairingStatusRequest")
+            .field("request_id", &self.request_id)
+            .field("has_request_secret", &!self.request_secret.is_empty())
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoteLanPairingStatusResponse {
+    pub state: RemoteLanPairingRequestState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offer: Option<RemotePairingOffer>,
+}
+
+impl fmt::Debug for RemoteLanPairingStatusResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteLanPairingStatusResponse")
+            .field("state", &self.state)
+            .field("offer", &self.offer)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoteLanPairingPendingRequestSummary {
+    pub request_id: RequestId,
+    pub display_name: String,
+    pub device_fingerprint: String,
+    pub verification_code: String,
+    pub state: RemoteLanPairingRequestState,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoteLanPairingAdvertisement {
+    pub advertisement_id: String,
+    pub service_instance: String,
+    pub display_name: String,
+    pub direct_origin: String,
+    pub protocol_min: u16,
+    pub protocol_max: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoteLanPairingWindowSnapshot {
+    pub discovery: RemoteLanPairingDiscoverySummary,
+    pub advertisement: RemoteLanPairingAdvertisement,
+    #[serde(default)]
+    pub pending_requests: Vec<RemoteLanPairingPendingRequestSummary>,
+}
+
+/// Derive the six-digit short authentication string shown on both devices.
+/// Length-prefixing every field keeps the transcript unambiguous across clients.
+pub fn remote_lan_pairing_verification_code(
+    window_id: &RequestId,
+    request_id: &RequestId,
+    server_id: &str,
+    server_identity_public_key: &str,
+    device_identity_public_key: &str,
+    client_nonce: &str,
+) -> String {
+    let fields = [
+        REMOTE_LAN_PAIRING_SCHEMA_VERSION,
+        window_id.as_str(),
+        request_id.as_str(),
+        server_id,
+        server_identity_public_key,
+        device_identity_public_key,
+        client_nonce,
+    ];
+    let mut transcript = Vec::new();
+    for field in fields {
+        transcript.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        transcript.extend_from_slice(field.as_bytes());
+    }
+    let digest = Sha256::digest(transcript);
+    let value = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % 1_000_000;
+    format!("{value:06}")
+}
+
+pub fn remote_lan_pairing_device_fingerprint(device_identity_public_key: &str) -> String {
+    let digest = Sha256::digest(device_identity_public_key.as_bytes());
+    digest[..4]
+        .chunks_exact(2)
+        .map(|chunk| format!("{:02X}{:02X}", chunk[0], chunk[1]))
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 impl fmt::Debug for RemotePairingOffer {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1168,6 +1343,112 @@ mod tests {
 
         let kind: RemoteBinaryFrameKind = serde_json::from_str(r#""future_binary""#).unwrap();
         assert_eq!(kind, RemoteBinaryFrameKind::Unknown);
+    }
+
+    #[test]
+    fn unknown_lan_pairing_request_state_decodes_without_crashing() {
+        let state: RemoteLanPairingRequestState =
+            serde_json::from_str(r#""future_state""#).unwrap();
+
+        assert_eq!(state, RemoteLanPairingRequestState::Unknown);
+    }
+
+    #[test]
+    fn lan_pairing_verification_code_is_stable_and_binds_every_request_field() {
+        let window_id = RequestId::parse("request_window").unwrap();
+        let request_id = RequestId::parse("request_pairing").unwrap();
+        let code = remote_lan_pairing_verification_code(
+            &window_id,
+            &request_id,
+            "server-a",
+            "server-public-a",
+            "device-public-a",
+            "client-nonce-a",
+        );
+
+        assert_eq!(code, "170588");
+        assert_eq!(code.len(), 6);
+        assert!(code.bytes().all(|byte| byte.is_ascii_digit()));
+
+        let changed_inputs = [
+            remote_lan_pairing_verification_code(
+                &RequestId::parse("request_window_changed").unwrap(),
+                &request_id,
+                "server-a",
+                "server-public-a",
+                "device-public-a",
+                "client-nonce-a",
+            ),
+            remote_lan_pairing_verification_code(
+                &window_id,
+                &RequestId::parse("request_pairing_changed").unwrap(),
+                "server-a",
+                "server-public-a",
+                "device-public-a",
+                "client-nonce-a",
+            ),
+            remote_lan_pairing_verification_code(
+                &window_id,
+                &request_id,
+                "server-a-changed",
+                "server-public-a",
+                "device-public-a",
+                "client-nonce-a",
+            ),
+            remote_lan_pairing_verification_code(
+                &window_id,
+                &request_id,
+                "server-a",
+                "server-public-a-changed",
+                "device-public-a",
+                "client-nonce-a",
+            ),
+            remote_lan_pairing_verification_code(
+                &window_id,
+                &request_id,
+                "server-a",
+                "server-public-a",
+                "device-public-a-changed",
+                "client-nonce-a",
+            ),
+            remote_lan_pairing_verification_code(
+                &window_id,
+                &request_id,
+                "server-a",
+                "server-public-a",
+                "device-public-a",
+                "client-nonce-a-changed",
+            ),
+        ];
+
+        assert!(changed_inputs.iter().all(|changed| changed != &code));
+    }
+
+    #[test]
+    fn lan_pairing_request_debug_output_redacts_secret_material() {
+        let request = RemoteLanPairingRequest {
+            window_id: RequestId::parse("request_window_debug").unwrap(),
+            device_identity_public_key: "device-public-debug".to_string(),
+            display_name: "Vibex Mobile".to_string(),
+            client_nonce: "client-nonce-secret".to_string(),
+            request_secret: "request-secret-sentinel".to_string(),
+            idempotency_key: "idempotency-secret".to_string(),
+        };
+        let status = RemoteLanPairingStatusRequest {
+            request_id: RequestId::parse("request_lan_status").unwrap(),
+            request_secret: "status-request-secret-sentinel".to_string(),
+        };
+
+        let request_debug = format!("{request:?}");
+        assert!(!request_debug.contains("device-public-debug"));
+        assert!(!request_debug.contains("client-nonce-secret"));
+        assert!(!request_debug.contains("request-secret-sentinel"));
+        assert!(!request_debug.contains("idempotency-secret"));
+        assert!(request_debug.contains("has_request_secret: true"));
+
+        let status_debug = format!("{status:?}");
+        assert!(!status_debug.contains("status-request-secret-sentinel"));
+        assert!(status_debug.contains("has_request_secret: true"));
     }
 
     #[test]

@@ -69,6 +69,7 @@ use vibex_terminal::TerminalManager;
 mod identity;
 pub use identity::{RemoteIdentity, RemoteIdentityStore};
 mod gateway;
+mod lan_pairing;
 mod pairing_v2;
 pub use gateway::{
     RelayAttachmentTasks, RelayRemoteOutbound, RemoteGateway, RemoteGatewayConfig,

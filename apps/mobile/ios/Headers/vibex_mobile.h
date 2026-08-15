@@ -9,6 +9,8 @@ void vibex_mobile_main(void);
 
 void vibex_mobile_pairing_qr_scanned(const char *value);
 
+void vibex_mobile_lan_discovery_event(const char *value);
+
 #ifdef __cplusplus
 }
 #endif

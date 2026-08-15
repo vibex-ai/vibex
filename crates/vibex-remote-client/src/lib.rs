@@ -11,6 +11,7 @@
 mod backend;
 mod binary;
 mod credentials;
+mod lan_pairing;
 mod pairing;
 mod sync;
 mod transport;
@@ -18,6 +19,7 @@ mod transport;
 pub use backend::*;
 pub use binary::*;
 pub use credentials::*;
+pub use lan_pairing::*;
 pub use pairing::*;
 pub use sync::*;
 pub use transport::*;

@@ -136,6 +136,149 @@ bounded per-connection RPC semaphore + bounded outbound queue
 create_pairing_offer request -> Gateway injects RemoteGatewayPairingRoutes
 ```
 
+## Scenario: LAN Discovery Pairing
+
+### 1. Scope / Trigger
+
+- Trigger: changing LAN pairing DTOs, `_vibex._tcp.local.` advertisement or
+  native discovery bridges, the Desktop approval window, or mobile nearby-pairing
+  claim flow.
+- LAN discovery is a short-lived pairing entry over an existing trusted Direct
+  HTTPS route. It is not a long-term transport and does not move authoritative
+  state out of `DesktopRuntime` / `RemoteGateway`.
+
+### 2. Signatures
+
+```text
+GET  /api/v2/pairing/lan
+  -> RemoteLanPairingDiscoverySummary
+POST /api/v2/pairing/lan/request
+  RemoteLanPairingRequest -> RemoteLanPairingRequestAccepted
+POST /api/v2/pairing/lan/status
+  RemoteLanPairingStatusRequest -> RemoteLanPairingStatusResponse
+
+RemoteGateway::{start_lan_pairing_window,lan_pairing_window_status,
+  approve_lan_pairing_request,reject_lan_pairing_request,
+  cancel_lan_pairing_window}
+RemoteConnectivityController::{start_lan_pairing_window,
+  lan_pairing_window_status,approve_lan_pairing_request,
+  reject_lan_pairing_request,cancel_lan_pairing_window}
+LanPairingSession::{start,poll,claim_approved}
+DNS-SD service type = _vibex._tcp.local.
+```
+
+### 3. Contracts
+
+- At most one in-memory Desktop LAN window is active. The default product TTL
+  is 90 seconds; offer TTL remains bounded by the existing 60-120 second pairing
+  contract. Cancel, expiry, successful claim, Gateway stop/restart, Direct route
+  loss, or dialog close clears the window and stops advertisement.
+- TXT contains exactly `version=1`, `advertisement_id`, `display_name`,
+  `protocol_min=2`, `protocol_max=2`, and `pairing=available`. Service instance
+  is at most 63 bytes, display name at most 192 bytes, advertisement id 16-128
+  bytes, and the bounded TXT representation at most 512 bytes. Offer/window/
+  request ids, challenge, request secret, grant, credentials, workspace data,
+  and identity fingerprints are forbidden.
+- Mobile treats DNS-SD as untrusted addressing. It builds a credential-free,
+  path/query/fragment-free exact HTTPS origin from resolved SRV hostname/port,
+  disables redirects, performs normal certificate/hostname validation, then
+  validates discovery and `/api/v2/info`. Server id/key and v2 protocol must
+  match; deployment mode must be `lan`, TLS policy `trusted_https_proxy`, and
+  fixed paths must be `/ws/v2`, `/api/v2/pairing/claim`,
+  `/api/v2/pairing/lan`, `/api/v2/pairing/lan/request`,
+  `/api/v2/pairing/lan/status`, and `/api/v2/ws-ticket`.
+- `RemoteLanPairingRequest` binds window id, X25519 device public key, bounded
+  display name, client nonce, request secret, and idempotency key. The client
+  generates a 32-byte request secret and retains it only in memory. Desktop
+  retains only HMAC-SHA256 under a process-random key. A window permits at most
+  eight pending requests; a repeated idempotency tuple returns the same request,
+  while any changed binding conflicts.
+- Both devices derive the six-digit SAS from the length-prefixed transcript:
+  LAN schema version, window id, request id, server id, server identity public
+  key, device identity public key, and client nonce. Mobile recomputes and
+  compares the returned code before waiting. Desktop must show the same code,
+  device name, and short public-key fingerprint before explicit approval.
+- Status polling is no faster than once per 500ms and puts the request secret in
+  the JSON body, never URL/log/Debug. Pending/rejected/expired/claimed status has
+  no offer. Only an approved request with matching secret returns the existing
+  `RemotePairingOffer`; approving one request rejects every other pending request.
+- Mobile validates the approved offer with the shared offer validator and
+  requires exactly one `RemotePairingTransport::Direct` candidate whose
+  normalized HTTPS origin equals the validated discovery origin. It then uses
+  the existing claim endpoint and persists the unchanged
+  `MobileCredentialBundle`, including all validated post-pairing routes.
+- Android discovery uses `NsdManager` with local-network/Wi-Fi permissions for
+  target SDK 35; iOS declares `NSLocalNetworkUsageDescription` and
+  `NSBonjourServices = [_vibex._tcp]`. Browsing runs only in the foreground
+  pairing flow and stops on selection, cancellation, success, or page exit.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Malformed/oversized service instance, SRV authority, TXT, unknown TXT key, or non-v2 advertisement | `remote_lan_discovery_invalid`; do not contact or list it as trusted. |
+| HTTP origin, credentials, path/query/fragment, TLS failure, or redirect | `remote_lan_discovery_invalid` / normal TLS-network error; never downgrade to HTTP. |
+| Discovery and `/api/v2/info` identity differ | `remote_lan_server_identity_mismatch`; submit no request. |
+| Fixed path, deployment mode, or TLS policy differs | `remote_lan_gateway_policy_invalid`; submit no request. |
+| Window absent/expired or reaches eight pending requests | `remote_lan_pairing_window_unavailable` / `remote_lan_pairing_request_limit`. |
+| Idempotency binding changes | `remote_lan_pairing_request_conflict`; create no second request. |
+| Request secret is malformed or wrong | `remote_lan_pairing_request_unauthorized`; return no enumerable request detail. |
+| Poll interval is below 500ms | `remote_lan_pairing_poll_rate_limited`; retain the request. |
+| Returned SAS does not match the shared transcript | `remote_lan_pairing_verification_invalid`; stop the flow. |
+| Approved offer identity or Direct origin differs | `remote_lan_server_identity_mismatch` / `remote_pairing_entry_route_mismatch`; do not claim. |
+| Native local-network permission is denied | `mobile_local_network_permission_denied` UI state; QR and stored routes remain usable. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: mobile lists two same-name advertisements as distinct candidates, the
+  user selects one, both devices show the same SAS, Desktop approves it, and the
+  existing claim returns a normal mobile credential bundle.
+- Base: Desktop has a valid Direct route but no active LAN window, so it emits no
+  advertisement and LAN endpoints return window unavailable; QR/Tailnet/Relay
+  pairing remains unchanged.
+- Bad: trust TXT identity, auto-select the first service, advertise an offer id
+  or challenge, store a plaintext request secret on Desktop, approve without
+  SAS comparison, return an offer while pending, follow an HTTPS redirect, or
+  replace the offer-owned route with an mDNS URL.
+
+### 6. Tests Required
+
+- Core tests freeze DTO JSON, unknown-safe request state, deterministic SAS, and
+  redacted `Debug` for secret-bearing request/status/offer values.
+- Coordinator tests cover single-window replacement refusal, eight-request
+  bound, idempotent retry/conflict, secret hashing/wrong secret, 500ms polling,
+  one approval winner, reject, expiry, cancel, and claim cleanup.
+- Gateway integration proves discovery/request/status routing, 8KiB request
+  body and 16-request concurrency bounds, pending offer absence, approved offer
+  presence, and no secret reflection.
+- Desktop tests use a fake advertiser/probe to prove mobile-compatible HTTPS
+  validation before start and advertisement stop on every terminal lifecycle.
+- Remote-client tests cover strict origin normalization, identity/path/policy
+  mismatch, SAS recomputation, exact Direct route match, and secret redaction.
+- Native mobile tests cover duplicate display names, malicious/oversized TXT,
+  permission/discovering/empty/waiting/rejected/expired/success states, and QR
+  fallback. Run `pnpm check:mobile-native`; real iOS and Android same-LAN tests
+  remain required before release.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+TXT: offer_id=<id>, challenge=<secret>, origin=http://192.168.1.2
+first discovered service -> auto approve -> save a new LAN transport
+GET /status?requestSecret=<secret> -> offer while pending
+```
+
+#### Correct
+
+```text
+bounded non-secret TXT -> user selects -> exact HTTPS + info validation
+request body secret -> shared SAS -> explicit Desktop approval
+approved body-secret status -> existing offer validator + exact Direct route
+existing claim transaction -> existing MobileCredentialBundle
+```
+
 ## Scenario: GPUI Desktop Remote Publication Controller
 
 ### 1. Scope / Trigger

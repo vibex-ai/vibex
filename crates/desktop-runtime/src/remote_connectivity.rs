@@ -28,8 +28,8 @@ use url::{Host, Url};
 use vibex_core::{
     ErrorCategory, RelayPeerId, RelayProtocolVersion, RelayRoomId, RemoteCancelPairingOfferRequest,
     RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDevicePermissionLevel,
-    RemotePairingCandidate, RemotePairingOfferSummary, RemotePairingTransport,
-    RemoteProtocolVersionRange, RequestId, VibexError, VibexResult,
+    RemoteLanPairingWindowSnapshot, RemotePairingCandidate, RemotePairingOfferSummary,
+    RemotePairingTransport, RemoteProtocolVersionRange, RequestId, VibexError, VibexResult,
 };
 use vibex_remote::{
     RemoteGateway, RemoteGatewayConfig, RemoteGatewayDeploymentMode, RemoteGatewayPairingRoutes,
@@ -37,6 +37,7 @@ use vibex_remote::{
 };
 
 use crate::relay::{RelayClientRuntime, RelayClientSettingsUpdate};
+use crate::{LanPairingAdvertiser, MdnsLanPairingAdvertiser};
 
 pub const REMOTE_ACCESS_SETTINGS_FILE: &str = "remote-access.json";
 pub const REMOTE_CONNECTIVITY_SCHEMA_VERSION: u16 = 1;
@@ -51,6 +52,7 @@ const PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const DIRECT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const DIRECT_PROBE_MAX_BYTES: usize = 128 * 1024;
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const LOCAL_CLIENT_ORIGINS: [&str; 1] = ["https://localhost"];
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteConnectivityMethod {
@@ -579,6 +581,12 @@ pub struct DirectProbeInfo {
     pub protocol_range: RemoteProtocolVersionRange,
     pub ws_path: String,
     pub pairing_claim_path: String,
+    #[serde(default)]
+    pub lan_pairing_discovery_path: String,
+    #[serde(default)]
+    pub lan_pairing_request_path: String,
+    #[serde(default)]
+    pub lan_pairing_status_path: String,
     pub ws_ticket_path: String,
     #[serde(default)]
     pub deployment_mode: String,
@@ -605,6 +613,21 @@ pub enum DirectProbeProxyPolicy {
 pub struct HttpDirectPublicationProbe {
     system_proxy_client: reqwest::Client,
     direct_client: Option<reqwest::Client>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WebPkiDirectPublicationProbe {
+    system_proxy_client: Option<reqwest::Client>,
+    direct_client: Option<reqwest::Client>,
+}
+
+impl Default for WebPkiDirectPublicationProbe {
+    fn default() -> Self {
+        Self {
+            system_proxy_client: webpki_probe_client(false),
+            direct_client: webpki_probe_client(true),
+        }
+    }
 }
 
 impl Default for HttpDirectPublicationProbe {
@@ -680,6 +703,75 @@ impl DirectPublicationProbe for HttpDirectPublicationProbe {
     }
 }
 
+#[async_trait]
+impl DirectPublicationProbe for WebPkiDirectPublicationProbe {
+    async fn probe(
+        &self,
+        origin: &str,
+        proxy_policy: DirectProbeProxyPolicy,
+    ) -> VibexResult<DirectProbeInfo> {
+        let client = match proxy_policy {
+            DirectProbeProxyPolicy::System => self.system_proxy_client.as_ref(),
+            DirectProbeProxyPolicy::Bypass => self.direct_client.as_ref(),
+        }
+        .ok_or_else(|| {
+            VibexError::process(
+                "remote_lan_tls_incompatible",
+                "the mobile-compatible TLS probe client could not be initialized",
+            )
+        })?;
+        let origin = normalize_https_origin(origin)?;
+        let response = client
+            .get(format!("{origin}/api/v2/info"))
+            .send()
+            .await
+            .map_err(|_| {
+                VibexError::process(
+                    "remote_lan_tls_incompatible",
+                    "the Direct origin is not reachable with the mobile WebPKI trust baseline",
+                )
+            })?;
+        if response.status() != StatusCode::OK {
+            return Err(VibexError::process(
+                "remote_lan_tls_incompatible",
+                "the Direct origin failed the mobile-compatible protocol probe",
+            )
+            .with_diagnostic("status", response.status().as_u16().to_string()));
+        }
+        let bytes = read_bounded_http_body(
+            response,
+            DIRECT_PROBE_MAX_BYTES,
+            "remote_lan_tls_incompatible",
+            "remote_direct_probe_response_too_large",
+            "the mobile-compatible Direct probe returned an unreadable response",
+            "the mobile-compatible Direct probe response is too large",
+        )
+        .await?;
+        serde_json::from_slice(&bytes).map_err(|_| {
+            VibexError::validation(
+                "remote_direct_probe_invalid",
+                "the mobile-compatible Direct origin returned an invalid info response",
+            )
+        })
+    }
+}
+
+fn webpki_probe_client(no_proxy: bool) -> Option<reqwest::Client> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add_parsable_certificates(webpki_root_certs::TLS_SERVER_ROOT_CERTS.iter().cloned());
+    let tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let mut builder = reqwest::Client::builder()
+        .use_preconfigured_tls(tls)
+        .timeout(DIRECT_PROBE_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none());
+    if no_proxy {
+        builder = builder.no_proxy();
+    }
+    builder.build().ok()
+}
+
 fn direct_probe_proxy_policy(origin: &str) -> DirectProbeProxyPolicy {
     let Ok(url) = Url::parse(origin) else {
         return DirectProbeProxyPolicy::System;
@@ -734,6 +826,7 @@ fn gateway_authority_allowlists(network_origins: Vec<String>) -> (Vec<String>, V
         .collect();
     let allowed_origins = network_origins
         .into_iter()
+        .chain(LOCAL_CLIENT_ORIGINS.map(str::to_string))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -1520,8 +1613,18 @@ struct ControllerInner {
     tailscale: Arc<dyn TailscalePublication>,
     direct_probe: Arc<dyn DirectPublicationProbe>,
     relay_probe: Arc<dyn RelayPublicationProbe>,
+    lan_probe: Arc<dyn DirectPublicationProbe>,
+    lan_advertiser: Arc<dyn LanPairingAdvertiser>,
     operation: Mutex<()>,
     state: Mutex<ControllerState>,
+}
+
+struct PublicationAdapters {
+    tailscale: Arc<dyn TailscalePublication>,
+    direct_probe: Arc<dyn DirectPublicationProbe>,
+    relay_probe: Arc<dyn RelayPublicationProbe>,
+    lan_probe: Arc<dyn DirectPublicationProbe>,
+    lan_advertiser: Arc<dyn LanPairingAdvertiser>,
 }
 
 #[derive(Clone)]
@@ -1545,12 +1648,19 @@ impl RemoteConnectivityController {
         gateway: RemoteGateway,
         relay: RelayClientRuntime,
     ) -> VibexResult<Self> {
-        Self::with_adapters(
+        let gateway_bind_addr = gateway.current_config().service.bind_addr;
+        Self::with_publication_adapters_at(
             home,
             gateway,
+            gateway_bind_addr,
             relay,
-            Arc::new(TailscaleCli::default()),
-            Arc::new(HttpDirectPublicationProbe::default()),
+            PublicationAdapters {
+                tailscale: Arc::new(TailscaleCli::default()),
+                direct_probe: Arc::new(HttpDirectPublicationProbe::default()),
+                relay_probe: Arc::new(HttpRelayPublicationProbe::default()),
+                lan_probe: Arc::new(WebPkiDirectPublicationProbe::default()),
+                lan_advertiser: Arc::new(MdnsLanPairingAdvertiser::default()),
+            },
         )
     }
 
@@ -1561,14 +1671,19 @@ impl RemoteConnectivityController {
         tailscale: Arc<dyn TailscalePublication>,
         direct_probe: Arc<dyn DirectPublicationProbe>,
     ) -> VibexResult<Self> {
+        let lan_probe = direct_probe.clone();
         Self::with_publication_adapters_at(
             home,
             gateway,
             DIRECT_LOOPBACK_BIND_ADDR.to_string(),
             relay,
-            tailscale,
-            direct_probe,
-            Arc::new(HttpRelayPublicationProbe::default()),
+            PublicationAdapters {
+                tailscale,
+                direct_probe,
+                relay_probe: Arc::new(HttpRelayPublicationProbe::default()),
+                lan_probe,
+                lan_advertiser: Arc::new(MdnsLanPairingAdvertiser::default()),
+            },
         )
     }
 
@@ -1581,14 +1696,19 @@ impl RemoteConnectivityController {
         relay_probe: Arc<dyn RelayPublicationProbe>,
     ) -> VibexResult<Self> {
         let gateway_bind_addr = gateway.current_config().service.bind_addr;
+        let lan_probe = direct_probe.clone();
         Self::with_publication_adapters_at(
             home,
             gateway,
             gateway_bind_addr,
             relay,
-            tailscale,
-            direct_probe,
-            relay_probe,
+            PublicationAdapters {
+                tailscale,
+                direct_probe,
+                relay_probe,
+                lan_probe,
+                lan_advertiser: Arc::new(MdnsLanPairingAdvertiser::default()),
+            },
         )
     }
 
@@ -1597,9 +1717,7 @@ impl RemoteConnectivityController {
         gateway: RemoteGateway,
         gateway_bind_addr: String,
         relay: RelayClientRuntime,
-        tailscale: Arc<dyn TailscalePublication>,
-        direct_probe: Arc<dyn DirectPublicationProbe>,
-        relay_probe: Arc<dyn RelayPublicationProbe>,
+        adapters: PublicationAdapters,
     ) -> VibexResult<Self> {
         let store = RemoteConnectivityStore::for_home(home);
         let loaded = store.load_or_default(vibex_core::unix_timestamp_ms())?;
@@ -1616,9 +1734,11 @@ impl RemoteConnectivityController {
                 gateway,
                 gateway_bind_addr,
                 relay,
-                tailscale,
-                direct_probe,
-                relay_probe,
+                tailscale: adapters.tailscale,
+                direct_probe: adapters.direct_probe,
+                relay_probe: adapters.relay_probe,
+                lan_probe: adapters.lan_probe,
+                lan_advertiser: adapters.lan_advertiser,
                 operation: Mutex::new(()),
                 state: Mutex::new(ControllerState {
                     settings: loaded.settings,
@@ -1714,6 +1834,88 @@ impl RemoteConnectivityController {
                 direct_candidates: Vec::new(),
                 relay_candidate: None,
             })
+    }
+
+    pub async fn start_lan_pairing_window(
+        &self,
+        permission_level: RemoteDevicePermissionLevel,
+        ttl_ms: u32,
+    ) -> VibexResult<RemoteLanPairingWindowSnapshot> {
+        let _operation = self.inner.operation.lock().await;
+        let direct_origin = {
+            let state = self.inner.state.lock().await;
+            state
+                .methods
+                .get(&RemoteConnectivityMethod::Direct)
+                .filter(|runtime| runtime.state == RemoteMethodState::Online)
+                .and_then(|runtime| runtime.candidate.as_ref())
+                .filter(|candidate| candidate.transport == RemotePairingTransport::Direct)
+                .map(|candidate| candidate.url.clone())
+                .ok_or_else(|| {
+                    VibexError::capability(
+                        "remote_lan_direct_unavailable",
+                        "LAN pairing requires a validated Direct HTTPS route",
+                    )
+                })?
+        };
+        let info = self
+            .inner
+            .lan_probe
+            .probe(&direct_origin, direct_probe_proxy_policy(&direct_origin))
+            .await
+            .map_err(|error| {
+                if error.code == "remote_lan_tls_incompatible" {
+                    error
+                } else {
+                    VibexError::process(
+                        "remote_lan_tls_incompatible",
+                        "the Direct origin failed the mobile-compatible TLS and protocol probe",
+                    )
+                    .with_diagnostic("causeCode", error.code)
+                }
+            })?;
+        self.validate_direct_info(&info)?;
+
+        let snapshot = self.inner.gateway.start_lan_pairing_window(
+            permission_level,
+            ttl_ms,
+            &direct_origin,
+        )?;
+        if let Err(error) = self.inner.lan_advertiser.start(&snapshot.advertisement) {
+            let _ = self.inner.gateway.cancel_lan_pairing_window();
+            return Err(error);
+        }
+        Ok(snapshot)
+    }
+
+    pub fn lan_pairing_window_status(&self) -> VibexResult<RemoteLanPairingWindowSnapshot> {
+        match self.inner.gateway.lan_pairing_window_status() {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) => {
+                let _ = self.inner.lan_advertiser.stop();
+                Err(error)
+            }
+        }
+    }
+
+    pub fn approve_lan_pairing_request(
+        &self,
+        request_id: &RequestId,
+    ) -> VibexResult<RemoteLanPairingWindowSnapshot> {
+        self.inner.gateway.approve_lan_pairing_request(request_id)
+    }
+
+    pub fn reject_lan_pairing_request(
+        &self,
+        request_id: &RequestId,
+    ) -> VibexResult<RemoteLanPairingWindowSnapshot> {
+        self.inner.gateway.reject_lan_pairing_request(request_id)
+    }
+
+    pub fn cancel_lan_pairing_window(&self) -> VibexResult<()> {
+        let advertiser = self.inner.lan_advertiser.stop();
+        let gateway = self.inner.gateway.cancel_lan_pairing_window();
+        advertiser.and(gateway)
     }
 
     pub fn pairing_offer_status(
@@ -2471,11 +2673,16 @@ impl RemoteConnectivityController {
             let mut route_only_update = previous.clone();
             route_only_update.pairing_routes = config.pairing_routes.clone();
             if route_only_update == config {
-                return self.inner.gateway.set_pairing_routes(config.pairing_routes);
+                self.inner
+                    .gateway
+                    .set_pairing_routes(config.pairing_routes)?;
+                self.stop_lan_advertiser_if_inactive();
+                return Ok(());
             }
         }
         if was_running {
             self.inner.gateway.stop().await?;
+            let _ = self.inner.lan_advertiser.stop();
         }
         if let Err(error) = self.inner.gateway.apply_config_while_stopped(config).await {
             if was_running {
@@ -2505,7 +2712,14 @@ impl RemoteConnectivityController {
             }
             return Err(error);
         }
+        self.stop_lan_advertiser_if_inactive();
         Ok(())
+    }
+
+    fn stop_lan_advertiser_if_inactive(&self) {
+        if self.inner.gateway.lan_pairing_window_status().is_err() {
+            let _ = self.inner.lan_advertiser.stop();
+        }
     }
 
     async fn confirmation_needed(
@@ -2554,6 +2768,9 @@ impl RemoteConnectivityController {
         }
         if info.ws_path != "/ws/v2"
             || info.pairing_claim_path != "/api/v2/pairing/claim"
+            || info.lan_pairing_discovery_path != "/api/v2/pairing/lan"
+            || info.lan_pairing_request_path != "/api/v2/pairing/lan/request"
+            || info.lan_pairing_status_path != "/api/v2/pairing/lan/status"
             || info.ws_ticket_path != "/api/v2/ws-ticket"
         {
             return Err(VibexError::validation(
@@ -3032,7 +3249,7 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
-    use vibex_core::RemoteClaimPairingOfferRequest;
+    use vibex_core::{RemoteClaimPairingOfferRequest, RemoteLanPairingAdvertisement};
 
     static CONTROLLER_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -3257,6 +3474,27 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FakeLanAdvertiser {
+        advertisements: StdMutex<Vec<RemoteLanPairingAdvertisement>>,
+        stop_calls: AtomicUsize,
+    }
+
+    impl LanPairingAdvertiser for FakeLanAdvertiser {
+        fn start(&self, advertisement: &RemoteLanPairingAdvertisement) -> VibexResult<()> {
+            self.advertisements
+                .lock()
+                .unwrap()
+                .push(advertisement.clone());
+            Ok(())
+        }
+
+        fn stop(&self) -> VibexResult<()> {
+            self.stop_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
     async fn test_controller(
         directory: &Path,
         tailscale: Arc<FakeTailscale>,
@@ -3286,6 +3524,39 @@ mod tests {
         (controller, gateway)
     }
 
+    async fn test_controller_with_lan_advertiser(
+        directory: &Path,
+        direct_probe: Arc<FakeDirectProbe>,
+        lan_advertiser: Arc<FakeLanAdvertiser>,
+    ) -> (RemoteConnectivityController, RemoteGateway) {
+        let dispatcher = vibex_remote::RemoteDispatcher::new(
+            vibex_remote::RemoteServiceConfig::loopback_disabled(),
+        );
+        let gateway = RemoteGateway::new(
+            RemoteGatewayConfig::loopback_enabled("127.0.0.1:0"),
+            dispatcher.clone(),
+            directory.join("vibex.db"),
+            directory.join("relay/desktop-identity.json"),
+        );
+        let relay = RelayClientRuntime::with_remote_gateway(dispatcher, gateway.clone()).unwrap();
+        let controller = RemoteConnectivityController::with_publication_adapters_at(
+            directory,
+            gateway.clone(),
+            gateway.current_config().service.bind_addr,
+            relay,
+            PublicationAdapters {
+                tailscale: Arc::new(FakeTailscale::default()),
+                direct_probe: direct_probe.clone(),
+                relay_probe: Arc::new(FakeRelayProbe::default()),
+                lan_probe: direct_probe.clone(),
+                lan_advertiser,
+            },
+        )
+        .unwrap();
+        *direct_probe.gateway.lock().unwrap() = Some(gateway.clone());
+        (controller, gateway)
+    }
+
     fn direct_info(gateway: &RemoteGateway) -> DirectProbeInfo {
         let identity = gateway.identity().unwrap();
         DirectProbeInfo {
@@ -3294,6 +3565,9 @@ mod tests {
             protocol_range: RemoteProtocolVersionRange::v2(),
             ws_path: "/ws/v2".to_string(),
             pairing_claim_path: "/api/v2/pairing/claim".to_string(),
+            lan_pairing_discovery_path: "/api/v2/pairing/lan".to_string(),
+            lan_pairing_request_path: "/api/v2/pairing/lan/request".to_string(),
+            lan_pairing_status_path: "/api/v2/pairing/lan/status".to_string(),
             ws_ticket_path: "/api/v2/ws-ticket".to_string(),
             deployment_mode: "lan".to_string(),
             tls_policy: "trusted_https_proxy".to_string(),
@@ -3524,6 +3798,47 @@ mod tests {
             .await
             .unwrap();
         assert!(!gateway.status().running);
+    }
+
+    #[tokio::test]
+    async fn lan_pairing_advertisement_follows_window_lifecycle() {
+        let _guard = CONTROLLER_TEST_LOCK.lock().await;
+        let directory = tempdir().unwrap();
+        let direct = Arc::new(FakeDirectProbe::default());
+        let advertiser = Arc::new(FakeLanAdvertiser::default());
+        let (controller, gateway) = test_controller_with_lan_advertiser(
+            directory.path(),
+            direct.clone(),
+            advertiser.clone(),
+        )
+        .await;
+        *direct.info.lock().unwrap() = Some(direct_info(&gateway));
+        controller
+            .enable_direct("https://desktop.example.test")
+            .await
+            .unwrap();
+
+        let window = controller
+            .start_lan_pairing_window(RemoteDevicePermissionLevel::ReadOnly, 60_000)
+            .await
+            .unwrap();
+        let advertisements = advertiser.advertisements.lock().unwrap();
+        assert_eq!(
+            advertisements.as_slice(),
+            std::slice::from_ref(&window.advertisement)
+        );
+        let encoded = serde_json::to_string(&advertisements[0]).unwrap();
+        assert!(!encoded.contains("offer"));
+        assert!(!encoded.contains("challenge"));
+        assert!(!encoded.contains("requestSecret"));
+        drop(advertisements);
+
+        controller.cancel_lan_pairing_window().unwrap();
+        assert!(advertiser.stop_calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(
+            controller.lan_pairing_window_status().unwrap_err().code,
+            "remote_lan_pairing_window_unavailable"
+        );
     }
 
     #[tokio::test]
