@@ -3,7 +3,7 @@
 These guidelines define the current Rust GPUI presentation architecture for
 Vibex. `apps/desktop` is the visual and information-architecture baseline.
 `apps/mobile` is a native iOS/Android GPUI client that projects the same Agent
-session model into a compact, Zedra-aligned surface.
+session model into a compact native surface.
 
 Primary evidence:
 

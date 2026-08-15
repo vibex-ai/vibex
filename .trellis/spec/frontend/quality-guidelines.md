@@ -92,9 +92,9 @@ pnpm build:mobile:ios
   timeline projection. User bubbles, Agent Markdown, process/tool details,
   approval cards, and the composer remain GUI components; a terminal cannot be
   substituted for the session page.
-- Zedra alignment is visual and ergonomic: restrained dark surfaces, compact
-  spacing, small radii, clear secondary text, edge drawer navigation, and
-  thumb-safe explicit actions. Vibex labels, state semantics, and approval
+- The mobile treatment is visual and ergonomic: restrained dark surfaces,
+  compact spacing, small radii, clear secondary text, edge drawer navigation,
+  and thumb-safe explicit actions. Vibex labels, state semantics, and approval
   behavior remain authoritative.
 - Pairing, route selection, reconnect, and credential storage stay outside View
   rendering. Credentials are validated, atomically persisted, and redacted from

@@ -1,6 +1,6 @@
 //! Design tokens for the native mobile client.
 //!
-//! Values track the Zedra mobile palette and spacing scale so the two GPUI
+//! Values define the shared mobile palette and spacing scale so the two GPUI
 //! phone clients read as one product. Views must go through these accessors
 //! instead of hardcoding colors.
 

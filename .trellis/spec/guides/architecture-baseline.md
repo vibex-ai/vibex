@@ -51,7 +51,7 @@ Mobile projects that same GUI contract into a compact composition:
 - reconnect and loading states remain visible and never fabricate local history.
 
 Mobile may use a session drawer, edge swipe, sheets, reduced density, and a
-Zedra-aligned dark palette. It must not turn the Agent session page into a
+restrained dark palette. It must not turn the Agent session page into a
 terminal-first workflow, copy a separate domain component family, or silently
 drop approval/error states.
 
@@ -105,11 +105,11 @@ constants are derived and checked. Desktop owns Wide/Medium/Compact information
 architecture. Mobile uses the Compact composition as its primary surface and
 borrows Medium behavior only where the viewport permits it.
 
-The mobile visual baseline follows Zedra's restrained dark treatment: near-black
+The mobile visual baseline uses a restrained dark treatment: near-black
 background, subtle elevated surfaces, small radii, compact typography, clear
-secondary text, and explicit icon actions. This is a visual treatment only; all
-Vibex session labels, timeline states, approval semantics, and remote workflows
-remain Vibex-owned and desktop-compatible.
+secondary text, and explicit icon actions. This is a visual treatment only;
+all Vibex session labels, timeline states, approval semantics, and remote
+workflows remain desktop-compatible.
 
 Touch actions must be explicit and usable without hover. Fixed-format controls
 have stable dimensions. Loading, empty, streaming, failure, reconnecting,
