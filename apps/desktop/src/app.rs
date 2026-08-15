@@ -301,6 +301,7 @@ const SETTINGS_ROW_INLINE_MIN_VIEWPORT_WIDTH: f32 = 896.0;
 const SETTINGS_VERTICAL_TABS_MIN_WIDTH: f32 = 768.0;
 const SETTINGS_NAVIGATION_WIDTH: f32 = 196.0;
 const SETTINGS_NAVIGATION_ROW_HEIGHT: f32 = 36.0;
+const SETTINGS_NAVIGATION_SECTION_GAP: f32 = 6.0;
 const SETTINGS_DIALOG_MAX_WIDTH: f32 = 960.0;
 const SETTINGS_DIALOG_MAX_HEIGHT: f32 = 720.0;
 
@@ -32575,11 +32576,11 @@ impl FoundationSettings {
         let workflow = buttons.split_off(2);
         let group_label = |label| {
             div()
-                .px_3()
+                .px_2()
                 .pb_1()
                 .text_xs()
                 .font_medium()
-                .text_color(muted_foreground)
+                .text_color(muted_foreground.opacity(0.72))
                 .child(label)
         };
 
@@ -32594,7 +32595,7 @@ impl FoundationSettings {
             .child(search)
             .child(
                 v_flex()
-                    .gap(px(2.0))
+                    .gap(px(SETTINGS_NAVIGATION_SECTION_GAP))
                     .child(group_label(locale::text(
                         "Preferences",
                         "偏好设置",
@@ -32604,13 +32605,13 @@ impl FoundationSettings {
             )
             .child(
                 v_flex()
-                    .gap(px(2.0))
+                    .gap(px(SETTINGS_NAVIGATION_SECTION_GAP))
                     .child(group_label(locale::text("Workflow", "工作流", "工作流程")))
                     .children(workflow),
             )
             .child(
                 v_flex()
-                    .gap(px(2.0))
+                    .gap(px(SETTINGS_NAVIGATION_SECTION_GAP))
                     .child(group_label(locale::text("Support", "支持", "支援")))
                     .children(support),
             )
@@ -40402,6 +40403,7 @@ mod tests {
     fn settings_navigation_keeps_grouped_large_targets() {
         assert_eq!(SETTINGS_NAVIGATION_WIDTH, 196.0);
         assert_eq!(SETTINGS_NAVIGATION_ROW_HEIGHT, 36.0);
+        assert_eq!(SETTINGS_NAVIGATION_SECTION_GAP, 6.0);
         assert_eq!(SETTINGS_ROW_INLINE_MIN_VIEWPORT_WIDTH, 896.0);
 
         let source = include_str!("app.rs");
@@ -40418,6 +40420,9 @@ mod tests {
         assert!(navigation.contains("\"偏好设置\""));
         assert!(navigation.contains("\"工作流\""));
         assert!(navigation.contains("\"支持\""));
+        assert!(navigation.contains(".px_2()"));
+        assert!(navigation.contains(".text_color(muted_foreground.opacity(0.72))"));
+        assert!(navigation.contains(".gap(px(SETTINGS_NAVIGATION_SECTION_GAP))"));
         assert!(navigation.contains("let icon = Icon::new(icon)"));
         assert!(navigation.contains(".mr(px(2.0))"));
         assert!(navigation.contains(".child(div().flex_1())"));
