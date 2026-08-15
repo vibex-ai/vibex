@@ -28231,6 +28231,7 @@ fn render_agent_thinking_indicator(
     let glow = cx.theme().foreground;
     let background = cx.theme().background;
     let label = label.to_string();
+    let character_count = label.chars().count();
     let tooltip = tooltip.to_string();
     let element_id = format!("agent-thinking-{turn_id}");
     let animation_id = format!("{element_id}-animation");
@@ -28258,20 +28259,45 @@ fn render_agent_thinking_indicator(
                         let progress = agent_thinking_scroll_progress(delta);
                         let max_offset = animation_scroll.max_offset().x;
                         animation_scroll.set_offset(point(-max_offset * progress, px(0.0)));
-                        let intensity = (delta * 10.0 * std::f32::consts::TAU).sin() * 0.5 + 0.5;
-                        this.text_color(Hsla {
-                            h: base.h + (glow.h - base.h) * intensity,
-                            s: base.s + (glow.s - base.s) * intensity,
-                            l: base.l + (glow.l - base.l) * intensity,
-                            a: base.a + (glow.a - base.a) * intensity,
-                        })
-                        .child(
+                        let viewport_width = f32::from(animation_scroll.bounds().size.width);
+                        let content_width = viewport_width + f32::from(max_offset);
+                        let visible_span = if content_width > 0.0 {
+                            (viewport_width / content_width).clamp(0.0, 1.0)
+                        } else {
+                            1.0
+                        };
+                        let visible_start = progress * (1.0 - visible_span);
+                        let scan_position = visible_start - visible_span * 0.35
+                            + (delta * 10.0).fract() * visible_span * 1.7;
+                        let scan_radius = (visible_span * 0.42).max(0.01);
+                        this.child(
                             div()
                                 .id(scroll_id.clone())
                                 .w_full()
                                 .overflow_x_scroll()
                                 .track_scroll(&animation_scroll)
-                                .child(div().flex_none().whitespace_nowrap().child(label.clone())),
+                                .child(h_flex().flex_none().whitespace_nowrap().children(
+                                    label.chars().enumerate().map(|(index, character)| {
+                                        let position = if character_count > 1 {
+                                            index as f32 / (character_count - 1) as f32
+                                        } else {
+                                            0.5
+                                        };
+                                        let intensity = (1.0
+                                            - (position - scan_position).abs() / scan_radius)
+                                            .clamp(0.0, 1.0);
+                                        let intensity =
+                                            intensity * intensity * (3.0 - 2.0 * intensity);
+                                        div().flex_none().child(character.to_string()).text_color(
+                                            Hsla {
+                                                h: base.h + (glow.h - base.h) * intensity,
+                                                s: base.s + (glow.s - base.s) * intensity,
+                                                l: base.l + (glow.l - base.l) * intensity,
+                                                a: base.a + (glow.a - base.a) * intensity,
+                                            },
+                                        )
+                                    }),
+                                )),
                         )
                         .when(
                             max_offset > px(0.0) && progress < 1.0,
@@ -28284,6 +28310,7 @@ fn render_agent_thinking_indicator(
                                         .bottom_0()
                                         .pl_1()
                                         .bg(background)
+                                        .text_color(base)
                                         .child("…"),
                                 )
                             },
@@ -35758,7 +35785,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_thinking_indicator_scrolls_overflow_and_keeps_full_tooltip() {
+    fn agent_thinking_indicator_scrolls_scans_and_keeps_full_tooltip() {
         let source = include_str!("app.rs");
         let renderer = source
             .split_once("fn render_agent_thinking_indicator(")
@@ -35774,8 +35801,13 @@ mod tests {
         assert!(renderer.contains(".whitespace_nowrap()"));
         assert!(renderer.contains(".child(\"…\")"));
         assert!(renderer.contains("Tooltip::new(tooltip.clone())"));
-        assert!(renderer.contains(".child(label.clone())"));
-        assert!(!renderer.contains("label.chars()"));
+        assert!(renderer.contains("let visible_span"));
+        assert!(renderer.contains("let scan_position"));
+        assert!(renderer.contains(".children("));
+        assert!(renderer.contains("label.chars().enumerate().map("));
+        assert!(renderer.contains(".flex_none()"));
+        assert!(renderer.contains(".text_color("));
+        assert!(renderer.contains("Hsla {"));
     }
 
     #[test]
