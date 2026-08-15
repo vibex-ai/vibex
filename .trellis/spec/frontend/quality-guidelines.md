@@ -74,6 +74,7 @@ Add tests or story coverage for:
 
 ```text
 cargo check -p vibex-mobile --locked
+cargo ndk -t arm64-v8a check -p vibex-mobile --locked
 cargo test -p vibex-mobile --locked
 node scripts/check-mobile-native.mjs
 node scripts/check-mobile-native.mjs --self-test
@@ -124,6 +125,21 @@ pnpm build:mobile:ios
   threshold, cancels clearly vertical pans, then snaps by final direction or
   half-width with a faster close animation. A tap remains a tap and must not
   steal vertical timeline scrolling.
+- Native touch scrolling is a platform contract, not a view-level acceleration
+  workaround. Android and iOS emit the full per-event finger translation, use a
+  bounded recent velocity window, and continue a moving release with time-based
+  deceleration. A stationary hold suppresses momentum and a new touch stops any
+  active deceleration immediately.
+- A variable-height mobile timeline gives every unmeasured Turn a non-zero
+  initial height hint. The first frame must expose the complete estimated scroll
+  extent before off-screen Turns are measured; intrinsic measurements replace
+  hints as rows render. Virtualizing the rows without this initial extent is not
+  sufficient because the first upward gesture can otherwise be clamped to the
+  small measured tail.
+- The drawer and timeline own independent persistent scroll handles. A wheel or
+  touch-pan routed inside the open drawer is consumed there so the timeline does
+  not move behind it; this event isolation is separate from platform drag and
+  momentum fidelity, and both behaviors must be verified.
 - A mobile client can create a session through the shared typed backend using
   an available runtime and desktop-owned workspace. Pending ACP elicitation
   forms render as explicit text/number/boolean/single/multi controls and resolve
@@ -146,10 +162,25 @@ pnpm build:mobile:ios
 | Android input is focused | `dumpsys input_method` identifies the bridge editor as `mServedView`, reports a non-null `mServedInputConnection`, and exposes text input rather than the DecorView fallback. |
 | Placeholder is clicked while its document is empty | Resolve the selection to document offset zero; never slice with the shaped placeholder's byte offset. |
 | Android Activity is recreated while its process survives | Replace the platform Activity handle, discard stale IME events, and start normally without a one-shot initialization panic. |
+| A moving Android touch receives `ACTION_UP` | Apply the final pointer delta, end the direct pan, then continue with bounded time-based momentum from Android's monotonic event timestamps. |
+| A touch is held still before release or a new touch begins during momentum | Do not fling after the hold; cancel existing momentum immediately when the new touch lands. |
+| A variable-height timeline opens at the bottom before off-screen Turns are measured | Its estimated maximum offset already covers every Turn, so the first upward gesture is not clamped to the measured tail. |
+| The session drawer is open and receives a vertical scroll | Move only the drawer's list; the timeline offset remains unchanged. |
 | Approval or composer action is unavailable while the server is busy | The control is disabled with an explicit busy state; no duplicate mutation is sent. |
 | Timeline generation/sequence is stale | Ignore the result and request authoritative refresh. |
 
-### 5. Tests Required
+### 5. Good/Base/Bad Cases
+
+- Good: a quick flick follows the finger one-for-one, preserves the final release
+  delta, and decelerates smoothly while the same drawer or timeline remains the
+  scroll target.
+- Base: a slow drag remains linear and stops on release; a hold does not reuse an
+  older movement sample to create a fling.
+- Bad: the platform emits only raw move deltas with no momentum, the view scales
+  those deltas to compensate, or unmeasured virtual Turns contribute zero height
+  to the first-frame scroll range.
+
+### 6. Tests Required
 
 - `cargo test -p vibex-mobile --locked` covers storage permissions/atomicity and
   malformed-file removal, secret-redacted `Debug`, UTF-8/UTF-16 IME editing,
@@ -160,6 +191,11 @@ pnpm build:mobile:ios
 - `node scripts/check-mobile-native.mjs --self-test` covers the negative source
   contract, native entry points, vendored platform dependencies, GUI session
   markers, and forbidden legacy paths.
+- Android-target compilation must include `gpui_android`; a host-only mobile
+  check cannot validate code behind `cfg(target_os = "android")`. Platform unit
+  tests assert event-time velocity, fling bounds, and frame-rate-independent
+  momentum decay. Mobile GPUI tests assert a non-zero first-frame timeline
+  extent and drawer/timeline scroll isolation.
 - Android and iOS device validation must separately exercise touch/keyboard,
   drawer navigation, safe-area/IME changes, timeline streaming, approval and
   elicitation resolution, new-session creation, send/stop/continue, reconnect,
@@ -168,13 +204,19 @@ pnpm build:mobile:ios
   perform insert/delete/cursor/insert editing, and recreate the Activity at least
   twice in the same process while checking native and Java crash logs.
 
-### 6. Wrong vs Correct
+### 7. Wrong vs Correct
 
 ```text
 Wrong: copy a terminal screen into mobile, keep a second session reducer, or
        load a remote page at runtime.
 Correct: native GPUI -> shared AgentWorkflowController -> authoritative desktop
          timeline -> compact GUI cards and composer.
+
+Wrong: stop drawer event propagation and call the scrolling issue fixed while
+       Android still ends every pan at `ACTION_UP` and unmeasured Turns have no
+       scroll extent.
+Correct: isolate each scroll surface, preserve direct finger deltas, implement
+         platform momentum, and seed virtual Turn heights before first paint.
 ```
 
 ## Scenario: Native Mobile QR Pairing Entry

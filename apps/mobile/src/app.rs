@@ -38,6 +38,17 @@ use crate::storage::CredentialStorage;
 use crate::{markdown, scanner, theme};
 
 const TIMELINE_NEAR_BOTTOM_PX: f32 = 96.0;
+const TIMELINE_LIST_OVERDRAW_PX: f32 = 800.0;
+const TIMELINE_TURN_ESTIMATED_HEIGHT_PX: f32 = 180.0;
+
+fn timeline_list_state(turn_count: usize) -> ListState {
+    ListState::new(
+        turn_count,
+        ListAlignment::Top,
+        px(TIMELINE_LIST_OVERDRAW_PX),
+    )
+    .with_uniform_item_height(px(TIMELINE_TURN_ESTIMATED_HEIGHT_PX))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RootMode {
@@ -137,7 +148,7 @@ impl MobileApp {
             controller: None,
             composer_input: cx.new(|cx| TextInput::new("Message Vibex", cx)),
             timeline_turns: Arc::new(Vec::new()),
-            timeline_list: ListState::new(0, ListAlignment::Top, px(800.0)),
+            timeline_list: timeline_list_state(0),
             drawer_scroll: UniformListScrollHandle::new(),
             drawer_open: false,
             drawer_offset: 0.0,
@@ -1075,11 +1086,11 @@ impl MobileApp {
         if current_count == turn_count {
             return;
         }
-        if current_count < turn_count {
+        if current_count == 0 || current_count > turn_count {
+            self.timeline_list = timeline_list_state(turn_count);
+        } else {
             self.timeline_list
                 .splice(current_count..current_count, turn_count - current_count);
-        } else {
-            self.timeline_list.reset(turn_count);
         }
     }
 
@@ -3012,6 +3023,17 @@ mod tests {
         assert_eq!(timeline_distance_to_bottom(-500.0, 500.0), 0.0);
         assert_eq!(timeline_distance_to_bottom(-450.0, 500.0), 50.0);
         assert_eq!(timeline_distance_to_bottom(-100.0, 500.0), 400.0);
+    }
+
+    #[test]
+    fn timeline_list_has_a_scroll_extent_before_offscreen_turns_are_measured() {
+        let state = timeline_list_state(10);
+
+        assert_eq!(state.item_count(), 10);
+        assert_eq!(
+            state.max_offset_for_scrollbar().y,
+            px(10.0 * TIMELINE_TURN_ESTIMATED_HEIGHT_PX)
+        );
     }
 
     #[test]

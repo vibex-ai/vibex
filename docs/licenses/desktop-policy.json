@@ -261,7 +261,7 @@
         ".png"
       ],
       "expectedFileCount": 19,
-      "treeSha256": "aec7f4cb3cd3714a8997b2d812ac20a270bca28b0f0eefba792cde987e8dc1d7",
+      "treeSha256": "b690a33c976cf781364eabd7d3a7d8e376164d4616a1a0f435c8a56e2687cee5",
       "licenseExpression": "AGPL-3.0-or-later",
       "source": "https://github.com/vibex-ai/vibex/tree/main/apps/mobile/ios/Vibex/Assets.xcassets/AppIcon.appiconset"
     },
