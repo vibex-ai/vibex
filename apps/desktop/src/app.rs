@@ -3442,6 +3442,7 @@ pub struct VibexWorkbench {
     runtime_selection: Option<AgentSessionRuntimeSelectionState>,
     optimistic_runtime_selections: BTreeMap<String, SessionRuntimeSelection>,
     runtime_selection_requests_in_flight: BTreeSet<String>,
+    runtime_selection_cancellations_in_flight: BTreeSet<String>,
     runtime_preference_write_fence: RuntimePreferenceWriteFence,
     token_usage: Option<AgentTokenUsage>,
     composer_runtime_menu_open: bool,
@@ -4017,6 +4018,7 @@ impl VibexWorkbench {
             runtime_selection: None,
             optimistic_runtime_selections: BTreeMap::new(),
             runtime_selection_requests_in_flight: BTreeSet::new(),
+            runtime_selection_cancellations_in_flight: BTreeSet::new(),
             runtime_preference_write_fence: RuntimePreferenceWriteFence::default(),
             token_usage: None,
             composer_runtime_menu_open: false,
@@ -6428,6 +6430,13 @@ impl VibexWorkbench {
                     .as_ref()
                     .map(|state| state.desired.clone())
             })
+    }
+
+    fn active_runtime_controls_pending(&self) -> bool {
+        runtime_selection_cancellation_is_pending(
+            self.selected_session_id.as_ref(),
+            &self.runtime_selection_cancellations_in_flight,
+        )
     }
 
     fn install_optimistic_user_message(&mut self, message: OptimisticUserMessage) {
@@ -12138,7 +12147,11 @@ impl VibexWorkbench {
         value: String,
         cx: &mut Context<Self>,
     ) {
-        if self.agent_action_pending && matches!(target, RuntimeFeatureTarget::NewSession) {
+        let blocked = match target {
+            RuntimeFeatureTarget::NewSession => self.agent_action_pending,
+            RuntimeFeatureTarget::ActiveSession => self.active_runtime_controls_pending(),
+        };
+        if blocked {
             return;
         }
         let selection = match target {
@@ -12178,7 +12191,11 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if window.has_active_dialog(cx) || self.agent_action_pending {
+        let blocked = match target {
+            RuntimeFeatureTarget::NewSession => self.agent_action_pending,
+            RuntimeFeatureTarget::ActiveSession => self.active_runtime_controls_pending(),
+        };
+        if window.has_active_dialog(cx) || blocked {
             return;
         }
         let initial = feature
@@ -12776,6 +12793,9 @@ impl VibexWorkbench {
         selection: SessionRuntimeSelection,
         cx: &mut Context<Self>,
     ) {
+        if self.active_runtime_controls_pending() {
+            return;
+        }
         self.composer_runtime_menu_open = false;
         self.runtime_choice_menu_open = None;
         self.composer_runtime_menu_agent_id = None;
@@ -12784,7 +12804,7 @@ impl VibexWorkbench {
     }
 
     fn set_composer_runtime_menu_open(&mut self, open: bool, cx: &mut Context<Self>) {
-        let open = open && !self.agent_action_pending;
+        let open = open && !self.active_runtime_controls_pending();
         self.composer_runtime_menu_open = open;
         if open {
             self.runtime_choice_menu_open = None;
@@ -12845,7 +12865,12 @@ impl VibexWorkbench {
         open: bool,
         cx: &mut Context<Self>,
     ) {
-        let open = open && !self.agent_action_pending;
+        let blocked = if menu_id.starts_with("new-session-") {
+            self.agent_action_pending
+        } else {
+            self.active_runtime_controls_pending()
+        };
+        let open = open && !blocked;
         if open {
             self.new_session_runtime_menu_open = false;
             self.composer_runtime_menu_open = false;
@@ -13165,9 +13190,6 @@ impl VibexWorkbench {
     }
 
     fn cancel_runtime_switch(&mut self, cx: &mut Context<Self>) {
-        if self.agent_action_pending {
-            return;
-        }
         let (Some(runtime), Some(session_id), Some(switch_id)) = (
             self.runtime.clone(),
             self.selected_session_id.clone(),
@@ -13177,9 +13199,17 @@ impl VibexWorkbench {
         ) else {
             return;
         };
+        let session_key = session_id.as_str().to_string();
+        if self
+            .runtime_selection_cancellations_in_flight
+            .contains(&session_key)
+        {
+            return;
+        }
         self.optimistic_runtime_selections
             .remove(session_id.as_str());
-        self.agent_action_pending = true;
+        self.runtime_selection_cancellations_in_flight
+            .insert(session_key.clone());
         let generation = self.session_generation;
         let requested_session_id = session_id.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
@@ -13192,29 +13222,31 @@ impl VibexWorkbench {
                 })
                 .await
         });
-        self.agent_action_task = Some(cx.spawn(
+        cx.spawn(
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let outcome = runner.await;
                 let _ = entity.update(cx, |this, cx| {
-                    if this.session_generation != generation {
-                        return;
-                    }
-                    this.agent_action_pending = false;
+                    this.runtime_selection_cancellations_in_flight
+                        .remove(&session_key);
+                    let active = this.session_generation == generation
+                        && this.selected_session_id.as_ref() == Some(&requested_session_id);
                     match outcome {
                         Ok(Ok(state)) => {
                             this.apply_runtime_selection_state(&requested_session_id, state, cx);
                         }
-                        Ok(Err(error)) => {
+                        Ok(Err(error)) if active => {
                             this.agent_error = Some(format!("{}: {}", error.code, error.message));
                         }
-                        Err(error) => {
+                        Err(error) if active => {
                             this.agent_error = Some(format!("runtime cancel failed: {error}"));
                         }
+                        Ok(Err(_)) | Err(_) => {}
                     }
                     cx.notify();
                 });
             },
-        ));
+        )
+        .detach();
     }
 
     fn begin_sidebar_rename(
@@ -17394,6 +17426,10 @@ impl VibexWorkbench {
         compact: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let controls_pending = match target {
+            RuntimeFeatureTarget::NewSession => self.agent_action_pending,
+            RuntimeFeatureTarget::ActiveSession => self.active_runtime_controls_pending(),
+        };
         let current = feature.value_for(&selection.config_values);
         let current_value = current
             .as_ref()
@@ -17441,7 +17477,7 @@ impl VibexWorkbench {
                         )))
                         .small()
                         .checked(checked)
-                        .disabled(self.agent_action_pending)
+                        .disabled(controls_pending)
                         .tooltip(tooltip)
                         .on_click(cx.listener(
                             move |this, enabled: &bool, _, cx| {
@@ -17493,7 +17529,7 @@ impl VibexWorkbench {
                         .when(!compact, |button| button.px_2())
                         .tooltip(tooltip)
                         .child(content)
-                        .disabled(values_empty || self.agent_action_pending);
+                        .disabled(values_empty || controls_pending);
                 let items = values
                     .into_iter()
                     .map(|value| RuntimeChoiceMenuItem {
@@ -17552,7 +17588,7 @@ impl VibexWorkbench {
                     .when(!compact, |button| button.w(px(112.0)).px_2())
                     .tooltip(tooltip)
                     .child(content)
-                    .disabled(self.agent_action_pending)
+                    .disabled(controls_pending)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.prompt_runtime_feature_value(target, feature.clone(), window, cx)
                     }))
@@ -20385,7 +20421,7 @@ impl VibexWorkbench {
                                 .xsmall()
                                 .ghost()
                                 .label(strings.sidebar_cancel)
-                                .disabled(self.agent_action_pending)
+                                .disabled(self.active_runtime_controls_pending())
                                 .on_click(
                                     cx.listener(|this, _, _, cx| this.cancel_runtime_switch(cx)),
                                 ),
@@ -20397,7 +20433,7 @@ impl VibexWorkbench {
                                 .xsmall()
                                 .outline()
                                 .label(strings.retry)
-                                .disabled(self.agent_action_pending)
+                                .disabled(self.active_runtime_controls_pending())
                                 .on_click(
                                     cx.listener(|this, _, _, cx| this.retry_runtime_selection(cx)),
                                 ),
@@ -20407,7 +20443,7 @@ impl VibexWorkbench {
                                 .xsmall()
                                 .ghost()
                                 .label(strings.runtime_use_current)
-                                .disabled(self.agent_action_pending || !can_reset)
+                                .disabled(self.active_runtime_controls_pending() || !can_reset)
                                 .on_click(
                                     cx.listener(|this, _, _, cx| this.reset_runtime_selection(cx)),
                                 ),
@@ -20439,6 +20475,7 @@ impl VibexWorkbench {
         let menu_max_height = (self.last_visibility.layout.viewport_height as f32 - 128.0)
             .clamp(160.0, COMPOSER_RUNTIME_MENU_MAX_HEIGHT);
         let choices_empty = choices.is_empty();
+        let controls_pending = self.active_runtime_controls_pending();
         let trigger = Button::new(format!("composer-runtime-{id}"))
             .xsmall()
             .ghost()
@@ -20447,7 +20484,7 @@ impl VibexWorkbench {
             .when(!compact, |button| button.px_2())
             .tooltip(tooltip)
             .child(content)
-            .disabled(choices_empty || self.agent_action_pending);
+            .disabled(choices_empty || controls_pending);
         let items = choices
             .into_iter()
             .map(|choice| RuntimeChoiceMenuItem {
@@ -20534,7 +20571,7 @@ impl VibexWorkbench {
             .when(!compact, |button| button.px_2())
             .tooltip(tooltip)
             .child(tracked_content)
-            .disabled(self.agent_action_pending);
+            .disabled(self.active_runtime_controls_pending());
 
         let menu_agent_id = self
             .composer_runtime_menu_agent_id
@@ -28984,6 +29021,13 @@ fn sidebar_selection_indicator(state: SidebarSelectionState, cx: &App) -> AnyEle
             )
         })
         .into_any_element()
+}
+
+fn runtime_selection_cancellation_is_pending(
+    selected_session_id: Option<&VibexSessionId>,
+    pending_session_ids: &BTreeSet<String>,
+) -> bool {
+    selected_session_id.is_some_and(|session_id| pending_session_ids.contains(session_id.as_str()))
 }
 
 fn catalog_has_runtime_selection(
@@ -39363,6 +39407,39 @@ mod tests {
         assert!(!runtime_switch.contains("agent_turn_pending"));
         assert!(runtime_switch.contains("self.optimistic_runtime_selections"));
         assert!(runtime_switch.contains("request_pending_runtime_selection"));
+    }
+
+    #[test]
+    fn runtime_cancellation_blocks_only_its_own_session_controls() {
+        let first = VibexSessionId::parse("session_first").unwrap();
+        let second = VibexSessionId::parse("session_second").unwrap();
+        let pending = BTreeSet::from([first.as_str().to_string()]);
+
+        assert!(runtime_selection_cancellation_is_pending(
+            Some(&first),
+            &pending
+        ));
+        assert!(!runtime_selection_cancellation_is_pending(
+            Some(&second),
+            &pending
+        ));
+        assert!(!runtime_selection_cancellation_is_pending(None, &pending));
+
+        let source = include_str!("app.rs");
+        let cancel = source
+            .split_once("    fn cancel_runtime_switch(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn begin_sidebar_rename("))
+            .map(|(body, _)| body)
+            .expect("runtime cancellation should remain inspectable");
+        assert!(!cancel.contains("self.agent_action_pending"));
+        assert!(!cancel.contains("this.agent_action_pending"));
+        let release = cancel
+            .find("this.runtime_selection_cancellations_in_flight")
+            .expect("the per-session cancellation lock should be released");
+        let active_fence = cancel
+            .find("let active = this.session_generation == generation")
+            .expect("results should remain fenced to the active session");
+        assert!(release < active_fence);
     }
 
     #[test]
