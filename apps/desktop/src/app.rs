@@ -31559,7 +31559,7 @@ impl Render for SettingsDialogTitle {
                         .ghost()
                         .icon(IconName::Undo2)
                         .absolute()
-                        .top(px(-2.0))
+                        .top(px(-8.0))
                         .right(px(24.0))
                         .tooltip(strings.undo_changes)
                         .on_click(move |_, window, cx| {
@@ -40659,6 +40659,7 @@ mod tests {
         assert!(title.contains("has_changes"));
         assert!(title.contains("undo-settings-changes"));
         assert!(title.contains(".absolute()"));
+        assert!(title.contains(".top(px(-8.0))"));
         assert!(title.contains(".right(px(24.0))"));
         assert!(!title.contains("settings_description"));
         assert!(!title.contains("request_restore_defaults"));
