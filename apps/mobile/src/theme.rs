@@ -64,6 +64,9 @@ pub const RADIUS_CARD: f32 = 8.0;
 pub const RADIUS_CONTROL: f32 = 6.0;
 
 pub const DRAWER_WIDTH: f32 = 295.0;
+pub const DRAWER_ROW_HEIGHT: f32 = 52.0;
+pub const DRAWER_ACTION_HEIGHT: f32 = 40.0;
+pub const DRAWER_SECTION_HEIGHT: f32 = 32.0;
 /// Android reserves more of the left edge for its own back gesture, so the
 /// drawer needs a wider catch zone there to stay reachable.
 pub const DRAWER_EDGE_ZONE: f32 = if cfg!(target_os = "android") {

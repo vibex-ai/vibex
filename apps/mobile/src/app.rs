@@ -7,9 +7,10 @@ use futures_channel::mpsc;
 use futures_util::StreamExt as _;
 use gpui::{
     Animation, AnimationExt as _, App, AppContext as _, Context, ElementId, Entity, FontWeight,
-    IntoElement, KeyBinding, MouseButton, MouseUpEvent, ParentElement as _, Render, ScrollDelta,
-    ScrollHandle, ScrollWheelEvent, Styled as _, Task, TouchPhase, WeakEntity, Window, div,
-    ease_in_out, ease_out_quint, prelude::*, px, rgb, svg,
+    IntoElement, KeyBinding, ListAlignment, ListState, MouseButton, MouseUpEvent,
+    ParentElement as _, Render, ScrollDelta, ScrollWheelEvent, Styled as _, Task, TouchPhase,
+    UniformListScrollHandle, WeakEntity, Window, div, ease_in_out, ease_out_quint, list,
+    prelude::*, px, rgb, svg, uniform_list,
 };
 use vibex_backend::{
     AgentBackend as _, BackendError, BackendEvent, BackendResult, MutationRequest,
@@ -97,8 +98,9 @@ pub struct MobileApp {
     backend: Option<Arc<WebRemoteBackend>>,
     controller: Option<AgentWorkflowController>,
     composer_input: Entity<TextInput>,
-    timeline_scroll: ScrollHandle,
-    drawer_scroll: ScrollHandle,
+    timeline_turns: Arc<Vec<TimelineConversationTurn>>,
+    timeline_list: ListState,
+    drawer_scroll: UniformListScrollHandle,
     drawer_open: bool,
     drawer_offset: f32,
     drawer_gesture: Option<DrawerGesture>,
@@ -134,8 +136,9 @@ impl MobileApp {
             backend: None,
             controller: None,
             composer_input: cx.new(|cx| TextInput::new("Message Vibex", cx)),
-            timeline_scroll: ScrollHandle::new(),
-            drawer_scroll: ScrollHandle::new(),
+            timeline_turns: Arc::new(Vec::new()),
+            timeline_list: ListState::new(0, ListAlignment::Top, px(800.0)),
+            drawer_scroll: UniformListScrollHandle::new(),
             drawer_open: false,
             drawer_offset: 0.0,
             drawer_gesture: None,
@@ -293,8 +296,14 @@ impl MobileApp {
                         match decision {
                             Some(AgentEventDecision::Applied) => {
                                 this.notice = None;
+                                this.rebuild_timeline_turns();
+                                let turn_count = this.timeline_turns.len();
+                                if turn_count > 0 {
+                                    this.timeline_list
+                                        .remeasure_items(turn_count - 1..turn_count);
+                                }
                                 if should_follow {
-                                    this.timeline_scroll.scroll_to_bottom();
+                                    this.timeline_list.scroll_to_end();
                                 }
                             }
                             Some(AgentEventDecision::Disconnected) => {
@@ -538,14 +547,16 @@ impl MobileApp {
         self.drawer_snap_task = None;
         self.expanded_process.clear();
         self.expanded_approval.clear();
-        self.timeline_scroll = ScrollHandle::new();
+        self.timeline_turns = Arc::new(Vec::new());
+        self.timeline_list.reset(0);
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
             let _ = entity.update(cx, |this, cx| {
                 if let Some(controller) = this.controller.as_mut()
                     && controller.apply_session_snapshot(&ticket, outcome)
                 {
-                    this.timeline_scroll.scroll_to_bottom();
+                    this.rebuild_timeline_turns();
+                    this.timeline_list.scroll_to_end();
                 }
                 cx.notify();
             });
@@ -575,14 +586,18 @@ impl MobileApp {
             }
         };
         let runner = gpui_tokio::Tokio::spawn(cx, controller.load_session(ticket.clone()));
+        self.timeline_turns = Arc::new(Vec::new());
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
             let _ = entity.update(cx, |this, cx| {
                 if let Some(controller) = this.controller.as_mut()
                     && controller.apply_session_snapshot(&ticket, outcome)
-                    && should_follow
                 {
-                    this.timeline_scroll.scroll_to_bottom();
+                    this.rebuild_timeline_turns();
+                    this.timeline_list.remeasure();
+                    if should_follow {
+                        this.timeline_list.scroll_to_end();
+                    }
                 }
                 cx.notify();
             });
@@ -672,7 +687,8 @@ impl MobileApp {
         cx: &mut Context<Self>,
     ) {
         self.operation_busy = true;
-        self.timeline_scroll.scroll_to_bottom();
+        self.rebuild_timeline_turns();
+        self.timeline_list.scroll_to_end();
         let runner = gpui_tokio::Tokio::spawn(cx, future);
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
@@ -683,6 +699,7 @@ impl MobileApp {
                     controller.apply_timeline_mutation(&ticket, outcome);
                     this.error = controller.state.latest_mutation.error.clone();
                 }
+                this.rebuild_timeline_turns();
                 if failed
                     && let Some(text) = restore_composer
                     && this.composer_input.read(cx).text().is_empty()
@@ -788,6 +805,7 @@ impl MobileApp {
                     controller.apply_permission_mutation(&ticket, &request_id_string, outcome);
                     this.error = controller.state.latest_mutation.error.clone();
                 }
+                this.rebuild_timeline_turns();
                 cx.notify();
             });
         });
@@ -952,6 +970,7 @@ impl MobileApp {
                     controller.apply_elicitation_mutation(&ticket, &request_id_string, outcome);
                     this.error = controller.state.latest_mutation.error.clone();
                 }
+                this.rebuild_timeline_turns();
                 cx.notify();
             });
         });
@@ -1046,9 +1065,32 @@ impl MobileApp {
 
     fn timeline_is_near_bottom(&self) -> bool {
         timeline_distance_to_bottom(
-            f32::from(self.timeline_scroll.offset().y),
-            f32::from(self.timeline_scroll.max_offset().y),
+            f32::from(self.timeline_list.scroll_px_offset_for_scrollbar().y),
+            f32::from(self.timeline_list.max_offset_for_scrollbar().y),
         ) <= TIMELINE_NEAR_BOTTOM_PX
+    }
+
+    fn sync_timeline_list(&mut self, turn_count: usize) {
+        let current_count = self.timeline_list.item_count();
+        if current_count == turn_count {
+            return;
+        }
+        if current_count < turn_count {
+            self.timeline_list
+                .splice(current_count..current_count, turn_count - current_count);
+        } else {
+            self.timeline_list.reset(turn_count);
+        }
+    }
+
+    fn rebuild_timeline_turns(&mut self) {
+        let turns = self
+            .controller
+            .as_ref()
+            .map(|controller| controller.state.conversation_turns())
+            .unwrap_or_default();
+        self.sync_timeline_list(turns.len());
+        self.timeline_turns = Arc::new(turns);
     }
 
     fn refresh(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -1071,6 +1113,8 @@ impl MobileApp {
         let _ = self.storage.clear();
         self.controller = None;
         self.mode = RootMode::Pairing;
+        self.timeline_turns = Arc::new(Vec::new());
+        self.timeline_list.reset(0);
         self.drawer_open = false;
         self.drawer_offset = 0.0;
         self.drawer_gesture = None;
@@ -1143,6 +1187,17 @@ impl MobileApp {
                 }
             }
         }
+    }
+
+    /// The GPUI scroll element updates its handle before bubble listeners run.
+    /// Consume the event here so the overlaid timeline cannot scroll in parallel.
+    fn consume_drawer_scroll(
+        &mut self,
+        _: &ScrollWheelEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
     }
 
     fn advance_drawer_pan(
@@ -1381,32 +1436,38 @@ impl MobileApp {
             )
     }
 
-    fn render_workspace(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let controller = self.controller.as_ref();
-        let title = controller
+    fn render_workspace(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let title = self
+            .controller
+            .as_ref()
             .and_then(|controller| controller.state.active_session.value.as_ref())
-            .map(|session| session.title.as_str())
-            .unwrap_or("Vibex");
-        let state = controller
+            .map(|session| session.title.clone())
+            .unwrap_or_else(|| "Vibex".to_string());
+        let state = self
+            .controller
+            .as_ref()
             .and_then(|controller| controller.state.active_session.value.as_ref())
             .map(|session| session.state);
         let running = state == Some(AgentSessionState::Running);
-        let timeline_loading = controller.is_some_and(|controller| {
+        let timeline_loading = self.controller.as_ref().is_some_and(|controller| {
             controller.state.timeline_status.phase == AsyncPhase::Loading
         });
-        let turns = controller
-            .map(|controller| controller.state.conversation_turns())
-            .unwrap_or_default();
-        let approvals = controller
+        let turns = self.timeline_turns.clone();
+        let approvals = self
+            .controller
+            .as_ref()
             .map(|controller| controller.state.approval_surfaces(ShellKind::Compact))
             .unwrap_or_default();
-        let elicitations = controller
+        let elicitations = self
+            .controller
+            .as_ref()
             .map(|controller| controller.state.elicitation_surfaces(ShellKind::Compact))
             .unwrap_or_default();
-        let turn_elements = turns
-            .iter()
-            .map(|turn| self.render_turn(turn, cx).into_any_element())
-            .collect::<Vec<_>>();
+        let no_selected_session = self
+            .controller
+            .as_ref()
+            .is_some_and(|controller| controller.state.selected_session_id.is_none());
+        let turns_for_list = turns.clone();
         let show_drawer = self.drawer_offset > 0.0 || self.drawer_snap.is_some();
 
         div()
@@ -1418,19 +1479,15 @@ impl MobileApp {
                     .size_full()
                     .flex()
                     .flex_col()
-                    .child(self.render_header(title, state, cx))
+                    .child(self.render_header(&title, state, cx))
                     .child(
                         div()
                             .flex_1()
                             .min_h_0()
-                            .id("timeline-scroll")
-                            .overflow_y_scroll()
-                            .track_scroll(&self.timeline_scroll)
                             .px_4()
                             .py_4()
                             .flex()
                             .flex_col()
-                            .gap_5()
                             .when(timeline_loading && turns.is_empty(), |timeline| {
                                 timeline.child(
                                     div()
@@ -1453,35 +1510,50 @@ impl MobileApp {
                                         .text_color(theme::text_muted())
                                         .text_center()
                                         .child("No messages yet")
-                                        .when(
-                                            controller.is_some_and(|controller| {
-                                                controller.state.selected_session_id.is_none()
-                                            }),
-                                            |empty| {
-                                                empty.child(
-                                                    div()
-                                                        .id("create-first-session")
-                                                        .h(px(theme::TOUCH_TARGET))
-                                                        .px_4()
-                                                        .rounded(px(theme::RADIUS_CONTROL))
-                                                        .border_1()
-                                                        .border_color(theme::border_default())
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_center()
-                                                        .text_color(theme::text_secondary())
-                                                        .cursor_pointer()
-                                                        .on_mouse_up(
-                                                            MouseButton::Left,
-                                                            cx.listener(Self::create_session),
-                                                        )
-                                                        .child("New session"),
-                                                )
-                                            },
-                                        ),
+                                        .when(no_selected_session, |empty| {
+                                            empty.child(
+                                                div()
+                                                    .id("create-first-session")
+                                                    .h(px(theme::TOUCH_TARGET))
+                                                    .px_4()
+                                                    .rounded(px(theme::RADIUS_CONTROL))
+                                                    .border_1()
+                                                    .border_color(theme::border_default())
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .text_color(theme::text_secondary())
+                                                    .cursor_pointer()
+                                                    .on_mouse_up(
+                                                        MouseButton::Left,
+                                                        cx.listener(Self::create_session),
+                                                    )
+                                                    .child("New session"),
+                                            )
+                                        }),
                                 )
                             })
-                            .children(turn_elements),
+                            .when(!turns.is_empty(), |timeline| {
+                                timeline.child(
+                                    list(
+                                        self.timeline_list.clone(),
+                                        cx.processor(move |this, index, _window, cx| {
+                                            turns_for_list
+                                                .get(index)
+                                                .map(|turn| {
+                                                    div()
+                                                        .pb(px(theme::SPACING_XL))
+                                                        .child(this.render_turn(turn, cx))
+                                                        .into_any_element()
+                                                })
+                                                .unwrap_or_else(|| div().into_any_element())
+                                        }),
+                                    )
+                                    .w_full()
+                                    .flex_1()
+                                    .min_h_0(),
+                                )
+                            }),
                     )
                     .when_some(self.notice.as_ref(), |workspace, notice| {
                         workspace.child(
@@ -1509,11 +1581,12 @@ impl MobileApp {
                     .id("drawer-backdrop")
                     .absolute()
                     .inset_0()
+                    .occlude()
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(Self::close_drawer_from_backdrop),
                     );
-                let drawer_base = self.render_drawer(cx);
+                let drawer_base = self.render_drawer(cx).occlude();
                 let (backdrop, drawer) = if let Some(snap) = self.drawer_snap {
                     let duration = drawer_animation(snap.from, snap.target);
                     let from_opacity = drawer_backdrop_opacity(snap.from);
@@ -2437,6 +2510,86 @@ impl MobileApp {
             )
     }
 
+    fn render_drawer_session(
+        &self,
+        session: &vibex_core::AgentSession,
+        selected: Option<&VibexSessionId>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let session_id = session.id.clone();
+        let is_selected = selected == Some(&session.id);
+        let status = match session.state {
+            AgentSessionState::Running => theme::ACCENT_GREEN,
+            AgentSessionState::NeedsInput => theme::ACCENT_YELLOW,
+            AgentSessionState::Error => theme::ACCENT_RED,
+            AgentSessionState::Initializing => theme::ACCENT_BLUE,
+            _ => theme::ACCENT_DIM,
+        };
+        let workspace = workspace_label(&session.workspace_root);
+        let age = session_age_label(session.last_message_at_ms);
+
+        div()
+            .id(format!("session:{}", session.id))
+            .mx(px(theme::SPACING_SM))
+            .h(px(theme::DRAWER_ROW_HEIGHT))
+            .min_h(px(theme::DRAWER_ROW_HEIGHT))
+            .rounded(px(theme::RADIUS_CONTROL))
+            .px(px(theme::SPACING_MD))
+            .flex()
+            .items_center()
+            .gap(px(theme::SPACING_MD))
+            .when(is_selected, |row| {
+                row.bg(theme::bg_card())
+                    .border_1()
+                    .border_color(theme::border_default())
+            })
+            .cursor_pointer()
+            .active(|style| style.bg(theme::row_pressed_bg()))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| this.open_session(session_id.clone(), cx)),
+            )
+            .child(
+                div()
+                    .size(px(theme::ICON_STATUS))
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .bg(rgb(status)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(px(theme::FONT_BODY))
+                            .text_color(if is_selected {
+                                theme::text_primary()
+                            } else {
+                                theme::text_secondary()
+                            })
+                            .child(session.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(px(theme::FONT_MICRO))
+                            .text_color(theme::text_muted())
+                            .child(format!("{workspace}  {age}")),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_drawer(&self, cx: &mut Context<Self>) -> gpui::Div {
         let sessions = self
             .controller
@@ -2477,44 +2630,19 @@ impl MobileApp {
                     )
                     .child(
                         div()
+                            .id("close-session-drawer")
+                            .size(px(theme::HEADER_BUTTON_SIZE))
                             .flex()
                             .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .active(|style| style.opacity(0.6))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::close_drawer))
                             .child(
-                                div()
-                                    .id("create-session")
-                                    .size(px(theme::HEADER_BUTTON_SIZE))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .cursor_pointer()
-                                    .active(|style| style.opacity(0.6))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(Self::create_session),
-                                    )
-                                    .child(
-                                        svg()
-                                            .path("icons/plus.svg")
-                                            .size(px(theme::ICON_MD))
-                                            .text_color(theme::text_secondary()),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id("close-session-drawer")
-                                    .size(px(theme::HEADER_BUTTON_SIZE))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .cursor_pointer()
-                                    .active(|style| style.opacity(0.6))
-                                    .on_mouse_up(MouseButton::Left, cx.listener(Self::close_drawer))
-                                    .child(
-                                        svg()
-                                            .path("icons/x.svg")
-                                            .size(px(theme::ICON_SM))
-                                            .text_color(theme::text_muted()),
-                                    ),
+                                svg()
+                                    .path("icons/x.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_muted()),
                             ),
                     ),
             )
@@ -2523,77 +2651,71 @@ impl MobileApp {
                     .flex_1()
                     .min_h_0()
                     .id("drawer-scroll")
-                    .overflow_y_scroll()
-                    .track_scroll(&self.drawer_scroll)
-                    .py(px(theme::SPACING_SM))
                     .flex()
                     .flex_col()
-                    .gap(px(2.0))
-                    .children(sessions.into_iter().map(|session| {
-                        let session_id = session.id.clone();
-                        let is_selected = selected.as_ref() == Some(&session.id);
-                        let status = match session.state {
-                            AgentSessionState::Running => theme::ACCENT_GREEN,
-                            AgentSessionState::Error => theme::ACCENT_RED,
-                            _ => theme::ACCENT_DIM,
-                        };
+                    .child(
                         div()
-                            .id(format!("session:{}", session.id))
+                            .id("create-session")
+                            .flex_shrink_0()
+                            .h(px(theme::DRAWER_ACTION_HEIGHT))
                             .mx(px(theme::SPACING_SM))
-                            .min_h(px(theme::TOUCH_TARGET))
-                            .rounded(px(theme::RADIUS_CONTROL))
+                            .mt(px(theme::SPACING_SM))
                             .px(px(theme::SPACING_MD))
-                            .py(px(theme::SPACING_SM))
+                            .rounded(px(theme::RADIUS_CONTROL))
                             .flex()
                             .items_center()
-                            .gap(px(theme::SPACING_MD))
-                            .when(is_selected, |row| row.bg(theme::bg_card()))
+                            .gap(px(theme::SPACING_SM))
+                            .text_size(px(theme::FONT_BODY))
+                            .text_color(theme::text_secondary())
                             .cursor_pointer()
                             .active(|style| style.bg(theme::row_pressed_bg()))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.open_session(session_id.clone(), cx)
-                                }),
-                            )
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::create_session))
                             .child(
-                                div()
-                                    .size(px(theme::ICON_STATUS))
-                                    .flex_shrink_0()
-                                    .rounded_full()
-                                    .bg(rgb(status)),
+                                svg()
+                                    .path("icons/plus.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_secondary()),
                             )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(2.0))
-                                    .child(
-                                        div()
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .whitespace_nowrap()
-                                            .text_size(px(theme::FONT_BODY))
-                                            .text_color(if is_selected {
-                                                theme::text_primary()
-                                            } else {
-                                                theme::text_secondary()
+                            .child("New session"),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .h(px(theme::DRAWER_SECTION_HEIGHT))
+                            .px(px(theme::SPACING_LG))
+                            .flex()
+                            .items_end()
+                            .text_size(px(theme::FONT_CAPTION))
+                            .text_color(theme::text_muted())
+                            .child("Conversations"),
+                    )
+                    .child(
+                        uniform_list(
+                            "drawer-sessions",
+                            sessions.len(),
+                            cx.processor(
+                                move |this, range: std::ops::Range<usize>, _window, cx| {
+                                    range
+                                        .filter_map(|index| {
+                                            sessions.get(index).map(|session| {
+                                                this.render_drawer_session(
+                                                    session,
+                                                    selected.as_ref(),
+                                                    cx,
+                                                )
                                             })
-                                            .child(session.title),
-                                    )
-                                    .child(
-                                        div()
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .whitespace_nowrap()
-                                            .text_size(px(theme::FONT_CAPTION))
-                                            .text_color(theme::text_muted())
-                                            .child(session.workspace_root),
-                                    ),
-                            )
-                    })),
+                                        })
+                                        .collect::<Vec<_>>()
+                                },
+                            ),
+                        )
+                        .track_scroll(&self.drawer_scroll)
+                        .on_scroll_wheel(cx.listener(Self::consume_drawer_scroll))
+                        .w_full()
+                        .flex_1()
+                        .min_h_0()
+                        .py(px(theme::SPACING_SM)),
+                    ),
             )
             .child(
                 div()
@@ -2702,6 +2824,25 @@ fn drawer_backdrop_opacity(offset: f32) -> f32 {
     (offset / theme::DRAWER_WIDTH).clamp(0.0, 1.0) * theme::DRAWER_BACKDROP_OPACITY
 }
 
+fn workspace_label(root: &str) -> &str {
+    root.rsplit(['/', '\\'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(root)
+}
+
+fn session_age_label(timestamp_ms: i64) -> String {
+    if timestamp_ms <= 0 {
+        return String::new();
+    }
+    let elapsed_seconds = unix_timestamp_ms().saturating_sub(timestamp_ms).max(0) / 1_000;
+    match elapsed_seconds {
+        0..=59 => "now".to_string(),
+        60..=3_599 => format!("{}m", elapsed_seconds / 60),
+        3_600..=86_399 => format!("{}h", elapsed_seconds / 3_600),
+        days => format!("{}d", days / 86_400),
+    }
+}
+
 fn timeline_distance_to_bottom(offset_y: f32, max_offset_y: f32) -> f32 {
     (max_offset_y + offset_y).max(0.0)
 }
@@ -2770,6 +2911,49 @@ fn flatten_join<T>(outcome: Result<BackendResult<T>, gpui_tokio::JoinError>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{TestAppContext, point};
+
+    struct DrawerScrollIsolationProbe {
+        drawer_scroll: UniformListScrollHandle,
+        timeline_scroll: gpui::ScrollHandle,
+    }
+
+    impl Render for DrawerScrollIsolationProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .relative()
+                .w(px(360.0))
+                .h(px(480.0))
+                .id("timeline-scroll-probe")
+                .track_scroll(&self.timeline_scroll)
+                .overflow_y_scroll()
+                .child(div().h(px(1_200.0)).flex_none())
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left_0()
+                        .w(px(theme::DRAWER_WIDTH))
+                        .occlude()
+                        .child(
+                            uniform_list("drawer-scroll-probe", 60, |range, _, _| {
+                                range
+                                    .map(|index| {
+                                        div()
+                                            .h(px(theme::DRAWER_ROW_HEIGHT))
+                                            .flex_none()
+                                            .child(format!("Session {index}"))
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .track_scroll(&self.drawer_scroll)
+                            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                            .size_full(),
+                        ),
+                )
+        }
+    }
 
     #[test]
     fn drawer_pan_waits_until_the_gesture_clears_the_threshold() {
@@ -2828,5 +3012,45 @@ mod tests {
         assert_eq!(timeline_distance_to_bottom(-500.0, 500.0), 0.0);
         assert_eq!(timeline_distance_to_bottom(-450.0, 500.0), 50.0);
         assert_eq!(timeline_distance_to_bottom(-100.0, 500.0), 400.0);
+    }
+
+    #[test]
+    fn drawer_session_metadata_stays_compact_and_readable() {
+        assert_eq!(workspace_label("/work/vibex"), "vibex");
+        assert_eq!(workspace_label("/work/vibex/"), "vibex");
+        assert_eq!(workspace_label("C:\\work\\vibex"), "vibex");
+        assert_eq!(session_age_label(0), "");
+        assert_eq!(session_age_label(unix_timestamp_ms()), "now");
+        assert_eq!(session_age_label(unix_timestamp_ms() - 60_000), "1m");
+    }
+
+    #[gpui::test]
+    fn drawer_scroll_does_not_move_the_timeline_behind_it(cx: &mut TestAppContext) {
+        let drawer_scroll = UniformListScrollHandle::new();
+        let observed_drawer_scroll = drawer_scroll.0.borrow().base_handle.clone();
+        let timeline_scroll = gpui::ScrollHandle::new();
+        let observed_timeline_scroll = timeline_scroll.clone();
+        let (_, cx) = cx.add_window_view(|_, _| DrawerScrollIsolationProbe {
+            drawer_scroll,
+            timeline_scroll,
+        });
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(observed_drawer_scroll.max_offset().y > px(0.0));
+        assert!(observed_timeline_scroll.max_offset().y > px(0.0));
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(40.0), px(120.0)),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-160.0))),
+            modifiers: Default::default(),
+            touch_phase: TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+
+        assert!(observed_drawer_scroll.offset().y < px(0.0));
+        assert_eq!(observed_timeline_scroll.offset().y, px(0.0));
     }
 }

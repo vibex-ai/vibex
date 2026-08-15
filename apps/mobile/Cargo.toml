@@ -33,4 +33,5 @@ jni = "0.22"
 rustls-platform-verifier = "0.7"
 
 [dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
 tempfile = "3"
