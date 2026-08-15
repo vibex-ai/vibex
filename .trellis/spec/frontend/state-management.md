@@ -146,6 +146,19 @@ the measured prefix and continuing tail, that repeated streaming measurements
 are monotonic, and that the final non-streaming measurement can converge
 downward.
 
+### Convention: Existing-session composer drafts
+
+Unsent Composer state is local presentation state scoped by `VibexSessionId`.
+Preserve the text, inline attachments, and selected command entry together: save
+the active draft before changing sessions and restore the target session's draft
+before rendering its Composer. A draft must never migrate into another session.
+
+Remove empty drafts, consume the active draft when it is sent, and delete stored
+drafts with their sessions. Regression coverage must switch between at least two
+sessions with different unsent text, assert that each Composer shows only its own
+draft, and assert that returning to the first session restores its original
+content.
+
 When a new-session draft includes an initial message, await session creation
 only long enough to obtain the authoritative session record. Commit and select
 that session immediately, attach its timeline view, and submit the initial

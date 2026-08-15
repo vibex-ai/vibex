@@ -336,6 +336,31 @@ impl InlineComposerAttachment {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ComposerSessionDraft {
+    text: String,
+    attachments: Vec<InlineComposerAttachment>,
+    command_entry: Option<AgentCommandEntry>,
+}
+
+impl ComposerSessionDraft {
+    fn is_empty(&self) -> bool {
+        self.text.is_empty() && self.attachments.is_empty() && self.command_entry.is_none()
+    }
+}
+
+fn store_composer_session_draft(
+    drafts: &mut BTreeMap<String, ComposerSessionDraft>,
+    session_id: &VibexSessionId,
+    draft: ComposerSessionDraft,
+) {
+    if draft.is_empty() {
+        drafts.remove(session_id.as_str());
+    } else {
+        drafts.insert(session_id.as_str().to_string(), draft);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InlineAttachmentEdit {
     Backspace,
@@ -3363,6 +3388,9 @@ pub struct VibexWorkbench {
     user_message_edit_input: Entity<InputState>,
     composer_queue_edit_input: Entity<InputState>,
     composer_input: Entity<InputState>,
+    composer_input_session_id: Option<VibexSessionId>,
+    composer_input_syncing: bool,
+    composer_session_drafts: BTreeMap<String, ComposerSessionDraft>,
     new_session_input: Entity<InputState>,
     new_session_worktree_name_input: Entity<InputState>,
     new_session_worktree_path_input: Entity<InputState>,
@@ -3716,6 +3744,9 @@ impl VibexWorkbench {
                 window,
                 |this, _, event, window, cx| match event {
                     InputEvent::Change => {
+                        if this.composer_input_syncing {
+                            return;
+                        }
                         this.sync_inline_composer_attachments(false, cx);
                         this.sync_composer_command_entry(ComposerTarget::Session, cx);
                         this.refresh_suggestions(ComposerTarget::Session, window, cx);
@@ -3939,6 +3970,9 @@ impl VibexWorkbench {
             user_message_edit_input,
             composer_queue_edit_input,
             composer_input,
+            composer_input_session_id: selected_session_id.clone(),
+            composer_input_syncing: false,
+            composer_session_drafts: BTreeMap::new(),
             new_session_input,
             new_session_worktree_name_input,
             new_session_worktree_path_input,
@@ -6351,6 +6385,44 @@ impl VibexWorkbench {
         self.store_agent_session_view(session_id, entry);
     }
 
+    fn stash_current_composer_draft(&mut self, cx: &App) {
+        let Some(session_id) = self.composer_input_session_id.as_ref() else {
+            return;
+        };
+        if !self
+            .sessions
+            .iter()
+            .any(|session| session.id == *session_id)
+        {
+            self.composer_session_drafts.remove(session_id.as_str());
+            return;
+        }
+        let draft = ComposerSessionDraft {
+            text: self.composer_input.read(cx).value().to_string(),
+            attachments: self.composer_attachments.clone(),
+            command_entry: self.composer_command_entry.clone(),
+        };
+        store_composer_session_draft(&mut self.composer_session_drafts, session_id, draft);
+    }
+
+    fn sync_selected_composer_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composer_input_session_id == self.selected_session_id {
+            return;
+        }
+        let draft = self
+            .selected_session_id
+            .as_ref()
+            .and_then(|session_id| self.composer_session_drafts.remove(session_id.as_str()))
+            .unwrap_or_default();
+        self.composer_input_session_id = self.selected_session_id.clone();
+        self.composer_attachments = draft.attachments;
+        self.composer_command_entry = draft.command_entry;
+        self.composer_input_syncing = true;
+        self.composer_input
+            .update(cx, |input, cx| input.set_value(draft.text, window, cx));
+        self.composer_input_syncing = false;
+    }
+
     fn store_agent_session_view(
         &mut self,
         session_id: VibexSessionId,
@@ -6827,6 +6899,9 @@ impl VibexWorkbench {
             self.timeline_measured_turn_heights.remove(&edit.turn_id);
             self.rebuild_timeline_sizes();
         }
+        if navigation_changed {
+            self.stash_current_composer_draft(cx);
+        }
         self.stash_current_agent_session_view();
         self.session_generation = self.session_generation.saturating_add(1);
         let generation = self.session_generation;
@@ -6869,16 +6944,20 @@ impl VibexWorkbench {
             self.agent_loading = true;
         }
         self.refresh_agent_token_usage(&session_id);
-        match self
-            .suggestion_context
-            .as_ref()
-            .map(|context| context.target)
-        {
-            Some(ComposerTarget::Session) => {
-                self.refresh_active_suggestions(ComposerTarget::Session, cx)
+        if navigation_changed {
+            self.clear_suggestions();
+        } else {
+            match self
+                .suggestion_context
+                .as_ref()
+                .map(|context| context.target)
+            {
+                Some(ComposerTarget::Session) => {
+                    self.refresh_active_suggestions(ComposerTarget::Session, cx)
+                }
+                Some(ComposerTarget::NewSession) => self.clear_suggestions(),
+                None => {}
             }
-            Some(ComposerTarget::NewSession) => self.clear_suggestions(),
-            None => {}
         }
         if self
             .pending_new_session
@@ -11829,6 +11908,7 @@ impl VibexWorkbench {
         self.discard_optimistic_user_message(session_id);
         self.set_session_turn_pending(session_id, false);
         self.agent_session_view_cache.remove(session_id.as_str());
+        self.composer_session_drafts.remove(session_id.as_str());
         self.agent_session_view_lru
             .retain(|cached_session_id| cached_session_id != session_id.as_str());
         self.reconcile_sidebar_state();
@@ -13560,6 +13640,8 @@ impl VibexWorkbench {
         self.sessions
             .retain(|session| !session_ids.contains(session.id.as_str()));
         self.agent_session_view_cache
+            .retain(|session_id, _| !session_ids.contains(session_id));
+        self.composer_session_drafts
             .retain(|session_id, _| !session_ids.contains(session_id));
         self.agent_session_view_lru
             .retain(|session_id| !session_ids.contains(session_id));
@@ -20022,7 +20104,12 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
-    fn render_agent_workbench(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_agent_workbench(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.sync_selected_composer_draft(window, cx);
         self.prune_elicitation_forms();
         self.apply_pending_timeline_row_heights();
         self.apply_pending_timeline_scroll();
@@ -27355,7 +27442,7 @@ impl VibexWorkbench {
                 } else if new_session_open {
                     self.render_new_session_panel(strings, window, cx)
                 } else {
-                    self.render_agent_workbench(cx)
+                    self.render_agent_workbench(window, cx)
                 }),
         );
         if preview_docked {
@@ -38138,6 +38225,59 @@ mod tests {
             selection.contains("self.agent_turn_pending = self.session_turn_pending(&session_id);")
         );
         assert!(!selection.contains("self.agent_turn_pending = false;"));
+    }
+
+    #[test]
+    fn composer_drafts_follow_their_session_across_navigation() {
+        let first = VibexSessionId::parse("session_first_draft").unwrap();
+        let second = VibexSessionId::parse("session_second_draft").unwrap();
+        let mut drafts = BTreeMap::new();
+        store_composer_session_draft(
+            &mut drafts,
+            &first,
+            ComposerSessionDraft {
+                text: "first unsent message".to_string(),
+                ..Default::default()
+            },
+        );
+        store_composer_session_draft(
+            &mut drafts,
+            &second,
+            ComposerSessionDraft {
+                text: "second unsent message".to_string(),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            drafts.get(first.as_str()).map(|draft| draft.text.as_str()),
+            Some("first unsent message")
+        );
+        assert_eq!(
+            drafts.remove(second.as_str()).map(|draft| draft.text),
+            Some("second unsent message".to_string())
+        );
+        assert_eq!(
+            drafts.get(first.as_str()).map(|draft| draft.text.as_str()),
+            Some("first unsent message")
+        );
+
+        store_composer_session_draft(&mut drafts, &first, ComposerSessionDraft::default());
+        assert!(!drafts.contains_key(first.as_str()));
+
+        let source = include_str!("app.rs");
+        let selection = source
+            .split_once("    fn select_session_with_history(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn load_agent_session_timeline("))
+            .map(|(body, _)| body)
+            .expect("session navigation should remain inspectable");
+        assert!(selection.contains("self.stash_current_composer_draft(cx);"));
+        let renderer = source
+            .split_once("    fn render_agent_workbench(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_controls("))
+            .map(|(body, _)| body)
+            .expect("Agent workbench renderer should remain inspectable");
+        assert!(renderer.contains("self.sync_selected_composer_draft(window, cx);"));
     }
 
     #[test]
