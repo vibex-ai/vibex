@@ -54,6 +54,7 @@ use tokio::sync::mpsc;
 use vibex_agent_acp::build_runtime_option_catalog_for_agents;
 use vibex_agent_claude::{ClaudeSessionImportPreviewRequest, preview_claude_external_sessions};
 use vibex_agent_codex::{CodexSessionImportPreviewRequest, preview_codex_external_sessions};
+use vibex_app_update::{CheckReason, UpdateSnapshot, UpdateState};
 use vibex_backend::{
     BackendError, BackendFacade, BackendOperation, MutationRequest, NativeBackend,
 };
@@ -3350,6 +3351,11 @@ pub struct VibexWorkbench {
     sidebar_resize_drag: Option<SidebarResizeDragState>,
     right_panel_resize_drag: Option<RightPanelResizeDragState>,
     pair_button_hovered: bool,
+    update_snapshot: UpdateSnapshot,
+    update_prompt_visible: bool,
+    update_status_task: Option<Task<()>>,
+    update_action_task: Option<Task<()>>,
+    update_prompt_timeout_task: Option<Task<()>>,
     timeline_command_expansion: BTreeMap<String, bool>,
     elicitation_inputs: BTreeMap<String, Entity<InputState>>,
     elicitation_drafts: BTreeMap<String, ElicitationFormDraft>,
@@ -3933,6 +3939,11 @@ impl VibexWorkbench {
             sidebar_resize_drag: None,
             right_panel_resize_drag: None,
             pair_button_hovered: false,
+            update_snapshot: UpdateSnapshot::default(),
+            update_prompt_visible: false,
+            update_status_task: None,
+            update_action_task: None,
+            update_prompt_timeout_task: None,
             timeline_command_expansion: BTreeMap::new(),
             elicitation_inputs: BTreeMap::new(),
             elicitation_drafts: BTreeMap::new(),
@@ -4338,6 +4349,7 @@ impl VibexWorkbench {
                             this.management_view.update(cx, |management, cx| {
                                 management.set_runtime(runtime.clone(), cx)
                             });
+                            this.attach_update_status(runtime.clone(), cx);
                             this.attach_event_stream(runtime, cx);
                             this.load_agent_overview(cx);
                         }
@@ -4481,6 +4493,172 @@ impl VibexWorkbench {
         self.code_right_rail.update(cx, |right_rail, cx| {
             right_rail.set_mode(right_rail_mode, cx)
         });
+    }
+
+    fn attach_update_status(&mut self, runtime: Arc<DesktopRuntime>, cx: &mut Context<Self>) {
+        let service = runtime.app_update();
+        let mut updates = service.subscribe();
+        self.apply_update_snapshot(updates.borrow_and_update().clone(), cx);
+        let (signal_tx, mut signal_rx) = mpsc::channel(8);
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            while updates.changed().await.is_ok() {
+                let snapshot = updates.borrow_and_update().clone();
+                if signal_tx.send(snapshot).await.is_err() {
+                    break;
+                }
+            }
+        });
+        self.update_status_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                while let Some(snapshot) = signal_rx.recv().await {
+                    if entity
+                        .update(cx, |this, cx| this.apply_update_snapshot(snapshot, cx))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                drop(signal_rx);
+                let _ = runner.await;
+            },
+        ));
+    }
+
+    fn apply_update_snapshot(&mut self, snapshot: UpdateSnapshot, cx: &mut Context<Self>) {
+        if snapshot.seq < self.update_snapshot.seq {
+            return;
+        }
+        self.update_snapshot = snapshot;
+        if !self.update_snapshot.state.should_show_update_entry() {
+            self.update_prompt_visible = false;
+            self.update_prompt_timeout_task = None;
+        } else {
+            self.maybe_show_update_prompt(cx);
+        }
+        cx.notify();
+    }
+
+    fn maybe_show_update_prompt(&mut self, cx: &mut Context<Self>) {
+        if !self.ui_state.desktop_behavior.show_update_prompts
+            || self.last_visibility.layout.viewport_width < 760
+            || self.update_prompt_visible
+        {
+            return;
+        }
+        let Some(version) = self
+            .update_snapshot
+            .state
+            .release()
+            .map(|release| release.version.to_string())
+        else {
+            return;
+        };
+        if self
+            .ui_state
+            .desktop_behavior
+            .last_update_prompted_version
+            .as_deref()
+            == Some(version.as_str())
+        {
+            return;
+        }
+        self.update_prompt_visible = true;
+        self.ui_state.desktop_behavior.last_update_prompted_version = Some(version);
+        self.queue_ui_state();
+        self.update_prompt_timeout_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                cx.background_executor().timer(Duration::from_secs(8)).await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.update_prompt_visible = false;
+                    this.update_prompt_timeout_task = None;
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
+    fn dismiss_update_prompt(&mut self, cx: &mut Context<Self>) {
+        self.update_prompt_visible = false;
+        self.update_prompt_timeout_task = None;
+        cx.notify();
+    }
+
+    fn request_update_check(&mut self, cx: &mut Context<Self>) {
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            runtime.app_update().check(CheckReason::Manual).await
+        });
+        self.update_action_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.update_action_task = None;
+                    if let Err(error) = outcome {
+                        this.persistence_note =
+                            Some(format!("Update check task stopped unexpectedly: {error}"));
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
+    fn request_update_download(&mut self, cx: &mut Context<Self>) {
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        let runner =
+            gpui_tokio::Tokio::spawn(cx, async move { runtime.app_update().download().await });
+        self.update_action_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.update_action_task = None;
+                    if let Err(error) = outcome {
+                        this.persistence_note = Some(format!(
+                            "Update download task stopped unexpectedly: {error}"
+                        ));
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
+    fn request_update_install(&mut self, cx: &mut Context<Self>) {
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        let runner =
+            gpui_tokio::Tokio::spawn(cx, async move { runtime.app_update().install().await });
+        self.update_action_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.update_action_task = None;
+                    if let Err(error) = outcome {
+                        this.persistence_note =
+                            Some(format!("Update install task stopped unexpectedly: {error}"));
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
+    fn restart_after_update(&mut self, cx: &mut Context<Self>) {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return;
+        };
+        match runtime.app_update().restart() {
+            Ok(()) => cx.quit(),
+            Err(error) => {
+                self.persistence_note = Some(format!("{}: {}", error.code, error.message));
+                cx.notify();
+            }
+        }
     }
 
     fn attach_event_stream(&mut self, runtime: Arc<DesktopRuntime>, cx: &mut Context<Self>) {
@@ -15384,6 +15562,12 @@ impl VibexWorkbench {
             settings.sync_controls(&appearance, &session, &terminal_preferences, window, cx)
         });
         self.rebuild_timeline_sizes();
+        if self.ui_state.desktop_behavior.show_update_prompts {
+            self.maybe_show_update_prompt(cx);
+        } else {
+            self.update_prompt_visible = false;
+            self.update_prompt_timeout_task = None;
+        }
         self.queue_ui_state();
         cx.notify();
     }
@@ -15447,6 +15631,17 @@ impl VibexWorkbench {
                     });
                 })
                 .child(settings.clone())
+        });
+        cx.notify();
+    }
+
+    fn open_update_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.settings_open {
+            self.open_settings(window, cx);
+        }
+        self.settings_view.update(cx, |settings, cx| {
+            settings.active_section = SettingsSection::About;
+            cx.notify();
         });
         cx.notify();
     }
@@ -15530,6 +15725,19 @@ impl VibexWorkbench {
         let is_client_decorated = matches!(window.window_decorations(), Decorations::Client { .. });
         let drag_state = window.use_state(cx, |_, _| WorkbenchTitleBarState { should_move: false });
         let wide_window_controls = self.last_visibility.layout.viewport_width >= 760;
+        let show_update_entry = self.ui_state.desktop_behavior.show_update_prompts
+            && self.update_snapshot.state.should_show_update_entry();
+        let update_version = self
+            .update_snapshot
+            .state
+            .release()
+            .map(|release| release.version.to_string())
+            .unwrap_or_default();
+        let update_prompt = match self.resolved_locale() {
+            locale::ResolvedLocale::En => format!("Vibex {update_version} is available"),
+            locale::ResolvedLocale::ZhCn => format!("发现 Vibex {update_version}"),
+            locale::ResolvedLocale::ZhTw => format!("發現 Vibex {update_version}"),
+        };
 
         div()
             .id("title-bar")
@@ -15685,6 +15893,47 @@ impl VibexWorkbench {
                             .border_color(cx.theme().border)
                             .px_2()
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .when(show_update_entry, |this| {
+                                this.child(
+                                    h_flex()
+                                        .h_full()
+                                        .gap_1()
+                                        .when(self.update_prompt_visible, |this| {
+                                            this.child(
+                                                div()
+                                                    .max_w(px(220.0))
+                                                    .truncate()
+                                                    .rounded(px(6.0))
+                                                    .bg(cx.theme().accent.opacity(0.72))
+                                                    .px_2()
+                                                    .py_1()
+                                                    .text_xs()
+                                                    .font_medium()
+                                                    .child(update_prompt),
+                                            )
+                                        })
+                                        .child(
+                                            Button::new("open-update")
+                                                .small()
+                                                .ghost()
+                                                .compact()
+                                                .size(px(32.0))
+                                                .px_0()
+                                                .tooltip(locale::text(
+                                                    "Update available",
+                                                    "有可用更新",
+                                                    "有可用更新",
+                                                ))
+                                                .child(
+                                                    Icon::new(IconName::ArrowDown).size(px(18.0)),
+                                                )
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.dismiss_update_prompt(cx);
+                                                    this.open_update_settings(window, cx);
+                                                })),
+                                        ),
+                                )
+                            })
                             .child(
                                 div()
                                     .id("pair-mobile-hover")
@@ -32326,6 +32575,21 @@ impl FoundationSettings {
         cx.notify();
     }
 
+    fn set_show_update_prompts(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.ui_state.desktop_behavior.show_update_prompts = enabled;
+            if enabled {
+                this.maybe_show_update_prompt(cx);
+            } else {
+                this.update_prompt_visible = false;
+                this.update_prompt_timeout_task = None;
+            }
+            this.queue_ui_state();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
     fn set_notification_kind(
         &mut self,
         kind: NotificationKind,
@@ -32849,6 +33113,12 @@ impl FoundationSettings {
             .on_click(
                 cx.listener(|this, enabled, _, cx| this.set_notifications_enabled(*enabled, cx)),
             );
+        let update_prompts = Switch::new("update-prompts-enabled")
+            .small()
+            .checked(desktop_behavior.show_update_prompts)
+            .on_click(
+                cx.listener(|this, enabled, _, cx| this.set_show_update_prompts(*enabled, cx)),
+            );
         let completed_notifications = Switch::new("notify-completed")
             .small()
             .checked(desktop_behavior.notify_agent_completed)
@@ -32918,6 +33188,17 @@ impl FoundationSettings {
                         "顯示 Agent 活動的桌面通知。",
                     ),
                     notifications,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Update prompts", "更新提示", "更新提示"),
+                    locale::text(
+                        "Show the title-bar update button and one-time version notice. Background security checks remain enabled.",
+                        "显示标题栏更新按钮和每个版本的一次性提示；后台安全检查始终保持启用。",
+                        "顯示標題列更新按鈕與每個版本的一次性提示；背景安全檢查始終保持啟用。",
+                    ),
+                    update_prompts,
                     stacked,
                     cx,
                 ),
@@ -33961,6 +34242,195 @@ impl FoundationSettings {
         let channel = release_channel()
             .map(|channel| format!("{channel:?}"))
             .unwrap_or_else(|_| "Preview".into());
+        let update_snapshot = self
+            .workbench
+            .read_with(cx, |this, _| this.update_snapshot.clone())
+            .unwrap_or_default();
+        let (update_description, update_control) = match update_snapshot.state {
+            UpdateState::Idle => (
+                locale::text(
+                    "No newer signed release is available.",
+                    "当前没有更高版本的已签名发行版。",
+                    "目前沒有更高版本的已簽署發行版。",
+                )
+                .to_string(),
+                Button::new("check-for-updates")
+                    .small()
+                    .outline()
+                    .label(locale::text("Check now", "立即检查", "立即檢查"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let _ = this
+                            .workbench
+                            .update(cx, |workbench, cx| workbench.request_update_check(cx));
+                    }))
+                    .into_any_element(),
+            ),
+            UpdateState::Checking => (
+                locale::text(
+                    "Checking GitHub Releases and verifying the signed manifest.",
+                    "正在检查 GitHub Releases 并验证签名清单。",
+                    "正在檢查 GitHub Releases 並驗證簽署清單。",
+                )
+                .to_string(),
+                Button::new("checking-for-updates")
+                    .small()
+                    .outline()
+                    .loading(true)
+                    .disabled(true)
+                    .label(locale::text("Checking", "检查中", "檢查中"))
+                    .into_any_element(),
+            ),
+            UpdateState::Available { release } => {
+                let size = release
+                    .artifact
+                    .as_ref()
+                    .map(|artifact| format_bytes(artifact.size))
+                    .unwrap_or_default();
+                (
+                    format!("Vibex {} · {size}", release.version),
+                    Button::new("download-update")
+                        .small()
+                        .outline()
+                        .icon(IconName::ArrowDown)
+                        .label(locale::text("Download", "下载更新", "下載更新"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let _ = this.workbench.update(cx, |workbench, cx| {
+                                workbench.request_update_download(cx)
+                            });
+                        }))
+                        .into_any_element(),
+                )
+            }
+            UpdateState::Downloading {
+                downloaded_bytes,
+                total_bytes,
+                ..
+            } => {
+                let percent = if total_bytes == 0 {
+                    0
+                } else {
+                    downloaded_bytes.saturating_mul(100) / total_bytes
+                };
+                (
+                    format!(
+                        "{} / {} ({percent}%)",
+                        format_bytes(downloaded_bytes),
+                        format_bytes(total_bytes)
+                    ),
+                    Button::new("downloading-update")
+                        .small()
+                        .outline()
+                        .loading(true)
+                        .disabled(true)
+                        .label(locale::text("Downloading", "下载中", "下載中"))
+                        .into_any_element(),
+                )
+            }
+            UpdateState::Verifying { .. } => (
+                locale::text(
+                    "Verifying the signed size and cryptographic hashes.",
+                    "正在验证签名大小和加密哈希。",
+                    "正在驗證簽署大小與加密雜湊。",
+                )
+                .to_string(),
+                Button::new("verifying-update")
+                    .small()
+                    .outline()
+                    .loading(true)
+                    .disabled(true)
+                    .label(locale::text("Verifying", "验证中", "驗證中"))
+                    .into_any_element(),
+            ),
+            UpdateState::Staged { release, .. } => (
+                format!(
+                    "{} {}",
+                    locale::text("Verified and ready to install Vibex", "已验证并可安装 Vibex", "已驗證並可安裝 Vibex"),
+                    release.version
+                ),
+                Button::new("install-update")
+                    .small()
+                    .outline()
+                    .label(locale::text("Install update", "安装更新", "安裝更新"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let _ = this
+                            .workbench
+                            .update(cx, |workbench, cx| workbench.request_update_install(cx));
+                    }))
+                    .into_any_element(),
+            ),
+            UpdateState::Installing { .. } => (
+                locale::text(
+                    "The verified system installer has been opened. Complete its confirmation steps.",
+                    "已打开验证通过的系统安装器，请完成其中的确认步骤。",
+                    "已開啟驗證通過的系統安裝器，請完成其中的確認步驟。",
+                )
+                .to_string(),
+                Button::new("update-installer-open")
+                    .small()
+                    .outline()
+                    .disabled(true)
+                    .label(locale::text("Installer opened", "安装器已打开", "安裝器已開啟"))
+                    .into_any_element(),
+            ),
+            UpdateState::RestartRequired { release } => (
+                format!(
+                    "{} {}",
+                    locale::text("Restart to run Vibex", "重启以运行 Vibex", "重新啟動以執行 Vibex"),
+                    release.version
+                ),
+                Button::new("restart-after-update")
+                    .small()
+                    .outline()
+                    .label(locale::text("Restart now", "立即重启", "立即重新啟動"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let _ = this
+                            .workbench
+                            .update(cx, |workbench, cx| workbench.restart_after_update(cx));
+                    }))
+                    .into_any_element(),
+            ),
+            UpdateState::Unsupported { release, reason } => {
+                let notes_url = release.notes_url.to_string();
+                (
+                    reason,
+                    Button::new("open-update-release")
+                        .small()
+                        .outline()
+                        .label(locale::text("Open release", "打开发行版", "開啟發行版"))
+                        .on_click(move |_, _, _| {
+                            let _ = open_external_url(&notes_url);
+                        })
+                        .into_any_element(),
+                )
+            }
+            UpdateState::Error { failure, release } => {
+                let verification_unavailable =
+                    failure.code == "app_update_verification_key_unavailable";
+                let retry_download = release.is_some();
+                (
+                    format!("{}: {}", failure.code, failure.message),
+                    Button::new("retry-update")
+                        .small()
+                        .outline()
+                        .disabled(verification_unavailable)
+                        .label(if verification_unavailable {
+                            locale::text("Unavailable", "当前构建不可用", "目前建置不可用")
+                        } else {
+                            locale::text("Retry", "重试", "重試")
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let _ = this.workbench.update(cx, |workbench, cx| {
+                                if retry_download {
+                                    workbench.request_update_download(cx);
+                                } else {
+                                    workbench.request_update_check(cx);
+                                }
+                            });
+                        }))
+                        .into_any_element(),
+                )
+            }
+        };
         let summary = format!(
             "Vibex {}\nChannel: {}\nPlatform: {} {}\nRust: {}",
             env!("CARGO_PKG_VERSION"),
@@ -33978,6 +34448,13 @@ impl FoundationSettings {
                 "版本、建置與專案資訊。",
             ),
             vec![
+                setting_row(
+                    locale::text("Software update", "软件更新", "軟體更新"),
+                    update_description,
+                    update_control,
+                    stacked,
+                    cx,
+                ),
                 setting_row(
                     locale::text("Version", "版本", "版本"),
                     locale::text(
@@ -34362,6 +34839,9 @@ impl Render for VibexWorkbench {
             self.close_sidebar_hover_preview();
         }
         self.last_visibility = visibility;
+        if visibility.layout.viewport_width >= 760 {
+            self.maybe_show_update_prompt(cx);
+        }
         let preview_visible = self.ui_state.workbench.active_tab == "agent"
             && !self.new_session_open
             && (self.preview_fullscreen_active
@@ -34691,7 +35171,7 @@ fn settings_page(
 
 fn setting_row(
     title: &'static str,
-    description: &'static str,
+    description: impl IntoElement,
     control: impl IntoElement,
     stacked: bool,
     cx: &App,

@@ -35,6 +35,7 @@ use vibex_agent_acp::{
     AcpAgentProvider, AcpRuntimeClient, AcpRuntimeLifecycleBackend, AcpRuntimeSwitchBridge,
     AgentRuntimeProbeService,
 };
+use vibex_app_update::{AppUpdateConfig, AppUpdateService, UpdateChannel};
 use vibex_config_switch::{ProviderConfigService, ProviderProfileChangeListener};
 use vibex_core::{
     AgentAuthCatalog, AgentAuthContext, AgentAuthContextAuthenticateRequest,
@@ -852,6 +853,7 @@ pub trait DesktopRuntimeFacade: Send + Sync {
 
 pub struct DesktopRuntime {
     config: DesktopRuntimeConfig,
+    app_update: AppUpdateService,
     agent: AgentHandle,
     providers: ProviderHandle,
     workspace: WorkspaceHandle,
@@ -1036,9 +1038,24 @@ impl DesktopRuntime {
             connectivity,
             mutation_guard: ManagementMutationGuard::default(),
         };
+        let app_update_config = AppUpdateConfig::for_current_build(
+            env!("CARGO_PKG_VERSION"),
+            update_channel_for_mode(config.mode),
+            &config.home_dir,
+        )
+        .map_err(|error| VibexError::validation(error.code, error.message))?;
+        let app_update = AppUpdateService::new(app_update_config.clone()).unwrap_or_else(|error| {
+            tracing::warn!(
+                target: "vibex_desktop",
+                error_code = error.code,
+                "App update service initialization failed"
+            );
+            AppUpdateService::unavailable(app_update_config, error)
+        });
         let (events, _) = broadcast::channel(config.event_capacity);
         let runtime = Arc::new(Self {
             config,
+            app_update,
             agent: AgentHandle {
                 manager: manager.clone(),
                 runtime_selection,
@@ -1099,6 +1116,9 @@ impl DesktopRuntime {
         })?;
         startup_stage("agent_auth_context_consumer_start", || {
             runtime.spawn_agent_auth_context_consumer()
+        })?;
+        startup_stage("app_update_consumer_start", || {
+            runtime.spawn_app_update_consumer()
         })?;
         runtime.activate().await?;
         startup_stage("startup_reconciliation_spawn", || {
@@ -1522,6 +1542,21 @@ impl DesktopRuntime {
         Ok(())
     }
 
+    fn spawn_app_update_consumer(&self) -> VibexResult<()> {
+        if !self.app_update.automatic_checks_enabled() {
+            return Ok(());
+        }
+        let mut tasks = self.tasks.lock().map_err(|_| {
+            VibexError::process(
+                "desktop_runtime_task_lock_failed",
+                "desktop runtime task ownership is unavailable",
+            )
+        })?;
+        let service = self.app_update.clone();
+        tasks.push(tokio::spawn(service.run_automatic_checks()));
+        Ok(())
+    }
+
     fn spawn_usage_consumer(
         &self,
         mut receiver: mpsc::UnboundedReceiver<vibex_agent::AgentUsageTelemetryEvent>,
@@ -1673,6 +1708,10 @@ impl DesktopRuntime {
 
     pub fn config(&self) -> &DesktopRuntimeConfig {
         &self.config
+    }
+
+    pub fn app_update(&self) -> AppUpdateService {
+        self.app_update.clone()
     }
 
     pub fn ui_state_path(&self) -> PathBuf {
@@ -1936,6 +1975,14 @@ impl DesktopRuntime {
         } else {
             Ok(())
         }
+    }
+}
+
+fn update_channel_for_mode(mode: DesktopRuntimeMode) -> UpdateChannel {
+    match mode {
+        DesktopRuntimeMode::Stable | DesktopRuntimeMode::ReleaseStable => UpdateChannel::Stable,
+        DesktopRuntimeMode::ReleaseCandidate => UpdateChannel::Rc,
+        DesktopRuntimeMode::Preview => UpdateChannel::Preview,
     }
 }
 
@@ -2596,6 +2643,22 @@ mod tests {
         assert!(!stable.home_dir.ends_with(PREVIEW_HOME_DIRECTORY));
         assert!(!stable.home_dir.ends_with(RC_HOME_DIRECTORY));
         assert!(stable.database_path.starts_with(&stable.home_dir));
+    }
+
+    #[test]
+    fn release_runtime_modes_select_their_exact_update_channel() {
+        assert_eq!(
+            update_channel_for_mode(DesktopRuntimeMode::Preview),
+            UpdateChannel::Preview
+        );
+        assert_eq!(
+            update_channel_for_mode(DesktopRuntimeMode::ReleaseCandidate),
+            UpdateChannel::Rc
+        );
+        assert_eq!(
+            update_channel_for_mode(DesktopRuntimeMode::ReleaseStable),
+            UpdateChannel::Stable
+        );
     }
 
     #[test]

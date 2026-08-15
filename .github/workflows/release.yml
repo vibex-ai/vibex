@@ -1,0 +1,149 @@
+name: Publish Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PACKAGER_VERSION: "0.11.8"
+
+jobs:
+  linux:
+    name: Linux x86_64 release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          submodules: recursive
+      - uses: pnpm/action-setup@7088e561eb65bb68695d245aa206f005ef30921d
+        with:
+          version: 11.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83
+        with:
+          components: rustfmt, clippy
+      - name: Resolve and verify release identity
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          case "${version}" in
+            *-preview.*) channel="preview" ;;
+            *-rc.*) channel="rc" ;;
+            *-*) echo "unsupported release prerelease channel: ${version}" >&2; exit 1 ;;
+            *) channel="stable" ;;
+          esac
+          node --input-type=module - "${version}" "${channel}" <<'NODE'
+          import { execFileSync } from "node:child_process";
+          import { readFileSync } from "node:fs";
+
+          const [version, channel] = process.argv.slice(2);
+          const metadata = JSON.parse(execFileSync(
+            "cargo",
+            ["metadata", "--locked", "--no-deps", "--format-version", "1"],
+            { encoding: "utf8" }
+          ));
+          const desktop = metadata.packages.find((pkg) => pkg.name === "vibex-desktop");
+          if (desktop?.version !== version) {
+            throw new Error(`tag ${version} does not match vibex-desktop ${desktop?.version}`);
+          }
+          const packageVersion = JSON.parse(readFileSync("package.json", "utf8")).version;
+          if (packageVersion !== version) {
+            throw new Error(`tag ${version} does not match package.json ${packageVersion}`);
+          }
+          const packager = readFileSync(`apps/desktop/Packager.${channel}.toml`, "utf8");
+          if (!packager.includes(`version = "${version}"`)) {
+            throw new Error(`Packager.${channel}.toml does not declare version ${version}`);
+          }
+          NODE
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "channel=${channel}" >> "${GITHUB_OUTPUT}"
+      - name: Install Linux native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig1-dev libvulkan1 libxkbcommon-x11-dev patchelf
+      - name: Install dependencies and packager
+        run: |
+          pnpm install --frozen-lockfile
+          cargo install cargo-packager --version "${CARGO_PACKAGER_VERSION}" --locked
+      - name: Verify release contracts
+        run: |
+          pnpm check:release
+          cargo test -p vibex-app-update --locked
+      - name: Build signed-update-capable desktop
+        env:
+          VIBEX_UPDATE_PUBLIC_KEY: ${{ vars.VIBEX_UPDATE_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${VIBEX_UPDATE_PUBLIC_KEY}"
+          node scripts/prepare-pdfium-runtime.mjs
+          node scripts/build-channel.mjs "${{ steps.release.outputs.channel }}"
+          NO_STRIP=1 cargo packager \
+            --config "apps/desktop/Packager.${{ steps.release.outputs.channel }}.toml" \
+            --formats deb,appimage
+      - name: Normalize release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_dir="target/release-packages/${{ steps.release.outputs.channel }}"
+          mapfile -t debs < <(find "${package_dir}" -maxdepth 1 -type f -name '*.deb' -print)
+          mapfile -t appimages < <(find "${package_dir}" -maxdepth 1 -type f -name '*.AppImage' -print)
+          test "${#debs[@]}" -eq 1
+          test "${#appimages[@]}" -eq 1
+          mkdir -p target/publish
+          cp "${debs[0]}" "target/publish/vibex-${{ steps.release.outputs.version }}-linux-x86_64-deb.deb"
+          cp "${appimages[0]}" "target/publish/vibex-${{ steps.release.outputs.version }}-linux-x86_64-appimage.AppImage"
+      - name: Generate and sign update manifest
+        env:
+          VIBEX_UPDATE_PUBLIC_KEY: ${{ vars.VIBEX_UPDATE_PUBLIC_KEY }}
+          VIBEX_UPDATE_SIGNING_KEY: ${{ secrets.VIBEX_UPDATE_SIGNING_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${VIBEX_UPDATE_PUBLIC_KEY}"
+          test -n "${VIBEX_UPDATE_SIGNING_KEY}"
+          version="${{ steps.release.outputs.version }}"
+          tag="${{ steps.release.outputs.tag }}"
+          repository_url="https://github.com/vibex-ai/vibex/releases/download/${tag}"
+          generated_key="$(
+            cargo run --release --locked -p vibex-app-update --bin vibex-update-manifest -- \
+              --channel "${{ steps.release.outputs.channel }}" \
+              --version "${version}" \
+              --published-at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+              --output target/publish/vibex-update.json \
+              --signature-output target/publish/vibex-update.json.sig \
+              --artifact "linux|x86_64|deb|system_installer|target/publish/vibex-${version}-linux-x86_64-deb.deb|${repository_url}/vibex-${version}-linux-x86_64-deb.deb" \
+              --artifact "linux|x86_64|appimage|self_replace|target/publish/vibex-${version}-linux-x86_64-appimage.AppImage|${repository_url}/vibex-${version}-linux-x86_64-appimage.AppImage"
+          )"
+          test "${generated_key}" = "update_public_key=${VIBEX_UPDATE_PUBLIC_KEY}"
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_flags=(--verify-tag --generate-notes)
+          if [[ "${{ steps.release.outputs.channel }}" != "stable" ]]; then
+            release_flags+=(--prerelease)
+          fi
+          gh release create \
+            "${{ steps.release.outputs.tag }}" \
+            target/publish/* \
+            "${release_flags[@]}" \
+            --title "Vibex ${{ steps.release.outputs.version }}"

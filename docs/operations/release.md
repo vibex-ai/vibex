@@ -34,6 +34,12 @@ pnpm package:preview
 RC and Stable builds additionally require the signing, rollback, and operator
 approvals recorded by the release owner.
 
+Every published artifact remains immutable and addressable by its version tag.
+Rollback publishes or re-selects a previously verified release artifact; it
+never rewrites an existing tag, reuses an asset name with different bytes, or
+rolls user data back with the application package. For AppImage self-updates,
+retain the previous binary until the new version completes its first startup.
+
 ## Mobile
 
 Android and iOS are built independently from the desktop package:

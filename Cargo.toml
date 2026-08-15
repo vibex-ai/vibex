@@ -3,6 +3,7 @@ members = [
   "apps/desktop",
   "apps/relay-server",
   "apps/mobile",
+  "crates/app-update",
   "crates/agent",
   "crates/agent-acp",
   "crates/agent-claude",
@@ -64,6 +65,7 @@ axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 bzip2 = "0.6"
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+ed25519-dalek = "2"
 futures-util = { version = "0.3", features = ["sink"] }
 futures-channel = "0.3"
 reqwest = { version = "0.13.4", features = ["json", "stream"] }
@@ -92,7 +94,7 @@ libc = "0.2"
 rand_core = "0.6"
 tower = { version = "0.5", features = ["util"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
-url = "=2.5.8"
+url = { version = "=2.5.8", features = ["serde"] }
 webpki-root-certs = "1"
 ropey = "=2.0.0-beta.1"
 x25519-dalek = { version = "2", default-features = false, features = ["alloc", "precomputed-tables", "static_secrets", "zeroize"] }

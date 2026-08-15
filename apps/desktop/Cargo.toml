@@ -33,6 +33,7 @@ vibex-agent = { path = "../../crates/agent" }
 vibex-agent-acp = { path = "../../crates/agent-acp" }
 vibex-agent-claude = { path = "../../crates/agent-claude" }
 vibex-agent-codex = { path = "../../crates/agent-codex" }
+vibex-app-update = { path = "../../crates/app-update" }
 vibex-config-switch = { path = "../../crates/config-switch" }
 vibex-content = { path = "../../crates/content" }
 vibex-core = { path = "../../crates/core" }

@@ -326,6 +326,10 @@ pub struct DesktopBehaviorUiState {
     pub notify_agent_needs_input: bool,
     #[serde(default = "default_notifications_enabled")]
     pub notify_agent_failed: bool,
+    #[serde(default = "default_update_prompts_enabled")]
+    pub show_update_prompts: bool,
+    #[serde(default)]
+    pub last_update_prompted_version: Option<String>,
 }
 
 impl Default for DesktopBehaviorUiState {
@@ -338,6 +342,8 @@ impl Default for DesktopBehaviorUiState {
             notify_agent_completed: default_notifications_enabled(),
             notify_agent_needs_input: default_notifications_enabled(),
             notify_agent_failed: default_notifications_enabled(),
+            show_update_prompts: default_update_prompts_enabled(),
+            last_update_prompted_version: None,
         }
     }
 }
@@ -347,6 +353,10 @@ const fn default_close_to_tray() -> bool {
 }
 
 const fn default_notifications_enabled() -> bool {
+    true
+}
+
+const fn default_update_prompts_enabled() -> bool {
     true
 }
 
@@ -535,6 +545,10 @@ impl DesktopUiStateV1 {
             })
             .take(KEYBOARD_SHORTCUT_OVERRIDE_LIMIT)
             .collect();
+        self.desktop_behavior.last_update_prompted_version = bounded_optional(
+            self.desktop_behavior.last_update_prompted_version.take(),
+            80,
+        );
         normalize_set(&mut self.session.auto_continue_project_ids, 1_000);
         self.session.auto_continue_session_overrides =
             std::mem::take(&mut self.session.auto_continue_session_overrides)
@@ -1268,6 +1282,8 @@ mod tests {
         behavior.remove("notifyAgentCompleted");
         behavior.remove("notifyAgentNeedsInput");
         behavior.remove("notifyAgentFailed");
+        behavior.remove("showUpdatePrompts");
+        behavior.remove("lastUpdatePromptedVersion");
 
         let decoded = decode_and_migrate(&serde_json::to_vec(&legacy).unwrap()).unwrap();
         assert!(decoded.workbench.remember_layout);
@@ -1281,6 +1297,13 @@ mod tests {
         );
         assert_eq!(decoded.composer.message_send_key, MessageSendKey::Enter);
         assert!(decoded.desktop_behavior.notifications_enabled);
+        assert!(decoded.desktop_behavior.show_update_prompts);
+        assert!(
+            decoded
+                .desktop_behavior
+                .last_update_prompted_version
+                .is_none()
+        );
         assert_eq!(
             decoded.terminal_preferences,
             TerminalPreferencesUiState::default()
@@ -1293,6 +1316,8 @@ mod tests {
         state.desktop_behavior.startup_destination = StartupDestination::NewSession;
         state.desktop_behavior.launch_at_login = true;
         state.desktop_behavior.notify_agent_failed = false;
+        state.desktop_behavior.show_update_prompts = false;
+        state.desktop_behavior.last_update_prompted_version = Some(" 0.2.0 ".into());
         state.composer.queue_send_mode = ComposerQueueSendMode::Manual;
         state.composer.message_send_key = MessageSendKey::CommandEnter;
         state.terminal_preferences.shell = Some(" /bin/zsh ".into());
@@ -1315,6 +1340,14 @@ mod tests {
         );
         assert!(round_trip.desktop_behavior.launch_at_login);
         assert!(!round_trip.desktop_behavior.notify_agent_failed);
+        assert!(!round_trip.desktop_behavior.show_update_prompts);
+        assert_eq!(
+            round_trip
+                .desktop_behavior
+                .last_update_prompted_version
+                .as_deref(),
+            Some("0.2.0")
+        );
         assert_eq!(
             round_trip.composer.queue_send_mode,
             ComposerQueueSendMode::Manual
