@@ -299,7 +299,7 @@ const IMAGE_PREVIEW_HORIZONTAL_PADDING: f32 = 24.0;
 const IMAGE_PREVIEW_VERTICAL_PADDING: f32 = 64.0;
 const SETTINGS_ROW_INLINE_MIN_VIEWPORT_WIDTH: f32 = 896.0;
 const SETTINGS_VERTICAL_TABS_MIN_WIDTH: f32 = 768.0;
-const SETTINGS_NAVIGATION_WIDTH: f32 = 184.0;
+const SETTINGS_NAVIGATION_WIDTH: f32 = 196.0;
 const SETTINGS_NAVIGATION_ROW_HEIGHT: f32 = 36.0;
 const SETTINGS_DIALOG_MAX_WIDTH: f32 = 960.0;
 const SETTINGS_DIALOG_MAX_HEIGHT: f32 = 720.0;
@@ -31408,7 +31408,7 @@ impl Render for SettingsDialogTitle {
             .min_w_0()
             .flex_row()
             .items_center()
-            .justify_between()
+            .relative()
             .pr(px(40.0))
             .pb_2()
             .child(
@@ -31426,6 +31426,9 @@ impl Render for SettingsDialogTitle {
                         .small()
                         .ghost()
                         .icon(IconName::Undo2)
+                        .absolute()
+                        .top(px(-2.0))
+                        .right(px(24.0))
                         .tooltip(strings.undo_changes)
                         .on_click(move |_, window, cx| {
                             settings.update(cx, |settings, cx| settings.undo_changes(window, cx));
@@ -32517,6 +32520,16 @@ impl FoundationSettings {
             .into_iter()
             .map(|(section, label, icon)| {
                 let active = self.active_section == section;
+                let icon = Icon::new(icon)
+                    .size(px(24.0))
+                    .p(px(4.0))
+                    .mr(px(2.0))
+                    .rounded(px(6.0))
+                    .bg(if active {
+                        theme::semantic_color("accent", is_dark).opacity(0.24)
+                    } else {
+                        theme::semantic_color("muted", is_dark).opacity(0.55)
+                    });
                 Button::new(SharedString::from(format!("settings-{section:?}")))
                     .small()
                     .ghost()
@@ -32526,10 +32539,11 @@ impl FoundationSettings {
                     .selected(active)
                     .text_color(if active { foreground } else { muted_foreground })
                     .when(active, |this| this.bg(active_background))
-                    .when(wide, |this| this.w_full().justify_start().items_center())
+                    .when(wide, |this| this.w_full())
                     .when(!wide, |this| this.min_w(px(112.0)).flex_1())
-                    .icon(Icon::new(icon).size(px(15.0)))
+                    .icon(icon)
                     .label(label)
+                    .child(div().flex_1())
                     .tooltip(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.active_section = section;
@@ -40386,7 +40400,7 @@ mod tests {
 
     #[test]
     fn settings_navigation_keeps_grouped_large_targets() {
-        assert_eq!(SETTINGS_NAVIGATION_WIDTH, 184.0);
+        assert_eq!(SETTINGS_NAVIGATION_WIDTH, 196.0);
         assert_eq!(SETTINGS_NAVIGATION_ROW_HEIGHT, 36.0);
         assert_eq!(SETTINGS_ROW_INLINE_MIN_VIEWPORT_WIDTH, 896.0);
 
@@ -40404,6 +40418,10 @@ mod tests {
         assert!(navigation.contains("\"偏好设置\""));
         assert!(navigation.contains("\"工作流\""));
         assert!(navigation.contains("\"支持\""));
+        assert!(navigation.contains("let icon = Icon::new(icon)"));
+        assert!(navigation.contains(".mr(px(2.0))"));
+        assert!(navigation.contains(".child(div().flex_1())"));
+        assert!(navigation.contains(".w_full()"));
         assert!(navigation.contains(".h(px(SETTINGS_NAVIGATION_ROW_HEIGHT))"));
         assert!(navigation.contains(".flex_wrap()"));
     }
@@ -40418,6 +40436,8 @@ mod tests {
             .expect("settings title should remain inspectable");
         assert!(title.contains("has_changes"));
         assert!(title.contains("undo-settings-changes"));
+        assert!(title.contains(".absolute()"));
+        assert!(title.contains(".right(px(24.0))"));
         assert!(!title.contains("settings_description"));
         assert!(!title.contains("request_restore_defaults"));
 
