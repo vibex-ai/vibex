@@ -332,7 +332,6 @@ const RAW_EVENT_SUMMARY_LIMIT: usize = 512;
 const RAW_EVENT_ITEM_LIMIT: usize = 16;
 const RAW_EVENT_KEY_LIMIT: usize = 64;
 const RAW_EVENT_URI_LIMIT: usize = 1_024;
-const RAW_EVENT_REDACTED_VALUE: &str = "[redacted]";
 const RAW_EVENT_TRUNCATION_SUFFIX: &str = "...(truncated)";
 
 fn bounded_event_bytes(value: &str, limit: usize) -> (String, bool) {
@@ -353,76 +352,17 @@ fn bounded_text(value: impl Into<String>, limit: usize) -> (String, bool) {
     bounded_event_bytes(value, limit)
 }
 
-fn looks_sensitive_event_value(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    let normalized = lower
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .collect::<String>();
-    lower.contains("api_key")
-        || lower.contains("apikey")
-        || lower.contains("authorization")
-        || lower.contains("bearer ")
-        || lower.contains("password")
-        || lower.contains("private_key")
-        || lower.contains("prompt")
-        || lower.contains("\"env\"")
-        || lower.contains("environment")
-        || lower.contains("secret")
-        || lower.contains("token")
-        || normalized.contains("rawpayload")
-        || normalized.contains("nativesession")
-        || normalized.contains("sessionid")
-        || lower.starts_with("sk-")
-}
-
-fn redact_private_paths(value: &str) -> String {
-    // ACP payloads can carry Windows paths even when Vibex is running on a
-    // Unix host. Normalize separators before masking home-directory segments
-    // so native paths cannot bypass the redaction boundary.
-    let normalized = value.replace("\\\\", "/").replace('\\', "/");
-    let parts = normalized.split('/').collect::<Vec<_>>();
-    let mut output = String::new();
-    let mut index = 0;
-    while index < parts.len() {
-        if index > 0 {
-            output.push('/');
-        }
-        let part = parts[index];
-        output.push_str(part);
-        if matches!(part, "home" | "Users") && index + 1 < parts.len() {
-            output.push_str("/user");
-            index += 1;
-        }
-        index += 1;
-    }
-    output
-}
-
-fn safe_event_value(value: impl Into<String>, limit: usize) -> (String, bool) {
+fn bounded_event_value(value: impl Into<String>, limit: usize) -> (String, bool) {
     let value = value.into();
-    if value == RAW_EVENT_REDACTED_VALUE
-        || looks_sensitive_event_value(&value)
-        || value.trim_start().starts_with("data:")
-    {
-        return (RAW_EVENT_REDACTED_VALUE.to_string(), true);
-    }
     if value.ends_with(RAW_EVENT_TRUNCATION_SUFFIX) {
-        let (value, _) = bounded_event_bytes(&redact_private_paths(&value), limit);
+        let (value, _) = bounded_event_bytes(value.trim(), limit);
         return (value, true);
     }
-    bounded_text(redact_private_paths(&value), limit)
+    bounded_text(value, limit)
 }
 
-fn safe_event_output_value(value: impl Into<String>, limit: usize) -> (String, bool) {
+fn bounded_event_output_value(value: impl Into<String>, limit: usize) -> (String, bool) {
     let value = value.into();
-    if value == RAW_EVENT_REDACTED_VALUE
-        || looks_sensitive_event_value(&value)
-        || value.trim_start().starts_with("data:")
-    {
-        return (RAW_EVENT_REDACTED_VALUE.to_string(), true);
-    }
-    let value = redact_private_paths(&value);
     if value.ends_with(RAW_EVENT_TRUNCATION_SUFFIX) {
         let (value, _) = bounded_event_bytes(&value, limit);
         return (value, true);
@@ -458,7 +398,7 @@ impl fmt::Debug for AgentEventRawOutput {
 
 impl AgentEventRawOutput {
     pub fn new(mode: AgentEventRawOutputMode, text: impl Into<String>) -> (Self, bool) {
-        let (text, truncated) = safe_event_output_value(text, RAW_EVENT_TEXT_LIMIT);
+        let (text, truncated) = bounded_event_output_value(text, RAW_EVENT_TEXT_LIMIT);
         (
             Self {
                 mode,
@@ -507,8 +447,8 @@ impl fmt::Debug for AgentEventContentBlock {
 
 impl AgentEventContentBlock {
     pub fn new(block_type: impl Into<String>, summary: impl Into<String>) -> (Self, bool) {
-        let (block_type, type_truncated) = safe_event_value(block_type, RAW_EVENT_KEY_LIMIT);
-        let (summary, summary_truncated) = safe_event_value(summary, RAW_EVENT_SUMMARY_LIMIT);
+        let (block_type, type_truncated) = bounded_event_value(block_type, RAW_EVENT_KEY_LIMIT);
+        let (summary, summary_truncated) = bounded_event_value(summary, RAW_EVENT_SUMMARY_LIMIT);
         (
             Self {
                 block_type,
@@ -559,7 +499,7 @@ impl fmt::Debug for AgentEventLocation {
 
 impl AgentEventLocation {
     pub fn new(uri: impl Into<String>, line: Option<u32>, column: Option<u32>) -> (Self, bool) {
-        let (uri, truncated) = safe_event_value(uri, RAW_EVENT_URI_LIMIT);
+        let (uri, truncated) = bounded_event_value(uri, RAW_EVENT_URI_LIMIT);
         (
             Self {
                 uri,
@@ -619,8 +559,8 @@ impl fmt::Debug for AgentEventRawExtension {
 }
 
 impl AgentEventRawExtension {
-    pub fn sanitize_text(value: impl Into<String>) -> String {
-        safe_event_value(value, RAW_EVENT_TEXT_LIMIT).0
+    pub fn bounded_text(value: impl Into<String>) -> String {
+        bounded_event_value(value, RAW_EVENT_TEXT_LIMIT).0
     }
 
     pub fn new(
@@ -647,23 +587,19 @@ impl AgentEventRawExtension {
             .take(RAW_EVENT_ITEM_LIMIT)
             .collect::<Vec<_>>();
         let (raw_input, input_truncated) = raw_input
-            .map(|value| safe_event_value(value, RAW_EVENT_TEXT_LIMIT))
+            .map(|value| bounded_event_value(value, RAW_EVENT_TEXT_LIMIT))
             .map_or((None, false), |(value, was_truncated)| {
                 (Some(value), was_truncated)
             });
         truncated |= input_truncated;
-        let mut safe_meta = BTreeMap::new();
+        let mut bounded_meta = BTreeMap::new();
         for (key, value) in meta {
-            if looks_sensitive_event_value(&key) || looks_sensitive_event_value(&value) {
-                truncated = true;
-                continue;
-            }
             let (key, key_truncated) = bounded_text(key, RAW_EVENT_KEY_LIMIT);
-            let (value, value_truncated) = safe_event_value(value, RAW_EVENT_SUMMARY_LIMIT);
+            let (value, value_truncated) = bounded_event_value(value, RAW_EVENT_SUMMARY_LIMIT);
             truncated |= key_truncated || value_truncated;
             if !key.is_empty() {
-                safe_meta.insert(key, value);
-                if safe_meta.len() == RAW_EVENT_ITEM_LIMIT {
+                bounded_meta.insert(key, value);
+                if bounded_meta.len() == RAW_EVENT_ITEM_LIMIT {
                     break;
                 }
             }
@@ -674,7 +610,7 @@ impl AgentEventRawExtension {
             raw_input,
             raw_output,
             locations,
-            meta: safe_meta,
+            meta: bounded_meta,
             truncated,
         }
     }
@@ -1149,7 +1085,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_extension_bounds_redacts_and_revalidates_deserialization() {
+    fn raw_extension_preserves_content_bounds_and_revalidates_deserialization() {
         let long = "x".repeat(RAW_EVENT_TEXT_LIMIT * 2);
         let output = AgentEventRawOutput::new(AgentEventRawOutputMode::Append, long.clone()).0;
         let extension = AgentEventRawExtension::new(
@@ -1169,17 +1105,20 @@ mod tests {
         assert!(extension.truncated);
         assert_eq!(extension.content_blocks.len(), RAW_EVENT_ITEM_LIMIT);
         assert_eq!(extension.locations.len(), RAW_EVENT_ITEM_LIMIT);
-        assert!(!extension.meta.contains_key("apiToken"));
+        assert_eq!(
+            extension.meta.get("apiToken").map(String::as_str),
+            Some("secret-value")
+        );
         let encoded = serde_json::to_string(&extension).unwrap();
-        assert!(!encoded.contains("alice"));
-        assert!(!encoded.contains("secret-value"));
+        assert!(encoded.contains("alice"));
+        assert!(encoded.contains("secret-value"));
         let decoded: AgentEventRawExtension = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, extension);
         let debug = format!("{extension:?}");
         assert!(!debug.contains("alice"));
         assert!(!debug.contains("secret-value"));
 
-        let redacted_only = AgentEventRawExtension::new(
+        let meta_only = AgentEventRawExtension::new(
             Vec::new(),
             None,
             None,
@@ -1187,8 +1126,8 @@ mod tests {
             BTreeMap::from([(String::from("apiToken"), String::from("secret-value"))]),
             false,
         );
-        assert!(redacted_only.truncated);
-        assert!(!redacted_only.is_empty());
+        assert!(!meta_only.truncated);
+        assert!(!meta_only.is_empty());
         let unsupported_schema = serde_json::json!({
             "schemaVersion": 2,
             "contentBlocks": [],
@@ -1200,7 +1139,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_extension_sensitive_output_and_utf8_bounds_round_trip() {
+    fn raw_extension_preserves_sensitive_output_and_utf8_bounds_round_trip() {
         let sensitive = AgentEventRawExtension::new(
             Vec::new(),
             None,
@@ -1216,10 +1155,10 @@ mod tests {
             false,
         );
         let encoded = serde_json::to_string(&sensitive).unwrap();
-        assert!(!encoded.contains("secret-value"));
+        assert!(encoded.contains("secret-value"));
         let decoded: AgentEventRawExtension = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, sensitive);
-        assert!(decoded.truncated);
+        assert!(!decoded.truncated);
 
         let unicode = "界".repeat(RAW_EVENT_TEXT_LIMIT);
         let extension = AgentEventRawExtension::new(
@@ -1239,7 +1178,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_extension_masks_cross_platform_private_paths() {
+    fn raw_extension_preserves_cross_platform_private_paths() {
         let extension = AgentEventRawExtension::new(
             Vec::new(),
             Some(r#"{"cwd":"C:\\Users\\alice\\private-repo"}"#.to_string()),
@@ -1258,9 +1197,8 @@ mod tests {
             false,
         );
         let encoded = serde_json::to_string(&extension).unwrap();
-        assert!(!encoded.contains("alice"));
-        assert!(!encoded.contains(r#"C:\Users"#));
-        assert!(encoded.contains("C:/Users/user/private-repo"));
+        assert!(encoded.contains("alice"));
+        assert!(encoded.contains(r#"C:\\Users\\alice\\private-repo"#));
     }
 
     #[test]

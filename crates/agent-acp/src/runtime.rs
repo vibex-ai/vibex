@@ -143,9 +143,9 @@ use crate::spawn_config::{ProcessSpawnConfigSnapshot, secret_reference_version};
 use crate::{
     AcpClient, AcpCreateSessionRequest, AcpElicitationResolution, AcpEvent,
     AcpImportSessionRequest, AcpPermissionResolution, AcpRuntimeCommand, AcpRuntimeSessionProbe,
-    AcpSendTurnRequest, AcpSession, AcpTurn, contains_sensitive_data,
-    infer_permission_risk_category, looks_sensitive, redact_summary, redact_timeline_summary,
-    redacted_args, redacted_args_summary,
+    AcpSendTurnRequest, AcpSession, AcpTurn, bounded_session_content,
+    infer_permission_risk_category, looks_sensitive, redact_summary, redacted_args,
+    redacted_args_summary,
 };
 use crate::{
     AgentEventInput, AgentEventInputSource, ClaudeBackgroundWorkRegistry, ClaudeWorkKey,
@@ -866,7 +866,7 @@ fn parse_opencode_stream_error(line: &str) -> Option<OpenCodeStreamError> {
         .or_else(|| raw_message.strip_prefix("AI_RetryError: Failed after 3 attempts. Last error:"))
         .unwrap_or(raw_message)
         .trim();
-    let message = redact_summary(message);
+    let message = bounded_session_content(message);
     let message = if message.is_empty() {
         "The upstream model API returned an error".to_string()
     } else {
@@ -1109,7 +1109,7 @@ fn codex_unattributed_advisory(text: &str) -> Option<(SystemNoticeLevel, String)
         .iter()
         .any(|prefix| trimmed.starts_with(prefix))
     {
-        return Some((SystemNoticeLevel::Warning, redact_summary(trimmed)));
+        return Some((SystemNoticeLevel::Warning, bounded_session_content(trimmed)));
     }
     [
         "*Context compacted",
@@ -1118,7 +1118,7 @@ fn codex_unattributed_advisory(text: &str) -> Option<(SystemNoticeLevel, String)
     ]
     .iter()
     .any(|prefix| trimmed.starts_with(prefix))
-    .then(|| (SystemNoticeLevel::Info, redact_summary(trimmed)))
+    .then(|| (SystemNoticeLevel::Info, bounded_session_content(trimmed)))
 }
 
 fn acp_authentication_required_text(text: &str) -> bool {
@@ -2037,7 +2037,7 @@ impl AcpSessionAttachment {
         else {
             return false;
         };
-        reconnect.terminal_message = Some(redact_summary(message));
+        reconnect.terminal_message = Some(bounded_session_content(message));
         true
     }
 
@@ -2082,7 +2082,7 @@ impl AcpSessionAttachment {
             return false;
         };
         turn.codex_terminal_error = Some(
-            VibexError::provider(CODEX_UNATTRIBUTED_ERROR_CODE, redact_summary(text))
+            VibexError::provider(CODEX_UNATTRIBUTED_ERROR_CODE, bounded_session_content(text))
                 .with_recovery_hint("Continue the session to retry from the failed turn"),
         );
         true
@@ -2096,7 +2096,7 @@ impl AcpSessionAttachment {
             return false;
         };
         turn.codex_terminal_error = Some(
-            VibexError::provider(CODEX_UNATTRIBUTED_ERROR_CODE, redact_summary(text))
+            VibexError::provider(CODEX_UNATTRIBUTED_ERROR_CODE, bounded_session_content(text))
                 .with_recovery_hint("Continue the session to retry from the failed turn"),
         );
         true
@@ -2456,8 +2456,8 @@ impl AcpSessionAttachment {
             .take(ACP_ACTIVE_TOOL_CALL_LIMIT)
             .map(|(tool_call_id, call)| RuntimeLiveToolCallSnapshot {
                 tool_call_id: redact_summary(tool_call_id),
-                title: redact_summary(&call.title),
-                kind: redact_summary(&call.kind),
+                title: bounded_session_content(&call.title),
+                kind: bounded_session_content(&call.kind),
                 status: "in_progress".to_string(),
                 input_summary: call.input_summary.clone(),
                 output_summary: call.output_summary.clone(),
@@ -2844,7 +2844,7 @@ impl AcpSessionAttachment {
                             );
                             self.emit_turn_event(AcpEvent::Error {
                                 code: CODEX_STREAM_RECONNECTING_CODE.to_string(),
-                                message: redact_summary(&text),
+                                message: bounded_session_content(&text),
                                 recoverable: true,
                                 provider_correlation_id: Some(provider_correlation_id),
                             });
@@ -3018,7 +3018,7 @@ impl AcpSessionAttachment {
         };
         let snapshot = state.tool_calls.entry(tool_call_id.clone()).or_default();
         if let Some(title) = update.get("title").and_then(Value::as_str) {
-            snapshot.title = redact_timeline_summary(title);
+            snapshot.title = bounded_session_content(title);
         }
         if let Some(tool_kind) = update.get("kind").and_then(Value::as_str) {
             snapshot.kind = tool_kind.to_string();
@@ -3719,7 +3719,7 @@ impl AcpProcess {
                         .flatten()
                     })
                 });
-                let rpc_message = redact_summary(
+                let rpc_message = bounded_session_content(
                     latest_stream_error
                         .as_deref()
                         .unwrap_or(failure.message.as_str()),
@@ -13579,7 +13579,6 @@ fn parse_terminal_create_request(
                 .and_then(Value::as_str)
                 .map(ToString::to_string)
         })
-        .map(|value| redact_summary(&value))
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "terminal/create requires command".to_string())?;
 
@@ -13678,18 +13677,17 @@ fn terminal_permission_details(request: &AcpTerminalCreateRequest) -> Vec<Permis
 }
 
 fn bounded_terminal_output(text: &str, limit: usize, already_truncated: bool) -> (String, bool) {
-    let redacted = redact_summary(text);
-    if redacted.len() <= limit {
-        return (redacted, already_truncated);
+    if text.len() <= limit {
+        return (text.to_string(), already_truncated);
     }
     let mut end = 0;
-    for (index, _) in redacted.char_indices() {
+    for (index, _) in text.char_indices() {
         if index > limit {
             break;
         }
         end = index;
     }
-    (redacted[..end].to_string(), true)
+    (text[..end].to_string(), true)
 }
 
 async fn resolve_terminal_create_permission(
@@ -15766,9 +15764,6 @@ fn truncate_optional_summary(value: impl AsRef<str>) -> Option<String> {
     if value.is_empty() || value == "null" {
         return None;
     }
-    if contains_sensitive_data(value) {
-        return Some("[redacted-sensitive-output]".to_string());
-    }
     if value.len() > ACP_SUMMARY_LIMIT {
         let prefix: String = value.chars().take(ACP_SUMMARY_LIMIT).collect();
         Some(format!("{prefix}...(truncated)"))
@@ -15780,9 +15775,6 @@ fn truncate_optional_summary(value: impl AsRef<str>) -> Option<String> {
 fn safe_tool_raw_output(value: String) -> Option<String> {
     if value.trim().is_empty() || value.trim() == "null" {
         return None;
-    }
-    if contains_sensitive_data(&value) {
-        return Some("[redacted-sensitive-output]".to_string());
     }
     Some(value)
 }
@@ -17657,15 +17649,45 @@ mod tests {
     }
 
     #[test]
-    fn terminal_output_is_bounded_and_redacted() {
+    fn terminal_create_preserves_credential_shaped_command_names() {
+        let request = parse_terminal_create_request(
+            &json!({ "command": "/usr/local/bin/token-helper" }),
+            Path::new("/tmp/fallback"),
+        )
+        .unwrap();
+
+        assert_eq!(request.command, "/usr/local/bin/token-helper");
+    }
+
+    #[test]
+    fn terminal_output_is_bounded_without_redacting_session_content() {
         let (text, truncated) =
             bounded_terminal_output("token=secret-token-value\nhello", 12, false);
         assert!(truncated);
-        assert!(!text.contains("secret-token-value"));
+        assert_eq!(text, "token=secret");
 
         let (text, truncated) = bounded_terminal_output("hello", 12, false);
         assert_eq!(text, "hello");
         assert!(!truncated);
+    }
+
+    #[test]
+    fn tool_content_helpers_preserve_credentials() {
+        let content = r#"{"token":"private-value","path":"src/lib.rs"}"#;
+        assert_eq!(truncate_optional_summary(content).as_deref(), Some(content));
+        assert_eq!(
+            safe_tool_raw_output(content.to_string()).as_deref(),
+            Some(content)
+        );
+    }
+
+    #[test]
+    fn codex_warning_preserves_credential_shaped_session_text() {
+        let warning = "Warning: token=private-value";
+        assert_eq!(
+            codex_unattributed_advisory(warning),
+            Some((SystemNoticeLevel::Warning, warning.to_string()))
+        );
     }
 
     #[tokio::test]
@@ -18223,7 +18245,7 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
     }
 
     #[test]
-    fn cross_surface_sentinel_gate_redacts_debug_envelope_timeline_and_diagnostics() {
+    fn session_timeline_preserves_content_while_debug_envelope_and_diagnostics_redact() {
         use vibex_core::{
             AgentEventRawOutputMode, DiagnosticBundleRequest, ProviderSecretKind,
             ProviderSecretReference, ProviderSecretSetupState,
@@ -18245,7 +18267,7 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
             "env": { "VIBEX_PRIVATE_VALUE": ENV_VALUE },
             "rawPayload": RAW_PAYLOAD,
             "prompt": PROMPT,
-            "oversized": oversized,
+            "zOversized": oversized,
         });
 
         let mut debug_log = AcpDebugLog::default();
@@ -18300,6 +18322,19 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
         .payload;
         let timeline_output = serde_json::to_string(&timeline).unwrap();
         assert!(timeline_output.contains("\"truncated\":true"));
+        for sentinel in [
+            API_KEY,
+            OAUTH_TOKEN,
+            ENV_VALUE,
+            NATIVE_ID,
+            RAW_PAYLOAD,
+            PROMPT,
+        ] {
+            assert!(
+                timeline_output.contains(sentinel),
+                "timeline dropped session content {sentinel}: {timeline_output}"
+            );
+        }
 
         let Some(fixture) = MockAcpFixture::create("cross-surface-sentinel") else {
             return;
@@ -18351,7 +18386,6 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
         let combined = [
             debug_output.as_str(),
             envelope_output.as_str(),
-            timeline_output.as_str(),
             diagnostic_output.as_str(),
         ]
         .join("\n");

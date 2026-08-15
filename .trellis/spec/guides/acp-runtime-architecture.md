@@ -113,9 +113,11 @@ Rules:
   an Agent's behalf raises a permission request that shows command, args, cwd,
   risk, and a redacted env summary. Denial must reach the Agent as a refusal,
   not a silent failure.
-- **Secrets resolve late and print never.** MCP env and auth material resolve
-  before process start; debug logs and timeline show only redacted references.
-  Full raw transcripts are a local, explicit developer opt-in.
+- **Configured secrets resolve late and print never.** MCP env and auth material
+  resolve before process start and debug logs show only redacted references.
+  Authoritative session content is not keyword-redacted after an Agent emits
+  it; users must be able to inspect commands, warnings, errors, and tool output
+  without false-positive placeholders.
 - **MCP forwarding is opt-in per profile.** Disabled servers are omitted, and an
   invalid descriptor fails session start with a typed validation error instead of
   starting a half-configured session.

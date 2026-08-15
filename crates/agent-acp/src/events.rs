@@ -146,19 +146,6 @@ impl CanonicalAgentEvent {
             _ => TimelineSource::Agent,
         }
     }
-
-    fn contains_redactions(&self) -> bool {
-        match self {
-            Self::ToolCall(payload) => payload.raw_extension.is_some(),
-            Self::CommandExecution(payload) => payload.raw_extension.is_some(),
-            Self::FileOperation(payload) => payload.raw_extension.is_some(),
-            Self::WebSearch(payload) => payload.raw_extension.is_some(),
-            Self::TodoUpdate(payload) => payload.raw_extension.is_some(),
-            Self::Collaboration(payload) => payload.raw_extension.is_some(),
-            Self::ImageGeneration(payload) => payload.raw_extension.is_some(),
-            _ => false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,16 +157,11 @@ pub struct NormalizedAgentEvent {
 impl NormalizedAgentEvent {
     pub fn into_provider_event(self) -> ProviderEvent {
         let source = self.event.source();
-        let redaction_state = if self.event.contains_redactions() {
-            TimelineRedactionState::ContainsRedactions
-        } else {
-            TimelineRedactionState::None
-        };
         ProviderEvent {
             source,
             payload: self.event.into_timeline_payload(),
             provider_correlation_id: Some(self.provider_correlation_id),
-            redaction_state,
+            redaction_state: TimelineRedactionState::None,
         }
     }
 }
@@ -859,7 +841,7 @@ fn sorted_json_value(value: &Value) -> Value {
 }
 
 fn public_text(value: &str) -> String {
-    let value = AgentEventRawExtension::sanitize_text(crate::redact_summary(value));
+    let value = AgentEventRawExtension::bounded_text(value);
     if value.len() <= PUBLIC_EVENT_TEXT_LIMIT {
         value
     } else {
@@ -1236,7 +1218,7 @@ mod tests {
     }
 
     #[test]
-    fn input_and_extension_debug_hide_payloads() {
+    fn input_debug_hides_payloads_while_timeline_extension_preserves_them() {
         let input = input(
             "tool",
             json!({"path":"/home/alice/private","token":"secret-value"}),
@@ -1249,8 +1231,8 @@ mod tests {
         assert!(!debug.contains("alice"));
         assert!(!debug.contains("secret-value"));
         let json = serde_json::to_string(&extension).unwrap();
-        assert!(!json.contains("alice"));
-        assert!(!json.contains("secret-value"));
+        assert!(json.contains("alice"));
+        assert!(json.contains("secret-value"));
     }
 
     #[test]

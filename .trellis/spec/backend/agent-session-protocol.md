@@ -317,7 +317,8 @@ ClaudeTranscriptTailWatcher::poll() -> Result<ClaudeTranscriptEvent[]>
 - Unknown extension -> ignore with bounded diagnostic.
 - Partial final line -> retain offset and retry next poll.
 - Old binding/generation -> route fence rejects before timeline/background state mutation.
-- Sensitive transcript/extension values -> bounded/redacted raw extension only.
+- Transcript fixtures are sanitized before commit; live session extension
+  values remain bounded and lossless in the authoritative Timeline.
 
 ### 5. Good/Base/Bad Cases
 
@@ -1492,14 +1493,17 @@ carry `rawExtension?: AgentEventRawExtension`. Absence preserves legacy JSON.
   blocks, 16 locations, and 16 allowlisted meta entries; todo projection keeps
   at most 32 items. Raw input/output are at most 4096 UTF-8 bytes, summaries
   512 bytes, keys 64 bytes, and locations 1024 bytes, including the truncation
-  suffix. Constructors and deserialization apply the same redaction and bounds;
+  suffix. Constructors and deserialization apply the same bounds;
   unsupported `schemaVersion` values fail closed. Meta keys are canonicalized
   from ACP camelCase (for example `exitCode` -> `exit_code`) before enrichment.
-- Secret-like values, data URLs, prompt/env values, and private home path
-  segments (including Windows `C:\\Users\\...` paths) are redacted before persistence. The canonical `[redacted]` and
-  `...(truncated)` forms must restore internal sanitized state after JSON
-  deserialization so `truncated` and round-trip equality remain stable. Debug
-  exposes only counts, keys, modes, and presence flags.
+- Live session values, including credential-shaped text, data URLs, prompt/env
+  values, warnings, errors, tool input/output, and private paths, are preserved
+  in the authoritative Timeline. Keyword detection must never replace them with
+  `[redacted]` or `[redacted-sensitive-output]`. The `...(truncated)` form must
+  restore internal truncation state after JSON deserialization so bounds and
+  round-trip equality remain stable. Debug exposes only counts, keys, modes,
+  and presence flags; diagnostics, permission details, provider configuration,
+  and credential projections keep their separate redaction contracts.
 - Attachment-local tool state merges live updates only after native route and
   four-field current-fence validation. Cumulative output emits `snapshot`, then
   suffix-only `append`; exact duplicates carry no raw output, non-prefix
@@ -1531,9 +1535,10 @@ carry `rawExtension?: AgentEventRawExtension`. Absence preserves legacy JSON.
   diagnostic; zero Timeline, permission, config, or tool-state side effects.
 - Unknown enricher identity or incomplete advanced marker -> generic
   `ToolCall`; do not infer Command/File/Web/Todo/Collaboration/Image semantics.
-- Sensitive or data-URL raw value -> `[redacted]` with `truncated=true`.
+- Credential-shaped, data-URL, prompt/env, or private-path session value ->
+  preserve it subject only to the field's UTF-8-safe size bound.
 - Unsupported raw extension schema version -> deserialization error; a
-  redaction-only extension remains durable with `truncated=true`.
+  bounded extension remains durable with its truncation state.
 - Over-limit string, collection, or output -> UTF-8-safe deterministic
   truncation; malformed optional structures -> bounded generic fallback.
 - Unknown file `kind` with recognized `_meta.kind` -> use the recognized meta
@@ -1557,9 +1562,9 @@ carry `rawExtension?: AgentEventRawExtension`. Absence preserves legacy JSON.
 
 ### 6. Tests Required
 
-- Core serde tests cover all additive Timeline variants, legacy JSON,
-  redaction, private paths, UTF-8 byte bounds, collection bounds, sanitized
-  state round-trip, and leak-free Debug.
+- Core serde tests cover all additive Timeline variants, legacy JSON, exact
+  credential/private-path preservation, UTF-8 byte bounds, collection bounds,
+  truncation-state round-trip, and payload-free Debug.
 - Enricher tests cover all twelve variants, exact identity dispatch, ambiguous
   fallback, stable/non-colliding hashes, structured command/file batch/web/
   todo/collaboration/image classification, ACP v1 file lifecycle inference,
@@ -1567,13 +1572,16 @@ carry `rawExtension?: AgentEventRawExtension`. Absence preserves legacy JSON.
   Passthrough non-fabrication.
 - Runtime tests cover route/fence ordering, attachment isolation, snapshot /
   append / duplicate / replacement behavior, and state cleanup on completion,
-  failure, replacement, detach, and crash.
+  failure, replacement, detach, and crash. They also assert credential-shaped
+  warnings, errors, tool summaries, and raw output reach Timeline payloads
+  without redaction placeholders.
 - Manager tests cover exact streamed-snapshot suppression, preservation of
   status/output transitions, and bounded desktop projection of lossless file
   payloads.
 - Golden tests replay every live/transcript case twice, compare both against
   expected canonical Timeline JSON, verify P1 native baseline references, and
-  scan fixtures and serialized/debug output for ids, secrets, and private paths.
+  scan sanitized fixtures and debug output for ids, secrets, and private paths
+  while asserting that live serialized Timeline content remains lossless.
 
 ### 7. Wrong vs Correct
 
@@ -1590,7 +1598,7 @@ session/update -> UI/provider-specific kind parsing -> generic title/summary
 session/update -> exact native route + current fence
   -> attachment-local merge -> exact-identity AgentEventEnricher
   -> top-level/meta/tool file operation evidence -> bounded lifecycle fallback
-  -> bounded/redacted canonical event + stable hashed correlation id
+  -> bounded lossless canonical event + stable hashed correlation id
   -> provider-neutral Timeline -> shared desktop/remote rendering
 ```
 
@@ -2994,7 +3002,7 @@ ensure one AgentAuthContext
   provider-neutral backend action descriptor.
 - This is a cross-layer contract because ACP runtime requests flow through
   provider profile config, capability projection, runtime host seams,
-  permission requests, redacted output summaries, and later UI/remote terminal
+  permission requests, bounded output summaries, and later UI/remote terminal
   surfaces.
 
 ### 2. Signatures
@@ -3058,10 +3066,10 @@ terminal/wait_for_exit
   the ACP request with a terminal-denied error and must not create a terminal.
 - Pending terminal-create requests must be drained on interrupt, shutdown, or
   process exit so the ACP agent is not left waiting forever.
-- Terminal output returned through ACP responses must be bounded and redacted
-  before it crosses non-terminal surfaces. Secret env values must never be
-  copied into permission details, logs, terminal output summaries, or terminal
-  auth descriptors.
+- Terminal output returned through ACP responses must be bounded but otherwise
+  unchanged. Secret env values must never be copied by Vibex into permission
+  details, logs, or terminal auth descriptors; if an Agent command itself
+  prints a value, the authoritative session output preserves it.
 - Terminal auth is represented by `TerminalAuthActionDescriptor`. It may include
   command, args, cwd, env keys, and redacted env summaries, but not secret env
   values or auth codes.
@@ -3108,10 +3116,10 @@ terminal/wait_for_exit
 - Runtime tests must assert terminal create parses command, args, cwd, and env
   keys, emits a permission request, calls the mock host only after approval, and
   does not call it after denial.
-- Runtime tests must assert terminal output is bounded and redacted, wait
+- Runtime tests must assert terminal output is bounded and content-preserving, wait
   returns exit status, and kill/release delegate to the host.
 - Auth tests must assert `TerminalAuthActionDescriptor` contains env keys or
-  redacted summaries only and never contains secret values.
+  redacted permission/auth summaries only and never copies secret env values.
 
 ### 7. Wrong vs Correct
 
@@ -3213,8 +3221,9 @@ retryable main stream error -> provider/opencode_model_api_retrying
   was cancelled. Never assume cross-pipe write order equals reader-task order.
   In particular, one delayed stdout progress event may slide the recovery
   deadline but must not permanently disarm it.
-- User-visible errors use stable code `opencode_model_api_error`; raw stderr is
-  bounded and redacted before becoming diagnostic context.
+- User-visible errors use stable code `opencode_model_api_error`; their session
+  message is bounded and preserved, while the raw stderr copy is independently
+  redacted before becoming diagnostic context.
 - A normal OpenCode `end_turn` requires evidence of model-stream progress. If
   the turn has no non-empty Agent message, thought, or new tool-call update and
   no permission/elicitation remains pending, Vibex returns
@@ -3250,7 +3259,7 @@ retryable main stream error -> provider/opencode_model_api_retrying
 - Good: a transient upstream 500 recovers after several retries; subsequent
   model progress resets the budget and the turn continues without cancellation.
 - Good: an upstream failure remains unavailable through eight consecutive
-  errors; Vibex ends the turn with the redacted reason and OpenCode receives one
+  errors; Vibex ends the turn with the bounded original reason and OpenCode receives one
   cancel instead of retrying forever.
 - Good: `Free usage exceeded, subscribe to Go` or the underlying `Rate limit
   exceeded` fails on the first correlated main error, enters session `error`, and
