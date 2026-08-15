@@ -76,11 +76,7 @@ pub struct Strings {
     pub pair_mobile: &'static str,
     pub open_settings: &'static str,
     pub settings: &'static str,
-    pub settings_description: &'static str,
-    pub restore_defaults: &'static str,
-    pub restore_defaults_description: &'static str,
-    pub restore_defaults_confirm_title: &'static str,
-    pub restore_defaults_confirm_description: &'static str,
+    pub undo_changes: &'static str,
     pub general: &'static str,
     pub general_description: &'static str,
     pub close_to_tray: &'static str,
@@ -255,11 +251,7 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             pair_mobile: "Pair mobile",
             open_settings: "Open settings",
             settings: "Settings",
-            settings_description: "Manage desktop preferences for this Vibex workbench.",
-            restore_defaults: "Restore defaults",
-            restore_defaults_description: "Reset desktop behavior, language, theme, typography, and session display preferences to Vibex defaults.",
-            restore_defaults_confirm_title: "Restore default settings?",
-            restore_defaults_confirm_description: "This resets desktop behavior, language, theme, interface typography, code typography, and all session display preferences.",
+            undo_changes: "Undo changes",
             general: "General",
             general_description: "Configure default behavior for the desktop shell.",
             close_to_tray: "Keep running after closing the window",
@@ -405,11 +397,7 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             pair_mobile: "配对移动设备",
             open_settings: "打开设置",
             settings: "设置",
-            settings_description: "管理此 Vibex 工作台的桌面偏好。",
-            restore_defaults: "恢复默认设置",
-            restore_defaults_description: "将桌面行为、语言、主题、字体和会话显示偏好恢复为 Vibex 默认值。",
-            restore_defaults_confirm_title: "恢复默认设置？",
-            restore_defaults_confirm_description: "这会重置桌面行为、语言、主题、界面字体、代码字体和全部会话显示偏好。",
+            undo_changes: "撤销更改",
             general: "常规",
             general_description: "配置桌面端的默认行为。",
             close_to_tray: "关闭窗口后继续运行",
@@ -555,11 +543,7 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             pair_mobile: "配對行動裝置",
             open_settings: "開啟設定",
             settings: "設定",
-            settings_description: "管理此 Vibex 工作台的桌面偏好。",
-            restore_defaults: "恢復預設設定",
-            restore_defaults_description: "將桌面行為、語言、主題、字體和會話顯示偏好恢復為 Vibex 預設值。",
-            restore_defaults_confirm_title: "恢復預設設定？",
-            restore_defaults_confirm_description: "這會重設桌面行為、語言、主題、介面字體、程式碼字體和全部會話顯示偏好。",
+            undo_changes: "撤銷變更",
             general: "一般",
             general_description: "設定桌面端的預設行為。",
             close_to_tray: "關閉視窗後繼續執行",
@@ -1506,10 +1490,7 @@ mod tests {
         assert_eq!(strings(ResolvedLocale::ZhTw).settings, "設定");
         assert_eq!(strings(ResolvedLocale::En).general, "General");
         assert_eq!(strings(ResolvedLocale::ZhCn).theme, "主题");
-        assert_eq!(
-            strings(ResolvedLocale::ZhTw).restore_defaults,
-            "恢復預設設定"
-        );
+        assert_eq!(strings(ResolvedLocale::ZhTw).undo_changes, "撤銷變更");
         assert_eq!(
             strings(ResolvedLocale::ZhCn).message_agent,
             "让 Vibex 检查、编辑、测试或解释此工作区..."

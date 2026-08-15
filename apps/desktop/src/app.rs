@@ -299,10 +299,10 @@ const IMAGE_PREVIEW_HORIZONTAL_PADDING: f32 = 24.0;
 const IMAGE_PREVIEW_VERTICAL_PADDING: f32 = 64.0;
 const SETTINGS_ROW_INLINE_MIN_VIEWPORT_WIDTH: f32 = 896.0;
 const SETTINGS_VERTICAL_TABS_MIN_WIDTH: f32 = 768.0;
-const SETTINGS_NAVIGATION_WIDTH: f32 = 208.0;
+const SETTINGS_NAVIGATION_WIDTH: f32 = 184.0;
 const SETTINGS_NAVIGATION_ROW_HEIGHT: f32 = 36.0;
-const SETTINGS_DIALOG_MAX_WIDTH: f32 = 864.0;
-const SETTINGS_DIALOG_MAX_HEIGHT: f32 = 640.0;
+const SETTINGS_DIALOG_MAX_WIDTH: f32 = 960.0;
+const SETTINGS_DIALOG_MAX_HEIGHT: f32 = 720.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AutoContinueCountdown {
@@ -3334,6 +3334,7 @@ pub struct VibexWorkbench {
     preview_overlay_open: bool,
     right_rail_overlay_open: bool,
     settings_open: bool,
+    settings_snapshot: Option<DesktopUiStateV1>,
     open_settings_on_start: bool,
     settings_title: Entity<SettingsDialogTitle>,
     settings_view: Entity<FoundationSettings>,
@@ -3908,6 +3909,7 @@ impl VibexWorkbench {
             preview_overlay_open: false,
             right_rail_overlay_open: false,
             settings_open: false,
+            settings_snapshot: None,
             open_settings_on_start: settings_open_on_start,
             settings_title,
             settings_view,
@@ -15176,66 +15178,75 @@ impl VibexWorkbench {
         }
     }
 
-    fn restore_settings_defaults(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn restore_settings_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(snapshot) = self.settings_snapshot.clone() else {
+            return;
+        };
         let application_id = self
             .config
             .as_ref()
             .map(|config| config.application_id.as_str())
             .unwrap_or("com.vibex.desktop");
-        let launch_at_login = match set_launch_at_login(false, application_id) {
-            Ok(()) => {
-                self.persistence_note = None;
-                false
-            }
-            Err(error) => {
-                self.persistence_note = Some(format!("{}: {}", error.code, error.message));
-                launch_at_login_enabled(application_id)
-            }
-        };
-        self.ui_state.appearance = AppearanceUiState::default();
-        self.ui_state.session = SessionUiState::default();
-        self.ui_state.desktop_behavior = DesktopBehaviorUiState::default();
-        self.ui_state.desktop_behavior.launch_at_login = launch_at_login;
-        clear_remembered_workbench_layout(&mut self.ui_state);
-        self.ui_state.workbench.remember_layout = true;
-        self.ui_state.workbench.default_new_session_location = NewSessionLocation::CurrentCheckout;
-        self.ui_state.sidebar.hierarchy_mode = SidebarHierarchyMode::Compact;
-        self.ui_state.sidebar.project_location_preferences.clear();
-        self.ui_state.terminal_preferences =
-            vibex_desktop_model::TerminalPreferencesUiState::default();
-        clear_shortcut_overrides(&mut self.ui_state.keyboard.shortcuts, cx);
-        self.ui_state.composer.queue_send_mode = ComposerQueueSendMode::Automatic;
-        self.ui_state.composer.message_send_key = MessageSendKey::Enter;
-        self.clear_runtime_selection_preferences(cx);
-        self.composer_queue_manual_session_ids.clear();
-        self.clear_auto_continue_preference_state();
-        self.sidebar_overlay_open = false;
-        self.preview_overlay_open = false;
-        self.right_rail_overlay_open = false;
-        self.sidebar_hover_preview_open = false;
-        self.code_preview_visible = false;
-        self.code_files_surface_visible = false;
-        self.code_git_surface_visible = false;
-        self.code_workbench.update(cx, |workbench, cx| {
-            workbench.set_preview_visible(false, cx);
-            workbench.set_workspace_surface_visibility(false, false, cx);
-        });
-        theme::apply_appearance(&self.ui_state.appearance, Some(window), cx);
-        locale::apply_locale(self.ui_state.appearance.locale);
-        self.sync_locale_dependents(window, cx);
-        crate::system_tray::update_locale(self.resolved_locale(), cx);
+        let launch_at_login = snapshot.desktop_behavior.launch_at_login;
+        if let Err(error) = set_launch_at_login(launch_at_login, application_id) {
+            self.persistence_note = Some(format!("{}: {}", error.code, error.message));
+        } else {
+            self.persistence_note = None;
+        }
 
-        let code_family = self
-            .ui_state
+        let auto_continue_default_project_ids = snapshot.session.auto_continue_project_ids.clone();
+        let auto_continue_session_ids = restored_auto_continue_session_ids(&snapshot.session);
+        let selected_session_id = snapshot
+            .workbench
+            .selected_session_id
+            .as_deref()
+            .and_then(|id| VibexSessionId::parse(id).ok());
+        let code_font_family = snapshot
             .appearance
             .code_font
             .family
             .clone()
             .unwrap_or_else(|| crate::platform::default_code_font_family().to_string());
-        let code_size = self.ui_state.appearance.code_font.size;
+        let code_font_size = snapshot.appearance.code_font.size;
+        let preview = snapshot.preview.layout.clone();
+        let recovery = snapshot.preview.editor_recovery.clone();
+        let workspace_id = snapshot.workbench.selected_workspace_id.clone();
+        let right_rail_mode =
+            right_rail_mode_from_activity_id(snapshot.right_rail.selected_activity_id.as_deref());
+
+        self.ui_state = snapshot;
+        self.auto_continue_default_project_ids = auto_continue_default_project_ids;
+        self.auto_continue_session_ids = auto_continue_session_ids;
+        self.sidebar_state.row_order = self.ui_state.sidebar.session_order.clone();
+        self.sidebar_state.pinned_ids = self.ui_state.sidebar.pinned_session_ids.clone();
+        self.sidebar_state.collapsed_ids = self.ui_state.sidebar.collapsed_project_ids.clone();
+        self.sidebar_state.selected_ids.clear();
+        self.invalidate_sidebar_projection_cache();
+        self.selected_session_id = selected_session_id;
+        self.right_rail_mode = right_rail_mode;
+        self.appearance_reload_pending = true;
+        self.preview_overlay_open = false;
+        self.right_rail_overlay_open = false;
+        self.sidebar_hover_preview_open = false;
         self.code_workbench.update(cx, |workbench, cx| {
-            workbench.set_code_font(code_family, code_size, cx)
+            workbench.restore_persisted_state(
+                preview,
+                recovery,
+                workspace_id,
+                code_font_family.clone(),
+                code_font_size,
+                cx,
+            );
+            workbench.right_rail_mode = right_rail_mode;
+            workbench.set_code_font(code_font_family, code_font_size, cx);
         });
+        self.code_right_rail.update(cx, |right_rail, cx| {
+            right_rail.set_mode(right_rail_mode, cx)
+        });
+        theme::apply_appearance(&self.ui_state.appearance, Some(window), cx);
+        locale::apply_locale(self.ui_state.appearance.locale);
+        self.sync_locale_dependents(window, cx);
+        crate::system_tray::update_locale(self.resolved_locale(), cx);
 
         let appearance = self.ui_state.appearance.clone();
         let session = self.ui_state.session.clone();
@@ -15266,6 +15277,7 @@ impl VibexWorkbench {
         if self.settings_open || window.has_active_dialog(cx) || window.has_active_sheet(cx) {
             return;
         }
+        self.settings_snapshot = Some(self.ui_state.clone());
         self.settings_view.update(cx, |settings, cx| {
             settings.active_section = SettingsSection::General;
             cx.notify();
@@ -15278,9 +15290,9 @@ impl VibexWorkbench {
         let viewport = window.viewport_size();
         let viewport_width = f32::from(viewport.width);
         let viewport_height = f32::from(viewport.height);
-        let dialog_width = (viewport_width - 32.0).clamp(1.0, SETTINGS_DIALOG_MAX_WIDTH);
-        let dialog_height = (viewport_height - 32.0).clamp(1.0, SETTINGS_DIALOG_MAX_HEIGHT);
-        let dialog_margin_top = ((viewport_height - dialog_height) / 2.0).max(16.0);
+        let dialog_width = (viewport_width - 16.0).clamp(1.0, SETTINGS_DIALOG_MAX_WIDTH);
+        let dialog_height = (viewport_height - 16.0).clamp(1.0, SETTINGS_DIALOG_MAX_HEIGHT);
+        let dialog_margin_top = ((viewport_height - dialog_height) / 2.0).max(8.0);
         window.open_dialog(cx, move |dialog, _, cx| {
             let on_close = workbench.clone();
             let is_dark = cx.theme().is_dark();
@@ -15301,6 +15313,7 @@ impl VibexWorkbench {
                 .on_close(move |_, _, cx| {
                     let _ = on_close.update(cx, |this, cx| {
                         this.settings_open = false;
+                        this.settings_snapshot = None;
                         cx.notify();
                     });
                 })
@@ -31381,74 +31394,44 @@ impl SettingsDialogTitle {
 }
 
 impl Render for SettingsDialogTitle {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let appearance = self.settings.read(cx).appearance(cx);
         let strings = locale::strings(locale::resolve_locale(
             appearance.locale,
             locale::system_locale().as_deref(),
         ));
-        let header_inline =
-            f32::from(window.viewport_size().width) >= SETTINGS_ROW_INLINE_MIN_VIEWPORT_WIDTH;
-        let defaults_restored = self.settings.read(cx).all_defaults_restored(cx);
+        let has_changes = self.settings.read(cx).has_changes(cx);
         let settings = self.settings.clone();
 
         div()
             .w_full()
             .min_w_0()
-            .flex()
-            .when(header_inline, |this| {
-                this.flex_row().items_start().justify_between()
-            })
-            .when(!header_inline, |this| this.flex_col().items_start())
-            .gap_3()
+            .flex_row()
+            .items_center()
+            .justify_between()
             .pr(px(40.0))
             .pb_2()
             .child(
-                v_flex()
-                    .min_w_0()
-                    .flex_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_medium()
-                            .line_height(gpui::relative(1.43))
-                            .child(strings.settings),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_normal()
-                            .line_height(gpui::relative(1.625))
-                            .whitespace_normal()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(strings.settings_description),
-                    ),
+                v_flex().min_w_0().flex_1().child(
+                    div()
+                        .text_sm()
+                        .font_medium()
+                        .line_height(gpui::relative(1.43))
+                        .child(strings.settings),
+                ),
             )
-            .child(
-                Button::new("restore-settings-defaults")
-                    .small()
-                    .outline()
-                    .rounded(px(8.0))
-                    .px_2()
-                    .tooltip(strings.restore_defaults_description)
-                    .disabled(defaults_restored)
-                    .child(
-                        Icon::default()
-                            .path("icons/vibex/rotate-ccw.svg")
-                            .size(px(12.0)),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_medium()
-                            .child(strings.restore_defaults),
-                    )
-                    .on_click(move |_, window, cx| {
-                        settings.update(cx, |settings, cx| {
-                            settings.request_restore_defaults(window, cx)
-                        });
-                    }),
-            )
+            .when(has_changes, |this| {
+                this.child(
+                    Button::new("undo-settings-changes")
+                        .small()
+                        .ghost()
+                        .icon(IconName::Undo2)
+                        .tooltip(strings.undo_changes)
+                        .on_click(move |_, window, cx| {
+                            settings.update(cx, |settings, cx| settings.undo_changes(window, cx));
+                        }),
+                )
+            })
     }
 }
 
@@ -31954,14 +31937,14 @@ impl FoundationSettings {
             .unwrap_or_default()
     }
 
-    fn ui_state(&self, cx: &App) -> DesktopUiStateV1 {
+    fn has_changes(&self, cx: &App) -> bool {
         self.workbench
-            .read_with(cx, |this, _| this.ui_state.clone())
-            .unwrap_or_default()
-    }
-
-    fn all_defaults_restored(&self, cx: &App) -> bool {
-        all_settings_defaults_restored(&self.ui_state(cx))
+            .read_with(cx, |this, _| {
+                this.settings_snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot != &this.ui_state)
+            })
+            .unwrap_or(false)
     }
 
     fn sync_controls(
@@ -32085,6 +32068,13 @@ impl FoundationSettings {
         let _ = self
             .workbench
             .update(cx, |this, cx| this.set_sidebar_hierarchy_mode(mode, cx));
+        cx.notify();
+    }
+
+    fn undo_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self
+            .workbench
+            .update(cx, |this, cx| this.restore_settings_changes(window, cx));
         cx.notify();
     }
 
@@ -32469,53 +32459,6 @@ impl FoundationSettings {
         });
     }
 
-    fn request_restore_defaults(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let strings = locale::strings(locale::resolve_locale(
-            self.appearance(cx).locale,
-            locale::system_locale().as_deref(),
-        ));
-        let workbench = self.workbench.clone();
-        let dialog_width = (f32::from(window.viewport_size().width) - 32.0).clamp(280.0, 420.0);
-        window.open_dialog(cx, move |dialog, _, cx| {
-            let workbench = workbench.clone();
-            dialog
-                .title(strings.restore_defaults_confirm_title)
-                .w(px(dialog_width))
-                .max_w(px(dialog_width))
-                .overlay(true)
-                .overlay_closable(true)
-                .child(
-                    div()
-                        .text_sm()
-                        .whitespace_normal()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(strings.restore_defaults_confirm_description),
-                )
-                .footer(
-                    DialogFooter::new()
-                        .child(
-                            DialogClose::new().child(
-                                Button::new("cancel-restore-settings")
-                                    .outline()
-                                    .label(strings.sidebar_cancel),
-                            ),
-                        )
-                        .child(
-                            DialogAction::new().child(
-                                Button::new("confirm-restore-settings")
-                                    .primary()
-                                    .label(strings.restore_defaults),
-                            ),
-                        ),
-                )
-                .on_ok(move |_, window, cx| {
-                    let _ =
-                        workbench.update(cx, |this, cx| this.restore_settings_defaults(window, cx));
-                    true
-                })
-        });
-    }
-
     fn render_navigation(
         &self,
         wide: bool,
@@ -32583,9 +32526,9 @@ impl FoundationSettings {
                     .selected(active)
                     .text_color(if active { foreground } else { muted_foreground })
                     .when(active, |this| this.bg(active_background))
-                    .when(wide, |this| this.w_full().justify_start())
+                    .when(wide, |this| this.w_full().justify_start().items_center())
                     .when(!wide, |this| this.min_w(px(112.0)).flex_1())
-                    .icon(icon)
+                    .icon(Icon::new(icon).size(px(15.0)))
                     .label(label)
                     .tooltip(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -32618,7 +32561,7 @@ impl FoundationSettings {
         let workflow = buttons.split_off(2);
         let group_label = |label| {
             div()
-                .px_2()
+                .px_3()
                 .pb_1()
                 .text_xs()
                 .font_medium()
@@ -34687,59 +34630,6 @@ fn settings_number_stepper(
         .into_any_element()
 }
 
-fn settings_defaults_restored(
-    appearance: &AppearanceUiState,
-    session: &SessionUiState,
-    desktop_behavior: &DesktopBehaviorUiState,
-) -> bool {
-    appearance == &AppearanceUiState::default()
-        && session == &SessionUiState::default()
-        && desktop_behavior == &DesktopBehaviorUiState::default()
-}
-
-fn remembered_workbench_layout_defaults(state: &DesktopUiStateV1) -> bool {
-    let defaults = vibex_desktop_model::WorkbenchUiState::default();
-    state.workbench.selected_file_path == defaults.selected_file_path
-        && state.workbench.selected_git_path == defaults.selected_git_path
-        && state.workbench.sidebar_visible == defaults.sidebar_visible
-        && state.workbench.preview_visible == defaults.preview_visible
-        && state.workbench.right_rail_visible == defaults.right_rail_visible
-        && state.workbench.sidebar_width == defaults.sidebar_width
-        && state.workbench.preview_width == defaults.preview_width
-        && state.workbench.right_rail_width == defaults.right_rail_width
-        && state.preview.focused_pane_id == defaults_preview_focused_pane_id()
-        && state.preview.pinned_tab_ids.is_empty()
-        && state.preview.split_sizes == vec![1.0]
-        && state.preview.layout == vibex_desktop_model::PreviewState::default()
-        && state.terminal == vibex_desktop_model::TerminalUiState::default()
-        && state.right_rail == vibex_desktop_model::RightRailUiState::default()
-        && state.composer.terminal_ids.is_empty()
-        && state.terminal_tab_titles.is_empty()
-        && state.agent_tab_order.is_empty()
-}
-
-fn defaults_preview_focused_pane_id() -> Option<String> {
-    vibex_desktop_model::PreviewUiState::default().focused_pane_id
-}
-
-fn all_settings_defaults_restored(state: &DesktopUiStateV1) -> bool {
-    settings_defaults_restored(&state.appearance, &state.session, &state.desktop_behavior)
-        && remembered_workbench_layout_defaults(state)
-        && state.workbench.remember_layout
-        && state.workbench.default_new_session_location == NewSessionLocation::CurrentCheckout
-        && state.sidebar.hierarchy_mode == SidebarHierarchyMode::Compact
-        && state.sidebar.project_location_preferences.is_empty()
-        && state.terminal_preferences == vibex_desktop_model::TerminalPreferencesUiState::default()
-        && state.keyboard.shortcuts.is_empty()
-        && state.composer.queue_send_mode == ComposerQueueSendMode::Automatic
-        && state.composer.message_send_key == MessageSendKey::Enter
-        && state.composer.default_runtime_selection.is_none()
-        && state.composer.runtime_selections_by_agent.is_empty()
-        && state.composer.runtime_selections_by_model.is_empty()
-        && state.session.auto_continue_project_ids.is_empty()
-        && state.session.auto_continue_session_overrides.is_empty()
-}
-
 fn adjust_u16(value: u16, delta: i16, minimum: u16, maximum: u16) -> u16 {
     (value as i32 + delta as i32).clamp(minimum as i32, maximum as i32) as u16
 }
@@ -35208,42 +35098,6 @@ mod tests {
             timeline_notification_kind(&[final_event], &preferences),
             Some(NotificationKind::Completed)
         );
-    }
-
-    #[test]
-    fn settings_default_detection_covers_every_new_preference_family() {
-        let state = DesktopUiStateV1::default();
-        assert!(all_settings_defaults_restored(&state));
-
-        let mut changed = state.clone();
-        changed.workbench.remember_layout = false;
-        assert!(!all_settings_defaults_restored(&changed));
-
-        let mut changed = state.clone();
-        changed.terminal_preferences.shell = Some("/bin/zsh".into());
-        assert!(!all_settings_defaults_restored(&changed));
-
-        let mut changed = state.clone();
-        changed
-            .keyboard
-            .shortcuts
-            .insert("open_settings".into(), "cmd-shift-,".into());
-        assert!(!all_settings_defaults_restored(&changed));
-
-        let mut changed = state.clone();
-        changed.composer.default_runtime_selection = Some(SessionRuntimeSelection::provider(
-            AgentId::parse("codex").unwrap(),
-            ProviderProfileId::parse("provider_codex_default").unwrap(),
-            "gpt-5",
-        ));
-        assert!(!all_settings_defaults_restored(&changed));
-
-        let mut changed = state;
-        changed
-            .session
-            .auto_continue_project_ids
-            .insert("project-1".into());
-        assert!(!all_settings_defaults_restored(&changed));
     }
 
     #[test]
@@ -40488,57 +40342,6 @@ mod tests {
     }
 
     #[test]
-    fn settings_restore_state_tracks_appearance_and_session_contracts() {
-        let mut appearance = AppearanceUiState::default();
-        let mut session = SessionUiState::default();
-        let mut desktop_behavior = DesktopBehaviorUiState::default();
-        assert!(settings_defaults_restored(
-            &appearance,
-            &session,
-            &desktop_behavior
-        ));
-
-        appearance.theme = ModelThemeMode::Dark;
-        assert!(!settings_defaults_restored(
-            &appearance,
-            &session,
-            &desktop_behavior
-        ));
-
-        appearance = AppearanceUiState::default();
-        appearance.reduced_motion = true;
-        assert!(!settings_defaults_restored(
-            &appearance,
-            &session,
-            &desktop_behavior
-        ));
-
-        appearance = AppearanceUiState::default();
-        session.turn_preview_rail = false;
-        assert!(!settings_defaults_restored(
-            &appearance,
-            &session,
-            &desktop_behavior
-        ));
-
-        session = SessionUiState::default();
-        session.enhanced_command_execution_display = true;
-        assert!(!settings_defaults_restored(
-            &appearance,
-            &session,
-            &desktop_behavior
-        ));
-
-        session = SessionUiState::default();
-        desktop_behavior.close_to_tray = false;
-        assert!(!settings_defaults_restored(
-            &appearance,
-            &session,
-            &desktop_behavior
-        ));
-    }
-
-    #[test]
     fn settings_control_sync_uses_parent_owned_state_snapshots() {
         let source = include_str!("app.rs");
         let sync_controls = source
@@ -40555,8 +40358,8 @@ mod tests {
 
     #[test]
     fn settings_dialog_keeps_navigation_outside_the_page_scroll_viewport() {
-        assert_eq!(SETTINGS_DIALOG_MAX_WIDTH, 864.0);
-        assert_eq!(SETTINGS_DIALOG_MAX_HEIGHT, 640.0);
+        assert_eq!(SETTINGS_DIALOG_MAX_WIDTH, 960.0);
+        assert_eq!(SETTINGS_DIALOG_MAX_HEIGHT, 720.0);
 
         let source = include_str!("app.rs");
         let open_settings = source
@@ -40583,7 +40386,7 @@ mod tests {
 
     #[test]
     fn settings_navigation_keeps_grouped_large_targets() {
-        assert_eq!(SETTINGS_NAVIGATION_WIDTH, 208.0);
+        assert_eq!(SETTINGS_NAVIGATION_WIDTH, 184.0);
         assert_eq!(SETTINGS_NAVIGATION_ROW_HEIGHT, 36.0);
         assert_eq!(SETTINGS_ROW_INLINE_MIN_VIEWPORT_WIDTH, 896.0);
 
@@ -40603,6 +40406,28 @@ mod tests {
         assert!(navigation.contains("\"支持\""));
         assert!(navigation.contains(".h(px(SETTINGS_NAVIGATION_ROW_HEIGHT))"));
         assert!(navigation.contains(".flex_wrap()"));
+    }
+
+    #[test]
+    fn settings_title_only_exposes_undo_for_changes_from_this_open() {
+        let source = include_str!("app.rs");
+        let title = source
+            .split_once("impl Render for SettingsDialogTitle")
+            .and_then(|(_, tail)| tail.split_once("\n#[derive(Debug, Clone, Copy"))
+            .map(|(body, _)| body)
+            .expect("settings title should remain inspectable");
+        assert!(title.contains("has_changes"));
+        assert!(title.contains("undo-settings-changes"));
+        assert!(!title.contains("settings_description"));
+        assert!(!title.contains("request_restore_defaults"));
+
+        let open_settings = source
+            .split_once("    fn open_settings(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn strings("))
+            .map(|(body, _)| body)
+            .expect("settings open flow should remain inspectable");
+        assert!(open_settings.contains("settings_snapshot = Some(self.ui_state.clone())"));
+        assert!(open_settings.contains("settings_snapshot = None"));
     }
 
     #[test]
