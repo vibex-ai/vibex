@@ -3120,6 +3120,12 @@ struct SidebarProjectMenuTarget {
     auto_continue_enabled: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SidebarContextMenuTarget {
+    Project(String),
+    Session(String),
+}
+
 #[derive(Clone)]
 struct NewSessionAgentDrag {
     agent_id: String,
@@ -3314,6 +3320,7 @@ pub struct VibexWorkbench {
     sidebar_hover_preview_open: bool,
     sidebar_hover_preview_suppressed_until: Option<Instant>,
     sidebar_hover_preview_close_task: Option<Task<()>>,
+    sidebar_context_menu_target: Option<SidebarContextMenuTarget>,
     sidebar_resize_drag: Option<SidebarResizeDragState>,
     right_panel_resize_drag: Option<RightPanelResizeDragState>,
     pair_button_hovered: bool,
@@ -3887,6 +3894,7 @@ impl VibexWorkbench {
             sidebar_hover_preview_open: false,
             sidebar_hover_preview_suppressed_until: None,
             sidebar_hover_preview_close_task: None,
+            sidebar_context_menu_target: None,
             sidebar_resize_drag: None,
             right_panel_resize_drag: None,
             pair_button_hovered: false,
@@ -14455,6 +14463,23 @@ impl VibexWorkbench {
         self.sidebar_hover_preview_close_task = None;
     }
 
+    fn set_sidebar_context_menu_target(
+        &mut self,
+        target: SidebarContextMenuTarget,
+        cx: &mut Context<Self>,
+    ) {
+        if self.sidebar_context_menu_target.as_ref() != Some(&target) {
+            self.sidebar_context_menu_target = Some(target);
+            cx.notify();
+        }
+    }
+
+    fn clear_sidebar_context_menu_target(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_context_menu_target.take().is_some() {
+            cx.notify();
+        }
+    }
+
     fn dismiss_sidebar_for_navigation(&mut self) {
         let hover_preview_was_open = self.sidebar_hover_preview_open;
         let next = sidebar_display_after_navigation(
@@ -16088,11 +16113,19 @@ impl VibexWorkbench {
             .rounded(px(8.0))
             .bg(if active {
                 cx.theme().sidebar_accent.opacity(0.60)
+            } else if context_menu_hovered {
+                cx.theme().sidebar_accent.opacity(0.45)
             } else {
                 cx.theme().transparent
             })
             .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.45)))
+            .on_hover(cx.listener(|this, hovered, _, cx| {
+                if *hovered {
+                    this.clear_sidebar_context_menu_target(cx);
+                }
+            }))
             .on_click(cx.listener(move |this, _, _, cx| {
+                this.clear_sidebar_context_menu_target(cx);
                 this.activate_and_toggle_project(
                     click_project_id.clone(),
                     workspace_for_click.clone(),
@@ -16100,6 +16133,12 @@ impl VibexWorkbench {
                 )
             }))
             .context_menu(move |menu, _, cx| {
+                let _ = context_menu_hover_entity.update(cx, |this, cx| {
+                    this.set_sidebar_context_menu_target(
+                        SidebarContextMenuTarget::Project(context_menu_project_id.clone()),
+                        cx,
+                    );
+                });
                 Self::build_sidebar_project_menu(
                     menu,
                     context_menu_target.clone(),
@@ -16282,6 +16321,11 @@ impl VibexWorkbench {
             .w_full()
             .min_w_0()
             .gap(px(6.0))
+            .on_hover(cx.listener(|this, hovered, _, cx| {
+                if *hovered {
+                    this.clear_sidebar_context_menu_target(cx);
+                }
+            }))
             .when_some(active_drop_after, |this, after| {
                 this.child(
                     div()
@@ -16596,6 +16640,8 @@ impl VibexWorkbench {
             cached_desired_agent_id,
         );
         let hover_group: SharedString = format!("sidebar-session-{session_id_string}").into();
+        let context_menu_hovered = self.sidebar_context_menu_target
+            == Some(SidebarContextMenuTarget::Session(session_id_string.clone()));
         let row_background = if selected {
             cx.theme().sidebar_accent.opacity(0.70)
         } else {
@@ -16707,6 +16753,8 @@ impl VibexWorkbench {
         let rename_session_id = session.id.clone();
         let delete_session_id = session.id.clone();
         let context_entity = cx.weak_entity();
+        let context_hover_entity = cx.weak_entity();
+        let context_menu_session_id = session_id_string.clone();
         let context_auto_continue_id = session.id.clone();
         let context_pin_id = session.id.clone();
         let context_rename_id = session.id.clone();
@@ -16800,7 +16848,11 @@ impl VibexWorkbench {
             .bg(if active_drop_after.is_some() {
                 cx.theme().tokens.drop_target.into()
             } else {
-                row_background
+                if context_menu_hovered {
+                    cx.theme().sidebar_accent.opacity(0.45)
+                } else {
+                    row_background
+                }
             })
             .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.45)))
             .when_some(active_drop_after, |this, after| {
@@ -16888,6 +16940,7 @@ impl VibexWorkbench {
                     .gap_2()
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        this.clear_sidebar_context_menu_target(cx);
                         if this.sidebar_batch_mode {
                             this.sidebar_state.toggle_selected(batch_id.clone());
                             cx.notify();
@@ -16896,6 +16949,12 @@ impl VibexWorkbench {
                         }
                     }))
                     .context_menu(move |menu, _, cx| {
+                        let _ = context_hover_entity.update(cx, |this, cx| {
+                            this.set_sidebar_context_menu_target(
+                                SidebarContextMenuTarget::Session(context_menu_session_id.clone()),
+                                cx,
+                            );
+                        });
                         let _ = context_entity
                             .update(cx, |this, _| this.retain_sidebar_hover_preview());
                         let auto_continue_entity = context_entity.clone();
