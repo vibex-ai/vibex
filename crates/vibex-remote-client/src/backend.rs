@@ -38,15 +38,18 @@ use vibex_core::{
     RemoteAgentAuthenticateContextResponse, RemoteAgentAuthenticationOperationRequest,
     RemoteAgentAuthenticationOperationResponse, RemoteAgentCancelContextAuthenticationRequest,
     RemoteAgentCancelRuntimeSwitchRequest, RemoteAgentCancelRuntimeSwitchResponse,
+    RemoteAgentCreateSessionRequest, RemoteAgentCreateSessionResponse,
     RemoteAgentDeepLinkResolveRequest, RemoteAgentDeepLinkResolveResponse,
     RemoteAgentInterruptRequest, RemoteAgentInterruptResponse, RemoteAgentLogoutAuthContextRequest,
     RemoteAgentMessageSubmissionRequest, RemoteAgentMessageSubmissionResponse,
-    RemoteAgentRefreshAuthModelsRequest, RemoteAgentRequest, RemoteAgentResolveElicitationRequest,
+    RemoteAgentRefreshAuthModelsRequest, RemoteAgentRenameSessionRequest,
+    RemoteAgentRenameSessionResponse, RemoteAgentRequest, RemoteAgentResolveElicitationRequest,
     RemoteAgentResolveElicitationResponse, RemoteAgentResolvePermissionRequest,
     RemoteAgentResolvePermissionResponse, RemoteAgentRuntimeOptionsRequest,
     RemoteAgentRuntimeOptionsResponse, RemoteAgentRuntimeSelectionRequest,
     RemoteAgentRuntimeSelectionResponse, RemoteAgentSendMessageRequest,
-    RemoteAgentSendMessageResponse, RemoteAgentSessionDetailRequest,
+    RemoteAgentSendMessageResponse, RemoteAgentSessionActionRequest,
+    RemoteAgentSessionActionResponse, RemoteAgentSessionDetailRequest,
     RemoteAgentSessionDetailResponse, RemoteAgentSessionListRequest,
     RemoteAgentSessionListResponse, RemoteAgentSetDesiredRuntimeRequest,
     RemoteAgentSetDesiredRuntimeResponse, RemoteAgentTimelineFetchRequest,
@@ -176,6 +179,12 @@ impl WebRemoteBackend {
         }
     }
 
+    pub fn permits_remote_action(&self, action: RemoteActionClass) -> bool {
+        self.transport.server_info().is_some_and(|info| {
+            info.device_permissions.is_empty() || info.device_permissions.contains(&action)
+        })
+    }
+
     pub fn update_capabilities_from_server(&self, info: &vibex_core::RemoteServerInfoV2) {
         if let Ok(mut capabilities) = self.capabilities.lock() {
             *capabilities = remote_capabilities(Some(info));
@@ -190,6 +199,28 @@ impl WebRemoteBackend {
 
     pub async fn disconnect(&self) -> BackendResult<()> {
         self.transport.disconnect().await
+    }
+
+    pub async fn list_agent_config_summaries(
+        &self,
+        include_disabled: bool,
+    ) -> BackendResult<Vec<vibex_core::RemoteAgentConfigSummary>> {
+        let payload = RemoteProviderRequest::ListAgentSummaries(
+            vibex_core::RemoteAgentConfigSummaryListRequest {
+                auth: self.auth(),
+                include_disabled,
+            },
+        );
+        let value = self
+            .rpc(
+                RemoteOperationKind::ProviderSettings,
+                payload,
+                None,
+                None,
+                vibex_core::RemoteTimeoutClass::Standard,
+            )
+            .await?;
+        Ok(decode::<vibex_core::RemoteAgentConfigSummaryListResponse>(value)?.agents)
     }
 
     pub async fn resolve_unknown_mutation(
@@ -486,12 +517,27 @@ impl AgentBackend for WebRemoteBackend {
 
     fn create_session(
         &self,
-        _request: MutationRequest<CreateAgentSessionRequest>,
+        request: MutationRequest<CreateAgentSessionRequest>,
     ) -> BackendFuture<'_, AgentSession> {
-        self.unsupported(
-            "remote_agent_session_create_unavailable",
-            "remote session creation is not exposed by this Gateway",
-        )
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteAgentRequest::CreateSession(RemoteAgentCreateSessionRequest {
+                auth: this.auth(),
+                request: request.payload,
+            });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<RemoteAgentCreateSessionResponse>(value)?.session)
+        })
     }
 
     fn fetch_timeline(&self, request: FetchTimelineRequest) -> BackendFuture<'_, TimelinePage> {
@@ -683,26 +729,87 @@ impl AgentBackend for WebRemoteBackend {
 
     fn rename_session(
         &self,
-        _request: MutationRequest<RenameAgentSessionRequest>,
+        request: MutationRequest<RenameAgentSessionRequest>,
     ) -> BackendFuture<'_, AgentSession> {
-        self.unsupported(
-            "remote_agent_session_rename_unavailable",
-            "remote session rename is not exposed by this Gateway",
-        )
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteAgentRequest::RenameSession(RemoteAgentRenameSessionRequest {
+                auth: this.auth(),
+                request: request.payload,
+            });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Interactive,
+                )
+                .await?;
+            Ok(decode::<RemoteAgentRenameSessionResponse>(value)?.session)
+        })
     }
 
-    fn archive_session(&self, _request: MutationRequest<VibexSessionId>) -> BackendFuture<'_, ()> {
-        self.unsupported(
-            "remote_agent_session_archive_unavailable",
-            "remote session archive is not exposed by this Gateway",
-        )
+    fn archive_session(&self, request: MutationRequest<VibexSessionId>) -> BackendFuture<'_, ()> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteAgentRequest::ArchiveSession(RemoteAgentSessionActionRequest {
+                auth: this.auth(),
+                session_id: request.payload,
+            });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            let response = decode::<RemoteAgentSessionActionResponse>(value)?;
+            if response.completed {
+                Ok(())
+            } else {
+                Err(BackendError::failed(
+                    "remote_agent_session_archive_failed",
+                    "the desktop did not confirm session archive",
+                ))
+            }
+        })
     }
 
-    fn delete_session(&self, _request: MutationRequest<VibexSessionId>) -> BackendFuture<'_, ()> {
-        self.unsupported(
-            "remote_agent_session_delete_unavailable",
-            "remote session deletion is not exposed by this Gateway",
-        )
+    fn delete_session(&self, request: MutationRequest<VibexSessionId>) -> BackendFuture<'_, ()> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteAgentRequest::DeleteSession(RemoteAgentSessionActionRequest {
+                auth: this.auth(),
+                session_id: request.payload,
+            });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            let response = decode::<RemoteAgentSessionActionResponse>(value)?;
+            if response.completed {
+                Ok(())
+            } else {
+                Err(BackendError::failed(
+                    "remote_agent_session_delete_failed",
+                    "the desktop did not confirm session deletion",
+                ))
+            }
+        })
     }
 
     fn list_runtime_options(&self) -> BackendFuture<'_, SessionRuntimeOptionCatalog> {
@@ -2356,6 +2463,10 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
                     permits(RemoteActionClass::ReadAgentSession),
                 ),
                 (
+                    AgentCreateSession,
+                    permits(RemoteActionClass::MutateAgentSession),
+                ),
+                (
                     AgentFetchTimeline,
                     permits(RemoteActionClass::ReadAgentSession),
                 ),
@@ -2369,6 +2480,10 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
                 ),
                 (
                     AgentInterrupt,
+                    permits(RemoteActionClass::MutateAgentSession),
+                ),
+                (
+                    AgentManageSession,
                     permits(RemoteActionClass::MutateAgentSession),
                 ),
                 (
@@ -2564,6 +2679,8 @@ mod tests {
     #[derive(Clone)]
     struct MockTransport {
         events: Arc<Mutex<VecDeque<RemoteTransportEvent>>>,
+        responses: Arc<Mutex<VecDeque<vibex_core::RemoteRpcResponseV2>>>,
+        requests: Arc<Mutex<Vec<vibex_core::RemoteRpcRequestV2>>>,
         server_info: Arc<Mutex<Option<vibex_core::RemoteServerInfoV2>>>,
     }
 
@@ -2571,8 +2688,25 @@ mod tests {
         fn new(events: impl IntoIterator<Item = RemoteTransportEvent>) -> Self {
             Self {
                 events: Arc::new(Mutex::new(events.into_iter().collect())),
+                responses: Arc::new(Mutex::new(VecDeque::new())),
+                requests: Arc::new(Mutex::new(Vec::new())),
                 server_info: Arc::new(Mutex::new(None)),
             }
+        }
+
+        fn with_responses(
+            responses: impl IntoIterator<Item = vibex_core::RemoteRpcResponseV2>,
+        ) -> Self {
+            Self {
+                events: Arc::new(Mutex::new(VecDeque::new())),
+                responses: Arc::new(Mutex::new(responses.into_iter().collect())),
+                requests: Arc::new(Mutex::new(Vec::new())),
+                server_info: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        fn requests(&self) -> Vec<vibex_core::RemoteRpcRequestV2> {
+            self.requests.lock().expect("mock request lock").clone()
         }
 
         fn set_server_info(&self, server_info: vibex_core::RemoteServerInfoV2) {
@@ -2618,9 +2752,22 @@ mod tests {
 
         fn request(
             &self,
-            _request: vibex_core::RemoteRpcRequestV2,
+            request: vibex_core::RemoteRpcRequestV2,
         ) -> BackendFuture<'_, vibex_core::RemoteRpcResponseV2> {
-            Self::unavailable()
+            self.requests
+                .lock()
+                .expect("mock request lock")
+                .push(request);
+            let response = self
+                .responses
+                .lock()
+                .expect("mock response lock")
+                .pop_front();
+            Box::pin(async move {
+                response.ok_or_else(|| {
+                    BackendError::unsupported("mock_unavailable", "mock operation is unavailable")
+                })
+            })
         }
 
         fn subscribe(
@@ -2798,6 +2945,34 @@ mod tests {
     }
 
     #[test]
+    fn remote_agent_session_lifecycle_capabilities_follow_device_permissions() {
+        let full = remote_capabilities(Some(&full_control_server_info(&["agent"])));
+        assert!(full.agent.supports(BackendOperation::AgentCreateSession));
+        assert!(full.agent.supports(BackendOperation::AgentManageSession));
+
+        let mut read_only = full_control_server_info(&["agent"]);
+        read_only.device_permissions = vibex_core::remote_permissions_for_level(
+            vibex_core::RemoteDevicePermissionLevel::ReadOnly,
+        );
+        let read_only = remote_capabilities(Some(&read_only));
+        assert!(
+            read_only
+                .agent
+                .supports(BackendOperation::AgentListSessions)
+        );
+        assert!(
+            !read_only
+                .agent
+                .supports(BackendOperation::AgentCreateSession)
+        );
+        assert!(
+            !read_only
+                .agent
+                .supports(BackendOperation::AgentManageSession)
+        );
+    }
+
+    #[test]
     fn negotiated_remote_exposes_worktree_read_but_never_lifecycle_mutation() {
         let info = full_control_server_info(&["git", "git_worktree_read"]);
         let snapshot = remote_capabilities(Some(&info));
@@ -2889,6 +3064,59 @@ mod tests {
         assert!(!format!("{error:?}").contains(secret));
     }
 
+    #[tokio::test]
+    async fn remote_agent_config_summaries_use_the_redacted_provider_projection() {
+        let expected = vibex_core::RemoteAgentConfigSummary {
+            id: vibex_core::AgentId::parse("codex").unwrap(),
+            label: "Codex".to_string(),
+            enabled: true,
+            installed: true,
+            configured: true,
+            config_status: vibex_core::AgentConfigStatus::Configured,
+            runtime_status: vibex_core::AgentRuntimeStatus::Ready,
+            model_count: 2,
+            updated_at_ms: Some(11),
+        };
+        let transport = Arc::new(MockTransport::with_responses([
+            vibex_core::RemoteRpcResponseV2 {
+                request_id: vibex_core::RequestId::new(),
+                correlation_id: None,
+                payload: Some(
+                    serde_json::to_value(vibex_core::RemoteAgentConfigSummaryListResponse {
+                        agents: vec![expected.clone()],
+                    })
+                    .unwrap(),
+                ),
+                error: None,
+                metadata: Default::default(),
+                completed_at_ms: unix_timestamp_ms(),
+            },
+        ]));
+        let backend = WebRemoteBackend::new(
+            transport.clone(),
+            RemoteAuthProof {
+                device_id: vibex_core::DeviceId::new(),
+                auth_token: "test-token".to_string(),
+            },
+        );
+
+        assert_eq!(
+            backend.list_agent_config_summaries(true).await.unwrap(),
+            vec![expected]
+        );
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].operation, "provider_settings");
+        assert_eq!(
+            requests[0].payload.as_ref().unwrap()["type"],
+            "list_agent_summaries"
+        );
+        assert_eq!(
+            requests[0].payload.as_ref().unwrap()["data"]["includeDisabled"],
+            true
+        );
+    }
+
     #[test]
     fn remote_management_exposes_redacted_profiles_health_and_runtime_probes() {
         let snapshot = remote_capabilities(None);
@@ -2940,6 +3168,30 @@ mod tests {
                 .management
                 .supports(BackendOperation::ManagementRuntimeProbeMutate)
         );
+    }
+
+    #[test]
+    fn negotiated_action_permissions_distinguish_provider_reads_from_mutations() {
+        let transport = Arc::new(MockTransport::new([]));
+        let mut info = full_control_server_info(&["provider_settings"]);
+        info.device_permissions = vec![RemoteActionClass::ReadProviderSettings];
+        transport.set_server_info(info.clone());
+        let backend = WebRemoteBackend::new(
+            transport.clone(),
+            RemoteAuthProof {
+                device_id: vibex_core::DeviceId::new(),
+                auth_token: "test-token".to_string(),
+            },
+        );
+
+        assert!(backend.permits_remote_action(RemoteActionClass::ReadProviderSettings));
+        assert!(!backend.permits_remote_action(RemoteActionClass::MutateProviderSettings));
+
+        info.device_permissions = vibex_core::remote_permissions_for_level(
+            vibex_core::RemoteDevicePermissionLevel::FullControl,
+        );
+        transport.set_server_info(info);
+        assert!(backend.permits_remote_action(RemoteActionClass::MutateProviderSettings));
     }
 
     #[test]

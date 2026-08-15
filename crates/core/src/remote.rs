@@ -4,9 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::agent::{
-    AgentSession, AgentSessionSummary, ContinueAgentTurnRequest, FetchTimelineRequest,
-    GetMessageSubmissionRequest, MessageSubmissionState, ResolveElicitationRequest,
-    ResolvePermissionRequest, SendAgentMessageRequest,
+    AgentSession, AgentSessionSummary, ContinueAgentTurnRequest, CreateAgentSessionRequest,
+    FetchTimelineRequest, GetMessageSubmissionRequest, MessageSubmissionState,
+    RenameAgentSessionRequest, ResolveElicitationRequest, ResolvePermissionRequest,
+    SendAgentMessageRequest,
 };
 use crate::agent_auth::{
     AgentAuthCatalog, AgentAuthContext, AgentAuthContextAuthenticateRequest,
@@ -15,6 +16,7 @@ use crate::agent_auth::{
     AgentAuthContextRefreshModelsRequest, AgentAuthContextVerifyRequest,
     AgentAuthenticationOperation,
 };
+use crate::agent_config::{AgentConfigStatus, AgentId, AgentRuntimeStatus, AgentSnapshotEntry};
 use crate::agent_provider_runtime::{
     AgentRuntimeProbeCancelRequest, AgentRuntimeProbeListRequest, AgentRuntimeProbeRecord,
     AgentRuntimeProbeStartRequest,
@@ -380,6 +382,10 @@ pub struct RemoteAuditListResponse {
 pub enum RemoteAgentOperationKind {
     ListSessions,
     GetSession,
+    CreateSession,
+    RenameSession,
+    ArchiveSession,
+    DeleteSession,
     FetchTimeline,
     ResolveOpaqueLocator,
     ListRuntimeOptions,
@@ -436,6 +442,45 @@ pub struct RemoteAgentSessionDetailRequest {
 pub struct RemoteAgentSessionDetailResponse {
     pub session: AgentSession,
     pub latest_timeline: TimelinePage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentCreateSessionRequest {
+    pub auth: RemoteAuthProof,
+    pub request: CreateAgentSessionRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentCreateSessionResponse {
+    pub session: AgentSession,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentRenameSessionRequest {
+    pub auth: RemoteAuthProof,
+    pub request: RenameAgentSessionRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentRenameSessionResponse {
+    pub session: AgentSession,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentSessionActionRequest {
+    pub auth: RemoteAuthProof,
+    pub session_id: VibexSessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentSessionActionResponse {
+    pub completed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -811,6 +856,10 @@ pub struct RemoteAgentCatchUpResponse {
 pub enum RemoteAgentRequest {
     ListSessions(RemoteAgentSessionListRequest),
     GetSession(RemoteAgentSessionDetailRequest),
+    CreateSession(RemoteAgentCreateSessionRequest),
+    RenameSession(RemoteAgentRenameSessionRequest),
+    ArchiveSession(RemoteAgentSessionActionRequest),
+    DeleteSession(RemoteAgentSessionActionRequest),
     FetchTimeline(RemoteAgentTimelineFetchRequest),
     ResolveOpaqueLocator(RemoteAgentDeepLinkResolveRequest),
     ListRuntimeOptions(RemoteAgentRuntimeOptionsRequest),
@@ -845,6 +894,10 @@ impl RemoteAgentRequest {
         match self {
             Self::ListSessions(_) => RemoteAgentOperationKind::ListSessions,
             Self::GetSession(_) => RemoteAgentOperationKind::GetSession,
+            Self::CreateSession(_) => RemoteAgentOperationKind::CreateSession,
+            Self::RenameSession(_) => RemoteAgentOperationKind::RenameSession,
+            Self::ArchiveSession(_) => RemoteAgentOperationKind::ArchiveSession,
+            Self::DeleteSession(_) => RemoteAgentOperationKind::DeleteSession,
             Self::FetchTimeline(_) => RemoteAgentOperationKind::FetchTimeline,
             Self::ResolveOpaqueLocator(_) => RemoteAgentOperationKind::ResolveOpaqueLocator,
             Self::ListRuntimeOptions(_) => RemoteAgentOperationKind::ListRuntimeOptions,
@@ -1321,6 +1374,7 @@ impl RemoteWorkbenchRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteProviderOperationKind {
+    ListAgentSummaries,
     ListProfiles,
     PreviewInjection,
     ProjectionCapability,
@@ -1333,6 +1387,52 @@ pub enum RemoteProviderOperationKind {
     RunHealthProbes,
     ListUsageSummaries,
     ListFailoverRecommendations,
+}
+
+/// Redacted Agent configuration state for remote management surfaces. Command
+/// lines, environment values, native paths, parameters, and diagnostics are
+/// intentionally absent from this wire type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentConfigSummary {
+    pub id: AgentId,
+    pub label: String,
+    pub enabled: bool,
+    pub installed: bool,
+    pub configured: bool,
+    pub config_status: AgentConfigStatus,
+    pub runtime_status: AgentRuntimeStatus,
+    pub model_count: usize,
+    pub updated_at_ms: Option<i64>,
+}
+
+impl From<&AgentSnapshotEntry> for RemoteAgentConfigSummary {
+    fn from(agent: &AgentSnapshotEntry) -> Self {
+        Self {
+            id: agent.id.clone(),
+            label: agent.label.clone(),
+            enabled: agent.enabled,
+            installed: agent.installed,
+            configured: agent.configured,
+            config_status: agent.config_status,
+            runtime_status: agent.runtime_status,
+            model_count: agent.models.len(),
+            updated_at_ms: agent.updated_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentConfigSummaryListRequest {
+    pub auth: RemoteAuthProof,
+    pub include_disabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentConfigSummaryListResponse {
+    pub agents: Vec<RemoteAgentConfigSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1492,6 +1592,7 @@ pub struct RemoteProviderFailoverRecommendationListResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum RemoteProviderRequest {
+    ListAgentSummaries(RemoteAgentConfigSummaryListRequest),
     ListProfiles(RemoteProviderProfileListRequest),
     PreviewInjection(RemoteProviderInjectionPreviewRequest),
     ProjectionCapability(RemoteAgentProjectionCapabilityRequest),
@@ -1509,6 +1610,7 @@ pub enum RemoteProviderRequest {
 impl RemoteProviderRequest {
     pub const fn operation_kind(&self) -> RemoteProviderOperationKind {
         match self {
+            Self::ListAgentSummaries(_) => RemoteProviderOperationKind::ListAgentSummaries,
             Self::ListProfiles(_) => RemoteProviderOperationKind::ListProfiles,
             Self::PreviewInjection(_) => RemoteProviderOperationKind::PreviewInjection,
             Self::ProjectionCapability(_) => RemoteProviderOperationKind::ProjectionCapability,
@@ -1745,7 +1847,7 @@ mod tests {
     use super::*;
     use crate::{
         AgentId, ProviderProfileId, RuntimeSelectionInteraction, RuntimeSwitchId,
-        SessionRuntimeSelection,
+        SessionRuntimeSelection, WorkspaceMode,
     };
 
     #[test]
@@ -1865,6 +1967,71 @@ mod tests {
             "auth-token-returned-once"
         );
         assert!(!format!("{request:?}").contains("auth-token-returned-once"));
+    }
+
+    #[test]
+    fn remote_agent_session_mutations_use_stable_tags_and_operation_kinds() {
+        let auth = RemoteAuthProof {
+            device_id: DeviceId::new(),
+            auth_token: "session-mutation-token".to_string(),
+        };
+        let session_id = VibexSessionId::new();
+        let requests = [
+            (
+                RemoteAgentRequest::CreateSession(RemoteAgentCreateSessionRequest {
+                    auth: auth.clone(),
+                    request: CreateAgentSessionRequest {
+                        runtime: SessionRuntimeSelection::provider(
+                            AgentId::parse("codex").unwrap(),
+                            ProviderProfileId::new(),
+                            "gpt-5",
+                        ),
+                        workspace_root: "/published/workspace".to_string(),
+                        workspace_mode: WorkspaceMode::CurrentCheckout,
+                        title: Some("Mobile session".to_string()),
+                        safety: None,
+                    },
+                }),
+                RemoteAgentOperationKind::CreateSession,
+                "create_session",
+            ),
+            (
+                RemoteAgentRequest::RenameSession(RemoteAgentRenameSessionRequest {
+                    auth: auth.clone(),
+                    request: RenameAgentSessionRequest {
+                        session_id: session_id.clone(),
+                        title: "Renamed".to_string(),
+                    },
+                }),
+                RemoteAgentOperationKind::RenameSession,
+                "rename_session",
+            ),
+            (
+                RemoteAgentRequest::ArchiveSession(RemoteAgentSessionActionRequest {
+                    auth: auth.clone(),
+                    session_id: session_id.clone(),
+                }),
+                RemoteAgentOperationKind::ArchiveSession,
+                "archive_session",
+            ),
+            (
+                RemoteAgentRequest::DeleteSession(RemoteAgentSessionActionRequest {
+                    auth,
+                    session_id,
+                }),
+                RemoteAgentOperationKind::DeleteSession,
+                "delete_session",
+            ),
+        ];
+
+        for (request, operation, tag) in requests {
+            assert_eq!(request.operation_kind(), operation);
+            let value = serde_json::to_value(&request).unwrap();
+            assert_eq!(value["type"], tag);
+            let decoded: RemoteAgentRequest = serde_json::from_value(value).unwrap();
+            assert_eq!(decoded, request);
+            assert!(!format!("{request:?}").contains("session-mutation-token"));
+        }
     }
 
     #[test]
@@ -2126,6 +2293,51 @@ mod tests {
             "auth-token-returned-once"
         );
         assert!(json["data"]["request"]["providerProfileIds"].is_null());
+    }
+
+    #[test]
+    fn remote_agent_config_summary_excludes_private_agent_fields() {
+        let request =
+            RemoteProviderRequest::ListAgentSummaries(RemoteAgentConfigSummaryListRequest {
+                auth: RemoteAuthProof {
+                    device_id: DeviceId::new(),
+                    auth_token: "agent-summary-auth-token".to_string(),
+                },
+                include_disabled: true,
+            });
+        assert_eq!(
+            request.operation_kind(),
+            RemoteProviderOperationKind::ListAgentSummaries
+        );
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["type"],
+            "list_agent_summaries"
+        );
+
+        let response = RemoteAgentConfigSummaryListResponse {
+            agents: vec![RemoteAgentConfigSummary {
+                id: AgentId::parse("codex").unwrap(),
+                label: "Codex".to_string(),
+                enabled: true,
+                installed: true,
+                configured: true,
+                config_status: AgentConfigStatus::Configured,
+                runtime_status: AgentRuntimeStatus::Ready,
+                model_count: 3,
+                updated_at_ms: Some(7),
+            }],
+        };
+        let json = serde_json::to_value(response).unwrap();
+        let agent = &json["agents"][0];
+        for private_field in [
+            "command",
+            "env",
+            "params",
+            "nativeConfigPaths",
+            "diagnostics",
+        ] {
+            assert!(agent.get(private_field).is_none());
+        }
     }
 
     #[test]

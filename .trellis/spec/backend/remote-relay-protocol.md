@@ -1771,6 +1771,181 @@ Remote UI -> list_runtime_options (ReadAgentSession)
           -> poll authoritative selection/submission state
 ```
 
+## Scenario: Native Mobile Remote Workbench And Agent Lifecycle
+
+### 1. Scope / Trigger
+
+- Trigger: native mobile exposes Files, Git, Terminal, Provider/Agent status,
+  runtime selection, and Agent session create/rename/archive/delete against a
+  paired desktop.
+- The desktop runtime remains the only state authority. Native mobile must not
+  open a local workspace, access its own filesystem or Git repository, own a
+  PTY, launch an Agent, or read/write native Provider configuration directly.
+- This scenario refines the earlier workbench, Provider, and seamless runtime
+  contracts with the mobile interaction and concurrency rules required for a
+  production client.
+
+### 2. Signatures
+
+```text
+RemoteAgentRequest +=
+  create_session(RemoteAgentCreateSessionRequest {
+    auth, request: CreateAgentSessionRequest
+  }) -> RemoteAgentCreateSessionResponse { session }
+  rename_session(RemoteAgentRenameSessionRequest {
+    auth, request: RenameAgentSessionRequest
+  }) -> RemoteAgentRenameSessionResponse { session }
+  archive_session(RemoteAgentSessionActionRequest { auth, session_id })
+    -> RemoteAgentSessionActionResponse { completed }
+  delete_session(RemoteAgentSessionActionRequest { auth, session_id })
+    -> RemoteAgentSessionActionResponse { completed }
+
+RemoteProviderRequest +=
+  list_agent_summaries(RemoteAgentConfigSummaryListRequest {
+    auth, include_disabled
+  }) -> RemoteAgentConfigSummaryListResponse {
+    agents: Vec<RemoteAgentConfigSummary>
+  }
+
+RemoteAgentConfigSummary {
+  id, label, enabled, installed, configured, config_status,
+  runtime_status, model_count, updated_at_ms
+}
+
+FileReadResponse { ..., content_revision }
+FileWriteRequest { ..., expected_revision, encoding, line_ending }
+
+RemoteMutationContract {
+  idempotency_key, expected_revision, expected_generation
+}
+```
+
+### 3. Contracts
+
+- Session creation accepts only a workspace already published by the desktop.
+  `crates/remote` canonicalizes the requested root, finds an active
+  `WorkspaceRepository::list()` entry with both the same canonical root and
+  `WorkspaceMode`, and replaces the client-supplied root with the stored
+  authoritative root before calling `AgentManager::create_session`.
+- Session create, rename, archive, and delete require
+  `RemoteActionClass::MutateAgentSession` (`full_control`). Their audit rows
+  contain only operation, stable target id, and success metadata; titles,
+  workspace roots, auth tokens, and runtime configuration are excluded.
+- File saves carry the revision returned by the last desktop read. A
+  `file_external_revision_changed` conflict preserves both the unsaved mobile
+  buffer and the newly read desktop version. The UI offers an explicit
+  `Use desktop version` action; it must never silently overwrite either side.
+- Git stage/unstage and commit use canonical backend mutations. Commit requires
+  a visible confirmation step after the user enters the message.
+- Terminal create/attach/input/resize/kill always target the desktop
+  `TerminalManager`. Attach uses the current transport generation/session epoch
+  and a sequence cursor; a generation mismatch or stream gap requires a reset
+  snapshot. Killing a terminal requires confirmation, and confirmation is
+  rejected if the selected terminal id changed meanwhile.
+- Provider/Agent management returns redacted projections only.
+  `RemoteAgentConfigSummary` is deliberately distinct from
+  `AgentSnapshotEntry`; command lines, environment values, parameters, native
+  paths, diagnostics, raw Provider records, and every `Secret` value are
+  desktop-only and must not be added to a remote DTO or debug/audit payload.
+- Provider health probes, runtime probe mutations, session lifecycle, runtime
+  changes, file writes, Git mutations, and terminal mutations require
+  `full_control`. Read-only devices may render published summaries and
+  read-only workbench state but must not receive an enabled mutation control.
+- Mobile management and runtime requests carry local monotonically increasing
+  request generations. A completion is applied only when its generation and,
+  for runtime calls, its session id still match. Refresh, workspace/session
+  changes, and suspend invalidate older completions and clear only the busy
+  state owned by the invalidated generation.
+- Runtime selectors render unavailable Catalog options as disabled. Reasoning,
+  mode, toggle, select, and optional string features expose `Default` by
+  omitting the override. Whitespace-only string input removes an override;
+  any non-empty input is preserved byte-for-byte and is never replaced by the
+  Catalog display default. Applying a runtime sends the authoritative session
+  and selection revisions with a fresh idempotency key.
+
+### 4. Validation & Error Matrix
+
+- Session root cannot be canonicalized, is not published, has a different
+  `WorkspaceMode`, or is no longer active ->
+  `validation/remote_agent_workspace_not_published` with no path diagnostic.
+- `read_only` or `approve_only` attempts any lifecycle/workbench/Provider/
+  runtime mutation -> `permission/remote_permission_denied` before side effects.
+- File save revision differs from desktop ->
+  `conflict/file_external_revision_changed`; preserve both versions for an
+  explicit user choice.
+- File conflict version was invalidated before reload ->
+  `conflict/mobile_file_conflict_version_unavailable`.
+- Terminal selection changes after close prompt ->
+  `conflict/mobile_terminal_close_target_changed` and do not kill a terminal.
+- Runtime Catalog option is unavailable -> it cannot be selected or applied.
+- Runtime string override is longer than 256 bytes ->
+  `mobile_runtime_feature_value_too_long` and do not submit.
+- Stale runtime session/selection revisions -> canonical CAS conflict; refresh
+  Catalog and selection state rather than treating the draft as committed.
+- Async completion generation or session fence does not match -> discard the
+  completion without changing the current surface, error, or authoritative
+  state.
+
+### 5. Good/Base/Bad Cases
+
+- Good: a full-control device opens a published workspace, edits a revisioned
+  file, stages and commits reviewed changes, operates a desktop terminal,
+  checks Provider health, and switches the selected session runtime; all state
+  converges from desktop responses and audit summaries remain redacted.
+- Base: a read-only device browses files, Git state, terminal snapshots,
+  redacted Agent/Provider summaries, and the runtime Catalog with mutation
+  controls disabled.
+- Bad: mobile creates a session for an arbitrary native path, serializes an
+  Agent command/env record, applies a stale runtime response to a newly selected
+  session, overwrites a conflicting file, or kills a terminal with one tap.
+
+### 6. Tests Required
+
+- `vibex-core`: serde round trips and stable operation tags for Agent lifecycle
+  requests; `RemoteAgentConfigSummary` serialization proves private Agent
+  fields are absent.
+- `vibex-remote`: lifecycle permission and redacted audit coverage; published
+  workspace canonical-root plus `WorkspaceMode` acceptance; unpublished,
+  mismatched, and malicious-root rejection without path diagnostics.
+- `vibex-remote-client`: lifecycle dispatch/capability mapping, mutation
+  revision/generation propagation, and decoded Agent summaries remain the
+  dedicated redacted DTO.
+- `vibex-ui`: revision-conflict tests preserve local and server buffers and
+  support explicit reload; shared workbench controllers retain their existing
+  capability and stale-completion tests.
+- `vibex-mobile`: native build/tests cover multiline editing, lifecycle
+  confirmations, generation/session fences, runtime defaults/unavailable
+  options, and terminal close confirmation.
+- Required integration gates after contract changes: targeted package tests,
+  no-dependency Clippy with warnings denied, `pnpm check:mobile-native`, graph
+  and license checks, and the local Relay smoke test.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+mobile path / secret-bearing AgentSnapshotEntry / local draft
+  -> open local files or PTY
+  -> mutate without full_control or confirmation
+  -> accept whichever async response completes last
+```
+
+This makes mobile a second runtime authority, leaks desktop-only configuration,
+and permits stale or destructive actions against the wrong resource.
+
+#### Correct
+
+```text
+paired mobile request
+  -> authenticate + authorize on desktop
+  -> resolve a published workspace and canonical service DTO
+  -> execute through DesktopRuntime-owned services
+  -> return a redacted, revisioned response
+  -> apply only when generation and resource fences still match
+  -> require explicit resolution for conflicts and destructive actions
+```
+
 ## Scenario: Remote Agent Default Account Authentication
 
 ### 1. Scope / Trigger

@@ -13,15 +13,15 @@ use gpui::{
     prelude::*, px, rgb, svg, uniform_list,
 };
 use vibex_backend::{
-    AgentBackend as _, BackendError, BackendEvent, BackendResult, MutationRequest,
-    WorkspaceBackend as _,
+    AgentBackend as _, BackendError, BackendEvent, BackendFuture, BackendOperation, BackendResult,
+    MutationRequest, WorkspaceBackend as _,
 };
 use vibex_core::{
     AgentSessionState, ContinueAgentTurnRequest, CreateAgentSessionRequest, ElicitationFieldKind,
     ElicitationResolutionAction, PermissionResolution, PermissionResponseKind,
-    PermissionRiskCategory, RequestId, ResolvePermissionRequest, RuntimeOptionAvailability,
-    SendAgentMessageRequest, TimelinePayload, VibexSessionId, WorkspaceMode, WorkspaceRecord,
-    agent_session_turn_requires_continuation, unix_timestamp_ms,
+    PermissionRiskCategory, RenameAgentSessionRequest, RequestId, ResolvePermissionRequest,
+    RuntimeOptionAvailability, SendAgentMessageRequest, TimelinePayload, VibexSessionId,
+    WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation, unix_timestamp_ms,
 };
 use vibex_desktop_model::{TimelineConversationTurn, TimelineRow, TimelineRowKind};
 use vibex_remote_client::WebRemoteBackend;
@@ -31,10 +31,12 @@ use vibex_ui::{
 };
 
 use crate::input::{
-    Backspace, Copy, Cut, Delete, Left, Paste, Right, SelectAll, SelectLeft, SelectRight, TextInput,
+    Backspace, Copy, Cut, Delete, Down, Enter, Left, Paste, Right, SelectAll, SelectDown,
+    SelectLeft, SelectRight, SelectUp, TextInput, Up,
 };
 use crate::pairing::{MobileCredentialBundle, claim_pairing_link};
 use crate::storage::CredentialStorage;
+use crate::workbench::{MobileWorkbench, WorkbenchSurface};
 use crate::{markdown, scanner, theme};
 
 const TIMELINE_NEAR_BOTTOM_PX: f32 = 96.0;
@@ -55,6 +57,25 @@ enum RootMode {
     Pairing,
     Connecting,
     Workspace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionActionKind {
+    Rename,
+    Archive,
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionActionPrompt {
+    kind: SessionActionKind,
+    session_id: VibexSessionId,
+    current_title: String,
+}
+
+enum SessionMutationOutcome {
+    Renamed(Box<vibex_core::AgentSession>),
+    Removed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,10 +109,15 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("backspace", Backspace, Some("MobileTextInput")),
         KeyBinding::new("delete", Delete, Some("MobileTextInput")),
+        KeyBinding::new("enter", Enter, Some("MobileTextInput")),
         KeyBinding::new("left", Left, Some("MobileTextInput")),
         KeyBinding::new("right", Right, Some("MobileTextInput")),
+        KeyBinding::new("up", Up, Some("MobileTextInput")),
+        KeyBinding::new("down", Down, Some("MobileTextInput")),
         KeyBinding::new("shift-left", SelectLeft, Some("MobileTextInput")),
         KeyBinding::new("shift-right", SelectRight, Some("MobileTextInput")),
+        KeyBinding::new("shift-up", SelectUp, Some("MobileTextInput")),
+        KeyBinding::new("shift-down", SelectDown, Some("MobileTextInput")),
         KeyBinding::new("cmd-a", SelectAll, Some("MobileTextInput")),
         KeyBinding::new("ctrl-a", SelectAll, Some("MobileTextInput")),
         KeyBinding::new("cmd-v", Paste, Some("MobileTextInput")),
@@ -108,6 +134,8 @@ pub struct MobileApp {
     mode: RootMode,
     backend: Option<Arc<WebRemoteBackend>>,
     controller: Option<AgentWorkflowController>,
+    workbench: Option<Entity<MobileWorkbench>>,
+    workbench_open: bool,
     composer_input: Entity<TextInput>,
     timeline_turns: Arc<Vec<TimelineConversationTurn>>,
     timeline_list: ListState,
@@ -127,6 +155,9 @@ pub struct MobileApp {
     pairing_busy: bool,
     operation_busy: bool,
     new_session_busy: bool,
+    session_action: Option<SessionActionPrompt>,
+    session_action_input: Entity<TextInput>,
+    session_action_busy: bool,
     notice: Option<String>,
     error: Option<BackendError>,
     tasks: Vec<Task<()>>,
@@ -146,6 +177,8 @@ impl MobileApp {
             mode,
             backend: None,
             controller: None,
+            workbench: None,
+            workbench_open: false,
             composer_input: cx.new(|cx| TextInput::new("Message Vibex", cx)),
             timeline_turns: Arc::new(Vec::new()),
             timeline_list: timeline_list_state(0),
@@ -165,6 +198,9 @@ impl MobileApp {
             pairing_busy: false,
             operation_busy: false,
             new_session_busy: false,
+            session_action: None,
+            session_action_input: cx.new(|cx| TextInput::new("Session name", cx)),
+            session_action_busy: false,
             notice: None,
             error: stored.as_ref().err().cloned(),
             tasks: Vec::new(),
@@ -203,6 +239,10 @@ impl MobileApp {
     fn install_bundle(&mut self, bundle: MobileCredentialBundle, cx: &mut Context<Self>) {
         match bundle.backend() {
             Ok(backend) => {
+                if let Some(workbench) = self.workbench.take() {
+                    workbench.update(cx, |workbench, _| workbench.suspend());
+                }
+                self.workbench_open = false;
                 self.mode = RootMode::Connecting;
                 self.error = None;
                 self.backend = Some(backend.clone());
@@ -377,9 +417,16 @@ impl MobileApp {
     }
 
     fn refresh_sessions(&mut self, cx: &mut Context<Self>) {
+        let capabilities = self
+            .backend
+            .as_ref()
+            .map(|backend| backend.capability_snapshot().agent);
         let Some(controller) = self.controller.as_mut() else {
             return;
         };
+        if let Some(capabilities) = capabilities {
+            controller.set_capabilities(capabilities);
+        }
         controller.begin_sessions_refresh();
         let future = controller.list_sessions(false);
         let runner = gpui_tokio::Tokio::spawn(cx, future);
@@ -447,6 +494,29 @@ impl MobileApp {
                             .into_iter()
                             .map(|summary| summary.workspace)
                             .collect();
+                        let active_workspace = this
+                            .controller
+                            .as_ref()
+                            .and_then(|controller| controller.state.active_session.value.as_ref())
+                            .map(|session| session.workspace_id.clone());
+                        let target = active_workspace
+                            .filter(|workspace_id| {
+                                this.workspaces
+                                    .iter()
+                                    .any(|workspace| &workspace.id == workspace_id)
+                            })
+                            .or_else(|| {
+                                this.workspaces
+                                    .iter()
+                                    .find(|workspace| {
+                                        workspace.mode == WorkspaceMode::CurrentCheckout
+                                    })
+                                    .or_else(|| this.workspaces.first())
+                                    .map(|workspace| workspace.id.clone())
+                            });
+                        if let Some(workspace_id) = target {
+                            this.ensure_workbench(workspace_id, cx);
+                        }
                     }
                     Err(error) => this.error = Some(error),
                 }
@@ -454,6 +524,50 @@ impl MobileApp {
             });
         });
         self.tasks.push(task);
+    }
+
+    fn ensure_workbench(&mut self, workspace_id: vibex_core::WorkspaceId, cx: &mut Context<Self>) {
+        let session_id = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone());
+        if let Some(workbench) = self.workbench.as_ref() {
+            workbench.update(cx, |workbench, cx| {
+                workbench.set_workspace(workspace_id, cx);
+                workbench.set_session(session_id, cx);
+            });
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        self.workbench =
+            Some(cx.new(|cx| MobileWorkbench::new(backend, workspace_id, session_id, cx)));
+    }
+
+    fn open_workbench(&mut self, surface: WorkbenchSurface, cx: &mut Context<Self>) {
+        let Some(workbench) = self.workbench.as_ref() else {
+            self.error = Some(BackendError::loading(
+                "mobile_workbench_loading",
+                "Workspace tools are waiting for the desktop workspace list",
+            ));
+            self.refresh_workspaces(cx);
+            cx.notify();
+            return;
+        };
+        workbench.update(cx, |workbench, cx| workbench.set_surface(surface, cx));
+        self.workbench_open = true;
+        self.drawer_open = false;
+        self.drawer_offset = 0.0;
+        cx.notify();
+    }
+
+    fn close_workbench(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(workbench) = self.workbench.as_ref() {
+            workbench.update(cx, |workbench, _| workbench.suspend());
+        }
+        self.workbench_open = false;
+        cx.notify();
     }
 
     fn create_session(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -537,6 +651,132 @@ impl MobileApp {
         cx.notify();
     }
 
+    fn begin_session_action(
+        &mut self,
+        kind: SessionActionKind,
+        session_id: VibexSessionId,
+        current_title: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.session_action_busy {
+            return;
+        }
+        if kind == SessionActionKind::Rename {
+            self.session_action_input
+                .update(cx, |input, cx| input.set_text(current_title.clone(), cx));
+        }
+        self.session_action = Some(SessionActionPrompt {
+            kind,
+            session_id,
+            current_title,
+        });
+        self.error = None;
+        cx.notify();
+    }
+
+    fn cancel_session_action(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.session_action_busy {
+            self.session_action = None;
+            cx.notify();
+        }
+    }
+
+    fn confirm_session_action(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.session_action_busy {
+            return;
+        }
+        let Some(prompt) = self.session_action.clone() else {
+            return;
+        };
+        let Some(controller) = self.controller.as_ref() else {
+            return;
+        };
+        let future: BackendFuture<'static, SessionMutationOutcome> = match prompt.kind {
+            SessionActionKind::Rename => {
+                let title = self.session_action_input.read(cx).text().trim().to_string();
+                let future =
+                    controller.rename_session(MutationRequest::new(RenameAgentSessionRequest {
+                        session_id: prompt.session_id.clone(),
+                        title,
+                    }));
+                Box::pin(async move {
+                    future
+                        .await
+                        .map(Box::new)
+                        .map(SessionMutationOutcome::Renamed)
+                })
+            }
+            SessionActionKind::Archive => {
+                let future =
+                    controller.archive_session(MutationRequest::new(prompt.session_id.clone()));
+                Box::pin(async move {
+                    future.await?;
+                    Ok(SessionMutationOutcome::Removed)
+                })
+            }
+            SessionActionKind::Delete => {
+                let future =
+                    controller.delete_session(MutationRequest::new(prompt.session_id.clone()));
+                Box::pin(async move {
+                    future.await?;
+                    Ok(SessionMutationOutcome::Removed)
+                })
+            }
+        };
+        self.session_action_busy = true;
+        self.error = None;
+        let runner = gpui_tokio::Tokio::spawn(cx, future);
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.session_action_busy = false;
+                match outcome {
+                    Ok(SessionMutationOutcome::Renamed(session)) => {
+                        if let Some(controller) = this.controller.as_mut()
+                            && controller.state.selected_session_id.as_ref() == Some(&session.id)
+                        {
+                            controller.state.active_session.resolve(*session);
+                        }
+                        this.session_action = None;
+                        this.notice = Some("Session renamed".to_string());
+                        this.refresh_sessions(cx);
+                    }
+                    Ok(SessionMutationOutcome::Removed) => {
+                        let removed_selected = this.controller.as_ref().is_some_and(|controller| {
+                            controller.state.selected_session_id.as_ref()
+                                == Some(&prompt.session_id)
+                        });
+                        if removed_selected {
+                            if let Some(controller) = this.controller.as_mut() {
+                                controller.state.selected_session_id = None;
+                                controller.state.active_session.clear();
+                                controller.state.timeline_status.clear();
+                                controller.state.runtime_selection.clear();
+                            }
+                            this.timeline_turns = Arc::new(Vec::new());
+                            this.timeline_list.reset(0);
+                            if let Some(workbench) = this.workbench.as_ref() {
+                                workbench
+                                    .update(cx, |workbench, cx| workbench.set_session(None, cx));
+                            }
+                        }
+                        this.session_action = None;
+                        this.notice = Some(match prompt.kind {
+                            SessionActionKind::Archive => "Session archived".to_string(),
+                            SessionActionKind::Delete => "Session deleted".to_string(),
+                            SessionActionKind::Rename => unreachable!(),
+                        });
+                        this.refresh_sessions(cx);
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
     fn open_session(&mut self, session_id: VibexSessionId, cx: &mut Context<Self>) {
         let Some(controller) = self.controller.as_mut() else {
             return;
@@ -568,6 +808,14 @@ impl MobileApp {
                 {
                     this.rebuild_timeline_turns();
                     this.timeline_list.scroll_to_end();
+                    let workspace_id = this
+                        .controller
+                        .as_ref()
+                        .and_then(|controller| controller.state.active_session.value.as_ref())
+                        .map(|session| session.workspace_id.clone());
+                    if let Some(workspace_id) = workspace_id {
+                        this.ensure_workbench(workspace_id, cx);
+                    }
                 }
                 cx.notify();
             });
@@ -1122,6 +1370,10 @@ impl MobileApp {
             gpui_tokio::Tokio::spawn(cx, async move { backend.disconnect().await }).detach();
         }
         let _ = self.storage.clear();
+        if let Some(workbench) = self.workbench.take() {
+            workbench.update(cx, |workbench, _| workbench.suspend());
+        }
+        self.workbench_open = false;
         self.controller = None;
         self.mode = RootMode::Pairing;
         self.timeline_turns = Arc::new(Vec::new());
@@ -1480,6 +1732,15 @@ impl MobileApp {
             .is_some_and(|controller| controller.state.selected_session_id.is_none());
         let turns_for_list = turns.clone();
         let show_drawer = self.drawer_offset > 0.0 || self.drawer_snap.is_some();
+        let workbench = self.workbench.clone();
+        let show_workbench = self.workbench_open && workbench.is_some();
+        let session_action = self.session_action.clone();
+        let can_create_session = self.backend.as_ref().is_some_and(|backend| {
+            backend
+                .capability_snapshot()
+                .agent
+                .supports(BackendOperation::AgentCreateSession)
+        });
 
         div()
             .size_full()
@@ -1491,6 +1752,7 @@ impl MobileApp {
                     .flex()
                     .flex_col()
                     .child(self.render_header(&title, state, cx))
+                    .child(self.render_workbench_bar(cx))
                     .child(
                         div()
                             .flex_1()
@@ -1534,11 +1796,15 @@ impl MobileApp {
                                                     .items_center()
                                                     .justify_center()
                                                     .text_color(theme::text_secondary())
-                                                    .cursor_pointer()
-                                                    .on_mouse_up(
-                                                        MouseButton::Left,
-                                                        cx.listener(Self::create_session),
-                                                    )
+                                                    .when(can_create_session, |button| {
+                                                        button.cursor_pointer().on_mouse_up(
+                                                            MouseButton::Left,
+                                                            cx.listener(Self::create_session),
+                                                        )
+                                                    })
+                                                    .when(!can_create_session, |button| {
+                                                        button.opacity(0.55)
+                                                    })
                                                     .child("New session"),
                                             )
                                         }),
@@ -1643,6 +1909,240 @@ impl MobileApp {
                 };
                 root.child(backdrop).child(drawer)
             })
+            .when(show_workbench, |root| {
+                root.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .bg(theme::bg_primary())
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .h(px(theme::HEADER_HEIGHT))
+                                .flex_shrink_0()
+                                .border_b_1()
+                                .border_color(theme::border_subtle())
+                                .pl_4()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_size(px(theme::FONT_HEADING))
+                                        .text_color(theme::text_primary())
+                                        .child("Workspace tools"),
+                                )
+                                .child(
+                                    div()
+                                        .id("close-mobile-workbench")
+                                        .size(px(theme::HEADER_BUTTON_SIZE))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .active(|style| style.opacity(0.6))
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(Self::close_workbench),
+                                        )
+                                        .child(
+                                            svg()
+                                                .path("icons/x.svg")
+                                                .size(px(theme::ICON_SM))
+                                                .text_color(theme::text_muted()),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .child(workbench.expect("workbench checked above")),
+                        ),
+                )
+            })
+            .when_some(session_action, |root, prompt| {
+                root.child(self.render_session_action_prompt(&prompt, cx))
+            })
+    }
+
+    fn render_workbench_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("mobile-workbench-launchers")
+            .h(px(theme::TOUCH_TARGET))
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(theme::border_subtle())
+            .overflow_x_scroll()
+            .flex()
+            .items_center()
+            .children(WorkbenchSurface::ALL.into_iter().map(|surface| {
+                div()
+                    .id(format!("open-workbench:{}", surface.label()))
+                    .h_full()
+                    .min_w(px(72.0))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(theme::FONT_CAPTION))
+                    .text_color(theme::text_muted())
+                    .cursor_pointer()
+                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.open_workbench(surface, cx)),
+                    )
+                    .child(surface.label())
+            }))
+    }
+
+    fn render_session_action_prompt(
+        &self,
+        prompt: &SessionActionPrompt,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let can_manage_session = self.backend.as_ref().is_some_and(|backend| {
+            backend
+                .capability_snapshot()
+                .agent
+                .supports(BackendOperation::AgentManageSession)
+        });
+        let (heading, detail, confirm_label, destructive) = match prompt.kind {
+            SessionActionKind::Rename => (
+                "Rename session",
+                "Update the session name on the desktop.",
+                "Rename",
+                false,
+            ),
+            SessionActionKind::Archive => (
+                "Archive session",
+                "The session leaves the active list but remains available in desktop history.",
+                "Archive",
+                false,
+            ),
+            SessionActionKind::Delete => (
+                "Delete session",
+                "This removes the session and its stored conversation from the desktop.",
+                "Delete",
+                true,
+            ),
+        };
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme::backdrop(0.72))
+            .p_4()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(360.0))
+                    .rounded(px(theme::RADIUS_CARD))
+                    .border_1()
+                    .border_color(theme::border_default())
+                    .bg(theme::bg_card())
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_size(px(theme::FONT_HEADING))
+                            .text_color(theme::text_primary())
+                            .child(heading),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(theme::FONT_CAPTION))
+                            .text_color(theme::text_muted())
+                            .child(detail),
+                    )
+                    .when(prompt.kind == SessionActionKind::Rename, |dialog| {
+                        dialog.child(
+                            div()
+                                .h(px(theme::TOUCH_TARGET))
+                                .rounded(px(theme::RADIUS_CONTROL))
+                                .border_1()
+                                .border_color(theme::border_default())
+                                .bg(theme::bg_primary())
+                                .px_1()
+                                .child(self.session_action_input.clone()),
+                        )
+                    })
+                    .when(prompt.kind != SessionActionKind::Rename, |dialog| {
+                        dialog.child(
+                            div()
+                                .text_size(px(theme::FONT_BODY))
+                                .text_color(theme::text_secondary())
+                                .child(prompt.current_title.clone()),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("cancel-session-action")
+                                    .h(px(theme::TOUCH_TARGET))
+                                    .px_4()
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .border_1()
+                                    .border_color(theme::border_default())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(theme::FONT_BODY))
+                                    .text_color(theme::text_secondary())
+                                    .when(!self.session_action_busy, |button| {
+                                        button.cursor_pointer().on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(Self::cancel_session_action),
+                                        )
+                                    })
+                                    .child("Cancel"),
+                            )
+                            .child(
+                                div()
+                                    .id("confirm-session-action")
+                                    .h(px(theme::TOUCH_TARGET))
+                                    .px_4()
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .bg(if destructive {
+                                        rgb(theme::ACCENT_RED)
+                                    } else {
+                                        rgb(theme::TEXT_PRIMARY)
+                                    })
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(theme::FONT_BODY))
+                                    .text_color(rgb(theme::BG_PRIMARY))
+                                    .when(
+                                        !self.session_action_busy && can_manage_session,
+                                        |button| {
+                                            button.cursor_pointer().on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(Self::confirm_session_action),
+                                            )
+                                        },
+                                    )
+                                    .when(!can_manage_session, |button| button.opacity(0.55))
+                                    .child(if self.session_action_busy {
+                                        "Working..."
+                                    } else {
+                                        confirm_label
+                                    }),
+                            ),
+                    ),
+            )
     }
 
     fn render_header(
@@ -2612,6 +3112,22 @@ impl MobileApp {
             .controller
             .as_ref()
             .and_then(|controller| controller.state.selected_session_id.clone());
+        let selected_session = selected.as_ref().and_then(|session_id| {
+            sessions
+                .iter()
+                .find(|session| &session.id == session_id)
+                .cloned()
+        });
+        let capabilities = self
+            .backend
+            .as_ref()
+            .map(|backend| backend.capability_snapshot().agent);
+        let can_create_session = capabilities.as_ref().is_some_and(|capabilities| {
+            capabilities.supports(BackendOperation::AgentCreateSession)
+        });
+        let can_manage_session = capabilities.as_ref().is_some_and(|capabilities| {
+            capabilities.supports(BackendOperation::AgentManageSession)
+        });
         div()
             .absolute()
             .top_0()
@@ -2678,9 +3194,16 @@ impl MobileApp {
                             .gap(px(theme::SPACING_SM))
                             .text_size(px(theme::FONT_BODY))
                             .text_color(theme::text_secondary())
-                            .cursor_pointer()
-                            .active(|style| style.bg(theme::row_pressed_bg()))
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::create_session))
+                            .when(can_create_session, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(Self::create_session),
+                                    )
+                            })
+                            .when(!can_create_session, |button| button.opacity(0.55))
                             .child(
                                 svg()
                                     .path("icons/plus.svg")
@@ -2689,6 +3212,113 @@ impl MobileApp {
                             )
                             .child("New session"),
                     )
+                    .when_some(selected_session, |drawer, session| {
+                        let rename_id = session.id.clone();
+                        let archive_id = session.id.clone();
+                        let delete_id = session.id.clone();
+                        let rename_title = session.title.clone();
+                        let archive_title = session.title.clone();
+                        let delete_title = session.title.clone();
+                        drawer.child(
+                            div()
+                                .flex_shrink_0()
+                                .min_h(px(theme::DRAWER_ACTION_HEIGHT))
+                                .mx(px(theme::SPACING_SM))
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .id("rename-selected-session")
+                                        .h(px(36.0))
+                                        .flex_1()
+                                        .rounded(px(theme::RADIUS_CONTROL))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_size(px(theme::FONT_MICRO))
+                                        .text_color(theme::text_muted())
+                                        .when(can_manage_session, |button| {
+                                            button
+                                                .cursor_pointer()
+                                                .active(|style| style.bg(theme::row_pressed_bg()))
+                                                .on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        this.begin_session_action(
+                                                            SessionActionKind::Rename,
+                                                            rename_id.clone(),
+                                                            rename_title.clone(),
+                                                            cx,
+                                                        )
+                                                    }),
+                                                )
+                                        })
+                                        .when(!can_manage_session, |button| button.opacity(0.55))
+                                        .child("Rename"),
+                                )
+                                .child(
+                                    div()
+                                        .id("archive-selected-session")
+                                        .h(px(36.0))
+                                        .flex_1()
+                                        .rounded(px(theme::RADIUS_CONTROL))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_size(px(theme::FONT_MICRO))
+                                        .text_color(theme::text_muted())
+                                        .when(can_manage_session, |button| {
+                                            button
+                                                .cursor_pointer()
+                                                .active(|style| style.bg(theme::row_pressed_bg()))
+                                                .on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        this.begin_session_action(
+                                                            SessionActionKind::Archive,
+                                                            archive_id.clone(),
+                                                            archive_title.clone(),
+                                                            cx,
+                                                        )
+                                                    }),
+                                                )
+                                        })
+                                        .when(!can_manage_session, |button| button.opacity(0.55))
+                                        .child("Archive"),
+                                )
+                                .child(
+                                    div()
+                                        .id("delete-selected-session")
+                                        .h(px(36.0))
+                                        .flex_1()
+                                        .rounded(px(theme::RADIUS_CONTROL))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_size(px(theme::FONT_MICRO))
+                                        .text_color(rgb(theme::ACCENT_RED))
+                                        .when(can_manage_session, |button| {
+                                            button
+                                                .cursor_pointer()
+                                                .active(|style| style.bg(theme::row_pressed_bg()))
+                                                .on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        this.begin_session_action(
+                                                            SessionActionKind::Delete,
+                                                            delete_id.clone(),
+                                                            delete_title.clone(),
+                                                            cx,
+                                                        )
+                                                    }),
+                                                )
+                                        })
+                                        .when(!can_manage_session, |button| button.opacity(0.55))
+                                        .child("Delete"),
+                                ),
+                        )
+                    })
                     .child(
                         div()
                             .flex_shrink_0()

@@ -19,16 +19,17 @@ use vibex_core::{
     OpenWorkspaceRequest, ProjectWorkspaceSummary, RemoteActionClass,
     RemoteAgentAttachRuntimeResponse, RemoteAgentCancelRuntimeSwitchResponse,
     RemoteAgentCatchUpRequest, RemoteAgentCatchUpResponse, RemoteAgentContinueTurnResponse,
-    RemoteAgentDeepLinkResolveResponse, RemoteAgentDetachRuntimeResponse,
-    RemoteAgentInterruptResponse, RemoteAgentMessageSubmissionResponse,
-    RemoteAgentProjectionCapabilityResponse, RemoteAgentProjectionPreviewResponse,
-    RemoteAgentRequest, RemoteAgentResolveElicitationResponse,
-    RemoteAgentResolvePermissionResponse, RemoteAgentRuntimeEventsResponse,
-    RemoteAgentRuntimeOptionsResponse, RemoteAgentRuntimeProbeCancelResponse,
-    RemoteAgentRuntimeProbeGetResponse, RemoteAgentRuntimeProbeListResponse,
-    RemoteAgentRuntimeProbeStartResponse, RemoteAgentRuntimeProcessSnapshotResponse,
-    RemoteAgentRuntimeSelectionResponse, RemoteAgentRuntimeSnapshotResponse,
-    RemoteAgentSendMessageResponse, RemoteAgentSessionDetailResponse,
+    RemoteAgentCreateSessionResponse, RemoteAgentDeepLinkResolveResponse,
+    RemoteAgentDetachRuntimeResponse, RemoteAgentInterruptResponse,
+    RemoteAgentMessageSubmissionResponse, RemoteAgentProjectionCapabilityResponse,
+    RemoteAgentProjectionPreviewResponse, RemoteAgentRenameSessionResponse, RemoteAgentRequest,
+    RemoteAgentResolveElicitationResponse, RemoteAgentResolvePermissionResponse,
+    RemoteAgentRuntimeEventsResponse, RemoteAgentRuntimeOptionsResponse,
+    RemoteAgentRuntimeProbeCancelResponse, RemoteAgentRuntimeProbeGetResponse,
+    RemoteAgentRuntimeProbeListResponse, RemoteAgentRuntimeProbeStartResponse,
+    RemoteAgentRuntimeProcessSnapshotResponse, RemoteAgentRuntimeSelectionResponse,
+    RemoteAgentRuntimeSnapshotResponse, RemoteAgentSendMessageResponse,
+    RemoteAgentSessionActionResponse, RemoteAgentSessionDetailResponse,
     RemoteAgentSessionListResponse, RemoteAgentSetDesiredRuntimeResponse,
     RemoteAgentTimelineCursor, RemoteAgentTimelineFetchResponse, RemoteAuditAction,
     RemoteAuditOutcome, RemoteAuditRecord, RemoteAuditTargetKind, RemoteAuthContext,
@@ -1287,6 +1288,25 @@ async fn dispatch_provider_request(
     let service = ProviderConfigService::new(runtime.db_path.clone());
 
     match request {
+        RemoteProviderRequest::ListAgentSummaries(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let agents = service
+                .list_agents(vibex_core::AgentListRequest {
+                    include_disabled: request.include_disabled,
+                })?
+                .agents
+                .iter()
+                .map(vibex_core::RemoteAgentConfigSummary::from)
+                .collect();
+            serde_json::to_value(vibex_core::RemoteAgentConfigSummaryListResponse { agents })
+                .map_err(remote_payload_encode_error)
+        }
         RemoteProviderRequest::ListProfiles(request) => {
             authorize_provider_action(
                 runtime,
@@ -1565,6 +1585,104 @@ async fn dispatch_agent_request(
                 latest_timeline,
             })
             .map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::CreateSession(request) => {
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentSession,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = match published_agent_session_request(&manager, request.request) {
+                Ok(request) => manager.create_session(request).await,
+                Err(error) => Err(error),
+            };
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentSession,
+                "create",
+                "Agent session creation",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let session = result?;
+            serde_json::to_value(RemoteAgentCreateSessionResponse { session })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::RenameSession(request) => {
+            let target_id = request.request.session_id.as_str().to_string();
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentSession,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = manager.rename_session(request.request).await;
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentSession,
+                target_id,
+                "Agent session rename",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let session = result?;
+            serde_json::to_value(RemoteAgentRenameSessionResponse { session })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::ArchiveSession(request) => {
+            let target_id = request.session_id.as_str().to_string();
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentSession,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = manager.archive_session(&request.session_id).await;
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentSession,
+                target_id,
+                "Agent session archive",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            result?;
+            serde_json::to_value(RemoteAgentSessionActionResponse { completed: true })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::DeleteSession(request) => {
+            let target_id = request.session_id.as_str().to_string();
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentSession,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = manager.delete_session(&request.session_id).await;
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentSession,
+                target_id,
+                "Agent session deletion",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            result?;
+            serde_json::to_value(RemoteAgentSessionActionResponse { completed: true })
+                .map_err(remote_payload_encode_error)
         }
         RemoteAgentRequest::FetchTimeline(request) => {
             authorize_agent_action(
@@ -2130,6 +2248,35 @@ async fn dispatch_agent_request(
             serde_json::to_value(response).map_err(remote_payload_encode_error)
         }
     }
+}
+
+fn published_agent_session_request(
+    manager: &AgentManager,
+    mut request: vibex_core::CreateAgentSessionRequest,
+) -> VibexResult<vibex_core::CreateAgentSessionRequest> {
+    let not_published = || {
+        VibexError::validation(
+            "remote_agent_workspace_not_published",
+            "the requested workspace is not published by the desktop",
+        )
+    };
+    let requested_root = Path::new(&request.workspace_root)
+        .canonicalize()
+        .map_err(|_| not_published())?;
+    let conn = open_migrated_database(manager.database_path())?;
+    let workspace = WorkspaceRepository::list(&conn)?
+        .into_iter()
+        .map(|(_, workspace)| workspace)
+        .find(|workspace| {
+            workspace.mode == request.workspace_mode
+                && Path::new(&workspace.root_path)
+                    .canonicalize()
+                    .is_ok_and(|root| root == requested_root)
+        })
+        .ok_or_else(not_published)?;
+
+    request.workspace_root = workspace.root_path;
+    Ok(request)
 }
 
 fn remote_runtime_selection(
@@ -4121,6 +4268,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_agent_session_lifecycle_requires_full_control_and_audits_outcomes() {
+        let (db_path, manager) = test_agent_manager("session-lifecycle");
+        let rename_target = create_mock_session(&manager, "Rename target").await;
+        let archive_target = create_mock_session(&manager, "Archive target").await;
+        let delete_target = create_mock_session(&manager, "Delete target").await;
+        let reader = pair_device(&db_path, RemoteDevicePermissionLevel::ReadOnly, "Reader");
+        let controller = pair_device(
+            &db_path,
+            RemoteDevicePermissionLevel::FullControl,
+            "Controller",
+        );
+        let router =
+            build_router_with_agent(RemoteServiceConfig::loopback_disabled(), manager.clone());
+
+        let denied = post_agent(
+            router.clone(),
+            RemoteAgentRequest::ArchiveSession(vibex_core::RemoteAgentSessionActionRequest {
+                auth: reader.clone(),
+                session_id: archive_target.id.clone(),
+            }),
+        )
+        .await;
+        assert_eq!(denied.error.unwrap().code, "remote_permission_denied");
+
+        let renamed = post_agent(
+            router.clone(),
+            RemoteAgentRequest::RenameSession(vibex_core::RemoteAgentRenameSessionRequest {
+                auth: controller.clone(),
+                request: vibex_core::RenameAgentSessionRequest {
+                    session_id: rename_target.id.clone(),
+                    title: "Renamed remotely".to_string(),
+                },
+            }),
+        )
+        .await;
+        let renamed: vibex_core::RemoteAgentRenameSessionResponse =
+            serde_json::from_value(renamed.payload.unwrap()).unwrap();
+        assert_eq!(renamed.session.title, "Renamed remotely");
+
+        let archived = post_agent(
+            router.clone(),
+            RemoteAgentRequest::ArchiveSession(vibex_core::RemoteAgentSessionActionRequest {
+                auth: controller.clone(),
+                session_id: archive_target.id.clone(),
+            }),
+        )
+        .await;
+        let archived: vibex_core::RemoteAgentSessionActionResponse =
+            serde_json::from_value(archived.payload.unwrap()).unwrap();
+        assert!(archived.completed);
+
+        let deleted = post_agent(
+            router.clone(),
+            RemoteAgentRequest::DeleteSession(vibex_core::RemoteAgentSessionActionRequest {
+                auth: controller.clone(),
+                session_id: delete_target.id.clone(),
+            }),
+        )
+        .await;
+        let deleted: vibex_core::RemoteAgentSessionActionResponse =
+            serde_json::from_value(deleted.payload.unwrap()).unwrap();
+        assert!(deleted.completed);
+
+        let normalized = published_agent_session_request(
+            &manager,
+            vibex_core::CreateAgentSessionRequest {
+                runtime: remote_test_selection(&rename_target),
+                workspace_root: format!("{}/.", rename_target.workspace_root),
+                workspace_mode: rename_target.workspace_mode,
+                title: Some("Created remotely".to_string()),
+                safety: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(normalized.workspace_root, rename_target.workspace_root);
+
+        let create_attempt = post_agent(
+            router,
+            RemoteAgentRequest::CreateSession(vibex_core::RemoteAgentCreateSessionRequest {
+                auth: controller.clone(),
+                request: vibex_core::CreateAgentSessionRequest {
+                    runtime: remote_test_selection(&rename_target),
+                    workspace_root: "/tmp/private-create-workspace-sentinel".to_string(),
+                    workspace_mode: WorkspaceMode::CurrentCheckout,
+                    title: Some("private create title sentinel".to_string()),
+                    safety: None,
+                },
+            }),
+        )
+        .await;
+        assert_eq!(create_attempt.status, RemoteEnvelopeStatus::Error);
+        assert_eq!(
+            create_attempt.error.unwrap().code,
+            "remote_agent_workspace_not_published"
+        );
+
+        let mut conn = open_database(&db_path).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        assert!(
+            SessionRepository::get(&conn, &archive_target.id)
+                .unwrap()
+                .unwrap()
+                .archived_at_ms
+                .is_some()
+        );
+        assert!(
+            SessionRepository::get(&conn, &delete_target.id)
+                .unwrap()
+                .is_none()
+        );
+        let audits = RemoteAuditRepository::list(
+            &conn,
+            &RemoteAuditListRequest {
+                device_id: None,
+                limit: Some(50),
+            },
+        )
+        .unwrap();
+        assert!(audits.iter().any(|record| {
+            record.device_id.as_ref() == Some(&reader.device_id)
+                && record.action == RemoteAuditAction::PermissionDenied
+        }));
+        for target_id in [
+            rename_target.id.as_str(),
+            archive_target.id.as_str(),
+            delete_target.id.as_str(),
+        ] {
+            assert!(audits.iter().any(|record| {
+                record.device_id.as_ref() == Some(&controller.device_id)
+                    && record.target_kind == RemoteAuditTargetKind::AgentSession
+                    && record.target_id.as_deref() == Some(target_id)
+                    && record.action == RemoteAuditAction::MutationAllowed
+            }));
+        }
+        assert!(audits.iter().any(|record| {
+            record.device_id.as_ref() == Some(&controller.device_id)
+                && record.target_id.as_deref() == Some("create")
+                && record.action == RemoteAuditAction::MutationDenied
+                && record.outcome == RemoteAuditOutcome::Failed
+        }));
+        assert!(audits.iter().all(|record| {
+            !record.redacted_summary.contains("private create")
+                && !record.redacted_summary.contains(&controller.auth_token)
+        }));
+
+        cleanup_db(db_path);
+    }
+
+    #[tokio::test]
     async fn remote_runtime_query_reports_unavailable_without_production_wiring() {
         let (db_path, manager) = test_agent_manager("runtime-query-unavailable");
         let session = create_mock_session(&manager, "Runtime query unavailable").await;
@@ -5090,6 +5386,30 @@ mod tests {
                 .live_event_channels
                 .contains(&RemoteLiveEventChannel::Provider)
         );
+
+        let agents = post_provider(
+            router.clone(),
+            RemoteProviderRequest::ListAgentSummaries(
+                vibex_core::RemoteAgentConfigSummaryListRequest {
+                    auth: auth.clone(),
+                    include_disabled: true,
+                },
+            ),
+        )
+        .await;
+        let agents: vibex_core::RemoteAgentConfigSummaryListResponse =
+            serde_json::from_value(agents.payload.unwrap()).unwrap();
+        assert!(!agents.agents.is_empty());
+        let serialized_agents = serde_json::to_value(&agents).unwrap().to_string();
+        for private_field in [
+            "command",
+            "env",
+            "params",
+            "nativeConfigPaths",
+            "diagnostics",
+        ] {
+            assert!(!serialized_agents.contains(private_field));
+        }
 
         let list = post_provider(
             router.clone(),

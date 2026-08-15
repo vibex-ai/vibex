@@ -11,6 +11,7 @@ mod pairing;
 mod scanner;
 mod storage;
 mod theme;
+mod workbench;
 
 use std::path::PathBuf;
 
