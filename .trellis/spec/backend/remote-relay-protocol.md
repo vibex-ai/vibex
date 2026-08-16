@@ -324,6 +324,21 @@ DNS-SD service type = _vibex._tcp.local.; TXT mode = zero_config
   Treat the advertised identity as an untrusted key-agreement input, not a
   trust root. Offer/window/request ids, challenge, request secret, grant, and
   private keys remain forbidden.
+- Desktop emits canonical TXT key spelling. Native DNS-SD bridges normalize
+  keys case-insensitively at the Rust event boundary, accept standard
+  non-secret `txtvers=1` metadata when a platform supplies it, and reject
+  duplicate keys after normalization. A bridge that omits `mode` is accepted as
+  zero-config only when both zero-config identity keys are present and the
+  remaining key set is exact; desktop advertisements always include
+  `mode=zero_config`.
+- Native resolvers may return an address literal instead of the SRV hostname.
+  Mobile validates IPv4/IPv6 authorities (including bracketed IPv6 and a
+  validated scoped-IPv6 label) before constructing the bootstrap origin; it
+  rejects ambiguous colon-bearing host strings and never treats TXT as a URL.
+- A malformed, stale, or incompatible candidate is local to that candidate:
+  discard it and continue browsing. Only the native discovery service's own
+  permission or browsing failure terminates the active discovery flow. One
+  untrusted LAN advertisement must never suppress later valid candidates.
 - Mobile constructs one credential-free exact `http` origin from the resolved
   DNS-SD authority, bypasses all proxies, disables redirects, and uses it only
   for this bootstrap. HTTPS remains mandatory for ordinary Direct publication.
@@ -344,7 +359,7 @@ DNS-SD service type = _vibex._tcp.local.; TXT mode = zero_config
 | --- | --- |
 | No validated long-term route | `remote_zero_config_pairing_routes_unavailable`; bind is released and nothing is advertised. |
 | Listener bind/address or advertiser setup fails | `remote_zero_config_pairing_listener_*` / `remote_zero_config_advertisement_failed`; cancel the offer and listener. |
-| Unknown/oversized TXT, invalid server id/key, non-v2 mode, or malformed origin | `remote_lan_discovery_invalid` / `remote_zero_config_pairing_origin_invalid`; send no hello. |
+| Unknown/oversized TXT, invalid server id/key, non-v2 mode, or malformed origin | Reject that candidate with `remote_lan_discovery_invalid` / `remote_zero_config_pairing_origin_invalid`, keep browsing, and send no hello. |
 | Hello nonce/key is malformed or non-contributory | `remote_zero_config_pairing_hello_invalid` / `remote_zero_config_pairing_hello_rejected`; create no session. |
 | Session is unknown, expired, replayed, or frame authentication fails | `remote_zero_config_pairing_session_*` / `remote_zero_config_pairing_frame_invalid`; expose no plaintext payload. |
 | Session/request limits are reached | Existing bounded LAN busy/limit response; allocate no unbounded task or session. |

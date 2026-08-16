@@ -131,6 +131,25 @@ prefixes. Use exact mappings created by the same projection that produced the
 external configuration, keep already-translated values idempotent, fail closed
 on collisions, and test the full product -> wire -> product round trip.
 
+### Mistake 7: Treating Native DNS-SD Output As Byte-Stable
+
+**Bad**: Let Android and iOS bridges pass TXT dictionaries through as if every
+platform preserves key casing, optional `txtvers` metadata, hostname formatting,
+and IPv6 scope text identically. A strict consumer then turns a valid service
+into one generic discovery error.
+
+**Good**: Keep the desktop advertisement canonical, normalize DNS-SD keys once
+at the Rust event boundary, allow only documented non-secret compatibility
+metadata, and validate the resolved host before building an origin. Duplicate
+keys after normalization and unknown fields still fail closed.
+
+**Rule**: Every native discovery bridge needs a candidate fixture for each
+supported platform shape, including optional TXT metadata, case variation, and
+literal IPv6 authorities. Test the bridge -> JSON -> Rust parser path rather than
+only testing a hand-built map. Keep candidate validation failures local to that
+candidate; only an actual browser/permission failure may terminate the discovery
+stream.
+
 ---
 
 ## Checklist for Cross-Layer Features
