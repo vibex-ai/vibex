@@ -37,8 +37,8 @@ function loadFutureIncompatAllowlist() {
   if (parsed.schemaVersion !== "vibex-rust-future-incompat-allowlist.v1") {
     fail(`${FUTURE_INCOMPAT_ALLOWLIST_PATH} has an unsupported schemaVersion`);
   }
-  if (!Array.isArray(parsed.packages) || parsed.packages.length === 0) {
-    fail(`${FUTURE_INCOMPAT_ALLOWLIST_PATH} must contain reviewed package exceptions`);
+  if (!Array.isArray(parsed.packages)) {
+    fail(`${FUTURE_INCOMPAT_ALLOWLIST_PATH} packages must be an array`);
   }
   const allowed = new Set();
   for (const entry of parsed.packages) {

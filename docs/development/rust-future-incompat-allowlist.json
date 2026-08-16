@@ -1,13 +1,4 @@
 {
   "schemaVersion": "vibex-rust-future-incompat-allowlist.v1",
-  "packages": [
-    {
-      "name": "proc-macro-error2",
-      "version": "2.0.1",
-      "owner": "desktop-platform",
-      "rationale": "The unmodified crates.io package is reached through stacksafe in the reviewed Zed fork GPUI graph. Rust 1.97 caps E0365 for dependencies, so the workspace builds but Cargo reports future incompatibility.",
-      "upstreamIssue": "https://github.com/rust-lang/rust/issues/127909",
-      "removalGate": "Remove when the upstream dependency graph no longer selects proc-macro-error2 2.0.1 or a released version fixes pub_use_of_private_extern_crate."
-    }
-  ]
+  "packages": []
 }

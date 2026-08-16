@@ -374,9 +374,8 @@ if (
   fail("shared GPUI token source is stale against the resolved upstream graph");
 }
 
-const procMacroError = assertSinglePackage(graph.packages, "proc-macro-error2", "2.0.1");
-if (!procMacroError.source?.startsWith("registry+https://github.com/rust-lang/crates.io-index")) {
-  fail(`proc-macro-error2 must resolve from crates.io: ${procMacroError.source ?? "path"}`);
+if (graph.packages.some((pkg) => pkg.name === "proc-macro-error2")) {
+  fail("proc-macro-error2 re-entered the resolved graph after its stacksafe removal");
 }
 
 for (const name of ["ztracing", "ztracing_macro", "zlog"]) {
@@ -398,5 +397,5 @@ if (JSON.stringify(vendorEntries) !== JSON.stringify(["zed"])) {
 console.log(
   `GPUI graph verified: ${zedPackages.length} fork-submodule packages at ${zedCommit.slice(0, 12)}, ` +
     `gpui-component at ${componentCommit.slice(0, 12)}, shared UI isolated, ` +
-    `shared backend wasm-isolated, crates.io proc-macro-error2, and forked Zed GPL tracing`
+    `shared backend wasm-isolated, no proc-macro-error2 exception, and forked Zed GPL tracing`
 );

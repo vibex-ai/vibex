@@ -106,7 +106,7 @@ upstream-dependency-revalidation.v1 {
 | Cargo metadata contains an official or fork Zed Git package | Graph check fails and reports the escaped package names. |
 | gpui-component contains `rev`, `tag`, or `branch`, or resolves from multiple commits | Graph check fails. |
 | Another entry appears under `vendor/` or another root-managed lockfile appears | Graph check fails. The Zed submodule's own lockfile is outside the Vibex lock scan. |
-| `proc-macro-error2` is not crates.io `2.0.1`, or another future-incompatible package appears | Rust quality check fails until the graph or reviewed allowlist is corrected. |
+| `proc-macro-error2` re-enters the graph, or another future-incompatible package appears | Dependency or Rust quality checks fail until the graph or reviewed allowlist is corrected. |
 | An unapproved or missing SPDX selection enters the graph | License check fails; do not silently broaden the policy. |
 | Physical evidence identity differs from the current root source | Classify it as historical only when the revalidation disposition recognizes it; otherwise fail as stale. |
 | Generated SBOM, notices, baseline inventory, or decision hashes drift | Regenerate the owning artifact and rerun its verification command. |
@@ -133,10 +133,10 @@ upstream-dependency-revalidation.v1 {
 - `cargo metadata --locked --format-version 1` resolves successfully and every
   Zed-family manifest path is under `vendor/zed`.
 - `pnpm check:graph` asserts the fork URL, gitlink mode, exact path declarations,
-  canonical-URL patch, one gpui-component commit, crates.io proc-macro-error2,
+  canonical-URL patch, one gpui-component commit, no proc-macro-error2 exception,
   forked Zed tracing, one Vibex root lockfile, and no extra vendor entry.
-- `pnpm check:rust` accepts only the reviewed `proc-macro-error2 v2.0.1`
-  future-incompatibility entry and rejects any additional package.
+- `pnpm check:rust` accepts an empty reviewed future-incompatibility allowlist
+  and rejects every unlisted package or stale exception.
 - `pnpm check:licenses` verifies path-package provenance, the fork revision in the
   SBOM, the full Cargo graph, assets, notices, and intended AGPL/GPL selections.
 - Evidence checks assert either `current` or the reviewed

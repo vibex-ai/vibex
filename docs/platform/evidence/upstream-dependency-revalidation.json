@@ -3,9 +3,9 @@
   "status": "pending_physical_recapture",
   "currentSource": {
     "dependencySourcePolicy": "fork_submodule_root_cargo_lock",
-    "zedRevision": "49d9758e84846bf83f7595dde7e4478c8235e833",
+    "zedRevision": "53b7efce1ead525b8898cda74ccd2d7e0987d2d8",
     "gpuiComponentRevision": "031555662e99a1b5a549990b47f246d475b8288a",
-    "cargoLockSha256": "ba1e7dbbfb095bfa4213a6174162c6f08b48ac88e29b310f6c428645a98f2d99"
+    "cargoLockSha256": "70c29c15b94ea1f9621cb15c791b9a0b142fd72020c7f57c3f3c48a9e7b88a63"
   },
   "historicalSources": [
     {

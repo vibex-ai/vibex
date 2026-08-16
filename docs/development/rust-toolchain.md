@@ -25,16 +25,15 @@ is intrinsic to one existing API must stay adjacent to that item as a scoped
 
 ## Future-Incompatibility Allowlist
 
-The upstream GPUI graph exposes rustc E0365 in
-`proc-macro-error2 2.0.1 -> stacksafe 0.1.4 -> gpui 0.2.2`. Vibex uses the
-unmodified MIT/Apache-2.0 crates.io package. Rust 1.97 caps the lint for
-dependencies, so the workspace builds while Cargo emits a future-incompatibility
-report.
+The reviewed GPUI graph currently needs no future-incompatibility exceptions.
+Zed's upgrade to `stacksafe 1.0.3` removed the former
+`proc-macro-error2 2.0.1` path and its rustc E0365 report.
 
-The exact temporary exception lives in
-`docs/development/rust-future-incompat-allowlist.json`. The quality script fails
-on every additional reported package, and also fails when the exception becomes
-stale, so the upstream issue cannot silently expand or outlive the fix.
+Reviewed temporary exceptions live in
+`docs/development/rust-future-incompat-allowlist.json`, whose package list may be
+empty. The quality script fails on every unlisted reported package and also
+fails when an exception becomes stale, so an upstream issue cannot silently
+expand or outlive its fix.
 
 ## Platform Coverage
 
