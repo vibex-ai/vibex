@@ -207,7 +207,12 @@ mod android {
         vm.attach_current_thread(|env| -> jni::errors::Result<()> {
             let raw_activity = app.activity_as_ptr() as jni::sys::jobject;
             let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw_activity)? };
-            let result = env.call_method(activity, method, jni::jni_sig!(() -> ()), &[]);
+            let result = env.call_method(
+                activity,
+                jni::strings::JNIString::new(method),
+                jni::jni_sig!(() -> ()),
+                &[],
+            );
             if result.is_err() {
                 let _ = env.exception_clear();
             }
