@@ -2217,6 +2217,30 @@ fn timeline_conversation_turn_resident_bytes(turn: &TimelineConversationTurn) ->
                 .map(|group| group.id.len())
                 .sum::<usize>(),
         )
+        .saturating_add(
+            turn.process_activity_groups_with_commands
+                .iter()
+                .chain(turn.process_activity_groups_with_file_operations.iter())
+                .chain(
+                    turn.process_activity_groups_with_commands_and_file_operations
+                        .iter(),
+                )
+                .map(|group| group.id.len())
+                .sum::<usize>(),
+        )
+}
+
+fn timeline_process_activity_groups_for_display(
+    turn: &TimelineConversationTurn,
+    enhanced_command_display: bool,
+    enhanced_file_operation_display: bool,
+) -> &[TimelineProcessActivityGroup] {
+    match (enhanced_command_display, enhanced_file_operation_display) {
+        (true, true) => &turn.process_activity_groups,
+        (false, true) => &turn.process_activity_groups_with_commands,
+        (true, false) => &turn.process_activity_groups_with_file_operations,
+        (false, false) => &turn.process_activity_groups_with_commands_and_file_operations,
+    }
 }
 
 struct SidebarProjectionCache {
@@ -8033,6 +8057,10 @@ impl VibexWorkbench {
             .session
             .enhanced_command_execution_display
             .hash(&mut hasher);
+        self.ui_state
+            .session
+            .enhanced_file_operation_display
+            .hash(&mut hasher);
         for row in turn
             .user_row
             .iter()
@@ -8066,6 +8094,24 @@ impl VibexWorkbench {
                 .hash(&mut hasher);
         }
         for group in &turn.process_activity_groups_with_commands {
+            group.id.hash(&mut hasher);
+            group.start_row.hash(&mut hasher);
+            group.end_row.hash(&mut hasher);
+            self.timeline_command_expansion
+                .get(&group.id)
+                .copied()
+                .hash(&mut hasher);
+        }
+        for group in &turn.process_activity_groups_with_file_operations {
+            group.id.hash(&mut hasher);
+            group.start_row.hash(&mut hasher);
+            group.end_row.hash(&mut hasher);
+            self.timeline_command_expansion
+                .get(&group.id)
+                .copied()
+                .hash(&mut hasher);
+        }
+        for group in &turn.process_activity_groups_with_commands_and_file_operations {
             group.id.hash(&mut hasher);
             group.start_row.hash(&mut hasher);
             group.end_row.hash(&mut hasher);
@@ -15387,6 +15433,14 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    fn set_enhanced_file_operation_display(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.ui_state.session.enhanced_file_operation_display = enabled;
+        self.invalidate_timeline_layout_measurements();
+        self.rebuild_timeline_sizes();
+        self.queue_ui_state();
+        cx.notify();
+    }
+
     fn set_close_to_tray(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.ui_state.desktop_behavior.close_to_tray = enabled;
         self.queue_ui_state();
@@ -22537,11 +22591,11 @@ impl VibexWorkbench {
         let mut row_index = 0;
         let mut group_index = 0;
         let enhanced_command_display = self.ui_state.session.enhanced_command_execution_display;
-        let process_activity_groups = if enhanced_command_display {
-            &turn.process_activity_groups
-        } else {
-            &turn.process_activity_groups_with_commands
-        };
+        let process_activity_groups = timeline_process_activity_groups_for_display(
+            turn,
+            enhanced_command_display,
+            self.ui_state.session.enhanced_file_operation_display,
+        );
 
         while row_index < turn.process_rows.len() {
             while process_activity_groups
@@ -22655,7 +22709,12 @@ impl VibexWorkbench {
                 self.render_command_execution_card(row, None, cx)
             }
             TimelineRowKind::Command => self.render_process_activity_line(row, cx),
-            TimelineRowKind::FileOperation => self.render_file_operation_card(row, cx),
+            TimelineRowKind::FileOperation
+                if self.ui_state.session.enhanced_file_operation_display =>
+            {
+                self.render_file_operation_card(row, cx)
+            }
+            TimelineRowKind::FileOperation => self.render_process_activity_line(row, cx),
             TimelineRowKind::ImageGeneration => self.render_image_generation_card(row, cx),
             TimelineRowKind::ToolCall
             | TimelineRowKind::WebSearch
@@ -22978,7 +23037,9 @@ impl VibexWorkbench {
                 }
                 height
             }
-            TimelineRowKind::FileOperation => {
+            TimelineRowKind::FileOperation
+                if self.ui_state.session.enhanced_file_operation_display =>
+            {
                 let Some(vibex_core::TimelinePayload::FileOperation(_)) = payload else {
                     return 40.0;
                 };
@@ -23009,6 +23070,7 @@ impl VibexWorkbench {
                 if expanded { 312.0 } else { 40.0 }
             }
             TimelineRowKind::Command
+            | TimelineRowKind::FileOperation
             | TimelineRowKind::ToolCall
             | TimelineRowKind::WebSearch
             | TimelineRowKind::TodoUpdate
@@ -23071,11 +23133,11 @@ impl VibexWorkbench {
         let mut row_index = 0;
         let mut group_index = 0;
         let enhanced_command_display = self.ui_state.session.enhanced_command_execution_display;
-        let process_activity_groups = if enhanced_command_display {
-            &turn.process_activity_groups
-        } else {
-            &turn.process_activity_groups_with_commands
-        };
+        let process_activity_groups = timeline_process_activity_groups_for_display(
+            turn,
+            enhanced_command_display,
+            self.ui_state.session.enhanced_file_operation_display,
+        );
 
         while row_index < turn.process_rows.len() {
             while process_activity_groups
@@ -23655,8 +23717,8 @@ impl VibexWorkbench {
         row: &TimelineRow,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // Lightweight tool activity is a single muted line. Commands also use
-        // this projection when enhanced command display is disabled.
+        // Lightweight tool activity is a single muted line. Commands and file
+        // operations also use this projection when their card display is disabled.
         let projection = self.tool_card_projection_cached(row);
         let icon = process_activity_icon(projection.icon);
         let has_details = !projection.details.is_empty();
@@ -32446,6 +32508,13 @@ impl FoundationSettings {
         cx.notify();
     }
 
+    fn set_enhanced_file_operation_display(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.set_enhanced_file_operation_display(enabled, cx)
+        });
+        cx.notify();
+    }
+
     fn set_close_to_tray(&mut self, enabled: bool, cx: &mut Context<Self>) {
         let _ = self
             .workbench
@@ -33504,6 +33573,13 @@ impl FoundationSettings {
             .on_click(cx.listener(|this, enabled, _, cx| {
                 this.set_enhanced_command_execution_display(*enabled, cx)
             }));
+        let enhanced_file_operation_switch = Switch::new("enhanced-file-operation-display")
+            .small()
+            .checked(session.enhanced_file_operation_display)
+            .tooltip(strings.enhanced_file_operation_display)
+            .on_click(cx.listener(|this, enabled, _, cx| {
+                this.set_enhanced_file_operation_display(*enabled, cx)
+            }));
         let queue_manual = self
             .workbench
             .read_with(cx, |this, _| {
@@ -33631,6 +33707,13 @@ impl FoundationSettings {
                     strings.enhanced_command_execution_display,
                     strings.enhanced_command_execution_display_description,
                     enhanced_command_execution_switch,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    strings.enhanced_file_operation_display,
+                    strings.enhanced_file_operation_display_description,
+                    enhanced_file_operation_switch,
                     stacked,
                     cx,
                 ),
@@ -36241,6 +36324,8 @@ mod tests {
             process_rows: Vec::new(),
             process_activity_groups: Vec::new(),
             process_activity_groups_with_commands: Vec::new(),
+            process_activity_groups_with_file_operations: Vec::new(),
+            process_activity_groups_with_commands_and_file_operations: Vec::new(),
             live_status: None,
             conclusion_row: None,
             runtime_attribution: None,
@@ -36267,6 +36352,8 @@ mod tests {
             process_rows: Vec::new(),
             process_activity_groups: Vec::new(),
             process_activity_groups_with_commands: Vec::new(),
+            process_activity_groups_with_file_operations: Vec::new(),
+            process_activity_groups_with_commands_and_file_operations: Vec::new(),
             live_status: None,
             conclusion_row: Some(TimelineRow {
                 id: "agent:streaming-conclusion".into(),
@@ -41203,7 +41290,7 @@ mod tests {
     }
 
     #[test]
-    fn session_settings_own_session_layout_and_command_display_controls() {
+    fn session_settings_own_session_layout_and_card_display_controls() {
         let source = include_str!("app.rs");
         let navigation = source
             .split_once("    fn render_navigation(")
@@ -41230,6 +41317,8 @@ mod tests {
         assert!(session.contains("session_content_width"));
         assert!(session.contains("enhanced_command_execution_display"));
         assert!(session.contains("set_enhanced_command_execution_display"));
+        assert!(session.contains("enhanced_file_operation_display"));
+        assert!(session.contains("set_enhanced_file_operation_display"));
     }
 
     #[test]
@@ -41241,7 +41330,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("timeline process rendering should remain inspectable");
         assert!(process_rows.contains("enhanced_command_execution_display"));
-        assert!(process_rows.contains("process_activity_groups_with_commands"));
+        assert!(process_rows.contains("timeline_process_activity_groups_for_display"));
 
         let row_renderer = source
             .split_once("    fn render_timeline_row(")
@@ -41251,6 +41340,29 @@ mod tests {
         assert!(row_renderer.contains("render_command_execution_card(row, None, cx)"));
         assert!(
             row_renderer.contains("TimelineRowKind::Command => self.render_process_activity_line")
+        );
+    }
+
+    #[test]
+    fn file_operation_display_preference_switches_between_cards_and_tool_activity_groups() {
+        let source = include_str!("app.rs");
+        let process_rows = source
+            .split_once("    fn render_timeline_process_rows(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn command_permission_rows_are_linked("))
+            .map(|(body, _)| body)
+            .expect("timeline process rendering should remain inspectable");
+        assert!(process_rows.contains("enhanced_file_operation_display"));
+        assert!(process_rows.contains("timeline_process_activity_groups_for_display"));
+
+        let row_renderer = source
+            .split_once("    fn render_timeline_row(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn highlight_session_search_rows("))
+            .map(|(body, _)| body)
+            .expect("timeline row rendering should remain inspectable");
+        assert!(row_renderer.contains("render_file_operation_card(row, cx)"));
+        assert!(
+            row_renderer
+                .contains("TimelineRowKind::FileOperation => self.render_process_activity_line")
         );
     }
 
@@ -41266,9 +41378,14 @@ mod tests {
             .expect("content width setter should remain inspectable");
         let command_display = source
             .split_once("    fn set_enhanced_command_execution_display(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn set_close_to_tray("))
+            .and_then(|(_, tail)| tail.split_once("\n    fn set_enhanced_file_operation_display("))
             .map(|(body, _)| body)
             .expect("command display setter should remain inspectable");
+        let file_operation_display = source
+            .split_once("    fn set_enhanced_file_operation_display(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn set_close_to_tray("))
+            .map(|(body, _)| body)
+            .expect("file operation display setter should remain inspectable");
         let invalidation = source
             .split_once("    fn invalidate_timeline_layout_measurements(")
             .and_then(|(_, tail)| tail.split_once("\n    fn refresh_last_timeline_size("))
@@ -41277,13 +41394,14 @@ mod tests {
 
         assert!(content_width.contains("self.invalidate_timeline_layout_measurements();"));
         assert!(command_display.contains("self.invalidate_timeline_layout_measurements();"));
+        assert!(file_operation_display.contains("self.invalidate_timeline_layout_measurements();"));
         assert!(invalidation.contains("self.timeline_measured_turn_heights.clear();"));
         assert!(invalidation.contains("self.timeline_pending_turn_heights.clear();"));
         assert!(invalidation.contains("self.timeline_estimated_turn_heights.clear();"));
     }
 
     #[test]
-    fn timeline_height_signature_tracks_command_card_layout() {
+    fn timeline_height_signature_tracks_card_layout_preferences() {
         let source = include_str!("app.rs");
         let signature = source
             .split_once("    fn timeline_turn_estimate_signature(")
@@ -41292,7 +41410,9 @@ mod tests {
             .expect("timeline estimate signature should remain inspectable");
 
         assert!(signature.contains("enhanced_command_execution_display"));
+        assert!(signature.contains("enhanced_file_operation_display"));
         assert!(signature.contains("process_activity_groups_with_commands"));
+        assert!(signature.contains("process_activity_groups_with_file_operations"));
     }
 
     #[test]
@@ -41385,6 +41505,8 @@ mod tests {
             ],
             process_activity_groups: Vec::new(),
             process_activity_groups_with_commands: Vec::new(),
+            process_activity_groups_with_file_operations: Vec::new(),
+            process_activity_groups_with_commands_and_file_operations: Vec::new(),
             live_status: None,
             conclusion_row: Some(row(
                 "conclusion",

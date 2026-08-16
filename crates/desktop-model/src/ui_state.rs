@@ -287,6 +287,8 @@ pub struct SessionUiState {
     pub turn_preview_rail: bool,
     #[serde(default = "default_enhanced_command_execution_display")]
     pub enhanced_command_execution_display: bool,
+    #[serde(default = "default_enhanced_file_operation_display")]
+    pub enhanced_file_operation_display: bool,
     #[serde(default)]
     pub auto_continue_project_ids: BTreeSet<String>,
     #[serde(default)]
@@ -299,6 +301,7 @@ impl Default for SessionUiState {
             content_width: SessionContentWidthMode::Standard,
             turn_preview_rail: true,
             enhanced_command_execution_display: false,
+            enhanced_file_operation_display: true,
             auto_continue_project_ids: BTreeSet::new(),
             auto_continue_session_overrides: BTreeMap::new(),
         }
@@ -307,6 +310,10 @@ impl Default for SessionUiState {
 
 const fn default_enhanced_command_execution_display() -> bool {
     false
+}
+
+const fn default_enhanced_file_operation_display() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1215,18 +1222,22 @@ mod tests {
 
     #[test]
     fn session_display_preferences_are_backward_compatible() {
+        assert!(SessionUiState::default().enhanced_file_operation_display);
+
         let mut value = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
         let session = value
             .get_mut("session")
             .and_then(serde_json::Value::as_object_mut)
             .unwrap();
         session.remove("enhancedCommandExecutionDisplay");
+        session.remove("enhancedFileOperationDisplay");
         session.remove("autoContinueProjectIds");
         session.remove("autoContinueSessionOverrides");
 
         let decoded = decode_and_migrate(&serde_json::to_vec(&value).unwrap()).unwrap();
 
         assert!(!decoded.session.enhanced_command_execution_display);
+        assert!(decoded.session.enhanced_file_operation_display);
         assert!(decoded.session.auto_continue_project_ids.is_empty());
         assert!(decoded.session.auto_continue_session_overrides.is_empty());
     }

@@ -123,6 +123,8 @@ pub struct Strings {
     pub session_content_width_full: &'static str,
     pub enhanced_command_execution_display: &'static str,
     pub enhanced_command_execution_display_description: &'static str,
+    pub enhanced_file_operation_display: &'static str,
+    pub enhanced_file_operation_display_description: &'static str,
     pub decrease_font_size: &'static str,
     pub increase_font_size: &'static str,
     pub decrease_font_weight: &'static str,
@@ -261,7 +263,7 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             appearance: "Appearance",
             appearance_description: "Choose how the desktop shell resolves light and dark mode.",
             session_settings: "Session",
-            session_settings_description: "Configure how Agent sessions and command activity are displayed.",
+            session_settings_description: "Configure how Agent sessions and activity are displayed.",
             theme: "Theme",
             theme_description: "Applies immediately and persists locally on this device.",
             light: "Light",
@@ -298,6 +300,8 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             session_content_width_full: "Full width",
             enhanced_command_execution_display: "Command card rendering",
             enhanced_command_execution_display_description: "Render command executions as standalone detail cards. When off, include them in the collapsible tool activity display.",
+            enhanced_file_operation_display: "File edit card rendering",
+            enhanced_file_operation_display_description: "Render file edits as standalone diff cards. When off, include them in the collapsible tool activity display.",
             decrease_font_size: "Decrease font size",
             increase_font_size: "Increase font size",
             decrease_font_weight: "Decrease font weight",
@@ -407,7 +411,7 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             appearance: "外观",
             appearance_description: "选择桌面端如何使用浅色和深色模式。",
             session_settings: "会话",
-            session_settings_description: "配置 Agent 会话及命令活动的显示方式。",
+            session_settings_description: "配置 Agent 会话及活动内容的显示方式。",
             theme: "主题",
             theme_description: "立即生效，并保存在此设备上。",
             light: "浅色",
@@ -444,6 +448,8 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             session_content_width_full: "全屏",
             enhanced_command_execution_display: "命令卡片渲染",
             enhanced_command_execution_display_description: "将命令执行渲染为独立详情卡片；关闭后，命令会合入可折叠的工具活动显示。",
+            enhanced_file_operation_display: "文件编辑卡片渲染",
+            enhanced_file_operation_display_description: "将文件编辑渲染为独立差异卡片；关闭后，文件编辑会合入可折叠的工具活动显示。",
             decrease_font_size: "减小字体",
             increase_font_size: "增大字体",
             decrease_font_weight: "减小字重",
@@ -553,7 +559,7 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             appearance: "外觀",
             appearance_description: "選擇桌面端如何使用淺色和深色模式。",
             session_settings: "會話",
-            session_settings_description: "設定 Agent 會話及命令活動的顯示方式。",
+            session_settings_description: "設定 Agent 會話及活動內容的顯示方式。",
             theme: "主題",
             theme_description: "立即生效，並儲存在此裝置上。",
             light: "淺色",
@@ -590,6 +596,8 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             session_content_width_full: "全屏",
             enhanced_command_execution_display: "命令卡片渲染",
             enhanced_command_execution_display_description: "將命令執行渲染為獨立詳情卡片；關閉後，命令會合入可折疊的工具活動顯示。",
+            enhanced_file_operation_display: "檔案編輯卡片渲染",
+            enhanced_file_operation_display_description: "將檔案編輯渲染為獨立差異卡片；關閉後，檔案編輯會合入可折疊的工具活動顯示。",
             decrease_font_size: "縮小字體",
             increase_font_size: "放大字體",
             decrease_font_weight: "減小字重",
@@ -1520,6 +1528,18 @@ mod tests {
         assert_eq!(
             strings(ResolvedLocale::ZhTw).enhanced_command_execution_display,
             "命令卡片渲染"
+        );
+        assert_eq!(
+            strings(ResolvedLocale::En).enhanced_file_operation_display,
+            "File edit card rendering"
+        );
+        assert_eq!(
+            strings(ResolvedLocale::ZhCn).enhanced_file_operation_display,
+            "文件编辑卡片渲染"
+        );
+        assert_eq!(
+            strings(ResolvedLocale::ZhTw).enhanced_file_operation_display,
+            "檔案編輯卡片渲染"
         );
         assert_eq!(
             strings(ResolvedLocale::En).new_session_prompt_placeholder,
