@@ -523,12 +523,14 @@ impl AgentWorkflowController {
         let switching_session = self.state.selected_session_id.as_ref() != Some(&session_id);
         let generation = self.state.generation.advance();
         self.state.selected_session_id = Some(session_id.clone());
-        self.state.active_session.clear();
+        if switching_session {
+            self.state.active_session.clear();
+            self.state.timeline = TimelineModel::default();
+            self.state.timeline_status.clear();
+            self.state.runtime_selection.clear();
+        }
         self.state.active_session.begin();
-        self.state.timeline = TimelineModel::default();
-        self.state.timeline_status.clear();
         self.state.timeline_status.begin();
-        self.state.runtime_selection.clear();
         if self.supports(BackendOperation::AgentSwitchRuntime) {
             self.state.runtime_selection.begin();
         }
@@ -1511,6 +1513,46 @@ mod tests {
         assert!(controller.apply_session_snapshot(&current, Ok(snapshot)));
         assert_eq!(controller.state.timeline.items.len(), 2);
         assert_eq!(controller.state.conversation_turns().len(), 1);
+    }
+
+    #[test]
+    fn same_session_refetch_keeps_content_while_a_session_switch_clears_it() {
+        let session = session();
+        let item = timeline_item(
+            &session.id,
+            1,
+            TimelinePayload::AgentMessage(AgentMessagePayload {
+                text: "completed response".into(),
+                is_final: true,
+            }),
+        );
+        let backend = Arc::new(MockAgentBackend::new(session.clone(), vec![item.clone()]));
+        let mut controller = AgentWorkflowController::new(backend, capabilities());
+        controller.state.selected_session_id = Some(session.id.clone());
+        controller.state.active_session.resolve(session.clone());
+        controller.state.timeline_status.resolve(());
+        controller
+            .state
+            .timeline
+            .replace_authoritative(session.id.clone(), [item]);
+
+        controller
+            .begin_session_load(session.id.clone())
+            .expect("same-session refetch should start");
+
+        assert_eq!(controller.state.active_session.phase, AsyncPhase::Loading);
+        assert_eq!(controller.state.active_session.value, Some(session));
+        assert_eq!(controller.state.timeline_status.value, Some(()));
+        assert_eq!(controller.state.timeline.items.len(), 1);
+        assert_eq!(controller.state.conversation_turns().len(), 1);
+
+        controller
+            .begin_session_load(VibexSessionId::new())
+            .expect("session switch should start");
+
+        assert!(controller.state.active_session.value.is_none());
+        assert!(controller.state.timeline_status.value.is_none());
+        assert!(controller.state.timeline.items.is_empty());
     }
 
     #[test]

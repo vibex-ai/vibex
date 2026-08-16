@@ -1111,6 +1111,13 @@ impl MobileApp {
     }
 
     fn reload_selected_session(&mut self, cx: &mut Context<Self>) {
+        if self
+            .controller
+            .as_ref()
+            .is_some_and(|controller| controller.state.timeline_status.phase == AsyncPhase::Loading)
+        {
+            return;
+        }
         let selected = self
             .controller
             .as_ref()
@@ -1131,7 +1138,6 @@ impl MobileApp {
             }
         };
         let runner = gpui_tokio::Tokio::spawn(cx, controller.load_session(ticket.clone()));
-        self.timeline_turns = Arc::new(Vec::new());
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
             let _ = entity.update(cx, |this, cx| {

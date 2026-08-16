@@ -39,14 +39,14 @@ use vibex_core::{
     RemoteDevicePermissionLevel, RemoteDeviceRequest, RemoteEventV2, RemoteHello,
     RemoteJsonMessageV2, RemoteLanPairingDiscoverySummary, RemoteLanPairingRequest,
     RemoteLanPairingRequestAccepted, RemoteLanPairingStatusRequest, RemoteLanPairingStatusResponse,
-    RemoteLanPairingWindowSnapshot, RemoteMutationContract, RemoteOperationKind,
-    RemotePairingCandidate, RemotePairingOfferSummary, RemotePairingTransport, RemotePing,
-    RemoteProtocolError, RemoteProtocolVersion, RemoteProtocolVersionRange, RemoteResyncRequired,
-    RemoteRetryClass, RemoteRpcRequestV2, RemoteRpcResponseV2, RemoteRpcResultMetadata,
-    RemoteServerInfoV2, RemoteSubscribeRequestV2, RemoteSubscriptionAcceptedV2, RemoteTimeoutClass,
-    RemoteWsTicketRequest, RemoteWsTicketResponse, RemoteZeroConfigLanPairingHello, RequestId,
-    TerminalId, VibexError, VibexResult, WorkspaceId, remote_permissions_for_level,
-    unix_timestamp_ms,
+    RemoteLanPairingWindowSnapshot, RemoteLiveEventEnvelope, RemoteMutationContract,
+    RemoteOperationKind, RemotePairingCandidate, RemotePairingOfferSummary, RemotePairingTransport,
+    RemotePing, RemoteProtocolError, RemoteProtocolVersion, RemoteProtocolVersionRange,
+    RemoteResyncRequired, RemoteRetryClass, RemoteRpcRequestV2, RemoteRpcResponseV2,
+    RemoteRpcResultMetadata, RemoteServerInfoV2, RemoteSubscribeRequestV2,
+    RemoteSubscriptionAcceptedV2, RemoteTimeoutClass, RemoteWsTicketRequest,
+    RemoteWsTicketResponse, RemoteZeroConfigLanPairingHello, RequestId, TerminalId, VibexError,
+    VibexResult, WorkspaceId, remote_permissions_for_level, unix_timestamp_ms,
 };
 use vibex_db::RemotePairingOfferRepository;
 use vibex_terminal::TerminalManager;
@@ -3097,6 +3097,7 @@ fn spawn_timeline_events(
     let mut events = agent_manager.subscribe();
     let generation = state.session_epoch;
     tokio::spawn(async move {
+        let mut domain_sequence = 0_u64;
         loop {
             match events.recv().await {
                 Ok(event) => {
@@ -3110,15 +3111,11 @@ fn spawn_timeline_events(
                     let Ok(event) = remote_timeline_event(event) else {
                         continue;
                     };
-                    let message = RemoteJsonMessageV2::Event(RemoteEventV2 {
-                        event_id: event.event_id,
-                        channel: "agent_session".to_string(),
+                    let message = RemoteJsonMessageV2::Event(timeline_domain_event(
+                        event,
                         generation,
-                        sequence: event.sequence,
-                        correlation_id: event.correlation_id,
-                        payload: event.payload,
-                        emitted_at_ms: event.emitted_at_ms,
-                    });
+                        &mut domain_sequence,
+                    ));
                     if send_json(&outbound, message).await.is_err() {
                         break;
                     }
@@ -3141,6 +3138,23 @@ fn spawn_timeline_events(
             }
         }
     })
+}
+
+fn timeline_domain_event(
+    event: RemoteLiveEventEnvelope,
+    generation: u64,
+    domain_sequence: &mut u64,
+) -> RemoteEventV2 {
+    *domain_sequence = domain_sequence.saturating_add(1).max(1);
+    RemoteEventV2 {
+        event_id: event.event_id,
+        channel: "agent_session".to_string(),
+        generation,
+        sequence: *domain_sequence,
+        correlation_id: event.correlation_id,
+        payload: event.payload,
+        emitted_at_ms: event.emitted_at_ms,
+    }
 }
 
 fn spawn_domain_events(
@@ -4694,6 +4708,32 @@ mod tests {
     #[test]
     fn elicitation_resolution_requires_mutation_idempotency() {
         assert!(mutation_requires_idempotency("resolve_elicitation"));
+    }
+
+    #[test]
+    fn timeline_live_events_use_a_connection_scoped_domain_sequence() {
+        let envelope = |session: &str, timeline_sequence| RemoteLiveEventEnvelope {
+            protocol_version: RemoteProtocolVersion::foundation(),
+            event_id: EventId::new(),
+            correlation_id: None,
+            channel: vibex_core::RemoteLiveEventChannel::AgentSession,
+            sequence: timeline_sequence,
+            payload: Some(serde_json::json!({
+                "sessionId": session,
+                "sequence": timeline_sequence,
+            })),
+            emitted_at_ms: 0,
+        };
+        let mut domain_sequence = 0;
+
+        let first = timeline_domain_event(envelope("session-running", 19), 7, &mut domain_sequence);
+        let second =
+            timeline_domain_event(envelope("session-complete", 3), 7, &mut domain_sequence);
+
+        assert_eq!(first.sequence, 1);
+        assert_eq!(second.sequence, 2);
+        assert_eq!(first.payload.unwrap()["sequence"], 19);
+        assert_eq!(second.payload.unwrap()["sequence"], 3);
     }
 
     #[test]

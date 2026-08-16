@@ -2397,6 +2397,10 @@ BackendFacade::{capabilities, replace_capabilities}
 
 DomainSyncEngine::{observe, observe_invalidation, apply_replay_page, apply_snapshot,
   reset_for_reconnect, reset_for_session_epoch}
+RemoteEventV2.sequence = connection-scoped channel/domain sequence
+TimelineLiveEvent.sequence = authoritative per-session timeline sequence in payload
+timeline_domain_event(RemoteLiveEventEnvelope, generation, &mut domain_sequence)
+  -> RemoteEventV2
 ChunkedFileReceiver::push(FileChunkDescriptor, &[u8])
 TerminalBinaryBuffer::{push_frame, take_batch, require_reset}
 CredentialStore / ClientIdentityStore
@@ -2466,6 +2470,14 @@ CredentialStore / ClientIdentityStore
   emit `Lagged`/`Resync`, rewind local cursors where necessary, and require an
   authoritative snapshot/catch-up before live application resumes. Replay pages
   update authority but are not re-injected into the wire event queue.
+- Agent live events have two independent sequence spaces. The outer
+  `RemoteEventV2.sequence` is contiguous across every `agent_session` event sent
+  on one connection, including events from different sessions. The serialized
+  `TimelineLiveEvent.sequence` inside `payload` remains the authoritative
+  per-session timeline cursor. Gateway fanout must assign the outer domain
+  sequence separately and must never copy a session timeline sequence into it;
+  otherwise an established session whose next item is greater than one, or two
+  interleaved sessions, creates a false domain gap and repeated mobile refetches.
 - Domain and binary consumers use separate bounded queues. Binary consumers may
   select a stream id so Terminal frames cannot be stolen by another transfer.
   A domain queue overflow publishes one explicit resync marker instead of
@@ -2509,6 +2521,7 @@ CredentialStore / ClientIdentityStore
 | RPC times out while the socket remains usable | `remote_rpc_timeout`; keep socket state separate and require idempotency result query for mutations. |
 | Socket closes with an in-flight mutation | `remote_rpc_result_unknown`; mark the mutation unknown and never replay it automatically. |
 | Event generation/sequence gaps, queue overflow, or reconnect rewind | `BackendEvent::Lagged` with authoritative refetch metadata; do not deliver a later event as contiguous. |
+| Two Agent sessions publish local timeline sequences such as `19` then `3` | Send outer `agent_session` domain sequences `1` then `2` on a fresh connection while preserving `19` and `3` inside their typed payloads. |
 | Projection invalidation burst or out-of-order invalidation | Keep one newest `ProjectionInvalidated` event for that channel and leave strict Agent sequence handling active. |
 | Binary stream id/generation/sequence/checksum/offset is invalid | Reject the frame, request reset/rebuild, and write no unvalidated bytes. |
 | File chunk exceeds chunk/transfer limit or final size does not match | Reject before sink finish; invoke cancellation/cleanup and preserve no partial success claim. |
@@ -2535,6 +2548,10 @@ CredentialStore / ClientIdentityStore
   only `device_management` removes pairing from every existing facade clone.
 - Good: 100 file invalidations coalesce into one authoritative Files refetch
   while a contiguous Agent event remains deliverable.
+- Good: a running background session and the selected completed session can
+  interleave timeline events without changing the selected timeline's loading
+  state; the transport domain cursor stays contiguous while each payload keeps
+  its own session cursor.
 - Good: a Terminal stream with an evicted frame emits `reset_required`, while a
   large file is written chunk-by-chunk into a sink and the final total/checksum
   is checked before commit.
@@ -2548,6 +2565,8 @@ CredentialStore / ClientIdentityStore
   before enforcing the HTTP limit.
 - Bad: merge reconnect capabilities into the old snapshot, or let a projection
   invalidation gap pause unrelated sequenced domains.
+- Bad: assign `RemoteEventV2.sequence = TimelineLiveEvent.sequence`; timeline
+  sequences are local to a session and cannot order a multi-session channel.
 - Bad: fix an Android availability failure with
   `danger_accept_invalid_certs`, or configure WebPKI roots for HTTP while
   leaving WSS on the failing platform verifier.
@@ -2563,6 +2582,9 @@ CredentialStore / ClientIdentityStore
   `shared_facade_tracks_capability_additions_and_removals_after_reconnect`,
   `projection_invalidation_gaps_coalesce_without_pausing_other_domains`, and
   `projection_invalidation_burst_coalesces_without_pausing_agent_events` green.
+- `cargo test -p vibex-remote timeline_live_events_use_a_connection_scoped_domain_sequence
+  --locked` must prove interleaved session payload sequences remain unchanged
+  while their outer domain sequences are contiguous.
 - `cargo check -p vibex-mobile --locked` proves the native mobile transport,
   bounded WebSocket channel, storage traits, and shared Backend graph remain
   native-platform-safe.
@@ -2593,6 +2615,7 @@ let bytes = response.bytes().await?;
 if bytes.len() > MAX_JSON_BYTES { return Err(too_large()); }
 let client = reqwest::Client::new(); // Android platform verifier on product routes.
 let socket = tokio_tungstenite::connect_async(request).await?;
+let event_sequence = timeline_event.sequence; // Wrong sequence space.
 // A slow WebSocket consumer advances the cursor before the event is retained.
 send_message_again_after_timeout(request).await?;
 facade_capabilities.extend(reconnected_server_capabilities);
@@ -2611,6 +2634,7 @@ let socket = connect_async_tls_with_config(
     Some(android_websocket_connector()?),
 ).await?;
 validate_claim_response(&offer, &provisional_identity, &response)?;
+let event = timeline_domain_event(timeline_event, generation, &mut domain_sequence);
 let body = read_chunks_with_limit(response, MAX_JSON_BYTES).await?;
 let decision = if is_projection_invalidation(&event) {
     sync.observe_invalidation(event.clone())
