@@ -15006,22 +15006,6 @@ impl VibexWorkbench {
         }
     }
 
-    fn render_preview_activity_button(
-        &mut self,
-        preview_open: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        right_rail_activity_button("activity-preview", Icon::new(IconName::PanelLeftOpen))
-            .tooltip(if preview_open {
-                locale::text("Close Preview", "关闭预览", "關閉預覽")
-            } else {
-                locale::text("Open Preview", "打开预览", "開啟預覽")
-            })
-            .selected(preview_open)
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_preview(cx)))
-            .into_any_element()
-    }
-
     fn render_right_rail_panel(&self) -> AnyElement {
         self.code_right_rail
             .clone()
@@ -15031,11 +15015,6 @@ impl VibexWorkbench {
 
     fn render_right_rail_activity_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let panel_open = self.right_rail_panel_open();
-        let preview_open = if self.last_visibility.preview_docked {
-            self.ui_state.workbench.preview_visible
-        } else {
-            self.preview_overlay_open
-        };
         let activities = vec![
             right_rail_activity_button(
                 "activity-files",
@@ -15056,7 +15035,6 @@ impl VibexWorkbench {
                     }),
                 )
                 .into_any_element(),
-            self.render_preview_activity_button(preview_open, cx),
             right_rail_activity_button("activity-terminal", Icon::new(IconName::SquareTerminal))
                 .tooltip(locale::text("New terminal", "新建终端", "新增終端機"))
                 .on_click(cx.listener(|this, _, window, cx| {
@@ -37486,6 +37464,21 @@ mod tests {
             route_right_rail_activity_id("git").as_deref(),
             Some("rail_plugin_system_git")
         );
+    }
+
+    #[test]
+    fn right_rail_activity_bar_omits_the_preview_toggle() {
+        let source = include_str!("app.rs");
+        let renderer = source
+            .split_once("    fn render_right_rail_activity_bar(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn open_management("))
+            .map(|(renderer, _)| renderer)
+            .expect("right rail activity renderer should remain inspectable");
+
+        assert!(renderer.contains("activity-files"));
+        assert!(renderer.contains("activity-git"));
+        assert!(renderer.contains("activity-terminal"));
+        assert!(!renderer.contains("activity-preview"));
     }
 
     #[test]
