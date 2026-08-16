@@ -27,8 +27,10 @@ vibex-db = { path = "../db" }
 vibex-fs = { path = "../fs" }
 vibex-git = { path = "../git" }
 vibex-terminal = { path = "../terminal" }
+vibex-relay = { path = "../relay" }
 x25519-dalek.workspace = true
 
 [dev-dependencies]
+reqwest.workspace = true
 tempfile = "3"
 tokio-tungstenite.workspace = true

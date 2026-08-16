@@ -71,6 +71,72 @@ impl Default for LanPairingCoordinator {
 }
 
 impl LanPairingCoordinator {
+    pub(crate) fn start_zero_config(
+        &self,
+        offer: RemotePairingOffer,
+        local_port: u16,
+        display_name: &str,
+        now_ms: i64,
+    ) -> VibexResult<RemoteLanPairingWindowSnapshot> {
+        if local_port == 0 {
+            return Err(VibexError::validation(
+                "remote_zero_config_pairing_listener_invalid",
+                "zero-config LAN pairing listener port is invalid",
+            ));
+        }
+        if offer.summary.expires_at_ms <= now_ms
+            || offer.summary.canceled
+            || offer.summary.claimed_device_id.is_some()
+        {
+            return Err(remote_error(
+                "remote_zero_config_pairing_unavailable",
+                "zero-config LAN pairing window is already unavailable",
+            ));
+        }
+        let display_name = bounded_display_name(display_name)?;
+        let mut window = self.window.lock().map_err(|_| state_error())?;
+        if window.as_ref().is_some_and(|current| {
+            current.discovery.expires_at_ms > now_ms
+                && !current.offer.summary.canceled
+                && current.offer.summary.claimed_device_id.is_none()
+        }) {
+            return Err(VibexError::conflict(
+                "remote_zero_config_pairing_active",
+                "another zero-config LAN pairing window is already active",
+            ));
+        }
+
+        let window_id = RequestId::new();
+        let advertisement_id = secure_secret("local-adv");
+        let service_instance = service_instance_name(&display_name, &advertisement_id);
+        let discovery = RemoteLanPairingDiscoverySummary {
+            schema_version: REMOTE_LAN_PAIRING_SCHEMA_VERSION.to_string(),
+            window_id,
+            server_id: offer.summary.server_id.clone(),
+            server_identity_public_key: offer.summary.server_identity_public_key.clone(),
+            protocol_range: offer.summary.protocol_range,
+            permission_level: offer.summary.permission_level,
+            expires_at_ms: offer.summary.expires_at_ms,
+        };
+        let advertisement = RemoteLanPairingAdvertisement {
+            advertisement_id,
+            service_instance,
+            display_name,
+            direct_origin: format!("http://127.0.0.1:{local_port}"),
+            protocol_min: offer.summary.protocol_range.min.major,
+            protocol_max: offer.summary.protocol_range.max.major,
+        };
+        let next = LanPairingWindow {
+            discovery,
+            advertisement,
+            offer,
+            pending: HashMap::new(),
+        };
+        let snapshot = next.snapshot(now_ms);
+        *window = Some(next);
+        Ok(snapshot)
+    }
+
     pub(crate) fn start(
         &self,
         offer: RemotePairingOffer,

@@ -10006,6 +10006,7 @@ dependencies = [
 name = "vibex-mobile"
 version = "0.1.0-rc.1"
 dependencies = [
+ "base64",
  "futures-channel",
  "futures-util",
  "gpui",
@@ -10074,6 +10075,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "rand_core 0.6.4",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -10088,6 +10090,7 @@ dependencies = [
  "vibex-db",
  "vibex-fs",
  "vibex-git",
+ "vibex-relay",
  "vibex-terminal",
  "x25519-dalek",
 ]

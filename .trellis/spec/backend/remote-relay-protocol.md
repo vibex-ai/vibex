@@ -279,6 +279,122 @@ approved body-secret status -> existing offer validator + exact Direct route
 existing claim transaction -> existing MobileCredentialBundle
 ```
 
+## Scenario: Zero-Configuration LAN Pairing Bootstrap
+
+### 1. Scope / Trigger
+
+- Trigger: changing the separate zero-configuration pairing entry, the
+  `mode=zero_config` DNS-SD advertisement, its temporary HTTP listener,
+  application-encrypted pairing frames, or mobile zero-config claim flow.
+- This is a fourth pairing entry, not a fourth long-term transport. It must not
+  add nearby-device controls to the Direct, Tailnet, or Relay method rows.
+
+### 2. Signatures
+
+```text
+POST /api/v2/pairing/lan-zero/hello
+  RemoteZeroConfigLanPairingHello
+    -> RemoteZeroConfigLanPairingHelloAccepted
+POST /api/v2/pairing/lan-zero/{request,status,claim}
+  RelayEncryptedFrame -> RelayEncryptedFrame
+
+RemoteGateway::{start_zero_config_lan_pairing,
+  zero_config_lan_pairing_window_status,
+  approve_zero_config_lan_pairing_request,
+  reject_zero_config_lan_pairing_request,
+  cancel_zero_config_lan_pairing}
+RemoteConnectivityController mirrors the same lifecycle.
+ZeroConfigLanPairingSession::{start,poll,claim_approved}
+DNS-SD service type = _vibex._tcp.local.; TXT mode = zero_config
+```
+
+### 3. Contracts
+
+- Desktop binds a temporary `0.0.0.0:0` HTTP listener that serves only the four
+  `lan-zero` endpoints. It never merges the normal RemoteGateway router, never
+  becomes a persisted candidate, and stops after claim, cancel, expiry, route
+  change, Gateway stop/restart, or dialog close.
+- The entry requires at least one already validated Direct, Tailnet, or Relay
+  route because the temporary listener is pairing-only. The resulting offer,
+  claim transaction, device grant, audit record, `MobileCredentialBundle`, and
+  `AutoRemoteTransport` routes remain unchanged.
+- TXT is bounded to 512 bytes and contains exactly `version=1`,
+  `mode=zero_config`, advertisement/display fields, v2 protocol bounds,
+  `pairing=available`, server id, and the Desktop X25519 public identity.
+  Treat the advertised identity as an untrusted key-agreement input, not a
+  trust root. Offer/window/request ids, challenge, request secret, grant, and
+  private keys remain forbidden.
+- Mobile constructs one credential-free exact `http` origin from the resolved
+  DNS-SD authority, bypasses all proxies, disables redirects, and uses it only
+  for this bootstrap. HTTPS remains mandatory for ordinary Direct publication.
+- Hello carries a fresh mobile peer id, ephemeral X25519 public key, and
+  16-256 byte nonce. Public keys use unpadded base64url on this wire. Both peers
+  convert the key bytes to the Relay library's standard-base64 representation
+  before `RelaySession::establish_with_suite`, so the DirectionalV2 KDF sees an
+  identical canonical string on both ends; the hello nonce is KDF context.
+- Request, status, offer challenge, claim, and grant exist only inside
+  `RelayEncryptedFrame`. Desktop still shows device name, fingerprint, and the
+  shared six-digit SAS before explicit approval. At most 16 bootstrap sessions,
+  16 concurrent requests, one active window, eight pending devices, an 8KiB
+  body, and the existing 500ms minimum status interval are permitted.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| No validated long-term route | `remote_zero_config_pairing_routes_unavailable`; bind is released and nothing is advertised. |
+| Listener bind/address or advertiser setup fails | `remote_zero_config_pairing_listener_*` / `remote_zero_config_advertisement_failed`; cancel the offer and listener. |
+| Unknown/oversized TXT, invalid server id/key, non-v2 mode, or malformed origin | `remote_lan_discovery_invalid` / `remote_zero_config_pairing_origin_invalid`; send no hello. |
+| Hello nonce/key is malformed or non-contributory | `remote_zero_config_pairing_hello_invalid` / `remote_zero_config_pairing_hello_rejected`; create no session. |
+| Session is unknown, expired, replayed, or frame authentication fails | `remote_zero_config_pairing_session_*` / `remote_zero_config_pairing_frame_invalid`; expose no plaintext payload. |
+| Session/request limits are reached | Existing bounded LAN busy/limit response; allocate no unbounded task or session. |
+| Advertised, hello, discovery, or offer server identity differs | `remote_zero_config_pairing_identity_mismatch`; do not request, claim, or persist credentials. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: Mobile discovers the dedicated zero-config advertisement, establishes
+  an encrypted session, both devices compare SAS, Desktop approves, and the
+  encrypted claim persists the existing route bundle.
+- Base: the three remote method controls and QR flow work unchanged while no
+  zero-config window is active; the fourth entry has its own permission and
+  start/stop state.
+- Bad: attach a nearby button to every transport row, advertise the claim
+  challenge, send request/status/claim as plaintext HTTP JSON, accept a server
+  key change, use a proxy, or retain the listener as a long-term LAN route.
+
+### 6. Tests Required
+
+- Core golden JSON freezes the strict hello shape and secret-bearing DTO Debug
+  output remains redacted.
+- Gateway integration uses a real temporary listener and proves encrypted
+  request/status/claim, pending offer absence, existing transactional claim,
+  listener terminal shutdown, session/body/concurrency bounds, and route-less
+  refusal.
+- Remote-client tests cover exact HTTP-origin normalization, proxy bypass,
+  redirect refusal, base64url/Relay-base64 conversion, identity binding, SAS,
+  and encrypted response decoding.
+- Desktop advertiser/controller tests cover strict TXT, start failure cleanup,
+  expiry, route-change cancellation, and separate UI state. Native mobile tests
+  cover mode filtering, invalid identity metadata, duplicate names, lifecycle,
+  claim persistence, and QR fallback. Run `pnpm check:mobile-native`.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+_vibex TXT challenge=<secret> -> POST plaintext claim -> save mDNS HTTP as route
+Direct / Tailnet / Relay rows each render "Allow nearby device"
+```
+
+#### Correct
+
+```text
+bounded zero_config TXT -> hello -> DirectionalV2 encrypted request/status/claim
+separate fourth pairing entry -> existing offer routes -> existing credential bundle
+claim/cancel/expiry -> listener + advertisement + in-memory sessions cleared
+```
+
 ## Scenario: GPUI Desktop Remote Publication Controller
 
 ### 1. Scope / Trigger

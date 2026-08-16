@@ -29,7 +29,8 @@ use vibex_core::{
     ErrorCategory, RelayPeerId, RelayProtocolVersion, RelayRoomId, RemoteCancelPairingOfferRequest,
     RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDevicePermissionLevel,
     RemoteLanPairingWindowSnapshot, RemotePairingCandidate, RemotePairingOfferSummary,
-    RemotePairingTransport, RemoteProtocolVersionRange, RequestId, VibexError, VibexResult,
+    RemotePairingTransport, RemoteProtocolVersionRange, RemoteZeroConfigLanPairingAdvertisement,
+    RequestId, VibexError, VibexResult, unix_timestamp_ms,
 };
 use vibex_remote::{
     RemoteGateway, RemoteGatewayConfig, RemoteGatewayDeploymentMode, RemoteGatewayPairingRoutes,
@@ -37,7 +38,10 @@ use vibex_remote::{
 };
 
 use crate::relay::{RelayClientRuntime, RelayClientSettingsUpdate};
-use crate::{LanPairingAdvertiser, MdnsLanPairingAdvertiser};
+use crate::{
+    LanPairingAdvertiser, MdnsLanPairingAdvertiser, MdnsZeroConfigLanPairingAdvertiser,
+    ZeroConfigLanPairingAdvertiser,
+};
 
 pub const REMOTE_ACCESS_SETTINGS_FILE: &str = "remote-access.json";
 pub const REMOTE_CONNECTIVITY_SCHEMA_VERSION: u16 = 1;
@@ -1615,6 +1619,7 @@ struct ControllerInner {
     relay_probe: Arc<dyn RelayPublicationProbe>,
     lan_probe: Arc<dyn DirectPublicationProbe>,
     lan_advertiser: Arc<dyn LanPairingAdvertiser>,
+    zero_config_lan_advertiser: Arc<dyn ZeroConfigLanPairingAdvertiser>,
     operation: Mutex<()>,
     state: Mutex<ControllerState>,
 }
@@ -1625,6 +1630,7 @@ struct PublicationAdapters {
     relay_probe: Arc<dyn RelayPublicationProbe>,
     lan_probe: Arc<dyn DirectPublicationProbe>,
     lan_advertiser: Arc<dyn LanPairingAdvertiser>,
+    zero_config_lan_advertiser: Arc<dyn ZeroConfigLanPairingAdvertiser>,
 }
 
 #[derive(Clone)]
@@ -1659,6 +1665,7 @@ impl RemoteConnectivityController {
                 relay_probe: Arc::new(HttpRelayPublicationProbe::default()),
                 lan_probe: Arc::new(WebPkiDirectPublicationProbe::default()),
                 lan_advertiser: Arc::new(MdnsLanPairingAdvertiser::default()),
+                zero_config_lan_advertiser: Arc::new(MdnsZeroConfigLanPairingAdvertiser::default()),
             },
         )
     }
@@ -1682,6 +1689,7 @@ impl RemoteConnectivityController {
                 relay_probe: Arc::new(HttpRelayPublicationProbe::default()),
                 lan_probe,
                 lan_advertiser: Arc::new(MdnsLanPairingAdvertiser::default()),
+                zero_config_lan_advertiser: Arc::new(MdnsZeroConfigLanPairingAdvertiser::default()),
             },
         )
     }
@@ -1707,6 +1715,7 @@ impl RemoteConnectivityController {
                 relay_probe,
                 lan_probe,
                 lan_advertiser: Arc::new(MdnsLanPairingAdvertiser::default()),
+                zero_config_lan_advertiser: Arc::new(MdnsZeroConfigLanPairingAdvertiser::default()),
             },
         )
     }
@@ -1738,6 +1747,7 @@ impl RemoteConnectivityController {
                 relay_probe: adapters.relay_probe,
                 lan_probe: adapters.lan_probe,
                 lan_advertiser: adapters.lan_advertiser,
+                zero_config_lan_advertiser: adapters.zero_config_lan_advertiser,
                 operation: Mutex::new(()),
                 state: Mutex::new(ControllerState {
                     settings: loaded.settings,
@@ -1914,6 +1924,98 @@ impl RemoteConnectivityController {
     pub fn cancel_lan_pairing_window(&self) -> VibexResult<()> {
         let advertiser = self.inner.lan_advertiser.stop();
         let gateway = self.inner.gateway.cancel_lan_pairing_window();
+        advertiser.and(gateway)
+    }
+
+    pub async fn start_zero_config_lan_pairing(
+        &self,
+        permission_level: RemoteDevicePermissionLevel,
+        ttl_ms: u32,
+    ) -> VibexResult<RemoteLanPairingWindowSnapshot> {
+        let _operation = self.inner.operation.lock().await;
+        let snapshot = self
+            .inner
+            .gateway
+            .start_zero_config_lan_pairing(permission_level, ttl_ms)
+            .await?;
+        let local_port = self
+            .inner
+            .gateway
+            .zero_config_lan_pairing_listener_addr()
+            .map(|address| address.port())
+            .ok_or_else(|| {
+                VibexError::process(
+                    "remote_zero_config_pairing_listener_unavailable",
+                    "zero-config LAN pairing listener is unavailable",
+                )
+            })?;
+        let advertisement = RemoteZeroConfigLanPairingAdvertisement {
+            advertisement_id: snapshot.advertisement.advertisement_id.clone(),
+            service_instance: snapshot.advertisement.service_instance.clone(),
+            display_name: snapshot.advertisement.display_name.clone(),
+            server_id: snapshot.discovery.server_id.clone(),
+            server_identity_public_key: snapshot.discovery.server_identity_public_key.clone(),
+            local_port,
+            protocol_min: snapshot.advertisement.protocol_min,
+            protocol_max: snapshot.advertisement.protocol_max,
+        };
+        if let Err(error) = self.inner.zero_config_lan_advertiser.start(&advertisement) {
+            let _ = self.inner.gateway.cancel_zero_config_lan_pairing().await;
+            return Err(error);
+        }
+        let controller = self.clone();
+        let window_id = snapshot.discovery.window_id.clone();
+        let expires_at_ms = snapshot.discovery.expires_at_ms;
+        tokio::spawn(async move {
+            let delay_ms = expires_at_ms.saturating_sub(unix_timestamp_ms()).max(0) as u64;
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            match controller.zero_config_lan_pairing_window_status() {
+                Ok(current) if current.discovery.window_id == window_id => {
+                    let _ = controller.cancel_zero_config_lan_pairing().await;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    let _ = controller.cancel_zero_config_lan_pairing().await;
+                }
+            }
+        });
+        Ok(snapshot)
+    }
+
+    pub fn zero_config_lan_pairing_window_status(
+        &self,
+    ) -> VibexResult<RemoteLanPairingWindowSnapshot> {
+        match self.inner.gateway.zero_config_lan_pairing_window_status() {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) => {
+                let _ = self.inner.zero_config_lan_advertiser.stop();
+                Err(error)
+            }
+        }
+    }
+
+    pub fn approve_zero_config_lan_pairing_request(
+        &self,
+        request_id: &RequestId,
+    ) -> VibexResult<RemoteLanPairingWindowSnapshot> {
+        self.inner
+            .gateway
+            .approve_zero_config_lan_pairing_request(request_id)
+    }
+
+    pub fn reject_zero_config_lan_pairing_request(
+        &self,
+        request_id: &RequestId,
+    ) -> VibexResult<RemoteLanPairingWindowSnapshot> {
+        self.inner
+            .gateway
+            .reject_zero_config_lan_pairing_request(request_id)
+    }
+
+    pub async fn cancel_zero_config_lan_pairing(&self) -> VibexResult<()> {
+        let _operation = self.inner.operation.lock().await;
+        let advertiser = self.inner.zero_config_lan_advertiser.stop();
+        let gateway = self.inner.gateway.cancel_zero_config_lan_pairing().await;
         advertiser.and(gateway)
     }
 
@@ -2641,6 +2743,10 @@ impl RemoteConnectivityController {
         listener_enabled: bool,
     ) -> VibexResult<()> {
         let previous = self.inner.gateway.current_config();
+        if previous.pairing_routes != routes {
+            let _ = self.inner.zero_config_lan_advertiser.stop();
+            self.inner.gateway.cancel_zero_config_lan_pairing().await?;
+        }
         let mut config = previous.clone();
         config.pairing_routes = routes;
         config.service.bind_addr = self.inner.gateway_bind_addr.clone();
@@ -2718,6 +2824,14 @@ impl RemoteConnectivityController {
     fn stop_lan_advertiser_if_inactive(&self) {
         if self.inner.gateway.lan_pairing_window_status().is_err() {
             let _ = self.inner.lan_advertiser.stop();
+        }
+        if self
+            .inner
+            .gateway
+            .zero_config_lan_pairing_window_status()
+            .is_err()
+        {
+            let _ = self.inner.zero_config_lan_advertiser.stop();
         }
     }
 
@@ -3502,6 +3616,30 @@ mod tests {
         stop_calls: AtomicUsize,
     }
 
+    #[derive(Default)]
+    struct FakeZeroConfigLanAdvertiser {
+        advertisements: StdMutex<Vec<RemoteZeroConfigLanPairingAdvertisement>>,
+        stop_calls: AtomicUsize,
+    }
+
+    impl ZeroConfigLanPairingAdvertiser for FakeZeroConfigLanAdvertiser {
+        fn start(
+            &self,
+            advertisement: &RemoteZeroConfigLanPairingAdvertisement,
+        ) -> VibexResult<()> {
+            self.advertisements
+                .lock()
+                .unwrap()
+                .push(advertisement.clone());
+            Ok(())
+        }
+
+        fn stop(&self) -> VibexResult<()> {
+            self.stop_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
     impl LanPairingAdvertiser for FakeLanAdvertiser {
         fn start(&self, advertisement: &RemoteLanPairingAdvertisement) -> VibexResult<()> {
             self.advertisements
@@ -3550,6 +3688,7 @@ mod tests {
         directory: &Path,
         direct_probe: Arc<FakeDirectProbe>,
         lan_advertiser: Arc<FakeLanAdvertiser>,
+        zero_config_lan_advertiser: Arc<FakeZeroConfigLanAdvertiser>,
     ) -> (RemoteConnectivityController, RemoteGateway) {
         let dispatcher = vibex_remote::RemoteDispatcher::new(
             vibex_remote::RemoteServiceConfig::loopback_disabled(),
@@ -3572,6 +3711,7 @@ mod tests {
                 relay_probe: Arc::new(FakeRelayProbe::default()),
                 lan_probe: direct_probe.clone(),
                 lan_advertiser,
+                zero_config_lan_advertiser,
             },
         )
         .unwrap();
@@ -3832,6 +3972,7 @@ mod tests {
             directory.path(),
             direct.clone(),
             advertiser.clone(),
+            Arc::new(FakeZeroConfigLanAdvertiser::default()),
         )
         .await;
         *direct.info.lock().unwrap() = Some(direct_info(&gateway));
@@ -3859,6 +4000,56 @@ mod tests {
         assert!(advertiser.stop_calls.load(Ordering::SeqCst) >= 1);
         assert_eq!(
             controller.lan_pairing_window_status().unwrap_err().code,
+            "remote_lan_pairing_window_unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_config_pairing_advertisement_and_listener_follow_window_lifecycle() {
+        let _guard = CONTROLLER_TEST_LOCK.lock().await;
+        let directory = tempdir().unwrap();
+        let direct = Arc::new(FakeDirectProbe::default());
+        let advertiser = Arc::new(FakeZeroConfigLanAdvertiser::default());
+        let (controller, gateway) = test_controller_with_lan_advertiser(
+            directory.path(),
+            direct.clone(),
+            Arc::new(FakeLanAdvertiser::default()),
+            advertiser.clone(),
+        )
+        .await;
+        *direct.info.lock().unwrap() = Some(direct_info(&gateway));
+        controller
+            .enable_direct("https://desktop.example.test")
+            .await
+            .unwrap();
+
+        let window = controller
+            .start_zero_config_lan_pairing(RemoteDevicePermissionLevel::ReadOnly, 60_000)
+            .await
+            .unwrap();
+        let listener = gateway.zero_config_lan_pairing_listener_addr().unwrap();
+        {
+            let advertisements = advertiser.advertisements.lock().unwrap();
+            assert_eq!(advertisements.len(), 1);
+            assert_eq!(advertisements[0].local_port, listener.port());
+            assert_eq!(advertisements[0].server_id, window.discovery.server_id);
+            assert_eq!(
+                advertisements[0].server_identity_public_key,
+                window.discovery.server_identity_public_key
+            );
+            let encoded = serde_json::to_string(&advertisements[0]).unwrap();
+            assert!(!encoded.contains("challenge"));
+            assert!(!encoded.contains("requestSecret"));
+        }
+
+        controller.cancel_zero_config_lan_pairing().await.unwrap();
+        assert!(advertiser.stop_calls.load(Ordering::SeqCst) >= 1);
+        assert!(gateway.zero_config_lan_pairing_listener_addr().is_none());
+        assert_eq!(
+            controller
+                .zero_config_lan_pairing_window_status()
+                .unwrap_err()
+                .code,
             "remote_lan_pairing_window_unavailable"
         );
     }

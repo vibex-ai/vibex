@@ -11,6 +11,7 @@ name = "vibex_mobile"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
+base64.workspace = true
 futures-channel.workspace = true
 futures-util.workspace = true
 gpui.workspace = true

@@ -71,6 +71,7 @@ pub use identity::{RemoteIdentity, RemoteIdentityStore};
 mod gateway;
 mod lan_pairing;
 mod pairing_v2;
+mod zero_config_pairing;
 pub use gateway::{
     RelayAttachmentTasks, RelayRemoteOutbound, RemoteGateway, RemoteGatewayConfig,
     RemoteGatewayDeploymentMode, RemoteGatewayPairingRoutes, RemoteGatewayStatus,

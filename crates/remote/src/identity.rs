@@ -33,6 +33,10 @@ impl RemoteIdentity {
         StaticSecret::from(self.private_key)
     }
 
+    pub(crate) fn private_key_bytes(&self) -> [u8; 32] {
+        self.private_key
+    }
+
     pub(crate) fn relay_transport_private_key(&self) -> VibexResult<[u8; 32]> {
         use hkdf::Hkdf;
         let hkdf =

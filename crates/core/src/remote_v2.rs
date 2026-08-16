@@ -33,6 +33,7 @@ pub const REMOTE_V2_BINARY_MAGIC: [u8; 4] = *b"VBX2";
 pub const REMOTE_V2_MAX_BINARY_HEADER_BYTES: usize = 64 * 1024;
 pub const REMOTE_V2_MAX_BINARY_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 pub const REMOTE_LAN_PAIRING_SCHEMA_VERSION: &str = "vibex-lan-pairing-discovery.v1";
+pub const REMOTE_ZERO_CONFIG_LAN_PAIRING_SCHEMA_VERSION: &str = "vibex-zero-config-lan-pairing.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -919,6 +920,63 @@ pub struct RemoteLanPairingWindowSnapshot {
     pub pending_requests: Vec<RemoteLanPairingPendingRequestSummary>,
 }
 
+/// The non-HTTPS, zero-configuration LAN bootstrap advertises an application-
+/// encrypted endpoint. It is intentionally separate from the Direct HTTPS
+/// advertisement above: the local listener is temporary and is never a
+/// long-term remote route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoteZeroConfigLanPairingAdvertisement {
+    pub advertisement_id: String,
+    pub service_instance: String,
+    pub display_name: String,
+    pub server_id: String,
+    pub server_identity_public_key: String,
+    pub local_port: u16,
+    pub protocol_min: u16,
+    pub protocol_max: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoteZeroConfigLanPairingHello {
+    pub client_peer_id: crate::RelayPeerId,
+    pub client_ephemeral_public_key: String,
+    pub client_nonce: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoteZeroConfigLanPairingHelloAccepted {
+    pub schema_version: String,
+    pub session_id: crate::RelaySessionId,
+    pub room_id: crate::RelayRoomId,
+    pub client_peer_id: crate::RelayPeerId,
+    pub server_peer_id: crate::RelayPeerId,
+    pub server_id: String,
+    pub server_identity_public_key: String,
+    pub discovery: RemoteLanPairingDiscoverySummary,
+}
+
+impl fmt::Debug for RemoteZeroConfigLanPairingHelloAccepted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteZeroConfigLanPairingHelloAccepted")
+            .field("schema_version", &self.schema_version)
+            .field("session_id", &self.session_id)
+            .field("room_id", &self.room_id)
+            .field("client_peer_id", &self.client_peer_id)
+            .field("server_peer_id", &self.server_peer_id)
+            .field("server_id", &self.server_id)
+            .field(
+                "server_identity_public_key",
+                &self.server_identity_public_key,
+            )
+            .field("discovery", &self.discovery)
+            .finish()
+    }
+}
+
 /// Derive the six-digit short authentication string shown on both devices.
 /// Length-prefixing every field keeps the transcript unambiguous across clients.
 pub fn remote_lan_pairing_verification_code(
@@ -1351,6 +1409,26 @@ mod tests {
             serde_json::from_str(r#""future_state""#).unwrap();
 
         assert_eq!(state, RemoteLanPairingRequestState::Unknown);
+    }
+
+    #[test]
+    fn zero_config_pairing_hello_has_a_stable_strict_wire_shape() {
+        let hello = RemoteZeroConfigLanPairingHello {
+            client_peer_id: crate::RelayPeerId::parse("relaypeer_mobile").unwrap(),
+            client_ephemeral_public_key: "mobile-ephemeral-public".into(),
+            client_nonce: "hello-nonce-0123456789".into(),
+        };
+
+        assert_eq!(
+            serde_json::to_string(&hello).unwrap(),
+            r#"{"clientPeerId":"relaypeer_mobile","clientEphemeralPublicKey":"mobile-ephemeral-public","clientNonce":"hello-nonce-0123456789"}"#
+        );
+        assert!(
+            serde_json::from_str::<RemoteZeroConfigLanPairingHello>(
+                r#"{"clientPeerId":"relaypeer_mobile","clientEphemeralPublicKey":"key","clientNonce":"nonce","future":true}"#,
+            )
+            .is_err()
+        );
     }
 
     #[test]

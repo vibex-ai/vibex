@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock};
 
+use base64::Engine as _;
 use futures_channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use serde::Deserialize;
 use vibex_backend::{BackendError, BackendResult};
@@ -17,14 +18,31 @@ pub struct LanDiscoveryCandidate {
     pub service_instance: String,
     pub display_name: String,
     pub origin: String,
+    pub mode: LanDiscoveryMode,
+    pub server_id: Option<String>,
+    pub server_identity_public_key: Option<String>,
     pub interface_scope: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LanDiscoveryMode {
+    DirectHttps,
+    ZeroConfig,
 }
 
 impl LanDiscoveryCandidate {
     pub fn key(&self) -> String {
         format!(
-            "{}\u{1f}{}\u{1f}{}\u{1f}{}",
-            self.advertisement_id, self.service_instance, self.origin, self.interface_scope
+            "{}\u{1f}{}\u{1f}{}\u{1f}{:?}\u{1f}{}\u{1f}{}\u{1f}{}",
+            self.advertisement_id,
+            self.service_instance,
+            self.origin,
+            self.mode,
+            self.server_id.as_deref().unwrap_or_default(),
+            self.server_identity_public_key
+                .as_deref()
+                .unwrap_or_default(),
+            self.interface_scope
         )
     }
 }
@@ -105,7 +123,7 @@ fn parse_candidate(event: NativeDiscoveryEvent) -> BackendResult<LanDiscoveryCan
     if event.port == 0 || event.host.is_empty() || event.host.len() > 253 {
         return Err(invalid_discovery());
     }
-    let expected_keys = BTreeSet::from([
+    let base_keys = BTreeSet::from([
         "advertisement_id",
         "display_name",
         "pairing",
@@ -113,13 +131,12 @@ fn parse_candidate(event: NativeDiscoveryEvent) -> BackendResult<LanDiscoveryCan
         "protocol_min",
         "version",
     ]);
-    if event
+    let actual_keys = event
         .txt
         .keys()
         .map(String::as_str)
-        .collect::<BTreeSet<_>>()
-        != expected_keys
-    {
+        .collect::<BTreeSet<_>>();
+    if !actual_keys.is_superset(&base_keys) {
         return Err(invalid_discovery());
     }
     let txt_bytes = event
@@ -135,6 +152,33 @@ fn parse_candidate(event: NativeDiscoveryEvent) -> BackendResult<LanDiscoveryCan
     {
         return Err(invalid_discovery());
     }
+    let mode = match event
+        .txt
+        .get("mode")
+        .map(String::as_str)
+        .unwrap_or("direct")
+    {
+        "direct" => LanDiscoveryMode::DirectHttps,
+        "zero_config" => LanDiscoveryMode::ZeroConfig,
+        _ => return Err(invalid_discovery()),
+    };
+    let expected_keys = match mode {
+        LanDiscoveryMode::DirectHttps => base_keys.clone(),
+        LanDiscoveryMode::ZeroConfig => BTreeSet::from([
+            "advertisement_id",
+            "display_name",
+            "mode",
+            "pairing",
+            "protocol_max",
+            "protocol_min",
+            "server_id",
+            "server_identity_public_key",
+            "version",
+        ]),
+    };
+    if actual_keys != expected_keys {
+        return Err(invalid_discovery());
+    }
     let advertisement_id = event.txt["advertisement_id"].clone();
     let display_name = event.txt["display_name"].clone();
     validate_bounded_text(&advertisement_id, 16, MAX_ADVERTISEMENT_ID_BYTES)?;
@@ -148,12 +192,42 @@ fn parse_candidate(event: NativeDiscoveryEvent) -> BackendResult<LanDiscoveryCan
     } else {
         format!("{host}:{}", event.port)
     };
-    let origin = normalize_lan_https_origin(&format!("https://{authority}"))?;
+    let origin = match mode {
+        LanDiscoveryMode::DirectHttps => {
+            normalize_lan_https_origin(&format!("https://{authority}"))?
+        }
+        LanDiscoveryMode::ZeroConfig => {
+            let url =
+                url::Url::parse(&format!("http://{authority}")).map_err(|_| invalid_discovery())?;
+            if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+                return Err(invalid_discovery());
+            }
+            url.origin().ascii_serialization()
+        }
+    };
+    let (server_id, server_identity_public_key) = match mode {
+        LanDiscoveryMode::DirectHttps => (None, None),
+        LanDiscoveryMode::ZeroConfig => {
+            let server_id = event.txt["server_id"].clone();
+            validate_bounded_text(&server_id, 1, 128)?;
+            let key = event.txt["server_identity_public_key"].clone();
+            let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(&key)
+                .map_err(|_| invalid_discovery())?;
+            if decoded.len() != 32 || decoded.iter().all(|byte| *byte == 0) {
+                return Err(invalid_discovery());
+            }
+            (Some(server_id), Some(key))
+        }
+    };
     Ok(LanDiscoveryCandidate {
         advertisement_id,
         service_instance: event.service_instance,
         display_name,
         origin,
+        mode,
+        server_id,
+        server_identity_public_key,
         interface_scope: event.interface_scope,
     })
 }
@@ -313,7 +387,41 @@ mod tests {
             panic!("expected candidate");
         };
         assert_eq!(candidate.origin, "https://desktop.example");
+        assert_eq!(candidate.mode, LanDiscoveryMode::DirectHttps);
         assert!(candidate.key().contains("adv-0123456789012345"));
+    }
+
+    #[test]
+    fn zero_config_candidate_requires_and_preserves_desktop_identity() {
+        let public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let native: NativeDiscoveryEvent = serde_json::from_str(&candidate_json(&format!(
+            r#","mode":"zero_config","server_id":"desktop-test","server_identity_public_key":"{public_key}""#
+        )))
+        .unwrap();
+        let LanDiscoveryEvent::Candidate(candidate) = parse_native_event(native).unwrap() else {
+            panic!("expected candidate");
+        };
+
+        assert_eq!(candidate.mode, LanDiscoveryMode::ZeroConfig);
+        assert_eq!(candidate.origin, "http://desktop.example:443");
+        assert_eq!(candidate.server_id.as_deref(), Some("desktop-test"));
+        assert_eq!(
+            candidate.server_identity_public_key.as_deref(),
+            Some(public_key.as_str())
+        );
+    }
+
+    #[test]
+    fn zero_config_candidate_rejects_invalid_identity_key() {
+        let native: NativeDiscoveryEvent = serde_json::from_str(&candidate_json(
+            r#","mode":"zero_config","server_id":"desktop-test","server_identity_public_key":"invalid""#,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            parse_native_event(native).unwrap_err().code,
+            "remote_lan_discovery_invalid"
+        );
     }
 
     #[test]

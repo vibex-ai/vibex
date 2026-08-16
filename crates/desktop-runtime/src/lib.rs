@@ -77,7 +77,10 @@ pub use events::{
 };
 pub use fixture::FixtureDesktopRuntime;
 pub use home_lock::{DESKTOP_RUNTIME_LOCK_FILE, DesktopHomeLock};
-pub use lan_pairing::{LAN_PAIRING_SERVICE_TYPE, LanPairingAdvertiser, MdnsLanPairingAdvertiser};
+pub use lan_pairing::{
+    LAN_PAIRING_SERVICE_TYPE, LanPairingAdvertiser, MdnsLanPairingAdvertiser,
+    MdnsZeroConfigLanPairingAdvertiser, ZeroConfigLanPairingAdvertiser,
+};
 pub use management::{
     BackupProgress, ExternalOpenUrl, ManagementMutationGuard, ProviderManagementFacade,
     validate_external_open_url,

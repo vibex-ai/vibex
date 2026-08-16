@@ -15,6 +15,8 @@ mod lan_pairing;
 mod pairing;
 mod sync;
 mod transport;
+#[cfg(not(target_family = "wasm"))]
+mod zero_config_pairing;
 
 pub use backend::*;
 pub use binary::*;
@@ -23,3 +25,5 @@ pub use lan_pairing::*;
 pub use pairing::*;
 pub use sync::*;
 pub use transport::*;
+#[cfg(not(target_family = "wasm"))]
+pub use zero_config_pairing::*;

@@ -48,10 +48,13 @@ enum RemoteAccessMutation {
     CreateOffer,
     RegenerateOffer,
     CancelOffer,
-    StartLanPairing,
     CancelLanPairing,
     ApproveLanPairing,
     RejectLanPairing,
+    StartZeroConfigPairing,
+    CancelZeroConfigPairing,
+    ApproveZeroConfigPairing,
+    RejectZeroConfigPairing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,15 +67,19 @@ enum RemoteAccessAction {
     RepairMethod(RemoteConnectivityMethod),
     DisableAll,
     SetPermission(RemoteDevicePermissionLevel),
+    SetZeroConfigPermission(RemoteDevicePermissionLevel),
     CreateOffer,
     RegenerateOffer,
     CancelOffer,
     SelectEntry(RemoteConnectivityMethod),
     CopyLink,
-    StartLanPairing,
     CancelLanPairing,
     ApproveLanPairing(RequestId),
     RejectLanPairing(RequestId),
+    StartZeroConfigPairing,
+    CancelZeroConfigPairing,
+    ApproveZeroConfigPairing(RequestId),
+    RejectZeroConfigPairing(RequestId),
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -278,8 +285,10 @@ struct PairingViewState {
     connectivity: Option<RemoteConnectivitySnapshot>,
     selected_method: RemoteConnectivityMethod,
     permission: RemoteDevicePermissionLevel,
+    zero_config_permission: RemoteDevicePermissionLevel,
     active_offer: Option<ActivePairingOffer>,
     active_lan_window: Option<RemoteLanPairingWindowSnapshot>,
+    active_zero_config_window: Option<RemoteLanPairingWindowSnapshot>,
     pending: Option<RemoteAccessMutation>,
     error_code: Option<String>,
     notice: Option<&'static str>,
@@ -291,8 +300,10 @@ impl Default for PairingViewState {
             connectivity: None,
             selected_method: RemoteConnectivityMethod::TailscaleServe,
             permission: RemoteDevicePermissionLevel::ReadOnly,
+            zero_config_permission: RemoteDevicePermissionLevel::ReadOnly,
             active_offer: None,
             active_lan_window: None,
+            active_zero_config_window: None,
             pending: None,
             error_code: None,
             notice: None,
@@ -414,6 +425,8 @@ enum RemoteAccessMutationOutcome {
     OfferCanceled,
     LanWindow(RemoteLanPairingWindowSnapshot),
     LanCanceled,
+    ZeroConfigWindow(RemoteLanPairingWindowSnapshot),
+    ZeroConfigCanceled,
 }
 
 struct OfferPollOutcome {
@@ -429,6 +442,7 @@ pub(crate) struct RemoteAccessPairing {
     mutation_task: Option<Task<()>>,
     offer_poll_task: Option<Task<()>>,
     lan_poll_task: Option<Task<()>>,
+    zero_config_poll_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -479,6 +493,7 @@ impl RemoteAccessPairing {
             mutation_task: None,
             offer_poll_task: None,
             lan_poll_task: None,
+            zero_config_poll_task: None,
             _subscriptions: subscriptions,
         }
     }
@@ -497,18 +512,28 @@ impl RemoteAccessPairing {
             RemoteAccessAction::RepairMethod(method) => self.repair_method(method, cx),
             RemoteAccessAction::DisableAll => self.disable_all(cx),
             RemoteAccessAction::SetPermission(permission) => self.set_permission(permission, cx),
+            RemoteAccessAction::SetZeroConfigPermission(permission) => {
+                self.set_zero_config_permission(permission, cx)
+            }
             RemoteAccessAction::CreateOffer => self.create_offer(cx),
             RemoteAccessAction::RegenerateOffer => self.regenerate_offer(self.state.permission, cx),
             RemoteAccessAction::CancelOffer => self.cancel_offer(cx),
             RemoteAccessAction::SelectEntry(method) => self.select_entry(method, cx),
             RemoteAccessAction::CopyLink => self.copy_pairing_link(cx),
-            RemoteAccessAction::StartLanPairing => self.start_lan_pairing(cx),
             RemoteAccessAction::CancelLanPairing => self.cancel_lan_pairing(cx),
             RemoteAccessAction::ApproveLanPairing(request_id) => {
                 self.approve_lan_pairing(request_id, cx)
             }
             RemoteAccessAction::RejectLanPairing(request_id) => {
                 self.reject_lan_pairing(request_id, cx)
+            }
+            RemoteAccessAction::StartZeroConfigPairing => self.start_zero_config_pairing(cx),
+            RemoteAccessAction::CancelZeroConfigPairing => self.cancel_zero_config_pairing(cx),
+            RemoteAccessAction::ApproveZeroConfigPairing(request_id) => {
+                self.approve_zero_config_pairing(request_id, cx)
+            }
+            RemoteAccessAction::RejectZeroConfigPairing(request_id) => {
+                self.reject_zero_config_pairing(request_id, cx)
             }
         }
     }
@@ -563,6 +588,7 @@ impl RemoteAccessPairing {
                             this.state.apply_connectivity(snapshot);
                             this.clear_offer();
                             this.clear_lan_window();
+                            this.clear_zero_config_window();
                             this.state.notice = Some(locale::text(
                                 "Remote access disabled",
                                 "远程访问已停用",
@@ -598,6 +624,18 @@ impl RemoteAccessPairing {
                                 "Nearby pairing stopped",
                                 "附近配对已停止",
                                 "附近配對已停止",
+                            ));
+                        }
+                        Ok(Ok(RemoteAccessMutationOutcome::ZeroConfigWindow(snapshot))) => {
+                            this.state.active_zero_config_window = Some(snapshot);
+                            this.schedule_zero_config_poll(cx);
+                        }
+                        Ok(Ok(RemoteAccessMutationOutcome::ZeroConfigCanceled)) => {
+                            this.clear_zero_config_window();
+                            this.state.notice = Some(locale::text(
+                                "Local pairing stopped",
+                                "局域网配对已停止",
+                                "區域網路配對已停止",
                             ));
                         }
                         Ok(Err(error)) => this.state.error_code = Some(error.code),
@@ -704,6 +742,7 @@ impl RemoteAccessPairing {
                 let _ = controller.cancel_pairing_offer(offer_id);
             }
             let _ = controller.cancel_lan_pairing_window();
+            let _ = controller.cancel_zero_config_lan_pairing().await;
             controller
                 .disable_all()
                 .await
@@ -712,26 +751,15 @@ impl RemoteAccessPairing {
     }
 
     fn create_offer(&mut self, cx: &mut Context<Self>) {
+        if self.state.active_zero_config_window.is_some() {
+            return;
+        }
         let controller = self.controller.clone();
         let permission = self.state.permission;
         self.begin_mutation(RemoteAccessMutation::CreateOffer, cx, async move {
             controller
                 .create_pairing_offer(permission, PAIRING_OFFER_TTL_MS)
                 .map(RemoteAccessMutationOutcome::OfferCreated)
-        });
-    }
-
-    fn start_lan_pairing(&mut self, cx: &mut Context<Self>) {
-        if self.state.active_offer.is_some() || self.state.active_lan_window.is_some() {
-            return;
-        }
-        let controller = self.controller.clone();
-        let permission = self.state.permission;
-        self.begin_mutation(RemoteAccessMutation::StartLanPairing, cx, async move {
-            controller
-                .start_lan_pairing_window(permission, PAIRING_OFFER_TTL_MS)
-                .await
-                .map(RemoteAccessMutationOutcome::LanWindow)
         });
     }
 
@@ -763,6 +791,70 @@ impl RemoteAccessPairing {
                 .reject_lan_pairing_request(&request_id)
                 .map(RemoteAccessMutationOutcome::LanWindow)
         });
+    }
+
+    fn start_zero_config_pairing(&mut self, cx: &mut Context<Self>) {
+        if self.state.active_offer.is_some()
+            || self.state.active_lan_window.is_some()
+            || self.state.active_zero_config_window.is_some()
+        {
+            return;
+        }
+        let controller = self.controller.clone();
+        let permission = self.state.zero_config_permission;
+        self.begin_mutation(
+            RemoteAccessMutation::StartZeroConfigPairing,
+            cx,
+            async move {
+                controller
+                    .start_zero_config_lan_pairing(permission, PAIRING_OFFER_TTL_MS)
+                    .await
+                    .map(RemoteAccessMutationOutcome::ZeroConfigWindow)
+            },
+        );
+    }
+
+    fn cancel_zero_config_pairing(&mut self, cx: &mut Context<Self>) {
+        if self.state.active_zero_config_window.is_none() {
+            return;
+        }
+        let controller = self.controller.clone();
+        self.begin_mutation(
+            RemoteAccessMutation::CancelZeroConfigPairing,
+            cx,
+            async move {
+                controller
+                    .cancel_zero_config_lan_pairing()
+                    .await
+                    .map(|_| RemoteAccessMutationOutcome::ZeroConfigCanceled)
+            },
+        );
+    }
+
+    fn approve_zero_config_pairing(&mut self, request_id: RequestId, cx: &mut Context<Self>) {
+        let controller = self.controller.clone();
+        self.begin_mutation(
+            RemoteAccessMutation::ApproveZeroConfigPairing,
+            cx,
+            async move {
+                controller
+                    .approve_zero_config_lan_pairing_request(&request_id)
+                    .map(RemoteAccessMutationOutcome::ZeroConfigWindow)
+            },
+        );
+    }
+
+    fn reject_zero_config_pairing(&mut self, request_id: RequestId, cx: &mut Context<Self>) {
+        let controller = self.controller.clone();
+        self.begin_mutation(
+            RemoteAccessMutation::RejectZeroConfigPairing,
+            cx,
+            async move {
+                controller
+                    .reject_zero_config_lan_pairing_request(&request_id)
+                    .map(RemoteAccessMutationOutcome::ZeroConfigWindow)
+            },
+        );
     }
 
     fn regenerate_offer(
@@ -837,6 +929,7 @@ impl RemoteAccessPairing {
         if self.state.permission == permission
             || self.state.pending.is_some()
             || self.state.active_lan_window.is_some()
+            || self.state.active_zero_config_window.is_some()
             || self
                 .state
                 .active_offer
@@ -852,6 +945,24 @@ impl RemoteAccessPairing {
             self.state.error_code = None;
             cx.notify();
         }
+    }
+
+    fn set_zero_config_permission(
+        &mut self,
+        permission: RemoteDevicePermissionLevel,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state.zero_config_permission == permission
+            || self.state.pending.is_some()
+            || self.state.active_offer.is_some()
+            || self.state.active_lan_window.is_some()
+            || self.state.active_zero_config_window.is_some()
+        {
+            return;
+        }
+        self.state.zero_config_permission = permission;
+        self.state.error_code = None;
+        cx.notify();
     }
 
     fn copy_pairing_link(&mut self, cx: &mut Context<Self>) {
@@ -1008,6 +1119,75 @@ impl RemoteAccessPairing {
         ));
     }
 
+    fn schedule_zero_config_poll(&mut self, cx: &mut Context<Self>) {
+        if self.state.active_zero_config_window.is_none() {
+            return;
+        }
+        let controller = self.controller.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            tokio::time::sleep(OFFER_POLL_INTERVAL).await;
+            controller.zero_config_lan_pairing_window_status()
+        });
+        self.zero_config_poll_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.zero_config_poll_task = None;
+                    match outcome {
+                        Ok(Ok(snapshot)) => {
+                            let active = snapshot.discovery.expires_at_ms > unix_timestamp_ms();
+                            this.state.active_zero_config_window = active.then_some(snapshot);
+                            if active {
+                                this.schedule_zero_config_poll(cx);
+                            }
+                        }
+                        Ok(Err(error))
+                            if matches!(
+                                error.code.as_str(),
+                                "remote_lan_pairing_window_unavailable"
+                                    | "remote_pairing_offer_already_claimed"
+                                    | "remote_pairing_offer_expired"
+                            ) =>
+                        {
+                            let had_approved_request =
+                                this.state.active_zero_config_window.as_ref().is_some_and(
+                                    |window| {
+                                        window.pending_requests.iter().any(|request| {
+                                            request.state == RemoteLanPairingRequestState::Approved
+                                        })
+                                    },
+                                );
+                            this.clear_zero_config_window();
+                            let controller = this.controller.clone();
+                            gpui_tokio::Tokio::spawn(cx, async move {
+                                let _ = controller.cancel_zero_config_lan_pairing().await;
+                            })
+                            .detach();
+                            this.state.notice = Some(if had_approved_request {
+                                locale::text("Device paired", "设备已配对", "裝置已配對")
+                            } else {
+                                locale::text(
+                                    "Local pairing ended",
+                                    "局域网配对已结束",
+                                    "區域網路配對已結束",
+                                )
+                            });
+                        }
+                        Ok(Err(error)) => {
+                            this.state.error_code = Some(error.code);
+                            this.schedule_zero_config_poll(cx);
+                        }
+                        Err(_) => {
+                            this.state.error_code =
+                                Some("remote_zero_config_pairing_status_task_failed".to_string());
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
     fn record_claimed_entry(
         &mut self,
         offer_id: RequestId,
@@ -1049,6 +1229,11 @@ impl RemoteAccessPairing {
         self.state.active_lan_window = None;
     }
 
+    fn clear_zero_config_window(&mut self) {
+        self.zero_config_poll_task = None;
+        self.state.active_zero_config_window = None;
+    }
+
     fn dismiss(&mut self, cx: &mut Context<Self>) {
         let offer_id = self
             .state
@@ -1057,8 +1242,10 @@ impl RemoteAccessPairing {
             .filter(|offer| !offer.is_terminal(unix_timestamp_ms()))
             .map(|offer| offer.offer_id().clone());
         let had_lan_window = self.state.active_lan_window.is_some();
+        let had_zero_config_window = self.state.active_zero_config_window.is_some();
         self.clear_offer();
         self.clear_lan_window();
+        self.clear_zero_config_window();
         if let Some(offer_id) = offer_id {
             let controller = self.controller.clone();
             gpui_tokio::Tokio::spawn(cx, async move {
@@ -1070,6 +1257,13 @@ impl RemoteAccessPairing {
             let controller = self.controller.clone();
             gpui_tokio::Tokio::spawn(cx, async move {
                 let _ = controller.cancel_lan_pairing_window();
+            })
+            .detach();
+        }
+        if had_zero_config_window {
+            let controller = self.controller.clone();
+            gpui_tokio::Tokio::spawn(cx, async move {
+                let _ = controller.cancel_zero_config_lan_pairing().await;
             })
             .detach();
         }
@@ -1397,35 +1591,52 @@ impl RemoteAccessPairing {
         panel.into_any_element()
     }
 
-    fn render_permission_selector(&self, cx: &mut Context<Self>) -> AnyElement {
-        let selected = permission_index(self.state.permission);
+    fn render_permission_selector(&self, zero_config: bool, cx: &mut Context<Self>) -> AnyElement {
+        let selected = permission_index(if zero_config {
+            self.state.zero_config_permission
+        } else {
+            self.state.permission
+        });
         let disabled = self.state.pending.is_some()
             || self.state.active_lan_window.is_some()
+            || self.state.active_zero_config_window.is_some()
+            || (zero_config && self.state.active_offer.is_some())
             || self
                 .state
                 .active_offer
                 .as_ref()
                 .is_some_and(|offer| offer.summary.claimed_device_id.is_some());
         let entity = cx.weak_entity();
-        TabBar::new("remote-pairing-permission")
-            .segmented()
-            .selected_index(selected)
-            .children(permission_options().into_iter().map(|permission| {
-                Tab::new()
-                    .flex_1()
-                    .label(permission_label(permission))
-                    .disabled(disabled)
-            }))
-            .on_click(move |index, _, cx| {
-                let permission = permission_options()
-                    .get(*index)
-                    .copied()
-                    .unwrap_or(RemoteDevicePermissionLevel::ReadOnly);
-                let _ = entity.update(cx, |this, cx| {
-                    this.dispatch_action(RemoteAccessAction::SetPermission(permission), cx)
-                });
-            })
-            .into_any_element()
+        TabBar::new(if zero_config {
+            "zero-config-pairing-permission"
+        } else {
+            "remote-pairing-permission"
+        })
+        .segmented()
+        .selected_index(selected)
+        .children(permission_options().into_iter().map(|permission| {
+            Tab::new()
+                .flex_1()
+                .label(permission_label(permission))
+                .disabled(disabled)
+        }))
+        .on_click(move |index, _, cx| {
+            let permission = permission_options()
+                .get(*index)
+                .copied()
+                .unwrap_or(RemoteDevicePermissionLevel::ReadOnly);
+            let _ = entity.update(cx, |this, cx| {
+                this.dispatch_action(
+                    if zero_config {
+                        RemoteAccessAction::SetZeroConfigPermission(permission)
+                    } else {
+                        RemoteAccessAction::SetPermission(permission)
+                    },
+                    cx,
+                )
+            });
+        })
+        .into_any_element()
     }
 
     fn render_offer(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1436,64 +1647,36 @@ impl RemoteAccessPairing {
                 .iter()
                 .any(|method| method.candidate_available)
         });
-        let lan_available = self.state.connectivity.as_ref().is_some_and(|snapshot| {
-            snapshot
-                .method(RemoteConnectivityMethod::Direct)
-                .is_some_and(|method| method.candidate_available)
-        });
         if let Some(window) = self.state.active_lan_window.as_ref() {
-            return self.render_lan_window(window, cx);
+            return self.render_lan_window(window, false, cx);
         }
         let Some(offer) = self.state.active_offer.as_ref() else {
             let entity = cx.weak_entity();
-            let lan_entity = entity.clone();
             return v_flex()
                 .w_full()
                 .gap_3()
-                .child(self.render_permission_selector(cx))
+                .child(self.render_permission_selector(false, cx))
                 .child(
-                    h_flex()
-                        .flex_wrap()
-                        .gap_2()
-                        .child(
-                            Button::new("create-pairing-offer")
-                                .primary()
-                                .icon(IconName::Plus)
-                                .label(locale::text("Show QR code", "显示二维码", "顯示 QR Code"))
-                                .loading(matches!(
-                                    self.state.pending,
-                                    Some(RemoteAccessMutation::CreateOffer)
-                                ))
-                                .disabled(pending || !route_available)
-                                .on_click(move |_, _, cx| {
-                                    let _ = entity.update(cx, |this, cx| {
-                                        this.dispatch_action(RemoteAccessAction::CreateOffer, cx)
-                                    });
-                                }),
-                        )
-                        .child(
-                            Button::new("start-lan-pairing")
-                                .outline()
-                                .icon(IconName::Network)
-                                .label(locale::text(
-                                    "Allow nearby device",
-                                    "允许附近设备",
-                                    "允許附近裝置",
-                                ))
-                                .loading(matches!(
-                                    self.state.pending,
-                                    Some(RemoteAccessMutation::StartLanPairing)
-                                ))
-                                .disabled(pending || !lan_available)
-                                .on_click(move |_, _, cx| {
-                                    let _ = lan_entity.update(cx, |this, cx| {
-                                        this.dispatch_action(
-                                            RemoteAccessAction::StartLanPairing,
-                                            cx,
-                                        )
-                                    });
-                                }),
-                        ),
+                    h_flex().flex_wrap().gap_2().child(
+                        Button::new("create-pairing-offer")
+                            .primary()
+                            .icon(IconName::Plus)
+                            .label(locale::text("Show QR code", "显示二维码", "顯示 QR Code"))
+                            .loading(matches!(
+                                self.state.pending,
+                                Some(RemoteAccessMutation::CreateOffer)
+                            ))
+                            .disabled(
+                                pending
+                                    || !route_available
+                                    || self.state.active_zero_config_window.is_some(),
+                            )
+                            .on_click(move |_, _, cx| {
+                                let _ = entity.update(cx, |this, cx| {
+                                    this.dispatch_action(RemoteAccessAction::CreateOffer, cx)
+                                });
+                            }),
+                    ),
                 )
                 .when(!route_available, |column| {
                     column.child(
@@ -1635,7 +1818,7 @@ impl RemoteAccessPairing {
                             .child(countdown),
                     ),
             )
-            .child(self.render_permission_selector(cx))
+            .child(self.render_permission_selector(false, cx))
             .child(entry_selector)
             .child(
                 h_flex()
@@ -1699,6 +1882,7 @@ impl RemoteAccessPairing {
     fn render_lan_window(
         &self,
         window: &RemoteLanPairingWindowSnapshot,
+        zero_config: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let pending = self.state.pending.is_some();
@@ -1710,10 +1894,33 @@ impl RemoteAccessPairing {
             .div_euclid(1_000)
             .max(0);
         let cancel_entity = cx.weak_entity();
+        let cancel_action = if zero_config {
+            RemoteAccessAction::CancelZeroConfigPairing
+        } else {
+            RemoteAccessAction::CancelLanPairing
+        };
+        let cancel_mutation = if zero_config {
+            RemoteAccessMutation::CancelZeroConfigPairing
+        } else {
+            RemoteAccessMutation::CancelLanPairing
+        };
+        let pairing_title = if zero_config {
+            locale::text(
+                "Local network pairing is available",
+                "局域网配对已开启",
+                "區域網路配對已開啟",
+            )
+        } else {
+            locale::text(
+                "Nearby pairing is available",
+                "附近设备可以配对",
+                "附近裝置可以配對",
+            )
+        };
         let mut column = v_flex()
             .w_full()
             .gap_3()
-            .child(self.render_permission_selector(cx))
+            .child(self.render_permission_selector(zero_config, cx))
             .child(
                 h_flex()
                     .w_full()
@@ -1724,11 +1931,7 @@ impl RemoteAccessPairing {
                         v_flex()
                             .min_w_0()
                             .gap_1()
-                            .child(div().text_sm().font_semibold().child(locale::text(
-                                "Nearby pairing is available",
-                                "附近设备可以配对",
-                                "附近裝置可以配對",
-                            )))
+                            .child(div().text_sm().font_semibold().child(pairing_title))
                             .child(
                                 div()
                                     .text_xs()
@@ -1748,24 +1951,25 @@ impl RemoteAccessPairing {
                                     .child(format!("{remaining}s")),
                             )
                             .child(
-                                Button::new("cancel-lan-pairing")
-                                    .small()
-                                    .outline()
-                                    .icon(IconName::Pause)
-                                    .label(locale::text("Stop", "停止", "停止"))
-                                    .loading(matches!(
-                                        self.state.pending,
-                                        Some(RemoteAccessMutation::CancelLanPairing)
-                                    ))
-                                    .disabled(pending)
-                                    .on_click(move |_, _, cx| {
-                                        let _ = cancel_entity.update(cx, |this, cx| {
-                                            this.dispatch_action(
-                                                RemoteAccessAction::CancelLanPairing,
-                                                cx,
-                                            )
-                                        });
-                                    }),
+                                Button::new(if zero_config {
+                                    "cancel-zero-config-pairing"
+                                } else {
+                                    "cancel-lan-pairing"
+                                })
+                                .small()
+                                .outline()
+                                .icon(IconName::Pause)
+                                .label(locale::text("Stop", "停止", "停止"))
+                                .loading(matches!(
+                                    self.state.pending,
+                                    Some(pending_mutation) if pending_mutation == cancel_mutation
+                                ))
+                                .disabled(pending)
+                                .on_click(move |_, _, cx| {
+                                    let _ = cancel_entity.update(cx, |this, cx| {
+                                        this.dispatch_action(cancel_action.clone(), cx)
+                                    });
+                                }),
                             ),
                     ),
             );
@@ -1789,6 +1993,16 @@ impl RemoteAccessPairing {
         for request in &window.pending_requests {
             let request_id = request.request_id.clone();
             let reject_id = request.request_id.clone();
+            let approve_action = if zero_config {
+                RemoteAccessAction::ApproveZeroConfigPairing(request_id.clone())
+            } else {
+                RemoteAccessAction::ApproveLanPairing(request_id.clone())
+            };
+            let reject_action = if zero_config {
+                RemoteAccessAction::RejectZeroConfigPairing(reject_id.clone())
+            } else {
+                RemoteAccessAction::RejectLanPairing(reject_id.clone())
+            };
             let approve_entity = cx.weak_entity();
             let reject_entity = approve_entity.clone();
             let request_pending = request.state == RemoteLanPairingRequestState::Pending;
@@ -1865,7 +2079,8 @@ impl RemoteAccessPairing {
                             .when(request_pending, |row| {
                                 row.child(
                                     Button::new(format!(
-                                        "approve-lan-pairing-{}",
+                                        "approve-{}-pairing-{}",
+                                        if zero_config { "zero-config" } else { "lan" },
                                         request.request_id.as_str()
                                     ))
                                     .small()
@@ -1879,21 +2094,16 @@ impl RemoteAccessPairing {
                                     .disabled(pending)
                                     .on_click(
                                         move |_, _, cx| {
-                                            let request_id = request_id.clone();
                                             let _ = approve_entity.update(cx, |this, cx| {
-                                                this.dispatch_action(
-                                                    RemoteAccessAction::ApproveLanPairing(
-                                                        request_id,
-                                                    ),
-                                                    cx,
-                                                )
+                                                this.dispatch_action(approve_action.clone(), cx)
                                             });
                                         },
                                     ),
                                 )
                                 .child(
                                     Button::new(format!(
-                                        "reject-lan-pairing-{}",
+                                        "reject-{}-pairing-{}",
+                                        if zero_config { "zero-config" } else { "lan" },
                                         request.request_id.as_str()
                                     ))
                                     .small()
@@ -1903,14 +2113,8 @@ impl RemoteAccessPairing {
                                     .disabled(pending)
                                     .on_click(
                                         move |_, _, cx| {
-                                            let request_id = reject_id.clone();
                                             let _ = reject_entity.update(cx, |this, cx| {
-                                                this.dispatch_action(
-                                                    RemoteAccessAction::RejectLanPairing(
-                                                        request_id,
-                                                    ),
-                                                    cx,
-                                                )
+                                                this.dispatch_action(reject_action.clone(), cx)
                                             });
                                         },
                                     ),
@@ -1920,6 +2124,94 @@ impl RemoteAccessPairing {
             );
         }
         column.into_any_element()
+    }
+
+    fn render_zero_config_pairing(&self, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(window) = self.state.active_zero_config_window.as_ref() {
+            return v_flex()
+                .w_full()
+                .gap_3()
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .pt_4()
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(Icon::new(IconName::Network).size(px(16.0)))
+                        .child(div().text_sm().font_semibold().child(locale::text(
+                            "Local network pairing",
+                            "局域网配对",
+                            "區域網路配對",
+                        ))),
+                )
+                .child(self.render_lan_window(window, true, cx))
+                .into_any_element();
+        }
+
+        let route_available = self.state.connectivity.as_ref().is_some_and(|snapshot| {
+            snapshot
+                .methods
+                .iter()
+                .any(|method| method.candidate_available)
+        });
+        let pairing_active = self.state.active_offer.is_some()
+            || self.state.active_lan_window.is_some()
+            || self.state.active_zero_config_window.is_some();
+        let pending = self.state.pending.is_some();
+        let entity = cx.weak_entity();
+
+        v_flex()
+            .w_full()
+            .gap_3()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .pt_4()
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Icon::new(IconName::Network).size(px(16.0)))
+                    .child(div().text_sm().font_semibold().child(locale::text(
+                        "Local network pairing",
+                        "局域网配对",
+                        "區域網路配對",
+                    ))),
+            )
+            .child(self.render_permission_selector(true, cx))
+            .child(
+                Button::new("start-zero-config-pairing")
+                    .primary()
+                    .icon(IconName::Network)
+                    .label(locale::text(
+                        "Start local pairing",
+                        "开始局域网配对",
+                        "開始區域網路配對",
+                    ))
+                    .loading(matches!(
+                        self.state.pending,
+                        Some(RemoteAccessMutation::StartZeroConfigPairing)
+                    ))
+                    .disabled(pending || pairing_active || !route_available)
+                    .on_click(move |_, _, cx| {
+                        let _ = entity.update(cx, |this, cx| {
+                            this.dispatch_action(RemoteAccessAction::StartZeroConfigPairing, cx)
+                        });
+                    }),
+            )
+            .when(!route_available, |column| {
+                column.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(locale::text(
+                            "Enable a remote connection before pairing",
+                            "请先启用一种远程连接",
+                            "請先啟用一種遠端連線",
+                        )),
+                )
+            })
+            .into_any_element()
     }
 }
 
@@ -2129,11 +2421,12 @@ impl Render for RemoteAccessPairing {
                 )
             })
             .child(div().text_sm().font_semibold().child(locale::text(
-                "Pair a device",
-                "配对设备",
-                "配對裝置",
+                "QR code pairing",
+                "二维码配对",
+                "QR Code 配對",
             )))
             .child(self.render_offer(cx))
+            .child(self.render_zero_config_pairing(cx))
     }
 }
 
@@ -2358,10 +2651,13 @@ fn remote_access_mutation_name(mutation: RemoteAccessMutation) -> &'static str {
         RemoteAccessMutation::CreateOffer => "create_offer",
         RemoteAccessMutation::RegenerateOffer => "regenerate_offer",
         RemoteAccessMutation::CancelOffer => "cancel_offer",
-        RemoteAccessMutation::StartLanPairing => "start_lan_pairing",
         RemoteAccessMutation::CancelLanPairing => "cancel_lan_pairing",
         RemoteAccessMutation::ApproveLanPairing => "approve_lan_pairing",
         RemoteAccessMutation::RejectLanPairing => "reject_lan_pairing",
+        RemoteAccessMutation::StartZeroConfigPairing => "start_zero_config_pairing",
+        RemoteAccessMutation::CancelZeroConfigPairing => "cancel_zero_config_pairing",
+        RemoteAccessMutation::ApproveZeroConfigPairing => "approve_zero_config_pairing",
+        RemoteAccessMutation::RejectZeroConfigPairing => "reject_zero_config_pairing",
     }
 }
 
@@ -2470,11 +2766,13 @@ fn recovery_label(action: RemoteRecoveryAction) -> &'static str {
 
 fn remote_error_label(code: &str) -> &'static str {
     match code {
-        "remote_pairing_routes_unavailable" => locale::text(
-            "Enable and validate at least one remote method",
-            "请先启用并验证一种远程连接方式",
-            "請先啟用並驗證一種遠端連線方式",
-        ),
+        "remote_pairing_routes_unavailable" | "remote_zero_config_pairing_routes_unavailable" => {
+            locale::text(
+                "Enable and validate at least one remote method",
+                "请先启用并验证一种远程连接方式",
+                "請先啟用並驗證一種遠端連線方式",
+            )
+        }
         "remote_direct_origin_missing" | "relay_origin_missing" => locale::text(
             "Enter a valid HTTPS origin",
             "请输入有效的 HTTPS 地址",

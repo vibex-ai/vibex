@@ -87,6 +87,22 @@ DesktopRuntime
   -> native mobile GPUI views
 ```
 
+Zero-configuration LAN pairing is a separate bootstrap path before that flow:
+
+```text
+Mobile DNS-SD discovery
+  -> temporary Desktop HTTP listener
+  -> DirectionalV2 application-encrypted request/status/claim
+  -> existing MobileCredentialBundle with Direct/Tailnet/Relay routes
+  -> normal Remote Data Flow above
+```
+
+The temporary listener is pairing-only. It is not a fourth remote transport,
+does not expose the RemoteGateway business router, and is never persisted as a
+candidate. Desktop UI presents it as a separate pairing entry with its own
+permission, lifetime, SAS approval, and stop state; the three publication
+method rows do not each receive a nearby-device control.
+
 Pairing is one-time and server-issued. The mobile app validates the offer,
 claims exactly one route, persists the minimum credential bundle in its sandbox,
 and keeps session/private keys in memory. Direct candidates and Relay routes are
@@ -135,6 +151,12 @@ directly or introduce a second authority.
   terminal bytes are redacted from `Debug`, logs, and evidence.
 - RemoteGateway validates Host and HTTP(S) Origin boundaries and rejects secrets
   in URLs. LAN mode requires an explicitly trusted HTTPS/WSS boundary.
+- The only non-HTTPS LAN exception is the bounded zero-configuration pairing
+  listener. After its plaintext hello, every request, status, offer challenge,
+  claim, and grant is protected by a DirectionalV2 application-encrypted
+  session bound to the Desktop X25519 identity and a fresh mobile ephemeral key.
+  Mobile bypasses proxies for this listener, which disappears on every terminal
+  lifecycle.
 - Relay forwards encrypted payloads and has no provider, workspace, or Agent
   authorization logic.
 

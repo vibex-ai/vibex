@@ -47901,6 +47901,7 @@
         "cargo:vibex-db@0.1.0-rc.1:b0d5d96e1f6cacc2",
         "cargo:vibex-fs@0.1.0-rc.1:9fbf48bd55955db3",
         "cargo:vibex-git@0.1.0-rc.1:b6ca7a78bc73d037",
+        "cargo:vibex-relay@0.1.0-rc.1:0c0a0267098c7864",
         "cargo:vibex-terminal@0.1.0-rc.1:73363de7836b4dd0",
         "cargo:x25519-dalek@2.0.1:c19b7c6f923b580a"
       ]

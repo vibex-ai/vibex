@@ -22,28 +22,31 @@ use futures_util::{SinkExt, StreamExt};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use rand_core::OsRng;
+use serde::de::DeserializeOwned;
+use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use url::Url;
 use vibex_core::{
     CorrelationId, DeviceId, ErrorCategory, EventId, REMOTE_V2_MAX_BINARY_PAYLOAD_BYTES,
-    RelayRemoteHandshakeContext, RemoteActionClass, RemoteAttachmentAcceptedV2,
-    RemoteAttachmentKind, RemoteAuthContext, RemoteAuthProof, RemoteBinaryFrame,
-    RemoteBinaryFrameHeader, RemoteBinaryFrameKind, RemoteCancelPairingOfferRequest,
-    RemoteClaimPairingOfferRequest, RemoteClaimPairingOfferResponse, RemoteCloseCode,
-    RemoteCloseReason, RemoteControlMessageV2, RemoteCreatePairingOfferRequest,
-    RemoteCreatePairingOfferResponse, RemoteDeviceListResponse, RemoteDevicePermissionLevel,
-    RemoteDeviceRequest, RemoteEventV2, RemoteHello, RemoteJsonMessageV2,
-    RemoteLanPairingDiscoverySummary, RemoteLanPairingRequest, RemoteLanPairingRequestAccepted,
-    RemoteLanPairingStatusRequest, RemoteLanPairingStatusResponse, RemoteLanPairingWindowSnapshot,
-    RemoteMutationContract, RemoteOperationKind, RemotePairingCandidate, RemotePairingOfferSummary,
-    RemotePairingTransport, RemotePing, RemoteProtocolError, RemoteProtocolVersion,
-    RemoteProtocolVersionRange, RemoteResyncRequired, RemoteRetryClass, RemoteRpcRequestV2,
-    RemoteRpcResponseV2, RemoteRpcResultMetadata, RemoteServerInfoV2, RemoteSubscribeRequestV2,
-    RemoteSubscriptionAcceptedV2, RemoteTimeoutClass, RemoteWsTicketRequest,
-    RemoteWsTicketResponse, RequestId, TerminalId, VibexError, VibexResult, WorkspaceId,
-    remote_permissions_for_level, unix_timestamp_ms,
+    RelayEncryptedFrame, RelayRemoteHandshakeContext, RelaySessionId, RemoteActionClass,
+    RemoteAttachmentAcceptedV2, RemoteAttachmentKind, RemoteAuthContext, RemoteAuthProof,
+    RemoteBinaryFrame, RemoteBinaryFrameHeader, RemoteBinaryFrameKind,
+    RemoteCancelPairingOfferRequest, RemoteClaimPairingOfferRequest,
+    RemoteClaimPairingOfferResponse, RemoteCloseCode, RemoteCloseReason, RemoteControlMessageV2,
+    RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeviceListResponse,
+    RemoteDevicePermissionLevel, RemoteDeviceRequest, RemoteEventV2, RemoteHello,
+    RemoteJsonMessageV2, RemoteLanPairingDiscoverySummary, RemoteLanPairingRequest,
+    RemoteLanPairingRequestAccepted, RemoteLanPairingStatusRequest, RemoteLanPairingStatusResponse,
+    RemoteLanPairingWindowSnapshot, RemoteMutationContract, RemoteOperationKind,
+    RemotePairingCandidate, RemotePairingOfferSummary, RemotePairingTransport, RemotePing,
+    RemoteProtocolError, RemoteProtocolVersion, RemoteProtocolVersionRange, RemoteResyncRequired,
+    RemoteRetryClass, RemoteRpcRequestV2, RemoteRpcResponseV2, RemoteRpcResultMetadata,
+    RemoteServerInfoV2, RemoteSubscribeRequestV2, RemoteSubscriptionAcceptedV2, RemoteTimeoutClass,
+    RemoteWsTicketRequest, RemoteWsTicketResponse, RemoteZeroConfigLanPairingHello, RequestId,
+    TerminalId, VibexError, VibexResult, WorkspaceId, remote_permissions_for_level,
+    unix_timestamp_ms,
 };
 use vibex_db::RemotePairingOfferRepository;
 use vibex_terminal::TerminalManager;
@@ -51,6 +54,12 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 use super::lan_pairing::{LanPairingCoordinator, normalize_https_origin};
 use super::pairing_v2::secure_secret;
+use super::zero_config_pairing::{
+    ZERO_CONFIG_PAIRING_CLAIM_PATH, ZERO_CONFIG_PAIRING_HELLO_PATH,
+    ZERO_CONFIG_PAIRING_REQUEST_PATH, ZERO_CONFIG_PAIRING_STATUS_PATH, ZeroConfigLanSession,
+    establish_server_session, open_json as open_zero_config_json,
+    seal_json as seal_zero_config_json,
+};
 use super::{
     RemoteDispatcher, RemoteIdentity, RemoteIdentityStore, RemoteRequestEnvelope,
     RemoteResponseEnvelope, RemoteServiceConfig, RemoteTrustService, build_router_with_dispatcher,
@@ -72,6 +81,7 @@ const MAX_FILE_TRANSFER_BYTES: usize = 64 * 1024 * 1024;
 const FILE_TRANSFER_CHUNK_BYTES: usize = 64 * 1024;
 const LAN_PAIRING_MAX_CONCURRENT_REQUESTS: usize = 16;
 const LAN_PAIRING_MAX_BODY_BYTES: usize = 8 * 1024;
+const ZERO_CONFIG_PAIRING_MAX_SESSIONS: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteGatewayDeploymentMode {
@@ -330,6 +340,8 @@ struct RemoteGatewayInner {
     domain_events: GatewayDomainEvents,
     pairing_routes: Arc<Mutex<RemoteGatewayPairingRoutes>>,
     lan_pairing: Arc<LanPairingCoordinator>,
+    zero_config_lan_pairing: Arc<LanPairingCoordinator>,
+    zero_config_lan_sessions: Arc<Mutex<HashMap<RelaySessionId, ZeroConfigLanSession>>>,
     lan_pairing_requests: Arc<Semaphore>,
     session_epoch: AtomicU64,
 }
@@ -387,6 +399,9 @@ struct GatewayLifecycle {
     bound_addr: Option<SocketAddr>,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
+    zero_config_bound_addr: Option<SocketAddr>,
+    zero_config_shutdown: Option<oneshot::Sender<()>>,
+    zero_config_task: Option<JoinHandle<()>>,
 }
 
 impl RemoteGateway {
@@ -414,6 +429,8 @@ impl RemoteGateway {
                 domain_events: GatewayDomainEvents::default(),
                 pairing_routes: Arc::new(Mutex::new(pairing_routes)),
                 lan_pairing: Arc::new(LanPairingCoordinator::default()),
+                zero_config_lan_pairing: Arc::new(LanPairingCoordinator::default()),
+                zero_config_lan_sessions: Arc::new(Mutex::new(HashMap::new())),
                 lan_pairing_requests: Arc::new(Semaphore::new(LAN_PAIRING_MAX_CONCURRENT_REQUESTS)),
                 session_epoch: AtomicU64::new(0),
             }),
@@ -560,6 +577,224 @@ impl RemoteGateway {
                 let _ = self.cancel_pairing_offer(RemoteCancelPairingOfferRequest { offer_id });
                 Err(error)
             }
+        }
+    }
+
+    /// Starts the isolated zero-configuration LAN bootstrap listener. The
+    /// listener only exposes the encrypted pairing endpoints below; it never
+    /// serves the normal RemoteGateway router or becomes a long-term route.
+    pub async fn start_zero_config_lan_pairing(
+        &self,
+        permission_level: RemoteDevicePermissionLevel,
+        ttl_ms: u32,
+    ) -> VibexResult<RemoteLanPairingWindowSnapshot> {
+        let _lifecycle_guard = self.inner.lifecycle_guard.lock().await;
+        {
+            let mut lifecycle = self
+                .inner
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if lifecycle
+                .zero_config_task
+                .as_ref()
+                .is_some_and(|task| !task.is_finished())
+            {
+                return Err(VibexError::conflict(
+                    "remote_zero_config_pairing_active",
+                    "zero-config LAN pairing is already active",
+                ));
+            }
+            lifecycle.zero_config_task = None;
+            lifecycle.zero_config_shutdown = None;
+            lifecycle.zero_config_bound_addr = None;
+        }
+
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0")
+            .await
+            .map_err(|error| {
+                VibexError::process(
+                    "remote_zero_config_pairing_listener_bind_failed",
+                    "zero-config LAN pairing listener could not bind",
+                )
+                .with_diagnostic("errorKind", format!("{:?}", error.kind()))
+            })?;
+        let bound_addr = listener.local_addr().map_err(|error| {
+            VibexError::process(
+                "remote_zero_config_pairing_listener_addr_failed",
+                "zero-config LAN pairing listener address is unavailable",
+            )
+            .with_diagnostic("errorKind", format!("{:?}", error.kind()))
+        })?;
+        let router = self.zero_config_router()?;
+        let offer = match self.create_zero_config_pairing_offer(permission_level, ttl_ms) {
+            Ok(offer) => offer,
+            Err(error) => return Err(error),
+        };
+        let offer_id = offer.offer.summary.offer_id.clone();
+        let snapshot = match self.inner.zero_config_lan_pairing.start_zero_config(
+            offer.offer,
+            bound_addr.port(),
+            &self.current_config().service.service_name,
+            unix_timestamp_ms(),
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let _ = self.cancel_pairing_offer(RemoteCancelPairingOfferRequest { offer_id });
+                return Err(error);
+            }
+        };
+        let pairing = self.inner.zero_config_lan_pairing.clone();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let terminal = async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    if pairing.snapshot(unix_timestamp_ms()).is_err() {
+                        break;
+                    }
+                }
+            };
+            let _ = axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    tokio::select! {
+                        _ = shutdown_rx => {}
+                        _ = terminal => {}
+                    }
+                })
+                .await;
+        });
+        {
+            let mut lifecycle = self
+                .inner
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            lifecycle.zero_config_bound_addr = Some(bound_addr);
+            lifecycle.zero_config_shutdown = Some(shutdown_tx);
+            lifecycle.zero_config_task = Some(task);
+        }
+        Ok(snapshot)
+    }
+
+    fn create_zero_config_pairing_offer(
+        &self,
+        permission_level: RemoteDevicePermissionLevel,
+        ttl_ms: u32,
+    ) -> VibexResult<RemoteCreatePairingOfferResponse> {
+        let connection = open_migrated_database(&self.inner.db_path)?;
+        let identity = self.identity()?;
+        let request = RemoteCreatePairingOfferRequest {
+            permission_level,
+            ttl_ms: Some(ttl_ms),
+            direct_candidates: Vec::new(),
+            relay_candidate: None,
+        };
+        let routes = self
+            .inner
+            .pairing_routes
+            .lock()
+            .map_err(|_| gateway_state_error())?
+            .clone();
+        if routes.is_empty() {
+            return Err(VibexError::capability(
+                "remote_zero_config_pairing_routes_unavailable",
+                "zero-config LAN pairing requires an enabled remote connection route",
+            ));
+        }
+        create_pairing_offer_with_routes(
+            &connection,
+            &identity,
+            request,
+            &self.inner.pairing_routes,
+        )
+    }
+
+    pub fn zero_config_lan_pairing_window_status(
+        &self,
+    ) -> VibexResult<RemoteLanPairingWindowSnapshot> {
+        self.inner
+            .zero_config_lan_pairing
+            .snapshot(unix_timestamp_ms())
+    }
+
+    pub fn approve_zero_config_lan_pairing_request(
+        &self,
+        request_id: &RequestId,
+    ) -> VibexResult<RemoteLanPairingWindowSnapshot> {
+        self.inner
+            .zero_config_lan_pairing
+            .approve(request_id, unix_timestamp_ms())
+    }
+
+    pub fn reject_zero_config_lan_pairing_request(
+        &self,
+        request_id: &RequestId,
+    ) -> VibexResult<RemoteLanPairingWindowSnapshot> {
+        self.inner
+            .zero_config_lan_pairing
+            .reject(request_id, unix_timestamp_ms())
+    }
+
+    pub async fn cancel_zero_config_lan_pairing(&self) -> VibexResult<()> {
+        let _lifecycle_guard = self.inner.lifecycle_guard.lock().await;
+        let offer_id = self.inner.zero_config_lan_pairing.active_offer_id();
+        if let Some(offer_id) = offer_id.clone() {
+            let cancellation = self.cancel_pairing_offer(RemoteCancelPairingOfferRequest {
+                offer_id: offer_id.clone(),
+            });
+            let _ = self.inner.zero_config_lan_pairing.clear_offer(&offer_id);
+            if let Err(error) = cancellation
+                && !matches!(
+                    error.code.as_str(),
+                    "remote_pairing_offer_already_claimed"
+                        | "remote_pairing_offer_canceled"
+                        | "remote_pairing_offer_expired"
+                        | "remote_pairing_offer_unknown"
+                )
+            {
+                self.stop_zero_config_listener().await;
+                return Err(error);
+            }
+        }
+        self.stop_zero_config_listener().await;
+        Ok(())
+    }
+
+    pub fn zero_config_lan_pairing_listener_addr(&self) -> Option<SocketAddr> {
+        self.inner
+            .lifecycle
+            .lock()
+            .ok()
+            .and_then(|lifecycle| lifecycle.zero_config_bound_addr)
+    }
+
+    async fn stop_zero_config_listener(&self) {
+        let (shutdown, task) = {
+            let mut lifecycle = self
+                .inner
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            lifecycle.zero_config_bound_addr = None;
+            (
+                lifecycle.zero_config_shutdown.take(),
+                lifecycle.zero_config_task.take(),
+            )
+        };
+        if let Some(shutdown) = shutdown {
+            let _ = shutdown.send(());
+        }
+        if let Some(mut task) = task
+            && tokio::time::timeout(Duration::from_secs(3), &mut task)
+                .await
+                .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Ok(mut sessions) = self.inner.zero_config_lan_sessions.lock() {
+            sessions.clear();
         }
     }
 
@@ -793,6 +1028,8 @@ impl RemoteGateway {
             domain_events: self.inner.domain_events.clone(),
             pairing_routes: self.inner.pairing_routes.clone(),
             lan_pairing: self.inner.lan_pairing.clone(),
+            zero_config_lan_pairing: self.inner.zero_config_lan_pairing.clone(),
+            zero_config_lan_sessions: self.inner.zero_config_lan_sessions.clone(),
             lan_pairing_requests: self.inner.lan_pairing_requests.clone(),
             session_epoch: context.session_epoch,
         };
@@ -1192,6 +1429,8 @@ impl RemoteGateway {
                 domain_events: self.inner.domain_events.clone(),
                 pairing_routes: self.inner.pairing_routes.clone(),
                 lan_pairing: self.inner.lan_pairing.clone(),
+                zero_config_lan_pairing: self.inner.zero_config_lan_pairing.clone(),
+                zero_config_lan_sessions: self.inner.zero_config_lan_sessions.clone(),
                 lan_pairing_requests: self.inner.lan_pairing_requests.clone(),
                 session_epoch: context.session_epoch,
             },
@@ -1242,6 +1481,29 @@ impl RemoteGateway {
             domain_events: self.inner.domain_events.clone(),
             pairing_routes: self.inner.pairing_routes.clone(),
             lan_pairing: self.inner.lan_pairing.clone(),
+            zero_config_lan_pairing: self.inner.zero_config_lan_pairing.clone(),
+            zero_config_lan_sessions: self.inner.zero_config_lan_sessions.clone(),
+            lan_pairing_requests: self.inner.lan_pairing_requests.clone(),
+            session_epoch: epoch,
+        }))
+    }
+
+    fn zero_config_router(&self) -> VibexResult<Router> {
+        let identity = self.identity()?;
+        let epoch = self.ensure_session_epoch();
+        Ok(build_zero_config_router(GatewayState {
+            config: Arc::new(self.current_config()),
+            dispatcher: self.inner.dispatcher.clone(),
+            db_path: self.inner.db_path.clone(),
+            identity,
+            tickets: self.inner.tickets.clone(),
+            registry: self.inner.registry.clone(),
+            idempotency: self.inner.idempotency.clone(),
+            domain_events: self.inner.domain_events.clone(),
+            pairing_routes: self.inner.pairing_routes.clone(),
+            lan_pairing: self.inner.lan_pairing.clone(),
+            zero_config_lan_pairing: self.inner.zero_config_lan_pairing.clone(),
+            zero_config_lan_sessions: self.inner.zero_config_lan_sessions.clone(),
             lan_pairing_requests: self.inner.lan_pairing_requests.clone(),
             session_epoch: epoch,
         }))
@@ -1296,6 +1558,7 @@ impl RemoteGateway {
 
     pub async fn stop(&self) -> VibexResult<()> {
         self.cancel_lan_pairing_window()?;
+        self.cancel_zero_config_lan_pairing().await?;
         let _guard = self.inner.lifecycle_guard.lock().await;
         self.inner.registry.disconnect_all(RemoteCloseReason {
             code: RemoteCloseCode::ServerShutdown,
@@ -1449,6 +1712,11 @@ impl Drop for RemoteGatewayInner {
         {
             task.abort();
         }
+        if let Ok(lifecycle) = self.lifecycle.get_mut()
+            && let Some(task) = lifecycle.zero_config_task.take()
+        {
+            task.abort();
+        }
     }
 }
 
@@ -1464,6 +1732,8 @@ struct GatewayState {
     domain_events: GatewayDomainEvents,
     pairing_routes: Arc<Mutex<RemoteGatewayPairingRoutes>>,
     lan_pairing: Arc<LanPairingCoordinator>,
+    zero_config_lan_pairing: Arc<LanPairingCoordinator>,
+    zero_config_lan_sessions: Arc<Mutex<HashMap<RelaySessionId, ZeroConfigLanSession>>>,
     lan_pairing_requests: Arc<Semaphore>,
     session_epoch: u64,
 }
@@ -1577,6 +1847,208 @@ fn build_gateway_router(state: GatewayState) -> Router {
         state.clone(),
         security_perimeter,
     ))
+}
+
+fn build_zero_config_router(state: GatewayState) -> Router {
+    Router::new()
+        .route(
+            ZERO_CONFIG_PAIRING_HELLO_PATH,
+            post(zero_config_pairing_hello),
+        )
+        .route(
+            ZERO_CONFIG_PAIRING_REQUEST_PATH,
+            post(zero_config_pairing_request),
+        )
+        .route(
+            ZERO_CONFIG_PAIRING_STATUS_PATH,
+            post(zero_config_pairing_status),
+        )
+        .route(
+            ZERO_CONFIG_PAIRING_CLAIM_PATH,
+            post(zero_config_pairing_claim),
+        )
+        .layer(DefaultBodyLimit::max(LAN_PAIRING_MAX_BODY_BYTES))
+        .with_state(state)
+}
+
+async fn zero_config_pairing_hello(
+    State(state): State<GatewayState>,
+    Json(hello): Json<RemoteZeroConfigLanPairingHello>,
+) -> Response {
+    let _permit = match state.lan_pairing_requests.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return lan_pairing_busy_response(),
+    };
+    let discovery = match state.zero_config_lan_pairing.discovery(unix_timestamp_ms()) {
+        Ok(discovery) => discovery,
+        Err(error) => return protocol_error_response(status_for_error(&error), error),
+    };
+    let (accepted, session) =
+        match establish_server_session(&state.identity, discovery, hello, unix_timestamp_ms()) {
+            Ok(value) => value,
+            Err(error) => return protocol_error_response(status_for_error(&error), error),
+        };
+    match state.zero_config_lan_sessions.lock() {
+        Ok(mut sessions) => {
+            sessions.retain(|_, session| session.expires_at_ms > unix_timestamp_ms());
+            if sessions.len() >= ZERO_CONFIG_PAIRING_MAX_SESSIONS {
+                return lan_pairing_busy_response();
+            }
+            sessions.insert(session.session_id.clone(), session);
+            Json(accepted).into_response()
+        }
+        Err(_) => protocol_error_response(StatusCode::INTERNAL_SERVER_ERROR, gateway_state_error()),
+    }
+}
+
+async fn zero_config_pairing_request(
+    State(state): State<GatewayState>,
+    Json(frame): Json<RelayEncryptedFrame>,
+) -> Response {
+    let _permit = match state.lan_pairing_requests.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return lan_pairing_busy_response(),
+    };
+    let payload = match open_zero_config_frame(&state, &frame) {
+        Ok(payload) => payload,
+        Err(error) => return protocol_error_response(status_for_error(&error), error),
+    };
+    let request = match decode_zero_config_payload::<RemoteLanPairingRequest>(payload) {
+        Ok(request) => request,
+        Err(error) => return protocol_error_response(status_for_error(&error), error),
+    };
+    let accepted = match state
+        .zero_config_lan_pairing
+        .submit(request, unix_timestamp_ms())
+    {
+        Ok(accepted) => accepted,
+        Err(error) => return protocol_error_response(status_for_error(&error), error),
+    };
+    encrypted_zero_config_response(&state, &frame.session_id, accepted)
+}
+
+async fn zero_config_pairing_status(
+    State(state): State<GatewayState>,
+    Json(frame): Json<RelayEncryptedFrame>,
+) -> Response {
+    let _permit = match state.lan_pairing_requests.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return lan_pairing_busy_response(),
+    };
+    let payload = match open_zero_config_frame(&state, &frame) {
+        Ok(payload) => payload,
+        Err(error) => return protocol_error_response(status_for_error(&error), error),
+    };
+    let request = match decode_zero_config_payload::<RemoteLanPairingStatusRequest>(payload) {
+        Ok(request) => request,
+        Err(error) => return protocol_error_response(status_for_error(&error), error),
+    };
+    let status = match state
+        .zero_config_lan_pairing
+        .status(request, unix_timestamp_ms())
+    {
+        Ok(status) => status,
+        Err(error) => return protocol_error_response(status_for_error(&error), error),
+    };
+    encrypted_zero_config_response(&state, &frame.session_id, status)
+}
+
+async fn zero_config_pairing_claim(
+    State(state): State<GatewayState>,
+    Json(frame): Json<RelayEncryptedFrame>,
+) -> Response {
+    let _permit = match state.lan_pairing_requests.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return lan_pairing_busy_response(),
+    };
+    let payload = match open_zero_config_frame(&state, &frame) {
+        Ok(payload) => payload,
+        Err(error) => return protocol_error_response(status_for_error(&error), error),
+    };
+    let request = match decode_zero_config_payload::<RemoteClaimPairingOfferRequest>(payload) {
+        Ok(request) => request,
+        Err(error) => return protocol_error_response(status_for_error(&error), error),
+    };
+    let connection = match open_migrated_database(&state.db_path) {
+        Ok(connection) => connection,
+        Err(error) => return protocol_error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
+    };
+    let offer_id = request.offer_id.clone();
+    let response = match RemoteTrustService::claim_pairing_offer(&connection, request) {
+        Ok(response) => response,
+        Err(error) => return protocol_error_response(status_for_error(&error), error),
+    };
+    let _ = state.zero_config_lan_pairing.clear_offer(&offer_id);
+    encrypted_zero_config_response(&state, &frame.session_id, response)
+}
+
+fn open_zero_config_frame(
+    state: &GatewayState,
+    frame: &RelayEncryptedFrame,
+) -> VibexResult<JsonValue> {
+    let mut sessions = state
+        .zero_config_lan_sessions
+        .lock()
+        .map_err(|_| gateway_state_error())?;
+    let session = sessions.get_mut(&frame.session_id).ok_or_else(|| {
+        VibexError::new(
+            ErrorCategory::Permission,
+            "remote_zero_config_pairing_session_invalid",
+            "zero-config LAN pairing session is invalid",
+        )
+    })?;
+    open_zero_config_json(session, frame, unix_timestamp_ms())
+}
+
+fn decode_zero_config_payload<T: DeserializeOwned>(payload: JsonValue) -> VibexResult<T> {
+    serde_json::from_value(payload).map_err(|_| {
+        VibexError::validation(
+            "remote_zero_config_pairing_payload_invalid",
+            "zero-config LAN pairing payload is invalid",
+        )
+    })
+}
+
+fn encrypted_zero_config_response<T: serde::Serialize>(
+    state: &GatewayState,
+    session_id: &RelaySessionId,
+    value: T,
+) -> Response {
+    let payload = match serde_json::to_value(value) {
+        Ok(payload) => payload,
+        Err(_) => {
+            return protocol_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                VibexError::process(
+                    "remote_zero_config_pairing_response_invalid",
+                    "zero-config LAN pairing response is invalid",
+                ),
+            );
+        }
+    };
+    let mut sessions = match state.zero_config_lan_sessions.lock() {
+        Ok(sessions) => sessions,
+        Err(_) => {
+            return protocol_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                gateway_state_error(),
+            );
+        }
+    };
+    let Some(session) = sessions.get_mut(session_id) else {
+        return protocol_error_response(
+            StatusCode::UNAUTHORIZED,
+            VibexError::new(
+                ErrorCategory::Permission,
+                "remote_zero_config_pairing_session_invalid",
+                "zero-config LAN pairing session is invalid",
+            ),
+        );
+    };
+    match seal_zero_config_json(session, payload) {
+        Ok(frame) => Json(frame).into_response(),
+        Err(error) => protocol_error_response(status_for_error(&error), error),
+    }
 }
 
 async fn gateway_info(State(state): State<GatewayState>) -> Response {
@@ -4160,7 +4632,7 @@ mod tests {
     };
     use tower::ServiceExt;
     use vibex_core::{
-        RemoteClaimPairingCodeRequest, RemoteCreatePairingCodeRequest,
+        RelayFrameKind, RelayPeerId, RemoteClaimPairingCodeRequest, RemoteCreatePairingCodeRequest,
         RemoteCreatePairingOfferRequest, RemoteDeviceCancelPairingOfferRequest,
         RemoteDeviceCreatePairingOfferRequest, RemoteDeviceListRequest, RemoteDeviceListResponse,
         RemoteDevicePermissionLevel, RemoteDeviceRequest, RemoteDeviceRevokeRequest,
@@ -4168,6 +4640,7 @@ mod tests {
         RemoteRevokeDeviceRequest,
     };
     use vibex_db::{RemoteDeviceRepository, apply_migrations};
+    use vibex_relay::{RelayCryptoSuite, RelayKeypair, RelaySession, RelaySessionConfig};
 
     use super::*;
 
@@ -4186,6 +4659,36 @@ mod tests {
             &database_path,
             directory.path().join("identity.json"),
         )
+    }
+
+    async fn send_zero_config_encrypted<T, R>(
+        client: &reqwest::Client,
+        origin: &str,
+        path: &str,
+        session: &mut RelaySession,
+        value: &T,
+    ) -> R
+    where
+        T: serde::Serialize,
+        R: serde::de::DeserializeOwned,
+    {
+        let payload = serde_json::to_value(value).unwrap();
+        let frame = session
+            .seal_json(RelayFrameKind::PairRequest, None, payload)
+            .unwrap();
+        let response = client
+            .post(format!("{origin}{path}"))
+            .json(&frame)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<RelayEncryptedFrame>()
+            .await
+            .unwrap();
+        let plaintext = session.open_json(&response).unwrap().business_payload_json;
+        serde_json::from_value(plaintext).unwrap()
     }
 
     #[test]
@@ -4983,6 +5486,193 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zero_config_listener_encrypts_pairing_and_reuses_the_existing_claim_transaction() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = RemoteGatewayConfig::loopback_enabled("127.0.0.1:1428");
+        config.pairing_routes.direct_candidates = vec![RemotePairingCandidate {
+            transport: RemotePairingTransport::Direct,
+            url: "http://127.0.0.1:1428".into(),
+            relay_room_id: None,
+            relay_pc_peer_id: None,
+            relay_pc_public_key: None,
+        }];
+        let gateway = test_gateway(&directory, config);
+        let window = gateway
+            .start_zero_config_lan_pairing(RemoteDevicePermissionLevel::ReadOnly, 60_000)
+            .await
+            .unwrap();
+        let address = gateway.zero_config_lan_pairing_listener_addr().unwrap();
+        let origin = format!("http://127.0.0.1:{}", address.port());
+        let client = reqwest::Client::new();
+
+        let client_keypair = RelayKeypair::generate();
+        let client_peer_id = RelayPeerId::new();
+        let client_nonce = "hello-nonce-0123456789".to_string();
+        let hello = RemoteZeroConfigLanPairingHello {
+            client_peer_id: client_peer_id.clone(),
+            client_ephemeral_public_key: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(client_keypair.public_key_bytes()),
+            client_nonce: client_nonce.clone(),
+        };
+        let hello_response = client
+            .post(format!("{origin}{ZERO_CONFIG_PAIRING_HELLO_PATH}"))
+            .json(&hello)
+            .send()
+            .await
+            .unwrap();
+        let hello_status = hello_response.status();
+        let hello_body = hello_response.text().await.unwrap();
+        assert_eq!(hello_status, StatusCode::OK, "{hello_body}");
+        let accepted: vibex_core::RemoteZeroConfigLanPairingHelloAccepted =
+            serde_json::from_str(&hello_body).unwrap();
+        assert_eq!(accepted.discovery, window.discovery);
+        assert_eq!(
+            accepted.server_identity_public_key,
+            gateway.identity().unwrap().public_key_base64()
+        );
+
+        let mut session = RelaySession::establish_with_suite(
+            &client_keypair,
+            &base64::engine::general_purpose::STANDARD.encode(
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(&accepted.server_identity_public_key)
+                    .unwrap(),
+            ),
+            RelaySessionConfig {
+                room_id: accepted.room_id,
+                session_id: accepted.session_id,
+                local_peer_id: client_peer_id,
+                remote_peer_id: accepted.server_peer_id,
+            },
+            RelayCryptoSuite::DirectionalV2,
+            Some(&client_nonce),
+        )
+        .unwrap();
+        let device_secret = StaticSecret::random_from_rng(OsRng);
+        let device_public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(PublicKey::from(&device_secret).as_bytes());
+        let request_secret = format!(
+            "secret-{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([23u8; 32])
+        );
+        let request = RemoteLanPairingRequest {
+            window_id: window.discovery.window_id,
+            device_identity_public_key: device_public_key.clone(),
+            display_name: "Encrypted Integration Phone".into(),
+            client_nonce: "pairing-nonce-0123456789".into(),
+            request_secret: request_secret.clone(),
+            idempotency_key: "zero-config-idempotency-0001".into(),
+        };
+        let request_payload = serde_json::to_value(&request).unwrap();
+        let request_frame = session
+            .seal_json(RelayFrameKind::PairRequest, None, request_payload)
+            .unwrap();
+        let encoded_frame = serde_json::to_string(&request_frame).unwrap();
+        assert!(!encoded_frame.contains(&request_secret));
+        assert!(!encoded_frame.contains(&device_public_key));
+        let response_frame = client
+            .post(format!("{origin}{ZERO_CONFIG_PAIRING_REQUEST_PATH}"))
+            .json(&request_frame)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<RelayEncryptedFrame>()
+            .await
+            .unwrap();
+        let accepted_request: RemoteLanPairingRequestAccepted = serde_json::from_value(
+            session
+                .open_json(&response_frame)
+                .unwrap()
+                .business_payload_json,
+        )
+        .unwrap();
+
+        let status_request = RemoteLanPairingStatusRequest {
+            request_id: accepted_request.request_id.clone(),
+            request_secret,
+        };
+        let pending: RemoteLanPairingStatusResponse = send_zero_config_encrypted(
+            &client,
+            &origin,
+            ZERO_CONFIG_PAIRING_STATUS_PATH,
+            &mut session,
+            &status_request,
+        )
+        .await;
+        assert_eq!(pending.state, RemoteLanPairingRequestState::Pending);
+        assert!(pending.offer.is_none());
+
+        gateway
+            .approve_zero_config_lan_pairing_request(&accepted_request.request_id)
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(510)).await;
+        let approved: RemoteLanPairingStatusResponse = send_zero_config_encrypted(
+            &client,
+            &origin,
+            ZERO_CONFIG_PAIRING_STATUS_PATH,
+            &mut session,
+            &status_request,
+        )
+        .await;
+        assert_eq!(approved.state, RemoteLanPairingRequestState::Approved);
+        let offer = approved.offer.unwrap();
+
+        let claim = RemoteClaimPairingOfferRequest {
+            offer_id: offer.summary.offer_id,
+            one_time_challenge: offer.one_time_challenge,
+            expected_server_id: offer.summary.server_id,
+            expected_server_identity_public_key: offer.summary.server_identity_public_key,
+            display_name: "Encrypted Integration Phone".into(),
+            device_identity_public_key: device_public_key,
+            claim_nonce: "zero-config-claim-nonce-0001".into(),
+        };
+        let claimed: RemoteClaimPairingOfferResponse = send_zero_config_encrypted(
+            &client,
+            &origin,
+            ZERO_CONFIG_PAIRING_CLAIM_PATH,
+            &mut session,
+            &claim,
+        )
+        .await;
+        assert_eq!(
+            claimed.device.status,
+            vibex_core::RemoteDeviceStatus::Active
+        );
+        assert!(!claimed.device_grant_token.is_empty());
+
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert!(
+            gateway
+                .inner
+                .lifecycle
+                .lock()
+                .unwrap()
+                .zero_config_task
+                .as_ref()
+                .is_some_and(JoinHandle::is_finished)
+        );
+        gateway.cancel_zero_config_lan_pairing().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn zero_config_pairing_requires_an_existing_long_term_route() {
+        let directory = tempfile::tempdir().unwrap();
+        let gateway = test_gateway(
+            &directory,
+            RemoteGatewayConfig::loopback_enabled("127.0.0.1:0"),
+        );
+
+        let error = gateway
+            .start_zero_config_lan_pairing(RemoteDevicePermissionLevel::ReadOnly, 60_000)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "remote_zero_config_pairing_routes_unavailable");
+        assert!(gateway.zero_config_lan_pairing_listener_addr().is_none());
+    }
+
+    #[tokio::test]
     async fn gateway_listener_start_stop_restart_releases_the_socket() {
         let directory = tempfile::tempdir().unwrap();
         let gateway = test_gateway(
@@ -5188,6 +5878,8 @@ mod tests {
             domain_events: gateway.inner.domain_events.clone(),
             pairing_routes: gateway.inner.pairing_routes.clone(),
             lan_pairing: gateway.inner.lan_pairing.clone(),
+            zero_config_lan_pairing: gateway.inner.zero_config_lan_pairing.clone(),
+            zero_config_lan_sessions: gateway.inner.zero_config_lan_sessions.clone(),
             lan_pairing_requests: gateway.inner.lan_pairing_requests.clone(),
             session_epoch: epoch,
         }

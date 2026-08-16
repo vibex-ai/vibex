@@ -25,18 +25,18 @@ use vibex_core::{
     unix_timestamp_ms,
 };
 use vibex_desktop_model::{TimelineConversationTurn, TimelineRow, TimelineRowKind};
-use vibex_remote_client::{LanPairingSession, WebRemoteBackend};
+use vibex_remote_client::{WebRemoteBackend, ZeroConfigLanPairingSession};
 use vibex_ui::{
     AgentEventDecision, AgentMutationTicket, AgentWorkflowController, AsyncPhase,
     ElicitationFormDraft, ElicitationSurfaceModel, ShellKind,
 };
 
-use crate::discovery::{LanDiscoveryCandidate, LanDiscoveryEvent};
+use crate::discovery::{LanDiscoveryCandidate, LanDiscoveryEvent, LanDiscoveryMode};
 use crate::input::{
     Backspace, Copy, Cut, Delete, Down, Enter, Left, Paste, Right, SelectAll, SelectDown,
     SelectLeft, SelectRight, SelectUp, TextInput, Up,
 };
-use crate::pairing::{MobileCredentialBundle, claim_lan_pairing, claim_pairing_link};
+use crate::pairing::{MobileCredentialBundle, claim_pairing_link, claim_zero_config_lan_pairing};
 use crate::storage::CredentialStorage;
 use crate::workbench::{MobileWorkbench, WorkbenchSurface};
 use crate::{markdown, scanner, theme};
@@ -450,6 +450,9 @@ impl MobileApp {
         }
         match event {
             LanDiscoveryEvent::Candidate(candidate) => {
+                if candidate.mode != LanDiscoveryMode::ZeroConfig {
+                    return;
+                }
                 self.nearby_candidates.insert(candidate.key(), candidate);
                 self.nearby_pairing_state = NearbyPairingState::Discovering;
             }
@@ -538,7 +541,31 @@ impl MobileApp {
         };
         let display_name = candidate.display_name.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            LanPairingSession::start(candidate.origin, "Vibex Mobile").await
+            if candidate.mode != LanDiscoveryMode::ZeroConfig {
+                return Err(BackendError::failed(
+                    "remote_zero_config_pairing_mode_invalid",
+                    "local network pairing selected an incompatible advertisement",
+                ));
+            }
+            let server_key = candidate.server_identity_public_key.ok_or_else(|| {
+                BackendError::failed(
+                    "remote_zero_config_pairing_identity_missing",
+                    "nearby desktop omitted its zero-config pairing identity",
+                )
+            })?;
+            let server_id = candidate.server_id.ok_or_else(|| {
+                BackendError::failed(
+                    "remote_zero_config_pairing_identity_missing",
+                    "nearby desktop omitted its zero-config server identity",
+                )
+            })?;
+            ZeroConfigLanPairingSession::start(
+                candidate.origin,
+                &server_id,
+                &server_key,
+                "Vibex Mobile",
+            )
+            .await
         });
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
@@ -574,7 +601,11 @@ impl MobileApp {
         cx.notify();
     }
 
-    fn start_lan_pairing_poll(&mut self, session: LanPairingSession, cx: &mut Context<Self>) {
+    fn start_lan_pairing_poll(
+        &mut self,
+        mut session: ZeroConfigLanPairingSession,
+        cx: &mut Context<Self>,
+    ) {
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(700)).await;
@@ -582,10 +613,8 @@ impl MobileApp {
                 match status.state {
                     RemoteLanPairingRequestState::Pending => continue,
                     RemoteLanPairingRequestState::Approved => {
-                        return claim_lan_pairing(&session, status)
-                            .await
-                            .map(Box::new)
-                            .map(LanPairingOutcome::Bundle);
+                        let bundle = claim_zero_config_lan_pairing(&mut session, status).await?;
+                        return Ok(LanPairingOutcome::Bundle(Box::new(bundle)));
                     }
                     RemoteLanPairingRequestState::Rejected => {
                         return Ok(LanPairingOutcome::Rejected);
@@ -1883,7 +1912,9 @@ impl MobileApp {
                     div()
                         .text_size(px(theme::FONT_DETAIL))
                         .text_color(theme::text_muted())
-                        .child("Pair with a Vibex desktop on this network."),
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::text_primary())
+                        .child("Local Network Pairing"),
                 )
                 .child(
                     div()
@@ -1906,7 +1937,7 @@ impl MobileApp {
                                 .size(px(theme::ICON_MD))
                                 .text_color(rgb(theme::BG_PRIMARY)),
                         )
-                        .child("Find Nearby Desktops"),
+                        .child("Find Desktops"),
                 )
                 .into_any_element(),
             NearbyPairingState::Discovering | NearbyPairingState::Empty => {
