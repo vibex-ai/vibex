@@ -1648,11 +1648,10 @@ impl RemoteConnectivityController {
         gateway: RemoteGateway,
         relay: RelayClientRuntime,
     ) -> VibexResult<Self> {
-        let gateway_bind_addr = gateway.current_config().service.bind_addr;
         Self::with_publication_adapters_at(
             home,
             gateway,
-            gateway_bind_addr,
+            DIRECT_LOOPBACK_BIND_ADDR.to_string(),
             relay,
             PublicationAdapters {
                 tailscale: Arc::new(TailscaleCli::default()),
@@ -3333,6 +3332,29 @@ mod tests {
         assert!(origins.contains(&"https://desktop.tailnet.ts.net:8443".to_string()));
         assert!(origins.contains(&"https://localhost".to_string()));
         assert!(!hosts.contains(&"localhost".to_string()));
+    }
+
+    #[test]
+    fn production_controller_binds_the_tailnet_loopback_target() {
+        let directory = tempdir().unwrap();
+        let dispatcher = vibex_remote::RemoteDispatcher::new(
+            vibex_remote::RemoteServiceConfig::loopback_disabled(),
+        );
+        let gateway = RemoteGateway::new(
+            RemoteGatewayConfig::default(),
+            dispatcher.clone(),
+            directory.path().join("vibex.db"),
+            directory.path().join("relay/desktop-identity.json"),
+        );
+        let relay = RelayClientRuntime::with_remote_gateway(dispatcher, gateway.clone()).unwrap();
+
+        let controller =
+            RemoteConnectivityController::new(directory.path(), gateway, relay).unwrap();
+
+        assert_eq!(
+            controller.inner.gateway_bind_addr,
+            DIRECT_LOOPBACK_BIND_ADDR
+        );
     }
 
     #[tokio::test]
