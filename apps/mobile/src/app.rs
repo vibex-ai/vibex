@@ -41,7 +41,7 @@ use crate::input::{
 use crate::lifecycle::MobileLifecycleEvent;
 use crate::pairing::{MobileCredentialBundle, claim_pairing_link, claim_zero_config_lan_pairing};
 use crate::storage::CredentialStorage;
-use crate::workbench::{MobileWorkbench, WorkbenchSurface};
+use crate::workbench::MobileWorkbench;
 use crate::{locale, markdown, scanner, theme};
 
 const TIMELINE_NEAR_BOTTOM_PX: f32 = 96.0;
@@ -113,9 +113,24 @@ enum SessionMutationOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrawerPage {
+    Sessions,
+    Workbench,
+}
+
+impl DrawerPage {
+    const fn open_offset(self) -> f32 {
+        match self {
+            Self::Sessions => 1.0,
+            Self::Workbench => -1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DrawerDragOrigin {
-    Panel,
-    Edge,
+    Main,
+    Page(DrawerPage),
 }
 
 /// Touch pans arrive as scroll events (see `gpui_android`/`gpui_ios`), so the drawer
@@ -128,6 +143,7 @@ enum DrawerGesture {
         dy: f32,
     },
     Dragging {
+        page: DrawerPage,
         last_dx: f32,
     },
 }
@@ -395,7 +411,7 @@ impl MobileApp {
                 if let Some(workbench) = self.workbench.take() {
                     workbench.update(cx, |workbench, _| workbench.suspend());
                 }
-                self.workbench_open = false;
+                self.reset_drawers();
                 self.mode = RootMode::Connecting;
                 self.error = None;
                 self.backend = Some(backend.clone());
@@ -996,33 +1012,8 @@ impl MobileApp {
             Some(cx.new(|cx| MobileWorkbench::new(backend, workspace_id, session_id, cx)));
     }
 
-    fn open_workbench(&mut self, surface: WorkbenchSurface, cx: &mut Context<Self>) {
-        let Some(workbench) = self.workbench.as_ref() else {
-            self.error = Some(BackendError::loading(
-                "mobile_workbench_loading",
-                locale::text(
-                    "Workspace tools are waiting for the desktop workspace list.",
-                    "工作区工具正在等待桌面端的工作区列表。",
-                    "工作區工具正在等待桌面版的工作區清單。",
-                ),
-            ));
-            self.refresh_workspaces(cx);
-            cx.notify();
-            return;
-        };
-        workbench.update(cx, |workbench, cx| workbench.set_surface(surface, cx));
-        self.workbench_open = true;
-        self.drawer_open = false;
-        self.drawer_offset = 0.0;
-        cx.notify();
-    }
-
-    fn close_workbench(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(workbench) = self.workbench.as_ref() {
-            workbench.update(cx, |workbench, _| workbench.suspend());
-        }
-        self.workbench_open = false;
-        cx.notify();
+    fn close_workbench(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_drawer_snap(0.0, Some(window), cx);
     }
 
     fn create_session(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1258,11 +1249,7 @@ impl MobileApp {
         };
         let future = controller.load_session(ticket.clone());
         let runner = gpui_tokio::Tokio::spawn(cx, future);
-        self.drawer_open = false;
-        self.drawer_offset = 0.0;
-        self.drawer_gesture = None;
-        self.drawer_snap = None;
-        self.drawer_snap_task = None;
+        self.reset_drawers();
         self.expanded_process.clear();
         self.expanded_approval.clear();
         self.timeline_turns = Arc::new(Vec::new());
@@ -1714,15 +1701,6 @@ impl MobileApp {
         cx.notify();
     }
 
-    fn toggle_drawer(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let target = if self.drawer_open {
-            0.0
-        } else {
-            theme::DRAWER_WIDTH
-        };
-        self.start_drawer_snap(target, Some(window), cx);
-    }
-
     fn close_drawer(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.start_drawer_snap(0.0, Some(window), cx);
     }
@@ -1744,15 +1722,29 @@ impl MobileApp {
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
-        let target = target.clamp(0.0, theme::DRAWER_WIDTH);
+        let target = target.clamp(-1.0, 1.0);
         let from = self.drawer_offset;
         self.drawer_gesture = None;
         self.drawer_open = target > 0.0;
+        let workbench_was_open = self.workbench_open;
+        self.workbench_open = target < 0.0;
+        if self.workbench_open && !workbench_was_open {
+            if let Some(workbench) = self.workbench.as_ref() {
+                workbench.update(cx, |workbench, cx| workbench.resume(cx));
+            } else {
+                self.refresh_workspaces(cx);
+            }
+        } else if workbench_was_open
+            && !self.workbench_open
+            && let Some(workbench) = self.workbench.as_ref()
+        {
+            workbench.update(cx, |workbench, _| workbench.suspend());
+        }
         self.drawer_snap_task = None;
         if let Some(window) = window {
             window.hide_soft_keyboard();
         }
-        if (from - target).abs() < 1.0 {
+        if (from - target).abs() < 0.001 {
             self.drawer_offset = target;
             self.drawer_snap = None;
             cx.notify();
@@ -1760,10 +1752,11 @@ impl MobileApp {
         }
 
         self.drawer_animation_id = self.drawer_animation_id.wrapping_add(1);
+        let animation_id = self.drawer_animation_id;
         self.drawer_snap = Some(DrawerSnap {
             from,
             target,
-            animation_id: self.drawer_animation_id,
+            animation_id,
         });
         let duration_ms = drawer_snap_duration_ms(from, target);
         let timer = cx
@@ -1774,7 +1767,7 @@ impl MobileApp {
             let _ = entity.update(cx, |this, cx| {
                 let is_current = this
                     .drawer_snap
-                    .is_some_and(|snap| snap.target == target && snap.from == from);
+                    .is_some_and(|snap| snap.animation_id == animation_id);
                 if is_current {
                     this.drawer_offset = target;
                     this.drawer_snap = None;
@@ -1783,6 +1776,25 @@ impl MobileApp {
             });
         }));
         cx.notify();
+    }
+
+    fn reset_drawers(&mut self) {
+        self.drawer_open = false;
+        self.workbench_open = false;
+        self.drawer_offset = 0.0;
+        self.drawer_gesture = None;
+        self.drawer_snap = None;
+        self.drawer_snap_task = None;
+    }
+
+    fn settled_drawer_target(&self) -> f32 {
+        if self.drawer_open {
+            DrawerPage::Sessions.open_offset()
+        } else if self.workbench_open {
+            DrawerPage::Workbench.open_offset()
+        } else {
+            0.0
+        }
     }
 
     fn toggle_process(&mut self, id: String, cx: &mut Context<Self>) {
@@ -1851,16 +1863,11 @@ impl MobileApp {
         if let Some(workbench) = self.workbench.take() {
             workbench.update(cx, |workbench, _| workbench.suspend());
         }
-        self.workbench_open = false;
         self.controller = None;
         self.mode = RootMode::Pairing;
         self.timeline_turns = Arc::new(Vec::new());
         self.timeline_list.reset(0);
-        self.drawer_open = false;
-        self.drawer_offset = 0.0;
-        self.drawer_gesture = None;
-        self.drawer_snap = None;
-        self.drawer_snap_task = None;
+        self.reset_drawers();
         self.workspaces.clear();
         self.expanded_process.clear();
         self.expanded_approval.clear();
@@ -1872,9 +1879,9 @@ impl MobileApp {
         cx.notify();
     }
 
-    /// Drives the drawer from the platform touch-pan stream. Android and iOS both
-    /// synthesize a finger drag as `ScrollWheel` events carrying a `TouchPhase`;
-    /// mouse-move events only ever describe a tap, so they cannot drive a swipe.
+    /// Drives the full-page side drawers from the platform touch-pan stream.
+    /// Android and iOS synthesize a finger drag as `ScrollWheel` events carrying
+    /// a `TouchPhase`; mouse-move events only ever describe a tap.
     fn drawer_pan(
         &mut self,
         event: &ScrollWheelEvent,
@@ -1889,16 +1896,15 @@ impl MobileApp {
         match event.touch_phase {
             TouchPhase::Started => {
                 self.drawer_gesture = None;
-                if self.drawer_snap.is_some() {
+                if self.drawer_snap.is_some() || self.session_action.is_some() {
                     return;
                 }
-                let x = f32::from(event.position.x);
-                let origin = if self.drawer_offset > 0.0 && x <= self.drawer_offset {
-                    DrawerDragOrigin::Panel
-                } else if self.drawer_offset <= 0.0 && x <= theme::DRAWER_EDGE_ZONE {
-                    DrawerDragOrigin::Edge
+                let origin = if self.drawer_offset > 0.0 {
+                    DrawerDragOrigin::Page(DrawerPage::Sessions)
+                } else if self.drawer_offset < 0.0 {
+                    DrawerDragOrigin::Page(DrawerPage::Workbench)
                 } else {
-                    return;
+                    DrawerDragOrigin::Main
                 };
                 self.drawer_gesture = Some(DrawerGesture::Pending {
                     origin,
@@ -1911,19 +1917,16 @@ impl MobileApp {
             }
             TouchPhase::Moved => self.advance_drawer_pan(delta_x, delta_y, window, cx),
             TouchPhase::Ended => {
-                if let Some(DrawerGesture::Dragging { last_dx }) = self.drawer_gesture.take() {
+                if let Some(DrawerGesture::Dragging { page, last_dx }) = self.drawer_gesture.take()
+                {
                     cx.stop_propagation();
-                    let target = drawer_snap_target(self.drawer_offset, last_dx);
+                    let target = drawer_snap_target(page, self.drawer_offset, last_dx);
                     self.start_drawer_snap(target, Some(window), cx);
                 }
             }
             TouchPhase::Cancelled => {
                 if self.drawer_gesture.take().is_some() {
-                    let target = if self.drawer_open {
-                        theme::DRAWER_WIDTH
-                    } else {
-                        0.0
-                    };
+                    let target = self.settled_drawer_target();
                     self.start_drawer_snap(target, Some(window), cx);
                 }
             }
@@ -1956,26 +1959,41 @@ impl MobileApp {
                         self.drawer_gesture = Some(DrawerGesture::Pending { origin, dx, dy });
                     }
                     DrawerPanDecision::Cancel => self.drawer_gesture = None,
-                    DrawerPanDecision::Drag => {
+                    DrawerPanDecision::Drag(page) => {
                         window.hide_soft_keyboard();
-                        self.drawer_gesture = Some(DrawerGesture::Dragging { last_dx: 0.0 });
-                        self.apply_drawer_drag(dx, cx);
+                        if page == DrawerPage::Workbench && self.workbench.is_none() {
+                            self.refresh_workspaces(cx);
+                        }
+                        self.drawer_gesture = Some(DrawerGesture::Dragging { page, last_dx: 0.0 });
+                        self.apply_drawer_drag(page, dx, workspace_page_width(window), cx);
                         cx.stop_propagation();
                     }
                 }
             }
-            Some(DrawerGesture::Dragging { .. }) => {
-                self.apply_drawer_drag(delta_x, cx);
+            Some(DrawerGesture::Dragging { page, .. }) => {
+                self.apply_drawer_drag(page, delta_x, workspace_page_width(window), cx);
                 cx.stop_propagation();
             }
             None => {}
         }
     }
 
-    fn apply_drawer_drag(&mut self, delta_x: f32, cx: &mut Context<Self>) {
-        self.drawer_offset = (self.drawer_offset + delta_x).clamp(0.0, theme::DRAWER_WIDTH);
-        self.drawer_open = self.drawer_offset > 0.0;
-        self.drawer_gesture = Some(DrawerGesture::Dragging { last_dx: delta_x });
+    fn apply_drawer_drag(
+        &mut self,
+        page: DrawerPage,
+        delta_x: f32,
+        page_width: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let normalized_delta = delta_x / page_width.max(1.0);
+        self.drawer_offset = match page {
+            DrawerPage::Sessions => (self.drawer_offset + normalized_delta).clamp(0.0, 1.0),
+            DrawerPage::Workbench => (self.drawer_offset + normalized_delta).clamp(-1.0, 0.0),
+        };
+        self.drawer_gesture = Some(DrawerGesture::Dragging {
+            page,
+            last_dx: delta_x,
+        });
         cx.notify();
     }
 
@@ -2450,7 +2468,7 @@ impl MobileApp {
             )
     }
 
-    fn render_workspace(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_workspace(&mut self, page_width: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self
             .controller
             .as_ref()
@@ -2482,9 +2500,8 @@ impl MobileApp {
             .as_ref()
             .is_some_and(|controller| controller.state.selected_session_id.is_none());
         let turns_for_list = turns.clone();
-        let show_drawer = self.drawer_offset > 0.0 || self.drawer_snap.is_some();
+        let drawer_page = visible_drawer_page(self.drawer_offset, self.drawer_snap);
         let workbench = self.workbench.clone();
-        let show_workbench = self.workbench_open && workbench.is_some();
         let session_action = self.session_action.clone();
         let can_create_session = self.backend.as_ref().is_some_and(|backend| {
             backend
@@ -2503,7 +2520,6 @@ impl MobileApp {
                     .flex()
                     .flex_col()
                     .child(self.render_header(&title, state, cx))
-                    .child(self.render_workbench_bar(cx))
                     .child(
                         div()
                             .flex_1()
@@ -2604,7 +2620,7 @@ impl MobileApp {
                     })
                     .child(self.render_composer(running, state, &turns, cx)),
             )
-            .when(show_drawer, |root| {
+            .when_some(drawer_page, |root, page| {
                 let backdrop_base = div()
                     .id("drawer-backdrop")
                     .absolute()
@@ -2614,7 +2630,12 @@ impl MobileApp {
                         MouseButton::Left,
                         cx.listener(Self::close_drawer_from_backdrop),
                     );
-                let drawer_base = self.render_drawer(cx).occlude();
+                let drawer_base = match page {
+                    DrawerPage::Sessions => self.render_drawer(cx),
+                    DrawerPage::Workbench => self.render_workbench_drawer(workbench.clone(), cx),
+                }
+                .w(px(page_width))
+                .occlude();
                 let (backdrop, drawer) = if let Some(snap) = self.drawer_snap {
                     let duration = drawer_animation(snap.from, snap.target);
                     let from_opacity = drawer_backdrop_opacity(snap.from);
@@ -2643,7 +2664,7 @@ impl MobileApp {
                                 duration,
                                 move |element, delta| {
                                     let offset = snap.from + (snap.target - snap.from) * delta;
-                                    element.left(px(offset - theme::DRAWER_WIDTH))
+                                    element.left(px(drawer_left(page, offset, page_width)))
                                 },
                             )
                             .into_any_element(),
@@ -2654,100 +2675,15 @@ impl MobileApp {
                             .bg(theme::backdrop(drawer_backdrop_opacity(self.drawer_offset)))
                             .into_any_element(),
                         drawer_base
-                            .left(px(self.drawer_offset - theme::DRAWER_WIDTH))
+                            .left(px(drawer_left(page, self.drawer_offset, page_width)))
                             .into_any_element(),
                     )
                 };
                 root.child(backdrop).child(drawer)
             })
-            .when(show_workbench, |root| {
-                root.child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .occlude()
-                        .bg(theme::bg_primary())
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .h(px(theme::HEADER_HEIGHT))
-                                .flex_shrink_0()
-                                .border_b_1()
-                                .border_color(theme::border_subtle())
-                                .pl_4()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .child(
-                                    div()
-                                        .text_size(px(theme::FONT_HEADING))
-                                        .text_color(theme::text_primary())
-                                        .child(locale::common("Workspace tools")),
-                                )
-                                .child(
-                                    div()
-                                        .id("close-mobile-workbench")
-                                        .size(px(theme::HEADER_BUTTON_SIZE))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .cursor_pointer()
-                                        .active(|style| style.opacity(0.6))
-                                        .on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(Self::close_workbench),
-                                        )
-                                        .child(
-                                            svg()
-                                                .path("icons/x.svg")
-                                                .size(px(theme::ICON_SM))
-                                                .text_color(theme::text_muted()),
-                                        ),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_h_0()
-                                .child(workbench.expect("workbench checked above")),
-                        ),
-                )
-            })
             .when_some(session_action, |root, prompt| {
                 root.child(self.render_session_action_prompt(&prompt, cx))
             })
-    }
-
-    fn render_workbench_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .id("mobile-workbench-launchers")
-            .h(px(theme::TOUCH_TARGET))
-            .flex_shrink_0()
-            .border_b_1()
-            .border_color(theme::border_subtle())
-            .overflow_x_scroll()
-            .flex()
-            .items_center()
-            .children(WorkbenchSurface::ALL.into_iter().map(|surface| {
-                div()
-                    .id(format!("open-workbench:{}", surface.label()))
-                    .h_full()
-                    .min_w(px(72.0))
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(theme::FONT_CAPTION))
-                    .text_color(theme::text_muted())
-                    .cursor_pointer()
-                    .active(|style| style.bg(theme::row_pressed_bg()))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| this.open_workbench(surface, cx)),
-                    )
-                    .child(surface.localized_label())
-            }))
     }
 
     fn render_session_action_prompt(
@@ -2927,23 +2863,7 @@ impl MobileApp {
             .border_color(theme::border_subtle())
             .flex()
             .items_center()
-            .child(
-                div()
-                    .id("open-session-drawer")
-                    .size(px(theme::HEADER_BUTTON_SIZE))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .active(|style| style.opacity(0.6))
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::toggle_drawer))
-                    .child(
-                        svg()
-                            .path("icons/menu.svg")
-                            .size(px(theme::ICON_MD))
-                            .text_color(theme::text_secondary()),
-                    ),
-            )
+            .child(div().size(px(theme::HEADER_BUTTON_SIZE)).flex_shrink_0())
             .child(
                 div()
                     .flex_1()
@@ -3891,6 +3811,71 @@ impl MobileApp {
             .into_any_element()
     }
 
+    fn render_workbench_drawer(
+        &self,
+        workbench: Option<Entity<MobileWorkbench>>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let body = match workbench {
+            Some(workbench) => div().flex_1().min_h_0().child(workbench),
+            None => div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(theme::FONT_BODY))
+                .text_color(theme::text_muted())
+                .child(locale::common("Loading")),
+        };
+
+        div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .bg(theme::bg_primary())
+            .border_l_1()
+            .border_color(theme::border_default())
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(theme::HEADER_HEIGHT))
+                    .flex_shrink_0()
+                    .border_b_1()
+                    .border_color(theme::border_subtle())
+                    .pl(px(theme::SPACING_LG))
+                    .pr(px(theme::SPACING_XS))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(theme::FONT_HEADING))
+                            .text_color(theme::text_primary())
+                            .child(locale::common("Workspace tools")),
+                    )
+                    .child(
+                        div()
+                            .id("close-mobile-workbench")
+                            .size(px(theme::HEADER_BUTTON_SIZE))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .active(|style| style.opacity(0.6))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::close_workbench))
+                            .child(
+                                svg()
+                                    .path("icons/x.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_muted()),
+                            ),
+                    ),
+            )
+            .child(body)
+    }
+
     fn render_drawer(&self, cx: &mut Context<Self>) -> gpui::Div {
         let sessions = self
             .controller
@@ -3922,7 +3907,6 @@ impl MobileApp {
             .absolute()
             .top_0()
             .bottom_0()
-            .w(px(theme::DRAWER_WIDTH))
             .bg(theme::bg_primary())
             .border_r_1()
             .border_color(theme::border_default())
@@ -4181,6 +4165,7 @@ impl Render for MobileApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_elicitation_form(cx);
         let insets = window.insets().effective();
+        let page_width = workspace_page_width(window);
         div()
             .size_full()
             .bg(theme::bg_primary())
@@ -4193,13 +4178,19 @@ impl Render for MobileApp {
             .child(match self.mode {
                 RootMode::Pairing => self.render_pairing(cx).into_any_element(),
                 RootMode::Connecting => self.render_connecting(cx).into_any_element(),
-                RootMode::Workspace => self.render_workspace(cx).into_any_element(),
+                RootMode::Workspace => self.render_workspace(page_width, cx).into_any_element(),
             })
     }
 }
 
+fn workspace_page_width(window: &Window) -> f32 {
+    let viewport = window.viewport_size();
+    let insets = window.insets().effective();
+    (f32::from(viewport.width) - f32::from(insets.left) - f32::from(insets.right)).max(1.0)
+}
+
 fn drawer_snap_duration_ms(from: f32, target: f32) -> u64 {
-    if target > from {
+    if target.abs() > from.abs() {
         theme::DRAWER_OPEN_ANIMATION_MS
     } else {
         theme::DRAWER_CLOSE_ANIMATION_MS
@@ -4208,23 +4199,22 @@ fn drawer_snap_duration_ms(from: f32, target: f32) -> u64 {
 
 fn drawer_animation(from: f32, target: f32) -> Animation {
     let animation = Animation::new(Duration::from_millis(drawer_snap_duration_ms(from, target)));
-    if target > from {
+    if target.abs() > from.abs() {
         animation.with_easing(ease_out_quint())
     } else {
         animation.with_easing(ease_in_out)
     }
 }
 
-/// What an in-progress edge/panel touch pan should do once its accumulated
-/// translation is known.
+/// What a page touch pan should do once its accumulated translation is known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DrawerPanDecision {
     /// Too little movement so far to tell a swipe from a tap.
     Wait,
     /// The pan belongs to something else — most often a vertical scroll.
     Cancel,
-    /// The pan is a horizontal drawer swipe.
-    Drag,
+    /// The pan is a horizontal swipe for one of the two side pages.
+    Drag(DrawerPage),
 }
 
 fn drawer_pan_decision(origin: DrawerDragOrigin, dx: f32, dy: f32) -> DrawerPanDecision {
@@ -4232,31 +4222,66 @@ fn drawer_pan_decision(origin: DrawerDragOrigin, dx: f32, dy: f32) -> DrawerPanD
     if abs_dx < theme::DRAWER_DRAG_THRESHOLD && abs_dy < theme::DRAWER_DRAG_THRESHOLD {
         return DrawerPanDecision::Wait;
     }
-    let toward_drawer = match origin {
-        DrawerDragOrigin::Panel => dx < 0.0,
-        DrawerDragOrigin::Edge => dx > 0.0,
-    };
-    if !toward_drawer
-        || abs_dx < theme::DRAWER_DRAG_THRESHOLD
+    if abs_dx < theme::DRAWER_DRAG_THRESHOLD
         || abs_dy > abs_dx * theme::DRAWER_VERTICAL_CANCEL_RATIO
     {
         return DrawerPanDecision::Cancel;
     }
-    DrawerPanDecision::Drag
+    match origin {
+        DrawerDragOrigin::Main if dx > 0.0 => DrawerPanDecision::Drag(DrawerPage::Sessions),
+        DrawerDragOrigin::Main => DrawerPanDecision::Drag(DrawerPage::Workbench),
+        DrawerDragOrigin::Page(DrawerPage::Sessions) if dx < 0.0 => {
+            DrawerPanDecision::Drag(DrawerPage::Sessions)
+        }
+        DrawerDragOrigin::Page(DrawerPage::Workbench) if dx > 0.0 => {
+            DrawerPanDecision::Drag(DrawerPage::Workbench)
+        }
+        DrawerDragOrigin::Page(_) => DrawerPanDecision::Cancel,
+    }
 }
 
-fn drawer_snap_target(offset: f32, last_dx: f32) -> f32 {
-    if last_dx < -2.0 {
+fn visible_drawer_page(offset: f32, snap: Option<DrawerSnap>) -> Option<DrawerPage> {
+    let active_offset = snap
+        .map(|snap| {
+            if snap.target.abs() > f32::EPSILON {
+                snap.target
+            } else {
+                snap.from
+            }
+        })
+        .unwrap_or(offset);
+    if active_offset > f32::EPSILON {
+        Some(DrawerPage::Sessions)
+    } else if active_offset < -f32::EPSILON {
+        Some(DrawerPage::Workbench)
+    } else {
+        None
+    }
+}
+
+fn drawer_snap_target(page: DrawerPage, offset: f32, last_dx: f32) -> f32 {
+    let direction = page.open_offset();
+    let directional_delta = last_dx * direction;
+    let reveal = (offset * direction).clamp(0.0, 1.0);
+    if directional_delta < -2.0 {
         0.0
-    } else if last_dx > 2.0 || offset > theme::DRAWER_WIDTH / 2.0 {
-        theme::DRAWER_WIDTH
+    } else if directional_delta > 2.0 || reveal > 0.5 {
+        direction
     } else {
         0.0
     }
 }
 
+fn drawer_left(page: DrawerPage, offset: f32, page_width: f32) -> f32 {
+    let reveal = (offset * page.open_offset()).clamp(0.0, 1.0);
+    match page {
+        DrawerPage::Sessions => (reveal - 1.0) * page_width,
+        DrawerPage::Workbench => (1.0 - reveal) * page_width,
+    }
+}
+
 fn drawer_backdrop_opacity(offset: f32) -> f32 {
-    (offset / theme::DRAWER_WIDTH).clamp(0.0, 1.0) * theme::DRAWER_BACKDROP_OPACITY
+    offset.abs().clamp(0.0, 1.0) * theme::DRAWER_BACKDROP_OPACITY
 }
 
 fn workspace_label(root: &str) -> &str {
@@ -4389,7 +4414,7 @@ mod tests {
                         .top_0()
                         .bottom_0()
                         .left_0()
-                        .w(px(theme::DRAWER_WIDTH))
+                        .w_full()
                         .occlude()
                         .child(
                             uniform_list("drawer-scroll-probe", 60, |range, _, _| {
@@ -4413,53 +4438,86 @@ mod tests {
     #[test]
     fn drawer_pan_waits_until_the_gesture_clears_the_threshold() {
         assert_eq!(
-            drawer_pan_decision(DrawerDragOrigin::Edge, 4.0, 3.0),
+            drawer_pan_decision(DrawerDragOrigin::Main, 4.0, 3.0),
             DrawerPanDecision::Wait
         );
+    }
+
+    #[test]
+    fn main_page_swipes_open_the_page_in_the_finger_direction() {
         assert_eq!(
-            drawer_pan_decision(DrawerDragOrigin::Edge, 24.0, 4.0),
-            DrawerPanDecision::Drag
+            drawer_pan_decision(DrawerDragOrigin::Main, 24.0, 4.0),
+            DrawerPanDecision::Drag(DrawerPage::Sessions)
         );
         assert_eq!(
-            drawer_pan_decision(DrawerDragOrigin::Panel, -24.0, 4.0),
-            DrawerPanDecision::Drag
+            drawer_pan_decision(DrawerDragOrigin::Main, -24.0, 4.0),
+            DrawerPanDecision::Drag(DrawerPage::Workbench)
+        );
+        assert_eq!(
+            drawer_pan_decision(DrawerDragOrigin::Page(DrawerPage::Sessions), -24.0, 4.0,),
+            DrawerPanDecision::Drag(DrawerPage::Sessions)
+        );
+        assert_eq!(
+            drawer_pan_decision(DrawerDragOrigin::Page(DrawerPage::Workbench), 24.0, 4.0,),
+            DrawerPanDecision::Drag(DrawerPage::Workbench)
         );
     }
 
     #[test]
     fn drawer_pan_yields_to_vertical_scrolling_and_wrong_direction_swipes() {
         assert_eq!(
-            drawer_pan_decision(DrawerDragOrigin::Edge, 8.0, 40.0),
+            drawer_pan_decision(DrawerDragOrigin::Main, 8.0, 40.0),
             DrawerPanDecision::Cancel
         );
         assert_eq!(
-            drawer_pan_decision(DrawerDragOrigin::Edge, -24.0, 2.0),
+            drawer_pan_decision(DrawerDragOrigin::Page(DrawerPage::Sessions), 24.0, 2.0,),
             DrawerPanDecision::Cancel
         );
         assert_eq!(
-            drawer_pan_decision(DrawerDragOrigin::Panel, 24.0, 2.0),
+            drawer_pan_decision(DrawerDragOrigin::Page(DrawerPage::Workbench), -24.0, 2.0,),
             DrawerPanDecision::Cancel
         );
     }
 
     #[test]
-    fn drawer_snap_uses_direction_then_half_width() {
-        assert_eq!(drawer_snap_target(40.0, 3.0), theme::DRAWER_WIDTH);
-        assert_eq!(drawer_snap_target(250.0, -3.0), 0.0);
-        assert_eq!(drawer_snap_target(160.0, 0.0), theme::DRAWER_WIDTH);
-        assert_eq!(drawer_snap_target(100.0, 0.0), 0.0);
+    fn drawer_snap_uses_direction_then_half_page() {
+        assert_eq!(drawer_snap_target(DrawerPage::Sessions, 0.2, 3.0), 1.0);
+        assert_eq!(drawer_snap_target(DrawerPage::Sessions, 0.8, -3.0), 0.0);
+        assert_eq!(drawer_snap_target(DrawerPage::Sessions, 0.6, 0.0), 1.0);
+        assert_eq!(drawer_snap_target(DrawerPage::Sessions, 0.4, 0.0), 0.0);
+        assert_eq!(drawer_snap_target(DrawerPage::Workbench, -0.2, -3.0), -1.0);
+        assert_eq!(drawer_snap_target(DrawerPage::Workbench, -0.8, 3.0), 0.0);
+        assert_eq!(drawer_snap_target(DrawerPage::Workbench, -0.6, 0.0), -1.0);
+        assert_eq!(drawer_snap_target(DrawerPage::Workbench, -0.4, 0.0), 0.0);
     }
 
     #[test]
     fn drawer_close_animation_is_faster() {
         assert_eq!(
-            drawer_snap_duration_ms(0.0, theme::DRAWER_WIDTH),
+            drawer_snap_duration_ms(0.0, 1.0),
             theme::DRAWER_OPEN_ANIMATION_MS
         );
         assert_eq!(
-            drawer_snap_duration_ms(theme::DRAWER_WIDTH, 0.0),
+            drawer_snap_duration_ms(1.0, 0.0),
             theme::DRAWER_CLOSE_ANIMATION_MS
         );
+        assert_eq!(
+            drawer_snap_duration_ms(0.0, -1.0),
+            theme::DRAWER_OPEN_ANIMATION_MS
+        );
+        assert_eq!(
+            drawer_snap_duration_ms(-1.0, 0.0),
+            theme::DRAWER_CLOSE_ANIMATION_MS
+        );
+    }
+
+    #[test]
+    fn side_pages_travel_one_full_viewport() {
+        let width = 390.0;
+        assert_eq!(drawer_left(DrawerPage::Sessions, 0.0, width), -width);
+        assert_eq!(drawer_left(DrawerPage::Sessions, 1.0, width), 0.0);
+        assert_eq!(drawer_left(DrawerPage::Workbench, 0.0, width), width);
+        assert_eq!(drawer_left(DrawerPage::Workbench, -1.0, width), 0.0);
     }
 
     #[test]

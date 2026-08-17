@@ -93,7 +93,7 @@ pnpm build:mobile:ios
   approval cards, and the composer remain GUI components; a terminal cannot be
   substituted for the session page.
 - The mobile treatment is visual and ergonomic: restrained dark surfaces,
-  compact spacing, small radii, clear secondary text, edge drawer navigation,
+  compact spacing, small radii, clear secondary text, full-page side navigation,
   and thumb-safe explicit actions. Vibex labels, state semantics, and approval
   behavior remain authoritative.
 - Pairing, route selection, reconnect, and credential storage stay outside View
@@ -121,10 +121,17 @@ pnpm build:mobile:ios
   Activity is recreated in the same process and clears pending IME events for the
   previous Activity. A process-global one-shot Activity handle is invalid for the
   NativeActivity lifecycle.
-- The session drawer follows the pointer continuously after a horizontal
-  threshold, cancels clearly vertical pans, then snaps by final direction or
-  half-width with a faster close animation. A tap remains a tap and must not
-  steal vertical timeline scrolling.
+- The session page is the center of a three-page horizontal composition. A
+  right-moving finger opens the project/session page from the left; a
+  left-moving finger opens the workspace-tools page from the right. Both pages
+  follow the pointer continuously after a horizontal threshold, cover the full
+  safe-area-adjusted viewport when open, close with the inverse gesture, and
+  snap by final direction or half-page with a faster close animation. A tap and
+  clearly vertical pan remain available to the underlying control or scroller.
+- Files, Git, Terminal, Providers, and Runtime live in the right workspace-tools
+  page and remain selectable through its internal tabs. Do not duplicate these
+  launchers in a strip on the center session page, and do not require a logo or
+  menu-button tap to reach the left project/session page.
 - Native touch scrolling is a platform contract, not a view-level acceleration
   workaround. Android and iOS emit the full per-event finger translation, use a
   bounded recent velocity window, and continue a moving release with time-based
@@ -136,10 +143,10 @@ pnpm build:mobile:ios
   hints as rows render. Virtualizing the rows without this initial extent is not
   sufficient because the first upward gesture can otherwise be clamped to the
   small measured tail.
-- The drawer and timeline own independent persistent scroll handles. A wheel or
-  touch-pan routed inside the open drawer is consumed there so the timeline does
-  not move behind it; this event isolation is separate from platform drag and
-  momentum fidelity, and both behaviors must be verified.
+- The left project/session page and timeline own independent persistent scroll
+  handles. A wheel or touch-pan routed inside the open page is consumed there so
+  the timeline does not move behind it; this event isolation is separate from
+  platform drag and momentum fidelity, and both behaviors must be verified.
 - A mobile client can create a session through the shared typed backend using
   an available runtime and desktop-owned workspace. Pending ACP elicitation
   forms render as explicit text/number/boolean/single/multi controls and resolve
@@ -165,17 +172,26 @@ pnpm build:mobile:ios
 | A moving Android touch receives `ACTION_UP` | Apply the final pointer delta, end the direct pan, then continue with bounded time-based momentum from Android's monotonic event timestamps. |
 | A touch is held still before release or a new touch begins during momentum | Do not fling after the hold; cancel existing momentum immediately when the new touch lands. |
 | A variable-height timeline opens at the bottom before off-screen Turns are measured | Its estimated maximum offset already covers every Turn, so the first upward gesture is not clamped to the measured tail. |
-| The session drawer is open and receives a vertical scroll | Move only the drawer's list; the timeline offset remains unchanged. |
+| A horizontal pan starts on the center session page | Right-moving fingers reveal the left project/session page; left-moving fingers reveal the right workspace-tools page, one physical pixel per reported pointer pixel. |
+| A side page reaches its open state after an inset or viewport-width change | Resolve its travel from the current safe-area-adjusted viewport width and cover the center page completely; do not retain a fixed drawer width. |
+| The project/session page is open and receives a vertical scroll | Move only that page's list; the timeline offset remains unchanged. |
 | Approval or composer action is unavailable while the server is busy | The control is disabled with an explicit busy state; no duplicate mutation is sent. |
 | Timeline generation/sequence is stale | Ignore the result and request authoritative refresh. |
 
 ### 5. Good/Base/Bad Cases
 
-- Good: a quick flick follows the finger one-for-one, preserves the final release
-  delta, and decelerates smoothly while the same drawer or timeline remains the
-  scroll target.
-- Base: a slow drag remains linear and stops on release; a hold does not reuse an
-  older movement sample to create a fling.
+- Good: from the session page, drag right to reveal Sessions or left to reveal
+  workspace tools; either page tracks one-for-one, covers the viewport, and
+  closes with the inverse gesture.
+- Base: a slow horizontal drag remains linear and snaps by half-page on release;
+  a vertical pan continues scrolling the timeline or active side page.
+- Bad: require an edge-only or logo-button gesture, keep a fixed-width floating
+  drawer, leave the five workspace launchers on the session page, or let a side
+  page and the timeline scroll together.
+- Good: a moving touch preserves the final release delta and decelerates smoothly
+  while its drawer or timeline remains the scroll target.
+- Base: a stationary hold does not reuse an older movement sample to create a
+  fling.
 - Bad: the platform emits only raw move deltas with no momentum, the view scales
   those deltas to compensate, or unmeasured virtual Turns contribute zero height
   to the first-frame scroll range.
@@ -184,7 +200,8 @@ pnpm build:mobile:ios
 
 - `cargo test -p vibex-mobile --locked` covers storage permissions/atomicity and
   malformed-file removal, secret-redacted `Debug`, UTF-8/UTF-16 IME editing,
-  empty-placeholder hit testing, stale selection clamping, drawer snap decisions,
+  empty-placeholder hit testing, stale selection clamping, both main-page swipe
+  directions, inverse side-page closing, full-viewport travel, snap decisions,
   Markdown block projection, and route bundle validation.
 - `cargo test -p vibex-ui --locked` covers the shared controller, timeline
   projection, approval surfaces, and compact shell semantics.
@@ -197,9 +214,10 @@ pnpm build:mobile:ios
   momentum decay. Mobile GPUI tests assert a non-zero first-frame timeline
   extent and drawer/timeline scroll isolation.
 - Android and iOS device validation must separately exercise touch/keyboard,
-  drawer navigation, safe-area/IME changes, timeline streaming, approval and
-  elicitation resolution, new-session creation, send/stop/continue, reconnect,
-  bundled Latin/CJK text, and credential redaction before a release claim.
+  full-page navigation in both directions, safe-area/IME changes, timeline
+  streaming, approval and elicitation resolution, new-session creation,
+  send/stop/continue, reconnect, bundled Latin/CJK text, and credential redaction
+  before a release claim.
 - Android device validation must also inspect the served editor/InputConnection,
   perform insert/delete/cursor/insert editing, and recreate the Activity at least
   twice in the same process while checking native and Java crash logs.
@@ -217,6 +235,11 @@ Wrong: stop drawer event propagation and call the scrolling issue fixed while
        scroll extent.
 Correct: isolate each scroll surface, preserve direct finger deltas, implement
          platform momentum, and seed virtual Turn heights before first paint.
+
+Wrong: center session page -> logo/menu button or edge-only fixed drawer;
+       center session page -> persistent Files/Git/Terminal/Providers/Runtime strip.
+Correct: full-page Sessions <- right swipe - center session - left swipe ->
+         full-page workspace tools with internal tabs.
 ```
 
 ## Scenario: Native Mobile QR Pairing Entry
@@ -2272,7 +2295,8 @@ type contracts only.
 Required device scenarios are:
 
 - first frame and safe-area layout;
-- touch scrolling and session-drawer edge gesture;
+- touch scrolling plus full-page Sessions/workspace-tools gestures from the
+  center session page and inverse gestures from both open pages;
 - IME commit, selection, paste, keyboard resize, and focus recovery;
 - GUI timeline streaming, Markdown, process expansion, and approval actions;
 - send, stop, continue, disconnect, reconnect, and authoritative catch-up;
