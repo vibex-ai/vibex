@@ -130,8 +130,9 @@ pnpm build:mobile:ios
   clearly vertical pan remain available to the underlying control or scroller.
 - Files, Git, Terminal, Providers, and Runtime live in the right workspace-tools
   page and remain selectable through its internal tabs. Do not duplicate these
-  launchers in a strip on the center session page, and do not require a logo or
-  menu-button tap to reach the left project/session page.
+  launchers in a strip on the center session page. The center-page swipe must
+  reach the left project/session page independently, while the top-left menu
+  button remains as an explicit fallback entry.
 - Native touch scrolling is a platform contract, not a view-level acceleration
   workaround. Android and iOS emit the full per-event finger translation, use a
   bounded recent velocity window, and continue a moving release with time-based
@@ -183,11 +184,14 @@ pnpm build:mobile:ios
 - Good: from the session page, drag right to reveal Sessions or left to reveal
   workspace tools; either page tracks one-for-one, covers the viewport, and
   closes with the inverse gesture.
+- Good: the top-left menu button opens the same full-width Sessions page as the
+  right-moving gesture.
 - Base: a slow horizontal drag remains linear and snaps by half-page on release;
   a vertical pan continues scrolling the timeline or active side page.
-- Bad: require an edge-only or logo-button gesture, keep a fixed-width floating
-  drawer, leave the five workspace launchers on the session page, or let a side
-  page and the timeline scroll together.
+- Bad: make the left page edge-only or button-only, remove the explicit menu
+  fallback, keep a fixed-width floating drawer, leave the five workspace
+  launchers on the session page, or let a side page and the timeline scroll
+  together.
 - Good: a moving touch preserves the final release delta and decelerates smoothly
   while its drawer or timeline remains the scroll target.
 - Base: a stationary hold does not reuse an older movement sample to create a
@@ -201,8 +205,9 @@ pnpm build:mobile:ios
 - `cargo test -p vibex-mobile --locked` covers storage permissions/atomicity and
   malformed-file removal, secret-redacted `Debug`, UTF-8/UTF-16 IME editing,
   empty-placeholder hit testing, stale selection clamping, both main-page swipe
-  directions, inverse side-page closing, full-viewport travel, snap decisions,
-  Markdown block projection, and route bundle validation.
+  directions, inverse side-page closing, terminal/cancelled gesture recovery,
+  the menu-button fallback, full-viewport travel, snap decisions, Markdown block
+  projection, and route bundle validation.
 - `cargo test -p vibex-ui --locked` covers the shared controller, timeline
   projection, approval surfaces, and compact shell semantics.
 - `node scripts/check-mobile-native.mjs --self-test` covers the negative source
@@ -236,10 +241,10 @@ Wrong: stop drawer event propagation and call the scrolling issue fixed while
 Correct: isolate each scroll surface, preserve direct finger deltas, implement
          platform momentum, and seed virtual Turn heights before first paint.
 
-Wrong: center session page -> logo/menu button or edge-only fixed drawer;
+Wrong: center session page -> button-only or edge-only fixed drawer;
        center session page -> persistent Files/Git/Terminal/Providers/Runtime strip.
-Correct: full-page Sessions <- right swipe - center session - left swipe ->
-         full-page workspace tools with internal tabs.
+Correct: menu fallback + full-page Sessions <- right swipe - center session -
+         left swipe -> full-page workspace tools with internal tabs.
 ```
 
 ## Scenario: Native Mobile QR Pairing Entry

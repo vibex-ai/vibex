@@ -131,6 +131,7 @@ impl DrawerPage {
 enum DrawerDragOrigin {
     Main,
     Page(DrawerPage),
+    Partial(DrawerPage),
 }
 
 /// Touch pans arrive as scroll events (see `gpui_android`/`gpui_ios`), so the drawer
@@ -1705,6 +1706,11 @@ impl MobileApp {
         self.start_drawer_snap(0.0, Some(window), cx);
     }
 
+    fn toggle_drawer(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let target = sessions_button_target(self.drawer_open);
+        self.start_drawer_snap(target, Some(window), cx);
+    }
+
     fn close_drawer_from_backdrop(
         &mut self,
         _: &MouseUpEvent,
@@ -1888,24 +1894,13 @@ impl MobileApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let ScrollDelta::Pixels(delta) = event.delta else {
-            return;
-        };
-        let (delta_x, delta_y) = (f32::from(delta.x), f32::from(delta.y));
-
-        match event.touch_phase {
-            TouchPhase::Started => {
+        match drawer_pan_input(event) {
+            DrawerPanInput::Started { delta_x, delta_y } => {
                 self.drawer_gesture = None;
                 if self.drawer_snap.is_some() || self.session_action.is_some() {
                     return;
                 }
-                let origin = if self.drawer_offset > 0.0 {
-                    DrawerDragOrigin::Page(DrawerPage::Sessions)
-                } else if self.drawer_offset < 0.0 {
-                    DrawerDragOrigin::Page(DrawerPage::Workbench)
-                } else {
-                    DrawerDragOrigin::Main
-                };
+                let origin = drawer_drag_origin(self.drawer_offset);
                 self.drawer_gesture = Some(DrawerGesture::Pending {
                     origin,
                     dx: 0.0,
@@ -1915,22 +1910,34 @@ impl MobileApp {
                 // very event, so fold it in rather than waiting for the next one.
                 self.advance_drawer_pan(delta_x, delta_y, window, cx);
             }
-            TouchPhase::Moved => self.advance_drawer_pan(delta_x, delta_y, window, cx),
-            TouchPhase::Ended => {
-                if let Some(DrawerGesture::Dragging { page, last_dx }) = self.drawer_gesture.take()
-                {
-                    cx.stop_propagation();
-                    let target = drawer_snap_target(page, self.drawer_offset, last_dx);
-                    self.start_drawer_snap(target, Some(window), cx);
-                }
+            DrawerPanInput::Moved { delta_x, delta_y } => {
+                self.advance_drawer_pan(delta_x, delta_y, window, cx)
             }
-            TouchPhase::Cancelled => {
-                if self.drawer_gesture.take().is_some() {
-                    let target = self.settled_drawer_target();
-                    self.start_drawer_snap(target, Some(window), cx);
-                }
-            }
+            DrawerPanInput::Ended => self.finish_drawer_pan(false, window, cx),
+            DrawerPanInput::Cancelled => self.finish_drawer_pan(true, window, cx),
+            DrawerPanInput::Ignore => {}
         }
+    }
+
+    fn finish_drawer_pan(&mut self, cancelled: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let gesture = self.drawer_gesture.take();
+        if self.drawer_snap.is_some() {
+            return;
+        }
+        let was_dragging = matches!(gesture, Some(DrawerGesture::Dragging { .. }));
+        let was_partial = drawer_offset_is_intermediate(self.drawer_offset);
+        let Some(target) = drawer_terminal_target(
+            gesture,
+            self.drawer_offset,
+            self.settled_drawer_target(),
+            cancelled,
+        ) else {
+            return;
+        };
+        if was_dragging || was_partial {
+            cx.stop_propagation();
+        }
+        self.start_drawer_snap(target, Some(window), cx);
     }
 
     /// The GPUI scroll element updates its handle before bubble listeners run.
@@ -1958,7 +1965,13 @@ impl MobileApp {
                     DrawerPanDecision::Wait => {
                         self.drawer_gesture = Some(DrawerGesture::Pending { origin, dx, dy });
                     }
-                    DrawerPanDecision::Cancel => self.drawer_gesture = None,
+                    DrawerPanDecision::Cancel => {
+                        self.drawer_gesture = None;
+                        if matches!(origin, DrawerDragOrigin::Partial(_)) {
+                            let target = drawer_nearest_target(self.drawer_offset);
+                            self.start_drawer_snap(target, Some(window), cx);
+                        }
+                    }
                     DrawerPanDecision::Drag(page) => {
                         window.hide_soft_keyboard();
                         if page == DrawerPage::Workbench && self.workbench.is_none() {
@@ -2863,7 +2876,24 @@ impl MobileApp {
             .border_color(theme::border_subtle())
             .flex()
             .items_center()
-            .child(div().size(px(theme::HEADER_BUTTON_SIZE)).flex_shrink_0())
+            .child(
+                div()
+                    .id("open-session-drawer")
+                    .size(px(theme::HEADER_BUTTON_SIZE))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .active(|style| style.opacity(0.6))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::toggle_drawer))
+                    .child(
+                        svg()
+                            .path("icons/menu.svg")
+                            .size(px(theme::ICON_MD))
+                            .text_color(theme::text_secondary()),
+                    ),
+            )
             .child(
                 div()
                     .flex_1()
@@ -4206,6 +4236,98 @@ fn drawer_animation(from: f32, target: f32) -> Animation {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum DrawerPanInput {
+    Started { delta_x: f32, delta_y: f32 },
+    Moved { delta_x: f32, delta_y: f32 },
+    Ended,
+    Cancelled,
+    Ignore,
+}
+
+fn drawer_pan_input(event: &ScrollWheelEvent) -> DrawerPanInput {
+    match event.touch_phase {
+        TouchPhase::Ended => DrawerPanInput::Ended,
+        TouchPhase::Cancelled => DrawerPanInput::Cancelled,
+        phase @ (TouchPhase::Started | TouchPhase::Moved) => {
+            let ScrollDelta::Pixels(delta) = event.delta else {
+                return DrawerPanInput::Ignore;
+            };
+            let (delta_x, delta_y) = (f32::from(delta.x), f32::from(delta.y));
+            match phase {
+                TouchPhase::Started => DrawerPanInput::Started { delta_x, delta_y },
+                TouchPhase::Moved => DrawerPanInput::Moved { delta_x, delta_y },
+                TouchPhase::Ended | TouchPhase::Cancelled => unreachable!(),
+            }
+        }
+    }
+}
+
+fn sessions_button_target(drawer_open: bool) -> f32 {
+    if drawer_open {
+        0.0
+    } else {
+        DrawerPage::Sessions.open_offset()
+    }
+}
+
+fn drawer_drag_origin(offset: f32) -> DrawerDragOrigin {
+    let Some(page) = drawer_page_at_offset(offset) else {
+        return DrawerDragOrigin::Main;
+    };
+    if (offset.abs() - 1.0).abs() < 0.001 {
+        DrawerDragOrigin::Page(page)
+    } else {
+        DrawerDragOrigin::Partial(page)
+    }
+}
+
+fn drawer_page_at_offset(offset: f32) -> Option<DrawerPage> {
+    if offset > f32::EPSILON {
+        Some(DrawerPage::Sessions)
+    } else if offset < -f32::EPSILON {
+        Some(DrawerPage::Workbench)
+    } else {
+        None
+    }
+}
+
+fn drawer_offset_is_intermediate(offset: f32) -> bool {
+    drawer_page_at_offset(offset).is_some() && (offset.abs() - 1.0).abs() >= 0.001
+}
+
+fn drawer_nearest_target(offset: f32) -> f32 {
+    if offset > 0.5 {
+        DrawerPage::Sessions.open_offset()
+    } else if offset < -0.5 {
+        DrawerPage::Workbench.open_offset()
+    } else {
+        0.0
+    }
+}
+
+fn drawer_terminal_target(
+    gesture: Option<DrawerGesture>,
+    offset: f32,
+    settled_target: f32,
+    cancelled: bool,
+) -> Option<f32> {
+    if let Some(DrawerGesture::Dragging { page, last_dx }) = gesture {
+        return Some(if cancelled {
+            settled_target
+        } else {
+            drawer_snap_target(page, offset, last_dx)
+        });
+    }
+    drawer_offset_is_intermediate(offset).then(|| {
+        if cancelled {
+            settled_target
+        } else {
+            drawer_nearest_target(offset)
+        }
+    })
+}
+
 /// What a page touch pan should do once its accumulated translation is known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DrawerPanDecision {
@@ -4237,6 +4359,7 @@ fn drawer_pan_decision(origin: DrawerDragOrigin, dx: f32, dy: f32) -> DrawerPanD
             DrawerPanDecision::Drag(DrawerPage::Workbench)
         }
         DrawerDragOrigin::Page(_) => DrawerPanDecision::Cancel,
+        DrawerDragOrigin::Partial(page) => DrawerPanDecision::Drag(page),
     }
 }
 
@@ -4444,6 +4567,23 @@ mod tests {
     }
 
     #[test]
+    fn drawer_terminal_phases_do_not_depend_on_pixel_delta() {
+        let mut event = ScrollWheelEvent {
+            position: point(px(0.0), px(0.0)),
+            delta: ScrollDelta::Lines(point(0.0, 0.0)),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: TouchPhase::Ended,
+        };
+        assert!(matches!(drawer_pan_input(&event), DrawerPanInput::Ended));
+
+        event.touch_phase = TouchPhase::Cancelled;
+        assert!(matches!(
+            drawer_pan_input(&event),
+            DrawerPanInput::Cancelled
+        ));
+    }
+
+    #[test]
     fn main_page_swipes_open_the_page_in_the_finger_direction() {
         assert_eq!(
             drawer_pan_decision(DrawerDragOrigin::Main, 24.0, 4.0),
@@ -4477,6 +4617,56 @@ mod tests {
             drawer_pan_decision(DrawerDragOrigin::Page(DrawerPage::Workbench), -24.0, 2.0,),
             DrawerPanDecision::Cancel
         );
+    }
+
+    #[test]
+    fn a_partial_page_can_resume_or_close_in_either_direction() {
+        assert_eq!(
+            drawer_drag_origin(0.08),
+            DrawerDragOrigin::Partial(DrawerPage::Sessions)
+        );
+        assert_eq!(
+            drawer_pan_decision(DrawerDragOrigin::Partial(DrawerPage::Sessions), 24.0, 2.0,),
+            DrawerPanDecision::Drag(DrawerPage::Sessions)
+        );
+        assert_eq!(
+            drawer_pan_decision(DrawerDragOrigin::Partial(DrawerPage::Sessions), -24.0, 2.0,),
+            DrawerPanDecision::Drag(DrawerPage::Sessions)
+        );
+        assert_eq!(
+            drawer_pan_decision(DrawerDragOrigin::Partial(DrawerPage::Workbench), -24.0, 2.0,),
+            DrawerPanDecision::Drag(DrawerPage::Workbench)
+        );
+    }
+
+    #[test]
+    fn terminal_events_reconcile_every_partial_offset() {
+        for offset in [-0.8, -0.2, 0.2, 0.8] {
+            let target = drawer_terminal_target(None, offset, 0.0, false)
+                .expect("partial drawer should always receive a snap target");
+            assert!(!drawer_offset_is_intermediate(target));
+        }
+        assert_eq!(drawer_terminal_target(None, 0.2, 0.0, false), Some(0.0));
+        assert_eq!(drawer_terminal_target(None, 0.8, 0.0, false), Some(1.0));
+        assert_eq!(drawer_terminal_target(None, -0.8, 0.0, false), Some(-1.0));
+        assert_eq!(drawer_terminal_target(None, 0.0, 0.0, false), None);
+        assert_eq!(drawer_terminal_target(None, 1.0, 1.0, false), None);
+    }
+
+    #[test]
+    fn cancelled_drag_returns_to_the_last_settled_page() {
+        let gesture = Some(DrawerGesture::Dragging {
+            page: DrawerPage::Sessions,
+            last_dx: -24.0,
+        });
+        assert_eq!(drawer_terminal_target(gesture, 0.3, 1.0, true), Some(1.0));
+        assert_eq!(drawer_terminal_target(gesture, 0.3, 0.0, true), Some(0.0));
+    }
+
+    #[test]
+    fn header_button_targets_the_full_sessions_page() {
+        assert_eq!(sessions_button_target(false), 1.0);
+        assert_eq!(sessions_button_target(true), 0.0);
     }
 
     #[test]
