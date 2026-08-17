@@ -66,7 +66,10 @@ impl fmt::Debug for MobileCredentialBundle {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MobileRemoteRouteBundle {
     #[serde(default)]
+    pub local_network: Option<MobileLocalNetworkCandidate>,
+    #[serde(default)]
     pub direct_candidates: Vec<String>,
+    #[serde(default)]
     pub relay: Option<MobileRelayCandidate>,
 }
 
@@ -74,8 +77,25 @@ impl fmt::Debug for MobileRemoteRouteBundle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("MobileRemoteRouteBundle")
+            .field("has_local_network", &self.local_network.is_some())
             .field("direct_candidate_count", &self.direct_candidates.len())
             .field("has_relay", &self.relay.is_some())
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MobileLocalNetworkCandidate {
+    pub url: String,
+    pub tls_certificate_der: String,
+}
+
+impl fmt::Debug for MobileLocalNetworkCandidate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MobileLocalNetworkCandidate")
+            .field("has_tls_certificate", &!self.tls_certificate_der.is_empty())
             .finish()
     }
 }
@@ -156,21 +176,37 @@ impl MobileCredentialBundle {
                 "native mobile credentials do not contain a remote route",
             )
         })?;
-        let direct_candidates = route
-            .direct_candidates
-            .iter()
-            .enumerate()
-            .map(|(index, url)| {
-                let mut candidate_config = config.clone();
-                candidate_config.base_url = url.clone();
-                candidate_config.validate()?;
-                Ok(DirectCandidate {
-                    url: url.clone(),
-                    label: format!("direct-{index}"),
-                    priority: u8::try_from(index).unwrap_or(u8::MAX),
+        let mut direct_candidates = Vec::new();
+        if let Some(local) = &route.local_network {
+            let mut candidate_config = config.clone();
+            candidate_config.base_url = local.url.clone();
+            candidate_config.pinned_tls_certificate_der = Some(local.tls_certificate_der.clone());
+            candidate_config.validate()?;
+            direct_candidates.push(DirectCandidate {
+                url: local.url.clone(),
+                label: "local-network".to_string(),
+                priority: 0,
+                tls_certificate_der: Some(local.tls_certificate_der.clone()),
+            });
+        }
+        direct_candidates.extend(
+            route
+                .direct_candidates
+                .iter()
+                .enumerate()
+                .map(|(index, url)| {
+                    let mut candidate_config = config.clone();
+                    candidate_config.base_url = url.clone();
+                    candidate_config.validate()?;
+                    Ok(DirectCandidate {
+                        url: url.clone(),
+                        label: format!("direct-{index}"),
+                        priority: u8::try_from(index.saturating_add(1)).unwrap_or(u8::MAX),
+                        tls_certificate_der: None,
+                    })
                 })
-            })
-            .collect::<BackendResult<Vec<_>>>()?;
+                .collect::<BackendResult<Vec<_>>>()?,
+        );
         let relay = route
             .relay
             .as_ref()
@@ -312,22 +348,18 @@ pub async fn claim_zero_config_lan_pairing(
     status: RemoteLanPairingStatusResponse,
 ) -> BackendResult<MobileCredentialBundle> {
     let claim = session.claim_approved(status).await?;
-    let route = route_bundle(&claim.offer);
-    let server_url = route
+    let mut route = route_bundle(&claim.offer);
+    route
         .direct_candidates
-        .first()
-        .cloned()
-        .or_else(|| route.relay.as_ref().map(|relay| relay.url.clone()))
-        .ok_or_else(|| {
-            BackendError::unsupported(
-                "remote_pairing_route_missing",
-                "zero-config pairing offer does not contain a long-term remote route",
-            )
-        })?;
+        .retain(|candidate| !is_local_placeholder(candidate));
+    route.local_network = Some(MobileLocalNetworkCandidate {
+        url: claim.local_network_url.clone(),
+        tls_certificate_der: claim.lan_gateway_tls_certificate,
+    });
     let bundle = MobileCredentialBundle {
         schema_version: MOBILE_CREDENTIAL_SCHEMA_VERSION.to_string(),
         record: RemoteCredentialRecord {
-            server_url,
+            server_url: claim.local_network_url,
             auth: RemoteAuthProof {
                 device_id: claim.response.device.device_id,
                 auth_token: claim.response.device_grant_token,
@@ -427,9 +459,17 @@ fn route_bundle(offer: &RemotePairingOffer) -> MobileRemoteRouteBundle {
             })
         });
     MobileRemoteRouteBundle {
+        local_network: None,
         direct_candidates,
         relay,
     }
+}
+
+fn is_local_placeholder(candidate: &str) -> bool {
+    Url::parse(candidate)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .is_some_and(|host| host == vibex_core::REMOTE_LOCAL_LAN_TLS_HOSTNAME)
 }
 
 fn invalid_relay() -> BackendError {
@@ -469,6 +509,7 @@ mod tests {
             client_type: RemoteClientType::Mobile,
             allow_insecure_local_dev: false,
             route: Some(MobileRemoteRouteBundle {
+                local_network: None,
                 direct_candidates: vec![private_route.to_string()],
                 relay: None,
             }),
@@ -524,6 +565,7 @@ mod tests {
             client_type: RemoteClientType::Mobile,
             allow_insecure_local_dev: false,
             route: Some(MobileRemoteRouteBundle {
+                local_network: None,
                 direct_candidates: vec!["https://desktop.example?token=leak".to_string()],
                 relay: None,
             }),

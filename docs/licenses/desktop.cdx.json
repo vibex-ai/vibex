@@ -1421,6 +1421,114 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:asn1-rs@0.7.2:c19b7c6f923b580a",
+      "name": "asn1-rs",
+      "version": "0.7.2",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/asn1-rs@0.7.2",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rusticata/asn1-rs.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:asn1-rs-derive@0.6.0:c19b7c6f923b580a",
+      "name": "asn1-rs-derive",
+      "version": "0.6.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/asn1-rs-derive@0.6.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rusticata/asn1-rs.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:asn1-rs-impl@0.2.0:c19b7c6f923b580a",
+      "name": "asn1-rs-impl",
+      "version": "0.2.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/asn1-rs-impl@0.2.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rusticata/asn1-rs.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:async-broadcast@0.7.2:c19b7c6f923b580a",
       "name": "async-broadcast",
       "version": "0.7.2",
@@ -2424,6 +2532,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/tokio-rs/axum"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:axum-server@0.8.0:c19b7c6f923b580a",
+      "name": "axum-server",
+      "version": "0.8.0",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/axum-server@0.8.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/programatik29/axum-server"
         }
       ]
     },
@@ -6533,6 +6677,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:der-parser@10.0.0:c19b7c6f923b580a",
+      "name": "der-parser",
+      "version": "10.0.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/der-parser@10.0.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rusticata/der-parser.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:deranged@0.5.8:c19b7c6f923b580a",
       "name": "deranged",
       "version": "0.5.8",
@@ -9192,6 +9372,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/PistonDevelopers/freetype-sys.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:fs-err@3.3.1:c19b7c6f923b580a",
+      "name": "fs-err",
+      "version": "3.3.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/fs-err@3.3.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/andrewhickman/fs-err"
         }
       ]
     },
@@ -18809,6 +19025,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:oid-registry@0.8.1:c19b7c6f923b580a",
+      "name": "oid-registry",
+      "version": "0.8.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/oid-registry@0.8.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rusticata/oid-registry.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:once_cell@1.21.4:c19b7c6f923b580a",
       "name": "once_cell",
       "version": "1.21.4",
@@ -22337,6 +22589,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:rcgen@0.14.9:c19b7c6f923b580a",
+      "name": "rcgen",
+      "version": "0.14.9",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/rcgen@0.14.9",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rustls/rcgen"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:read-fonts@0.37.0:c19b7c6f923b580a",
       "name": "read-fonts",
       "version": "0.37.0",
@@ -23556,6 +23844,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/djc/rustc-version-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:rusticata-macros@4.1.0:c19b7c6f923b580a",
+      "name": "rusticata-macros",
+      "version": "4.1.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/rusticata-macros@4.1.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rusticata/rusticata-macros.git"
         }
       ]
     },
@@ -37493,6 +37817,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:x509-parser@0.18.1:c19b7c6f923b580a",
+      "name": "x509-parser",
+      "version": "0.18.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/x509-parser@0.18.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rusticata/x509-parser.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:xattr@1.6.1:c19b7c6f923b580a",
       "name": "xattr",
       "version": "1.6.1",
@@ -37992,6 +38352,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/image-rs/y4m.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:yasna@0.6.0:c19b7c6f923b580a",
+      "name": "yasna",
+      "version": "0.6.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/yasna@0.6.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/qnighy/yasna.rs"
         }
       ]
     },
@@ -40581,6 +40977,36 @@
       ]
     },
     {
+      "ref": "cargo:asn1-rs-derive@0.6.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
+        "cargo:quote@1.0.46:c19b7c6f923b580a",
+        "cargo:syn@2.0.118:c19b7c6f923b580a",
+        "cargo:synstructure@0.13.2:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:asn1-rs-impl@0.2.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
+        "cargo:quote@1.0.46:c19b7c6f923b580a",
+        "cargo:syn@2.0.118:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:asn1-rs@0.7.2:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:asn1-rs-derive@0.6.0:c19b7c6f923b580a",
+        "cargo:asn1-rs-impl@0.2.0:c19b7c6f923b580a",
+        "cargo:displaydoc@0.2.6:c19b7c6f923b580a",
+        "cargo:nom@7.1.3:c19b7c6f923b580a",
+        "cargo:num-traits@0.2.19:c19b7c6f923b580a",
+        "cargo:rusticata-macros@4.1.0:c19b7c6f923b580a",
+        "cargo:thiserror@2.0.18:c19b7c6f923b580a",
+        "cargo:time@0.3.55:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:async-broadcast@0.7.2:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:event-listener-strategy@0.5.4:c19b7c6f923b580a",
@@ -40831,6 +41257,25 @@
       ]
     },
     {
+      "ref": "cargo:axum-server@0.8.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:arc-swap@1.9.2:c19b7c6f923b580a",
+        "cargo:bytes@1.12.0:c19b7c6f923b580a",
+        "cargo:either@1.16.0:c19b7c6f923b580a",
+        "cargo:fs-err@3.3.1:c19b7c6f923b580a",
+        "cargo:http-body@1.0.1:c19b7c6f923b580a",
+        "cargo:http@1.4.2:c19b7c6f923b580a",
+        "cargo:hyper-util@0.1.20:c19b7c6f923b580a",
+        "cargo:hyper@1.10.1:c19b7c6f923b580a",
+        "cargo:pin-project-lite@0.2.17:c19b7c6f923b580a",
+        "cargo:rustls-pki-types@1.14.1:c19b7c6f923b580a",
+        "cargo:rustls@0.23.41:c19b7c6f923b580a",
+        "cargo:tokio-rustls@0.26.4:c19b7c6f923b580a",
+        "cargo:tokio@1.52.3:c19b7c6f923b580a",
+        "cargo:tower-service@0.3.3:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:axum@0.8.9:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:axum-core@0.5.6:c19b7c6f923b580a",
@@ -40922,7 +41367,9 @@
     },
     {
       "ref": "cargo:bit-vec@0.9.1:c19b7c6f923b580a",
-      "dependsOn": []
+      "dependsOn": [
+        "cargo:serde@1.0.228:c19b7c6f923b580a"
+      ]
     },
     {
       "ref": "cargo:bit_field@0.10.3:c19b7c6f923b580a",
@@ -41754,6 +42201,17 @@
       ]
     },
     {
+      "ref": "cargo:der-parser@10.0.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:asn1-rs@0.7.2:c19b7c6f923b580a",
+        "cargo:displaydoc@0.2.6:c19b7c6f923b580a",
+        "cargo:nom@7.1.3:c19b7c6f923b580a",
+        "cargo:num-bigint@0.4.8:c19b7c6f923b580a",
+        "cargo:num-traits@0.2.19:c19b7c6f923b580a",
+        "cargo:rusticata-macros@4.1.0:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:der@0.7.10:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:const-oid@0.9.6:c19b7c6f923b580a",
@@ -42236,6 +42694,13 @@
         "cargo:cc@1.2.65:c19b7c6f923b580a",
         "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:pkg-config@0.3.33:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:fs-err@3.3.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:autocfg@1.5.1:c19b7c6f923b580a",
+        "cargo:tokio@1.52.3:c19b7c6f923b580a"
       ]
     },
     {
@@ -44647,6 +45112,12 @@
       ]
     },
     {
+      "ref": "cargo:oid-registry@0.8.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:asn1-rs@0.7.2:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:once_cell@1.21.4:c19b7c6f923b580a",
       "dependsOn": []
     },
@@ -45381,6 +45852,16 @@
       ]
     },
     {
+      "ref": "cargo:rcgen@0.14.9:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:ring@0.17.14:c19b7c6f923b580a",
+        "cargo:rustls-pki-types@1.14.1:c19b7c6f923b580a",
+        "cargo:time@0.3.55:c19b7c6f923b580a",
+        "cargo:x509-parser@0.18.1:c19b7c6f923b580a",
+        "cargo:yasna@0.6.0:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:read-fonts@0.37.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:bytemuck@1.25.0:c19b7c6f923b580a",
@@ -45690,6 +46171,12 @@
       "ref": "cargo:rustc_version@0.4.1:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:semver@1.0.28:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:rusticata-macros@4.1.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:nom@7.1.3:c19b7c6f923b580a"
       ]
     },
     {
@@ -47837,12 +48324,15 @@
       "ref": "cargo:vibex-remote@0.1.0-rc.1:b2402acf3d0333d8",
       "dependsOn": [
         "cargo:async-trait@0.1.89:c19b7c6f923b580a",
+        "cargo:axum-server@0.8.0:c19b7c6f923b580a",
         "cargo:axum@0.8.9:c19b7c6f923b580a",
         "cargo:base64@0.22.1:c19b7c6f923b580a",
         "cargo:futures-util@0.3.32:c19b7c6f923b580a",
         "cargo:hkdf@0.12.4:c19b7c6f923b580a",
         "cargo:hmac@0.12.1:c19b7c6f923b580a",
         "cargo:rand_core@0.6.4:c19b7c6f923b580a",
+        "cargo:rcgen@0.14.9:c19b7c6f923b580a",
+        "cargo:rustls@0.23.41:c19b7c6f923b580a",
         "cargo:serde@1.0.228:c19b7c6f923b580a",
         "cargo:serde_json@1.0.150:c19b7c6f923b580a",
         "cargo:sha2@0.10.9:c19b7c6f923b580a",
@@ -48777,6 +49267,21 @@
       ]
     },
     {
+      "ref": "cargo:x509-parser@0.18.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:asn1-rs@0.7.2:c19b7c6f923b580a",
+        "cargo:data-encoding@2.11.0:c19b7c6f923b580a",
+        "cargo:der-parser@10.0.0:c19b7c6f923b580a",
+        "cargo:lazy_static@1.5.0:c19b7c6f923b580a",
+        "cargo:nom@7.1.3:c19b7c6f923b580a",
+        "cargo:oid-registry@0.8.1:c19b7c6f923b580a",
+        "cargo:ring@0.17.14:c19b7c6f923b580a",
+        "cargo:rusticata-macros@4.1.0:c19b7c6f923b580a",
+        "cargo:thiserror@2.0.18:c19b7c6f923b580a",
+        "cargo:time@0.3.55:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:xattr@1.6.1:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:libc@0.2.189:c19b7c6f923b580a",
@@ -48866,6 +49371,13 @@
     {
       "ref": "cargo:y4m@0.8.0:c19b7c6f923b580a",
       "dependsOn": []
+    },
+    {
+      "ref": "cargo:yasna@0.6.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:bit-vec@0.9.1:c19b7c6f923b580a",
+        "cargo:time@0.3.55:c19b7c6f923b580a"
+      ]
     },
     {
       "ref": "cargo:yazi@0.2.1:c19b7c6f923b580a",

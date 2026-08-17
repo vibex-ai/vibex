@@ -57,6 +57,7 @@ async fn e2e_native_probe() {
             url: probe_url.clone(),
             label: "native-probe".to_string(),
             priority: 0,
+            tls_certificate_der: None,
         }],
         relay: None,
     })

@@ -33,7 +33,8 @@ pub const REMOTE_V2_BINARY_MAGIC: [u8; 4] = *b"VBX2";
 pub const REMOTE_V2_MAX_BINARY_HEADER_BYTES: usize = 64 * 1024;
 pub const REMOTE_V2_MAX_BINARY_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 pub const REMOTE_LAN_PAIRING_SCHEMA_VERSION: &str = "vibex-lan-pairing-discovery.v1";
-pub const REMOTE_ZERO_CONFIG_LAN_PAIRING_SCHEMA_VERSION: &str = "vibex-zero-config-lan-pairing.v1";
+pub const REMOTE_ZERO_CONFIG_LAN_PAIRING_SCHEMA_VERSION: &str = "vibex-zero-config-lan-pairing.v2";
+pub const REMOTE_LOCAL_LAN_TLS_HOSTNAME: &str = "vibex-lan.local";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -921,9 +922,8 @@ pub struct RemoteLanPairingWindowSnapshot {
 }
 
 /// The non-HTTPS, zero-configuration LAN bootstrap advertises an application-
-/// encrypted endpoint. It is intentionally separate from the Direct HTTPS
-/// advertisement above: the local listener is temporary and is never a
-/// long-term remote route.
+/// encrypted endpoint. It is separate from the pinned-TLS LAN Gateway that is
+/// returned by the authenticated bootstrap handshake for long-term use.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoteZeroConfigLanPairingAdvertisement {
@@ -955,6 +955,8 @@ pub struct RemoteZeroConfigLanPairingHelloAccepted {
     pub server_peer_id: crate::RelayPeerId,
     pub server_id: String,
     pub server_identity_public_key: String,
+    pub lan_gateway_port: u16,
+    pub lan_gateway_tls_certificate: String,
     pub discovery: RemoteLanPairingDiscoverySummary,
 }
 
@@ -972,9 +974,28 @@ impl fmt::Debug for RemoteZeroConfigLanPairingHelloAccepted {
                 "server_identity_public_key",
                 &self.server_identity_public_key,
             )
+            .field("lan_gateway_port", &self.lan_gateway_port)
+            .field(
+                "has_lan_gateway_tls_certificate",
+                &!self.lan_gateway_tls_certificate.is_empty(),
+            )
             .field("discovery", &self.discovery)
             .finish()
     }
+}
+
+/// Bind the pinned LAN Gateway route into the zero-config encrypted session.
+/// Length prefixes keep the context unambiguous without exposing any secret.
+pub fn remote_zero_config_lan_session_context(
+    client_nonce: &str,
+    lan_gateway_port: u16,
+    lan_gateway_tls_certificate: &str,
+) -> String {
+    format!(
+        "v2:{}:{client_nonce}:{lan_gateway_port}:{}:{lan_gateway_tls_certificate}",
+        client_nonce.len(),
+        lan_gateway_tls_certificate.len(),
+    )
 }
 
 /// Derive the six-digit short authentication string shown on both devices.

@@ -206,6 +206,7 @@ async fn relay_e2ee_remote_v2_handshake_rpc_event_revoke_and_reconnect_smoke() {
             url: direct_url.clone(),
             label: "recovering-direct".to_string(),
             priority: 0,
+            tls_certificate_der: None,
         }],
         relay: Some(relay),
     })
@@ -512,10 +513,15 @@ async fn relay_e2ee_remote_v2_handshake_rpc_event_revoke_and_reconnect_smoke() {
 }
 
 async fn wait_for_pc(relay_url: &str, runtime: &RelayClientRuntime) {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
     for _ in 0..100 {
         if runtime.get_status().await.state
             == vibex_desktop_runtime::RelayClientConnectionState::Connected
-            && let Ok(response) = reqwest::get(format!("{relay_url}/health")).await
+            && let Ok(response) = client.get(format!("{relay_url}/health")).send().await
             && let Ok(response) = response.error_for_status()
             && let Ok(health) = response
                 .json::<vibex_relay_server::RelayHealthStatus>()
@@ -530,8 +536,13 @@ async fn wait_for_pc(relay_url: &str, runtime: &RelayClientRuntime) {
 }
 
 async fn wait_for_direct(direct_url: &str) {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
     for _ in 0..100 {
-        if let Ok(response) = reqwest::get(format!("{direct_url}/api/v2/info")).await
+        if let Ok(response) = client.get(format!("{direct_url}/api/v2/info")).send().await
             && response.status().is_success()
         {
             return;

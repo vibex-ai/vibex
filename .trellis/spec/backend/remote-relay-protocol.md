@@ -283,11 +283,11 @@ existing claim transaction -> existing MobileCredentialBundle
 
 ### 1. Scope / Trigger
 
-- Trigger: changing the separate zero-configuration pairing entry, the
-  `mode=zero_config` DNS-SD advertisement, its temporary HTTP listener,
-  application-encrypted pairing frames, or mobile zero-config claim flow.
-- This is a fourth pairing entry, not a fourth long-term transport. It must not
-  add nearby-device controls to the Direct, Tailnet, or Relay method rows.
+- Trigger: changing zero-configuration discovery, the temporary encrypted HTTP
+  bootstrap, the pinned-TLS local Gateway, or mobile LAN credential persistence.
+- The UI entry remains separate from Direct/Tailnet/Relay publication. The
+  resulting local HTTPS/WSS route is independently usable and must never require
+  Tailnet, a user-managed Direct proxy, or self-hosted Relay.
 
 ### 2. Signatures
 
@@ -299,25 +299,43 @@ POST /api/v2/pairing/lan-zero/{request,status,claim}
   RelayEncryptedFrame -> RelayEncryptedFrame
 
 RemoteGateway::{start_zero_config_lan_pairing,
+  start_local_lan_gateway,stop_local_lan_gateway,local_lan_gateway_info,
   zero_config_lan_pairing_window_status,
   approve_zero_config_lan_pairing_request,
   reject_zero_config_lan_pairing_request,
   cancel_zero_config_lan_pairing}
 RemoteConnectivityController mirrors the same lifecycle.
 ZeroConfigLanPairingSession::{start,poll,claim_approved}
+RemoteZeroConfigLanPairingHelloAccepted {
+  lan_gateway_port, lan_gateway_tls_certificate, ...
+}
+MobileRemoteRouteBundle {
+  local_network?: { url, tls_certificate_der }, direct_candidates, relay
+}
 DNS-SD service type = _vibex._tcp.local.; TXT mode = zero_config
 ```
 
 ### 3. Contracts
 
-- Desktop binds a temporary `0.0.0.0:0` HTTP listener that serves only the four
-  `lan-zero` endpoints. It never merges the normal RemoteGateway router, never
-  becomes a persisted candidate, and stops after claim, cancel, expiry, route
-  change, Gateway stop/restart, or dialog close.
-- The entry requires at least one already validated Direct, Tailnet, or Relay
-  route because the temporary listener is pairing-only. The resulting offer,
-  claim transaction, device grant, audit record, `MobileCredentialBundle`, and
-  `AutoRemoteTransport` routes remain unchanged.
+- Desktop starts a separate pinned-TLS Gateway on `0.0.0.0:1429` before opening
+  the temporary `0.0.0.0:0` HTTP bootstrap. The bootstrap serves only the four
+  `lan-zero` endpoints and stops after claim/cancel/expiry; the TLS Gateway serves
+  the normal typed RemoteGateway router and remains available for paired devices.
+- `remote-access.json.localNetworkEnabled` is backward-compatible and independent
+  of the three publication methods. Starting zero-config pairing persists it;
+  startup reconciliation restores it; global disable clears it and stops both
+  bootstrap advertisement and TLS listener. Route reconfiguration must restore
+  the local listener after a normal Gateway stop/restart.
+- The local certificate/key are deterministically derived from the long-term
+  Desktop X25519 private identity with HKDF-SHA256 domain
+  `vibex.remote.local-lan-tls.v1`, then encoded as an Ed25519 PKCS#8 key and a
+  self-signed certificate for `vibex-lan.local`. A Desktop identity therefore
+  yields the same certificate across listener and process restarts without a
+  second secret file.
+- Zero-config pairing requires the local TLS Gateway, not another published
+  route. The encrypted offer includes exactly one Direct placeholder origin
+  `https://vibex-lan.local:<lan_gateway_port>` plus any optional existing routes.
+  Mobile must never resolve or persist that placeholder.
 - TXT is bounded to 512 bytes and contains exactly `version=1`,
   `mode=zero_config`, advertisement/display fields, v2 protocol bounds,
   `pairing=available`, server id, and the Desktop X25519 public identity.
@@ -341,14 +359,33 @@ DNS-SD service type = _vibex._tcp.local.; TXT mode = zero_config
   discard it and continue browsing. Only the native discovery service's own
   permission or browsing failure terminates the active discovery flow. One
   untrusted LAN advertisement must never suppress later valid candidates.
-- Mobile constructs one credential-free exact `http` origin from the resolved
-  DNS-SD authority, bypasses all proxies, disables redirects, and uses it only
-  for this bootstrap. HTTPS remains mandatory for ordinary Direct publication.
+- Mobile constructs one credential-free exact `http` origin from a resolved
+  loopback/private/link-local numeric DNS-SD address, bypasses all proxies,
+  disables redirects, and uses it only for bootstrap. It constructs the durable
+  route by replacing only scheme and port with
+  `https://<same-numeric-address>:<lan_gateway_port>`.
 - Hello carries a fresh mobile peer id, ephemeral X25519 public key, and
   16-256 byte nonce. Public keys use unpadded base64url on this wire. Both peers
   convert the key bytes to the Relay library's standard-base64 representation
   before `RelaySession::establish_with_suite`, so the DirectionalV2 KDF sees an
-  identical canonical string on both ends; the hello nonce is KDF context.
+  identical canonical string on both ends. The length-prefixed KDF context binds
+  the hello nonce, LAN Gateway port, and full base64url certificate DER; changing
+  any route field makes subsequent encrypted frames fail authentication.
+- Mobile validates a nonzero port and bounded valid DER certificate, confirms the
+  encrypted offer contains exactly the placeholder for that port, then stores the
+  numeric route and certificate in `MobileRemoteRouteBundle.localNetwork`.
+  Existing credentials deserialize with `localNetwork = None`. The local route is
+  first in Auto candidate order; optional Direct/Tailnet/Relay routes remain
+  fallback candidates, not prerequisites.
+- Pinned HTTP uses a proxy-free, redirect-free reqwest client whose only root is
+  the stored certificate and whose hostname exception applies only to that trust
+  store. Pinned WSS uses an exact-leaf rustls verifier, validates chain/time/TLS
+  signatures against the same single root, and accepts no intermediates. Both
+  paths require HTTPS/WSS plus a local numeric address; an accept-all verifier is
+  forbidden.
+- The local Gateway accepts only loopback/private/link-local numeric Host or
+  HTTP/2 `:authority`, requires HTTPS Origin, and retains normal device grant,
+  ticket, identity-proof, permission, and protocol checks.
 - Request, status, offer challenge, claim, and grant exist only inside
   `RelayEncryptedFrame`. Desktop still shows device name, fingerprint, and the
   shared six-digit SAS before explicit approval. At most 16 bootstrap sessions,
@@ -359,37 +396,41 @@ DNS-SD service type = _vibex._tcp.local.; TXT mode = zero_config
 
 | Condition | Required result |
 | --- | --- |
-| No validated long-term route | `remote_zero_config_pairing_routes_unavailable`; bind is released and nothing is advertised. |
+| Local TLS Gateway is absent or its port/certificate is invalid | `remote_local_lan_gateway_unavailable` / `remote_local_lan_route_invalid`; create no bootstrap session. |
 | Listener bind/address or advertiser setup fails | `remote_zero_config_pairing_listener_*` / `remote_zero_config_advertisement_failed`; cancel the offer and listener. |
 | Unknown/oversized TXT, invalid server id/key, non-v2 mode, or malformed origin | Reject that candidate with `remote_lan_discovery_invalid` / `remote_zero_config_pairing_origin_invalid`, keep browsing, and send no hello. |
 | Hello nonce/key is malformed or non-contributory | `remote_zero_config_pairing_hello_invalid` / `remote_zero_config_pairing_hello_rejected`; create no session. |
 | Session is unknown, expired, replayed, or frame authentication fails | `remote_zero_config_pairing_session_*` / `remote_zero_config_pairing_frame_invalid`; expose no plaintext payload. |
 | Session/request limits are reached | Existing bounded LAN busy/limit response; allocate no unbounded task or session. |
 | Advertised, hello, discovery, or offer server identity differs | `remote_zero_config_pairing_identity_mismatch`; do not request, claim, or persist credentials. |
+| Offer placeholder, LAN port, or certificate differs from encrypted hello | `remote_zero_config_pairing_route_mismatch` / `_route_invalid`; persist nothing. |
+| Pinned route is HTTP, hostname/public IP, oversized/malformed DER, or presents another leaf | `remote_pinned_tls_route_invalid` / `remote_tls_certificate_invalid` / transport TLS failure; do not fall back by weakening verification. |
+| HTTP/2 request has no Host header but has valid local `:authority` | Apply the same local numeric allowlist and continue; do not report `remote_host_required`. |
 
 ### 5. Good / Base / Bad Cases
 
-- Good: Mobile discovers the dedicated zero-config advertisement, establishes
-  an encrypted session, both devices compare SAS, Desktop approves, and the
-  encrypted claim persists the existing route bundle.
+- Good: with no Tailnet, Direct publication, or Relay configured, Mobile discovers
+  Desktop, compares SAS, claims through the encrypted bootstrap, persists the
+  resolved LAN IP/certificate, and reaches v2 Online over pinned HTTPS/WSS.
 - Base: the three remote method controls and QR flow work unchanged while no
   zero-config window is active; the fourth entry has its own permission and
   start/stop state.
 - Bad: attach a nearby button to every transport row, advertise the claim
-  challenge, send request/status/claim as plaintext HTTP JSON, accept a server
-  key change, use a proxy, or retain the listener as a long-term LAN route.
+  challenge, send request/status/claim as plaintext HTTP JSON, save
+  `vibex-lan.local`, require Tailnet/Relay, or disable all certificate checks.
 
 ### 6. Tests Required
 
 - Core golden JSON freezes the strict hello shape and secret-bearing DTO Debug
   output remains redacted.
-- Gateway integration uses a real temporary listener and proves encrypted
-  request/status/claim, pending offer absence, existing transactional claim,
-  listener terminal shutdown, session/body/concurrency bounds, and route-less
-  refusal.
-- Remote-client tests cover exact HTTP-origin normalization, proxy bypass,
-  redirect refusal, base64url/Relay-base64 conversion, identity binding, SAS,
-  and encrypted response decoding.
+- Gateway integration proves encrypted request/status/claim, stable derived
+  certificate, local-only offer creation, listener cleanup, bounds, local Host
+  and HTTP/2 authority validation, and request secrets whose base64url payload
+  contains `-` (prefix parsing removes only the first separator).
+- Remote-client integration must start both listeners on random ports, configure
+  no published route and no Relay, complete approval/claim, connect with pinned
+  HTTPS/WSS, reach Online, and heartbeat. Unit tests cover numeric-address policy,
+  malformed pins, proxy/redirect refusal, KDF binding, identity, and SAS.
 - Desktop advertiser/controller tests cover strict TXT, start failure cleanup,
   expiry, route-change cancellation, and separate UI state. Native mobile tests
   cover mode filtering, invalid identity metadata, duplicate names, lifecycle,
@@ -401,23 +442,25 @@ DNS-SD service type = _vibex._tcp.local.; TXT mode = zero_config
 
 ```text
 _vibex TXT challenge=<secret> -> POST plaintext claim -> save mDNS HTTP as route
+pair locally -> save vibex-lan.local -> require Tailnet when DNS fails
 Direct / Tailnet / Relay rows each render "Allow nearby device"
 ```
 
 #### Correct
 
 ```text
-bounded zero_config TXT -> hello -> DirectionalV2 encrypted request/status/claim
-separate fourth pairing entry -> existing offer routes -> existing credential bundle
-claim/cancel/expiry -> listener + advertisement + in-memory sessions cleared
+bounded TXT -> hello binds nonce + LAN port + certificate -> encrypted claim
+resolved LAN IP + exact certificate pin -> HTTPS/WSS RemoteGateway v2
+Tailnet/Direct/Relay = optional fallback routes; bootstrap HTTP stops after claim
 ```
 
 ## Scenario: GPUI Desktop Remote Publication Controller
 
 ### 1. Scope / Trigger
 
-- Trigger: changing `RemoteConnectivityController`, Direct/Tailnet publication,
-  self-hosted Relay publication validation, or `RemoteGateway` reconfiguration.
+- Trigger: changing `RemoteConnectivityController`, the pinned local-network
+  listener, Direct/Tailnet publication, self-hosted Relay publication
+  validation, or `RemoteGateway` reconfiguration.
 - The GPUI Desktop runtime is the only product consumer. Frozen Tauri/React
   clients do not receive a parallel command layer.
 
@@ -425,15 +468,18 @@ claim/cancel/expiry -> listener + advertisement + in-memory sessions cleared
 
 ```text
 ~/.vibex/remote-access.json -> RemoteConnectivitySettingsV1 {
-  schema_version, desired_enabled, generation,
+  schema_version, desired_enabled, local_network_enabled, generation,
   tailscale, direct, relay, last_successful_pairing_entry, updated_at_ms
 }
 RemoteConnectivityController::{snapshot,reconcile_on_startup,
   enable_direct,enable_tailscale,enable_relay,disable_method,
   disable_all,repair_method,create_pairing_offer,pairing_offer_status,
-  cancel_pairing_offer,record_claimed_pairing_entry}
+  cancel_pairing_offer,record_claimed_pairing_entry,
+  start_zero_config_lan_pairing,cancel_zero_config_lan_pairing}
 RemoteGateway::{current_config,apply_config_while_stopped,set_pairing_routes,
-  create_pairing_offer,pairing_offer_status,cancel_pairing_offer}
+  create_pairing_offer,pairing_offer_status,cancel_pairing_offer,
+  start_local_lan_gateway,stop_local_lan_gateway}
+LOCAL_LAN_GATEWAY_PORT = 1429
 TailscalePublication::{inspect,create,remove_owned}
 GET <direct-origin>/api/v2/info -> DirectProbeInfo
 GET <relay-origin>/api/info -> RelayPublicationInfo
@@ -445,6 +491,17 @@ GET <relay-origin>/api/info -> RelayPublicationInfo
   contains intent plus exact non-secret route metadata only. Corrupt, symlinked,
   or future-version state is quarantined and starts fail-closed; pairing grants,
   challenges, private keys, credentials, and raw CLI output are forbidden.
+- `localNetworkEnabled` is an independent durable intent, defaults to false when
+  absent in an older settings file, and participates in `desiredEnabled` without
+  appearing as a Direct/Tailnet/Relay method row. Production binds its pinned-TLS
+  Gateway on `0.0.0.0:1429`; startup restores it without probing or enabling any
+  other route. Opening zero-config pairing starts and persists this listener;
+  closing the pairing window leaves it available to already paired devices.
+- A local-network settings transition is committed to disk before replacing the
+  controller's in-memory settings. Failed enable persistence cancels bootstrap
+  state, advertisement, and the newly started local listener. Failed disable
+  persistence preserves the enabled in-memory intent and listener so restart and
+  UI state cannot falsely report a completed disable.
 - One async operation lock serializes enable, disable, repair, startup
   reconciliation, Gateway configuration, and Relay lifecycle changes. Startup
   may restore local Gateway/Relay state and inspect external systems, but never
@@ -517,6 +574,9 @@ GET <relay-origin>/api/info -> RelayPublicationInfo
 | --- | --- |
 | Missing, corrupt, symlinked, or future settings | Quarantine when possible; `remote_connectivity_settings_invalid` or `remote_connectivity_settings_version_unsupported`; enable nothing. |
 | Validated method state cannot persist | `remote_connectivity_settings_*`; remove its candidate and expose `retry`. |
+| Local listener bind/TLS initialization fails | `remote_local_lan_listener_*` / `remote_local_lan_tls_config_failed`; advertise nothing and do not persist local intent. |
+| Enabling the local listener cannot persist | Return `remote_connectivity_settings_*`; cancel bootstrap/advertisement and stop the listener while retaining disabled in-memory state. |
+| Disabling the local listener cannot persist | Return `remote_connectivity_settings_*`; retain enabled in-memory state and keep the listener running. |
 | Direct identity/protocol/path/security mismatch | `remote_direct_identity_mismatch`, `remote_direct_protocol_incompatible`, `remote_direct_paths_invalid`, or `remote_direct_security_policy_invalid`; publish no candidate. |
 | A proxy-bypassing probe client cannot initialize, or a private/Tailnet origin cannot be reached directly | `remote_direct_probe_client_unavailable` or `remote_direct_probe_direct_failed`; publish no candidate and show actionable recovery. |
 | Tailscale daemon/DNS/CLI is unavailable | Stable `tailscale_daemon_offline`, `tailscale_dns_unavailable`, `tailscale_binary_missing`, or `tailscale_cli_unsupported`; never mutate Serve. |
@@ -531,6 +591,9 @@ GET <relay-origin>/api/info -> RelayPublicationInfo
 
 - Good: Direct is online, Relay becomes compatible, and only the live Relay
   pairing route changes; the Direct bound address and session epoch are stable.
+- Good: with all three publication methods disabled, zero-config pairing enables
+  the pinned local listener, and a later process startup restores only that
+  listener from `localNetworkEnabled`.
 - Good: an interrupted owned Tailscale disable is repaired while desired state
   remains false, then its persisted origin/port/ownership are cleared.
 - Good: after an owned fallback Tailscale route is disabled, re-enable performs
@@ -541,18 +604,25 @@ GET <relay-origin>/api/info -> RelayPublicationInfo
 - Base: default settings perform no process/network side effect and bind no
   listener. An existing exact Tailscale handler is reused as external and is
   never removed by Desktop.
+- Base: an older settings file without `localNetworkEnabled` loads it as false
+  and retains its existing Direct/Tailnet/Relay intent.
 - Bad: follow a probe redirect, publish before durable commit, run `serve reset`,
   infer ownership from target alone, remove a whole port containing sibling
   handlers, restart Direct for a Relay-only route change, store an entry merely
   because it was enabled or selected, or retain a terminal offer's QR material.
   Do not clear proxy environment variables or
   silently retry a requested proxy bypass through the system proxy.
+- Bad: treat nearby pairing as a Tailnet enable action, require a pre-existing
+  Direct candidate, or mutate local-network memory before a failing disk write.
 
 ### 6. Tests Required
 
 - Store tests cover round-trip, atomic/private permissions, corrupt and unknown
   schema quarantine, secret absence, interrupted transitions, and persistence
   failure after successful validation.
+- Controller tests must cover a LAN-only persisted startup restore, bootstrap
+  cleanup after local enable persistence failure, and listener/state retention
+  after local disable persistence failure.
 - Adapter tests assert exact Tailscale program/argv, bounded output/timeout,
   daemon and Self DNS parsing, 443 confirmation, deterministic fallback,
   disable/re-enable confirmation renewal, post-mutation verification,
@@ -584,6 +654,8 @@ GET <relay-origin>/api/info -> RelayPublicationInfo
 
 ```text
 tailscale serve reset
+nearby pairing -> enable Tailscale -> advertise its route
+settings.local_network_enabled = false -> save fails -> stop listener anyway
 reuse a previous 8443 confirmation after disabling the owned route
 HTTP probe -> follow 302 -> accept copied /api/v2/info
 Relay route changed -> stop Direct -> replace config -> start Direct
@@ -595,6 +667,8 @@ staticSha256 = index/host/glue only
 
 ```text
 inspect exact handler -> confirm bounded port -> exact create/remove -> verify
+start pinned listener:1429 -> persist cloned settings -> publish bootstrap
+disable: persist cloned settings -> commit memory -> stop local listener
 disable owned route -> inspect again -> request fresh fallback-port confirmation
 exact HTTPS origin + redirects disabled + bounded typed probe
 Relay route changed -> set_pairing_routes while Direct epoch stays running
@@ -2383,6 +2457,9 @@ select_pairing_claim_route(RemotePairingOffer, PairingEntryHint)
    | PairingClaimRoute::Relay(RemotePairingCandidate)
 claim_pairing_offer(...) / claim_pairing_offer_via_relay(...)
 remote_http_client() -> BackendResult<reqwest::Client>
+remote_http_client_for_config(RemoteClientConfig {
+  base_url, pinned_tls_certificate_der?, ...
+}) -> BackendResult<reqwest::Client>
 android_websocket_connector() -> BackendResult<tokio_tungstenite::Connector>
 
 DirectWebSocketTransport::probe() -> RemoteGatewayInfo
@@ -2392,6 +2469,10 @@ DirectWebSocketTransport::{connect, reconnect, request, subscribe, attach}
 DirectWebSocketTransport::next_domain_event()
 DirectWebSocketTransport::next_binary_event_for(stream_id?)
 AutoRemoteTransport::{connect,reconnect,request,subscribe,attach,active_route}
+DirectCandidate { url, label, priority, tls_certificate_der? }
+MobileRemoteRouteBundle {
+  local_network?: { url, tls_certificate_der }, direct_candidates, relay
+}
 
 WebRemoteBackend::facade() -> BackendFacade
 WebRemoteBackend::resolve_unknown_mutation(RequestId) -> MessageSubmissionState
@@ -2436,6 +2517,23 @@ CredentialStore / ClientIdentityStore
   query strings, and fragments. HTTP/WS is accepted only for an explicit
   loopback development exception. The client checks the paired server id and
   static identity key before ticket/WS use.
+- Zero-config pairing stores its resolved loopback/private/link-local numeric
+  HTTPS origin separately as `localNetwork`, together with the full encrypted-
+  transcript-bound certificate DER. It never stores or resolves the offer's
+  `vibex-lan.local` placeholder. Credentials written before this field existed
+  deserialize with `localNetwork = None` and retain their previous routes.
+- A local-network candidate is priority zero and carries its certificate pin
+  into every `/api/v2/info`, ticket, and WebSocket connection config. Pinned
+  HTTP uses a no-proxy/no-redirect client with only the stored certificate as a
+  root and a hostname exception scoped to that store. Pinned WSS requires the
+  exact leaf, no intermediates, a valid signature/time chain to that single root,
+  and normal TLS handshake signatures. The pin never applies to other Direct or
+  Tailnet candidates, which retain their normal WebPKI policy.
+- HTTP requests to `localhost` or loopback/private/link-local numeric Direct and
+  Relay URLs bypass environment/system proxies and disable redirects; public
+  URLs retain the platform proxy policy. URL classification happens before
+  building the client and never mutates process proxy variables. Local smoke
+  health probes use the same explicit no-proxy boundary.
 - Android product HTTP and WebSocket routes use the same bundled Mozilla
   WebPKI roots. The HTTP client installs them with `tls_certs_only`; the WSS
   client supplies an explicit rustls connector backed by the same root set.
@@ -2514,6 +2612,10 @@ CredentialStore / ClientIdentityStore
 | Claim response device/public key/grant or route bundle is invalid | `remote_pairing_claim_response_invalid` or route validation error; export no credential. |
 | Candidate list empty/over limit | `remote_candidate_count_invalid`; no probe beyond the bound. |
 | Direct URL is insecure outside explicit loopback, contains credentials/query/fragment, or has invalid backoff/queue limits | Structured local validation error; no network request. |
+| Pinned route is not HTTPS/WSS, uses a hostname/public IP, or has malformed/oversized DER | `remote_pinned_tls_route_invalid` / `remote_tls_certificate_invalid`; make no request. |
+| Pinned HTTP/WSS presents a certificate other than the stored certificate | TLS transport failure; never retry with hostname or certificate checks disabled. |
+| A local numeric Direct/Relay URL is configured while environment proxies are present | Use a proxy-free HTTP client; do not send local pairing, probe, or ticket requests to the proxy. |
+| Stored credentials omit `localNetwork` | Load it as `None` and continue using the existing Direct/Relay bundle. |
 | Android receives a valid public chain with no OCSP responder | Verify both HTTP and WSS through the bundled WebPKI roots; do not publish a false `Revoked` state. |
 | Android certificate hostname, chain, signature, validity window, or root trust is invalid | Return the typed HTTP/WS transport failure and remain offline; never bypass certificate verification. |
 | `/api/v2/info` identity or v2 range mismatch | `remote_server_identity_mismatch` / `remote_protocol_incompatible`; do not issue a WS ticket. |
@@ -2540,6 +2642,9 @@ CredentialStore / ClientIdentityStore
 - Good: Auto probes LAN and Tailnet candidates in parallel, chooses the healthy
   low-latency path, then uses the same paired device identity for the ticket and
   v2 handshake while exposing the selected active route.
+- Good: with no Tailnet, published Direct route, or Relay, the local candidate
+  passes pinned HTTPS probe, obtains a WS ticket, reaches v2 Online over pinned
+  WSS, and completes a heartbeat.
 - Good: an Android client claims and attaches over a publicly trusted Tailnet
   HTTPS/WSS endpoint whose leaf has CRL metadata but no OCSP responder; both
   transports validate the same chain and neither reports `Revoked`.
@@ -2560,6 +2665,8 @@ CredentialStore / ClientIdentityStore
 - Base: a loopback HTTP fixture is allowed only when the development host
   explicitly sets the exception; product mobile state remains HTTPS/WSS-only.
 - Base: non-Android clients continue using their existing platform trust path.
+- Base: a credential created before `localNetwork` existed still connects through
+  its prior Direct/Relay candidates.
 - Bad: use the entry hint as a URL, try Direct and Relay claims in sequence, probe
   by consuming the offer, put the grant in a URL, treat an RPC timeout as socket
   death, resend a prompt after reconnect, advance a cursor on a dropped event,
@@ -2572,6 +2679,9 @@ CredentialStore / ClientIdentityStore
 - Bad: fix an Android availability failure with
   `danger_accept_invalid_certs`, or configure WebPKI roots for HTTP while
   leaving WSS on the failing platform verifier.
+- Bad: discard the local route after claim, resolve `vibex-lan.local` later,
+  require Relay when the local probe is healthy, or share the pinned trust store
+  with unrelated Direct candidates.
 
 ### 6. Tests Required
 
@@ -2580,6 +2690,13 @@ CredentialStore / ClientIdentityStore
   rejection, one-route claim smoke, candidate selection, control waiter cleanup,
   bounded domain/binary queues, stream filtering, cursor gap/rewind/reconnect
   behavior, credential redaction, Terminal rebuild, and File chunk cases.
+- `local_lan_smoke` must configure no Tailnet, published Direct route, or Relay;
+  perform discovery bootstrap, encrypted approval/claim, pinned HTTPS probe,
+  pinned WSS v2 Online, and heartbeat. Mobile storage tests must deserialize an
+  otherwise valid older credential with no `localNetwork` field.
+- Direct and Relay loopback smoke probes must construct no-proxy clients so a
+  developer or CI environment proxy cannot turn a healthy local endpoint into a
+  false `remote_candidates_unreachable` failure.
 - Regression coverage must keep
   `shared_facade_tracks_capability_additions_and_removals_after_reconnect`,
   `projection_invalidation_gaps_coalesce_without_pausing_other_domains`, and
@@ -2617,6 +2734,7 @@ let bytes = response.bytes().await?;
 if bytes.len() > MAX_JSON_BYTES { return Err(too_large()); }
 let client = reqwest::Client::new(); // Android platform verifier on product routes.
 let socket = tokio_tungstenite::connect_async(request).await?;
+let local = offer.direct_candidates[0].url; // Persist vibex-lan.local.
 let event_sequence = timeline_event.sequence; // Wrong sequence space.
 // A slow WebSocket consumer advances the cursor before the event is retained.
 send_message_again_after_timeout(request).await?;
@@ -2635,6 +2753,12 @@ let socket = connect_async_tls_with_config(
     false,
     Some(android_websocket_connector()?),
 ).await?;
+let local = DirectCandidate {
+    url: resolved_numeric_lan_origin,
+    tls_certificate_der: Some(encrypted_transcript_certificate),
+    priority: 0,
+    ..candidate
+};
 validate_claim_response(&offer, &provisional_identity, &response)?;
 let event = timeline_domain_event(timeline_event, generation, &mut domain_sequence);
 let body = read_chunks_with_limit(response, MAX_JSON_BYTES).await?;

@@ -93,15 +93,19 @@ Zero-configuration LAN pairing is a separate bootstrap path before that flow:
 Mobile DNS-SD discovery
   -> temporary Desktop HTTP listener
   -> DirectionalV2 application-encrypted request/status/claim
-  -> existing MobileCredentialBundle with Direct/Tailnet/Relay routes
-  -> normal Remote Data Flow above
+  -> numeric LAN address + encrypted-session-bound TLS certificate
+  -> persistent Desktop pinned-TLS LAN Gateway
+  -> normal Remote Data Flow above (Tailnet/Relay remain optional)
 ```
 
-The temporary listener is pairing-only. It is not a fourth remote transport,
-does not expose the RemoteGateway business router, and is never persisted as a
-candidate. Desktop UI presents it as a separate pairing entry with its own
-permission, lifetime, SAS approval, and stop state; the three publication
-method rows do not each receive a nearby-device control.
+The temporary plaintext listener remains pairing-only, does not expose the
+RemoteGateway business router, and is never persisted as a candidate. The
+long-term LAN path is a separate HTTPS/WSS Gateway whose certificate is pinned
+by the encrypted pairing transcript. Desktop persists and restores this local
+network listener independently of Direct/Tailnet/Relay publication. Desktop UI
+presents discovery as a separate pairing entry with its own permission,
+lifetime, SAS approval, and stop state; the three publication method rows do
+not each receive a nearby-device control.
 
 Pairing is one-time and server-issued. The mobile app validates the offer,
 claims exactly one route, persists the minimum credential bundle in its sandbox,
@@ -149,14 +153,20 @@ directly or introduce a second authority.
   permissions where supported; malformed or mismatched records are discarded.
 - Auth tokens, private keys, pairing links, prompt bodies, file contents, and
   terminal bytes are redacted from `Debug`, logs, and evidence.
-- RemoteGateway validates Host and HTTP(S) Origin boundaries and rejects secrets
-  in URLs. LAN mode requires an explicitly trusted HTTPS/WSS boundary.
+- RemoteGateway validates Host/HTTP2 authority and HTTP(S) Origin boundaries and
+  rejects secrets in URLs. Published LAN mode requires a trusted HTTPS/WSS proxy;
+  the local-only Gateway requires an encrypted-pairing-bound certificate pin and
+  a loopback/private/link-local numeric address.
 - The only non-HTTPS LAN exception is the bounded zero-configuration pairing
   listener. After its plaintext hello, every request, status, offer challenge,
   claim, and grant is protected by a DirectionalV2 application-encrypted
   session bound to the Desktop X25519 identity and a fresh mobile ephemeral key.
   Mobile bypasses proxies for this listener, which disappears on every terminal
   lifecycle.
+- The long-term local Gateway uses a stable certificate derived from the Desktop
+  identity, exposes the normal typed v2 business router over TLS only, and is
+  accepted by mobile only through the exact stored certificate. Disabling
+  hostname checks without a single-certificate trust store is forbidden.
 - Relay forwards encrypted payloads and has no provider, workspace, or Agent
   authorization logic.
 

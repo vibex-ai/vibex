@@ -82,6 +82,7 @@ async fn direct_gateway_pair_and_v2_handshake_smoke() {
             url: base_url.clone(),
             label: "loopback".to_string(),
             priority: 0,
+            tls_certificate_der: None,
         }])
         .await
         .expect("probe gateway without consuming offer");
@@ -154,6 +155,7 @@ async fn direct_gateway_pair_and_v2_handshake_smoke() {
             url: base_url,
             label: "loopback-restart".to_string(),
             priority: 0,
+            tls_certificate_der: None,
         }],
         relay: None,
     })

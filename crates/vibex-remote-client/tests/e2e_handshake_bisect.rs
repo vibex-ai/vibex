@@ -132,6 +132,7 @@ async fn e2e_handshake_bisect() {
             url: base_url.clone(),
             label: "bisect".to_string(),
             priority: 0,
+            tls_certificate_der: None,
         }],
         relay: None,
     })

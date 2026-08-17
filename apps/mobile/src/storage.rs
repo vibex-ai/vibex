@@ -143,6 +143,7 @@ mod tests {
             client_type: RemoteClientType::Mobile,
             allow_insecure_local_dev: false,
             route: Some(MobileRemoteRouteBundle {
+                local_network: None,
                 direct_candidates: vec!["https://desktop.example".to_string()],
                 relay: None,
             }),
@@ -159,6 +160,22 @@ mod tests {
         assert_eq!(storage.load().unwrap().unwrap(), fixture);
         storage.clear().unwrap();
         assert!(storage.load().unwrap().is_none());
+    }
+
+    #[test]
+    fn credentials_without_local_network_route_remain_backward_compatible() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        let mut encoded = serde_json::to_value(fixture()).unwrap();
+        encoded
+            .get_mut("route")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .remove("localNetwork");
+        fs::write(storage.path(), serde_json::to_vec(&encoded).unwrap()).unwrap();
+
+        let loaded = storage.load().unwrap().unwrap();
+        assert!(loaded.route.unwrap().local_network.is_none());
     }
 
     #[cfg(unix)]

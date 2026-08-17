@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
+use std::net::IpAddr;
 #[cfg(not(target_family = "wasm"))]
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -52,11 +53,17 @@ const MAX_DIRECT_CANDIDATES: usize = 16;
 const MAX_EVENT_QUEUE_CAPACITY: usize = 8192;
 const MAX_BINARY_QUEUE_CAPACITY: usize = 4096;
 const MAX_HTTP_JSON_BYTES: usize = 64 * 1024;
+const MAX_PINNED_TLS_CERTIFICATE_BYTES: usize = 8 * 1024;
 const PROJECTION_INVALIDATION_CHANNEL_COUNT: usize = 4;
 const RELAY_REMOTE_JSON_KIND: RelayFrameKind = RelayFrameKind::Command;
 
 #[cfg(target_os = "android")]
 pub(crate) fn remote_http_client() -> BackendResult<reqwest::Client> {
+    android_remote_http_client(false)
+}
+
+#[cfg(target_os = "android")]
+fn android_remote_http_client(no_proxy: bool) -> BackendResult<reqwest::Client> {
     let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS
         .iter()
         .map(|certificate| {
@@ -68,25 +75,94 @@ pub(crate) fn remote_http_client() -> BackendResult<reqwest::Client> {
             })
         })
         .collect::<BackendResult<Vec<_>>>()?;
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         // Android's platform verifier can reject otherwise valid public chains
         // when the leaf omits an OCSP responder.  A Mozilla WebPKI store keeps
         // normal chain, hostname, signature, and validity checks in rustls
         // without accepting invalid certificates.
         .tls_certs_only(roots)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| {
-            BackendError::failed(
-                "remote_http_client_build_failed",
-                "remote HTTP TLS client could not be initialized",
-            )
-        })
+        .redirect(reqwest::redirect::Policy::none());
+    if no_proxy {
+        builder = builder.no_proxy();
+    }
+    builder.build().map_err(|_| {
+        BackendError::failed(
+            "remote_http_client_build_failed",
+            "remote HTTP TLS client could not be initialized",
+        )
+    })
 }
 
 #[cfg(not(target_os = "android"))]
 pub(crate) fn remote_http_client() -> BackendResult<reqwest::Client> {
     Ok(reqwest::Client::new())
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn remote_http_client_for_url(url: &Url) -> BackendResult<reqwest::Client> {
+    if !is_proxy_bypassed_remote_url(url) {
+        return remote_http_client();
+    }
+    #[cfg(target_os = "android")]
+    {
+        android_remote_http_client(true)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| {
+                BackendError::failed(
+                    "remote_http_client_build_failed",
+                    "direct remote HTTP client could not be initialized",
+                )
+            })
+    }
+}
+
+#[cfg(target_family = "wasm")]
+fn remote_http_client_for_url(_url: &Url) -> BackendResult<reqwest::Client> {
+    remote_http_client()
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn remote_http_client_for_config(config: &RemoteClientConfig) -> BackendResult<reqwest::Client> {
+    let Some(encoded) = config.pinned_tls_certificate_der.as_deref() else {
+        return remote_http_client_for_url(&config.validate()?);
+    };
+    let certificate_der = decode_pinned_tls_certificate(encoded)?;
+    let certificate = reqwest::Certificate::from_der(&certificate_der).map_err(|_| {
+        BackendError::failed(
+            "remote_tls_certificate_invalid",
+            "pinned local network TLS certificate is invalid",
+        )
+    })?;
+    reqwest::Client::builder()
+        .tls_backend_rustls()
+        .tls_certs_only([certificate])
+        .tls_danger_accept_invalid_hostnames(true)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| {
+            BackendError::failed(
+                "remote_http_client_build_failed",
+                "pinned local network HTTP client could not be initialized",
+            )
+        })
+}
+
+#[cfg(target_family = "wasm")]
+fn remote_http_client_for_config(config: &RemoteClientConfig) -> BackendResult<reqwest::Client> {
+    if config.pinned_tls_certificate_der.is_some() {
+        return Err(BackendError::unsupported(
+            "remote_pinned_tls_unsupported",
+            "pinned local network TLS is unavailable in browser transports",
+        ));
+    }
+    remote_http_client()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +237,7 @@ pub enum RemoteLifecycleSignal {
 #[derive(Clone)]
 pub struct RemoteClientConfig {
     pub base_url: String,
+    pub pinned_tls_certificate_der: Option<String>,
     pub auth: RemoteAuthProof,
     pub device_identity: Option<ClientDeviceIdentity>,
     pub expected_server_id: Option<String>,
@@ -181,6 +258,10 @@ impl fmt::Debug for RemoteClientConfig {
         formatter
             .debug_struct("RemoteClientConfig")
             .field("base_url", &self.base_url)
+            .field(
+                "has_pinned_tls_certificate",
+                &self.pinned_tls_certificate_der.is_some(),
+            )
             .field("auth", &self.auth)
             .field("has_device_identity", &self.device_identity.is_some())
             .field("expected_server_id", &self.expected_server_id)
@@ -203,6 +284,7 @@ impl RemoteClientConfig {
     pub fn new(base_url: impl Into<String>, auth: RemoteAuthProof) -> Self {
         Self {
             base_url: base_url.into(),
+            pinned_tls_certificate_der: None,
             auth,
             device_identity: None,
             expected_server_id: None,
@@ -271,6 +353,20 @@ impl RemoteClientConfig {
                 "remote Web entry requires HTTPS/WSS (loopback HTTP is a development exception)",
             ));
         }
+        if let Some(certificate) = self.pinned_tls_certificate_der.as_deref() {
+            decode_pinned_tls_certificate(certificate)?;
+            if !secure
+                || !url
+                    .host_str()
+                    .and_then(|host| host.parse::<IpAddr>().ok())
+                    .is_some_and(is_local_network_ip)
+            {
+                return Err(BackendError::failed(
+                    "remote_pinned_tls_route_invalid",
+                    "pinned TLS requires an HTTPS/WSS local numeric address",
+                ));
+            }
+        }
         if self.reconnect_initial.is_zero()
             || self.reconnect_max.is_zero()
             || self.reconnect_initial > self.reconnect_max
@@ -309,6 +405,56 @@ impl RemoteClientConfig {
                 server_identity_public_key: self.expected_server_identity_public_key.clone(),
             })
     }
+}
+
+fn decode_pinned_tls_certificate(encoded: &str) -> BackendResult<Vec<u8>> {
+    let max_encoded_len = MAX_PINNED_TLS_CERTIFICATE_BYTES
+        .saturating_mul(4)
+        .div_ceil(3);
+    if encoded.is_empty() || encoded.len() > max_encoded_len {
+        return Err(BackendError::failed(
+            "remote_tls_certificate_invalid",
+            "pinned local network TLS certificate is missing or too large",
+        ));
+    }
+    let certificate = URL_SAFE_NO_PAD.decode(encoded).map_err(|_| {
+        BackendError::failed(
+            "remote_tls_certificate_invalid",
+            "pinned local network TLS certificate is not valid base64url",
+        )
+    })?;
+    if certificate.is_empty() || certificate.len() > MAX_PINNED_TLS_CERTIFICATE_BYTES {
+        return Err(BackendError::failed(
+            "remote_tls_certificate_invalid",
+            "pinned local network TLS certificate is missing or too large",
+        ));
+    }
+    #[cfg(not(target_family = "wasm"))]
+    reqwest::Certificate::from_der(&certificate).map_err(|_| {
+        BackendError::failed(
+            "remote_tls_certificate_invalid",
+            "pinned local network TLS certificate is invalid",
+        )
+    })?;
+    Ok(certificate)
+}
+
+fn is_local_network_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            address.is_loopback() || address.is_private() || address.is_link_local()
+        }
+        IpAddr::V6(address) => {
+            address.is_loopback() || address.is_unique_local() || address.is_unicast_link_local()
+        }
+    }
+}
+
+fn is_proxy_bypassed_remote_url(url: &Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host.parse::<IpAddr>().is_ok_and(is_local_network_ip)
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -506,7 +652,12 @@ pub fn claim_pairing_offer(
         url.set_query(None);
         url.set_fragment(None);
         let endpoint = endpoint_url(&url, "/api/v2/pairing/claim")?;
-        http_json(remote_http_client()?.post(endpoint).json(&request)).await
+        http_json(
+            remote_http_client_for_url(&url)?
+                .post(endpoint)
+                .json(&request),
+        )
+        .await
     })
 }
 
@@ -539,6 +690,7 @@ pub fn claim_pairing_offer_via_relay(
             ));
         }
         let base = validate_relay_pairing_url(&relay_url, allow_insecure_local_dev)?;
+        let client = remote_http_client_for_url(&base)?;
         let endpoint = canonical_relay_endpoint(&base)?;
         let relay_keypair =
             RelayKeypair::from_private_key_base64url(&identity.private_key_base64())
@@ -578,7 +730,7 @@ pub fn claim_pairing_offer_via_relay(
 
         let pair_path = format!("/api/rooms/{}/pair", room_id.as_str());
         let ready_message: RelayControlMessage = http_json(
-            remote_http_client()?
+            client
                 .post(endpoint_url(&base, &pair_path)?)
                 .json(&RelayControlMessage::Hello(hello)),
         )
@@ -689,7 +841,7 @@ pub fn claim_pairing_offer_via_relay(
             .map_err(BackendError::from)?;
         let command_path = format!("/api/rooms/{}/command", room_id.as_str());
         let response: RelayControlMessage = http_json(
-            remote_http_client()?
+            client
                 .post(endpoint_url(&base, &command_path)?)
                 .json(&frame),
         )
@@ -1183,6 +1335,7 @@ impl DirectWebSocketTransport {
             let probes = candidates.into_iter().map(|candidate| {
                 let mut config = self.config.clone();
                 config.base_url = candidate.url.clone();
+                config.pinned_tls_certificate_der = candidate.tls_certificate_der.clone();
                 async move {
                     // `Instant::now` is unavailable on wasm; measure probe
                     // latency with the host wall clock instead.
@@ -1266,7 +1419,8 @@ impl DirectWebSocketTransport {
         let base = self.config.validate()?;
         let url = endpoint_url(&base, "api/v2/info")?;
         set_state(&self.inner.state, RemoteConnectionState::Probing, None);
-        let info: RemoteGatewayInfo = http_json(remote_http_client()?.get(url)).await?;
+        let info: RemoteGatewayInfo =
+            http_json(remote_http_client_for_config(&self.config)?.get(url)).await?;
         if self
             .config
             .expected_server_id
@@ -1349,7 +1503,7 @@ impl DirectWebSocketTransport {
         let base = self.config.validate()?;
         let ticket_url = endpoint_url(&base, &gateway.ws_ticket_path)?;
         let ticket: RemoteWsTicketResponse = http_json(
-            remote_http_client()?
+            remote_http_client_for_config(&self.config)?
                 .post(ticket_url)
                 .json(&RemoteWsTicketRequest {
                     auth: self.config.auth.clone(),
@@ -1418,8 +1572,13 @@ impl DirectWebSocketTransport {
             .event_queue_capacity
             .saturating_add(self.config.binary_queue_capacity)
             .min(MAX_EVENT_QUEUE_CAPACITY.saturating_add(MAX_BINARY_QUEUE_CAPACITY));
-        let (mut writer, mut reader) =
-            open_socket(&ws_url, &ticket.subprotocol, socket_queue_capacity).await?;
+        let (mut writer, mut reader) = open_socket(
+            &ws_url,
+            &ticket.subprotocol,
+            socket_queue_capacity,
+            self.config.pinned_tls_certificate_der.as_deref(),
+        )
+        .await?;
         send_socket_text(
             &mut writer,
             &serde_json::to_string(&RemoteJsonMessageV2::Control(
@@ -1905,7 +2064,8 @@ impl RelayE2eeTransport {
     async fn probe_inner(&self) -> BackendResult<RelayEndpointInfo> {
         let base = self.config.validate()?;
         let info: RelayEndpointInfo =
-            http_json(remote_http_client()?.get(endpoint_url(&base, "/api/info")?)).await?;
+            http_json(remote_http_client_for_url(&base)?.get(endpoint_url(&base, "/api/info")?))
+                .await?;
         if info.protocol_version != vibex_core::RelayProtocolVersion::foundation() {
             return Err(BackendError::unsupported(
                 "relay_protocol_incompatible",
@@ -2003,7 +2163,8 @@ impl RelayE2eeTransport {
             .event_queue_capacity
             .saturating_add(self.config.remote.binary_queue_capacity)
             .max(1);
-        let (mut socket_writer, mut raw_reader) = open_socket(&ws_url, "", queue_capacity).await?;
+        let (mut socket_writer, mut raw_reader) =
+            open_socket(&ws_url, "", queue_capacity, None).await?;
         let registration = serde_json::to_string(&RelayControlMessage::Hello(hello.clone()))
             .map_err(|_| {
                 BackendError::failed(
@@ -3433,10 +3594,112 @@ fn android_websocket_connector() -> BackendResult<tokio_tungstenite::Connector> 
 }
 
 #[cfg(not(target_family = "wasm"))]
+#[derive(Debug)]
+struct PinnedCertificateVerifier {
+    pinned: rustls::pki_types::CertificateDer<'static>,
+    roots: rustls::RootCertStore,
+    signature_algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl rustls::client::danger::ServerCertVerifier for PinnedCertificateVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if !intermediates.is_empty() || end_entity.as_ref() != self.pinned.as_ref() {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            ));
+        }
+        let certificate = rustls::server::ParsedCertificate::try_from(end_entity)?;
+        rustls::client::verify_server_cert_signed_by_trust_anchor(
+            &certificate,
+            &self.roots,
+            intermediates,
+            now,
+            self.signature_algorithms.all,
+        )?;
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &rustls::pki_types::CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            certificate,
+            signature,
+            &self.signature_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &rustls::pki_types::CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            certificate,
+            signature,
+            &self.signature_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.signature_algorithms.supported_schemes()
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn pinned_websocket_connector(
+    encoded_certificate: &str,
+) -> BackendResult<tokio_tungstenite::Connector> {
+    let certificate = rustls::pki_types::CertificateDer::from(decode_pinned_tls_certificate(
+        encoded_certificate,
+    )?);
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(certificate.clone()).map_err(|_| {
+        BackendError::failed(
+            "remote_tls_certificate_invalid",
+            "pinned local network TLS certificate is invalid",
+        )
+    })?;
+    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    let verifier = PinnedCertificateVerifier {
+        pinned: certificate,
+        roots,
+        signature_algorithms: provider.signature_verification_algorithms,
+    };
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .map_err(|_| {
+            BackendError::failed(
+                "remote_tls_config_invalid",
+                "pinned local network WebSocket TLS configuration is invalid",
+            )
+        })?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_no_client_auth();
+    Ok(tokio_tungstenite::Connector::Rustls(Arc::new(config)))
+}
+
+#[cfg(not(target_family = "wasm"))]
 async fn open_socket(
     url: &Url,
     subprotocol: &str,
     _queue_capacity: usize,
+    pinned_tls_certificate_der: Option<&str>,
 ) -> BackendResult<(NativeSocketWriter, NativeReader)> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::http::header::{
@@ -3480,16 +3743,20 @@ async fn open_socket(
             })?,
         );
     }
-    #[cfg(target_os = "android")]
-    let socket_result = tokio_tungstenite::connect_async_tls_with_config(
-        request,
-        None,
-        false,
-        Some(android_websocket_connector()?),
-    )
-    .await;
-    #[cfg(not(target_os = "android"))]
-    let socket_result = tokio_tungstenite::connect_async(request).await;
+    let connector = if let Some(certificate) = pinned_tls_certificate_der {
+        Some(pinned_websocket_connector(certificate)?)
+    } else {
+        #[cfg(target_os = "android")]
+        {
+            Some(android_websocket_connector()?)
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            None
+        }
+    };
+    let socket_result =
+        tokio_tungstenite::connect_async_tls_with_config(request, None, false, connector).await;
     let (stream, _) = socket_result.map_err(|error| {
         BackendError::offline(
             "remote_ws_connect_failed",
@@ -3505,11 +3772,18 @@ async fn open_socket(
     url: &Url,
     subprotocol: &str,
     queue_capacity: usize,
+    pinned_tls_certificate_der: Option<&str>,
 ) -> BackendResult<(BrowserSocketWriter, BrowserReader)> {
     use js_sys::Array;
     use wasm_bindgen::JsCast;
     use wasm_bindgen::JsValue;
     use wasm_bindgen::closure::Closure;
+    if pinned_tls_certificate_der.is_some() {
+        return Err(BackendError::unsupported(
+            "remote_pinned_tls_unsupported",
+            "pinned local network TLS is unavailable in browser transports",
+        ));
+    }
     let socket = if subprotocol.trim().is_empty() {
         web_sys::WebSocket::new(url.as_str())
     } else {
@@ -4331,6 +4605,8 @@ pub struct DirectCandidate {
     pub url: String,
     pub label: String,
     pub priority: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_certificate_der: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4566,6 +4842,7 @@ impl AutoRemoteTransport {
             {
                 let mut config = self.config.remote.clone();
                 config.base_url = candidate.candidate.url;
+                config.pinned_tls_certificate_der = candidate.candidate.tls_certificate_der;
                 let transport = Shared::new(DirectWebSocketTransport::new(config)?)
                     as Shared<dyn RemoteTransport>;
                 transport.seed_cursors(handoff_cursors.clone());
@@ -5322,6 +5599,7 @@ mod tests {
                     url: "https://tailnet".to_string(),
                     label: "tailnet".to_string(),
                     priority: 0,
+                    tls_certificate_der: None,
                 },
                 latency_ms: 12,
                 info: info.clone(),
@@ -5331,6 +5609,7 @@ mod tests {
                     url: "https://lan".to_string(),
                     label: "lan".to_string(),
                     priority: 5,
+                    tls_certificate_der: None,
                 },
                 latency_ms: 4,
                 info: info.clone(),

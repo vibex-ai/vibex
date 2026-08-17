@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -17,6 +17,8 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use axum_server::Handle as AxumServerHandle;
+use axum_server::tls_rustls::RustlsConfig;
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use hkdf::Hkdf;
@@ -29,11 +31,11 @@ use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use url::Url;
 use vibex_core::{
-    CorrelationId, DeviceId, ErrorCategory, EventId, REMOTE_V2_MAX_BINARY_PAYLOAD_BYTES,
-    RelayEncryptedFrame, RelayRemoteHandshakeContext, RelaySessionId, RemoteActionClass,
-    RemoteAttachmentAcceptedV2, RemoteAttachmentKind, RemoteAuthContext, RemoteAuthProof,
-    RemoteBinaryFrame, RemoteBinaryFrameHeader, RemoteBinaryFrameKind,
-    RemoteCancelPairingOfferRequest, RemoteClaimPairingOfferRequest,
+    CorrelationId, DeviceId, ErrorCategory, EventId, REMOTE_LOCAL_LAN_TLS_HOSTNAME,
+    REMOTE_V2_MAX_BINARY_PAYLOAD_BYTES, RelayEncryptedFrame, RelayRemoteHandshakeContext,
+    RelaySessionId, RemoteActionClass, RemoteAttachmentAcceptedV2, RemoteAttachmentKind,
+    RemoteAuthContext, RemoteAuthProof, RemoteBinaryFrame, RemoteBinaryFrameHeader,
+    RemoteBinaryFrameKind, RemoteCancelPairingOfferRequest, RemoteClaimPairingOfferRequest,
     RemoteClaimPairingOfferResponse, RemoteCloseCode, RemoteCloseReason, RemoteControlMessageV2,
     RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeviceListResponse,
     RemoteDevicePermissionLevel, RemoteDeviceRequest, RemoteEventV2, RemoteHello,
@@ -57,7 +59,7 @@ use super::pairing_v2::secure_secret;
 use super::zero_config_pairing::{
     ZERO_CONFIG_PAIRING_CLAIM_PATH, ZERO_CONFIG_PAIRING_HELLO_PATH,
     ZERO_CONFIG_PAIRING_REQUEST_PATH, ZERO_CONFIG_PAIRING_STATUS_PATH, ZeroConfigLanSession,
-    establish_server_session, open_json as open_zero_config_json,
+    derive_local_lan_tls_identity, establish_server_session, open_json as open_zero_config_json,
     seal_json as seal_zero_config_json,
 };
 use super::{
@@ -93,6 +95,7 @@ pub enum RemoteGatewayDeploymentMode {
 pub enum RemoteGatewayTlsPolicy {
     LoopbackHttp,
     TrustedHttpsProxy,
+    PinnedCertificate,
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -279,14 +282,19 @@ impl RemoteGatewayConfig {
             ));
         }
         if self.deployment_mode == RemoteGatewayDeploymentMode::Lan
-            && self.tls_policy != RemoteGatewayTlsPolicy::TrustedHttpsProxy
+            && !matches!(
+                self.tls_policy,
+                RemoteGatewayTlsPolicy::TrustedHttpsProxy
+                    | RemoteGatewayTlsPolicy::PinnedCertificate
+            )
         {
             return Err(VibexError::validation(
                 "remote_gateway_lan_tls_required",
-                "LAN RemoteGateway requires a trusted HTTPS/WSS proxy or Tailscale Serve",
+                "LAN RemoteGateway requires a trusted HTTPS/WSS proxy or a pinned local certificate",
             ));
         }
         if self.deployment_mode == RemoteGatewayDeploymentMode::Lan
+            && self.tls_policy != RemoteGatewayTlsPolicy::PinnedCertificate
             && self
                 .allowed_hosts
                 .iter()
@@ -318,6 +326,25 @@ pub struct RemoteGatewayStatus {
     pub bound_addr: Option<SocketAddr>,
     pub session_epoch: u64,
     pub active_connections: usize,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct LocalLanGatewayInfo {
+    pub bound_addr: SocketAddr,
+    pub tls_certificate_base64: String,
+}
+
+impl std::fmt::Debug for LocalLanGatewayInfo {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalLanGatewayInfo")
+            .field("bound_addr", &self.bound_addr)
+            .field(
+                "has_tls_certificate",
+                &!self.tls_certificate_base64.is_empty(),
+            )
+            .finish()
+    }
 }
 
 #[derive(Clone)]
@@ -402,6 +429,9 @@ struct GatewayLifecycle {
     zero_config_bound_addr: Option<SocketAddr>,
     zero_config_shutdown: Option<oneshot::Sender<()>>,
     zero_config_task: Option<JoinHandle<()>>,
+    local_lan_info: Option<LocalLanGatewayInfo>,
+    local_lan_handle: Option<AxumServerHandle<SocketAddr>>,
+    local_lan_task: Option<JoinHandle<()>>,
 }
 
 impl RemoteGateway {
@@ -580,15 +610,149 @@ impl RemoteGateway {
         }
     }
 
+    /// Starts the pinned-certificate HTTPS/WSS Gateway used by paired devices
+    /// on the local network. The certificate is deterministically bound to the
+    /// Desktop identity and is accepted by mobile only after encrypted pairing.
+    pub async fn start_local_lan_gateway(&self, port: u16) -> VibexResult<LocalLanGatewayInfo> {
+        let _lifecycle_guard = self.inner.lifecycle_guard.lock().await;
+        if let Some(info) = self.local_lan_gateway_info() {
+            return Ok(info);
+        }
+
+        let identity = self.identity()?;
+        let tls_identity = derive_local_lan_tls_identity(&identity)?;
+        let listener =
+            std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).map_err(|error| {
+                VibexError::process(
+                    "remote_local_lan_listener_bind_failed",
+                    "local LAN Gateway could not bind its HTTPS listener",
+                )
+                .with_diagnostic("errorKind", format!("{:?}", error.kind()))
+            })?;
+        listener.set_nonblocking(true).map_err(|error| {
+            VibexError::process(
+                "remote_local_lan_listener_config_failed",
+                "local LAN Gateway listener could not be configured",
+            )
+            .with_diagnostic("errorKind", format!("{:?}", error.kind()))
+        })?;
+        let bound_addr = listener.local_addr().map_err(|error| {
+            VibexError::process(
+                "remote_local_lan_listener_addr_failed",
+                "local LAN Gateway listener address is unavailable",
+            )
+            .with_diagnostic("errorKind", format!("{:?}", error.kind()))
+        })?;
+        let route_origin = format!(
+            "https://{REMOTE_LOCAL_LAN_TLS_HOSTNAME}:{}",
+            bound_addr.port()
+        );
+        let mut config = self.current_config();
+        config.service.enabled = true;
+        config.service.bind_addr = bound_addr.to_string();
+        config.deployment_mode = RemoteGatewayDeploymentMode::Lan;
+        config.tls_policy = RemoteGatewayTlsPolicy::PinnedCertificate;
+        config.allowed_hosts = vec![REMOTE_LOCAL_LAN_TLS_HOSTNAME.to_string()];
+        config.allowed_origins = vec![route_origin];
+        let router = self.router_with_config(config)?;
+        let tls_config = RustlsConfig::from_der(
+            vec![tls_identity.certificate_der],
+            tls_identity.private_key_der,
+        )
+        .await
+        .map_err(|_| {
+            VibexError::process(
+                "remote_local_lan_tls_config_failed",
+                "local LAN Gateway TLS configuration could not be initialized",
+            )
+        })?;
+        let handle = AxumServerHandle::new();
+        let task_handle = handle.clone();
+        let server = axum_server::from_tcp_rustls(listener, tls_config).map_err(|error| {
+            VibexError::process(
+                "remote_local_lan_listener_config_failed",
+                "local LAN Gateway HTTPS server could not be initialized",
+            )
+            .with_diagnostic("errorKind", format!("{:?}", error.kind()))
+        })?;
+        let task = tokio::spawn(async move {
+            let _ = server
+                .handle(task_handle)
+                .serve(router.into_make_service())
+                .await;
+        });
+        let info = LocalLanGatewayInfo {
+            bound_addr,
+            tls_certificate_base64: tls_identity.certificate_base64,
+        };
+        let mut lifecycle = self
+            .inner
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        lifecycle.local_lan_info = Some(info.clone());
+        lifecycle.local_lan_handle = Some(handle);
+        lifecycle.local_lan_task = Some(task);
+        Ok(info)
+    }
+
+    pub fn local_lan_gateway_info(&self) -> Option<LocalLanGatewayInfo> {
+        self.inner.lifecycle.lock().ok().and_then(|lifecycle| {
+            lifecycle
+                .local_lan_task
+                .as_ref()
+                .is_some_and(|task| !task.is_finished())
+                .then(|| lifecycle.local_lan_info.clone())
+                .flatten()
+        })
+    }
+
+    pub async fn stop_local_lan_gateway(&self) {
+        let _lifecycle_guard = self.inner.lifecycle_guard.lock().await;
+        self.stop_local_lan_gateway_locked().await;
+    }
+
+    async fn stop_local_lan_gateway_locked(&self) {
+        let (handle, task) = {
+            let mut lifecycle = self
+                .inner
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            lifecycle.local_lan_info = None;
+            (
+                lifecycle.local_lan_handle.take(),
+                lifecycle.local_lan_task.take(),
+            )
+        };
+        if let Some(handle) = handle {
+            handle.graceful_shutdown(Some(Duration::from_secs(3)));
+        }
+        if let Some(mut task) = task
+            && tokio::time::timeout(Duration::from_secs(4), &mut task)
+                .await
+                .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
     /// Starts the isolated zero-configuration LAN bootstrap listener. The
-    /// listener only exposes the encrypted pairing endpoints below; it never
-    /// serves the normal RemoteGateway router or becomes a long-term route.
+    /// listener exposes only encrypted pairing endpoints and provisions the
+    /// already-running pinned-TLS local LAN Gateway as the long-term route.
     pub async fn start_zero_config_lan_pairing(
         &self,
         permission_level: RemoteDevicePermissionLevel,
         ttl_ms: u32,
     ) -> VibexResult<RemoteLanPairingWindowSnapshot> {
         let _lifecycle_guard = self.inner.lifecycle_guard.lock().await;
+        if self.local_lan_gateway_info().is_none() {
+            return Err(VibexError::capability(
+                "remote_local_lan_gateway_unavailable",
+                "zero-config pairing requires the local LAN Gateway",
+            ));
+        }
         {
             let mut lifecycle = self
                 .inner
@@ -690,24 +854,38 @@ impl RemoteGateway {
             direct_candidates: Vec::new(),
             relay_candidate: None,
         };
-        let routes = self
+        let mut routes = self
             .inner
             .pairing_routes
             .lock()
             .map_err(|_| gateway_state_error())?
             .clone();
-        if routes.is_empty() {
-            return Err(VibexError::capability(
-                "remote_zero_config_pairing_routes_unavailable",
-                "zero-config LAN pairing requires an enabled remote connection route",
-            ));
-        }
-        create_pairing_offer_with_routes(
-            &connection,
-            &identity,
-            request,
-            &self.inner.pairing_routes,
-        )
+        let local = self.local_lan_gateway_info().ok_or_else(|| {
+            VibexError::capability(
+                "remote_local_lan_gateway_unavailable",
+                "zero-config pairing requires the local LAN Gateway",
+            )
+        })?;
+        let local_url = format!(
+            "https://{REMOTE_LOCAL_LAN_TLS_HOSTNAME}:{}",
+            local.bound_addr.port()
+        );
+        routes
+            .direct_candidates
+            .retain(|candidate| candidate.url != local_url);
+        routes.direct_candidates.insert(
+            0,
+            RemotePairingCandidate {
+                transport: RemotePairingTransport::Direct,
+                url: local_url,
+                relay_room_id: None,
+                relay_pc_peer_id: None,
+                relay_pc_public_key: None,
+            },
+        );
+        routes.direct_candidates.truncate(8);
+        let routes = Arc::new(Mutex::new(routes));
+        create_pairing_offer_with_routes(&connection, &identity, request, &routes)
     }
 
     pub fn zero_config_lan_pairing_window_status(
@@ -1031,6 +1209,7 @@ impl RemoteGateway {
             zero_config_lan_pairing: self.inner.zero_config_lan_pairing.clone(),
             zero_config_lan_sessions: self.inner.zero_config_lan_sessions.clone(),
             lan_pairing_requests: self.inner.lan_pairing_requests.clone(),
+            local_lan_info: self.local_lan_gateway_info(),
             session_epoch: context.session_epoch,
         };
         let auth = RemoteAuthContext {
@@ -1432,6 +1611,7 @@ impl RemoteGateway {
                 zero_config_lan_pairing: self.inner.zero_config_lan_pairing.clone(),
                 zero_config_lan_sessions: self.inner.zero_config_lan_sessions.clone(),
                 lan_pairing_requests: self.inner.lan_pairing_requests.clone(),
+                local_lan_info: self.local_lan_gateway_info(),
                 session_epoch: context.session_epoch,
             },
             WsTicketRecord {
@@ -1484,6 +1664,7 @@ impl RemoteGateway {
             zero_config_lan_pairing: self.inner.zero_config_lan_pairing.clone(),
             zero_config_lan_sessions: self.inner.zero_config_lan_sessions.clone(),
             lan_pairing_requests: self.inner.lan_pairing_requests.clone(),
+            local_lan_info: self.local_lan_gateway_info(),
             session_epoch: epoch,
         }))
     }
@@ -1505,6 +1686,7 @@ impl RemoteGateway {
             zero_config_lan_pairing: self.inner.zero_config_lan_pairing.clone(),
             zero_config_lan_sessions: self.inner.zero_config_lan_sessions.clone(),
             lan_pairing_requests: self.inner.lan_pairing_requests.clone(),
+            local_lan_info: self.local_lan_gateway_info(),
             session_epoch: epoch,
         }))
     }
@@ -1560,6 +1742,7 @@ impl RemoteGateway {
         self.cancel_lan_pairing_window()?;
         self.cancel_zero_config_lan_pairing().await?;
         let _guard = self.inner.lifecycle_guard.lock().await;
+        self.stop_local_lan_gateway_locked().await;
         self.inner.registry.disconnect_all(RemoteCloseReason {
             code: RemoteCloseCode::ServerShutdown,
             message: "RemoteGateway is shutting down".to_string(),
@@ -1717,6 +1900,11 @@ impl Drop for RemoteGatewayInner {
         {
             task.abort();
         }
+        if let Ok(lifecycle) = self.lifecycle.get_mut()
+            && let Some(task) = lifecycle.local_lan_task.take()
+        {
+            task.abort();
+        }
     }
 }
 
@@ -1735,6 +1923,7 @@ struct GatewayState {
     zero_config_lan_pairing: Arc<LanPairingCoordinator>,
     zero_config_lan_sessions: Arc<Mutex<HashMap<RelaySessionId, ZeroConfigLanSession>>>,
     lan_pairing_requests: Arc<Semaphore>,
+    local_lan_info: Option<LocalLanGatewayInfo>,
     session_epoch: u64,
 }
 
@@ -1883,11 +2072,24 @@ async fn zero_config_pairing_hello(
         Ok(discovery) => discovery,
         Err(error) => return protocol_error_response(status_for_error(&error), error),
     };
-    let (accepted, session) =
-        match establish_server_session(&state.identity, discovery, hello, unix_timestamp_ms()) {
-            Ok(value) => value,
-            Err(error) => return protocol_error_response(status_for_error(&error), error),
-        };
+    let session_result = match state.local_lan_info.as_ref() {
+        Some(local) => establish_server_session(
+            &state.identity,
+            discovery,
+            local.bound_addr.port(),
+            local.tls_certificate_base64.clone(),
+            hello,
+            unix_timestamp_ms(),
+        ),
+        None => Err(VibexError::capability(
+            "remote_local_lan_gateway_unavailable",
+            "zero-config pairing requires the local LAN Gateway",
+        )),
+    };
+    let (accepted, session) = match session_result {
+        Ok(value) => value,
+        Err(error) => return protocol_error_response(status_for_error(&error), error),
+    };
     match state.zero_config_lan_sessions.lock() {
         Ok(mut sessions) => {
             sessions.retain(|_, session| session.expires_at_ms > unix_timestamp_ms());
@@ -2069,6 +2271,7 @@ async fn gateway_info(State(state): State<GatewayState>) -> Response {
         "tlsPolicy": match state.config.tls_policy {
             RemoteGatewayTlsPolicy::LoopbackHttp => "loopback_http",
             RemoteGatewayTlsPolicy::TrustedHttpsProxy => "trusted_https_proxy",
+            RemoteGatewayTlsPolicy::PinnedCertificate => "pinned_certificate",
         },
         "sessionEpoch": state.session_epoch,
         "enabledFeatures": gateway_features(&state),
@@ -4295,6 +4498,12 @@ fn validate_perimeter_request(
         .headers()
         .get(HOST)
         .and_then(|value| value.to_str().ok())
+        .or_else(|| {
+            request
+                .uri()
+                .authority()
+                .map(|authority| authority.as_str())
+        })
         .ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,
@@ -4313,12 +4522,16 @@ fn validate_perimeter_request(
             ),
         )
     })?;
-    let host_allowed = state
-        .config
-        .allowed_hosts
-        .iter()
-        .filter_map(|allowed| normalize_host(allowed))
-        .any(|allowed| allowed == host);
+    let host_allowed = if state.config.tls_policy == RemoteGatewayTlsPolicy::PinnedCertificate {
+        is_local_lan_host(&host)
+    } else {
+        state
+            .config
+            .allowed_hosts
+            .iter()
+            .filter_map(|allowed| normalize_host(allowed))
+            .any(|allowed| allowed == host)
+    };
     if !host_allowed {
         return Err((
             StatusCode::MISDIRECTED_REQUEST,
@@ -4383,7 +4596,9 @@ fn origin_allowed(config: &RemoteGatewayConfig, origin: &str, request_host: &str
     });
     let scheme_allowed = match config.tls_policy {
         RemoteGatewayTlsPolicy::LoopbackHttp => matches!(url.scheme(), "http" | "https"),
-        RemoteGatewayTlsPolicy::TrustedHttpsProxy => url.scheme() == "https",
+        RemoteGatewayTlsPolicy::TrustedHttpsProxy | RemoteGatewayTlsPolicy::PinnedCertificate => {
+            url.scheme() == "https"
+        }
     };
     if !scheme_allowed {
         return false;
@@ -4454,6 +4669,17 @@ fn normalize_host(value: &str) -> Option<String> {
 fn is_loopback_host(host: &str) -> bool {
     host.parse::<IpAddr>()
         .is_ok_and(|address| address.is_loopback())
+}
+
+fn is_local_lan_host(host: &str) -> bool {
+    host.parse::<IpAddr>().is_ok_and(|address| match address {
+        IpAddr::V4(address) => {
+            address.is_loopback() || address.is_private() || address.is_link_local()
+        }
+        IpAddr::V6(address) => {
+            address.is_loopback() || address.is_unique_local() || address.is_unicast_link_local()
+        }
+    })
 }
 
 fn validate_origin_value(origin: &str) -> VibexResult<()> {
@@ -5537,13 +5763,14 @@ mod tests {
             relay_pc_public_key: None,
         }];
         let gateway = test_gateway(&directory, config);
+        gateway.start_local_lan_gateway(0).await.unwrap();
         let window = gateway
             .start_zero_config_lan_pairing(RemoteDevicePermissionLevel::ReadOnly, 60_000)
             .await
             .unwrap();
         let address = gateway.zero_config_lan_pairing_listener_addr().unwrap();
         let origin = format!("http://127.0.0.1:{}", address.port());
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
 
         let client_keypair = RelayKeypair::generate();
         let client_peer_id = RelayPeerId::new();
@@ -5585,7 +5812,11 @@ mod tests {
                 remote_peer_id: accepted.server_peer_id,
             },
             RelayCryptoSuite::DirectionalV2,
-            Some(&client_nonce),
+            Some(&vibex_core::remote_zero_config_lan_session_context(
+                &client_nonce,
+                accepted.lan_gateway_port,
+                &accepted.lan_gateway_tls_certificate,
+            )),
         )
         .unwrap();
         let device_secret = StaticSecret::random_from_rng(OsRng);
@@ -5697,19 +5928,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_config_pairing_requires_an_existing_long_term_route() {
+    async fn zero_config_pairing_uses_local_gateway_without_an_existing_route() {
         let directory = tempfile::tempdir().unwrap();
         let gateway = test_gateway(
             &directory,
             RemoteGatewayConfig::loopback_enabled("127.0.0.1:0"),
         );
 
-        let error = gateway
+        let local = gateway.start_local_lan_gateway(0).await.unwrap();
+        let window = gateway
             .start_zero_config_lan_pairing(RemoteDevicePermissionLevel::ReadOnly, 60_000)
             .await
-            .unwrap_err();
-        assert_eq!(error.code, "remote_zero_config_pairing_routes_unavailable");
-        assert!(gateway.zero_config_lan_pairing_listener_addr().is_none());
+            .unwrap();
+        assert_eq!(
+            window.discovery.server_id,
+            gateway.identity().unwrap().server_id()
+        );
+        assert!(gateway.zero_config_lan_pairing_listener_addr().is_some());
+        assert_eq!(
+            gateway.local_lan_gateway_info().unwrap().bound_addr,
+            local.bound_addr
+        );
+        gateway.stop().await.unwrap();
     }
 
     #[tokio::test]
@@ -5921,6 +6161,7 @@ mod tests {
             zero_config_lan_pairing: gateway.inner.zero_config_lan_pairing.clone(),
             zero_config_lan_sessions: gateway.inner.zero_config_lan_sessions.clone(),
             lan_pairing_requests: gateway.inner.lan_pairing_requests.clone(),
+            local_lan_info: gateway.local_lan_gateway_info(),
             session_epoch: epoch,
         }
     }

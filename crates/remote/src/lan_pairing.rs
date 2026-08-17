@@ -535,7 +535,7 @@ fn validate_request_secret(secret: &str) -> VibexResult<()> {
         "LAN pairing request secret is invalid",
     )?;
     let encoded = secret
-        .rsplit_once('-')
+        .split_once('-')
         .map_or(secret, |(_, encoded)| encoded);
     if !URL_SAFE_NO_PAD
         .decode(encoded)
@@ -674,6 +674,13 @@ mod tests {
             request_secret: format!("secret-{}", URL_SAFE_NO_PAD.encode([11u8; 32])),
             idempotency_key: "idempotency-0123456789".into(),
         }
+    }
+
+    #[test]
+    fn request_secret_accepts_base64url_hyphens_after_the_prefix() {
+        let secret = format!("secret-{}", URL_SAFE_NO_PAD.encode([251u8; 32]));
+        assert!(secret.matches('-').count() > 1);
+        validate_request_secret(&secret).unwrap();
     }
 
     #[test]

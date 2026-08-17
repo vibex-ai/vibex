@@ -47,6 +47,7 @@ pub const REMOTE_ACCESS_SETTINGS_FILE: &str = "remote-access.json";
 pub const REMOTE_CONNECTIVITY_SCHEMA_VERSION: u16 = 1;
 pub const DIRECT_LOOPBACK_BIND_ADDR: &str = "127.0.0.1:1428";
 pub const DIRECT_LOOPBACK_TARGET: &str = "http://127.0.0.1:1428";
+pub const LOCAL_LAN_GATEWAY_PORT: u16 = 1429;
 pub const MAX_DIRECT_CANDIDATES: usize = 8;
 pub const TAILSCALE_DEFAULT_PORT: u16 = 443;
 pub const TAILSCALE_FALLBACK_PORTS: RangeInclusive<u16> = 8443..=8450;
@@ -267,6 +268,8 @@ impl Default for RelaySettings {
 pub struct RemoteConnectivitySettingsV1 {
     pub schema_version: u16,
     pub desired_enabled: bool,
+    #[serde(default)]
+    pub local_network_enabled: bool,
     pub generation: u64,
     pub tailscale: TailscaleSettings,
     pub direct: DirectSettings,
@@ -280,6 +283,7 @@ impl Default for RemoteConnectivitySettingsV1 {
         Self {
             schema_version: REMOTE_CONNECTIVITY_SCHEMA_VERSION,
             desired_enabled: false,
+            local_network_enabled: false,
             generation: 0,
             tailscale: TailscaleSettings::default(),
             direct: DirectSettings::default(),
@@ -304,7 +308,8 @@ impl RemoteConnectivitySettingsV1 {
                 "remote connectivity routes must target the fixed loopback Gateway",
             ));
         }
-        let any_desired = self.tailscale.desired_enabled
+        let any_desired = self.local_network_enabled
+            || self.tailscale.desired_enabled
             || self.direct.desired_enabled
             || self.relay.desired_enabled;
         if self.desired_enabled != any_desired {
@@ -1613,6 +1618,7 @@ struct ControllerInner {
     store: RemoteConnectivityStore,
     gateway: RemoteGateway,
     gateway_bind_addr: String,
+    local_lan_port: u16,
     relay: RelayClientRuntime,
     tailscale: Arc<dyn TailscalePublication>,
     direct_probe: Arc<dyn DirectPublicationProbe>,
@@ -1658,6 +1664,7 @@ impl RemoteConnectivityController {
             home,
             gateway,
             DIRECT_LOOPBACK_BIND_ADDR.to_string(),
+            LOCAL_LAN_GATEWAY_PORT,
             relay,
             PublicationAdapters {
                 tailscale: Arc::new(TailscaleCli::default()),
@@ -1682,6 +1689,7 @@ impl RemoteConnectivityController {
             home,
             gateway,
             DIRECT_LOOPBACK_BIND_ADDR.to_string(),
+            0,
             relay,
             PublicationAdapters {
                 tailscale,
@@ -1708,6 +1716,7 @@ impl RemoteConnectivityController {
             home,
             gateway,
             gateway_bind_addr,
+            0,
             relay,
             PublicationAdapters {
                 tailscale,
@@ -1724,6 +1733,7 @@ impl RemoteConnectivityController {
         home: impl AsRef<Path>,
         gateway: RemoteGateway,
         gateway_bind_addr: String,
+        local_lan_port: u16,
         relay: RelayClientRuntime,
         adapters: PublicationAdapters,
     ) -> VibexResult<Self> {
@@ -1741,6 +1751,7 @@ impl RemoteConnectivityController {
                 store,
                 gateway,
                 gateway_bind_addr,
+                local_lan_port,
                 relay,
                 tailscale: adapters.tailscale,
                 direct_probe: adapters.direct_probe,
@@ -1773,6 +1784,7 @@ impl RemoteConnectivityController {
     pub async fn snapshot(&self) -> RemoteConnectivitySnapshot {
         let state = self.inner.state.lock().await.clone();
         let gateway_status = self.inner.gateway.status();
+        let local_lan_info = self.inner.gateway.local_lan_gateway_info();
         let relay_status = self.inner.relay.get_status().await;
         let methods = RemoteConnectivityMethod::ALL
             .into_iter()
@@ -1818,6 +1830,7 @@ impl RemoteConnectivityController {
             schema_version: REMOTE_CONNECTIVITY_SCHEMA_VERSION,
             desired_enabled: state.settings.desired_enabled,
             running: gateway_status.running
+                || local_lan_info.is_some()
                 || relay_status.state == crate::RelayClientConnectionState::Connected,
             generation: state.settings.generation,
             methods,
@@ -1825,8 +1838,10 @@ impl RemoteConnectivityController {
             last_successful_pairing_entry: state.settings.last_successful_pairing_entry,
             direct_route_count,
             relay_connected: relay_status.state == crate::RelayClientConnectionState::Connected,
-            gateway_running: gateway_status.running,
-            gateway_bound_addr: gateway_status.bound_addr,
+            gateway_running: gateway_status.running || local_lan_info.is_some(),
+            gateway_bound_addr: gateway_status
+                .bound_addr
+                .or_else(|| local_lan_info.map(|info| info.bound_addr)),
         }
     }
 
@@ -1933,11 +1948,26 @@ impl RemoteConnectivityController {
         ttl_ms: u32,
     ) -> VibexResult<RemoteLanPairingWindowSnapshot> {
         let _operation = self.inner.operation.lock().await;
-        let snapshot = self
+        let was_local_network_enabled =
+            self.inner.state.lock().await.settings.local_network_enabled;
+        self.inner
+            .gateway
+            .start_local_lan_gateway(self.inner.local_lan_port)
+            .await?;
+        let snapshot = match self
             .inner
             .gateway
             .start_zero_config_lan_pairing(permission_level, ttl_ms)
-            .await?;
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                if !was_local_network_enabled {
+                    self.inner.gateway.stop_local_lan_gateway().await;
+                }
+                return Err(error);
+            }
+        };
         let local_port = self
             .inner
             .gateway
@@ -1961,7 +1991,29 @@ impl RemoteConnectivityController {
         };
         if let Err(error) = self.inner.zero_config_lan_advertiser.start(&advertisement) {
             let _ = self.inner.gateway.cancel_zero_config_lan_pairing().await;
+            if !was_local_network_enabled {
+                self.inner.gateway.stop_local_lan_gateway().await;
+            }
             return Err(error);
+        }
+        if !was_local_network_enabled {
+            let persist_result = {
+                let mut state = self.inner.state.lock().await;
+                let mut settings = state.settings.clone();
+                settings.local_network_enabled = true;
+                settings.desired_enabled = true;
+                settings.generation = settings.generation.saturating_add(1);
+                settings.updated_at_ms = unix_timestamp_ms();
+                persist_state(&self.inner.store, &settings).map(|()| {
+                    state.settings = settings;
+                })
+            };
+            if let Err(error) = persist_result {
+                let _ = self.inner.zero_config_lan_advertiser.stop();
+                let _ = self.inner.gateway.cancel_zero_config_lan_pairing().await;
+                self.inner.gateway.stop_local_lan_gateway().await;
+                return Err(error);
+            }
         }
         let controller = self.clone();
         let window_id = snapshot.discovery.window_id.clone();
@@ -2107,8 +2159,15 @@ impl RemoteConnectivityController {
         let tailscale_settings = state.settings.tailscale.clone();
         let direct_settings = state.settings.direct.clone();
         let relay_settings = state.settings.relay.clone();
+        let local_network_enabled = state.settings.local_network_enabled;
         drop(state);
 
+        if local_network_enabled {
+            self.inner
+                .gateway
+                .start_local_lan_gateway(self.inner.local_lan_port)
+                .await?;
+        }
         if tailscale_settings.desired_enabled {
             self.reconcile_tailscale(tailscale_settings).await;
         }
@@ -2689,10 +2748,19 @@ impl RemoteConnectivityController {
                 self.disable_method_inner(method).await?;
             }
         }
-        let mut state = self.inner.state.lock().await;
-        state.settings.desired_enabled = false;
-        persist_state(&self.inner.store, &state.settings)?;
-        drop(state);
+        {
+            let mut state = self.inner.state.lock().await;
+            let mut settings = state.settings.clone();
+            settings.local_network_enabled = false;
+            settings.desired_enabled = false;
+            settings.generation = settings.generation.saturating_add(1);
+            settings.updated_at_ms = unix_timestamp_ms();
+            persist_state(&self.inner.store, &settings)?;
+            state.settings = settings;
+        }
+        let _ = self.inner.zero_config_lan_advertiser.stop();
+        self.inner.gateway.cancel_zero_config_lan_pairing().await?;
+        self.inner.gateway.stop_local_lan_gateway().await;
         Ok(self.snapshot().await)
     }
 
@@ -2742,6 +2810,7 @@ impl RemoteConnectivityController {
         network_origins: Vec<String>,
         listener_enabled: bool,
     ) -> VibexResult<()> {
+        let local_network_enabled = self.inner.state.lock().await.settings.local_network_enabled;
         let previous = self.inner.gateway.current_config();
         if previous.pairing_routes != routes {
             let _ = self.inner.zero_config_lan_advertiser.stop();
@@ -2793,6 +2862,13 @@ impl RemoteConnectivityController {
             if was_running {
                 let _ = self.inner.gateway.start().await;
             }
+            if local_network_enabled {
+                let _ = self
+                    .inner
+                    .gateway
+                    .start_local_lan_gateway(self.inner.local_lan_port)
+                    .await;
+            }
             return Err(error);
         }
         if listener_enabled && let Err(error) = self.inner.gateway.start().await {
@@ -2805,6 +2881,12 @@ impl RemoteConnectivityController {
                 if was_running {
                     self.inner.gateway.start().await?;
                 }
+                if local_network_enabled {
+                    self.inner
+                        .gateway
+                        .start_local_lan_gateway(self.inner.local_lan_port)
+                        .await?;
+                }
                 Ok::<(), VibexError>(())
             }
             .await;
@@ -2816,6 +2898,12 @@ impl RemoteConnectivityController {
                 );
             }
             return Err(error);
+        }
+        if local_network_enabled {
+            self.inner
+                .gateway
+                .start_local_lan_gateway(self.inner.local_lan_port)
+                .await?;
         }
         self.stop_lan_advertiser_if_inactive();
         Ok(())
@@ -3232,7 +3320,8 @@ fn set_desired(
         RemoteConnectivityMethod::Direct => settings.direct.desired_enabled = desired,
         RemoteConnectivityMethod::SelfHostedRelay => settings.relay.desired_enabled = desired,
     }
-    settings.desired_enabled = settings.tailscale.desired_enabled
+    settings.desired_enabled = settings.local_network_enabled
+        || settings.tailscale.desired_enabled
         || settings.direct.desired_enabled
         || settings.relay.desired_enabled;
 }
@@ -3704,6 +3793,7 @@ mod tests {
             directory,
             gateway.clone(),
             gateway.current_config().service.bind_addr,
+            0,
             relay,
             PublicationAdapters {
                 tailscale: Arc::new(FakeTailscale::default()),
@@ -3762,6 +3852,17 @@ mod tests {
             use std::os::unix::fs::MetadataExt;
             assert_eq!(fs::metadata(store.path()).unwrap().mode() & 0o077, 0);
         }
+    }
+
+    #[test]
+    fn settings_without_local_network_flag_remain_backward_compatible() {
+        let encoded = serde_json::to_value(RemoteConnectivitySettingsV1::default()).unwrap();
+        let mut object = encoded.as_object().unwrap().clone();
+        object.remove("localNetworkEnabled");
+        let decoded: RemoteConnectivitySettingsV1 =
+            serde_json::from_value(serde_json::Value::Object(object)).unwrap();
+        assert!(!decoded.local_network_enabled);
+        decoded.validate().unwrap();
     }
 
     #[test]
@@ -4017,11 +4118,6 @@ mod tests {
             advertiser.clone(),
         )
         .await;
-        *direct.info.lock().unwrap() = Some(direct_info(&gateway));
-        controller
-            .enable_direct("https://desktop.example.test")
-            .await
-            .unwrap();
 
         let window = controller
             .start_zero_config_lan_pairing(RemoteDevicePermissionLevel::ReadOnly, 60_000)
@@ -4041,6 +4137,13 @@ mod tests {
             assert!(!encoded.contains("challenge"));
             assert!(!encoded.contains("requestSecret"));
         }
+        let persisted = controller.store().load().unwrap().unwrap();
+        assert!(persisted.local_network_enabled);
+        assert!(persisted.desired_enabled);
+        assert!(!persisted.direct.desired_enabled);
+        assert!(!persisted.tailscale.desired_enabled);
+        assert!(!persisted.relay.desired_enabled);
+        assert!(gateway.local_lan_gateway_info().is_some());
 
         controller.cancel_zero_config_lan_pairing().await.unwrap();
         assert!(advertiser.stop_calls.load(Ordering::SeqCst) >= 1);
@@ -4052,6 +4155,109 @@ mod tests {
                 .code,
             "remote_lan_pairing_window_unavailable"
         );
+        assert!(gateway.local_lan_gateway_info().is_some());
+        controller.disable_all().await.unwrap();
+        assert!(gateway.local_lan_gateway_info().is_none());
+    }
+
+    #[tokio::test]
+    async fn zero_config_pairing_persistence_failure_rolls_back_local_network_state() {
+        let _guard = CONTROLLER_TEST_LOCK.lock().await;
+        let directory = tempdir().unwrap();
+        let (controller, gateway) = test_controller_with_lan_advertiser(
+            directory.path(),
+            Arc::new(FakeDirectProbe::default()),
+            Arc::new(FakeLanAdvertiser::default()),
+            Arc::new(FakeZeroConfigLanAdvertiser::default()),
+        )
+        .await;
+        fs::create_dir(controller.store().path()).unwrap();
+
+        let error = controller
+            .start_zero_config_lan_pairing(RemoteDevicePermissionLevel::ReadOnly, 60_000)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, "remote_connectivity_settings_commit_failed");
+        let snapshot = controller.snapshot().await;
+        assert!(!snapshot.desired_enabled);
+        assert!(!snapshot.running);
+        assert!(gateway.local_lan_gateway_info().is_none());
+        assert!(gateway.zero_config_lan_pairing_listener_addr().is_none());
+    }
+
+    #[tokio::test]
+    async fn disable_all_persistence_failure_preserves_local_network_state() {
+        let _guard = CONTROLLER_TEST_LOCK.lock().await;
+        let directory = tempdir().unwrap();
+        let (controller, gateway) = test_controller_with_lan_advertiser(
+            directory.path(),
+            Arc::new(FakeDirectProbe::default()),
+            Arc::new(FakeLanAdvertiser::default()),
+            Arc::new(FakeZeroConfigLanAdvertiser::default()),
+        )
+        .await;
+        controller
+            .start_zero_config_lan_pairing(RemoteDevicePermissionLevel::ReadOnly, 60_000)
+            .await
+            .unwrap();
+        controller.cancel_zero_config_lan_pairing().await.unwrap();
+        fs::remove_file(controller.store().path()).unwrap();
+        fs::create_dir(controller.store().path()).unwrap();
+
+        let error = controller.disable_all().await.unwrap_err();
+
+        assert_eq!(error.code, "remote_connectivity_settings_commit_failed");
+        let snapshot = controller.snapshot().await;
+        assert!(snapshot.desired_enabled);
+        assert!(snapshot.running);
+        assert!(gateway.local_lan_gateway_info().is_some());
+
+        fs::remove_dir(controller.store().path()).unwrap();
+        controller.disable_all().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_restores_persisted_local_network_without_other_routes() {
+        let _guard = CONTROLLER_TEST_LOCK.lock().await;
+        let directory = tempdir().unwrap();
+        let first_direct = Arc::new(FakeDirectProbe::default());
+        let (first, first_gateway) = test_controller_with_lan_advertiser(
+            directory.path(),
+            first_direct,
+            Arc::new(FakeLanAdvertiser::default()),
+            Arc::new(FakeZeroConfigLanAdvertiser::default()),
+        )
+        .await;
+        first
+            .start_zero_config_lan_pairing(RemoteDevicePermissionLevel::ReadOnly, 60_000)
+            .await
+            .unwrap();
+        first.cancel_zero_config_lan_pairing().await.unwrap();
+        first_gateway.stop_local_lan_gateway().await;
+        drop(first);
+        drop(first_gateway);
+
+        let second_direct = Arc::new(FakeDirectProbe::default());
+        let (second, second_gateway) = test_controller_with_lan_advertiser(
+            directory.path(),
+            second_direct,
+            Arc::new(FakeLanAdvertiser::default()),
+            Arc::new(FakeZeroConfigLanAdvertiser::default()),
+        )
+        .await;
+        let snapshot = second.reconcile_on_startup().await.unwrap();
+
+        assert!(snapshot.desired_enabled);
+        assert!(snapshot.running);
+        assert!(second_gateway.local_lan_gateway_info().is_some());
+        assert!(
+            snapshot
+                .methods
+                .iter()
+                .all(|method| !method.desired_enabled)
+        );
+        second.disable_all().await.unwrap();
     }
 
     #[tokio::test]

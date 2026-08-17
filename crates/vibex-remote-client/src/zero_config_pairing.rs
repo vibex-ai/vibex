@@ -1,6 +1,7 @@
 #![cfg(not(target_family = "wasm"))]
 
 use std::fmt;
+use std::net::IpAddr;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -8,11 +9,13 @@ use rand_core::RngCore;
 use serde::de::DeserializeOwned;
 use vibex_backend::{BackendError, BackendResult};
 use vibex_core::{
-    REMOTE_ZERO_CONFIG_LAN_PAIRING_SCHEMA_VERSION, RelayEncryptedFrame, RelayFrameKind,
-    RelayPeerId, RelaySessionId, RemoteClaimPairingOfferResponse, RemoteLanPairingRequest,
-    RemoteLanPairingRequestAccepted, RemoteLanPairingStatusRequest, RemoteLanPairingStatusResponse,
-    RemotePairingOffer, RemoteZeroConfigLanPairingHello, RemoteZeroConfigLanPairingHelloAccepted,
-    RequestId, unix_timestamp_ms,
+    REMOTE_LOCAL_LAN_TLS_HOSTNAME, REMOTE_ZERO_CONFIG_LAN_PAIRING_SCHEMA_VERSION,
+    RelayEncryptedFrame, RelayFrameKind, RelayPeerId, RelaySessionId,
+    RemoteClaimPairingOfferResponse, RemoteLanPairingRequest, RemoteLanPairingRequestAccepted,
+    RemoteLanPairingStatusRequest, RemoteLanPairingStatusResponse, RemotePairingOffer,
+    RemotePairingTransport, RemoteZeroConfigLanPairingHello,
+    RemoteZeroConfigLanPairingHelloAccepted, RequestId, remote_zero_config_lan_session_context,
+    unix_timestamp_ms,
 };
 use vibex_relay::{RelayCryptoSuite, RelayKeypair, RelaySession, RelaySessionConfig};
 
@@ -24,11 +27,14 @@ const HELLO_PATH: &str = "/api/v2/pairing/lan-zero/hello";
 const REQUEST_PATH: &str = "/api/v2/pairing/lan-zero/request";
 const STATUS_PATH: &str = "/api/v2/pairing/lan-zero/status";
 const CLAIM_PATH: &str = "/api/v2/pairing/lan-zero/claim";
+const MAX_TLS_CERTIFICATE_BYTES: usize = 8 * 1024;
 
 pub struct ZeroConfigLanPairingSession {
     client: reqwest::Client,
     origin: String,
     server_identity_public_key: String,
+    local_network_url: String,
+    lan_gateway_tls_certificate: String,
     discovery: vibex_core::RemoteLanPairingDiscoverySummary,
     session_id: RelaySessionId,
     session: RelaySession,
@@ -48,6 +54,11 @@ impl fmt::Debug for ZeroConfigLanPairingSession {
             .field(
                 "server_identity_public_key",
                 &self.server_identity_public_key,
+            )
+            .field("local_network_url", &self.local_network_url)
+            .field(
+                "has_lan_gateway_tls_certificate",
+                &!self.lan_gateway_tls_certificate.is_empty(),
             )
             .field("session_id", &self.session_id)
             .field("request_id", &self.request_id)
@@ -109,6 +120,9 @@ impl ZeroConfigLanPairingSession {
         };
         let accepted: RemoteZeroConfigLanPairingHelloAccepted =
             http_json(client.post(endpoint_url(&origin, HELLO_PATH)?).json(&hello)).await?;
+        let lan_gateway_tls_certificate =
+            validate_tls_certificate(&accepted.lan_gateway_tls_certificate)?;
+        let local_network_url = local_gateway_origin(&origin, accepted.lan_gateway_port)?;
         if accepted.schema_version != REMOTE_ZERO_CONFIG_LAN_PAIRING_SCHEMA_VERSION
             || accepted.server_identity_public_key != expected_server_identity_public_key
             || accepted.server_id != expected_server_id
@@ -117,6 +131,7 @@ impl ZeroConfigLanPairingSession {
             || accepted.session_id.as_str().is_empty()
             || accepted.room_id.as_str().is_empty()
             || accepted.client_peer_id != client_peer_id
+            || accepted.lan_gateway_port == 0
         {
             return Err(BackendError::permission(
                 "remote_zero_config_pairing_identity_mismatch",
@@ -135,7 +150,11 @@ impl ZeroConfigLanPairingSession {
             &server_relay_public_key,
             session_config,
             RelayCryptoSuite::DirectionalV2,
-            Some(&hello.client_nonce),
+            Some(&remote_zero_config_lan_session_context(
+                &hello.client_nonce,
+                accepted.lan_gateway_port,
+                &lan_gateway_tls_certificate,
+            )),
         )
         .map_err(|_| {
             BackendError::permission(
@@ -178,6 +197,8 @@ impl ZeroConfigLanPairingSession {
             client,
             origin,
             server_identity_public_key: accepted.server_identity_public_key,
+            local_network_url,
+            lan_gateway_tls_certificate,
             discovery: accepted.discovery,
             session_id: accepted.session_id,
             session,
@@ -238,6 +259,24 @@ impl ZeroConfigLanPairingSession {
                 "zero-config LAN pairing offer identity did not match discovery",
             ));
         }
+        let expected_placeholder = placeholder_gateway_origin(&self.local_network_url)?;
+        if offer
+            .summary
+            .direct_candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.transport == RemotePairingTransport::Direct
+                    && url::Url::parse(&candidate.url)
+                        .is_ok_and(|url| url.origin().ascii_serialization() == expected_placeholder)
+            })
+            .count()
+            != 1
+        {
+            return Err(BackendError::permission(
+                "remote_zero_config_pairing_route_mismatch",
+                "zero-config LAN pairing offer did not match the encrypted local route",
+            ));
+        }
         let request = pairing_claim_request(
             &offer,
             &self.display_name,
@@ -266,6 +305,8 @@ impl ZeroConfigLanPairingSession {
             offer,
             response,
             identity: self.identity.clone(),
+            local_network_url: self.local_network_url.clone(),
+            lan_gateway_tls_certificate: self.lan_gateway_tls_certificate.clone(),
         })
     }
 }
@@ -274,6 +315,8 @@ pub struct ZeroConfigLanPairingClaim {
     pub offer: RemotePairingOffer,
     pub response: RemoteClaimPairingOfferResponse,
     pub identity: ClientDeviceIdentity,
+    pub local_network_url: String,
+    pub lan_gateway_tls_certificate: String,
 }
 
 async fn send_encrypted<T: serde::Serialize, R: DeserializeOwned>(
@@ -315,11 +358,71 @@ fn normalize_zero_config_origin(value: &str) -> BackendResult<String> {
         || url.path() != "/"
         || url.query().is_some()
         || url.fragment().is_some()
+        || !url
+            .host_str()
+            .and_then(|host| host.parse::<IpAddr>().ok())
+            .is_some_and(is_local_network_ip)
     {
         return Err(invalid_origin());
     }
     url.set_path("");
     Ok(url.origin().ascii_serialization())
+}
+
+fn local_gateway_origin(bootstrap_origin: &str, port: u16) -> BackendResult<String> {
+    if port == 0 {
+        return Err(BackendError::permission(
+            "remote_zero_config_pairing_route_invalid",
+            "zero-config LAN pairing returned an invalid local Gateway port",
+        ));
+    }
+    let mut url = url::Url::parse(bootstrap_origin).map_err(|_| invalid_origin())?;
+    url.set_scheme("https").map_err(|_| invalid_origin())?;
+    url.set_port(Some(port)).map_err(|_| invalid_origin())?;
+    url.set_path("");
+    Ok(url.origin().ascii_serialization())
+}
+
+fn placeholder_gateway_origin(local_network_url: &str) -> BackendResult<String> {
+    let url = url::Url::parse(local_network_url).map_err(|_| invalid_origin())?;
+    let port = url.port_or_known_default().ok_or_else(invalid_origin)?;
+    let placeholder = url::Url::parse(&format!("https://{REMOTE_LOCAL_LAN_TLS_HOSTNAME}:{port}"))
+        .map_err(|_| invalid_origin())?;
+    Ok(placeholder.origin().ascii_serialization())
+}
+
+fn validate_tls_certificate(encoded: &str) -> BackendResult<String> {
+    let max_encoded_len = MAX_TLS_CERTIFICATE_BYTES.saturating_mul(4).div_ceil(3);
+    let certificate = (encoded.len() <= max_encoded_len)
+        .then(|| URL_SAFE_NO_PAD.decode(encoded).ok())
+        .flatten()
+        .filter(|certificate| {
+            !certificate.is_empty() && certificate.len() <= MAX_TLS_CERTIFICATE_BYTES
+        })
+        .ok_or_else(|| {
+            BackendError::permission(
+                "remote_zero_config_pairing_route_invalid",
+                "zero-config LAN pairing returned an invalid local TLS certificate",
+            )
+        })?;
+    reqwest::Certificate::from_der(&certificate).map_err(|_| {
+        BackendError::permission(
+            "remote_zero_config_pairing_route_invalid",
+            "zero-config LAN pairing returned an invalid local TLS certificate",
+        )
+    })?;
+    Ok(encoded.to_string())
+}
+
+fn is_local_network_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            address.is_loopback() || address.is_private() || address.is_link_local()
+        }
+        IpAddr::V6(address) => {
+            address.is_loopback() || address.is_unique_local() || address.is_unicast_link_local()
+        }
+    }
 }
 
 fn endpoint_url(origin: &str, path: &str) -> BackendResult<url::Url> {
