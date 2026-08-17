@@ -3438,6 +3438,8 @@ pub struct VibexWorkbench {
     sidebar_state: SidebarState,
     sidebar_projection_revision: u64,
     sidebar_projection_cache: Option<SidebarProjectionCache>,
+    sidebar_scroll: gpui::ScrollHandle,
+    selected_session_scroll_anchor: gpui::ScrollAnchor,
     sidebar_batch_mode: bool,
     sidebar_renaming_session_id: Option<VibexSessionId>,
     sidebar_rename_error: Option<String>,
@@ -3928,6 +3930,8 @@ impl VibexWorkbench {
             collapsed_ids: ui_state.sidebar.collapsed_project_ids.clone(),
             selected_ids: Default::default(),
         };
+        let sidebar_scroll = gpui::ScrollHandle::new();
+        let selected_session_scroll_anchor = gpui::ScrollAnchor::for_handle(sidebar_scroll.clone());
         let selected_session_id = ui_state
             .workbench
             .selected_session_id
@@ -4026,6 +4030,8 @@ impl VibexWorkbench {
             sidebar_state,
             sidebar_projection_revision: 0,
             sidebar_projection_cache: None,
+            sidebar_scroll,
+            selected_session_scroll_anchor,
             sidebar_batch_mode: false,
             sidebar_renaming_session_id: None,
             sidebar_rename_error: None,
@@ -14342,6 +14348,25 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    fn locate_selected_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = self.selected_session().cloned() else {
+            return;
+        };
+        let revealed = reveal_sidebar_session(
+            &mut self.sidebar_state.collapsed_ids,
+            &mut self.ui_state.sidebar.collapsed_workspace_ids,
+            session.project_id.as_str(),
+            session.workspace_id.as_str(),
+            self.ui_state.sidebar.hierarchy_mode,
+        );
+        if revealed {
+            self.collapsed_project_restore = None;
+            self.queue_agent_ui_state();
+        }
+        self.selected_session_scroll_anchor.scroll_to(window, cx);
+        cx.notify();
+    }
+
     fn toggle_sidebar_hierarchy_mode(&mut self, cx: &mut Context<Self>) {
         self.ui_state.sidebar.hierarchy_mode = match self.ui_state.sidebar.hierarchy_mode {
             SidebarHierarchyMode::Compact => SidebarHierarchyMode::Detailed,
@@ -16227,6 +16252,24 @@ impl VibexWorkbench {
                                     })),
                             )
                             .child(
+                                Button::new("sidebar-locate-session")
+                                    .small()
+                                    .ghost()
+                                    .compact()
+                                    .w(px(28.0))
+                                    .h(px(28.0))
+                                    .icon(sidebar_icon("icons/vibex/crosshair.svg"))
+                                    .tooltip(locale::text(
+                                        "Locate Current Session",
+                                        "定位当前会话",
+                                        "定位目前工作階段",
+                                    ))
+                                    .disabled(self.selected_session_id.is_none())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.locate_selected_session(window, cx)
+                                    })),
+                            )
+                            .child(
                                 Button::new("sidebar-collapse-all")
                                     .small()
                                     .ghost()
@@ -16365,10 +16408,13 @@ impl VibexWorkbench {
             })
             .child(
                 v_flex()
+                    .id("sidebar-session-list")
                     .flex_1()
                     .min_h_0()
                     .gap_1()
-                    .overflow_y_scrollbar()
+                    .track_scroll(&self.sidebar_scroll)
+                    .overflow_y_scroll()
+                    .vertical_scrollbar(&self.sidebar_scroll)
                     .px_4()
                     .py_3()
                     .when(group_elements.is_empty(), |this| {
@@ -17167,6 +17213,7 @@ impl VibexWorkbench {
                             .child(locale::localize_error_message(&error)),
                     )
                 })
+                .anchor_scroll(selected.then(|| self.selected_session_scroll_anchor.clone()))
                 .into_any_element();
         }
 
@@ -17267,6 +17314,7 @@ impl VibexWorkbench {
             .min_h(px(32.0))
             .w_full()
             .min_w_0()
+            .anchor_scroll(selected.then(|| self.selected_session_scroll_anchor.clone()))
             .rounded(px(8.0))
             .bg(if active_drop_after.is_some() {
                 cx.theme().tokens.drop_target.into()
@@ -29397,6 +29445,19 @@ fn toggle_sidebar_project_collapse_all(
     }
 }
 
+fn reveal_sidebar_session(
+    collapsed_project_ids: &mut BTreeSet<String>,
+    collapsed_workspace_ids: &mut BTreeSet<String>,
+    project_id: &str,
+    workspace_id: &str,
+    hierarchy_mode: SidebarHierarchyMode,
+) -> bool {
+    let project_revealed = collapsed_project_ids.remove(project_id);
+    let workspace_revealed = hierarchy_mode == SidebarHierarchyMode::Detailed
+        && collapsed_workspace_ids.remove(workspace_id);
+    project_revealed || workspace_revealed
+}
+
 fn sidebar_selection_indicator(state: SidebarSelectionState, cx: &App) -> AnyElement {
     div()
         .size(px(14.0))
@@ -41252,6 +41313,76 @@ mod tests {
             ["workspace-a"].into_iter().map(str::to_string).collect()
         );
         assert_eq!(restore_snapshot, None);
+    }
+
+    #[test]
+    fn locating_a_session_reveals_the_required_sidebar_ancestors() {
+        let mut collapsed_projects = ["project-a", "project-b"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        let mut collapsed_workspaces = ["workspace-a", "workspace-b"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+
+        assert!(reveal_sidebar_session(
+            &mut collapsed_projects,
+            &mut collapsed_workspaces,
+            "project-a",
+            "workspace-a",
+            SidebarHierarchyMode::Compact,
+        ));
+        assert!(!collapsed_projects.contains("project-a"));
+        assert!(collapsed_workspaces.contains("workspace-a"));
+
+        collapsed_projects.insert("project-a".into());
+        assert!(reveal_sidebar_session(
+            &mut collapsed_projects,
+            &mut collapsed_workspaces,
+            "project-a",
+            "workspace-a",
+            SidebarHierarchyMode::Detailed,
+        ));
+        assert!(!collapsed_projects.contains("project-a"));
+        assert!(!collapsed_workspaces.contains("workspace-a"));
+        assert!(collapsed_projects.contains("project-b"));
+        assert!(collapsed_workspaces.contains("workspace-b"));
+    }
+
+    #[test]
+    fn sidebar_locate_button_targets_the_selected_session_row() {
+        let source = include_str!("app.rs");
+        let sidebar = source
+            .split_once("    fn render_agent_sidebar(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn build_sidebar_project_menu("))
+            .map(|(body, _)| body)
+            .expect("sidebar renderer should remain inspectable");
+        let batch = sidebar
+            .find("Button::new(\"sidebar-toggle-batch\")")
+            .expect("batch control should exist");
+        let locate = sidebar
+            .find("Button::new(\"sidebar-locate-session\")")
+            .expect("locate control should exist");
+        let collapse = sidebar
+            .find("Button::new(\"sidebar-collapse-all\")")
+            .expect("collapse control should exist");
+
+        assert!(batch < locate && locate < collapse);
+        assert!(sidebar.contains("icons/vibex/crosshair.svg"));
+        assert!(sidebar.contains(".disabled(self.selected_session_id.is_none())"));
+        assert!(sidebar.contains("this.locate_selected_session(window, cx)"));
+        assert!(sidebar.contains(".track_scroll(&self.sidebar_scroll)"));
+        assert!(sidebar.contains(".vertical_scrollbar(&self.sidebar_scroll)"));
+
+        let session = source
+            .split_once("    fn render_sidebar_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_new_session_panel("))
+            .map(|(body, _)| body)
+            .expect("sidebar session renderer should remain inspectable");
+        assert!(session.contains(
+            ".anchor_scroll(selected.then(|| self.selected_session_scroll_anchor.clone()))"
+        ));
     }
 
     #[test]
