@@ -1,6 +1,7 @@
 use std::sync::OnceLock;
 
 use vibex_desktop_model::LocaleMode;
+use vibex_ui::locale::Locale as SharedLocale;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolvedLocale {
@@ -174,24 +175,11 @@ pub fn resolve_locale(mode: LocaleMode, system_locale: Option<&str>) -> Resolved
         LocaleMode::En => ResolvedLocale::En,
         LocaleMode::ZhCn => ResolvedLocale::ZhCn,
         LocaleMode::ZhTw => ResolvedLocale::ZhTw,
-        LocaleMode::System => {
-            let locale = system_locale
-                .unwrap_or_default()
-                .trim()
-                .to_ascii_lowercase()
-                .replace('_', "-");
-            if locale.starts_with("zh-tw")
-                || locale.starts_with("zh-hk")
-                || locale.starts_with("zh-mo")
-                || locale.contains("hant")
-            {
-                ResolvedLocale::ZhTw
-            } else if locale.starts_with("zh") {
-                ResolvedLocale::ZhCn
-            } else {
-                ResolvedLocale::En
-            }
-        }
+        LocaleMode::System => match SharedLocale::from_system_tag(system_locale) {
+            SharedLocale::En => ResolvedLocale::En,
+            SharedLocale::ZhCn => ResolvedLocale::ZhCn,
+            SharedLocale::ZhTw => ResolvedLocale::ZhTw,
+        },
     }
 }
 
@@ -1436,12 +1424,16 @@ pub fn system_locale() -> Option<String> {
     static SYSTEM_LOCALE: OnceLock<Option<String>> = OnceLock::new();
     SYSTEM_LOCALE
         .get_or_init(|| {
-            ["LC_ALL", "LC_MESSAGES", "LANG"]
-                .into_iter()
-                .find_map(|key| {
-                    std::env::var(key)
-                        .ok()
-                        .filter(|value| !value.trim().is_empty())
+            sys_locale::get_locale()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    ["LC_ALL", "LC_MESSAGES", "LANG"]
+                        .into_iter()
+                        .find_map(|key| {
+                            std::env::var(key)
+                                .ok()
+                                .filter(|value| !value.trim().is_empty())
+                        })
                 })
                 .or_else(|| {
                     let locale = gpui_component::locale().to_string();

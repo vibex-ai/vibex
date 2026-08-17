@@ -26,6 +26,7 @@ use vibex_ui::{
 };
 
 use crate::input::TextInput;
+use crate::locale;
 use crate::theme;
 
 const TERMINAL_OUTPUT_LIMIT: usize = 64 * 1024;
@@ -58,6 +59,10 @@ impl WorkbenchSurface {
             Self::Providers => "Providers",
             Self::Runtime => "Runtime",
         }
+    }
+
+    pub fn localized_label(self) -> &'static str {
+        locale::common(self.label())
     }
 }
 
@@ -124,10 +129,17 @@ impl MobileWorkbench {
             git,
             terminal,
             management,
-            file_search_input: cx.new(|cx| TextInput::new("Search files", cx)),
-            file_editor_input: cx.new(|cx| TextInput::new("File content", cx).multiline()),
-            git_commit_input: cx.new(|cx| TextInput::new("Commit message", cx)),
-            terminal_input: cx.new(|cx| TextInput::new("Type a command", cx)),
+            file_search_input: cx
+                .new(|cx| TextInput::new(locale::text("Search files", "搜索文件", "搜尋檔案"), cx)),
+            file_editor_input: cx.new(|cx| {
+                TextInput::new(locale::text("File content", "文件内容", "檔案內容"), cx).multiline()
+            }),
+            git_commit_input: cx.new(|cx| {
+                TextInput::new(locale::text("Commit message", "提交消息", "提交訊息"), cx)
+            }),
+            terminal_input: cx.new(|cx| {
+                TextInput::new(locale::text("Type a command", "输入命令", "輸入命令"), cx)
+            }),
             file_editor_path: None,
             git_diff: None,
             git_commit_confirmation: false,
@@ -349,7 +361,7 @@ impl MobileWorkbench {
                 this.busy = false;
                 this.error = this.files.state.last_error.clone();
                 if this.error.is_none() {
-                    this.notice = Some("File saved on desktop".to_string());
+                    this.notice = Some(locale::common("File saved on desktop").to_string());
                 }
                 cx.notify();
             });
@@ -362,7 +374,11 @@ impl MobileWorkbench {
         if !self.files.state.reload_server_version() {
             self.error = Some(BackendError::conflict(
                 "mobile_file_conflict_version_unavailable",
-                "the desktop conflict version is no longer available",
+                locale::text(
+                    "The desktop conflict version is no longer available.",
+                    "桌面端的冲突版本已不可用。",
+                    "桌面版的衝突版本已無法使用。",
+                ),
             ));
             cx.notify();
             return;
@@ -372,7 +388,7 @@ impl MobileWorkbench {
                 .update(cx, |input, cx| input.set_text(content, cx));
         }
         self.error = None;
-        self.notice = Some("Desktop file version loaded".to_string());
+        self.notice = Some(locale::common("Desktop file version loaded").to_string());
         cx.notify();
     }
 
@@ -493,7 +509,7 @@ impl MobileWorkbench {
                     this.git_commit_input.update(cx, |input, cx| {
                         let _ = input.take(cx);
                     });
-                    this.notice = Some("Commit created on desktop".to_string());
+                    this.notice = Some(locale::common("Commit created on desktop").to_string());
                     this.refresh_git(cx);
                 }
                 cx.notify();
@@ -528,7 +544,7 @@ impl MobileWorkbench {
     fn create_terminal(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         let request = MutationRequest::new(TerminalCreateRequest {
             workspace_id: self.workspace_id.clone(),
-            title: Some("Mobile terminal".to_string()),
+            title: Some(locale::text("Mobile terminal", "移动端终端", "行動端終端機").to_string()),
             shell: None,
             cwd: None,
             rows: 24,
@@ -690,7 +706,10 @@ impl MobileWorkbench {
                 this.busy = false;
                 this.error = this.terminal.state.last_error.clone();
                 if this.error.is_none() {
-                    this.notice = Some(format!("Terminal resized to {cols} x {rows}"));
+                    this.notice = Some(format!(
+                        "{} {cols} x {rows}",
+                        locale::text("Terminal resized to", "终端已调整为", "終端機已調整為")
+                    ));
                     if let Some(terminal_id) = this
                         .terminal
                         .state
@@ -835,7 +854,11 @@ impl MobileWorkbench {
         {
             self.error = Some(BackendError::conflict(
                 "mobile_terminal_close_target_changed",
-                "the selected terminal changed before close confirmation",
+                locale::text(
+                    "The selected terminal changed before close confirmation.",
+                    "确认关闭前，所选终端已发生变化。",
+                    "確認關閉前，所選終端機已變更。",
+                ),
             ));
             cx.notify();
             return;
@@ -936,7 +959,9 @@ impl MobileWorkbench {
                         this.management = controller;
                         this.error = result.err();
                         if this.error.is_none() {
-                            this.notice = Some("Provider health probes completed".to_string());
+                            this.notice = Some(
+                                locale::common("Provider health probes completed").to_string(),
+                            );
                         }
                     }
                     Err(_) => this.error = Some(background_task_error()),
@@ -1025,7 +1050,7 @@ impl MobileWorkbench {
             .map(|feature| {
                 let value = config_values.get(&feature.id).cloned().unwrap_or_default();
                 let input = cx.new(|cx| {
-                    let mut input = TextInput::new("Value", cx);
+                    let mut input = TextInput::new(locale::common("Value"), cx);
                     input.set_text(value, cx);
                     input
                 });
@@ -1129,7 +1154,8 @@ impl MobileWorkbench {
                         this.runtime_draft = Some(state.desired.clone());
                         this.runtime_state = Some(state);
                         this.sync_runtime_feature_inputs(cx);
-                        this.notice = Some("Runtime selection sent to desktop".to_string());
+                        this.notice =
+                            Some(locale::common("Runtime selection sent to desktop").to_string());
                         this.error = None;
                     }
                     Err(error) => this.error = Some(error),
@@ -1381,10 +1407,12 @@ impl MobileWorkbench {
             .unwrap_or_default();
         let summary = status.as_ref().map(|status| {
             format!(
-                "{}  {} staged  {} unstaged",
+                "{}  {} {}  {} {}",
                 status.branch.as_deref().unwrap_or("detached"),
                 status.staged_count,
-                status.unstaged_count
+                locale::text("staged", "已暂存", "已暫存"),
+                status.unstaged_count,
+                locale::text("unstaged", "未暂存", "未暫存"),
             )
         });
 
@@ -1401,7 +1429,9 @@ impl MobileWorkbench {
                     .border_color(theme::border_subtle())
                     .text_size(px(theme::FONT_CAPTION))
                     .text_color(theme::text_muted())
-                    .child(summary.unwrap_or_else(|| "Loading repository status...".to_string())),
+                    .child(summary.unwrap_or_else(|| {
+                        locale::common("Loading repository status...").to_string()
+                    })),
             )
             .child(
                 div()
@@ -1475,7 +1505,11 @@ impl MobileWorkbench {
                                         .gap_2()
                                         .text_size(px(theme::FONT_CAPTION))
                                         .text_color(theme::text_secondary())
-                                        .child("Commit the currently staged changes?")
+                                        .child(locale::text(
+                                            "Commit the currently staged changes?",
+                                            "提交当前已暂存的更改？",
+                                            "提交目前已暫存的變更？",
+                                        ))
                                         .child(
                                             div()
                                                 .flex()
@@ -1585,17 +1619,22 @@ impl MobileWorkbench {
             )
             .when(change.unstaged && can_stage, |row| {
                 row.child(
-                    compact_action(format!("stage:{}", stage_path), "Stage").on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            this.mutate_git_path(stage_path.clone(), true, cx)
-                        }),
-                    ),
+                    compact_action(format!("stage:{}", stage_path), locale::common("Stage"))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.mutate_git_path(stage_path.clone(), true, cx)
+                            }),
+                        ),
                 )
             })
             .when(change.staged && can_unstage, |row| {
                 row.child(
-                    compact_action(format!("unstage:{}", unstage_path), "Unstage").on_mouse_up(
+                    compact_action(
+                        format!("unstage:{}", unstage_path),
+                        locale::common("Unstage"),
+                    )
+                    .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
                             this.mutate_git_path(unstage_path.clone(), false, cx)
@@ -1688,7 +1727,11 @@ impl MobileWorkbench {
                         .gap_2()
                         .text_size(px(theme::FONT_CAPTION))
                         .text_color(theme::text_secondary())
-                        .child("Close this terminal and stop its running process?")
+                        .child(locale::text(
+                            "Close this terminal and stop its running process?",
+                            "关闭此终端并停止正在运行的进程？",
+                            "關閉此終端機並停止正在執行的程序？",
+                        ))
                         .child(
                             div()
                                 .flex()
@@ -2160,7 +2203,9 @@ impl MobileWorkbench {
                         self.runtime_state
                             .as_ref()
                             .map(|state| format!("{:?}", state.status))
-                            .unwrap_or_else(|| "Select an Agent session first".to_string()),
+                            .unwrap_or_else(|| {
+                                locale::common("Select an Agent session first").to_string()
+                            }),
                     ),
             )
             .child(
@@ -2377,18 +2422,20 @@ impl MobileWorkbench {
             .cloned();
         let values = match feature.kind {
             SessionRuntimeFeatureKind::Toggle => vec![
-                ("Default".to_string(), None),
-                ("On".to_string(), Some("true".to_string())),
-                ("Off".to_string(), Some("false".to_string())),
+                (locale::common("Default").to_string(), None),
+                (locale::common("On").to_string(), Some("true".to_string())),
+                (locale::common("Off").to_string(), Some("false".to_string())),
             ],
-            SessionRuntimeFeatureKind::Select => std::iter::once(("Default".to_string(), None))
-                .chain(feature.values.iter().map(|value| {
-                    (
-                        value.label.clone().unwrap_or_else(|| value.value.clone()),
-                        Some(value.value.clone()),
-                    )
-                }))
-                .collect(),
+            SessionRuntimeFeatureKind::Select => {
+                std::iter::once((locale::common("Default").to_string(), None))
+                    .chain(feature.values.iter().map(|value| {
+                        (
+                            value.label.clone().unwrap_or_else(|| value.value.clone()),
+                            Some(value.value.clone()),
+                        )
+                    }))
+                    .collect()
+            }
             SessionRuntimeFeatureKind::String => Vec::new(),
         };
         let row = div().px_3().pb_3().flex().flex_col().gap_2().child(
@@ -2405,7 +2452,7 @@ impl MobileWorkbench {
                         div()
                             .text_size(px(theme::FONT_MICRO))
                             .text_color(theme::text_muted())
-                            .child("Loading value..."),
+                            .child(locale::common("Loading value...")),
                     )
                     .into_any_element(),
             };
@@ -2421,7 +2468,9 @@ impl MobileWorkbench {
                                 .current_value
                                 .or(feature.default_value)
                                 .map(|value| value.value)
-                                .unwrap_or_else(|| "Configured by Agent".to_string()),
+                                .unwrap_or_else(|| {
+                                    locale::common("Configured by Agent").to_string()
+                                }),
                         ),
                 )
                 .into_any_element();
@@ -2497,7 +2546,7 @@ impl Render for MobileWorkbench {
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| this.set_surface(candidate, cx)),
                             )
-                            .child(candidate.label())
+                            .child(candidate.localized_label())
                     })),
             )
             .when_some(self.notice.clone(), |root, notice| {
@@ -2569,10 +2618,7 @@ fn input_shell(input: Entity<TextInput>) -> gpui::Div {
         .child(input)
 }
 
-fn action_button(
-    id: impl Into<gpui::ElementId>,
-    label: impl Into<String>,
-) -> gpui::Stateful<gpui::Div> {
+fn action_button(id: impl Into<gpui::ElementId>, label: &'static str) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .h(px(theme::TOUCH_TARGET))
@@ -2588,7 +2634,7 @@ fn action_button(
         .text_color(theme::text_secondary())
         .cursor_pointer()
         .active(|style| style.bg(theme::row_pressed_bg()))
-        .child(label.into())
+        .child(locale::common(label))
 }
 
 fn compact_action(
@@ -2633,7 +2679,7 @@ fn section_heading(label: &'static str) -> gpui::Div {
         .items_center()
         .text_size(px(theme::FONT_CAPTION))
         .text_color(theme::text_muted())
-        .child(label)
+        .child(locale::common(label))
 }
 
 fn empty_label(label: &'static str) -> gpui::Div {
@@ -2642,11 +2688,11 @@ fn empty_label(label: &'static str) -> gpui::Div {
         .py_4()
         .text_size(px(theme::FONT_CAPTION))
         .text_color(theme::text_muted())
-        .child(label)
+        .child(locale::common(label))
 }
 
 fn file_status_label(status: FileEditorStatus) -> &'static str {
-    match status {
+    locale::common(match status {
         FileEditorStatus::Loading => "Loading",
         FileEditorStatus::Clean => "Clean",
         FileEditorStatus::Dirty => "Unsaved",
@@ -2656,7 +2702,7 @@ fn file_status_label(status: FileEditorStatus) -> &'static str {
         FileEditorStatus::Disconnected => "Offline",
         FileEditorStatus::Unsupported => "Read only",
         FileEditorStatus::TooLarge => "Too large",
-    }
+    })
 }
 
 fn file_status_color(status: FileEditorStatus) -> gpui::Hsla {
@@ -2755,7 +2801,11 @@ fn flatten_join<T>(outcome: Result<BackendResult<T>, gpui_tokio::JoinError>) -> 
 fn background_task_error() -> BackendError {
     BackendError::failed(
         "mobile_workbench_task_failed",
-        "mobile workbench background task stopped unexpectedly",
+        locale::text(
+            "A mobile workspace task stopped unexpectedly.",
+            "移动端工作区任务意外停止。",
+            "行動端工作區工作意外停止。",
+        ),
     )
 }
 

@@ -7,6 +7,7 @@ mod app;
 mod assets;
 mod discovery;
 mod input;
+mod locale;
 mod markdown;
 mod pairing;
 mod scanner;
@@ -26,6 +27,10 @@ fn run(data_dir: PathBuf) {
         .run(move |cx: &mut App| {
             gpui_tokio::init(cx);
             app::bind_keys(cx);
+            // Resolve the native platform's preferred language before the
+            // first window is created so the initial pairing screen is never
+            // rendered with a stale English fallback.
+            let _ = locale::current();
             assets::load_fonts(cx).expect("failed to load bundled mobile fonts");
 
             let bounds = Bounds::centered(None, gpui::size(gpui::px(390.0), gpui::px(844.0)), cx);

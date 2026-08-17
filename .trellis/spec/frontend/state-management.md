@@ -42,6 +42,78 @@ Persisted preferences:
   list plus bounded numeric font size and font weight values. Do not store
   arbitrary CSS strings or backend-synced configuration.
 
+## Scenario: Native First-Launch Locale
+
+### 1. Scope / Trigger
+
+- Trigger: changing desktop/mobile startup, supported product languages, or
+  locale parsing. The installed clients must render the first window in the
+  platform's preferred language without waiting for remote state.
+
+### 2. Signatures
+
+```rust
+sys_locale::get_locale() -> Option<String>
+vibex_ui::locale::Locale::from_system_tag(Option<&str>) -> Locale
+desktop::locale::resolve_locale(LocaleMode, Option<&str>) -> ResolvedLocale
+```
+
+### 3. Contracts
+
+- `Locale` supports `En`, `ZhCn`, and `ZhTw`. `zh-Hans`, mainland/Singapore
+  Chinese, and Mandarin tags resolve to `ZhCn`; `zh-Hant`, Hong Kong, Macau,
+  Taiwan, and Cantonese tags resolve to `ZhTw`; every non-Chinese or missing
+  locale resolves to `En`.
+- A fresh desktop profile defaults `DesktopUiStateV1.appearance.locale` to
+  `LocaleMode::System`. An explicit persisted `En`, `ZhCn`, or `ZhTw` selection
+  continues to override the platform locale.
+- Mobile currently has no independent locale preference. Resolve and cache the
+  native platform's first preferred locale before creating the first GPUI
+  window, then use that locale for startup, pairing, session, approval, and
+  workspace copy.
+- Platform detection belongs in the app crates; shared classification belongs
+  in `crates/vibex-ui`. Do not make shared UI depend on an OS runtime API.
+
+### 4. Validation & Error Matrix
+
+| Input | Required result |
+| --- | --- |
+| `zh-CN`, `zh-Hans`, `cmn-Hans-CN` | Simplified Chinese |
+| `zh-TW`, `zh-Hant`, `zh-HK`, `zh-MO`, `yue-Hant-HK` | Traditional Chinese |
+| `en-US`, any other language, empty/missing locale | English |
+| Persisted desktop explicit locale | Preserve it; ignore system locale |
+| Platform lookup unavailable | English fallback; startup must continue |
+
+### 5. Good/Base/Bad Cases
+
+- Good: an iOS device using Traditional Chinese opens directly in Traditional
+  Chinese; a French Windows install opens in English.
+- Base: a desktop profile with an explicit Simplified Chinese preference stays
+  Simplified Chinese after the OS language changes.
+- Bad: render the first frame in English and switch later, infer language only
+  from Linux environment variables, or treat every `zh-*` tag as Simplified.
+
+### 6. Tests Required
+
+- `cargo test -p vibex-ui --locked` covers BCP-47/POSIX classification and
+  non-Chinese fallback.
+- `cargo test -p vibex-desktop locale::tests --locked` covers System versus
+  explicit desktop modes.
+- `cargo test -p vibex-mobile --locked` covers deterministic Simplified,
+  Traditional, English, and unknown-copy selection.
+- Android/iOS release validation must launch a fresh install under Simplified
+  Chinese, Traditional Chinese, English, and one unsupported system language.
+
+### 7. Wrong vs Correct
+
+```rust
+// Wrong: platform-specific parsing drifts between clients.
+if tag.starts_with("zh") { Locale::ZhCn } else { Locale::En }
+
+// Correct: native lookup at each app boundary, one shared classifier.
+Locale::from_system_tag(sys_locale::get_locale().as_deref())
+```
+
 ## Authoritative Timeline
 
 The backend timeline is authoritative. Client state may keep optimistic or

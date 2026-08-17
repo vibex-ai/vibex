@@ -7,6 +7,7 @@ pub mod controller;
 pub mod files;
 mod generated_tokens;
 pub mod git;
+pub mod locale;
 pub mod management;
 pub mod shell;
 pub mod terminal;

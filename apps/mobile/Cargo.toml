@@ -19,6 +19,7 @@ gpui_platform.workspace = true
 gpui_tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sys-locale.workspace = true
 unicode-segmentation = "1"
 url.workspace = true
 tokio.workspace = true

@@ -39,7 +39,7 @@ use crate::input::{
 use crate::pairing::{MobileCredentialBundle, claim_pairing_link, claim_zero_config_lan_pairing};
 use crate::storage::CredentialStorage;
 use crate::workbench::{MobileWorkbench, WorkbenchSurface};
-use crate::{markdown, scanner, theme};
+use crate::{locale, markdown, scanner, theme};
 
 const TIMELINE_NEAR_BOTTOM_PX: f32 = 96.0;
 const TIMELINE_LIST_OVERDRAW_PX: f32 = 800.0;
@@ -212,7 +212,12 @@ impl MobileApp {
             controller: None,
             workbench: None,
             workbench_open: false,
-            composer_input: cx.new(|cx| TextInput::new("Message Vibex", cx)),
+            composer_input: cx.new(|cx| {
+                TextInput::new(
+                    locale::text("Message Vibex", "发送消息给 Vibex", "傳送訊息給 Vibex"),
+                    cx,
+                )
+            }),
             timeline_turns: Arc::new(Vec::new()),
             timeline_list: timeline_list_state(0),
             drawer_scroll: UniformListScrollHandle::new(),
@@ -236,7 +241,9 @@ impl MobileApp {
             operation_busy: false,
             new_session_busy: false,
             session_action: None,
-            session_action_input: cx.new(|cx| TextInput::new("Session name", cx)),
+            session_action_input: cx.new(|cx| {
+                TextInput::new(locale::text("Session name", "会话名称", "工作階段名稱"), cx)
+            }),
             session_action_busy: false,
             notice: None,
             error: stored.as_ref().err().cloned(),
@@ -330,7 +337,11 @@ impl MobileApp {
                         this.mode = RootMode::Connecting;
                         this.error = Some(BackendError::offline(
                             "mobile_connect_task_failed",
-                            "native mobile connection task stopped unexpectedly",
+                            locale::text(
+                                "Native mobile connection stopped unexpectedly",
+                                "移动端连接意外停止。",
+                                "行動端連線意外停止。",
+                            ),
                         ));
                     }
                 }
@@ -400,7 +411,14 @@ impl MobileApp {
                                 }
                             }
                             Some(AgentEventDecision::Disconnected) => {
-                                this.notice = Some("Desktop connection lost".to_string());
+                                this.notice = Some(
+                                    locale::text(
+                                        "Desktop connection lost",
+                                        "桌面端连接已断开",
+                                        "桌面版連線已中斷",
+                                    )
+                                    .to_string(),
+                                );
                             }
                             _ => {}
                         }
@@ -544,19 +562,31 @@ impl MobileApp {
             if candidate.mode != LanDiscoveryMode::ZeroConfig {
                 return Err(BackendError::failed(
                     "remote_zero_config_pairing_mode_invalid",
-                    "local network pairing selected an incompatible advertisement",
+                    locale::text(
+                        "Local network pairing selected an incompatible desktop.",
+                        "局域网配对选择了不兼容的桌面端。",
+                        "區域網路配對選擇了不相容的桌面版。",
+                    ),
                 ));
             }
             let server_key = candidate.server_identity_public_key.ok_or_else(|| {
                 BackendError::failed(
                     "remote_zero_config_pairing_identity_missing",
-                    "nearby desktop omitted its zero-config pairing identity",
+                    locale::text(
+                        "The nearby desktop did not provide its pairing identity.",
+                        "附近的桌面端未提供配对身份。",
+                        "附近的桌面版未提供配對身分。",
+                    ),
                 )
             })?;
             let server_id = candidate.server_id.ok_or_else(|| {
                 BackendError::failed(
                     "remote_zero_config_pairing_identity_missing",
-                    "nearby desktop omitted its zero-config server identity",
+                    locale::text(
+                        "The nearby desktop did not provide its server identity.",
+                        "附近的桌面端未提供服务器身份。",
+                        "附近的桌面版未提供伺服器身分。",
+                    ),
                 )
             })?;
             ZeroConfigLanPairingSession::start(
@@ -591,7 +621,12 @@ impl MobileApp {
                     this.pairing_busy = false;
                     this.lan_pairing_task = None;
                     this.nearby_pairing_state = NearbyPairingState::Failed {
-                        message: "Nearby pairing stopped unexpectedly".to_string(),
+                        message: locale::text(
+                            "Nearby pairing stopped unexpectedly.",
+                            "附近配对意外停止。",
+                            "附近配對意外停止。",
+                        )
+                        .to_string(),
                     };
                     cx.notify();
                 }
@@ -626,7 +661,11 @@ impl MobileApp {
                     RemoteLanPairingRequestState::Unknown => {
                         return Err(BackendError::failed(
                             "remote_lan_pairing_state_unknown",
-                            "desktop returned an unknown LAN pairing state",
+                            locale::text(
+                                "The desktop returned an unknown pairing state.",
+                                "桌面端返回了未知的配对状态。",
+                                "桌面版傳回了未知的配對狀態。",
+                            ),
                         ));
                     }
                 }
@@ -659,7 +698,12 @@ impl MobileApp {
                     }
                     Err(_) => {
                         this.nearby_pairing_state = NearbyPairingState::Failed {
-                            message: "Nearby pairing stopped unexpectedly".to_string(),
+                            message: locale::text(
+                                "Nearby pairing stopped unexpectedly.",
+                                "附近配对意外停止。",
+                                "附近配對意外停止。",
+                            )
+                            .to_string(),
                         };
                     }
                 }
@@ -691,7 +735,11 @@ impl MobileApp {
                     Err(_) => {
                         this.error = Some(BackendError::failed(
                             "remote_pairing_task_failed",
-                            "pairing task stopped unexpectedly",
+                            locale::text(
+                                "Pairing stopped unexpectedly.",
+                                "配对意外停止。",
+                                "配對意外停止。",
+                            ),
                         ))
                     }
                 }
@@ -835,7 +883,11 @@ impl MobileApp {
         let Some(workbench) = self.workbench.as_ref() else {
             self.error = Some(BackendError::loading(
                 "mobile_workbench_loading",
-                "Workspace tools are waiting for the desktop workspace list",
+                locale::text(
+                    "Workspace tools are waiting for the desktop workspace list.",
+                    "工作区工具正在等待桌面端的工作区列表。",
+                    "工作區工具正在等待桌面版的工作區清單。",
+                ),
             ));
             self.refresh_workspaces(cx);
             cx.notify();
@@ -893,7 +945,11 @@ impl MobileApp {
         let Some(runtime) = runtime else {
             self.error = Some(BackendError::loading(
                 "mobile_runtime_catalog_loading",
-                "No available Agent runtime has been published by the desktop yet",
+                locale::text(
+                    "The desktop has not published an available Agent runtime yet.",
+                    "桌面端尚未发布可用的 Agent 运行时。",
+                    "桌面版尚未發佈可用的 Agent 執行環境。",
+                ),
             ));
             self.refresh_runtime_options(cx);
             cx.notify();
@@ -902,7 +958,11 @@ impl MobileApp {
         let Some((workspace_root, workspace_mode)) = workspace else {
             self.error = Some(BackendError::failed(
                 "mobile_workspace_required",
-                "Open a workspace on the desktop before creating a mobile session",
+                locale::text(
+                    "Open a workspace on the desktop before creating a mobile session.",
+                    "请先在桌面端打开工作区，再创建移动端会话。",
+                    "請先在桌面版開啟工作區，再建立行動端工作階段。",
+                ),
             ));
             self.refresh_workspaces(cx);
             cx.notify();
@@ -1024,7 +1084,7 @@ impl MobileApp {
                             controller.state.active_session.resolve(*session);
                         }
                         this.session_action = None;
-                        this.notice = Some("Session renamed".to_string());
+                        this.notice = Some(locale::common("Session renamed").to_string());
                         this.refresh_sessions(cx);
                     }
                     Ok(SessionMutationOutcome::Removed) => {
@@ -1048,8 +1108,12 @@ impl MobileApp {
                         }
                         this.session_action = None;
                         this.notice = Some(match prompt.kind {
-                            SessionActionKind::Archive => "Session archived".to_string(),
-                            SessionActionKind::Delete => "Session deleted".to_string(),
+                            SessionActionKind::Archive => {
+                                locale::common("Session archived").to_string()
+                            }
+                            SessionActionKind::Delete => {
+                                locale::common("Session deleted").to_string()
+                            }
                             SessionActionKind::Rename => unreachable!(),
                         });
                         this.refresh_sessions(cx);
@@ -1174,7 +1238,11 @@ impl MobileApp {
         let Some(runtime) = controller.state.runtime_selection.value.as_ref() else {
             self.error = Some(BackendError::loading(
                 "mobile_runtime_selection_loading",
-                "session runtime selection is not available yet",
+                locale::text(
+                    "The session runtime selection is not available yet.",
+                    "会话运行时选择尚不可用。",
+                    "工作階段執行環境選擇尚無法使用。",
+                ),
             ));
             cx.notify();
             return;
@@ -1855,7 +1923,7 @@ impl MobileApp {
                                     MouseButton::Left,
                                     cx.listener(Self::start_nearby_pairing),
                                 )
-                                .child("Try Again"),
+                                .child(locale::common("Try Again")),
                         )
                     })
                     .when_some(self.error.as_ref(), |panel, error| {
@@ -1899,9 +1967,9 @@ impl MobileApp {
                                     .text_color(theme::text_primary()),
                             )
                             .child(if self.pairing_busy && self.lan_pairing_task.is_none() {
-                                "Pairing\u{2026}"
+                                locale::common("Pairing...")
                             } else {
-                                "Use QR Code"
+                                locale::common("Use QR Code")
                             }),
                     ),
             )
@@ -1920,7 +1988,7 @@ impl MobileApp {
                         .text_color(theme::text_muted())
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme::text_primary())
-                        .child("Local Network Pairing"),
+                        .child(locale::common("Local Network Pairing")),
                 )
                 .child(
                     div()
@@ -1943,7 +2011,7 @@ impl MobileApp {
                                 .size(px(theme::ICON_MD))
                                 .text_color(rgb(theme::BG_PRIMARY)),
                         )
-                        .child("Find Desktops"),
+                        .child(locale::common("Find Desktops")),
                 )
                 .into_any_element(),
             NearbyPairingState::Discovering | NearbyPairingState::Empty => {
@@ -1964,7 +2032,7 @@ impl MobileApp {
                                     .text_size(px(theme::FONT_HEADING))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme::text_primary())
-                                    .child("Nearby desktops"),
+                                    .child(locale::common("Nearby desktops")),
                             )
                             .child(
                                 div()
@@ -1996,9 +2064,9 @@ impl MobileApp {
                                 .text_size(px(theme::FONT_DETAIL))
                                 .text_color(theme::text_muted())
                                 .child(if empty {
-                                    "No nearby desktops found"
+                                    locale::common("No nearby desktops found")
                                 } else {
-                                    "Searching\u{2026}"
+                                    locale::common("Searching...")
                                 }),
                         )
                     })
@@ -2037,7 +2105,7 @@ impl MobileApp {
                                         div()
                                             .text_size(px(theme::FONT_MICRO))
                                             .text_color(theme::text_muted())
-                                            .child("Vibex Remote v2"),
+                                            .child(locale::common("Vibex Remote v2")),
                                     ),
                             )
                             .child(
@@ -2045,14 +2113,18 @@ impl MobileApp {
                                     .text_size(px(theme::FONT_CAPTION))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme::text_primary())
-                                    .child("Pair"),
+                                    .child(locale::common("Pair")),
                             )
                     }))
                     .into_any_element()
             }
-            NearbyPairingState::Validating { display_name } => {
-                self.render_nearby_message(format!("Checking {display_name}\u{2026}"), false)
-            }
+            NearbyPairingState::Validating { display_name } => self.render_nearby_message(
+                format!(
+                    "{} {display_name}…",
+                    locale::text("Checking", "检查", "檢查")
+                ),
+                false,
+            ),
             NearbyPairingState::Waiting {
                 display_name,
                 verification_code,
@@ -2078,13 +2150,20 @@ impl MobileApp {
                             .text_size(px(theme::FONT_HEADING))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::text_primary())
-                            .child(format!("Waiting for {display_name}")),
+                            .child(format!(
+                                "{} {display_name}",
+                                locale::text("Waiting for", "等待", "等待")
+                            )),
                     )
                     .child(
                         div()
                             .text_size(px(theme::FONT_DETAIL))
                             .text_color(theme::text_muted())
-                            .child("Confirm the same code is shown on the desktop."),
+                            .child(locale::text(
+                                "Confirm the same code is shown on the desktop.",
+                                "请确认桌面端显示了相同的验证码。",
+                                "請確認桌面版顯示了相同的驗證碼。",
+                            )),
                     )
                     .child(
                         div()
@@ -2100,20 +2179,37 @@ impl MobileApp {
                         div()
                             .text_size(px(theme::FONT_MICRO))
                             .text_color(theme::text_muted())
-                            .child(format!("Expires in {remaining}s")),
+                            .child(format!(
+                                "{} {remaining}s",
+                                locale::text("Expires in", "将在", "將於")
+                            )),
                     )
                     .into_any_element()
             }
             NearbyPairingState::PermissionDenied => self.render_nearby_message(
-                "Local network access is required to find nearby desktops.",
+                locale::text(
+                    "Local network access is required to find nearby desktops.",
+                    "查找附近的桌面端需要局域网访问权限。",
+                    "尋找附近的桌面版需要區域網路存取權限。",
+                ),
                 true,
             ),
-            NearbyPairingState::Rejected => {
-                self.render_nearby_message("The desktop rejected this pairing request.", true)
-            }
-            NearbyPairingState::Expired => {
-                self.render_nearby_message("The nearby pairing window expired.", true)
-            }
+            NearbyPairingState::Rejected => self.render_nearby_message(
+                locale::text(
+                    "The desktop rejected this pairing request.",
+                    "桌面端拒绝了此次配对请求。",
+                    "桌面版拒絕了此次配對請求。",
+                ),
+                true,
+            ),
+            NearbyPairingState::Expired => self.render_nearby_message(
+                locale::text(
+                    "The nearby pairing window expired.",
+                    "附近配对窗口已过期。",
+                    "附近配對視窗已過期。",
+                ),
+                true,
+            ),
             NearbyPairingState::Failed { message } => {
                 self.render_nearby_message(message.clone(), true)
             }
@@ -2173,9 +2269,9 @@ impl MobileApp {
                             )))
                             .child(div().text_color(theme::text_secondary()).child(
                                 if self.operation_busy {
-                                    "Connecting to desktop\u{2026}"
+                                    locale::common("Connecting to desktop...")
                                 } else {
-                                    "Desktop is unavailable"
+                                    locale::common("Desktop is unavailable")
                                 },
                             )),
                     )
@@ -2213,7 +2309,7 @@ impl MobileApp {
                                         MouseButton::Left,
                                         cx.listener(Self::retry_connection),
                                     )
-                                    .child("Retry"),
+                                    .child(locale::common("Retry")),
                             )
                             .child(
                                 div()
@@ -2230,7 +2326,7 @@ impl MobileApp {
                                         MouseButton::Left,
                                         cx.listener(Self::forget_desktop),
                                     )
-                                    .child("Disconnect"),
+                                    .child(locale::common("Disconnect")),
                             )
                     }),
             )
@@ -2305,7 +2401,7 @@ impl MobileApp {
                                         .text_size(px(theme::FONT_BODY))
                                         .text_color(theme::text_muted())
                                         .text_center()
-                                        .child("Loading conversation..."),
+                                        .child(locale::common("Loading conversation...")),
                                 )
                             })
                             .when(!timeline_loading && turns.is_empty(), |timeline| {
@@ -2319,7 +2415,7 @@ impl MobileApp {
                                         .text_size(px(theme::FONT_BODY))
                                         .text_color(theme::text_muted())
                                         .text_center()
-                                        .child("No messages yet")
+                                        .child(locale::common("No messages yet"))
                                         .when(no_selected_session, |empty| {
                                             empty.child(
                                                 div()
@@ -2342,7 +2438,7 @@ impl MobileApp {
                                                     .when(!can_create_session, |button| {
                                                         button.opacity(0.55)
                                                     })
-                                                    .child("New session"),
+                                                    .child(locale::common("New session")),
                                             )
                                         }),
                                 )
@@ -2469,7 +2565,7 @@ impl MobileApp {
                                     div()
                                         .text_size(px(theme::FONT_HEADING))
                                         .text_color(theme::text_primary())
-                                        .child("Workspace tools"),
+                                        .child(locale::common("Workspace tools")),
                                 )
                                 .child(
                                     div()
@@ -2532,7 +2628,7 @@ impl MobileApp {
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| this.open_workbench(surface, cx)),
                     )
-                    .child(surface.label())
+                    .child(surface.localized_label())
             }))
     }
 
@@ -2549,21 +2645,33 @@ impl MobileApp {
         });
         let (heading, detail, confirm_label, destructive) = match prompt.kind {
             SessionActionKind::Rename => (
-                "Rename session",
-                "Update the session name on the desktop.",
-                "Rename",
+                locale::text("Rename session", "重命名会话", "重新命名工作階段"),
+                locale::text(
+                    "Update the session name on the desktop.",
+                    "更新桌面端上的会话名称。",
+                    "更新桌面版上的工作階段名稱。",
+                ),
+                locale::common("Rename"),
                 false,
             ),
             SessionActionKind::Archive => (
-                "Archive session",
-                "The session leaves the active list but remains available in desktop history.",
-                "Archive",
+                locale::text("Archive session", "归档会话", "封存工作階段"),
+                locale::text(
+                    "The session leaves the active list but remains available in desktop history.",
+                    "会话将从活动列表中移除，但仍保留在桌面端历史记录中。",
+                    "工作階段會從使用中清單移除，但仍保留在桌面版歷史記錄中。",
+                ),
+                locale::common("Archive"),
                 false,
             ),
             SessionActionKind::Delete => (
-                "Delete session",
-                "This removes the session and its stored conversation from the desktop.",
-                "Delete",
+                locale::text("Delete session", "删除会话", "刪除工作階段"),
+                locale::text(
+                    "This removes the session and its stored conversation from the desktop.",
+                    "这会从桌面端删除会话及其已保存的对话。",
+                    "這會從桌面版刪除工作階段及其已儲存的對話。",
+                ),
+                locale::common("Delete"),
                 true,
             ),
         };
@@ -2644,7 +2752,7 @@ impl MobileApp {
                                             cx.listener(Self::cancel_session_action),
                                         )
                                     })
-                                    .child("Cancel"),
+                                    .child(locale::common("Cancel")),
                             )
                             .child(
                                 div()
@@ -2673,7 +2781,7 @@ impl MobileApp {
                                     )
                                     .when(!can_manage_session, |button| button.opacity(0.55))
                                     .child(if self.session_action_busy {
-                                        "Working..."
+                                        locale::common("Working...")
                                     } else {
                                         confirm_label
                                     }),
@@ -2826,20 +2934,22 @@ impl MobileApp {
                                     div()
                                         .text_size(px(theme::FONT_CAPTION))
                                         .text_color(theme::text_muted())
-                                        .child(
-                                            turn.live_status
-                                                .clone()
-                                                .unwrap_or_else(|| "Process".to_string()),
-                                        ),
+                                        .child(turn.live_status.clone().unwrap_or_else(|| {
+                                            locale::common("Process").to_string()
+                                        })),
                                 )
                                 .child(
                                     div()
                                         .text_size(px(theme::FONT_MICRO))
                                         .text_color(theme::text_muted())
                                         .child(if expanded {
-                                            "Hide".to_string()
+                                            locale::common("Hide").to_string()
                                         } else {
-                                            format!("{} items", turn.process_rows.len())
+                                            format!(
+                                                "{} {}",
+                                                turn.process_rows.len(),
+                                                locale::text("items", "项", "項")
+                                            )
                                         }),
                                 ),
                         )
@@ -2879,7 +2989,7 @@ impl MobileApp {
                             .child(
                                 turn.live_status
                                     .clone()
-                                    .unwrap_or_else(|| "Working...".to_string()),
+                                    .unwrap_or_else(|| locale::common("Working...").to_string()),
                             ),
                     )
                 },
@@ -2960,13 +3070,20 @@ impl MobileApp {
         let can_always = approval
             .allowed_responses
             .contains(&PermissionResponseKind::AlwaysAllowForSession);
-        let approve_label =
-            approval_response_label(approval, PermissionResponseKind::Approve, "Approve");
-        let deny_label = approval_response_label(approval, PermissionResponseKind::Deny, "Deny");
+        let approve_label = approval_response_label(
+            approval,
+            PermissionResponseKind::Approve,
+            locale::common("Approve"),
+        );
+        let deny_label = approval_response_label(
+            approval,
+            PermissionResponseKind::Deny,
+            locale::common("Deny"),
+        );
         let always_label = approval_response_label(
             approval,
             PermissionResponseKind::AlwaysAllowForSession,
-            "Always allow",
+            locale::common("Always allow"),
         );
         div()
             .flex_shrink_0()
@@ -3039,9 +3156,14 @@ impl MobileApp {
                             }),
                         )
                         .child(if details_expanded {
-                            "Show less".to_string()
+                            locale::common("Show less").to_string()
                         } else {
-                            format!("Show all {} details", approval.details.len())
+                            format!(
+                                "{} {} {}",
+                                locale::text("Show all", "显示全部", "顯示全部"),
+                                approval.details.len(),
+                                locale::text("details", "项详情", "項詳細資料")
+                            )
                         }),
                 )
             })
@@ -3059,7 +3181,7 @@ impl MobileApp {
                                 .items_center()
                                 .text_size(px(theme::FONT_BODY))
                                 .text_color(theme::text_muted())
-                                .child("Resolving..."),
+                                .child(locale::common("Resolving...")),
                         )
                     })
                     .when(!resolving && can_deny, |actions| {
@@ -3158,73 +3280,74 @@ impl MobileApp {
         });
         let mut fields = Vec::new();
         for field in &request.fields {
-            let control =
-                match &field.kind {
-                    ElicitationFieldKind::Text { options, .. } if !options.is_empty() => div()
-                        .flex()
-                        .flex_wrap()
-                        .gap_2()
-                        .children(options.iter().map(|option| {
-                            let request_id = request.id.clone();
-                            let field_id = field.id.clone();
-                            let value = option.value.clone();
-                            let selected = self
-                                .elicitation_draft
-                                .as_ref()
-                                .and_then(|draft| draft.text(&field.id))
-                                == Some(option.value.as_str());
-                            div()
-                                .id(format!("elicitation:{}:{}", field.id, option.value))
-                                .min_h(px(theme::TOUCH_TARGET))
-                                .px_3()
-                                .rounded(px(theme::RADIUS_CONTROL))
-                                .border_1()
-                                .border_color(if selected {
-                                    rgb(theme::TEXT_PRIMARY).into()
-                                } else {
-                                    theme::border_default()
-                                })
-                                .when(selected, |choice| choice.bg(theme::bg_card_dim()))
-                                .flex()
-                                .items_center()
-                                .text_size(px(theme::FONT_CAPTION))
-                                .text_color(theme::text_secondary())
-                                .cursor_pointer()
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.set_elicitation_option(
-                                            request_id.clone(),
-                                            field_id.clone(),
-                                            value.clone(),
-                                            cx,
-                                        )
-                                    }),
-                                )
-                                .child(option.title.clone())
-                        }))
-                        .into_any_element(),
-                    ElicitationFieldKind::Text { .. }
-                    | ElicitationFieldKind::Number { .. }
-                    | ElicitationFieldKind::Integer { .. } => self
-                        .elicitation_inputs
-                        .get(&field.id)
-                        .cloned()
-                        .map(|input| {
-                            div()
-                                .rounded(px(theme::RADIUS_CONTROL))
-                                .border_1()
-                                .border_color(theme::border_default())
-                                .bg(theme::bg_card_dim())
-                                .child(input)
-                                .into_any_element()
-                        })
-                        .unwrap_or_else(|| div().into_any_element()),
-                    ElicitationFieldKind::Boolean { .. } => div()
-                        .flex()
-                        .gap_2()
-                        .children([(false, "No"), (true, "Yes")].into_iter().map(
-                            |(value, label)| {
+            let control = match &field.kind {
+                ElicitationFieldKind::Text { options, .. } if !options.is_empty() => div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .children(options.iter().map(|option| {
+                        let request_id = request.id.clone();
+                        let field_id = field.id.clone();
+                        let value = option.value.clone();
+                        let selected = self
+                            .elicitation_draft
+                            .as_ref()
+                            .and_then(|draft| draft.text(&field.id))
+                            == Some(option.value.as_str());
+                        div()
+                            .id(format!("elicitation:{}:{}", field.id, option.value))
+                            .min_h(px(theme::TOUCH_TARGET))
+                            .px_3()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(if selected {
+                                rgb(theme::TEXT_PRIMARY).into()
+                            } else {
+                                theme::border_default()
+                            })
+                            .when(selected, |choice| choice.bg(theme::bg_card_dim()))
+                            .flex()
+                            .items_center()
+                            .text_size(px(theme::FONT_CAPTION))
+                            .text_color(theme::text_secondary())
+                            .cursor_pointer()
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.set_elicitation_option(
+                                        request_id.clone(),
+                                        field_id.clone(),
+                                        value.clone(),
+                                        cx,
+                                    )
+                                }),
+                            )
+                            .child(option.title.clone())
+                    }))
+                    .into_any_element(),
+                ElicitationFieldKind::Text { .. }
+                | ElicitationFieldKind::Number { .. }
+                | ElicitationFieldKind::Integer { .. } => self
+                    .elicitation_inputs
+                    .get(&field.id)
+                    .cloned()
+                    .map(|input| {
+                        div()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(theme::border_default())
+                            .bg(theme::bg_card_dim())
+                            .child(input)
+                            .into_any_element()
+                    })
+                    .unwrap_or_else(|| div().into_any_element()),
+                ElicitationFieldKind::Boolean { .. } => div()
+                    .flex()
+                    .gap_2()
+                    .children(
+                        [(false, locale::common("No")), (true, locale::common("Yes"))]
+                            .into_iter()
+                            .map(|(value, label)| {
                                 let request_id = request.id.clone();
                                 let field_id = field.id.clone();
                                 let selected = self
@@ -3261,57 +3384,65 @@ impl MobileApp {
                                         }),
                                     )
                                     .child(label)
-                            },
-                        ))
-                        .into_any_element(),
-                    ElicitationFieldKind::MultiSelect { options, .. } => div()
-                        .flex()
-                        .flex_wrap()
-                        .gap_2()
-                        .children(options.iter().map(|option| {
-                            let request_id = request.id.clone();
-                            let field_id = field.id.clone();
-                            let value = option.value.clone();
-                            let selected = self.elicitation_draft.as_ref().is_some_and(|draft| {
-                                draft.multi_selected(&field.id, &option.value)
-                            });
-                            div()
-                                .id(format!("elicitation:{}:{}", field.id, option.value))
-                                .min_h(px(theme::TOUCH_TARGET))
-                                .px_3()
-                                .rounded(px(theme::RADIUS_CONTROL))
-                                .border_1()
-                                .border_color(if selected {
-                                    rgb(theme::TEXT_PRIMARY).into()
-                                } else {
-                                    theme::border_default()
-                                })
-                                .when(selected, |choice| choice.bg(theme::bg_card_dim()))
-                                .flex()
-                                .items_center()
-                                .text_size(px(theme::FONT_CAPTION))
-                                .text_color(theme::text_secondary())
-                                .cursor_pointer()
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.toggle_elicitation_multi_option(
-                                            request_id.clone(),
-                                            field_id.clone(),
-                                            value.clone(),
-                                            cx,
-                                        )
-                                    }),
-                                )
-                                .child(option.title.clone())
-                        }))
-                        .into_any_element(),
-                    ElicitationFieldKind::Unsupported { schema_type } => div()
-                        .text_size(px(theme::FONT_CAPTION))
-                        .text_color(rgb(theme::ACCENT_RED))
-                        .child(format!("Unsupported input type: {schema_type}"))
-                        .into_any_element(),
-                };
+                            }),
+                    )
+                    .into_any_element(),
+                ElicitationFieldKind::MultiSelect { options, .. } => div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .children(options.iter().map(|option| {
+                        let request_id = request.id.clone();
+                        let field_id = field.id.clone();
+                        let value = option.value.clone();
+                        let selected = self
+                            .elicitation_draft
+                            .as_ref()
+                            .is_some_and(|draft| draft.multi_selected(&field.id, &option.value));
+                        div()
+                            .id(format!("elicitation:{}:{}", field.id, option.value))
+                            .min_h(px(theme::TOUCH_TARGET))
+                            .px_3()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(if selected {
+                                rgb(theme::TEXT_PRIMARY).into()
+                            } else {
+                                theme::border_default()
+                            })
+                            .when(selected, |choice| choice.bg(theme::bg_card_dim()))
+                            .flex()
+                            .items_center()
+                            .text_size(px(theme::FONT_CAPTION))
+                            .text_color(theme::text_secondary())
+                            .cursor_pointer()
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.toggle_elicitation_multi_option(
+                                        request_id.clone(),
+                                        field_id.clone(),
+                                        value.clone(),
+                                        cx,
+                                    )
+                                }),
+                            )
+                            .child(option.title.clone())
+                    }))
+                    .into_any_element(),
+                ElicitationFieldKind::Unsupported { schema_type } => div()
+                    .text_size(px(theme::FONT_CAPTION))
+                    .text_color(rgb(theme::ACCENT_RED))
+                    .child(format!(
+                        "{}: {schema_type}",
+                        locale::text(
+                            "Unsupported input type",
+                            "不支持的输入类型",
+                            "不支援的輸入類型"
+                        )
+                    ))
+                    .into_any_element(),
+            };
             fields.push(
                 div()
                     .flex()
@@ -3363,7 +3494,7 @@ impl MobileApp {
                         request
                             .title
                             .clone()
-                            .unwrap_or_else(|| "Input requested".to_string()),
+                            .unwrap_or_else(|| locale::common("Input requested").to_string()),
                     ),
             )
             .child(
@@ -3412,7 +3543,7 @@ impl MobileApp {
                                     }),
                                 )
                             })
-                            .child("Decline"),
+                            .child(locale::common("Decline")),
                     )
                     .child(
                         div()
@@ -3437,7 +3568,11 @@ impl MobileApp {
                                     }),
                                 )
                             })
-                            .child(if pending { "Submitting..." } else { "Submit" }),
+                            .child(if pending {
+                                locale::common("Submitting...")
+                            } else {
+                                locale::common("Submit")
+                            }),
                     ),
             )
     }
@@ -3498,7 +3633,7 @@ impl MobileApp {
                         .child(if self.operation_busy {
                             "Continuing\u{2026}"
                         } else {
-                            "Continue"
+                            locale::common("Continue")
                         }),
                 )
             })
@@ -3690,7 +3825,7 @@ impl MobileApp {
                         div()
                             .text_size(px(theme::FONT_HEADING))
                             .text_color(theme::text_primary())
-                            .child("Sessions"),
+                            .child(locale::common("Sessions")),
                     )
                     .child(
                         div()
@@ -3747,7 +3882,7 @@ impl MobileApp {
                                     .size(px(theme::ICON_SM))
                                     .text_color(theme::text_secondary()),
                             )
-                            .child("New session"),
+                            .child(locale::common("New session")),
                     )
                     .when_some(selected_session, |drawer, session| {
                         let rename_id = session.id.clone();
@@ -3792,7 +3927,7 @@ impl MobileApp {
                                                 )
                                         })
                                         .when(!can_manage_session, |button| button.opacity(0.55))
-                                        .child("Rename"),
+                                        .child(locale::common("Rename")),
                                 )
                                 .child(
                                     div()
@@ -3822,7 +3957,7 @@ impl MobileApp {
                                                 )
                                         })
                                         .when(!can_manage_session, |button| button.opacity(0.55))
-                                        .child("Archive"),
+                                        .child(locale::common("Archive")),
                                 )
                                 .child(
                                     div()
@@ -3852,7 +3987,7 @@ impl MobileApp {
                                                 )
                                         })
                                         .when(!can_manage_session, |button| button.opacity(0.55))
-                                        .child("Delete"),
+                                        .child(locale::common("Delete")),
                                 ),
                         )
                     })
@@ -3865,7 +4000,7 @@ impl MobileApp {
                             .items_end()
                             .text_size(px(theme::FONT_CAPTION))
                             .text_color(theme::text_muted())
-                            .child("Conversations"),
+                            .child(locale::common("Conversations")),
                     )
                     .child(
                         uniform_list(
@@ -3914,7 +4049,11 @@ impl MobileApp {
                             .cursor_pointer()
                             .active(|style| style.bg(theme::row_pressed_bg()))
                             .on_mouse_up(MouseButton::Left, cx.listener(Self::forget_desktop))
-                            .child("Disconnect desktop"),
+                            .child(locale::text(
+                                "Disconnect desktop",
+                                "断开桌面端",
+                                "中斷桌面版連線",
+                            )),
                     ),
             )
     }
@@ -4009,15 +4148,31 @@ fn workspace_label(root: &str) -> &str {
 }
 
 fn session_age_label(timestamp_ms: i64) -> String {
+    session_age_label_for(locale::current(), timestamp_ms)
+}
+
+fn session_age_label_for(resolved: vibex_ui::locale::Locale, timestamp_ms: i64) -> String {
     if timestamp_ms <= 0 {
         return String::new();
     }
     let elapsed_seconds = unix_timestamp_ms().saturating_sub(timestamp_ms).max(0) / 1_000;
     match elapsed_seconds {
-        0..=59 => "now".to_string(),
-        60..=3_599 => format!("{}m", elapsed_seconds / 60),
-        3_600..=86_399 => format!("{}h", elapsed_seconds / 3_600),
-        days => format!("{}d", days / 86_400),
+        0..=59 => locale::text_for(resolved, "now", "刚刚", "剛剛").to_string(),
+        60..=3_599 => match resolved {
+            vibex_ui::locale::Locale::En => format!("{}m", elapsed_seconds / 60),
+            vibex_ui::locale::Locale::ZhCn => format!("{} 分钟", elapsed_seconds / 60),
+            vibex_ui::locale::Locale::ZhTw => format!("{} 分鐘", elapsed_seconds / 60),
+        },
+        3_600..=86_399 => match resolved {
+            vibex_ui::locale::Locale::En => format!("{}h", elapsed_seconds / 3_600),
+            vibex_ui::locale::Locale::ZhCn => format!("{} 小时", elapsed_seconds / 3_600),
+            vibex_ui::locale::Locale::ZhTw => format!("{} 小時", elapsed_seconds / 3_600),
+        },
+        days => match resolved {
+            vibex_ui::locale::Locale::En => format!("{}d", days / 86_400),
+            vibex_ui::locale::Locale::ZhCn => format!("{} 天", days / 86_400),
+            vibex_ui::locale::Locale::ZhTw => format!("{} 天", days / 86_400),
+        },
     }
 }
 
@@ -4039,7 +4194,7 @@ fn approval_response_label(
 }
 
 fn permission_risk_label(risk: PermissionRiskCategory) -> &'static str {
-    match risk {
+    locale::common(match risk {
         PermissionRiskCategory::Command => "Command",
         PermissionRiskCategory::FileReadSensitive => "Sensitive read",
         PermissionRiskCategory::FileWrite => "File write",
@@ -4048,14 +4203,14 @@ fn permission_risk_label(risk: PermissionRiskCategory) -> &'static str {
         PermissionRiskCategory::GitDestructive => "Destructive Git",
         PermissionRiskCategory::ProviderConfigExport => "Config export",
         PermissionRiskCategory::CustomTool => "Custom tool",
-    }
+    })
 }
 
 fn process_title(row: &TimelineRow) -> String {
     if !row.title.trim().is_empty() {
         return row.title.clone();
     }
-    match row.kind {
+    locale::common(match row.kind {
         TimelineRowKind::Reasoning => "Reasoning",
         TimelineRowKind::Plan => "Plan",
         TimelineRowKind::ToolCall => "Tool",
@@ -4073,7 +4228,7 @@ fn process_title(row: &TimelineRow) -> String {
         TimelineRowKind::ElicitationResolution => "Input response",
         TimelineRowKind::Error => "Error",
         TimelineRowKind::UserMessage | TimelineRowKind::AgentMessage => "Message",
-    }
+    })
     .to_string()
 }
 
@@ -4081,7 +4236,11 @@ fn flatten_join<T>(outcome: Result<BackendResult<T>, gpui_tokio::JoinError>) -> 
     outcome.unwrap_or_else(|_| {
         Err(BackendError::failed(
             "mobile_async_task_failed",
-            "native mobile background task stopped unexpectedly",
+            locale::text(
+                "A mobile background task stopped unexpectedly.",
+                "移动端后台任务意外停止。",
+                "行動端背景工作意外停止。",
+            ),
         ))
     })
 }
@@ -4208,9 +4367,13 @@ mod tests {
         assert_eq!(workspace_label("/work/vibex"), "vibex");
         assert_eq!(workspace_label("/work/vibex/"), "vibex");
         assert_eq!(workspace_label("C:\\work\\vibex"), "vibex");
-        assert_eq!(session_age_label(0), "");
-        assert_eq!(session_age_label(unix_timestamp_ms()), "now");
-        assert_eq!(session_age_label(unix_timestamp_ms() - 60_000), "1m");
+        let locale = vibex_ui::locale::Locale::En;
+        assert_eq!(session_age_label_for(locale, 0), "");
+        assert_eq!(session_age_label_for(locale, unix_timestamp_ms()), "now");
+        assert_eq!(
+            session_age_label_for(locale, unix_timestamp_ms() - 60_000),
+            "1m"
+        );
     }
 
     #[gpui::test]
