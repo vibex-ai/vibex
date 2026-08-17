@@ -223,6 +223,7 @@ const TIMELINE_MARKDOWN_SOURCE_CACHE_BYTES: usize = 2 * 1024 * 1024;
 const TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 const TIMELINE_STREAMING_MARKDOWN_REFRESH_BYTES: usize = 8 * 1024;
 const AGENT_THINKING_SCROLL_DURATION: Duration = Duration::from_secs(12);
+const SHIMMER_SCAN_PASSES: f32 = 10.0;
 const TIMELINE_TOOL_PROJECTION_CACHE_LIMIT: usize = 128;
 const TIMELINE_TOOL_PROJECTION_CACHE_BYTES: usize = 2 * 1024 * 1024;
 const TIMELINE_FILE_DIFF_PREVIEW_CACHE_LIMIT: usize = 64;
@@ -28722,6 +28723,27 @@ fn agent_thinking_scroll_progress(delta: f32) -> f32 {
     }
 }
 
+fn shimmer_scan_position(delta: f32, visible_start: f32, visible_span: f32) -> f32 {
+    visible_start - visible_span * 0.35 + (delta * SHIMMER_SCAN_PASSES).fract() * visible_span * 1.7
+}
+
+fn shimmer_color(
+    base: Hsla,
+    glow: Hsla,
+    position: f32,
+    scan_position: f32,
+    scan_radius: f32,
+) -> Hsla {
+    let intensity = (1.0 - (position - scan_position).abs() / scan_radius).clamp(0.0, 1.0);
+    let intensity = intensity * intensity * (3.0 - 2.0 * intensity);
+    Hsla {
+        h: base.h + (glow.h - base.h) * intensity,
+        s: base.s + (glow.s - base.s) * intensity,
+        l: base.l + (glow.l - base.l) * intensity,
+        a: base.a + (glow.a - base.a) * intensity,
+    }
+}
+
 fn render_agent_thinking_indicator(
     turn_id: &str,
     label: &str,
@@ -28768,8 +28790,8 @@ fn render_agent_thinking_indicator(
                             1.0
                         };
                         let visible_start = progress * (1.0 - visible_span);
-                        let scan_position = visible_start - visible_span * 0.35
-                            + (delta * 10.0).fract() * visible_span * 1.7;
+                        let scan_position =
+                            shimmer_scan_position(delta, visible_start, visible_span);
                         let scan_radius = (visible_span * 0.42).max(0.01);
                         this.child(
                             div()
@@ -28784,18 +28806,14 @@ fn render_agent_thinking_indicator(
                                         } else {
                                             0.5
                                         };
-                                        let intensity = (1.0
-                                            - (position - scan_position).abs() / scan_radius)
-                                            .clamp(0.0, 1.0);
-                                        let intensity =
-                                            intensity * intensity * (3.0 - 2.0 * intensity);
                                         div().flex_none().child(character.to_string()).text_color(
-                                            Hsla {
-                                                h: base.h + (glow.h - base.h) * intensity,
-                                                s: base.s + (glow.s - base.s) * intensity,
-                                                l: base.l + (glow.l - base.l) * intensity,
-                                                a: base.a + (glow.a - base.a) * intensity,
-                                            },
+                                            shimmer_color(
+                                                base,
+                                                glow,
+                                                position,
+                                                scan_position,
+                                                scan_radius,
+                                            ),
                                         )
                                     }),
                                 )),
@@ -34800,6 +34818,51 @@ fn vibex_wordmark(
         .into_any_element()
 }
 
+fn startup_loading_wordmark(show_shimmer: bool, cx: &App) -> AnyElement {
+    let base = cx.theme().muted_foreground.opacity(0.75);
+    let glow = cx.theme().foreground;
+    let wordmark = move |scan_position: Option<f32>| {
+        let color_at = |position| {
+            scan_position.map_or(base, |scan_position| {
+                shimmer_color(base, glow, position, scan_position, 0.42)
+            })
+        };
+        h_flex()
+            .items_center()
+            .gap(px(1.0))
+            .child(
+                Icon::default()
+                    .path("icons/vibex/vibex-mark.svg")
+                    .w(px(46.0))
+                    .h(px(45.0))
+                    .mt(px(2.0))
+                    .relative()
+                    .top(px(-6.0))
+                    .text_color(color_at(0.0)),
+            )
+            .child(
+                h_flex().children("ibex".chars().enumerate().map(|(index, character)| {
+                    div()
+                        .flex_none()
+                        .text_color(color_at((index + 1) as f32 / 4.0))
+                        .child(character.to_string())
+                })),
+            )
+    };
+
+    let container = div().relative().text_size(px(42.0)).font_semibold();
+    if !show_shimmer {
+        return container.child(wordmark(None)).into_any_element();
+    }
+    container
+        .with_animation(
+            "startup-wordmark-shimmer",
+            Animation::new(AGENT_THINKING_SCROLL_DURATION).repeat(),
+            move |this, delta| this.child(wordmark(Some(shimmer_scan_position(delta, 0.0, 1.0)))),
+        )
+        .into_any_element()
+}
+
 fn startup_loading_overlay(show_loading_indicator: bool, cx: &App) -> AnyElement {
     div()
         .id("startup-loading-overlay")
@@ -34811,30 +34874,7 @@ fn startup_loading_overlay(show_loading_indicator: bool, cx: &App) -> AnyElement
         .justify_center()
         .bg(cx.theme().background)
         .text_color(cx.theme().foreground)
-        .child(
-            div()
-                .relative()
-                .text_size(px(42.0))
-                .font_semibold()
-                .child(vibex_wordmark(46.0, 45.0, 2.0, -6.0, cx))
-                .when(show_loading_indicator, |this| {
-                    this.child(
-                        div()
-                            .absolute()
-                            .top(px(64.0))
-                            .left_0()
-                            .right_0()
-                            .flex()
-                            .justify_center()
-                            .child(
-                                Spinner::new()
-                                    .icon(Icon::new(IconName::LoaderCircle))
-                                    .color(cx.theme().muted_foreground)
-                                    .small(),
-                            ),
-                    )
-                }),
-        )
+        .child(startup_loading_wordmark(show_loading_indicator, cx))
         .into_any_element()
 }
 
@@ -36442,6 +36482,26 @@ mod tests {
     }
 
     #[test]
+    fn shimmer_scan_reaches_each_glyph_and_falls_back_to_the_base_color() {
+        let base = Hsla {
+            h: 0.0,
+            s: 0.0,
+            l: 0.25,
+            a: 0.75,
+        };
+        let glow = Hsla {
+            h: 0.0,
+            s: 0.0,
+            l: 1.0,
+            a: 1.0,
+        };
+
+        assert_eq!(shimmer_color(base, glow, 0.5, 0.5, 0.42), glow);
+        assert_eq!(shimmer_color(base, glow, 0.0, 1.0, 0.42), base);
+        assert_eq!(shimmer_scan_position(0.0, 0.0, 1.0), -0.35);
+    }
+
+    #[test]
     fn agent_thinking_indicator_scrolls_scans_and_keeps_full_tooltip() {
         let source = include_str!("app.rs");
         let renderer = source
@@ -36464,7 +36524,7 @@ mod tests {
         assert!(renderer.contains("label.chars().enumerate().map("));
         assert!(renderer.contains(".flex_none()"));
         assert!(renderer.contains(".text_color("));
-        assert!(renderer.contains("Hsla {"));
+        assert!(renderer.contains("shimmer_color("));
     }
 
     #[test]
@@ -38166,9 +38226,18 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\nimpl Render for VibexWorkbench"))
             .map(|(body, _)| body)
             .expect("startup overlay should remain inspectable");
-        assert!(overlay.contains("when(show_loading_indicator"));
-        assert!(overlay.contains("Spinner::new()"));
-        assert!(overlay.contains("IconName::LoaderCircle"));
+        assert!(overlay.contains("startup_loading_wordmark(show_loading_indicator, cx)"));
+
+        let wordmark = source
+            .split_once("fn startup_loading_wordmark(")
+            .and_then(|(_, tail)| tail.split_once("\nfn startup_loading_overlay("))
+            .map(|(body, _)| body)
+            .expect("startup loading wordmark should remain inspectable");
+        assert!(wordmark.contains("icons/vibex/vibex-mark.svg"));
+        assert!(wordmark.contains(".children(\"ibex\".chars().enumerate()"));
+        assert!(wordmark.contains(".with_animation("));
+        assert!(wordmark.contains("shimmer_scan_position(delta, 0.0, 1.0)"));
+        assert!(!wordmark.contains("Spinner::new()"));
     }
 
     #[test]
