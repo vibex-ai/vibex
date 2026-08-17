@@ -25,7 +25,9 @@ use vibex_core::{
     unix_timestamp_ms,
 };
 use vibex_desktop_model::{TimelineConversationTurn, TimelineRow, TimelineRowKind};
-use vibex_remote_client::{WebRemoteBackend, ZeroConfigLanPairingSession};
+use vibex_remote_client::{
+    RemoteConnectionState, RemoteLifecycleSignal, WebRemoteBackend, ZeroConfigLanPairingSession,
+};
 use vibex_ui::{
     AgentEventDecision, AgentMutationTicket, AgentWorkflowController, AsyncPhase,
     ElicitationFormDraft, ElicitationSurfaceModel, ShellKind,
@@ -36,6 +38,7 @@ use crate::input::{
     Backspace, Copy, Cut, Delete, Down, Enter, Left, Paste, Right, SelectAll, SelectDown,
     SelectLeft, SelectRight, SelectUp, TextInput, Up,
 };
+use crate::lifecycle::MobileLifecycleEvent;
 use crate::pairing::{MobileCredentialBundle, claim_pairing_link, claim_zero_config_lan_pairing};
 use crate::storage::CredentialStorage;
 use crate::workbench::{MobileWorkbench, WorkbenchSurface};
@@ -44,6 +47,8 @@ use crate::{locale, markdown, scanner, theme};
 const TIMELINE_NEAR_BOTTOM_PX: f32 = 96.0;
 const TIMELINE_LIST_OVERDRAW_PX: f32 = 800.0;
 const TIMELINE_TURN_ESTIMATED_HEIGHT_PX: f32 = 180.0;
+const RESUME_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const RESUME_RECOVERY_POLL_ATTEMPTS: usize = 600;
 
 fn timeline_list_state(turn_count: usize) -> ListState {
     ListState::new(
@@ -193,6 +198,11 @@ pub struct MobileApp {
     session_action_busy: bool,
     notice: Option<String>,
     error: Option<BackendError>,
+    app_backgrounded: bool,
+    event_stream_generation: u64,
+    event_forward_task: Option<Task<Result<(), gpui_tokio::JoinError>>>,
+    event_consumer_task: Option<Task<()>>,
+    resume_recovery_task: Option<Task<()>>,
     tasks: Vec<Task<()>>,
 }
 
@@ -247,6 +257,11 @@ impl MobileApp {
             session_action_busy: false,
             notice: None,
             error: stored.as_ref().err().cloned(),
+            app_backgrounded: false,
+            event_stream_generation: 0,
+            event_forward_task: None,
+            event_consumer_task: None,
+            resume_recovery_task: None,
             tasks: Vec::new(),
         };
         if let Ok(Some(bundle)) = stored {
@@ -254,7 +269,95 @@ impl MobileApp {
         }
         app.start_scanner_result_stream(cx);
         app.start_lan_discovery_event_stream(cx);
+        app.start_lifecycle_stream(cx);
         app
+    }
+
+    fn start_lifecycle_stream(&mut self, cx: &mut Context<Self>) {
+        let mut events = crate::lifecycle::subscribe();
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            while let Some(event) = events.next().await {
+                if entity
+                    .update(cx, |this, cx| this.handle_lifecycle_event(event, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        self.tasks.push(task);
+    }
+
+    fn handle_lifecycle_event(&mut self, event: MobileLifecycleEvent, cx: &mut Context<Self>) {
+        match event {
+            MobileLifecycleEvent::Backgrounded => {
+                self.app_backgrounded = true;
+                if matches!(
+                    self.nearby_pairing_state,
+                    NearbyPairingState::Discovering
+                        | NearbyPairingState::Empty
+                        | NearbyPairingState::Validating { .. }
+                        | NearbyPairingState::Waiting { .. }
+                ) {
+                    self.stop_nearby_pairing();
+                }
+                if let Some(workbench) = self.workbench.as_ref() {
+                    workbench.update(cx, |workbench, _| workbench.suspend());
+                }
+                if let Some(backend) = self.backend.as_ref() {
+                    backend.apply_lifecycle_signal(RemoteLifecycleSignal::AppBackgrounded);
+                }
+            }
+            MobileLifecycleEvent::Resumed => {
+                self.app_backgrounded = false;
+                let Some(backend) = self.backend.clone() else {
+                    return;
+                };
+                backend.apply_lifecycle_signal(RemoteLifecycleSignal::AppResumed);
+                self.wait_for_resume_recovery(backend, cx);
+            }
+        }
+    }
+
+    fn wait_for_resume_recovery(&mut self, backend: Arc<WebRemoteBackend>, cx: &mut Context<Self>) {
+        let background = cx.background_executor().clone();
+        self.resume_recovery_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            for _ in 0..RESUME_RECOVERY_POLL_ATTEMPTS {
+                match backend.connection_state().state {
+                    RemoteConnectionState::Online => {
+                        let _ = entity.update(cx, |this, cx| {
+                            if this.app_backgrounded {
+                                return;
+                            }
+                            this.start_event_stream(cx);
+                            this.refresh_sessions(cx);
+                            this.refresh_runtime_options(cx);
+                            this.refresh_workspaces(cx);
+                            this.reload_selected_session(cx);
+                            if let Some(workbench) = this.workbench.as_ref() {
+                                workbench.update(cx, |workbench, cx| workbench.resume(cx));
+                            }
+                            this.notice = None;
+                            cx.notify();
+                        });
+                        return;
+                    }
+                    RemoteConnectionState::Revoked | RemoteConnectionState::Incompatible => {
+                        return;
+                    }
+                    RemoteConnectionState::Idle
+                    | RemoteConnectionState::Resolving
+                    | RemoteConnectionState::Probing
+                    | RemoteConnectionState::Connecting
+                    | RemoteConnectionState::Authenticating
+                    | RemoteConnectionState::Syncing
+                    | RemoteConnectionState::Reconnecting
+                    | RemoteConnectionState::Degraded
+                    | RemoteConnectionState::Offline => {}
+                }
+                background.timer(RESUME_RECOVERY_POLL_INTERVAL).await;
+            }
+        }));
     }
 
     fn start_scanner_result_stream(&mut self, cx: &mut Context<Self>) {
@@ -283,6 +386,7 @@ impl MobileApp {
 
     fn install_bundle(&mut self, bundle: MobileCredentialBundle, cx: &mut Context<Self>) {
         crate::discovery::stop();
+        self.stop_connection_tasks();
         self.lan_pairing_task = None;
         self.nearby_candidates.clear();
         self.nearby_pairing_state = NearbyPairingState::Idle;
@@ -371,8 +475,10 @@ impl MobileApp {
         let Ok(mut subscription) = backend.subscribe() else {
             return;
         };
+        self.event_stream_generation = self.event_stream_generation.wrapping_add(1);
+        let generation = self.event_stream_generation;
         let (sender, mut receiver) = mpsc::unbounded::<BackendEvent>();
-        gpui_tokio::Tokio::spawn(cx, async move {
+        self.event_forward_task = Some(gpui_tokio::Tokio::spawn(cx, async move {
             loop {
                 match subscription.next().await {
                     Ok(Some(event)) => {
@@ -386,8 +492,7 @@ impl MobileApp {
                     }
                 }
             }
-        })
-        .detach();
+        }));
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             while let Some(event) = receiver.next().await {
                 let needs_refetch = entity
@@ -410,7 +515,7 @@ impl MobileApp {
                                     this.timeline_list.scroll_to_end();
                                 }
                             }
-                            Some(AgentEventDecision::Disconnected) => {
+                            Some(AgentEventDecision::Disconnected) if !this.app_backgrounded => {
                                 this.notice = Some(
                                     locale::text(
                                         "Desktop connection lost",
@@ -430,8 +535,20 @@ impl MobileApp {
                     let _ = entity.update(cx, |this, cx| this.reload_selected_session(cx));
                 }
             }
+            let _ = entity.update(cx, |this, _| {
+                if this.event_stream_generation == generation {
+                    this.event_forward_task = None;
+                }
+            });
         });
-        self.tasks.push(task);
+        self.event_consumer_task = Some(task);
+    }
+
+    fn stop_connection_tasks(&mut self) {
+        self.event_stream_generation = self.event_stream_generation.wrapping_add(1);
+        self.event_forward_task = None;
+        self.event_consumer_task = None;
+        self.resume_recovery_task = None;
     }
 
     fn scan_pairing_code(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1726,6 +1843,7 @@ impl MobileApp {
     }
 
     fn forget_desktop(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.stop_connection_tasks();
         if let Some(backend) = self.backend.take() {
             gpui_tokio::Tokio::spawn(cx, async move { backend.disconnect().await }).detach();
         }

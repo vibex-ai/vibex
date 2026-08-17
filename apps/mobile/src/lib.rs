@@ -7,6 +7,7 @@ mod app;
 mod assets;
 mod discovery;
 mod input;
+mod lifecycle;
 mod locale;
 mod markdown;
 mod pairing;
@@ -22,7 +23,9 @@ use gpui::{App, AppContext as _, Bounds, WindowBackgroundAppearance, WindowBound
 pub use pairing::{MobileCredentialBundle, MobileRemoteRouteBundle};
 
 fn run(data_dir: PathBuf) {
-    gpui_platform::application()
+    let platform = gpui_platform::current_platform(false);
+    lifecycle::attach(platform.as_ref());
+    gpui::Application::with_platform(platform)
         .with_assets(assets::MobileAssets)
         .run(move |cx: &mut App| {
             gpui_tokio::init(cx);

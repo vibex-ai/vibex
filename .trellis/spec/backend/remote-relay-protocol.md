@@ -750,6 +750,19 @@ Agent timeline service:
 - Reconnect uses exponential backoff and a bounded send queue with idempotency
   keys for user messages, permission resolutions, file/Git mutations, and
   terminal commands.
+- Installed mobile registers the native GPUI application lifecycle callback on
+  the same platform instance used to construct `gpui::Application`. Entering the
+  background sends `AppBackgrounded` to the remote transport owner, stops
+  foreground-only discovery/polling work, and preserves the credential bundle.
+  Mobile operating systems may suspend or close a background WebSocket, so the
+  product must preserve pairing and recover the route rather than claim that a
+  socket remains permanently runnable in the background.
+- Returning to the foreground sends `AppResumed` to that same transport owner.
+  After the transport reports `Online`, mobile replaces the domain-event
+  consumer, triggers an authoritative session/timeline/workspace refetch, and
+  only then treats the background disconnect as recovered. A disconnect event
+  observed while the app is hidden must not leave a stale "connection lost"
+  notice after this recovery completes.
 
 Do not let feature hooks own independent reconnect loops. One transport layer
 owns reconnect, replay, auth refresh, and queue draining.

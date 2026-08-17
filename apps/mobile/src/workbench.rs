@@ -219,6 +219,10 @@ impl MobileWorkbench {
         }
     }
 
+    pub fn resume(&mut self, cx: &mut Context<Self>) {
+        self.refresh_all(cx);
+    }
+
     fn refresh_all(&mut self, cx: &mut Context<Self>) {
         self.sync_capabilities();
         self.refresh_files(cx);

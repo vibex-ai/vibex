@@ -4048,9 +4048,19 @@ fn close_requires_reselection(reason: &vibex_core::RemoteCloseReason) -> bool {
 fn auto_lifecycle_reselection(
     signal: &RemoteLifecycleSignal,
     state: RemoteConnectionState,
+    resumed_from_background: bool,
 ) -> Option<bool> {
     match signal {
         RemoteLifecycleSignal::NetworkChanged => Some(true),
+        RemoteLifecycleSignal::AppResumed
+            if resumed_from_background
+                && !matches!(
+                    state,
+                    RemoteConnectionState::Revoked | RemoteConnectionState::Incompatible
+                ) =>
+        {
+            Some(true)
+        }
         RemoteLifecycleSignal::ComputerResumed
         | RemoteLifecycleSignal::AppResumed
         | RemoteLifecycleSignal::VisibilityChanged { visible: true }
@@ -4644,6 +4654,7 @@ pub struct AutoRemoteTransport {
     reselection_active: Shared<AtomicBool>,
     reselection_enabled: Shared<AtomicBool>,
     reselection_generation: Shared<AtomicU64>,
+    app_backgrounded: Shared<AtomicBool>,
 }
 
 impl fmt::Debug for AutoRemoteTransport {
@@ -4683,6 +4694,7 @@ impl AutoRemoteTransport {
             reselection_active: Shared::new(AtomicBool::new(false)),
             reselection_enabled: Shared::new(AtomicBool::new(false)),
             reselection_generation: Shared::new(AtomicU64::new(0)),
+            app_backgrounded: Shared::new(AtomicBool::new(false)),
         })
     }
 
@@ -5245,6 +5257,16 @@ impl RemoteTransport for AutoRemoteTransport {
     }
 
     fn apply_lifecycle_signal(&self, signal: RemoteLifecycleSignal) {
+        let resumed_from_background = match &signal {
+            RemoteLifecycleSignal::AppBackgrounded => {
+                self.app_backgrounded.store(true, Ordering::Release);
+                false
+            }
+            RemoteLifecycleSignal::AppResumed => {
+                self.app_backgrounded.swap(false, Ordering::AcqRel)
+            }
+            _ => false,
+        };
         let is_recovery_signal = matches!(
             &signal,
             RemoteLifecycleSignal::NetworkChanged
@@ -5253,7 +5275,9 @@ impl RemoteTransport for AutoRemoteTransport {
                 | RemoteLifecycleSignal::VisibilityChanged { visible: true }
         );
         if is_recovery_signal {
-            if let Some(force) = auto_lifecycle_reselection(&signal, self.state().state) {
+            if let Some(force) =
+                auto_lifecycle_reselection(&signal, self.state().state, resumed_from_background)
+            {
                 // A real network change probes Direct before Relay. Resume
                 // signals only recover a degraded route, so an initial or
                 // duplicate visibility event cannot invalidate an in-flight
@@ -5643,11 +5667,11 @@ mod tests {
             RemoteLifecycleSignal::AppResumed,
         ] {
             assert_eq!(
-                auto_lifecycle_reselection(&signal, RemoteConnectionState::Online),
+                auto_lifecycle_reselection(&signal, RemoteConnectionState::Online, false),
                 None
             );
             assert_eq!(
-                auto_lifecycle_reselection(&signal, RemoteConnectionState::Degraded),
+                auto_lifecycle_reselection(&signal, RemoteConnectionState::Degraded, false),
                 Some(false)
             );
         }
@@ -5655,8 +5679,29 @@ mod tests {
             auto_lifecycle_reselection(
                 &RemoteLifecycleSignal::NetworkChanged,
                 RemoteConnectionState::Online,
+                false,
             ),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn auto_lifecycle_reselects_online_route_after_mobile_background() {
+        assert_eq!(
+            auto_lifecycle_reselection(
+                &RemoteLifecycleSignal::AppResumed,
+                RemoteConnectionState::Online,
+                true,
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            auto_lifecycle_reselection(
+                &RemoteLifecycleSignal::AppResumed,
+                RemoteConnectionState::Revoked,
+                true,
+            ),
+            None
         );
     }
 

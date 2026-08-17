@@ -87,7 +87,7 @@ use crate::binary::TerminalBinaryBuffer;
 use crate::sync::SyncDecision;
 use crate::transport::{
     AutoRemoteTransport, DirectWebSocketTransport, RelayE2eeTransport, RemoteConnectionState,
-    RemoteInboundEvent, RemoteTransport, RemoteTransportEvent,
+    RemoteInboundEvent, RemoteLifecycleSignal, RemoteTransport, RemoteTransportEvent,
 };
 
 /// Typed remote adapter over one transport.  It owns no domain authority; all
@@ -199,6 +199,10 @@ impl WebRemoteBackend {
 
     pub async fn disconnect(&self) -> BackendResult<()> {
         self.transport.disconnect().await
+    }
+
+    pub fn apply_lifecycle_signal(&self, signal: RemoteLifecycleSignal) {
+        self.transport.apply_lifecycle_signal(signal);
     }
 
     pub async fn list_agent_config_summaries(
@@ -2682,6 +2686,7 @@ mod tests {
         responses: Arc<Mutex<VecDeque<vibex_core::RemoteRpcResponseV2>>>,
         requests: Arc<Mutex<Vec<vibex_core::RemoteRpcRequestV2>>>,
         server_info: Arc<Mutex<Option<vibex_core::RemoteServerInfoV2>>>,
+        lifecycle_signals: Arc<Mutex<Vec<RemoteLifecycleSignal>>>,
     }
 
     impl MockTransport {
@@ -2691,6 +2696,7 @@ mod tests {
                 responses: Arc::new(Mutex::new(VecDeque::new())),
                 requests: Arc::new(Mutex::new(Vec::new())),
                 server_info: Arc::new(Mutex::new(None)),
+                lifecycle_signals: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -2702,6 +2708,7 @@ mod tests {
                 responses: Arc::new(Mutex::new(responses.into_iter().collect())),
                 requests: Arc::new(Mutex::new(Vec::new())),
                 server_info: Arc::new(Mutex::new(None)),
+                lifecycle_signals: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -2711,6 +2718,13 @@ mod tests {
 
         fn set_server_info(&self, server_info: vibex_core::RemoteServerInfoV2) {
             *self.server_info.lock().expect("mock server info lock") = Some(server_info);
+        }
+
+        fn lifecycle_signals(&self) -> Vec<RemoteLifecycleSignal> {
+            self.lifecycle_signals
+                .lock()
+                .expect("mock lifecycle signal lock")
+                .clone()
         }
 
         fn unavailable<T>() -> BackendFuture<'static, T> {
@@ -2808,7 +2822,12 @@ mod tests {
             Self::unavailable()
         }
 
-        fn apply_lifecycle_signal(&self, _signal: crate::transport::RemoteLifecycleSignal) {}
+        fn apply_lifecycle_signal(&self, signal: RemoteLifecycleSignal) {
+            self.lifecycle_signals
+                .lock()
+                .expect("mock lifecycle signal lock")
+                .push(signal);
+        }
 
         fn cursors(&self) -> Vec<vibex_core::RemoteStreamCursor> {
             Vec::new()
@@ -2982,6 +3001,29 @@ mod tests {
             !snapshot
                 .git
                 .supports(BackendOperation::GitWorktreeLifecycleMutate)
+        );
+    }
+
+    #[test]
+    fn backend_forwards_mobile_lifecycle_to_the_transport_owner() {
+        let transport = Arc::new(MockTransport::new([]));
+        let backend = WebRemoteBackend::new(
+            transport.clone(),
+            RemoteAuthProof {
+                device_id: vibex_core::DeviceId::new(),
+                auth_token: "test-token".to_string(),
+            },
+        );
+
+        backend.apply_lifecycle_signal(RemoteLifecycleSignal::AppBackgrounded);
+        backend.apply_lifecycle_signal(RemoteLifecycleSignal::AppResumed);
+
+        assert_eq!(
+            transport.lifecycle_signals(),
+            vec![
+                RemoteLifecycleSignal::AppBackgrounded,
+                RemoteLifecycleSignal::AppResumed,
+            ]
         );
     }
 
