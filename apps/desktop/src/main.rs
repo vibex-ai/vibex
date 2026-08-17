@@ -10,7 +10,7 @@ use gpui_component::{Root, TitleBar};
 use vibex_desktop::{
     DEFAULT_HEIGHT, DEFAULT_WIDTH, MIN_HEIGHT, MIN_WIDTH, app, assets,
     code_workbench::{CodeWorkbenchFixture, CodeWorkbenchFixtureKind},
-    first_frame_probe, theme,
+    first_frame_probe, terminal_surface, theme,
 };
 use vibex_desktop_model::{AppearanceUiState, ThemeMode};
 use vibex_terminal::run_terminal_feasibility;
@@ -24,7 +24,6 @@ mod pdf_controller;
 mod pdf_spike;
 mod pdf_surface;
 mod pdf_worker;
-mod terminal_surface;
 
 #[derive(Clone)]
 enum LaunchMode {
@@ -386,4 +385,14 @@ fn main() {
             .expect("failed to open Vibex preview window");
             cx.activate(true);
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn terminal_actions_are_registered_once(cx: &mut gpui::TestAppContext) {
+        cx.update(terminal_surface::bind_terminal_keys);
+    }
 }
