@@ -80,6 +80,13 @@ the Vibex session and Provider Profile. A per-turn temporary directory is only
 valid for stateless probes such as model listing; it must not be used for turns
 that later resume a native thread/session id.
 
+Codex ACP initialization must continue to identify Vibex truthfully on the ACP
+wire. Its managed custom-provider overlay must separately set the HTTP
+`originator` header to `codex_cli_rs`, because Codex app-server otherwise derives
+that provider-facing header from the embedding ACP client name. This preserves
+compatibility with Responses gateways that authorize the Codex HTTP engine while
+keeping ACP client attribution accurate.
+
 ## Scenario: ACP Agent Authentication And Profile Secret Transactions
 
 ### 1. Scope / Trigger

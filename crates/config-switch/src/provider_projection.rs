@@ -46,6 +46,7 @@ const OPENCODE_SECRET_ENV: &str = "VIBEX_OPENCODE_PROVIDER_API_KEY";
 const CODEX_MODEL_PROVIDER_ENV: &str = "MODEL_PROVIDER";
 const CODEX_DEFAULT_AUTH_REQUEST_ENV: &str = "DEFAULT_AUTH_REQUEST";
 const CODEX_DEFAULT_API_KEY_AUTH_REQUEST: &str = r#"{"methodId":"api-key"}"#;
+const CODEX_PROVIDER_ORIGINATOR: &str = "codex_cli_rs";
 const OVERLAY_SECRET_PLACEHOLDER_PREFIX: &str = "__VIBEX_SECRET_ENV_";
 const OVERLAY_SECRET_PLACEHOLDER_SUFFIX: &str = "__";
 
@@ -1695,6 +1696,13 @@ fn codex_overlay(
     lines.push("wire_api = \"responses\"".to_string());
     lines.push("requires_openai_auth = true".to_string());
     lines.push("env_key = \"CODEX_API_KEY\"".to_string());
+    // Codex app-server derives its default originator from the ACP client name.
+    // Keep the ACP identity truthful while identifying the actual HTTP engine to
+    // Codex-compatible gateways that route or authorize by request originator.
+    lines.push(format!(
+        "http_headers = {{ originator = {} }}",
+        toml_quote(CODEX_PROVIDER_ORIGINATOR)
+    ));
     format!("{}\n", lines.join("\n"))
 }
 
@@ -3288,6 +3296,22 @@ mod tests {
             deleted_at_ms: None,
         };
         (provider, runtime, binding, descriptor)
+    }
+
+    #[test]
+    fn codex_overlay_identifies_the_codex_http_engine_to_compatible_gateways() {
+        let (provider, _, _, _) = fixture(ConfigOverlayStrategy::CodexStableHome);
+        let endpoint = provider.endpoints.first().unwrap();
+        let content = codex_overlay(&provider, Some(endpoint));
+        let config: toml::Value = toml::from_str(&content).unwrap();
+        let projected = &config["model_providers"]["fake"];
+
+        assert_eq!(
+            projected["http_headers"]["originator"].as_str(),
+            Some(CODEX_PROVIDER_ORIGINATOR)
+        );
+        assert_eq!(projected["requires_openai_auth"].as_bool(), Some(true));
+        assert_eq!(projected["env_key"].as_str(), Some("CODEX_API_KEY"));
     }
 
     const TYPED_SECRET_LOOKUP: &str = "opaque-typed-projection-secret";
