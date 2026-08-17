@@ -34947,7 +34947,7 @@ fn startup_loading_wordmark(show_shimmer: bool, cx: &App) -> AnyElement {
     let glow = cx.theme().foreground;
     let wordmark = move |scan_position: Option<f32>| {
         let color_at = |position| {
-            scan_position.map_or(base, |scan_position| {
+            scan_position.map_or(glow, |scan_position| {
                 shimmer_color(base, glow, position, scan_position, 0.42)
             })
         };
@@ -38439,6 +38439,7 @@ mod tests {
             .expect("startup loading wordmark should remain inspectable");
         assert!(wordmark.contains("icons/vibex/vibex-mark.svg"));
         assert!(wordmark.contains(".children(\"ibex\".chars().enumerate()"));
+        assert!(wordmark.contains("scan_position.map_or(glow"));
         assert!(wordmark.contains(".with_animation("));
         assert!(wordmark.contains("shimmer_scan_position(delta, 0.0, 1.0)"));
         assert!(!wordmark.contains("Spinner::new()"));
