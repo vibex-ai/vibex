@@ -24,6 +24,8 @@ import androidx.core.view.WindowCompat;
 
 import org.json.JSONObject;
 
+import java.net.Inet4Address;
+import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
@@ -216,16 +218,7 @@ public final class GpuiNativeActivity extends NativeActivity {
             event.put("serviceInstance", service == null ? "" : service.getServiceName());
             event.put("port", service == null ? 0 : service.getPort());
             event.put("interfaceScope", "");
-            String host = "";
-            if (service != null && service.getHost() != null) {
-                // NsdManager has already resolved the service at this point.
-                // Pass the numeric address to Rust instead of the advertised
-                // `.local` name; the Rust resolver cannot reliably resolve
-                // Android mDNS names a second time when opening the pairing
-                // listener.
-                host = service.getHost().getHostAddress();
-            }
-            event.put("host", host);
+            event.put("host", resolvedNumericHost(service));
             JSONObject txt = new JSONObject();
             if (attributes != null) {
                 for (Map.Entry<String, byte[]> entry : attributes.entrySet()) {
@@ -237,6 +230,31 @@ public final class GpuiNativeActivity extends NativeActivity {
         } catch (Exception ignored) {
             nativeOnLanDiscoveryEvent("{\"kind\":\"failed\"}");
         }
+    }
+
+    @SuppressWarnings("deprecation")
+    private static String resolvedNumericHost(NsdServiceInfo service) {
+        if (service == null) {
+            return "";
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            // Zero-config listeners are IPv4-only; Rust still accepts the
+            // numeric fallback for Direct HTTPS candidates.
+            String fallback = "";
+            for (InetAddress address : service.getHostAddresses()) {
+                if (address instanceof Inet4Address) {
+                    return address.getHostAddress();
+                }
+                if (fallback.isEmpty()) {
+                    fallback = address.getHostAddress();
+                }
+            }
+            if (!fallback.isEmpty()) {
+                return fallback;
+            }
+        }
+        InetAddress address = service.getHost();
+        return address == null ? "" : address.getHostAddress();
     }
 
     private static final class GpuiEditText extends EditText {

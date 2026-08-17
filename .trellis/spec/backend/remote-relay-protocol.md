@@ -349,18 +349,23 @@ DNS-SD service type = _vibex._tcp.local.; TXT mode = zero_config
   zero-config only when both zero-config identity keys are present and the
   remaining key set is exact; desktop advertisements always include
   `mode=zero_config`.
-- Native resolvers must pass the resolved numeric address (IPv4 or IPv6) to
-  Rust instead of the advertised `.local`/mDNS hostname; Rust must not perform
-  a second mDNS lookup for the pairing listener. Mobile validates IPv4/IPv6
-  authorities (including bracketed IPv6 and a validated scoped-IPv6 label)
-  before constructing the bootstrap origin; it rejects ambiguous colon-bearing
-  host strings and never treats TXT as a URL.
+- Both zero-config listeners are currently IPv4-only because Desktop binds
+  `0.0.0.0`. Native resolvers must pass a resolved numeric address to Rust
+  instead of the advertised `.local`/mDNS hostname and prefer IPv4 when the
+  platform returns multiple addresses; Rust must not perform a second mDNS
+  lookup for the pairing listener. Android scans
+  `NsdServiceInfo.getHostAddresses()` where available and iOS searches for an
+  `AF_INET` service address before falling back to another numeric family. Rust
+  revalidates loopback/private/link-local IPv4 for zero-config while Direct HTTPS
+  retains its existing numeric IPv6 support. If zero-config resolution supplies
+  only IPv6, discard that candidate and keep browsing; do not claim zero-config
+  IPv6 support until both Desktop listeners are dual-stack.
 - A malformed, stale, or incompatible candidate is local to that candidate:
   discard it and continue browsing. Only the native discovery service's own
   permission or browsing failure terminates the active discovery flow. One
   untrusted LAN advertisement must never suppress later valid candidates.
 - Mobile constructs one credential-free exact `http` origin from a resolved
-  loopback/private/link-local numeric DNS-SD address, bypasses all proxies,
+  loopback/private/link-local numeric IPv4 DNS-SD address, bypasses all proxies,
   disables redirects, and uses it only for bootstrap. It constructs the durable
   route by replacing only scheme and port with
   `https://<same-numeric-address>:<lan_gateway_port>`.
@@ -399,6 +404,7 @@ DNS-SD service type = _vibex._tcp.local.; TXT mode = zero_config
 | Local TLS Gateway is absent or its port/certificate is invalid | `remote_local_lan_gateway_unavailable` / `remote_local_lan_route_invalid`; create no bootstrap session. |
 | Listener bind/address or advertiser setup fails | `remote_zero_config_pairing_listener_*` / `remote_zero_config_advertisement_failed`; cancel the offer and listener. |
 | Unknown/oversized TXT, invalid server id/key, non-v2 mode, or malformed origin | Reject that candidate with `remote_lan_discovery_invalid` / `remote_zero_config_pairing_origin_invalid`, keep browsing, and send no hello. |
+| Zero-config resolution has no IPv4 address, or Rust receives an IPv6/hostname origin | Discard that candidate locally and keep browsing; show no pairing-origin error and send no hello. |
 | Hello nonce/key is malformed or non-contributory | `remote_zero_config_pairing_hello_invalid` / `remote_zero_config_pairing_hello_rejected`; create no session. |
 | Session is unknown, expired, replayed, or frame authentication fails | `remote_zero_config_pairing_session_*` / `remote_zero_config_pairing_frame_invalid`; expose no plaintext payload. |
 | Session/request limits are reached | Existing bounded LAN busy/limit response; allocate no unbounded task or session. |
@@ -415,9 +421,13 @@ DNS-SD service type = _vibex._tcp.local.; TXT mode = zero_config
 - Base: the three remote method controls and QR flow work unchanged while no
   zero-config window is active; the fourth entry has its own permission and
   start/stop state.
+- Base: an IPv6 result arrives before a usable IPv4 result; Mobile ignores the
+  IPv6-only candidate and presents the later IPv4 candidate without surfacing a
+  pairing-origin error.
 - Bad: attach a nearby button to every transport row, advertise the claim
   challenge, send request/status/claim as plaintext HTTP JSON, save
-  `vibex-lan.local`, require Tailnet/Relay, or disable all certificate checks.
+  `vibex-lan.local`, use the first resolved address without checking the Desktop
+  listener family, require Tailnet/Relay, or disable all certificate checks.
 
 ### 6. Tests Required
 
@@ -433,8 +443,9 @@ DNS-SD service type = _vibex._tcp.local.; TXT mode = zero_config
   malformed pins, proxy/redirect refusal, KDF binding, identity, and SAS.
 - Desktop advertiser/controller tests cover strict TXT, start failure cleanup,
   expiry, route-change cancellation, and separate UI state. Native mobile tests
-  cover mode filtering, invalid identity metadata, duplicate names, lifecycle,
-  claim persistence, and QR fallback. Run `pnpm check:mobile-native`.
+  cover mode filtering, invalid identity metadata, duplicate names, IPv4
+  selection, IPv6-only candidate discard, lifecycle, claim persistence, and QR
+  fallback. Run `pnpm check:mobile-native`.
 
 ### 7. Wrong vs Correct
 
@@ -443,6 +454,7 @@ DNS-SD service type = _vibex._tcp.local.; TXT mode = zero_config
 ```text
 _vibex TXT challenge=<secret> -> POST plaintext claim -> save mDNS HTTP as route
 pair locally -> save vibex-lan.local -> require Tailnet when DNS fails
+first DNS-SD address is IPv6 -> build an origin for an IPv4-only listener
 Direct / Tailnet / Relay rows each render "Allow nearby device"
 ```
 
@@ -450,7 +462,7 @@ Direct / Tailnet / Relay rows each render "Allow nearby device"
 
 ```text
 bounded TXT -> hello binds nonce + LAN port + certificate -> encrypted claim
-resolved LAN IP + exact certificate pin -> HTTPS/WSS RemoteGateway v2
+resolved IPv4 matching Desktop listener + exact pin -> HTTPS/WSS RemoteGateway v2
 Tailnet/Direct/Relay = optional fallback routes; bootstrap HTTP stops after claim
 ```
 
@@ -738,6 +750,19 @@ Agent timeline service:
 - Reconnect uses exponential backoff and a bounded send queue with idempotency
   keys for user messages, permission resolutions, file/Git mutations, and
   terminal commands.
+- Installed mobile registers the native GPUI application lifecycle callback on
+  the same platform instance used to construct `gpui::Application`. Entering the
+  background sends `AppBackgrounded` to the remote transport owner, stops
+  foreground-only discovery/polling work, and preserves the credential bundle.
+  Mobile operating systems may suspend or close a background WebSocket, so the
+  product must preserve pairing and recover the route rather than claim that a
+  socket remains permanently runnable in the background.
+- Returning to the foreground sends `AppResumed` to that same transport owner.
+  After the transport reports `Online`, mobile replaces the domain-event
+  consumer, triggers an authoritative session/timeline/workspace refetch, and
+  only then treats the background disconnect as recovered. A disconnect event
+  observed while the app is hidden must not leave a stale "connection lost"
+  notice after this recovery completes.
 
 Do not let feature hooks own independent reconnect loops. One transport layer
 owns reconnect, replay, auth refresh, and queue draining.

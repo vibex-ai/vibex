@@ -1,7 +1,6 @@
 #![cfg(not(target_family = "wasm"))]
 
 use std::fmt;
-use std::net::IpAddr;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -77,7 +76,7 @@ impl ZeroConfigLanPairingSession {
         expected_server_identity_public_key: &str,
         display_name: &str,
     ) -> BackendResult<Self> {
-        let origin = normalize_zero_config_origin(&origin.into())?;
+        let origin = normalize_zero_config_lan_origin(&origin.into())?;
         let expected_server_id = expected_server_id.trim();
         let expected_server_identity_public_key = expected_server_identity_public_key.trim();
         if expected_server_id.is_empty()
@@ -349,8 +348,11 @@ async fn send_encrypted<T: serde::Serialize, R: DeserializeOwned>(
     })
 }
 
-fn normalize_zero_config_origin(value: &str) -> BackendResult<String> {
+pub fn normalize_zero_config_lan_origin(value: &str) -> BackendResult<String> {
     let mut url = url::Url::parse(value.trim()).map_err(|_| invalid_origin())?;
+    let Some(url::Host::Ipv4(address)) = url.host() else {
+        return Err(invalid_origin());
+    };
     if url.scheme() != "http"
         || url.host_str().is_none()
         || url.username() != ""
@@ -358,10 +360,7 @@ fn normalize_zero_config_origin(value: &str) -> BackendResult<String> {
         || url.path() != "/"
         || url.query().is_some()
         || url.fragment().is_some()
-        || !url
-            .host_str()
-            .and_then(|host| host.parse::<IpAddr>().ok())
-            .is_some_and(is_local_network_ip)
+        || !(address.is_loopback() || address.is_private() || address.is_link_local())
     {
         return Err(invalid_origin());
     }
@@ -414,17 +413,6 @@ fn validate_tls_certificate(encoded: &str) -> BackendResult<String> {
     Ok(encoded.to_string())
 }
 
-fn is_local_network_ip(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(address) => {
-            address.is_loopback() || address.is_private() || address.is_link_local()
-        }
-        IpAddr::V6(address) => {
-            address.is_loopback() || address.is_unique_local() || address.is_unicast_link_local()
-        }
-    }
-}
-
 fn endpoint_url(origin: &str, path: &str) -> BackendResult<url::Url> {
     let mut url = url::Url::parse(origin).map_err(|_| invalid_origin())?;
     url.set_path(path);
@@ -462,7 +450,7 @@ mod tests {
     #[test]
     fn zero_config_origin_requires_an_exact_http_origin() {
         assert_eq!(
-            normalize_zero_config_origin(" http://192.168.1.10:4321 ").unwrap(),
+            normalize_zero_config_lan_origin(" http://192.168.1.10:4321 ").unwrap(),
             "http://192.168.1.10:4321"
         );
         for invalid in [
@@ -471,9 +459,10 @@ mod tests {
             "http://192.168.1.10:4321/pair",
             "http://192.168.1.10:4321?token=secret",
             "http://192.168.1.10:4321#pair",
+            "http://[fe80::1]:4321",
         ] {
             assert_eq!(
-                normalize_zero_config_origin(invalid).unwrap_err().code,
+                normalize_zero_config_lan_origin(invalid).unwrap_err().code,
                 "remote_zero_config_pairing_origin_invalid"
             );
         }

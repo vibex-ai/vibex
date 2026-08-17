@@ -4,10 +4,14 @@
 #import <sys/socket.h>
 
 static NSString *VibexNumericHost(NSNetService *service) {
+    // Zero-config listeners are IPv4-only; Rust still accepts the numeric
+    // fallback for Direct HTTPS candidates.
+    NSString *fallback = @"";
     for (NSData *data in service.addresses) {
-        if (data.length == 0) {
+        if (data.length < sizeof(struct sockaddr)) {
             continue;
         }
+        const struct sockaddr *address = data.bytes;
         char host[NI_MAXHOST] = {0};
         int result = getnameinfo(
             data.bytes,
@@ -20,11 +24,16 @@ static NSString *VibexNumericHost(NSNetService *service) {
         if (result == 0) {
             NSString *value = [NSString stringWithUTF8String:host];
             if (value.length > 0) {
-                return value;
+                if (address->sa_family == AF_INET) {
+                    return value;
+                }
+                if (fallback.length == 0) {
+                    fallback = value;
+                }
             }
         }
     }
-    return @"";
+    return fallback;
 }
 
 @interface VibexLanDiscoveryController : NSObject <NSNetServiceBrowserDelegate, NSNetServiceDelegate>

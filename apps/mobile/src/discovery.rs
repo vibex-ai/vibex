@@ -5,7 +5,7 @@ use base64::Engine as _;
 use futures_channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use serde::Deserialize;
 use vibex_backend::{BackendError, BackendResult};
-use vibex_remote_client::normalize_lan_https_origin;
+use vibex_remote_client::{normalize_lan_https_origin, normalize_zero_config_lan_origin};
 
 const MAX_SERVICE_INSTANCE_BYTES: usize = 63;
 const MAX_DISPLAY_NAME_BYTES: usize = 192;
@@ -206,18 +206,15 @@ fn parse_candidate(event: NativeDiscoveryEvent) -> BackendResult<LanDiscoveryCan
     if event.interface_scope.len() > 128 || event.interface_scope.chars().any(char::is_control) {
         return Err(invalid_discovery());
     }
-    let authority = host_authority(&event.host, event.port)?;
     let origin = match mode {
         LanDiscoveryMode::DirectHttps => {
+            let authority = host_authority(&event.host, event.port)?;
             normalize_lan_https_origin(&format!("https://{authority}"))?
         }
         LanDiscoveryMode::ZeroConfig => {
-            let url =
-                url::Url::parse(&format!("http://{authority}")).map_err(|_| invalid_discovery())?;
-            if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
-                return Err(invalid_discovery());
-            }
-            url.origin().ascii_serialization()
+            let authority = ipv4_host_authority(&event.host, event.port)?;
+            normalize_zero_config_lan_origin(&format!("http://{authority}"))
+                .map_err(|_| invalid_discovery())?
         }
     };
     let (server_id, server_identity_public_key) = match mode {
@@ -295,6 +292,17 @@ fn host_authority(host: &str, port: u16) -> BackendResult<String> {
         return Err(invalid_discovery());
     }
     Ok(format!("{host}:{port}"))
+}
+
+fn ipv4_host_authority(host: &str, port: u16) -> BackendResult<String> {
+    let address = host
+        .trim_end_matches('.')
+        .parse::<std::net::Ipv4Addr>()
+        .map_err(|_| invalid_discovery())?;
+    if !(address.is_loopback() || address.is_private() || address.is_link_local()) {
+        return Err(invalid_discovery());
+    }
+    Ok(format!("{address}:{port}"))
 }
 
 fn validate_bounded_text(value: &str, min: usize, max: usize) -> BackendResult<()> {
@@ -475,16 +483,17 @@ mod tests {
     #[test]
     fn zero_config_candidate_requires_and_preserves_desktop_identity() {
         let public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]);
-        let native: NativeDiscoveryEvent = serde_json::from_str(&candidate_json(&format!(
+        let mut native: NativeDiscoveryEvent = serde_json::from_str(&candidate_json(&format!(
             r#","mode":"zero_config","server_id":"desktop-test","server_identity_public_key":"{public_key}""#
         )))
         .unwrap();
+        native.host = "192.168.1.10".into();
         let LanDiscoveryEvent::Candidate(candidate) = parse_native_event(native).unwrap() else {
             panic!("expected candidate");
         };
 
         assert_eq!(candidate.mode, LanDiscoveryMode::ZeroConfig);
-        assert_eq!(candidate.origin, "http://desktop.example:443");
+        assert_eq!(candidate.origin, "http://192.168.1.10:443");
         assert_eq!(candidate.server_id.as_deref(), Some("desktop-test"));
         assert_eq!(
             candidate.server_identity_public_key.as_deref(),
@@ -500,6 +509,7 @@ mod tests {
         )))
         .unwrap();
         native.txt.remove("mode");
+        native.host = "192.168.1.10".into();
 
         let LanDiscoveryEvent::Candidate(candidate) = parse_native_event(native).unwrap() else {
             panic!("expected candidate");
@@ -519,11 +529,24 @@ mod tests {
     }
 
     #[test]
+    fn zero_config_ipv6_candidate_is_discarded_before_user_selection() {
+        let public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let mut encoded: serde_json::Value = serde_json::from_str(&candidate_json(&format!(
+            r#","mode":"zero_config","server_id":"desktop-test","server_identity_public_key":"{public_key}""#
+        )))
+        .unwrap();
+        encoded["host"] = serde_json::Value::String("fe80::1%wlan0".into());
+
+        assert!(decode_native_json(&serde_json::to_string(&encoded).unwrap()).is_none());
+    }
+
+    #[test]
     fn zero_config_candidate_rejects_invalid_identity_key() {
-        let native: NativeDiscoveryEvent = serde_json::from_str(&candidate_json(
+        let mut native: NativeDiscoveryEvent = serde_json::from_str(&candidate_json(
             r#","mode":"zero_config","server_id":"desktop-test","server_identity_public_key":"invalid""#,
         ))
         .unwrap();
+        native.host = "192.168.1.10".into();
 
         assert_eq!(
             parse_native_event(native).unwrap_err().code,
