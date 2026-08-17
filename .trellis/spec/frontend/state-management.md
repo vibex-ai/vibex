@@ -1770,6 +1770,10 @@ SidebarOrganizationScope::{Root, Project(project_id)}
   parent currently being rendered. An item with no placement may fall back only
   at its scope root; never append every remaining available item at nested levels,
   because that renders siblings and the folder itself as recursive children.
+- Root-level Session placements remain aligned with the existing sidebar Session
+  projection. Folder metadata must not replace `SidebarUiState.session_order` as
+  the compatibility order for ordinary drag reordering, and a newly discovered
+  Session keeps the existing new-before-manually-ordered default.
 - The sidebar header, empty/root context menu, Project context menu, and folder
   context menu expose the scoped create action. A new folder starts with localized
   default text and immediately focuses/selects inline rename. Empty names remain
@@ -1796,6 +1800,8 @@ SidebarOrganizationScope::{Root, Project(project_id)}
 | Folder is dropped into itself or a descendant | Reject; never create a cycle. |
 | Moving a subtree would exceed 32 levels | Reject the preview/drop and keep the original parent. |
 | A newly created empty folder is rendered | Show exactly one row with no recursive copy below it. |
+| A Session is created after users manually ordered existing Sessions | Show the new Session before the manually ordered unpinned Sessions; retain their relative order. |
+| Two ordinary root Sessions are reordered by drag | Persist both the organization projection and legacy `session_order`, even if one representation was already in the requested order. |
 | Folder is deleted | Promote direct children; preserve every Project/Session/folder id. |
 | Referenced Project/Session no longer exists | Remove the stale placement during cleanup/reconcile. |
 
@@ -1805,6 +1811,9 @@ SidebarOrganizationScope::{Root, Project(project_id)}
   then nest another folder and reorder the Projects around it.
 - Good: create folders inside Project A and distribute its pinned and unpinned
   Sessions while Project B remains an invalid drop target.
+- Good: manually reorder two root Sessions, create another Session, and keep the
+  new Session ahead of the manually ordered unpinned pair without losing their
+  relative order.
 - Base: a user with pre-feature UI state sees the unchanged flat sidebar until
   they create or drag into a folder.
 - Bad: infer folder scope from the current selection, reparent a Session across
@@ -1815,8 +1824,9 @@ SidebarOrganizationScope::{Root, Project(project_id)}
 
 - Pure `desktop-model` tests cover cross-Project rejection, cycle and whole-subtree
   depth rejection, exact relative/into/root ordering, direct-parent-only
-  projection with root-only unplaced fallback, delete promotion, bounded
-  normalization, and stale-reference cleanup.
+  projection with root-only unplaced fallback, manual root Session ordering plus
+  new-Session insertion, delete promotion, bounded normalization, and stale-reference
+  cleanup.
 - UI-state tests decode legacy schema-v1 JSON without the additive field and
   round-trip a populated organization tree.
 - GPUI source/interaction coverage asserts scoped create/rename/delete menus,
@@ -1835,6 +1845,13 @@ organization.move_into(
     target_folder_id,
     &session_projects,
 );
+
+// Wrong: placement insertion time silently replaces established sidebar order.
+organization.reconcile(&project_ids, &sessions_in_snapshot_order);
+
+// Correct: root placements align with the existing projected Session order.
+let ordered_sessions = ordered_sidebar_session_projects();
+organization.reconcile(&project_ids, &ordered_sessions);
 ```
 
 ## Scenario: GPUI Agent Authentication Projection

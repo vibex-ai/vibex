@@ -5540,35 +5540,7 @@ impl VibexWorkbench {
             &mut ordered_project_ids,
             valid_project_ids.iter().cloned().collect(),
         );
-        let mut ordered_session_ids = self.sidebar_state.row_order.clone();
-        ordered_session_ids.extend(
-            self.sessions
-                .iter()
-                .map(|session| session.id.as_str().to_string()),
-        );
-        complete_string_order(
-            &mut ordered_session_ids,
-            valid_session_ids.iter().cloned().collect(),
-        );
-        let session_projects = self
-            .sessions
-            .iter()
-            .map(|session| {
-                (
-                    session.id.as_str().to_string(),
-                    session.project_id.as_str().to_string(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let ordered_session_projects = ordered_session_ids
-            .into_iter()
-            .filter_map(|session_id| {
-                session_projects
-                    .get(&session_id)
-                    .cloned()
-                    .map(|project_id| (session_id, project_id))
-            })
-            .collect::<Vec<_>>();
+        let ordered_session_projects = self.ordered_sidebar_session_projects();
         self.ui_state
             .sidebar
             .organization
@@ -6071,6 +6043,33 @@ impl VibexWorkbench {
             });
         }
         groups
+    }
+
+    fn ordered_sidebar_session_projects(&self) -> Vec<(String, String)> {
+        let mut seen = BTreeSet::new();
+        let mut ordered = sidebar_project_projections(
+            &self.workspaces,
+            &self.sessions,
+            &self.workspace_contexts,
+            &self.ui_state.sidebar.project_order,
+            &self.sidebar_state.row_order,
+            &self.sidebar_state.pinned_ids,
+            "",
+        )
+        .into_iter()
+        .flat_map(|group| group.compact_sessions)
+        .filter_map(|session| {
+            let session_id = session.id.as_str().to_string();
+            seen.insert(session_id.clone())
+                .then(|| (session_id, session.project_id.as_str().to_string()))
+        })
+        .collect::<Vec<_>>();
+        ordered.extend(self.sessions.iter().filter_map(|session| {
+            let session_id = session.id.as_str().to_string();
+            seen.insert(session_id.clone())
+                .then(|| (session_id, session.project_id.as_str().to_string()))
+        }));
+        ordered
     }
 
     fn sidebar_session_projects(&self) -> BTreeMap<String, String> {
@@ -6625,7 +6624,7 @@ impl VibexWorkbench {
         }
         self.sidebar_organization_root_drop_target = None;
         let target = target.expect("sidebar organization target checked above");
-        let changed = match target.position {
+        let organization_changed = match target.position {
             SidebarOrganizationDropPosition::Before | SidebarOrganizationDropPosition::After => {
                 self.ui_state.sidebar.organization.move_relative(
                     moving,
@@ -6644,49 +6643,57 @@ impl VibexWorkbench {
             },
         };
 
-        if changed {
-            match (moving, &target.target, target.position) {
-                (
-                    SidebarOrganizationItem::Project(moving_id),
-                    SidebarOrganizationItem::Project(target_id),
-                    SidebarOrganizationDropPosition::Before
-                    | SidebarOrganizationDropPosition::After,
-                ) => {
-                    let project_ids = self
-                        .workspaces
-                        .iter()
-                        .map(|(project, _)| project.id.as_str().to_string())
-                        .collect::<Vec<_>>();
-                    complete_string_order(&mut self.ui_state.sidebar.project_order, project_ids);
-                    let _ = move_string_relative(
-                        &mut self.ui_state.sidebar.project_order,
-                        moving_id,
-                        target_id,
-                        target.position == SidebarOrganizationDropPosition::After,
-                    );
-                }
-                (
-                    SidebarOrganizationItem::Session(moving_id),
-                    SidebarOrganizationItem::Session(target_id),
-                    SidebarOrganizationDropPosition::Before
-                    | SidebarOrganizationDropPosition::After,
-                ) => {
-                    let session_ids = self
-                        .sessions
-                        .iter()
-                        .map(|session| session.id.as_str().to_string())
-                        .collect::<Vec<_>>();
-                    complete_string_order(&mut self.sidebar_state.row_order, session_ids);
-                    let _ = self.sidebar_state.move_row_relative(
-                        moving_id,
-                        target_id,
-                        target.position == SidebarOrganizationDropPosition::After,
-                    );
-                    self.ui_state.sidebar.session_order = self.sidebar_state.row_order.clone();
-                }
-                _ => {}
+        // Root Project/Session order predates organization folders and remains
+        // the compatibility source for flat sidebar ordering.
+        let legacy_order_changed = match (moving, &target.target, target.position) {
+            (
+                SidebarOrganizationItem::Project(moving_id),
+                SidebarOrganizationItem::Project(target_id),
+                SidebarOrganizationDropPosition::Before | SidebarOrganizationDropPosition::After,
+            ) => {
+                let original_order = self.ui_state.sidebar.project_order.clone();
+                let project_ids = self
+                    .workspaces
+                    .iter()
+                    .map(|(project, _)| project.id.as_str().to_string())
+                    .collect::<Vec<_>>();
+                complete_string_order(&mut self.ui_state.sidebar.project_order, project_ids);
+                let _ = move_string_relative(
+                    &mut self.ui_state.sidebar.project_order,
+                    moving_id,
+                    target_id,
+                    target.position == SidebarOrganizationDropPosition::After,
+                );
+                self.ui_state.sidebar.project_order != original_order
             }
-            if target.position == SidebarOrganizationDropPosition::Into
+            (
+                SidebarOrganizationItem::Session(moving_id),
+                SidebarOrganizationItem::Session(target_id),
+                SidebarOrganizationDropPosition::Before | SidebarOrganizationDropPosition::After,
+            ) => {
+                let original_order = self.sidebar_state.row_order.clone();
+                let session_ids = self
+                    .ordered_sidebar_session_projects()
+                    .into_iter()
+                    .map(|(session_id, _)| session_id)
+                    .collect::<Vec<_>>();
+                complete_string_order(&mut self.sidebar_state.row_order, session_ids);
+                let _ = self.sidebar_state.move_row_relative(
+                    moving_id,
+                    target_id,
+                    target.position == SidebarOrganizationDropPosition::After,
+                );
+                let changed = self.sidebar_state.row_order != original_order
+                    || self.ui_state.sidebar.session_order != self.sidebar_state.row_order;
+                self.ui_state.sidebar.session_order = self.sidebar_state.row_order.clone();
+                changed
+            }
+            _ => false,
+        };
+
+        if organization_changed || legacy_order_changed {
+            if organization_changed
+                && target.position == SidebarOrganizationDropPosition::Into
                 && let SidebarOrganizationItem::Folder(folder_id) = &target.target
             {
                 self.ui_state
@@ -6877,29 +6884,49 @@ impl VibexWorkbench {
         let groups = self.sidebar_workspace_groups("");
         let moving = SidebarOrganizationItem::Session(drag.session_id.as_str().to_string());
         let parent = self.ui_state.sidebar.organization.parent_of(&moving);
-        let original_ids = groups
-            .iter()
-            .find(|group| group.project.id.as_str() == drag.project_id)
-            .map(|group| {
-                self.sidebar_project_organization_items(
-                    &drag.project_id,
-                    &group.compact_sessions,
-                    parent.as_deref(),
-                )
-                .into_iter()
-                .filter_map(|item| match item {
-                    SidebarOrganizationItem::Session(id)
-                        if self.sidebar_state.pinned_ids.contains(&id) == drag.pinned =>
-                    {
-                        Some(id)
-                    }
-                    SidebarOrganizationItem::Folder(_)
-                    | SidebarOrganizationItem::Project(_)
-                    | SidebarOrganizationItem::Session(_) => None,
+        let original_ids = if parent.is_some() {
+            groups
+                .iter()
+                .find(|group| group.project.id.as_str() == drag.project_id)
+                .map(|group| {
+                    self.sidebar_project_organization_items(
+                        &drag.project_id,
+                        &group.compact_sessions,
+                        parent.as_deref(),
+                    )
+                    .into_iter()
+                    .filter_map(|item| match item {
+                        SidebarOrganizationItem::Session(id)
+                            if self.sidebar_state.pinned_ids.contains(&id) == drag.pinned =>
+                        {
+                            Some(id)
+                        }
+                        SidebarOrganizationItem::Folder(_)
+                        | SidebarOrganizationItem::Project(_)
+                        | SidebarOrganizationItem::Session(_) => None,
+                    })
+                    .collect::<Vec<_>>()
                 })
-                .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+                .unwrap_or_default()
+        } else {
+            groups
+                .iter()
+                .flat_map(|group| &group.workspaces)
+                .find(|workspace| workspace.workspace.id.as_str() == drag.workspace_id)
+                .map(|workspace| {
+                    workspace
+                        .sessions
+                        .iter()
+                        .filter(|session| !self.sidebar_session_is_organized(&session.id))
+                        .filter(|session| {
+                            self.sidebar_state.pinned_ids.contains(session.id.as_str())
+                                == drag.pinned
+                        })
+                        .map(|session| session.id.as_str().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
         if !original_ids.iter().any(|id| id == drag.session_id.as_str()) {
             return;
         }
@@ -41333,6 +41360,25 @@ mod tests {
         assert!(folder.contains("SidebarSessionDrag"));
         assert!(folder.contains("SidebarOrganizationDropPosition::Into"));
         assert!(folder.contains(".aria_expanded(!collapsed)"));
+    }
+
+    #[test]
+    fn sidebar_organization_preserves_flat_session_order_contract() {
+        let source = include_str!("app.rs");
+        let drag = source
+            .split_once("    fn start_sidebar_session_drag(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn preview_sidebar_session_reorder("))
+            .map(|(body, _)| body)
+            .expect("session drag setup should remain inspectable");
+        let drop = source
+            .split_once("    fn apply_sidebar_organization_drop(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn sidebar_organization_drop_position("))
+            .map(|(body, _)| body)
+            .expect("organization drop should remain inspectable");
+
+        assert!(drag.contains(".flat_map(|group| &group.workspaces)"));
+        assert!(drop.contains("ordered_sidebar_session_projects()"));
+        assert!(drop.contains("if organization_changed || legacy_order_changed"));
     }
 
     #[test]

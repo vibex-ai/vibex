@@ -166,6 +166,7 @@ impl SidebarOrganizationState {
             }
         }
         self.enforce_placement_limit();
+        self.align_root_session_order(ordered_session_projects);
         self.collapsed_folder_ids
             .retain(|id| self.folders.contains_key(id));
     }
@@ -517,6 +518,49 @@ impl SidebarOrganizationState {
             current = Some(parent);
         }
         false
+    }
+
+    fn align_root_session_order(&mut self, ordered_session_projects: &[(String, String)]) {
+        let desired_positions = ordered_session_projects
+            .iter()
+            .enumerate()
+            .map(|(index, (session_id, _))| (session_id.clone(), index))
+            .collect::<BTreeMap<_, _>>();
+        let session_projects = ordered_session_projects
+            .iter()
+            .cloned()
+            .collect::<BTreeMap<_, _>>();
+        let mut slots_by_project = BTreeMap::<String, Vec<usize>>::new();
+        for (index, placement) in self.placements.iter().enumerate() {
+            let SidebarOrganizationItem::Session(session_id) = &placement.item else {
+                continue;
+            };
+            if placement.parent_folder_id.is_some() {
+                continue;
+            }
+            if let Some(project_id) = session_projects.get(session_id) {
+                slots_by_project
+                    .entry(project_id.clone())
+                    .or_default()
+                    .push(index);
+            }
+        }
+
+        for slots in slots_by_project.into_values() {
+            let mut sessions = slots
+                .iter()
+                .map(|index| self.placements[*index].item.clone())
+                .collect::<Vec<_>>();
+            sessions.sort_by_key(|item| {
+                desired_positions
+                    .get(item.id())
+                    .copied()
+                    .unwrap_or(usize::MAX)
+            });
+            for (index, item) in slots.into_iter().zip(sessions) {
+                self.placements[index].item = item;
+            }
+        }
     }
 
     fn folder_depth(&self, folder_id: &str) -> usize {
@@ -891,6 +935,51 @@ mod tests {
             [SidebarOrganizationItem::Folder("child".into())]
         );
         assert!(state.ordered_children(Some("child"), &available).is_empty());
+    }
+
+    #[test]
+    fn reconcile_preserves_manual_session_order_and_inserts_new_sessions_first() {
+        let mut state = SidebarOrganizationState::default();
+        let sessions = BTreeMap::from([
+            ("first".to_string(), "project".to_string()),
+            ("second".to_string(), "project".to_string()),
+        ]);
+        state.reconcile(
+            &["project".into()],
+            &[
+                ("first".into(), "project".into()),
+                ("second".into(), "project".into()),
+            ],
+        );
+        assert!(state.move_relative(
+            &SidebarOrganizationItem::Session("second".into()),
+            &SidebarOrganizationItem::Session("first".into()),
+            false,
+            &sessions,
+        ));
+
+        state.reconcile(
+            &["project".into()],
+            &[
+                ("new".into(), "project".into()),
+                ("second".into(), "project".into()),
+                ("first".into(), "project".into()),
+            ],
+        );
+        let available = [
+            SidebarOrganizationItem::Session("first".into()),
+            SidebarOrganizationItem::Session("second".into()),
+            SidebarOrganizationItem::Session("new".into()),
+        ];
+
+        assert_eq!(
+            state.ordered_children(None, &available),
+            [
+                SidebarOrganizationItem::Session("new".into()),
+                SidebarOrganizationItem::Session("second".into()),
+                SidebarOrganizationItem::Session("first".into()),
+            ]
+        );
     }
 
     #[test]
