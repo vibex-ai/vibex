@@ -742,8 +742,9 @@ Remote history attach role  -> viewer
   before spawning the durable send future. Runtime switching, Context Bridge
   preparation, Ready convergence, and prompt dispatch remain background work.
   The projection never mutates the authoritative Timeline: a matching persisted
-  user row replaces it, while a terminal send failure removes it and clears the
-  local running state.
+  user row replaces it. A terminal send failure clears the local running state
+  but retains the captured user projection so the error cannot swallow the
+  message that caused it; explicit cancellation may still remove the projection.
 - If the user interrupts that turn before initial runtime preparation reaches
   provider dispatch, Desktop removes the optimistic row and pending Agent state
   when the durable cancellation completes, without presenting the intentional
@@ -771,6 +772,9 @@ Remote history attach role  -> viewer
   selected source's login or Provider configuration recovery.
 - Final transient failure -> retain effective runtime and offer an explicit
   retry when a target is remembered.
+- Terminal message submission failure -> clear pending Agent state but keep the
+  captured user message visible until an authoritative matching row replaces it
+  or an explicit cancellation removes it.
 - Ambiguous message dispatch -> show uncertain delivery and never auto-resend.
 - User interrupt before initial prompt dispatch -> clear the optimistic turn and
   show no failure notification; do not claim that the provider was interrupted.
@@ -796,7 +800,7 @@ Remote history attach role  -> viewer
   bounds, TTL, and deduplication.
 - Desktop tests cover synchronous optimistic user-turn plus pending-Agent
   projection before the background durable send, authoritative replacement
-  without duplication, and failure cleanup.
+  without duplication, failure retention, and explicit cancellation cleanup.
 - Desktop/Web typechecks and builds cover generated contracts and controller
   wiring; lint must report no unsafe casts or suppressed errors.
 - Browser checks exercise preparing, queued, settled, read-only, and recovery

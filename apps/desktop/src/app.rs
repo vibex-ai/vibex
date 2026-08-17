@@ -9086,8 +9086,6 @@ impl VibexWorkbench {
                         .retain(|locator| locator.message_idempotency_key != submit_key);
                     this.composer_submission_states
                         .retain(|state| state.message_idempotency_key != submit_key);
-                } else if !is_command {
-                    this.discard_optimistic_user_message(&submitted_session_id);
                 }
                 this.set_session_turn_pending(&submitted_session_id, false);
                 this.sync_auto_continue_for_session(&submitted_session_id, cx);
@@ -39703,7 +39701,7 @@ mod tests {
         assert!(pending < optimistic);
         assert!(optimistic < repaint);
         assert!(repaint < background);
-        assert!(dispatch.contains("this.discard_optimistic_user_message(&submitted_session_id);"));
+        assert!(!dispatch.contains("discard_optimistic_user_message"));
     }
 
     #[test]
@@ -41917,6 +41915,15 @@ mod tests {
         );
         assert!(!pending_turns[0].complete);
         assert!(pending_turns[0].conclusion_row.is_none());
+
+        let failed_turns =
+            timeline_conversation_turns(&projected, Some(AgentSessionState::Error), false);
+        assert_eq!(failed_turns.len(), 1);
+        assert_eq!(
+            failed_turns[0].user_row.as_ref().map(|row| row.body.trim()),
+            Some("first prompt"),
+            "a terminal send failure must keep the captured user message visible"
+        );
 
         let mut timeline = TimelineModel::default();
         timeline.replace_authoritative(
