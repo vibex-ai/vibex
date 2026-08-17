@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use vibex_core::{AgentId, SessionRuntimeSelection};
 
-use crate::{NewSessionLocation, SidebarHierarchyMode};
+use crate::{NewSessionLocation, SidebarHierarchyMode, SidebarOrganizationState};
 
 pub const DESKTOP_UI_STATE_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_UI_STATE_WRITE_DELAY_MS: u64 = 200;
@@ -215,6 +215,8 @@ pub struct SidebarUiState {
     pub hierarchy_mode: SidebarHierarchyMode,
     #[serde(default)]
     pub project_location_preferences: BTreeMap<String, NewSessionLocation>,
+    #[serde(default)]
+    pub organization: SidebarOrganizationState,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -484,6 +486,7 @@ impl DesktopUiStateV1 {
                 })
                 .take(1_000)
                 .collect();
+        self.sidebar.organization.normalize();
         normalize_ids(&mut self.preview.pinned_tab_ids, 500);
         self.preview.focused_pane_id = bounded_optional(self.preview.focused_pane_id.take(), 256);
         self.preview.split_sizes =
@@ -601,6 +604,9 @@ impl DesktopUiStateV1 {
         self.sidebar
             .pinned_session_ids
             .retain(|id| references.session_ids.contains(id));
+        self.sidebar
+            .organization
+            .cleanup_references(&references.project_ids, &references.session_ids);
         self.session
             .auto_continue_project_ids
             .retain(|id| references.project_ids.contains(id));
@@ -1173,6 +1179,32 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_organization_is_additive_and_round_trips() {
+        let mut legacy = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
+        legacy["sidebar"]
+            .as_object_mut()
+            .unwrap()
+            .remove("organization");
+        let legacy: DesktopUiStateV1 = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            legacy.sidebar.organization,
+            SidebarOrganizationState::default()
+        );
+
+        let mut state = DesktopUiStateV1::default();
+        assert!(state.sidebar.organization.create_folder(
+            "folder-a",
+            "Planning",
+            Some("project-a".into()),
+            None,
+        ));
+        state.normalize().unwrap();
+        let round_trip: DesktopUiStateV1 =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(round_trip.sidebar.organization, state.sidebar.organization);
+    }
+
+    #[test]
     fn state_normalizes_fonts_layout_ids_and_split_sizes() {
         let mut state = DesktopUiStateV1::default();
         state.appearance.interface_font.size = 99;
@@ -1693,6 +1725,21 @@ mod tests {
         let mut state = DesktopUiStateV1::default();
         state.sidebar.project_order = vec!["project".to_string()];
         state.sidebar.session_order = vec!["session".to_string()];
+        assert!(state.sidebar.organization.create_folder(
+            "folder",
+            "Folder",
+            Some("project".into()),
+            None,
+        ));
+        state
+            .sidebar
+            .organization
+            .reconcile(&["project".into()], &[("session".into(), "project".into())]);
+        assert!(state.sidebar.organization.move_into(
+            &crate::SidebarOrganizationItem::Session("session".into()),
+            "folder",
+            &BTreeMap::from([("session".into(), "project".into())]),
+        ));
         state.terminal.tab_order = vec!["terminal".to_string()];
         state.composer.terminal_ids = vec!["terminal".to_string()];
         state
@@ -1715,6 +1762,10 @@ mod tests {
         state.cleanup_stale_ids(&UiStateReferences::default());
         assert!(state.sidebar.project_order.is_empty());
         assert!(state.sidebar.session_order.is_empty());
+        assert_eq!(
+            state.sidebar.organization,
+            SidebarOrganizationState::default()
+        );
         assert!(state.terminal.tab_order.is_empty());
         assert!(state.composer.terminal_ids.is_empty());
         assert!(state.terminal_tab_titles.is_empty());

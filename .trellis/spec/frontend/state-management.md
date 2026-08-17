@@ -1075,9 +1075,10 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   the same persisted `SidebarState` mutation as the inline pin button; menu actions
   must not maintain a second pin projection or infer the target from selection.
 - Session-row drag/drop carries the typed session id, project id, and pin band. A
-  drop may reorder only another session in the same project and pin band; the
-  deterministic `SidebarState.row_order` mutation owns before/after insertion and
-  the UI persists it only after a real move.
+  direct row-to-row reorder may target only another session in the same project
+  and pin band; a folder drop may change the parent only inside that same project.
+  The deterministic `SidebarState.row_order` and sidebar-organization placement
+  mutations own insertion, and the UI persists them only after a real move.
 - A session absent from persisted `SidebarState.row_order` is newly discovered.
   Sort newly discovered sessions by recency ahead of manually ordered sessions in
   the same pin band, while pinned sessions remain above unpinned sessions.
@@ -1610,6 +1611,7 @@ Persisted additive/defaulted UI fields:
 SidebarUiState.collapsedWorkspaceIds
 SidebarUiState.hierarchyMode = compact
 SidebarUiState.projectLocationPreferences
+SidebarUiState.organization = empty tree
 ```
 
 ### 3. Contracts
@@ -1726,6 +1728,108 @@ Workspace for the same normalized Worktree root and mode; presentation may
 fold those aliases into the Workspace owned by a Project with a current
 checkout and aggregate their Sessions there. This compatibility projection is
 non-destructive and must not delete or rewrite stored Workspace references.
+
+## Scenario: Persisted Sidebar Organization Folders
+
+### 1. Scope / Trigger
+
+- Trigger: GPUI Desktop lets users classify and reorder Projects and Sessions
+  with folders in the Agent sidebar.
+- These folders are local presentation metadata. They do not create filesystem
+  directories, change Project/Workspace/Session ownership, or become remote
+  runtime authority.
+
+### 2. Signatures
+
+```rust
+SidebarOrganizationState {
+    folders: BTreeMap<String, SidebarFolderUiState>,
+    placements: Vec<SidebarOrganizationPlacement>,
+    collapsed_folder_ids: BTreeSet<String>,
+}
+
+SidebarFolderUiState { name, project_id: Option<String> }
+SidebarOrganizationItem::{Folder, Project, Session}
+SidebarOrganizationScope::{Root, Project(project_id)}
+```
+
+### 3. Contracts
+
+- A root-scoped folder may contain Projects and other root-scoped folders. Moving
+  a Project moves its sidebar subtree as one unit because its Sessions remain
+  authoritative children of that Project.
+- A Project-scoped folder may contain only Sessions owned by that exact Project
+  and other folders with the same `project_id`. A Session or folder must never
+  enter another Project, even when a stale or malformed persisted placement asks
+  for it.
+- Folder, Project, and Session rows support deterministic before/after movement;
+  folders additionally accept into movement and may return to their scope root.
+  Reject self/descendant cycles and any move whose target depth plus the moving
+  folder subtree exceeds 32 levels.
+- The sidebar header, empty/root context menu, Project context menu, and folder
+  context menu expose the scoped create action. A new folder starts with localized
+  default text and immediately focuses/selects inline rename. Empty names remain
+  in rename state with a localized validation error.
+- Rename, collapse, placement, and ordering are persisted in the additive,
+  default-empty `DesktopUiStateV1.sidebar.organization` field without changing
+  schema version 1. Normalize bounded names/ids/counts, deduplicate items, repair
+  invalid parents/cycles, and remove stale Project/Session references.
+- Deleting a folder deletes only its classification node. Promote its direct
+  children to the deleted folder's parent without deleting Projects, Sessions,
+  nested folders, or authoritative runtime data.
+- Detailed hierarchy renders Sessions placed in Project folders only through the
+  organization tree, not again below their Workspace. Locating the selected
+  Session expands both Project/Workspace disclosure and every organization-folder
+  ancestor before applying the scroll anchor.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Older schema-v1 JSON has no `organization` | Decode an empty organization tree. |
+| Root Project is dropped into a root folder | Move the Project row and retain all of its Session children. |
+| Project A Session/folder is dropped in Project B | Reject without changing or persisting placement. |
+| Folder is dropped into itself or a descendant | Reject; never create a cycle. |
+| Moving a subtree would exceed 32 levels | Reject the preview/drop and keep the original parent. |
+| Folder is deleted | Promote direct children; preserve every Project/Session/folder id. |
+| Referenced Project/Session no longer exists | Remove the stale placement during cleanup/reconcile. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: create a root folder, rename it immediately, drag two Projects into it,
+  then nest another folder and reorder the Projects around it.
+- Good: create folders inside Project A and distribute its pinned and unpinned
+  Sessions while Project B remains an invalid drop target.
+- Base: a user with pre-feature UI state sees the unchanged flat sidebar until
+  they create or drag into a folder.
+- Bad: infer folder scope from the current selection, reparent a Session across
+  Projects, delete runtime records with a folder, or persist a cyclic/deeper tree
+  and rely on restart normalization to change what the user saw.
+
+### 6. Tests Required
+
+- Pure `desktop-model` tests cover cross-Project rejection, cycle and whole-subtree
+  depth rejection, exact relative/into/root ordering, delete promotion, bounded
+  normalization, and stale-reference cleanup.
+- UI-state tests decode legacy schema-v1 JSON without the additive field and
+  round-trip a populated organization tree.
+- GPUI source/interaction coverage asserts scoped create/rename/delete menus,
+  typed Project/Session/folder drags, root drop targets, detailed-mode
+  de-duplication, and selected-Session ancestor reveal.
+
+### 7. Wrong vs Correct
+
+```rust
+// Wrong: a visual folder silently changes authoritative ownership.
+session.project_id = target_project_id;
+
+// Correct: ownership determines scope; only local placement changes.
+organization.move_into(
+    &SidebarOrganizationItem::Session(session.id.to_string()),
+    target_folder_id,
+    &session_projects,
+);
+```
 
 ## Scenario: GPUI Agent Authentication Projection
 
