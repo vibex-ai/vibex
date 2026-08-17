@@ -1766,6 +1766,10 @@ SidebarOrganizationScope::{Root, Project(project_id)}
   folders additionally accept into movement and may return to their scope root.
   Reject self/descendant cycles and any move whose target depth plus the moving
   folder subtree exceeds 32 levels.
+- Tree projection returns only placements whose `parent_folder_id` matches the
+  parent currently being rendered. An item with no placement may fall back only
+  at its scope root; never append every remaining available item at nested levels,
+  because that renders siblings and the folder itself as recursive children.
 - The sidebar header, empty/root context menu, Project context menu, and folder
   context menu expose the scoped create action. A new folder starts with localized
   default text and immediately focuses/selects inline rename. Empty names remain
@@ -1791,6 +1795,7 @@ SidebarOrganizationScope::{Root, Project(project_id)}
 | Project A Session/folder is dropped in Project B | Reject without changing or persisting placement. |
 | Folder is dropped into itself or a descendant | Reject; never create a cycle. |
 | Moving a subtree would exceed 32 levels | Reject the preview/drop and keep the original parent. |
+| A newly created empty folder is rendered | Show exactly one row with no recursive copy below it. |
 | Folder is deleted | Promote direct children; preserve every Project/Session/folder id. |
 | Referenced Project/Session no longer exists | Remove the stale placement during cleanup/reconcile. |
 
@@ -1809,7 +1814,8 @@ SidebarOrganizationScope::{Root, Project(project_id)}
 ### 6. Tests Required
 
 - Pure `desktop-model` tests cover cross-Project rejection, cycle and whole-subtree
-  depth rejection, exact relative/into/root ordering, delete promotion, bounded
+  depth rejection, exact relative/into/root ordering, direct-parent-only
+  projection with root-only unplaced fallback, delete promotion, bounded
   normalization, and stale-reference cleanup.
 - UI-state tests decode legacy schema-v1 JSON without the additive field and
   round-trip a populated organization tree.

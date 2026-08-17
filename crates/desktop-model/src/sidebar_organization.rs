@@ -302,6 +302,11 @@ impl SidebarOrganizationState {
         available_items: &[SidebarOrganizationItem],
     ) -> Vec<SidebarOrganizationItem> {
         let available = available_items.iter().cloned().collect::<BTreeSet<_>>();
+        let placed = self
+            .placements
+            .iter()
+            .map(|placement| placement.item.clone())
+            .collect::<BTreeSet<_>>();
         let mut seen = BTreeSet::new();
         let mut children = self
             .placements
@@ -312,12 +317,16 @@ impl SidebarOrganizationState {
                     .then_some(placement.item.clone())
             })
             .collect::<Vec<_>>();
-        children.extend(
-            available_items
-                .iter()
-                .filter(|item| seen.insert((*item).clone()))
-                .cloned(),
-        );
+        if parent_folder_id.is_none() {
+            // Newly discovered items without a placement fall back to the scope
+            // root; placed items must appear only below their recorded parent.
+            children.extend(
+                available_items
+                    .iter()
+                    .filter(|item| !placed.contains(*item) && seen.insert((*item).clone()))
+                    .cloned(),
+            );
+        }
         children
     }
 
@@ -854,6 +863,34 @@ mod tests {
                 target,
             ]
         );
+    }
+
+    #[test]
+    fn ordered_children_projects_each_item_only_below_its_direct_parent() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_folder("root", "Root", None, None));
+        assert!(state.create_folder("child", "Child", None, Some("root".into())));
+        assert!(state.create_folder("sibling", "Sibling", None, None));
+        let available = [
+            SidebarOrganizationItem::Folder("root".into()),
+            SidebarOrganizationItem::Folder("child".into()),
+            SidebarOrganizationItem::Folder("sibling".into()),
+            SidebarOrganizationItem::Project("unplaced".into()),
+        ];
+
+        assert_eq!(
+            state.ordered_children(None, &available),
+            [
+                SidebarOrganizationItem::Folder("root".into()),
+                SidebarOrganizationItem::Folder("sibling".into()),
+                SidebarOrganizationItem::Project("unplaced".into()),
+            ]
+        );
+        assert_eq!(
+            state.ordered_children(Some("root"), &available),
+            [SidebarOrganizationItem::Folder("child".into())]
+        );
+        assert!(state.ordered_children(Some("child"), &available).is_empty());
     }
 
     #[test]
