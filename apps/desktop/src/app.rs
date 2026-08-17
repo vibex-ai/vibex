@@ -260,6 +260,9 @@ const SESSION_SEARCH_EXCERPT_MAX_CHARS: usize = 180;
 const COMPOSER_INLINE_ATTACHMENT_PREFIX: &str = "attachment_";
 const COMPOSER_INLINE_ATTACHMENT_MARKER_RESERVE: &str = "..........";
 const COMPOSER_INLINE_ATTACHMENT_SUFFIX: &str = "_vbx";
+const VIBEX_MESSAGE_CLIPBOARD_FORMAT: &str = "vibex-message";
+const VIBEX_MESSAGE_CLIPBOARD_VERSION: u8 = 1;
+const VIBEX_MESSAGE_CLIPBOARD_MAX_ATTACHMENTS: usize = 32;
 const COMPOSER_IMAGE_HOVER_PREVIEW_MAX_WIDTH: f32 = 384.0;
 const COMPOSER_IMAGE_HOVER_PREVIEW_MAX_HEIGHT: f32 = 288.0;
 const COMPOSER_IMAGE_HOVER_PREVIEW_MARGIN: f32 = 12.0;
@@ -599,6 +602,33 @@ impl AttachmentImagePreviewLayout {
 enum UserMessageInlineSegment {
     Text(String),
     Attachment(MessageAttachment),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VibexMessageClipboard {
+    format: String,
+    version: u8,
+    text: String,
+    attachments: Vec<MessageAttachment>,
+}
+
+impl VibexMessageClipboard {
+    fn new(text: String, attachments: Vec<MessageAttachment>) -> Self {
+        Self {
+            format: VIBEX_MESSAGE_CLIPBOARD_FORMAT.to_string(),
+            version: VIBEX_MESSAGE_CLIPBOARD_VERSION,
+            text,
+            attachments,
+        }
+    }
+
+    fn is_supported(&self) -> bool {
+        self.format == VIBEX_MESSAGE_CLIPBOARD_FORMAT
+            && self.version == VIBEX_MESSAGE_CLIPBOARD_VERSION
+            && !self.attachments.is_empty()
+            && self.attachments.len() <= VIBEX_MESSAGE_CLIPBOARD_MAX_ATTACHMENTS
+    }
 }
 
 fn composer_runtime_controls_are_compact(viewport_width: u32) -> bool {
@@ -9901,6 +9931,39 @@ impl VibexWorkbench {
         true
     }
 
+    fn add_vibex_message_clipboard_to(
+        &mut self,
+        clipboard: VibexMessageClipboard,
+        new_session: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !clipboard.is_supported() {
+            return false;
+        }
+        let Some((insertion, attachments, serial)) = vibex_message_composer_insertion(
+            &clipboard.text,
+            &clipboard.attachments,
+            self.composer_attachment_serial,
+        ) else {
+            return false;
+        };
+        self.composer_attachment_serial = serial;
+        let input = if new_session {
+            self.new_session_attachments.extend(attachments);
+            self.new_session_input.clone()
+        } else {
+            self.composer_attachments.extend(attachments);
+            self.composer_input.clone()
+        };
+        input.update(cx, |input, cx| {
+            input.replace(insertion, window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+        true
+    }
+
     fn paste_composer_clipboard_to(
         &mut self,
         new_session: bool,
@@ -9924,6 +9987,12 @@ impl VibexWorkbench {
                     captured = true;
                 }
                 ClipboardEntry::String(string) => {
+                    if let Some(metadata) = string.metadata_json::<VibexMessageClipboard>()
+                        && self.add_vibex_message_clipboard_to(metadata, new_session, window, cx)
+                    {
+                        captured = true;
+                        continue;
+                    }
                     captured |=
                         self.add_composer_html_data_image(&string.text, new_session, window, cx);
                     if let Some(metadata) = string.metadata.as_deref() {
@@ -23428,6 +23497,7 @@ impl VibexWorkbench {
         } else {
             attachments
         };
+        let copy_item = user_message_clipboard_item(&row.body, &attachments);
         let edit_attachments = attachments.clone();
         let timestamp = self.timeline_row_timestamp(row);
         let locale = self.resolved_locale();
@@ -23450,7 +23520,6 @@ impl VibexWorkbench {
             )
         };
         let hover_group: SharedString = format!("timeline-user-{}", row.id).into();
-        let copy_text = row.body.clone();
         let edit_text = row.body.clone();
         let edit_turn_id = turn_id.unwrap_or(&row.id).to_string();
         let edit_row_id = row.id.clone();
@@ -23505,9 +23574,7 @@ impl VibexWorkbench {
                                         .icon(IconName::Copy)
                                         .tooltip(locale::text("Copy", "复制", "複製"))
                                         .on_click(move |_, _, cx| {
-                                            cx.write_to_clipboard(ClipboardItem::new_string(
-                                                copy_text.clone(),
-                                            ));
+                                            cx.write_to_clipboard(copy_item.clone());
                                         }),
                                 )
                                 .when(
@@ -30239,6 +30306,93 @@ fn user_message_inline_segments(
         segments.push(UserMessageInlineSegment::Text(String::new()));
     }
     segments
+}
+
+fn message_attachment_is_image(attachment: &MessageAttachment) -> bool {
+    composer_attachment_from_message(attachment, String::new()).is_image()
+}
+
+fn user_message_clipboard_plain_text(text: &str, attachments: &[MessageAttachment]) -> String {
+    let mut output = String::with_capacity(text.len() + attachments.len() * "image".len());
+    let mut image_needs_trailing_space = false;
+    for segment in user_message_inline_segments(text, attachments) {
+        match segment {
+            UserMessageInlineSegment::Text(value) => {
+                if image_needs_trailing_space
+                    && value
+                        .chars()
+                        .next()
+                        .is_some_and(|character| !character.is_whitespace())
+                {
+                    output.push(' ');
+                }
+                output.push_str(&value);
+                image_needs_trailing_space = false;
+            }
+            UserMessageInlineSegment::Attachment(_) => {
+                if output
+                    .chars()
+                    .next_back()
+                    .is_some_and(|character| !character.is_whitespace())
+                {
+                    output.push(' ');
+                }
+                output.push_str("image");
+                image_needs_trailing_space = true;
+            }
+        }
+    }
+    output
+}
+
+fn user_message_clipboard_item(text: &str, attachments: &[MessageAttachment]) -> ClipboardItem {
+    let image_attachments = attachments
+        .iter()
+        .filter(|attachment| message_attachment_is_image(attachment))
+        .take(VIBEX_MESSAGE_CLIPBOARD_MAX_ATTACHMENTS)
+        .cloned()
+        .collect::<Vec<_>>();
+    if image_attachments.is_empty() {
+        return ClipboardItem::new_string(text.to_string());
+    }
+    let plain_text = user_message_clipboard_plain_text(text, &image_attachments);
+    ClipboardItem::new_string_with_json_metadata(
+        plain_text,
+        VibexMessageClipboard::new(text.to_string(), image_attachments),
+    )
+}
+
+fn vibex_message_composer_insertion(
+    text: &str,
+    attachments: &[MessageAttachment],
+    mut serial: u64,
+) -> Option<(String, Vec<InlineComposerAttachment>, u64)> {
+    if attachments.is_empty() || attachments.len() > VIBEX_MESSAGE_CLIPBOARD_MAX_ATTACHMENTS {
+        return None;
+    }
+    let mut insertion = String::with_capacity(text.len());
+    let mut inline_attachments = Vec::with_capacity(attachments.len());
+    for segment in user_message_inline_segments(text, attachments) {
+        match segment {
+            UserMessageInlineSegment::Text(value) => insertion.push_str(&value),
+            UserMessageInlineSegment::Attachment(attachment) => {
+                let mut composer_attachment =
+                    composer_attachment_from_message(&attachment, String::new());
+                if !composer_attachment.is_image() || composer_attachment.path.is_none() {
+                    return None;
+                }
+                serial = serial.saturating_add(1);
+                let marker = inline_composer_attachment_marker(serial);
+                composer_attachment.id = format!("attachment:{serial}");
+                insertion.push_str(&inline_composer_attachment_insertion(&marker));
+                inline_attachments.push(InlineComposerAttachment {
+                    attachment: composer_attachment,
+                    marker,
+                });
+            }
+        }
+    }
+    (!inline_attachments.is_empty()).then_some((insertion, inline_attachments, serial))
 }
 
 fn attachment_local_path(uri: &str) -> Option<String> {
@@ -41210,6 +41364,53 @@ mod tests {
         assert_eq!(text, "\u{1f642}\u{4e2d} tail");
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0].inline_text_offset, Some(3));
+    }
+
+    #[test]
+    fn copied_user_message_keeps_images_for_vibex_and_uses_plain_placeholders_elsewhere() {
+        let text = "\u{1f642}\u{4e2d} tail";
+        let image = MessageAttachment {
+            label: "diagram.png".into(),
+            mime_type: Some("image/png".into()),
+            uri: Some("file:///tmp/diagram.png".into()),
+            inline_text_offset: Some(3),
+        };
+
+        let clipboard = user_message_clipboard_item(text, std::slice::from_ref(&image));
+
+        assert_eq!(
+            clipboard.text().as_deref(),
+            Some("\u{1f642}\u{4e2d} image tail")
+        );
+        let ClipboardEntry::String(string) = &clipboard.entries()[0] else {
+            panic!("message clipboard should expose a string entry");
+        };
+        let metadata = string
+            .metadata_json::<VibexMessageClipboard>()
+            .expect("Vibex metadata should remain available to the composer");
+        assert!(metadata.is_supported());
+        assert_eq!(metadata.text, text);
+        assert_eq!(metadata.attachments, vec![image.clone()]);
+
+        let (insertion, inline_attachments, serial) =
+            vibex_message_composer_insertion(&metadata.text, &metadata.attachments, 7)
+                .expect("local image metadata should become a composer attachment");
+        let (round_trip_text, round_trip_attachments) =
+            composer_submission_payload(&insertion, &inline_attachments);
+        assert_eq!(serial, 8);
+        assert_eq!(round_trip_text, text);
+        assert_eq!(round_trip_attachments, vec![image]);
+    }
+
+    #[test]
+    fn copied_text_only_message_uses_the_regular_clipboard_shape() {
+        let clipboard = user_message_clipboard_item("plain text", &[]);
+
+        assert_eq!(clipboard.text().as_deref(), Some("plain text"));
+        let ClipboardEntry::String(string) = &clipboard.entries()[0] else {
+            panic!("text clipboard should expose a string entry");
+        };
+        assert!(string.metadata.is_none());
     }
 
     #[test]
