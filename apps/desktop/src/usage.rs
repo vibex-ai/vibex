@@ -36,6 +36,7 @@ const USAGE_HEATMAP_MIN_WIDTH: f32 = 840.0;
 const USAGE_MODEL_CHART_MIN_WIDTH: f32 = 720.0;
 const USAGE_TABLE_MIN_WIDTH: f32 = 1040.0;
 const USAGE_SESSION_FILTER_MENU_WIDTH: f32 = 420.0;
+const USAGE_SESSION_FILTER_LABEL_MAX_WIDTH_UNITS: usize = 48;
 const USAGE_MODEL_LIMIT: usize = 10;
 const USAGE_OTHER_MODEL_ID: &str = "__vibex_other_models__";
 const USAGE_AGENT_DEFAULT_MODEL_ID: &str = "__vibex_agent_default_model__";
@@ -520,6 +521,7 @@ impl UsageView {
                         SharedString::from(format!("usage-filter-{kind:?}-option-{id}"));
                     let label = option.label;
                     let item = if kind == UsageFilterKind::Session {
+                        let display_label = bounded_usage_session_filter_label(&label);
                         let tooltip_label = label.clone();
                         PopupMenuItem::element(move |_, _| {
                             let tooltip_label = tooltip_label.clone();
@@ -529,7 +531,7 @@ impl UsageView {
                                 .flex_1()
                                 .truncate()
                                 .aria_label(label.clone())
-                                .child(label.clone())
+                                .child(display_label.clone())
                                 .tooltip(move |window, cx| {
                                     Tooltip::new(tooltip_label.clone()).build(window, cx)
                                 })
@@ -1099,6 +1101,28 @@ fn toggle_typed<T: PartialEq>(values: &mut Vec<T>, value: T) {
     } else {
         values.push(value);
     }
+}
+
+fn bounded_usage_session_filter_label(value: &str) -> String {
+    let width_units = |character: char| if character.is_ascii() { 1 } else { 2 };
+    let total_width = value.chars().map(width_units).sum::<usize>();
+    if total_width <= USAGE_SESSION_FILTER_LABEL_MAX_WIDTH_UNITS {
+        return value.to_string();
+    }
+
+    let content_width = USAGE_SESSION_FILTER_LABEL_MAX_WIDTH_UNITS.saturating_sub(3);
+    let mut current_width = 0_usize;
+    let mut output = String::new();
+    for character in value.chars() {
+        let character_width = width_units(character);
+        if current_width.saturating_add(character_width) > content_width {
+            break;
+        }
+        output.push(character);
+        current_width = current_width.saturating_add(character_width);
+    }
+    output.push_str("...");
+    output
 }
 
 fn summary_metric_value(
@@ -2675,7 +2699,28 @@ mod tests {
         assert!(filter_menu.contains(".min_w(px(USAGE_SESSION_FILTER_MENU_WIDTH))"));
         assert!(filter_menu.contains(".max_w(px(USAGE_SESSION_FILTER_MENU_WIDTH))"));
         assert!(filter_menu.contains("if kind == UsageFilterKind::Session"));
-        assert!(filter_menu.contains(".min_w_0()\n                                .flex_1()\n                                .truncate()"));
+        assert!(filter_menu.contains("bounded_usage_session_filter_label(&label)"));
+        assert!(filter_menu.contains(".child(display_label.clone())"));
+    }
+
+    #[test]
+    fn session_filter_title_bound_handles_ascii_and_cjk_text() {
+        assert_eq!(
+            bounded_usage_session_filter_label("Short title"),
+            "Short title"
+        );
+
+        let ascii = bounded_usage_session_filter_label(&"a".repeat(80));
+        assert_eq!(ascii, format!("{}...", "a".repeat(45)));
+
+        let cjk = bounded_usage_session_filter_label(&"会话标题".repeat(12));
+        assert!(cjk.ends_with("..."));
+        assert_eq!(
+            cjk.chars()
+                .map(|character| if character.is_ascii() { 1 } else { 2 })
+                .sum::<usize>(),
+            47
+        );
     }
 
     #[test]
