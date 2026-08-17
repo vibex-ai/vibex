@@ -2048,6 +2048,16 @@ impl CodeWorkbench {
         }
     }
 
+    pub(crate) fn git_status(&self) -> Option<&GitStatusSummary> {
+        self.git.status.as_ref()
+    }
+
+    pub(crate) fn workspace_is_active(&self, workspace_id: &WorkspaceId) -> bool {
+        self.workspace
+            .as_ref()
+            .is_some_and(|workspace| &workspace.id == workspace_id)
+    }
+
     fn load_git_status(&mut self, cx: &mut Context<Self>) {
         let (Some(runtime), Some(workspace)) = (self.runtime.clone(), self.workspace.clone())
         else {

@@ -71,8 +71,9 @@ use vibex_core::{
     ContinueAgentTurnRequest, CreateAgentSessionRequest, DetachRuntimeRequest, ElicitationField,
     ElicitationFieldKind, ElicitationRequest, ElicitationResolutionAction,
     ExternalSessionImportCandidateStatus, ExternalSessionImportRequest, FetchTimelineRequest,
-    FileEntryKind, FileTreeRequest, ForkAgentSessionRequest, GetMessageSubmissionRequest,
-    GitProjectEligibilityState, GitProjectIneligibleReason, GitWorktreeAssistanceSessionRequest,
+    FileEntryKind, FileOperationKind, FileTreeRequest, ForkAgentSessionRequest,
+    GetMessageSubmissionRequest, GitProjectEligibilityState, GitProjectIneligibleReason,
+    GitStageRequest, GitStatusSummary, GitWorktreeAssistanceSessionRequest,
     GitWorktreeConflictKind, GitWorktreeOperationRecord, GitWorktreeOperationStatus,
     MessageAttachment, MessageSubmissionState, MessageSubmissionStatus, OpenWorkspaceRequest,
     PermissionResolution, PermissionResponseKind, PlanStepStatus, ProjectId, ProjectRecord,
@@ -92,17 +93,18 @@ use vibex_core::{
 use vibex_desktop_model::{
     AgentPlanProjection, AppearanceUiState, ComposerAttachment, ComposerQueueSendMode,
     ComposerSuggestionSelection, ComposerTrigger, DesktopBehaviorUiState, DesktopUiStateV1,
-    LocaleMode, MessageSendKey, NavigationHistory, NewSessionLocation, NewSessionProjectTicket,
-    NewSessionSubmissionStage, NewSessionWorkspaceState, RUNTIME_SELECTION_PREFERENCE_LIMIT,
-    RuntimeCascadeChoice, RuntimeCascadeProjection, SessionContentWidthMode, SessionUiState,
-    SidebarHierarchyMode, SidebarProjectProjection, SidebarState, SidebarWorkspaceProjection,
-    StartupDestination, TerminalWorkingDirectory, ThemeMode as ModelThemeMode,
-    ThrottledUiStateWriter, TimelineConversationTurn, TimelineFollowState, TimelineModel,
-    TimelineProcessActivityGroup, TimelineRow, TimelineRowKind, UiStateStore, WorkbenchRoute,
-    WorkspaceAgentSummary, WorkspaceContextProjection, WorktreeLifecycleDisplayState,
-    active_collaborations, composer_trigger_at, current_agent_plan,
-    custom_worktree_path_is_absolute, sidebar_project_projections,
-    timeline_agent_message_count_after_sequence, timeline_conversation_turns,
+    GitSelectionKey, GitWorkbenchMode, LocaleMode, MessageSendKey, NavigationHistory,
+    NewSessionLocation, NewSessionProjectTicket, NewSessionSubmissionStage,
+    NewSessionWorkspaceState, RUNTIME_SELECTION_PREFERENCE_LIMIT, RuntimeCascadeChoice,
+    RuntimeCascadeProjection, SessionContentWidthMode, SessionUiState, SidebarHierarchyMode,
+    SidebarProjectProjection, SidebarState, SidebarWorkspaceProjection, StartupDestination,
+    TerminalWorkingDirectory, ThemeMode as ModelThemeMode, ThrottledUiStateWriter,
+    TimelineConversationTurn, TimelineFollowState, TimelineModel, TimelineProcessActivityGroup,
+    TimelineRow, TimelineRowKind, UiStateStore, WorkbenchRoute, WorkspaceAgentSummary,
+    WorkspaceContextProjection, WorktreeLifecycleDisplayState, active_collaborations,
+    composer_trigger_at, current_agent_plan, custom_worktree_path_is_absolute,
+    sidebar_project_projections, timeline_agent_message_count_after_sequence,
+    timeline_conversation_turns,
 };
 use vibex_desktop_runtime::{
     DesktopEvent, DesktopRuntime, DesktopRuntimeConfig, DesktopRuntimeFacade, PREVIEW_APP_ID,
@@ -229,6 +231,9 @@ const TIMELINE_TOOL_PROJECTION_CACHE_BYTES: usize = 2 * 1024 * 1024;
 const TIMELINE_FILE_DIFF_PREVIEW_CACHE_LIMIT: usize = 64;
 const TIMELINE_FILE_DIFF_PREVIEW_CACHE_BYTES: usize = 4 * 1024 * 1024;
 const TIMELINE_FILE_DIFF_SCROLL_CACHE_LIMIT: usize = 128;
+const TIMELINE_TURN_FILE_CHANGES_CACHE_LIMIT: usize = 128;
+const TIMELINE_TURN_FILE_CHANGES_CACHE_BYTES: usize = 512 * 1024;
+const TURN_FILE_CHANGES_VISIBLE_COUNT: usize = 3;
 const AGENT_TIMELINE_IDLE_POLL_THRESHOLD: u16 = 4;
 const AGENT_TIMELINE_IDLE_POLL_MAX_MS: u64 = 2_000;
 const AGENT_TURN_PREVIEW_EDGE_TRIGGER_WIDTH: f32 = 18.0;
@@ -1887,6 +1892,12 @@ impl ConversationTurnsSummary {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnChangesUndoStatus {
+    Pending,
+    Completed,
+}
+
 struct AgentSessionViewCacheEntry {
     estimated_resident_bytes: usize,
     timeline: TimelineModel,
@@ -1905,6 +1916,7 @@ struct AgentSessionViewCacheEntry {
     collapsed_timeline_rows: BTreeSet<String>,
     timeline_process_expansion: BTreeMap<String, bool>,
     timeline_command_expansion: BTreeMap<String, bool>,
+    timeline_file_changes_expansion: BTreeMap<String, bool>,
 }
 
 impl AgentSessionViewCacheEntry {
@@ -1945,6 +1957,12 @@ impl AgentSessionViewCacheEntry {
             )
             .saturating_add(
                 self.timeline_command_expansion
+                    .keys()
+                    .map(String::len)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.timeline_file_changes_expansion
                     .keys()
                     .map(String::len)
                     .sum::<usize>(),
@@ -3547,6 +3565,7 @@ pub struct VibexWorkbench {
     timeline_tool_card_projections: BTreeMap<String, (i64, Rc<ToolCardProjection>)>,
     timeline_file_diff_previews: BTreeMap<String, (i64, Rc<AgentFileDiffPreview>)>,
     timeline_file_diff_scrolls: BTreeMap<String, gpui::ScrollHandle>,
+    timeline_turn_file_changes: BTreeMap<String, (i64, Rc<TurnFileChangesSummary>)>,
     conversation_turns_cache: Rc<Vec<Rc<TimelineConversationTurn>>>,
     conversation_turns_cache_key: Option<ConversationTurnsCacheKey>,
     conversation_turns_summary: ConversationTurnsSummary,
@@ -3579,6 +3598,8 @@ pub struct VibexWorkbench {
     new_session_command_entry: Option<AgentCommandEntry>,
     collapsed_timeline_rows: BTreeSet<String>,
     timeline_process_expansion: BTreeMap<String, bool>,
+    timeline_file_changes_expansion: BTreeMap<String, bool>,
+    turn_changes_undo_statuses: BTreeMap<String, TurnChangesUndoStatus>,
     composer_attachments: Vec<InlineComposerAttachment>,
     composer_attachment_serial: u64,
     composer_queue: Vec<ComposerQueueMessage>,
@@ -3646,6 +3667,7 @@ pub struct VibexWorkbench {
     runtime_heartbeat_task: Option<Task<()>>,
     agent_poll_task: Option<Task<()>>,
     composer_attachment_task: Option<Task<()>>,
+    turn_changes_undo_task: Option<Task<()>>,
     startup_loading_indicator_task: Option<Task<()>>,
     startup_loading_release_task: Option<Task<()>>,
     appearance_subscription: Option<Subscription>,
@@ -4139,6 +4161,7 @@ impl VibexWorkbench {
             timeline_tool_card_projections: BTreeMap::new(),
             timeline_file_diff_previews: BTreeMap::new(),
             timeline_file_diff_scrolls: BTreeMap::new(),
+            timeline_turn_file_changes: BTreeMap::new(),
             conversation_turns_cache: Rc::new(Vec::new()),
             conversation_turns_cache_key: None,
             conversation_turns_summary: ConversationTurnsSummary::default(),
@@ -4171,6 +4194,8 @@ impl VibexWorkbench {
             new_session_command_entry: None,
             collapsed_timeline_rows: BTreeSet::new(),
             timeline_process_expansion: BTreeMap::new(),
+            timeline_file_changes_expansion: BTreeMap::new(),
+            turn_changes_undo_statuses: BTreeMap::new(),
             composer_attachments: Vec::new(),
             composer_attachment_serial: 0,
             composer_queue: Vec::new(),
@@ -4238,6 +4263,7 @@ impl VibexWorkbench {
             runtime_heartbeat_task: None,
             agent_poll_task: None,
             composer_attachment_task: None,
+            turn_changes_undo_task: None,
             startup_loading_indicator_task: None,
             startup_loading_release_task: None,
             appearance_subscription: None,
@@ -6644,12 +6670,16 @@ impl VibexWorkbench {
             collapsed_timeline_rows: std::mem::take(&mut self.collapsed_timeline_rows),
             timeline_process_expansion: std::mem::take(&mut self.timeline_process_expansion),
             timeline_command_expansion: std::mem::take(&mut self.timeline_command_expansion),
+            timeline_file_changes_expansion: std::mem::take(
+                &mut self.timeline_file_changes_expansion,
+            ),
         };
         entry.estimated_resident_bytes = entry.calculate_estimated_resident_bytes();
         self.timeline_markdown_sources.clear();
         self.timeline_tool_card_projections.clear();
         self.timeline_file_diff_previews.clear();
         self.timeline_file_diff_scrolls.clear();
+        self.timeline_turn_file_changes.clear();
         self.store_agent_session_view(session_id, entry);
     }
 
@@ -6727,6 +6757,7 @@ impl VibexWorkbench {
         self.timeline_tool_card_projections.clear();
         self.timeline_file_diff_previews.clear();
         self.timeline_file_diff_scrolls.clear();
+        self.timeline_turn_file_changes.clear();
         self.conversation_turns_cache = entry.conversation_turns_cache;
         self.conversation_turns_cache_key = entry.conversation_turns_cache_key;
         self.conversation_turns_summary = entry.conversation_turns_summary;
@@ -6734,6 +6765,7 @@ impl VibexWorkbench {
         self.collapsed_timeline_rows = entry.collapsed_timeline_rows;
         self.timeline_process_expansion = entry.timeline_process_expansion;
         self.timeline_command_expansion = entry.timeline_command_expansion;
+        self.timeline_file_changes_expansion = entry.timeline_file_changes_expansion;
         if entry.content_width != self.ui_state.session.content_width
             || self.conversation_turns_cache_key.as_ref()
                 != Some(&self.current_conversation_turns_cache_key())
@@ -7214,6 +7246,7 @@ impl VibexWorkbench {
             self.collapsed_timeline_rows.clear();
             self.timeline_process_expansion.clear();
             self.timeline_command_expansion.clear();
+            self.timeline_file_changes_expansion.clear();
             self.agent_loading = true;
         }
         self.refresh_agent_token_usage(&session_id);
@@ -8084,6 +8117,7 @@ impl VibexWorkbench {
         self.timeline_tool_card_projections.clear();
         self.timeline_file_diff_previews.clear();
         self.timeline_file_diff_scrolls.clear();
+        self.timeline_turn_file_changes.clear();
         self.conversation_turns_cache = Rc::new(Vec::new());
         self.conversation_turns_cache_key = None;
         self.conversation_turns_summary = ConversationTurnsSummary::default();
@@ -8122,6 +8156,10 @@ impl VibexWorkbench {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         turn.complete.hash(&mut hasher);
         process_expansion.hash(&mut hasher);
+        self.timeline_file_changes_expansion
+            .get(&turn.id)
+            .copied()
+            .hash(&mut hasher);
         self.ui_state
             .session
             .enhanced_command_execution_display
@@ -22687,7 +22725,495 @@ impl VibexWorkbench {
             content = content.child(response);
         }
 
+        if turn.complete
+            && let Some(file_changes) = self.render_turn_file_changes_card(turn, is_last, cx)
+        {
+            content = content.child(file_changes);
+        }
+
         content.into_any_element()
+    }
+
+    fn render_turn_file_changes_card(
+        &mut self,
+        turn: &TimelineConversationTurn,
+        is_latest_turn: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let session = self.selected_session()?.clone();
+        let mut summary = self.agent_turn_file_changes_cached(turn).as_ref().clone();
+        if summary.files.is_empty() {
+            return None;
+        }
+        if is_latest_turn {
+            let code_workbench = self.code_workbench.read(cx);
+            if let Some(status) = code_workbench.git_status()
+                && status.workspace_id == session.workspace_id
+            {
+                apply_git_status_to_turn_file_changes(&mut summary, status);
+            }
+        }
+
+        let expanded = self
+            .timeline_file_changes_expansion
+            .get(&turn.id)
+            .copied()
+            .unwrap_or(false);
+        let visible_count = if expanded {
+            summary.files.len()
+        } else {
+            summary.files.len().min(TURN_FILE_CHANGES_VISIBLE_COUNT)
+        };
+        let remaining_count = summary.files.len().saturating_sub(visible_count);
+        let total_added = summary
+            .files
+            .iter()
+            .map(|file| file.added_lines)
+            .sum::<usize>();
+        let total_removed = summary
+            .files
+            .iter()
+            .map(|file| file.removed_lines)
+            .sum::<usize>();
+        let action_key = turn_changes_action_key(&session.id, &turn.id);
+        let undo_status = self.turn_changes_undo_statuses.get(&action_key).copied();
+        let undo_pending = undo_status == Some(TurnChangesUndoStatus::Pending);
+        let undo_completed = undo_status == Some(TurnChangesUndoStatus::Completed);
+        let can_undo = turn_file_changes_undo_available(is_latest_turn, turn.complete, &summary)
+            && self.turn_changes_undo_task.is_none()
+            && !undo_completed;
+        let first_review = summary.files.iter().find_map(|file| {
+            file.review_path
+                .clone()
+                .map(|path| (path, file.review_staged))
+        });
+        let card_bg = theme::semantic_color("card", cx.theme().is_dark());
+        let title = format!(
+            "{} {}",
+            summary.files.len(),
+            locale::text("files changed", "个文件变更", "個檔案變更")
+        );
+        let mut rows = v_flex().w_full().min_w_0();
+        for (index, file) in summary.files.iter().take(visible_count).enumerate() {
+            let review = file
+                .review_path
+                .clone()
+                .map(|path| (path, file.review_staged));
+            let row_id = format!("turn-file-change:{}:{index}", turn.id);
+            let mut row = h_flex()
+                .id(row_id)
+                .w_full()
+                .min_w_0()
+                .h(px(36.0))
+                .flex_none()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .border_t_1()
+                .border_color(cx.theme().border.opacity(0.72))
+                .child(
+                    Icon::default()
+                        .path("icons/vibex/file-text.svg")
+                        .size(px(14.0))
+                        .flex_none()
+                        .text_color(cx.theme().muted_foreground),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .text_sm()
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .font_weight(code_font_weight(cx))
+                        .child(file.display_path.clone()),
+                )
+                .when(file.removed_lines > 0, |this| {
+                    this.child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .font_weight(code_font_weight(cx))
+                            .text_color(cx.theme().danger)
+                            .child(format!("-{}", file.removed_lines)),
+                    )
+                })
+                .when(file.added_lines > 0, |this| {
+                    this.child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .font_weight(code_font_weight(cx))
+                            .text_color(cx.theme().success)
+                            .child(format!("+{}", file.added_lines)),
+                    )
+                });
+            if let Some((path, staged)) = review {
+                let tooltip_text = locale::text("Review this file", "审查此文件", "檢閱此檔案");
+                let aria_label = format!("{tooltip_text}: {}", file.display_path);
+                row = row
+                    .cursor_pointer()
+                    .focusable()
+                    .tab_stop(true)
+                    .role(Role::Button)
+                    .aria_label(aria_label)
+                    .hover(|style| style.bg(cx.theme().muted.opacity(0.32)))
+                    .focus_visible(|style| style.bg(cx.theme().muted.opacity(0.40)))
+                    .tooltip(move |window, cx| Tooltip::new(tooltip_text).build(window, cx))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.review_turn_file_changes(path.clone(), staged, cx)
+                    }));
+            }
+            rows = rows.child(row);
+        }
+
+        let turn_id = turn.id.clone();
+        let resolved_locale = self.resolved_locale();
+        let disclosure = (summary.files.len() > TURN_FILE_CHANGES_VISIBLE_COUNT).then(|| {
+            let label = if expanded {
+                locale::text("Show fewer", "收起", "收合").to_string()
+            } else {
+                match resolved_locale {
+                    locale::ResolvedLocale::En => {
+                        format!("Show {remaining_count} more files")
+                    }
+                    locale::ResolvedLocale::ZhCn => {
+                        format!("再显示 {remaining_count} 个文件")
+                    }
+                    locale::ResolvedLocale::ZhTw => {
+                        format!("再顯示 {remaining_count} 個檔案")
+                    }
+                }
+            };
+            Button::new(format!("toggle-turn-file-changes:{}", turn.id))
+                .small()
+                .ghost()
+                .compact()
+                .icon(if expanded {
+                    IconName::ChevronUp
+                } else {
+                    IconName::ChevronDown
+                })
+                .label(label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.invalidate_timeline_turn_measurement(&turn_id);
+                    this.timeline_file_changes_expansion
+                        .insert(turn_id.clone(), !expanded);
+                    this.rebuild_timeline_sizes();
+                    cx.notify();
+                }))
+        });
+        let has_disclosure = disclosure.is_some();
+        let review_button = {
+            let review = first_review.clone();
+            Button::new(format!("review-turn-file-changes:{}", turn.id))
+                .small()
+                .primary()
+                .icon(IconName::Eye)
+                .label(locale::text("Review", "审查", "檢閱"))
+                .disabled(review.is_none())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some((path, staged)) = review.as_ref() {
+                        this.review_turn_file_changes(path.clone(), *staged, cx);
+                    }
+                }))
+        };
+        let undo_turn_id = turn.id.clone();
+        let undo_button = Button::new(format!("undo-turn-file-changes:{}", turn.id))
+            .small()
+            .outline()
+            .icon(if undo_completed {
+                IconName::Check
+            } else {
+                IconName::Undo2
+            })
+            .label(if undo_completed {
+                locale::text("Undone", "已撤销", "已復原")
+            } else {
+                locale::text("Undo", "撤销", "復原")
+            })
+            .loading(undo_pending)
+            .disabled(!can_undo)
+            .tooltip(if can_undo || undo_pending || undo_completed {
+                locale::text(
+                    "Undo changes from this turn",
+                    "撤销本轮文件变更",
+                    "復原本輪檔案變更",
+                )
+            } else {
+                locale::text(
+                    "Undo is available only for the latest completed turn with workspace files",
+                    "仅可撤销最新已完成轮次中的工作区文件",
+                    "僅可復原最新已完成輪次中的工作區檔案",
+                )
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.confirm_undo_turn_file_changes(undo_turn_id.clone(), window, cx)
+            }));
+
+        Some(
+            v_flex()
+                .id(format!("turn-file-changes-card:{}", turn.id))
+                .w_full()
+                .min_w_0()
+                .flex_none()
+                .overflow_hidden()
+                .rounded_lg()
+                .border_1()
+                .border_color(cx.theme().border)
+                .bg(card_bg.opacity(0.72))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .h(px(42.0))
+                        .flex_none()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .child(
+                            Icon::new(IconName::File)
+                                .size(px(15.0))
+                                .flex_none()
+                                .text_color(cx.theme().muted_foreground),
+                        )
+                        .child(div().min_w_0().flex_1().font_medium().child(title))
+                        .when(total_removed > 0, |this| {
+                            this.child(
+                                div()
+                                    .flex_none()
+                                    .text_xs()
+                                    .font_family(cx.theme().mono_font_family.clone())
+                                    .font_weight(code_font_weight(cx))
+                                    .text_color(cx.theme().danger)
+                                    .child(format!("-{total_removed}")),
+                            )
+                        })
+                        .when(total_added > 0, |this| {
+                            this.child(
+                                div()
+                                    .flex_none()
+                                    .text_xs()
+                                    .font_family(cx.theme().mono_font_family.clone())
+                                    .font_weight(code_font_weight(cx))
+                                    .text_color(cx.theme().success)
+                                    .child(format!("+{total_added}")),
+                            )
+                        }),
+                )
+                .child(rows)
+                .child(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .h(px(42.0))
+                        .flex_none()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .px_2()
+                        .border_t_1()
+                        .border_color(cx.theme().border.opacity(0.72))
+                        .when_some(disclosure, |this, disclosure| this.child(disclosure))
+                        .when(!has_disclosure, |this| this.child(div().flex_1()))
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(undo_button)
+                                .child(review_button),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn review_turn_file_changes(&mut self, path: String, staged: bool, cx: &mut Context<Self>) {
+        let Some(session) = self.selected_session().cloned() else {
+            return;
+        };
+        let review_ready = if let Some(runtime) = self.runtime.clone() {
+            let workspace_id = session.workspace_id.clone();
+            self.ui_state.workbench.selected_workspace_id = Some(workspace_id.as_str().to_string());
+            let review_ready = self.code_workbench.update(cx, |workbench, cx| {
+                workbench.sync_workspace(
+                    runtime,
+                    workspace_id.clone(),
+                    std::path::PathBuf::from(session.workspace_root),
+                    cx,
+                );
+                if !workbench.workspace_is_active(&workspace_id) {
+                    return false;
+                }
+                workbench.set_git_mode(GitWorkbenchMode::Changes, cx);
+                workbench.open_diff(GitSelectionKey { path, staged }, cx);
+                true
+            });
+            self.queue_ui_state();
+            review_ready
+        } else {
+            false
+        };
+        self.open_right_rail_mode(RightRailMode::Git, cx);
+        if review_ready {
+            self.reveal_code_preview(cx);
+        }
+    }
+
+    fn confirm_undo_turn_file_changes(
+        &mut self,
+        turn_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.selected_session().cloned() else {
+            return;
+        };
+        let Some(turn) = self
+            .conversation_turns_cached()
+            .last()
+            .filter(|turn| turn.id == turn_id && turn.complete)
+            .cloned()
+        else {
+            return;
+        };
+        let summary = self.agent_turn_file_changes_cached(&turn);
+        if !turn_file_changes_undo_available(true, turn.complete, &summary) {
+            return;
+        }
+        let Some(paths) = summary.actionable_paths() else {
+            return;
+        };
+        let action_key = turn_changes_action_key(&session.id, &turn_id);
+        if self.turn_changes_undo_task.is_some()
+            || self.turn_changes_undo_statuses.contains_key(&action_key)
+        {
+            return;
+        }
+        let count = paths.len();
+        let description = match self.resolved_locale() {
+            locale::ResolvedLocale::ZhCn => format!(
+                "这会丢弃这 {count} 个文件中的所有未提交变更，包括本轮之后所做的编辑。此操作无法恢复。"
+            ),
+            locale::ResolvedLocale::ZhTw => format!(
+                "這會捨棄這 {count} 個檔案中的所有未提交變更，包括本輪之後所做的編輯。此操作無法還原。"
+            ),
+            locale::ResolvedLocale::En => format!(
+                "This discards all uncommitted changes in these {count} files, including edits made after this turn. This cannot be undone."
+            ),
+        };
+        let entity = cx.weak_entity();
+        let session_id = session.id.clone();
+        let workspace_id = session.workspace_id.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let entity = entity.clone();
+            let session_id = session_id.clone();
+            let workspace_id = workspace_id.clone();
+            let action_key = action_key.clone();
+            let paths = paths.clone();
+            dialog
+                .title(locale::text(
+                    "Undo changes from this turn?",
+                    "撤销本轮变更？",
+                    "復原本輪變更？",
+                ))
+                .child(div().text_sm().child(description.clone()))
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            DialogClose::new().child(
+                                Button::new("cancel-undo-turn-file-changes")
+                                    .outline()
+                                    .label(locale::text("Cancel", "取消", "取消")),
+                            ),
+                        )
+                        .child(
+                            DialogAction::new().child(
+                                Button::new("confirm-undo-turn-file-changes")
+                                    .danger()
+                                    .label(locale::text("Undo changes", "撤销变更", "復原變更")),
+                            ),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = entity.update(cx, |this, cx| {
+                        this.undo_turn_file_changes(
+                            session_id.clone(),
+                            workspace_id.clone(),
+                            action_key.clone(),
+                            paths.clone(),
+                            cx,
+                        )
+                    });
+                    true
+                })
+        });
+    }
+
+    fn undo_turn_file_changes(
+        &mut self,
+        session_id: VibexSessionId,
+        workspace_id: vibex_core::WorkspaceId,
+        action_key: String,
+        paths: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.turn_changes_undo_task.is_some()
+            || self.selected_session_id.as_ref() != Some(&session_id)
+        {
+            return;
+        }
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        let generation = self.session_generation;
+        self.agent_error = None;
+        self.turn_changes_undo_statuses
+            .insert(action_key.clone(), TurnChangesUndoStatus::Pending);
+        let request = GitStageRequest {
+            workspace_id,
+            paths,
+        };
+        let runner = gpui_tokio::Tokio::spawn(cx, async move { runtime.git().revert(&request) });
+        self.turn_changes_undo_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.turn_changes_undo_task = None;
+                    let active = this.session_generation == generation
+                        && this.selected_session_id.as_ref() == Some(&session_id);
+                    match outcome {
+                        Ok(Ok(_)) => {
+                            this.turn_changes_undo_statuses
+                                .insert(action_key.clone(), TurnChangesUndoStatus::Completed);
+                            if active {
+                                this.code_workbench
+                                    .update(cx, |workbench, cx| workbench.refresh_git(cx));
+                                this.refresh_workspace_contexts(cx);
+                            }
+                        }
+                        Ok(Err(error)) => {
+                            this.turn_changes_undo_statuses.remove(&action_key);
+                            if active {
+                                this.agent_error =
+                                    Some(format!("{}: {}", error.code, error.message));
+                            }
+                        }
+                        Err(error) => {
+                            this.turn_changes_undo_statuses.remove(&action_key);
+                            if active {
+                                this.agent_error =
+                                    Some(format!("turn changes undo failed: {error}"));
+                            }
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+        cx.notify();
     }
 
     fn timeline_turn_execution_attribution(
@@ -22981,6 +23507,38 @@ impl VibexWorkbench {
             |projection| projection.approximate_bytes(),
         );
         projection
+    }
+
+    fn agent_turn_file_changes_cached(
+        &mut self,
+        turn: &TimelineConversationTurn,
+    ) -> Rc<TurnFileChangesSummary> {
+        let sequence = timeline_turn_sequence_range(turn)
+            .map(|(_, end)| end)
+            .unwrap_or_default();
+        if let Some((cached_sequence, summary)) = self.timeline_turn_file_changes.get(&turn.id)
+            && *cached_sequence == sequence
+        {
+            return summary.clone();
+        }
+        let workspace_root = self
+            .selected_session()
+            .map(|session| session.workspace_root.clone());
+        let summary = Rc::new(agent_turn_file_changes(
+            turn,
+            &self.timeline.items,
+            workspace_root.as_deref(),
+        ));
+        insert_bounded_timeline_projection(
+            &mut self.timeline_turn_file_changes,
+            turn.id.clone(),
+            sequence,
+            summary.clone(),
+            TIMELINE_TURN_FILE_CHANGES_CACHE_LIMIT,
+            TIMELINE_TURN_FILE_CHANGES_CACHE_BYTES,
+            |summary| summary.approximate_bytes(),
+        );
+        summary
     }
 
     /// File snapshots can be large, and a line diff is substantially more expensive than
@@ -23369,7 +23927,7 @@ impl VibexWorkbench {
     }
 
     fn estimated_timeline_turn_height_projected(
-        &self,
+        &mut self,
         turn: &TimelineConversationTurn,
         explicit_process_expansion: Option<bool>,
     ) -> f32 {
@@ -23390,6 +23948,23 @@ impl VibexWorkbench {
                 height += self.estimated_timeline_row_height_projected(conclusion_row, true) + 12.0;
             } else if !turn.complete {
                 height += 34.0;
+            }
+        }
+        if turn.complete {
+            let expanded = self
+                .timeline_file_changes_expansion
+                .get(&turn.id)
+                .copied()
+                .unwrap_or(false);
+            let file_count = self.agent_turn_file_changes_cached(turn).files.len();
+            if file_count > 0 {
+                let visible_count = if expanded {
+                    file_count
+                } else {
+                    file_count.min(TURN_FILE_CHANGES_VISIBLE_COUNT)
+                };
+                // Card header + file rows + action footer + surrounding turn gap.
+                height += 42.0 + visible_count as f32 * 36.0 + 42.0 + 12.0;
             }
         }
         height.max(72.0)
@@ -28212,6 +28787,204 @@ const AGENT_FILE_DIFF_CONTEXT_LINES: usize = 3;
 const AGENT_FILE_DIFF_MAX_PREVIEW_LINES: usize = 160;
 const AGENT_FILE_DIFF_MAX_LINE_BYTES: usize = 2_048;
 const AGENT_FILE_DIFF_TIMEOUT: Duration = Duration::from_millis(200);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TurnFileChange {
+    display_path: String,
+    actionable_path: Option<String>,
+    review_path: Option<String>,
+    review_staged: bool,
+    added_lines: usize,
+    removed_lines: usize,
+    has_line_counts: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TurnFileChangesSummary {
+    files: Vec<TurnFileChange>,
+}
+
+impl TurnFileChangesSummary {
+    fn approximate_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.files
+                    .len()
+                    .saturating_mul(std::mem::size_of::<TurnFileChange>()),
+            )
+            .saturating_add(
+                self.files
+                    .iter()
+                    .map(|file| {
+                        file.display_path
+                            .len()
+                            .saturating_add(file.actionable_path.as_ref().map_or(0, String::len))
+                            .saturating_add(file.review_path.as_ref().map_or(0, String::len))
+                    })
+                    .sum::<usize>(),
+            )
+    }
+
+    fn actionable_paths(&self) -> Option<Vec<String>> {
+        if self.files.is_empty() {
+            return None;
+        }
+        self.files
+            .iter()
+            .map(|file| file.actionable_path.clone())
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+struct TurnFileChangeAccumulator {
+    display_path: String,
+    actionable_path: Option<String>,
+    old_text: Option<String>,
+    new_text: Option<String>,
+    has_text_snapshot: bool,
+}
+
+fn timeline_turn_sequence_range(turn: &TimelineConversationTurn) -> Option<(i64, i64)> {
+    let mut rows = turn
+        .user_row
+        .iter()
+        .chain(turn.process_rows.iter())
+        .chain(turn.conclusion_row.iter());
+    let first = rows.next()?;
+    let mut start = first.first_sequence;
+    let mut end = first.last_sequence;
+    for row in rows {
+        start = start.min(row.first_sequence);
+        end = end.max(row.last_sequence);
+    }
+    Some((start, end))
+}
+
+fn agent_turn_file_changes(
+    turn: &TimelineConversationTurn,
+    timeline_items: &[TimelineItem],
+    workspace_root: Option<&str>,
+) -> TurnFileChangesSummary {
+    let Some((start_sequence, end_sequence)) = timeline_turn_sequence_range(turn) else {
+        return TurnFileChangesSummary::default();
+    };
+    let start_index = timeline_items.partition_point(|item| item.sequence < start_sequence);
+    let mut indices = BTreeMap::<String, usize>::new();
+    let mut files = Vec::<TurnFileChangeAccumulator>::new();
+
+    for item in timeline_items[start_index..]
+        .iter()
+        .take_while(|item| item.sequence <= end_sequence)
+    {
+        let TimelinePayload::FileOperation(operation) = &item.payload else {
+            continue;
+        };
+        if operation.operation == FileOperationKind::Read {
+            continue;
+        }
+        let raw_path = operation.path.trim().replace('\\', "/");
+        if raw_path.is_empty() {
+            continue;
+        }
+        let actionable_path = agent_file_operation_preview_path(&raw_path, workspace_root);
+        let display_path = actionable_path.clone().unwrap_or_else(|| raw_path.clone());
+        let key = actionable_path
+            .as_ref()
+            .map(|path| format!("workspace:{path}"))
+            .unwrap_or_else(|| format!("external:{display_path}"));
+
+        if let Some(index) = indices.get(&key).copied() {
+            let file = &mut files[index];
+            if file.old_text.is_none() {
+                file.old_text.clone_from(&operation.old_text);
+            }
+            if let Some(new_text) = operation.new_text.as_ref() {
+                file.new_text = Some(new_text.clone());
+            } else if operation.operation == FileOperationKind::Delete
+                && (operation.old_text.is_some() || file.new_text.is_some())
+            {
+                file.new_text = Some(String::new());
+            }
+            file.has_text_snapshot |= operation.old_text.is_some() || operation.new_text.is_some();
+            continue;
+        }
+
+        let mut new_text = operation.new_text.clone();
+        if operation.operation == FileOperationKind::Delete && operation.old_text.is_some() {
+            new_text = Some(String::new());
+        }
+        indices.insert(key, files.len());
+        files.push(TurnFileChangeAccumulator {
+            display_path,
+            actionable_path,
+            old_text: operation.old_text.clone(),
+            new_text,
+            has_text_snapshot: operation.old_text.is_some() || operation.new_text.is_some(),
+        });
+    }
+
+    TurnFileChangesSummary {
+        files: files
+            .into_iter()
+            .map(|file| {
+                let (added_lines, removed_lines) = if file.has_text_snapshot {
+                    let preview =
+                        agent_file_diff_preview(file.old_text.as_deref(), file.new_text.as_deref());
+                    (preview.added_lines, preview.removed_lines)
+                } else {
+                    (0, 0)
+                };
+                TurnFileChange {
+                    review_path: file.actionable_path.clone(),
+                    display_path: file.display_path,
+                    actionable_path: file.actionable_path,
+                    review_staged: false,
+                    added_lines,
+                    removed_lines,
+                    has_line_counts: file.has_text_snapshot,
+                }
+            })
+            .collect(),
+    }
+}
+
+fn apply_git_status_to_turn_file_changes(
+    summary: &mut TurnFileChangesSummary,
+    status: &GitStatusSummary,
+) {
+    for file in &mut summary.files {
+        let Some(path) = file.actionable_path.as_deref() else {
+            continue;
+        };
+        let Some(change) = status
+            .changes
+            .iter()
+            .find(|change| change.path == path || change.original_path.as_deref() == Some(path))
+        else {
+            continue;
+        };
+        if !file.has_line_counts {
+            file.added_lines = change.additions as usize;
+            file.removed_lines = change.deletions as usize;
+            file.has_line_counts = true;
+        }
+        file.review_path = Some(change.path.clone());
+        file.review_staged = change.staged && !change.unstaged;
+    }
+}
+
+fn turn_file_changes_undo_available(
+    is_latest_turn: bool,
+    turn_complete: bool,
+    summary: &TurnFileChangesSummary,
+) -> bool {
+    is_latest_turn && turn_complete && summary.actionable_paths().is_some()
+}
+
+fn turn_changes_action_key(session_id: &VibexSessionId, turn_id: &str) -> String {
+    format!("{}:{turn_id}", session_id.as_str())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentFileDiffLineKind {
@@ -35974,11 +36747,12 @@ mod tests {
     use gpui::TestAppContext;
     use vibex_core::{
         AgentCommandExecutionBehavior, AgentCommandSelectionBehavior, AgentId,
-        AgentMessageDeltaPayload, AgentMessagePayload, GitWorktreeConflictFile,
-        GitWorktreeMergeStrategy, GitWorktreeOperationDetail, GitWorktreeOperationKind,
-        PlanPayload, PlanStepPayload, ProviderProfileId, ProviderProfileStatus,
-        RuntimeOptionAvailability, SessionConfigValue, SessionRuntimeOption, TimelineItemId,
-        TimelineRedactionState, TimelineSource, TodoUpdatePayload, UserMessagePayload, WorkspaceId,
+        AgentMessageDeltaPayload, AgentMessagePayload, FileOperationPayload, GitChange,
+        GitChangeKind, GitWorktreeConflictFile, GitWorktreeMergeStrategy,
+        GitWorktreeOperationDetail, GitWorktreeOperationKind, PlanPayload, PlanStepPayload,
+        ProviderProfileId, ProviderProfileStatus, RuntimeOptionAvailability, SessionConfigValue,
+        SessionRuntimeOption, TimelineItemId, TimelineRedactionState, TimelineSource,
+        TodoUpdatePayload, UserMessagePayload, WorkspaceId,
     };
 
     #[test]
@@ -43127,6 +43901,201 @@ mod tests {
             agent_markdown_preview_path(resource, Some("/work/vibex")).as_deref(),
             Some("README.md")
         );
+    }
+
+    fn completed_turn_with_file_operations(
+        operations: Vec<FileOperationPayload>,
+    ) -> (Vec<TimelineItem>, TimelineConversationTurn) {
+        let session_id = VibexSessionId::parse("session_turn_file_changes").unwrap();
+        let mut items = vec![timeline_item_with_payload(
+            &session_id,
+            1,
+            TimelineSource::User,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "Update the files".into(),
+                attachments: Vec::new(),
+            }),
+        )];
+        for (index, operation) in operations.into_iter().enumerate() {
+            items.push(timeline_item_with_payload(
+                &session_id,
+                index as i64 + 2,
+                TimelineSource::Agent,
+                TimelinePayload::FileOperation(operation),
+            ));
+        }
+        items.push(timeline_item_with_payload(
+            &session_id,
+            items.len() as i64 + 1,
+            TimelineSource::Agent,
+            TimelinePayload::AgentMessage(AgentMessagePayload {
+                text: "Done".into(),
+                is_final: true,
+            }),
+        ));
+        let turn = timeline_conversation_turns(&items, Some(AgentSessionState::Idle), false)
+            .into_iter()
+            .next()
+            .expect("completed turn");
+        (items, turn)
+    }
+
+    #[test]
+    fn turn_file_changes_keep_first_seen_files_and_net_snapshot_counts() {
+        let (items, turn) = completed_turn_with_file_operations(vec![
+            FileOperationPayload {
+                operation: FileOperationKind::Read,
+                path: "src/read_only.rs".into(),
+                summary: "Read".into(),
+                old_text: None,
+                new_text: None,
+                raw_extension: None,
+            },
+            FileOperationPayload {
+                operation: FileOperationKind::Edit,
+                path: "src/app.rs".into(),
+                summary: "First edit".into(),
+                old_text: Some("same\nold\ntail".into()),
+                new_text: Some("same\nintermediate\ntail".into()),
+                raw_extension: None,
+            },
+            FileOperationPayload {
+                operation: FileOperationKind::Write,
+                path: "/work/vibex/src/new.rs".into(),
+                summary: "Create file".into(),
+                old_text: None,
+                new_text: Some("first\nsecond".into()),
+                raw_extension: None,
+            },
+            FileOperationPayload {
+                operation: FileOperationKind::Edit,
+                path: "./src/app.rs".into(),
+                summary: "Second edit".into(),
+                old_text: Some("same\nintermediate\ntail".into()),
+                new_text: Some("same\nnew\nextra\ntail".into()),
+                raw_extension: None,
+            },
+        ]);
+
+        let summary = agent_turn_file_changes(&turn, &items, Some("/work/vibex"));
+        assert_eq!(
+            summary
+                .files
+                .iter()
+                .map(|file| file.display_path.as_str())
+                .collect::<Vec<_>>(),
+            ["src/app.rs", "src/new.rs"]
+        );
+        let expected =
+            agent_file_diff_preview(Some("same\nold\ntail"), Some("same\nnew\nextra\ntail"));
+        assert_eq!(summary.files[0].added_lines, expected.added_lines);
+        assert_eq!(summary.files[0].removed_lines, expected.removed_lines);
+        assert_eq!(summary.files[1].added_lines, 2);
+        assert_eq!(summary.files[1].removed_lines, 0);
+    }
+
+    #[test]
+    fn turn_file_changes_reject_unsafe_undo_paths() {
+        let (items, turn) = completed_turn_with_file_operations(vec![
+            FileOperationPayload {
+                operation: FileOperationKind::Edit,
+                path: "src/app.rs".into(),
+                summary: "Edit".into(),
+                old_text: None,
+                new_text: None,
+                raw_extension: None,
+            },
+            FileOperationPayload {
+                operation: FileOperationKind::Write,
+                path: "/work/other/private.rs".into(),
+                summary: "Outside workspace".into(),
+                old_text: None,
+                new_text: None,
+                raw_extension: None,
+            },
+        ]);
+
+        let summary = agent_turn_file_changes(&turn, &items, Some("/work/vibex"));
+        assert_eq!(summary.files.len(), 2);
+        assert_eq!(
+            summary.files[0].actionable_path.as_deref(),
+            Some("src/app.rs")
+        );
+        assert_eq!(summary.files[1].actionable_path, None);
+        assert!(!turn_file_changes_undo_available(true, true, &summary));
+        assert!(!turn_file_changes_undo_available(false, true, &summary));
+    }
+
+    #[test]
+    fn turn_file_changes_use_git_counts_only_when_snapshots_are_missing() {
+        let (items, turn) = completed_turn_with_file_operations(vec![FileOperationPayload {
+            operation: FileOperationKind::Edit,
+            path: "src/app.rs".into(),
+            summary: "Edit".into(),
+            old_text: None,
+            new_text: None,
+            raw_extension: None,
+        }]);
+        let mut summary = agent_turn_file_changes(&turn, &items, Some("/work/vibex"));
+        apply_git_status_to_turn_file_changes(
+            &mut summary,
+            &GitStatusSummary {
+                workspace_id: WorkspaceId::new(),
+                repo_path: "/work/vibex".into(),
+                branch: Some("main".into()),
+                short_commit: Some("abc1234".into()),
+                detached: false,
+                dirty: true,
+                staged_count: 1,
+                unstaged_count: 0,
+                untracked_count: 0,
+                changes: vec![GitChange {
+                    path: "src/app.rs".into(),
+                    original_path: None,
+                    kind: GitChangeKind::Modified,
+                    staged: true,
+                    unstaged: false,
+                    additions: 7,
+                    deletions: 3,
+                }],
+                captured_at_ms: 1,
+            },
+        );
+
+        assert_eq!(summary.files[0].added_lines, 7);
+        assert_eq!(summary.files[0].removed_lines, 3);
+        assert!(summary.files[0].review_staged);
+        assert!(turn_file_changes_undo_available(true, true, &summary));
+        assert!(!turn_file_changes_undo_available(false, true, &summary));
+    }
+
+    #[test]
+    fn turn_file_changes_card_follows_the_conclusion_and_affects_height_signature() {
+        let source = include_str!("app.rs");
+        let renderer = source
+            .split_once("    fn render_timeline_turn(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn timeline_turn_execution_attribution("))
+            .map(|(body, _)| body)
+            .expect("turn renderer should remain inspectable");
+        let conclusion = renderer
+            .find("render_timeline_row(conclusion_row")
+            .expect("conclusion renderer");
+        let changes = renderer
+            .find("render_turn_file_changes_card(turn, is_last, cx)")
+            .expect("file changes card");
+        assert!(conclusion < changes);
+        assert!(renderer.contains("review-turn-file-changes:"));
+        assert!(renderer.contains("undo-turn-file-changes:"));
+        assert!(renderer.contains("toggle-turn-file-changes:"));
+        assert!(renderer.contains("workspace_is_active"));
+        assert!(renderer.contains(".role(Role::Button)"));
+
+        let signature = source
+            .split_once("    fn timeline_turn_estimate_signature(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn record_timeline_turn_height("))
+            .map(|(body, _)| body)
+            .expect("height signature should remain inspectable");
+        assert!(signature.contains("timeline_file_changes_expansion"));
     }
 
     #[test]
