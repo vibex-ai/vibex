@@ -1016,6 +1016,13 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   project/session ordering invalidate it. Rendering consumes projections by
   reference; query-filtered projections remain uncached because their input is
   transient.
+- A vertical sidebar that uses GPUI `ScrollAnchor` for nested session rows must
+  constrain the resulting `ScrollHandle` correction to the Y axis. GPUI's
+  anchor computes both coordinates from the row origin, so sidebar padding can
+  otherwise produce a negative X offset and clip the entire session list. When
+  locating a row whose collapsed ancestors were just opened, defer the anchor
+  request until the expanded layout has rendered, then restore the horizontal
+  offset to zero.
 - Editor keystrokes update the editor entity immediately but debounce the full
   recovery snapshot by 200 ms. Ordinary layout persistence reuses the last
   recovery snapshot and must not walk every dirty buffer. Recovery buffers use

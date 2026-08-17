@@ -14390,7 +14390,23 @@ impl VibexWorkbench {
             self.collapsed_project_restore = None;
             self.queue_agent_ui_state();
         }
-        self.selected_session_scroll_anchor.scroll_to(window, cx);
+        let selected_session_scroll_anchor = self.selected_session_scroll_anchor.clone();
+        let sidebar_scroll = self.sidebar_scroll.clone();
+        let scroll_to_selected = move |window: &mut Window, cx: &mut App| {
+            selected_session_scroll_anchor.scroll_to(window, cx);
+            window.on_next_frame(move |_, _| {
+                let offset = sidebar_scroll.offset();
+                // ScrollAnchor targets both axes. The session row starts after the
+                // sidebar padding, so keep this vertical-only list at x = 0.
+                sidebar_scroll.set_offset(point(px(0.0), offset.y));
+            });
+        };
+        if revealed {
+            // Let the expanded project/workspace render before reading the row anchor.
+            window.on_next_frame(scroll_to_selected);
+        } else {
+            scroll_to_selected(window, cx);
+        }
         cx.notify();
     }
 
@@ -20736,11 +20752,7 @@ impl VibexWorkbench {
                     })
                 } else {
                     button
-                        .icon(
-                            Icon::default()
-                                .path("icons/vibex/vibex-mark.svg")
-                                .size(px(14.0)),
-                        )
+                        .icon(Icon::new(IconName::ArrowDown).size(px(14.0)))
                         .tooltip(match self.resolved_locale() {
                             locale::ResolvedLocale::En => "Scroll to conversation bottom",
                             locale::ResolvedLocale::ZhCn => "滚动到会话底部",
@@ -39296,6 +39308,15 @@ mod tests {
             AGENT_TIMELINE_NEAR_BOTTOM_THRESHOLD_PX + 1.0,
         ));
         assert!(timeline_should_show_bottom_control(false, 2, 0.0));
+
+        let source = include_str!("app.rs");
+        let workbench = source
+            .split_once("    fn render_agent_workbench(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_controls("))
+            .map(|(body, _)| body)
+            .expect("agent workbench renderer should remain inspectable");
+        assert!(workbench.contains("Icon::new(IconName::ArrowDown)"));
+        assert!(!workbench.contains("icons/vibex/vibex-mark.svg"));
     }
 
     #[test]
@@ -41536,6 +41557,15 @@ mod tests {
         assert!(sidebar.contains("this.locate_selected_session(window, cx)"));
         assert!(sidebar.contains(".track_scroll(&self.sidebar_scroll)"));
         assert!(sidebar.contains(".vertical_scrollbar(&self.sidebar_scroll)"));
+
+        let locator = source
+            .split_once("    fn locate_selected_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn toggle_sidebar_hierarchy_mode("))
+            .map(|(body, _)| body)
+            .expect("selected-session locator should remain inspectable");
+        assert!(locator.contains("sidebar_scroll.set_offset(point(px(0.0), offset.y));"));
+        assert!(locator.contains("if revealed"));
+        assert!(locator.contains("window.on_next_frame(scroll_to_selected);"));
 
         let session = source
             .split_once("    fn render_sidebar_session(")
