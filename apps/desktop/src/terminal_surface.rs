@@ -39,7 +39,7 @@ use vibex_terminal::{
 
 const TERMINAL_BASE_FONT_SIZE: f32 = 13.0;
 const TERMINAL_BASE_CELL_WIDTH: f32 = 8.0;
-const TERMINAL_BASE_CELL_HEIGHT: f32 = 16.0;
+const TERMINAL_BASE_CELL_HEIGHT: f32 = 18.0;
 const TERMINAL_MIN_FONT_SIZE: f32 = 10.0;
 const TERMINAL_MAX_FONT_SIZE: f32 = 24.0;
 const TERMINAL_HORIZONTAL_PADDING: f32 = 12.0;
@@ -1558,6 +1558,7 @@ impl TerminalSurface {
             .py(px(vertical_padding))
             .font_family(cx.theme().mono_font_family.clone())
             .text_size(cx.theme().mono_font_size)
+            .line_height(px(cell_metrics.cell_height))
             .font_weight(code_font_weight(cx))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .on_mouse_down(
@@ -2130,16 +2131,16 @@ mod tests {
     fn terminal_cell_metrics_follow_clamped_code_font_size() {
         let default = terminal_cell_metrics(13.0, TerminalSurfaceMode::Standalone);
         assert_eq!(default.cell_width, 8.0);
-        assert_eq!(default.cell_height, 16.0);
+        assert_eq!(default.cell_height, 18.0);
 
         let minimum = terminal_cell_metrics(1.0, TerminalSurfaceMode::Preview);
         assert_eq!(minimum.cell_width, 80.0 / 13.0);
-        assert_eq!(minimum.cell_height, 160.0 / 13.0);
+        assert_eq!(minimum.cell_height, 180.0 / 13.0);
         assert_eq!(minimum.horizontal_padding, PREVIEW_TERMINAL_PADDING);
 
         let maximum = terminal_cell_metrics(100.0, TerminalSurfaceMode::Composer);
         assert_eq!(maximum.cell_width, 192.0 / 13.0);
-        assert_eq!(maximum.cell_height, 384.0 / 13.0);
+        assert_eq!(maximum.cell_height, 432.0 / 13.0);
         assert_eq!(maximum.vertical_padding, COMPOSER_TERMINAL_PADDING);
 
         assert_eq!(

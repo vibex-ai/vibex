@@ -26203,10 +26203,9 @@ for line in sys.stdin:
                 if text_delta == "partial output before the stop"
         )));
         assert!(
-            !events.iter().any(|event| matches!(
-                event,
-                AcpEvent::AssistantMessage { is_final: true, .. }
-            )),
+            !events
+                .iter()
+                .any(|event| matches!(event, AcpEvent::AssistantMessage { is_final: true, .. })),
             "an abnormal stop must not manufacture a final Agent message"
         );
 
