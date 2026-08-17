@@ -13677,10 +13677,8 @@ impl VibexWorkbench {
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let outcome = runner.await;
                 let _ = entity.update(cx, |this, cx| {
+                    this.agent_action_pending = false;
                     let active = this.session_generation == generation;
-                    if active {
-                        this.agent_action_pending = false;
-                    }
                     match outcome {
                         Ok(Ok(updated)) => {
                             if let Some(session) = this
@@ -13965,10 +13963,8 @@ impl VibexWorkbench {
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let outcome = runner.await;
                 let _ = entity.update(cx, |this, cx| {
+                    this.agent_action_pending = false;
                     let active = this.session_generation == generation;
-                    if active {
-                        this.agent_action_pending = false;
-                    }
                     this.optimistic_session_deletion_reconciliation_pending = true;
                     this.load_agent_overview(cx);
                     match outcome {
@@ -13998,10 +13994,8 @@ impl VibexWorkbench {
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let outcome = runner.await;
                 let _ = entity.update(cx, |this, cx| {
+                    this.agent_action_pending = false;
                     let active = this.session_generation == generation;
-                    if active {
-                        this.agent_action_pending = false;
-                    }
                     match outcome {
                         Ok(Ok(())) => {
                             this.load_agent_overview(cx);
@@ -37816,6 +37810,47 @@ mod tests {
             completion.contains("this.optimistic_session_deletion_reconciliation_pending = true;")
         );
         assert!(completion.contains("this.load_agent_overview(cx);"));
+    }
+
+    #[test]
+    fn session_mutation_completions_release_the_action_lock_before_generation_fencing() {
+        let source = include_str!("app.rs");
+        let mutation_completions = [
+            (
+                "    fn rename_session(",
+                "\n    fn confirm_delete_session(",
+                "session rename",
+            ),
+            (
+                "    fn finish_optimistic_session_deletion(",
+                "\n    fn finish_session_mutation(",
+                "optimistic session deletion",
+            ),
+            (
+                "    fn finish_session_mutation(",
+                "\n    fn open_session_search(",
+                "session mutation",
+            ),
+        ];
+
+        for (start, end, label) in mutation_completions {
+            let completion = source
+                .split_once(start)
+                .and_then(|(_, tail)| tail.split_once(end))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("{label} completion should remain inspectable"));
+            let release = completion
+                .find("this.agent_action_pending = false;")
+                .unwrap_or_else(|| panic!("{label} must release its action lock"));
+            let generation_fence = completion
+                .find("let active = this.session_generation == generation;")
+                .unwrap_or_else(|| panic!("{label} must fence active-view updates"));
+
+            assert!(
+                release < generation_fence,
+                "{label} must release its operation lock even after navigation changes generation"
+            );
+        }
     }
 
     #[test]
