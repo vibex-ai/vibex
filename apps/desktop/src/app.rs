@@ -17139,7 +17139,7 @@ impl VibexWorkbench {
         let context_menu_hovered = self.sidebar_context_menu_target
             == Some(SidebarContextMenuTarget::Session(session_id_string.clone()));
         let row_background = if selected {
-            cx.theme().sidebar_accent.opacity(0.70)
+            sidebar_selected_session_background(cx.theme().sidebar_accent, cx.theme().is_dark())
         } else {
             cx.theme().transparent
         };
@@ -17147,6 +17147,11 @@ impl VibexWorkbench {
             cx.theme().sidebar_foreground
         } else {
             cx.theme().sidebar_foreground.opacity(0.72)
+        };
+        let row_hover_background = if selected {
+            row_background
+        } else {
+            cx.theme().sidebar_accent.opacity(0.45)
         };
 
         if renaming {
@@ -17345,6 +17350,8 @@ impl VibexWorkbench {
             .rounded(px(8.0))
             .bg(if active_drop_after.is_some() {
                 cx.theme().tokens.drop_target.into()
+            } else if selected {
+                row_background
             } else {
                 if context_menu_hovered {
                     cx.theme().sidebar_accent.opacity(0.45)
@@ -17352,7 +17359,7 @@ impl VibexWorkbench {
                     row_background
                 }
             })
-            .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.45)))
+            .hover(move |style| style.bg(row_hover_background))
             .when_some(active_drop_after, |this, after| {
                 this.child(
                     div()
@@ -29508,6 +29515,14 @@ fn reveal_sidebar_session(
     project_revealed || workspace_revealed
 }
 
+fn sidebar_selected_session_background(accent: Hsla, is_dark: bool) -> Hsla {
+    if is_dark {
+        accent.lighten(0.24)
+    } else {
+        accent.darken(0.04)
+    }
+}
+
 fn sidebar_selection_indicator(state: SidebarSelectionState, cx: &App) -> AnyElement {
     div()
         .size(px(14.0))
@@ -37984,6 +37999,17 @@ mod tests {
             "workspace_a",
             false
         ));
+    }
+
+    #[test]
+    fn selected_session_background_increases_contrast_in_both_themes() {
+        let light_accent = theme::semantic_color("sidebar-accent", false);
+        let light_selected = sidebar_selected_session_background(light_accent, false);
+        assert!(light_selected.l < light_accent.l);
+
+        let dark_accent = theme::semantic_color("sidebar-accent", true);
+        let dark_selected = sidebar_selected_session_background(dark_accent, true);
+        assert!(dark_selected.l > dark_accent.l);
     }
 
     #[test]
