@@ -8,11 +8,11 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, Bounds, ClipboardItem, Context, ElementInputHandler, Entity, EntityInputHandler,
-    FocusHandle, FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
-    Subscription, Task, UTF16Selection, WeakEntity, Window, canvas, div, point, prelude::*, px,
-    rgb, size,
+    AnyElement, App, Bounds, ClipboardItem, Context, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, FontWeight, Hsla, IntoElement, KeyBinding, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta,
+    ScrollWheelEvent, Subscription, Task, UTF16Selection, WeakEntity, Window, actions, canvas, div,
+    point, prelude::*, px, rgb, size,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, IconName, Selectable as _, Sizable as _,
@@ -55,6 +55,16 @@ const TERMINAL_IDLE_POLL_THRESHOLD: u16 = 4;
 const TERMINAL_RESIZE_DEBOUNCE: Duration = Duration::from_millis(80);
 const TERMINAL_CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 const PHYSICAL_MARKER_COMMAND: &str = "printf vibex-native-content-ok";
+const TERMINAL_KEY_CONTEXT: &str = "VibexTerminal";
+
+actions!(vibex_terminal, [SendTab, SendBacktab]);
+
+pub fn bind_terminal_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("tab", SendTab, Some(TERMINAL_KEY_CONTEXT)),
+        KeyBinding::new("shift-tab", SendBacktab, Some(TERMINAL_KEY_CONTEXT)),
+    ]);
+}
 
 type SharedTerminalBackend = Arc<Mutex<TerminalSurfaceBackend>>;
 
@@ -428,7 +438,7 @@ impl TerminalSurface {
             self.encode_active_key(TerminalKey::Enter, TerminalModifiers::default())
                 .unwrap_or_else(|| b"\r".to_vec()),
         );
-        if self.write_active(&bytes).is_ok() {
+        if self.write_active(&bytes, cx).is_ok() {
             self.command_submitted = true;
             cx.notify();
         }
@@ -790,7 +800,7 @@ impl TerminalSurface {
         self.mode.vertical_padding()
     }
 
-    fn write_active(&mut self, bytes: &[u8]) -> Result<(), ()> {
+    fn write_active(&mut self, bytes: &[u8], cx: &mut Context<Self>) -> Result<(), ()> {
         let Some((terminal_id, _)) = self.active_runtime() else {
             self.note = "No active terminal".into();
             self.last_error_code = Some("terminal_not_found");
@@ -803,7 +813,18 @@ impl TerminalSurface {
             .map_err(|error| {
                 self.note = format!("Terminal write failed: {}", error.message);
                 self.last_error_code = Some("terminal_write_failed");
-            })
+            })?;
+        self.wake_polling_after_input(cx);
+        Ok(())
+    }
+
+    fn wake_polling_after_input(&mut self, cx: &mut Context<Self>) {
+        if !self.foreground_active || self.idle_poll_count < TERMINAL_IDLE_POLL_THRESHOLD {
+            return;
+        }
+        self.idle_poll_count = 0;
+        self.poll_task = None;
+        self.start_polling(cx);
     }
 
     fn encode_active_key(&self, key: TerminalKey, modifiers: TerminalModifiers) -> Option<Vec<u8>> {
@@ -816,7 +837,7 @@ impl TerminalSurface {
         Some(backend.lock().ok()?.encode_paste(text))
     }
 
-    fn commit_text(&mut self, value: &str) -> bool {
+    fn commit_text(&mut self, value: &str, cx: &mut Context<Self>) -> bool {
         let Some((_, backend)) = self.active_runtime() else {
             return false;
         };
@@ -827,7 +848,7 @@ impl TerminalSurface {
         let Some(bytes) = bytes else {
             return false;
         };
-        match self.write_active(&bytes) {
+        match self.write_active(&bytes, cx) {
             Ok(()) => {
                 if !value.is_ascii() {
                     self.ime_commits = self.ime_commits.saturating_add(1);
@@ -840,10 +861,25 @@ impl TerminalSurface {
 
     fn send_key(&mut self, key: TerminalKey, modifiers: TerminalModifiers, cx: &mut Context<Self>) {
         if let Some(bytes) = self.encode_active_key(key, modifiers)
-            && self.write_active(&bytes).is_err()
+            && self.write_active(&bytes, cx).is_err()
         {
             cx.notify();
         }
+    }
+
+    fn send_tab(&mut self, _: &SendTab, _: &mut Window, cx: &mut Context<Self>) {
+        self.send_key(TerminalKey::Tab, TerminalModifiers::default(), cx);
+    }
+
+    fn send_backtab(&mut self, _: &SendBacktab, _: &mut Window, cx: &mut Context<Self>) {
+        self.send_key(
+            TerminalKey::Tab,
+            TerminalModifiers {
+                shift: true,
+                ..TerminalModifiers::default()
+            },
+            cx,
+        );
     }
 
     fn send_focus(&mut self, focused: bool) {
@@ -1044,7 +1080,7 @@ impl TerminalSurface {
             return;
         };
         if let Some(bytes) = self.encode_active_paste(&text) {
-            let _ = self.write_active(&bytes);
+            let _ = self.write_active(&bytes, cx);
             self.note = "Clipboard text sent using terminal paste mode".into();
             cx.notify();
         }
@@ -1741,7 +1777,7 @@ impl EntityInputHandler for TerminalSurface {
         if composition_cleared {
             window.invalidate_character_coordinates();
         }
-        if self.commit_text(text) || composition_cleared {
+        if self.commit_text(text, cx) || composition_cleared {
             cx.notify();
         }
     }
@@ -1816,6 +1852,9 @@ impl Render for TerminalSurface {
         v_flex()
             .id("terminal-surface")
             .track_focus(&self.focus)
+            .key_context(TERMINAL_KEY_CONTEXT)
+            .on_action(cx.listener(Self::send_tab))
+            .on_action(cx.listener(Self::send_backtab))
             .on_key_down(cx.listener(Self::on_key_down))
             .relative()
             .size_full()
@@ -2133,6 +2172,7 @@ mod tests {
     #[gpui::test]
     fn native_input_handler_routes_text_keys_and_ime(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
+        cx.update(bind_terminal_keys);
         let window = cx.update(|cx| {
             cx.open_window(Default::default(), |window, cx| {
                 cx.new(|cx| TerminalSurface::new(false, window, cx))
@@ -2162,6 +2202,14 @@ mod tests {
             [
                 (TerminalKey::Enter, TerminalModifiers::default()),
                 (TerminalKey::Backspace, TerminalModifiers::default()),
+                (TerminalKey::Tab, TerminalModifiers::default()),
+                (
+                    TerminalKey::Tab,
+                    TerminalModifiers {
+                        shift: true,
+                        ..TerminalModifiers::default()
+                    },
+                ),
                 (TerminalKey::Left, TerminalModifiers::default()),
                 (TerminalKey::Right, TerminalModifiers::default()),
                 (TerminalKey::Up, TerminalModifiers::default()),
@@ -2193,13 +2241,25 @@ mod tests {
         });
 
         let burst = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz";
+        surface.update(&mut cx, |surface, _| {
+            surface.idle_poll_count = TERMINAL_IDLE_POLL_THRESHOLD;
+        });
         cx.simulate_input(burst);
-        cx.simulate_keystrokes("enter backspace left right up down home end ctrl-c alt-x");
+        cx.simulate_keystrokes(
+            "enter backspace tab shift-tab left right up down home end ctrl-c alt-x",
+        );
 
         let mut expected = burst.bytes().map(|byte| vec![byte]).collect::<Vec<_>>();
         expected.extend(expected_keys);
         let actual = surface.read_with(&cx, |surface, _| surface.input_log.clone());
         assert_eq!(actual, expected);
+        assert_eq!(
+            surface.read_with(&cx, |surface, _| surface.idle_poll_count),
+            0,
+            "input after idle backoff should restore low-latency polling"
+        );
+        assert!(surface.read_with(&cx, |surface, _| surface.poll_task.is_some()));
+        assert!(cx.update(|window, cx| surface.read(cx).focus.is_focused(window)));
         assert_eq!(
             input_notifications.get(),
             0,

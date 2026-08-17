@@ -137,7 +137,7 @@ use crate::platform::{
 };
 use crate::remote_access_pairing::open_remote_access_pairing;
 use crate::responsive::WorkbenchVisibility;
-use crate::terminal_surface::{TerminalSurface, available_shells};
+use crate::terminal_surface::{TerminalSurface, available_shells, bind_terminal_keys};
 use crate::usage::UsageView;
 use crate::{DEFAULT_HEIGHT, DEFAULT_WIDTH, MIN_HEIGHT, MIN_WIDTH, theme};
 
@@ -35195,6 +35195,7 @@ fn action_name(action: &str) -> &'static str {
 
 pub fn open_workbench_window(cx: &mut App) -> Result<(), String> {
     bind_foundation_keys(cx);
+    bind_terminal_keys(cx);
     let application_id = release_application_id()
         .map_err(|error| format!("release channel configuration failed ({})", error.code))?;
     let bounds = Bounds::centered(

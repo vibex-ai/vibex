@@ -295,6 +295,9 @@ fn main() {
         .run(move |cx: &mut App| {
             gpui_tokio::init(cx);
             gpui_component::init(cx);
+            if !matches!(launch_mode, LaunchMode::Workbench) {
+                terminal_surface::bind_terminal_keys(cx);
+            }
             if let Some(fixture_theme) = fixture_theme {
                 let appearance = AppearanceUiState {
                     theme: fixture_theme,
