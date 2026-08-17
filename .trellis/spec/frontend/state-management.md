@@ -136,6 +136,14 @@ new non-empty Agent message rows only. Streaming deltas that reconcile into the
 same row count once; reasoning, plans, tools, permissions, and other activity
 rows do not increment the badge.
 
+Timeline wheel handling and bottom controls must treat a positive vertical
+`ScrollHandle::max_offset` as the prerequisite for leaving follow mode or
+showing a return-to-bottom affordance. GPUI can apply a wheel delta to the raw
+offset before prepaint clamps it to the available extent, so a transient
+distance-to-bottom value does not prove that the content is scrollable. A
+timeline that fits in its viewport stays in follow mode and shows no bottom
+control when the user moves the wheel.
+
 Timeline virtualization caches are presentation state, not authoritative
 content. When a non-stream event appends structured content to the latest
 projected turn, rebuild that projection before sizing, invalidate the turn's

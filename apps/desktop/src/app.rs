@@ -2739,12 +2739,14 @@ fn timeline_should_resume_follow_after_scroll_idle(
 }
 
 fn timeline_should_show_bottom_control(
+    scrollable: bool,
     following_bottom: bool,
     unread_count: u32,
     distance_to_bottom: f32,
 ) -> bool {
-    unread_count > 0
-        || (!following_bottom && distance_to_bottom > AGENT_TIMELINE_NEAR_BOTTOM_THRESHOLD_PX)
+    scrollable
+        && (unread_count > 0
+            || (!following_bottom && distance_to_bottom > AGENT_TIMELINE_NEAR_BOTTOM_THRESHOLD_PX))
 }
 
 fn timeline_should_auto_follow_content(
@@ -8298,7 +8300,7 @@ impl VibexWorkbench {
             ScrollDelta::Lines(point) => point.y,
             ScrollDelta::Pixels(point) => f32::from(point.y),
         };
-        if delta_y == 0.0 {
+        if delta_y == 0.0 || self.timeline_scroll.max_offset().y <= px(0.0) {
             return;
         }
 
@@ -20521,6 +20523,7 @@ impl VibexWorkbench {
         let content_max_width = session_content_max_width(self.ui_state.session.content_width);
         let pending_permission = turns_summary.has_pending_permission;
         let timeline_bottom_control_visible = timeline_should_show_bottom_control(
+            self.timeline_scroll.max_offset().y > px(0.0),
             self.timeline_follow.following_bottom,
             self.timeline_follow.unread_count,
             self.timeline_distance_to_bottom(),
@@ -39296,18 +39299,22 @@ mod tests {
 
     #[test]
     fn timeline_bottom_control_covers_unread_and_distant_reading_positions() {
-        assert!(!timeline_should_show_bottom_control(true, 0, 500.0));
+        assert!(!timeline_should_show_bottom_control(false, false, 0, 500.0));
+        assert!(!timeline_should_show_bottom_control(true, true, 0, 500.0));
         assert!(!timeline_should_show_bottom_control(
+            true,
             false,
             0,
             AGENT_TIMELINE_NEAR_BOTTOM_THRESHOLD_PX,
         ));
         assert!(timeline_should_show_bottom_control(
+            true,
             false,
             0,
             AGENT_TIMELINE_NEAR_BOTTOM_THRESHOLD_PX + 1.0,
         ));
-        assert!(timeline_should_show_bottom_control(false, 2, 0.0));
+        assert!(!timeline_should_show_bottom_control(false, false, 2, 0.0));
+        assert!(timeline_should_show_bottom_control(true, false, 2, 0.0));
 
         let source = include_str!("app.rs");
         let workbench = source
@@ -39328,6 +39335,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("timeline wheel handler should remain inspectable");
 
+        assert!(handler.contains("self.timeline_scroll.max_offset().y <= px(0.0)"));
         assert!(handler.contains(".timer(AGENT_TIMELINE_SCROLL_IDLE_DELAY)"));
         assert_eq!(handler.matches("cx.notify();").count(), 1);
     }
