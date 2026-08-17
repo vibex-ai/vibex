@@ -1030,7 +1030,10 @@ fn ambiguous_message_submission_notice() -> &'static str {
 }
 
 fn runtime_status_banner_is_visible(status: SessionRuntimeSelectionStatus) -> bool {
-    status != SessionRuntimeSelectionStatus::Ready
+    // Runtime preparation is deliberately presentation-transparent. The
+    // composer keeps the desired selection visible while durable submission
+    // waits in the background; only a failed switch needs an actionable row.
+    status == SessionRuntimeSelectionStatus::FailedUsingPrevious
 }
 
 fn composer_surface_background(is_dark: bool) -> Hsla {
@@ -39715,17 +39718,19 @@ mod tests {
     }
 
     #[test]
-    fn normal_runtime_selection_does_not_render_a_status_banner() {
+    fn runtime_preparation_does_not_render_a_status_banner() {
         assert!(!runtime_status_banner_is_visible(
             SessionRuntimeSelectionStatus::Ready
         ));
         for status in [
             SessionRuntimeSelectionStatus::WaitingForCurrentWork,
             SessionRuntimeSelectionStatus::Preparing,
-            SessionRuntimeSelectionStatus::FailedUsingPrevious,
         ] {
-            assert!(runtime_status_banner_is_visible(status));
+            assert!(!runtime_status_banner_is_visible(status));
         }
+        assert!(runtime_status_banner_is_visible(
+            SessionRuntimeSelectionStatus::FailedUsingPrevious
+        ));
     }
 
     #[test]

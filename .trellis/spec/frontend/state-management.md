@@ -647,9 +647,11 @@ Remote history attach role  -> viewer
 - Authoritative merge accepts a greater `selectionRevision`, or the same
   selection revision with a non-older `sessionRevision`. CAS failure clears the
   matching overlay and refetches instead of displaying a technical conflict.
-- Pending UI is hidden for the first 400 ms. After that it may say preparing,
-  waiting for the current response, or still using the previous runtime; it
-  must not expose spawn/resume/bridge/commit internals.
+- Desktop keeps normal runtime preparation presentation-transparent: the
+  selector shows the desired choice, while `WaitingForCurrentWork` and
+  `Preparing` render no top status banner regardless of duration. Only
+  `FailedUsingPrevious` may render an actionable recovery row, and it must not
+  expose spawn/resume/bridge/commit internals.
 - Current message/tool/permission projections are accepted only from the exact
   `sessionId + bindingId + activationGeneration` snapshot. A mismatch clears
   live state and triggers selection/snapshot recovery. Historical Timeline
