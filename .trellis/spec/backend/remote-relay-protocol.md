@@ -331,10 +331,12 @@ DNS-SD service type = _vibex._tcp.local.; TXT mode = zero_config
   zero-config only when both zero-config identity keys are present and the
   remaining key set is exact; desktop advertisements always include
   `mode=zero_config`.
-- Native resolvers may return an address literal instead of the SRV hostname.
-  Mobile validates IPv4/IPv6 authorities (including bracketed IPv6 and a
-  validated scoped-IPv6 label) before constructing the bootstrap origin; it
-  rejects ambiguous colon-bearing host strings and never treats TXT as a URL.
+- Native resolvers must pass the resolved numeric address (IPv4 or IPv6) to
+  Rust instead of the advertised `.local`/mDNS hostname; Rust must not perform
+  a second mDNS lookup for the pairing listener. Mobile validates IPv4/IPv6
+  authorities (including bracketed IPv6 and a validated scoped-IPv6 label)
+  before constructing the bootstrap origin; it rejects ambiguous colon-bearing
+  host strings and never treats TXT as a URL.
 - A malformed, stale, or incompatible candidate is local to that candidate:
   discard it and continue browsing. Only the native discovery service's own
   permission or browsing failure terminates the active discovery flow. One

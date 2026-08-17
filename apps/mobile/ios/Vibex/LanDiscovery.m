@@ -1,5 +1,31 @@
 #import <Foundation/Foundation.h>
 #import "vibex_mobile.h"
+#import <netdb.h>
+#import <sys/socket.h>
+
+static NSString *VibexNumericHost(NSNetService *service) {
+    for (NSData *data in service.addresses) {
+        if (data.length == 0) {
+            continue;
+        }
+        char host[NI_MAXHOST] = {0};
+        int result = getnameinfo(
+            data.bytes,
+            (socklen_t)data.length,
+            host,
+            sizeof(host),
+            NULL,
+            0,
+            NI_NUMERICHOST);
+        if (result == 0) {
+            NSString *value = [NSString stringWithUTF8String:host];
+            if (value.length > 0) {
+                return value;
+            }
+        }
+    }
+    return @"";
+}
 
 @interface VibexLanDiscoveryController : NSObject <NSNetServiceBrowserDelegate, NSNetServiceDelegate>
 @property(nonatomic, strong) NSNetServiceBrowser *browser;
@@ -87,10 +113,11 @@ static void VibexEmitLanDiscoveryEvent(NSDictionary *event) {
             txt[key] = decoded;
         }
     }];
+    NSString *host = VibexNumericHost(sender);
     VibexEmitLanDiscoveryEvent(@{
         @"kind": @"candidate",
         @"serviceInstance": sender.name ?: @"",
-        @"host": sender.hostName ?: @"",
+        @"host": host,
         @"port": @(sender.port),
         @"interfaceScope": sender.domain ?: @"",
         @"txt": txt,

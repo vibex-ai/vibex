@@ -218,7 +218,12 @@ public final class GpuiNativeActivity extends NativeActivity {
             event.put("interfaceScope", "");
             String host = "";
             if (service != null && service.getHost() != null) {
-                host = service.getHost().getHostName();
+                // NsdManager has already resolved the service at this point.
+                // Pass the numeric address to Rust instead of the advertised
+                // `.local` name; the Rust resolver cannot reliably resolve
+                // Android mDNS names a second time when opening the pairing
+                // listener.
+                host = service.getHost().getHostAddress();
             }
             event.put("host", host);
             JSONObject txt = new JSONObject();
