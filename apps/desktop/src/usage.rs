@@ -35,6 +35,7 @@ const USAGE_HEATMAP_GAP: f32 = 3.0;
 const USAGE_HEATMAP_MIN_WIDTH: f32 = 840.0;
 const USAGE_MODEL_CHART_MIN_WIDTH: f32 = 720.0;
 const USAGE_TABLE_MIN_WIDTH: f32 = 1040.0;
+const USAGE_SESSION_FILTER_MENU_WIDTH: f32 = 420.0;
 const USAGE_MODEL_LIMIT: usize = 10;
 const USAGE_OTHER_MODEL_ID: &str = "__vibex_other_models__";
 const USAGE_AGENT_DEFAULT_MODEL_ID: &str = "__vibex_agent_default_model__";
@@ -498,24 +499,50 @@ impl UsageView {
             .disabled(options.is_empty() && selected.is_empty())
             .dropdown_menu(move |menu, _, _| {
                 let clear_entity = entity.clone();
-                let mut menu = menu.item(
-                    PopupMenuItem::new(all_label.clone())
-                        .checked(selected.is_empty())
-                        .on_click(move |_, _, cx| {
-                            let _ = clear_entity.update(cx, |this, cx| this.clear_filter(kind, cx));
-                        }),
-                );
+                let mut menu = menu
+                    .when(kind == UsageFilterKind::Session, |menu| {
+                        menu.min_w(px(USAGE_SESSION_FILTER_MENU_WIDTH))
+                            .max_w(px(USAGE_SESSION_FILTER_MENU_WIDTH))
+                    })
+                    .item(
+                        PopupMenuItem::new(all_label.clone())
+                            .checked(selected.is_empty())
+                            .on_click(move |_, _, cx| {
+                                let _ =
+                                    clear_entity.update(cx, |this, cx| this.clear_filter(kind, cx));
+                            }),
+                    );
                 for option in options.iter().cloned() {
                     let checked = selected.contains(&option.id);
                     let id = option.id;
                     let option_entity = entity.clone();
-                    menu = menu.item(PopupMenuItem::new(option.label).checked(checked).on_click(
-                        move |_, _, cx| {
-                            let id = id.clone();
-                            let _ = option_entity
-                                .update(cx, |this, cx| this.toggle_filter(kind, id, cx));
-                        },
-                    ));
+                    let item_element_id =
+                        SharedString::from(format!("usage-filter-{kind:?}-option-{id}"));
+                    let label = option.label;
+                    let item = if kind == UsageFilterKind::Session {
+                        let tooltip_label = label.clone();
+                        PopupMenuItem::element(move |_, _| {
+                            let tooltip_label = tooltip_label.clone();
+                            div()
+                                .id(item_element_id.clone())
+                                .min_w_0()
+                                .flex_1()
+                                .truncate()
+                                .aria_label(label.clone())
+                                .child(label.clone())
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(tooltip_label.clone()).build(window, cx)
+                                })
+                        })
+                    } else {
+                        PopupMenuItem::new(label)
+                    };
+                    let item = item.checked(checked).on_click(move |_, _, cx| {
+                        let id = id.clone();
+                        let _ =
+                            option_entity.update(cx, |this, cx| this.toggle_filter(kind, id, cx));
+                    });
+                    menu = menu.item(item);
                 }
                 menu
             })
@@ -2634,6 +2661,21 @@ mod tests {
 
         assert!(!status.contains("self.stale"));
         assert!(!status.contains("Refreshing after new usage was committed"));
+    }
+
+    #[test]
+    fn session_filter_menu_constrains_and_truncates_long_titles() {
+        let source = include_str!("usage.rs");
+        let filter_menu = source
+            .split_once("    fn render_filter_button(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_summary("))
+            .map(|(body, _)| body)
+            .expect("usage filter menu rendering should remain inspectable");
+
+        assert!(filter_menu.contains(".min_w(px(USAGE_SESSION_FILTER_MENU_WIDTH))"));
+        assert!(filter_menu.contains(".max_w(px(USAGE_SESSION_FILTER_MENU_WIDTH))"));
+        assert!(filter_menu.contains("if kind == UsageFilterKind::Session"));
+        assert!(filter_menu.contains(".min_w_0()\n                                .flex_1()\n                                .truncate()"));
     }
 
     #[test]
