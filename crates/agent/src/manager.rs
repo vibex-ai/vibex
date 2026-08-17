@@ -10,11 +10,11 @@ use vibex_core::{
     AgentCommandEntry, AgentCommandExecuteRequest, AgentCommandExecuteResult,
     AgentCommandExecuteStatus, AgentCommandExecutionBehavior, AgentCommandSelectionBehavior,
     AgentCommandSourceKind, AgentCommandTrigger, AgentConfig, AgentId, AgentLogoutRequest,
-    AgentModelListRequest, AgentModelListResponse, AgentModelListSource, AgentSession,
-    AgentSessionConfigProbe, AgentSessionRestoreMethod, AgentSessionSafety, AgentSessionState,
-    AgentUsageCounterOrigin, AgentUsageExecutionContext, AgentUsageStreamAttribution, BindingState,
-    ContinueAgentTurnRequest, CreateAgentSessionRequest, ElicitationRequest,
-    ExternalSessionContinuationStatus, ExternalSessionImportCandidate,
+    AgentModelListRequest, AgentModelListResponse, AgentModelListSource, AgentNotificationIntent,
+    AgentSession, AgentSessionConfigProbe, AgentSessionRestoreMethod, AgentSessionSafety,
+    AgentSessionState, AgentUsageCounterOrigin, AgentUsageExecutionContext,
+    AgentUsageStreamAttribution, BindingState, ContinueAgentTurnRequest, CreateAgentSessionRequest,
+    ElicitationRequest, ExternalSessionContinuationStatus, ExternalSessionImportCandidate,
     ExternalSessionImportCandidateStatus, ExternalSessionImportDiagnostic,
     ExternalSessionImportPreview, ExternalSessionImportPreviewRequest,
     ExternalSessionImportRequest, ExternalSessionImportResult, ExternalSessionImportSource,
@@ -63,6 +63,7 @@ pub struct AgentManager {
     /// is no longer the dispatch key; multiple ACP agents coexist here.
     runtimes: HashMap<vibex_core::AgentRuntimeRouteKey, Arc<dyn AgentProvider>>,
     live_events: broadcast::Sender<TimelineLiveEvent>,
+    notification_events: broadcast::Sender<AgentNotificationIntent>,
     runtime_selection: OnceLock<Weak<RuntimeSelectionService>>,
     message_submission: OnceLock<Weak<MessageSubmissionCoordinator>>,
     usage_telemetry: OnceLock<mpsc::UnboundedSender<AgentUsageTelemetryEvent>>,
@@ -141,10 +142,12 @@ impl AgentManager {
         apply_migrations(&mut conn)?;
         let context_bridge = ContextBridgeService::new(db_path.clone())?;
         let (live_events, _) = broadcast::channel(512);
+        let (notification_events, _) = broadcast::channel(256);
         let manager = Self {
             db_path,
             runtimes: HashMap::new(),
             live_events,
+            notification_events,
             runtime_selection: OnceLock::new(),
             message_submission: OnceLock::new(),
             usage_telemetry: OnceLock::new(),
@@ -192,6 +195,10 @@ impl AgentManager {
 
     pub fn subscribe(&self) -> broadcast::Receiver<TimelineLiveEvent> {
         self.live_events.subscribe()
+    }
+
+    pub fn subscribe_notifications(&self) -> broadcast::Receiver<AgentNotificationIntent> {
+        self.notification_events.subscribe()
     }
 
     /// Publish a timeline item that was durably appended by a trusted local
@@ -1608,6 +1615,7 @@ impl AgentManager {
                     return Err(err);
                 }
             };
+            self.publish_attention_notification(&item);
             push_or_replace_timeline_item(&mut appended, item);
         }
 
@@ -1676,6 +1684,12 @@ impl AgentManager {
                 execution_attribution.as_ref(),
             );
             return Err(err);
+        }
+        if turn_completed
+            && next_state == AgentSessionState::Idle
+            && let Some(item) = appended.iter().max_by_key(|item| item.sequence)
+        {
+            self.publish_notification(AgentNotificationIntent::turn_completed(item));
         }
 
         Ok(appended)
@@ -2888,13 +2902,17 @@ impl AgentManager {
         err: &VibexError,
         execution_attribution: Option<&TurnExecutionAttribution>,
     ) -> VibexResult<()> {
-        let _ = self.append_provider_error_with_attribution(
+        let item = self.append_provider_error_with_attribution(
             conn,
             session_id,
             err,
             execution_attribution,
         );
-        SessionRepository::update_state(conn, session_id, AgentSessionState::Error)
+        SessionRepository::update_state(conn, session_id, AgentSessionState::Error)?;
+        if let Ok(item) = item {
+            self.publish_notification(AgentNotificationIntent::turn_failed(&item));
+        }
+        Ok(())
     }
 
     fn append_provider_event(
@@ -2955,13 +2973,15 @@ impl AgentManager {
             ElicitationRepository::insert_request(&conn, elicitation)?;
             *needs_input = true;
         }
-        self.append_provider_event(
+        let item = self.append_provider_event(
             &mut conn,
             session_id,
             event,
             coalesce_after_sequence,
             execution_attribution,
-        )
+        )?;
+        self.publish_attention_notification(&item);
+        Ok(item)
     }
 
     fn handle_streamed_provider_event(
@@ -3142,6 +3162,35 @@ impl AgentManager {
             item: item.clone(),
         });
         Ok(item)
+    }
+
+    fn publish_attention_notification(&self, item: &TimelineItem) {
+        let notification = match &item.payload {
+            TimelinePayload::PermissionRequest(request)
+                if request.status == vibex_core::PermissionRequestStatus::Pending =>
+            {
+                Some(AgentNotificationIntent::approval_required(
+                    item,
+                    request.id.clone(),
+                ))
+            }
+            TimelinePayload::ElicitationRequest(request)
+                if request.status == vibex_core::ElicitationRequestStatus::Pending =>
+            {
+                Some(AgentNotificationIntent::input_required(
+                    item,
+                    request.id.clone(),
+                ))
+            }
+            _ => None,
+        };
+        if let Some(notification) = notification {
+            self.publish_notification(notification);
+        }
+    }
+
+    fn publish_notification(&self, notification: AgentNotificationIntent) {
+        let _ = self.notification_events.send(notification);
     }
 
     fn turn_execution_attribution(
@@ -4162,9 +4211,10 @@ mod tests {
         assert_eq!(unknown_error.code, "acp_slash_command_not_available");
         assert!(provider.executed_turns.lock().unwrap().is_empty());
 
+        let mut notifications = manager.subscribe_notifications();
         manager
             .execute_command(AgentCommandExecuteRequest {
-                session_id: session.id,
+                session_id: session.id.clone(),
                 command_id: Some("provider:test:review".to_string()),
                 trigger: AgentCommandTrigger::Slash,
                 source_kind: AgentCommandSourceKind::Provider,
@@ -4182,6 +4232,21 @@ mod tests {
             provider.executed_turns.lock().unwrap().as_slice(),
             &["/review focus on correctness"]
         );
+        let notification = notifications.try_recv().unwrap();
+        assert_eq!(notification.session_id, session.id);
+        assert_eq!(
+            notification.kind,
+            vibex_core::AgentNotificationKind::TurnCompleted
+        );
+        let conn = manager.open_migrated().unwrap();
+        assert_eq!(
+            SessionRepository::get(&conn, &session.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            AgentSessionState::Idle
+        );
+        drop(conn);
 
         cleanup_db(&db_path);
         let _ = fs::remove_dir_all(workspace_root);
@@ -4806,6 +4871,121 @@ mod tests {
         assert!(projected.iter().all(|item| item.correlation_id.is_none()
             && item.provider_correlation_id.is_none()
             && item.execution_attribution.is_none()));
+    }
+
+    #[test]
+    fn attention_notification_is_emitted_only_for_a_pending_authoritative_request() {
+        let db_path = temp_db_path("attention-notification");
+        let manager = AgentManager::new(&db_path).unwrap();
+        let mut notifications = manager.subscribe_notifications();
+        let session_id = VibexSessionId::new();
+        let request_id = vibex_core::RequestId::new();
+        let request = ElicitationRequest {
+            id: request_id.clone(),
+            session_id: session_id.clone(),
+            provider_request_id: Some("provider-request".to_string()),
+            tool_call_id: None,
+            message: "private question".to_string(),
+            title: None,
+            description: None,
+            fields: Vec::new(),
+            status: vibex_core::ElicitationRequestStatus::Pending,
+            requested_at_ms: 1_000,
+        };
+        let payload = TimelinePayload::ElicitationRequest(request.clone());
+        let item = TimelineItem {
+            id: vibex_core::TimelineItemId::new(),
+            session_id,
+            sequence: 1,
+            timestamp_ms: request.requested_at_ms,
+            source: TimelineSource::Agent,
+            kind: payload.kind(),
+            correlation_id: None,
+            provider_correlation_id: None,
+            redaction_state: TimelineRedactionState::None,
+            execution_attribution: None,
+            payload,
+        };
+
+        manager.publish_attention_notification(&item);
+        let notification = notifications.try_recv().unwrap();
+        assert_eq!(
+            notification.kind,
+            vibex_core::AgentNotificationKind::InputRequired { request_id }
+        );
+        assert!(
+            !serde_json::to_string(&notification)
+                .unwrap()
+                .contains("private question")
+        );
+
+        let mut resolved = request;
+        resolved.status = vibex_core::ElicitationRequestStatus::Accepted;
+        let payload = TimelinePayload::ElicitationRequest(resolved);
+        manager.publish_attention_notification(&TimelineItem {
+            kind: payload.kind(),
+            payload,
+            ..item
+        });
+        assert!(matches!(
+            notifications.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        cleanup_db(&db_path);
+    }
+
+    #[test]
+    fn turn_failure_notification_follows_the_error_state_transition() {
+        let db_path = temp_db_path("turn-failure-notification");
+        let workspace_root = temp_workspace_path("turn-failure-notification");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let manager = AgentManager::new(&db_path).unwrap();
+        let mut conn = manager.open_migrated().unwrap();
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let session = insert_session(
+            &conn,
+            "failed notification",
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            AgentId::parse("failure-notification-agent").unwrap(),
+            AgentSessionState::Running,
+        );
+        let mut notifications = manager.subscribe_notifications();
+
+        manager
+            .finish_turn_with_error_on_conn(
+                &mut conn,
+                &session.id,
+                &VibexError::provider("turn_failed_for_test", "private provider failure"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            SessionRepository::get(&conn, &session.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            AgentSessionState::Error
+        );
+        let notification = notifications.try_recv().unwrap();
+        assert_eq!(notification.session_id, session.id);
+        assert_eq!(
+            notification.kind,
+            vibex_core::AgentNotificationKind::TurnFailed
+        );
+        assert!(
+            !serde_json::to_string(&notification)
+                .unwrap()
+                .contains("private provider failure")
+        );
+
+        drop(conn);
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
     }
 
     #[test]

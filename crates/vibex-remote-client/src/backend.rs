@@ -17,13 +17,13 @@ use vibex_core::{
     AgentAuthContextId, AgentAuthContextLogoutPreview, AgentAuthContextLogoutRequest,
     AgentAuthContextMutationResult, AgentAuthContextRefreshModelsRequest,
     AgentAuthContextVerifyRequest, AgentAuthenticationOperation, AgentAuthenticationOperationId,
-    AgentId, AgentListRequest, AgentListResponse, AgentSession, AgentSessionRuntimeSelectionState,
-    CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
-    FetchTimelineRequest, FileMutationRequest, FileReadRequest, FileReadResponse,
-    FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest, FileWriteRequest,
-    GetMessageSubmissionRequest, GitCommitRequest, GitCommitResult, GitDiffRequest,
-    GitDiffResponse, GitProjectEligibility, GitStageRequest, GitStatusSummary,
-    GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
+    AgentId, AgentListRequest, AgentListResponse, AgentNotificationIntent, AgentSession,
+    AgentSessionRuntimeSelectionState, CancelAgentSessionRuntimeSwitchRequest,
+    ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest, FileMutationRequest,
+    FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
+    FileTreeRequest, FileWriteRequest, GetMessageSubmissionRequest, GitCommitRequest,
+    GitCommitResult, GitDiffRequest, GitDiffResponse, GitProjectEligibility, GitStageRequest,
+    GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
     GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeCreateRequest,
     GitWorktreeCreateResult, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
     GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
@@ -410,6 +410,12 @@ fn map_remote_event(event: RemoteInboundEvent) -> BackendEvent {
             && let Ok(timeline) = serde_json::from_value::<TimelineLiveEvent>(payload.clone())
         {
             return BackendEvent::Timeline(timeline);
+        }
+        if channel == "agent_notification"
+            && let Ok(notification) =
+                serde_json::from_value::<AgentNotificationIntent>(payload.clone())
+        {
+            return BackendEvent::Notification(notification);
         }
         if channel == "runtime"
             && let Ok(runtime) = serde_json::from_value::<vibex_core::RuntimeSessionEvent>(payload)
@@ -2907,6 +2913,33 @@ mod tests {
                 vibex_backend::BackendProjection::Files
             ))
         ));
+    }
+
+    #[test]
+    fn agent_notification_event_maps_to_the_typed_backend_event() {
+        let notification = AgentNotificationIntent {
+            notification_id: "turn-completed.session.event".to_string(),
+            source_event_id: vibex_core::TimelineItemId::new(),
+            session_id: vibex_core::VibexSessionId::new(),
+            kind: vibex_core::AgentNotificationKind::TurnCompleted,
+            created_at_ms: 1,
+            expires_at_ms: 2,
+            opaque_locator: "opaque-session".to_string(),
+        };
+        let mapped = map_remote_event(RemoteInboundEvent {
+            event: RemoteEventV2 {
+                event_id: EventId::new(),
+                channel: "agent_notification".to_string(),
+                generation: 1,
+                sequence: 1,
+                correlation_id: None,
+                payload: Some(serde_json::to_value(&notification).unwrap()),
+                emitted_at_ms: unix_timestamp_ms(),
+            },
+            decision: SyncDecision::Apply,
+        });
+
+        assert_eq!(mapped, BackendEvent::Notification(notification));
     }
 
     #[test]

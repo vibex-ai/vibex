@@ -29,6 +29,7 @@ targets:
       - sdk: UIKit.framework
       - sdk: Security.framework
       - sdk: Network.framework
+      - sdk: UserNotifications.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.vibex.mobile

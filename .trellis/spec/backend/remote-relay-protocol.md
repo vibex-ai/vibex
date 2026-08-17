@@ -12,6 +12,81 @@ Current evidence: [Architecture Baseline](../guides/architecture-baseline.md), `
 > `apps/desktop` path and is the only product runtime consumer; current composition
 > enters through `DesktopRuntime` and the GPUI Backend facade.
 
+## Scenario: Online Mobile Agent Notifications
+
+### 1. Scope / Trigger
+
+- Trigger: changing `AgentNotificationIntent`, Remote live-event topics,
+  native Android/iOS notification presentation, or notification-tap routing.
+- This scenario covers an installed mobile client with an active authenticated
+  Direct or self-hosted Relay Remote v2 connection.
+
+### 2. Signatures
+
+```text
+Remote v2 topic/channel = "agent_notification"
+BackendEvent::Notification(AgentNotificationIntent)
+AgentBackend::resolve_opaque_locator(notification_id, opaque_locator)
+```
+
+### 3. Contracts
+
+- The PC gateway subscribes to the authoritative Agent notification stream and
+  emits a typed `agent_notification` live event. Access requires
+  `ReadAgentSession`; the topic is available to read-only and stronger paired
+  device grants.
+- Direct and Relay clients subscribe to the same topic and apply contiguous
+  generation/sequence duplicate rules within one connection before exposing a
+  typed backend event. The topic is ephemeral: never persist or hand off its
+  cursor across reconnect because it has no authoritative catch-up operation;
+  stable notification IDs provide replacement across connections. Shared
+  timeline controllers ignore this event because it is presentation intent,
+  not timeline state.
+- Native mobile rejects expired intents and suppresses the OS notification only
+  while its target session is visibly selected in the foreground. Otherwise it
+  presents generic, localized copy with the stable notification ID so the OS can
+  replace a duplicate delivery.
+- Ask for OS notification permission only after a paired backend connects.
+  Existing paired installs receive the same one-time Android request on upgrade;
+  Android persists that the request was made rather than prompting at every
+  launch.
+- Notification taps carry only `notification_id + opaque_locator`. Buffer a
+  cold-start tap until the GPUI app subscribes and the paired backend is online,
+  then call the authenticated PC resolver. Navigate only when it returns a
+  resolved authoritative session; invalid, expired, deleted, or revoked targets
+  never navigate directly from native payload data.
+- Lock-screen copy and native payloads must not include prompt/answer text,
+  commands, file paths, tool output, approval details, or any auth material.
+
+### 4. Background Delivery Boundary
+
+- A live Remote event plus a local native notification works while the mobile
+  process retains its authenticated connection. It does not promise delivery
+  after iOS/Android suspends or kills the process.
+- True background delivery requires the user's self-hosted Relay and its
+  operator-configured APNs/FCM adapter. Never copy the Relay operator bearer
+  into pairing offers or mobile credentials. Until paired-device registration
+  and dispatch have their own authenticated Relay contract, UI and docs must
+  not claim killed-process background push.
+
+### 5. Tests Required
+
+- Core/Agent tests cover stable privacy-bounded intent production.
+- Gateway tests include `agent_notification` in permission-filtered topics.
+- Remote-client tests decode the topic into `BackendEvent::Notification`.
+- Mobile tests cover bounded action validation and cold-start buffering;
+  `pnpm check:mobile-native` covers Android/iOS host contract drift.
+
+### 6. Wrong vs Correct
+
+```text
+Wrong: native payload session id -> open session without backend validation
+Correct: buffered id + opaque locator -> authenticated PC resolve -> open session
+
+Wrong: put the self-hosted Relay operator bearer in a pairing bundle
+Correct: keep online delivery live-only until a paired-device push auth contract exists
+```
+
 ## Scenario: Remote Protocol v2 Gateway And Pairing
 
 ### 1. Scope / Trigger

@@ -2,6 +2,10 @@ package ai.vibex.mobile;
 
 import android.Manifest;
 import android.app.NativeActivity;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
@@ -33,6 +37,12 @@ import java.util.Map;
 /** NativeActivity host that supplies Android's IME with a real InputConnection. */
 public final class GpuiNativeActivity extends NativeActivity {
     private static final int LOCAL_NETWORK_PERMISSION_REQUEST = 4102;
+    private static final int NOTIFICATION_PERMISSION_REQUEST = 4103;
+    private static final String AGENT_NOTIFICATION_CHANNEL = "agent_activity";
+    private static final String EXTRA_NOTIFICATION_ID = "vibex.notification.id";
+    private static final String EXTRA_NOTIFICATION_LOCATOR = "vibex.notification.locator";
+    private static final String NOTIFICATION_PERMISSION_PREFERENCES = "vibex.notifications";
+    private static final String NOTIFICATION_PERMISSION_REQUESTED = "permission_requested";
     private static final String VIBEX_SERVICE_TYPE = "_vibex._tcp.";
 
     static {
@@ -49,6 +59,8 @@ public final class GpuiNativeActivity extends NativeActivity {
     private static native void nativeReplaceText(int start, int before, String replacement);
     private static native void nativeSetSelection(int start, int end);
     private static native void nativeOnLanDiscoveryEvent(String payload);
+    private static native void nativeOnNotificationActivated(
+            String notificationId, String opaqueLocator);
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -62,6 +74,84 @@ public final class GpuiNativeActivity extends NativeActivity {
         FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(1, 1);
         ViewGroup content = findViewById(android.R.id.content);
         content.addView(textInput, params);
+        createAgentNotificationChannel();
+        handleNotificationIntent(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleNotificationIntent(intent);
+    }
+
+    public void requestNotificationAuthorization() {
+        runOnUiThread(() -> {
+            if (Build.VERSION.SDK_INT >= 33
+                    && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                            != PackageManager.PERMISSION_GRANTED
+                    && !getSharedPreferences(NOTIFICATION_PERMISSION_PREFERENCES, MODE_PRIVATE)
+                            .getBoolean(NOTIFICATION_PERMISSION_REQUESTED, false)) {
+                getSharedPreferences(NOTIFICATION_PERMISSION_PREFERENCES, MODE_PRIVATE)
+                        .edit()
+                        .putBoolean(NOTIFICATION_PERMISSION_REQUESTED, true)
+                        .apply();
+                requestPermissions(
+                        new String[] {Manifest.permission.POST_NOTIFICATIONS},
+                        NOTIFICATION_PERMISSION_REQUEST);
+            }
+        });
+    }
+
+    public void showAgentNotification(
+            String notificationId, String title, String body, String opaqueLocator) {
+        runOnUiThread(() -> {
+            Intent intent = new Intent(this, GpuiNativeActivity.class)
+                    .setAction("ai.vibex.mobile.OPEN_AGENT_NOTIFICATION")
+                    .putExtra(EXTRA_NOTIFICATION_ID, notificationId)
+                    .putExtra(EXTRA_NOTIFICATION_LOCATOR, opaqueLocator)
+                    .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+            int requestCode = notificationId.hashCode() & 0x7fffffff;
+            PendingIntent pendingIntent = PendingIntent.getActivity(
+                    this,
+                    requestCode,
+                    intent,
+                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+            Notification notification = new Notification.Builder(this, AGENT_NOTIFICATION_CHANNEL)
+                    .setSmallIcon(ai.vibex.mobile.R.drawable.ic_launcher_foreground)
+                    .setContentTitle(title)
+                    .setContentText(body)
+                    .setCategory(Notification.CATEGORY_MESSAGE)
+                    .setAutoCancel(true)
+                    .setContentIntent(pendingIntent)
+                    .build();
+            NotificationManager manager = getSystemService(NotificationManager.class);
+            manager.notify(notificationId, 0, notification);
+        });
+    }
+
+    private void createAgentNotificationChannel() {
+        NotificationManager manager = getSystemService(NotificationManager.class);
+        NotificationChannel channel = new NotificationChannel(
+                AGENT_NOTIFICATION_CHANNEL,
+                "Agent activity",
+                NotificationManager.IMPORTANCE_DEFAULT);
+        channel.setDescription("Agent approvals, input requests, and completed work");
+        manager.createNotificationChannel(channel);
+    }
+
+    private static void handleNotificationIntent(Intent intent) {
+        if (intent == null) {
+            return;
+        }
+        String notificationId = intent.getStringExtra(EXTRA_NOTIFICATION_ID);
+        String opaqueLocator = intent.getStringExtra(EXTRA_NOTIFICATION_LOCATOR);
+        if (notificationId != null && !notificationId.isEmpty()
+                && opaqueLocator != null && !opaqueLocator.isEmpty()) {
+            intent.removeExtra(EXTRA_NOTIFICATION_ID);
+            intent.removeExtra(EXTRA_NOTIFICATION_LOCATOR);
+            nativeOnNotificationActivated(notificationId, opaqueLocator);
+        }
     }
 
     /** Called from the GPUI thread; all View work is transferred to Android's UI thread. */

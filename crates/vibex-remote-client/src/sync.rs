@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use vibex_core::{RemoteEventV2, RemoteResyncRequired, RemoteStreamCursor};
@@ -80,6 +80,7 @@ pub enum SyncApplyError {
 #[derive(Debug, Clone)]
 pub struct DomainSyncEngine {
     domains: BTreeMap<String, DomainCursorState>,
+    ephemeral_domains: BTreeSet<String>,
     pending_events: VecDeque<RemoteEventV2>,
     max_pending_events: usize,
     dropped_events: u64,
@@ -96,6 +97,7 @@ impl DomainSyncEngine {
     pub fn new(max_pending_events: usize) -> Self {
         Self {
             domains: BTreeMap::new(),
+            ephemeral_domains: BTreeSet::new(),
             pending_events: VecDeque::new(),
             max_pending_events: max_pending_events.max(1),
             dropped_events: 0,
@@ -120,11 +122,23 @@ impl DomainSyncEngine {
         }
     }
 
+    /// Ephemeral domains use contiguous sequencing only for the current wire
+    /// connection. They have no authoritative catch-up source, so their
+    /// cursors must never survive reconnect or route handoff.
+    pub fn register_ephemeral_domain(&mut self, domain: impl Into<String>) {
+        let domain = domain.into();
+        self.register_domain(domain.clone());
+        self.ephemeral_domains.insert(domain);
+    }
+
     /// Seed a fresh transport with cursors committed by the shared backend.
     /// Route handoff uses this before hello/subscribe so Direct and Relay ask
     /// the PC for authoritative catch-up from the same applied position.
     pub fn seed_cursors(&mut self, cursors: &[RemoteStreamCursor]) {
         for cursor in cursors {
+            if self.ephemeral_domains.contains(&cursor.domain) {
+                continue;
+            }
             let state = self
                 .domains
                 .entry(cursor.domain.clone())
@@ -146,6 +160,7 @@ impl DomainSyncEngine {
     pub fn cursors(&self) -> Vec<RemoteStreamCursor> {
         self.domains
             .values()
+            .filter(|state| !self.ephemeral_domains.contains(&state.domain))
             .map(DomainCursorState::as_stream_cursor)
             .collect()
     }
@@ -182,6 +197,13 @@ impl DomainSyncEngine {
     /// so the server performs authoritative catch-up instead of treating a
     /// received-but-unconsumed event as committed.
     pub fn reset_for_reconnect(&mut self) {
+        for domain in &self.ephemeral_domains {
+            if let Some(cursor) = self.domains.get_mut(domain) {
+                cursor.generation = 0;
+                cursor.cursor = 0;
+                cursor.snapshot_version = None;
+            }
+        }
         self.paused = false;
         self.pending_events.clear();
     }
@@ -582,6 +604,37 @@ mod tests {
         assert_eq!(engine.domain("agent_session").unwrap().generation, 7);
         assert_eq!(engine.domain("agent_session").unwrap().cursor, 42);
         assert_eq!(engine.cursors()[0].cursor, 42);
+    }
+
+    #[test]
+    fn ephemeral_domain_cursor_is_scoped_to_one_connection() {
+        let mut engine = DomainSyncEngine::new(8);
+        engine.register_domain("agent_session");
+        engine.register_ephemeral_domain("agent_notification");
+
+        assert_eq!(
+            engine.observe(event("agent_notification", 7, 1)),
+            SyncDecision::Apply
+        );
+        assert_eq!(engine.domain("agent_notification").unwrap().cursor, 1);
+        assert!(
+            engine
+                .cursors()
+                .iter()
+                .all(|cursor| cursor.domain != "agent_notification")
+        );
+
+        engine.seed_cursors(&[RemoteStreamCursor {
+            domain: "agent_notification".to_string(),
+            generation: 7,
+            cursor: 42,
+        }]);
+        assert_eq!(engine.domain("agent_notification").unwrap().cursor, 1);
+
+        engine.reset_for_reconnect();
+        let cursor = engine.domain("agent_notification").unwrap();
+        assert_eq!(cursor.generation, 0);
+        assert_eq!(cursor.cursor, 0);
     }
 
     #[test]

@@ -1034,6 +1034,7 @@ impl AgentWorkflowController {
                     AgentEventDecision::IgnoredStale
                 }
             }
+            BackendEvent::Notification(_) => AgentEventDecision::IgnoredStale,
             BackendEvent::Runtime(event) => {
                 if self.state.selected_session_id.as_ref() != Some(&event.session_id) {
                     return AgentEventDecision::IgnoredStale;

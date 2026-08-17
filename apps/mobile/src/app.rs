@@ -19,10 +19,10 @@ use vibex_backend::{
 use vibex_core::{
     AgentSessionState, ContinueAgentTurnRequest, CreateAgentSessionRequest, ElicitationFieldKind,
     ElicitationResolutionAction, PermissionResolution, PermissionResponseKind,
-    PermissionRiskCategory, RemoteLanPairingRequestState, RenameAgentSessionRequest, RequestId,
-    ResolvePermissionRequest, RuntimeOptionAvailability, SendAgentMessageRequest, TimelinePayload,
-    VibexSessionId, WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation,
-    unix_timestamp_ms,
+    PermissionRiskCategory, RemoteDeepLinkResolutionStatus, RemoteLanPairingRequestState,
+    RenameAgentSessionRequest, RequestId, ResolvePermissionRequest, RuntimeOptionAvailability,
+    SendAgentMessageRequest, TimelinePayload, VibexSessionId, WorkspaceMode, WorkspaceRecord,
+    agent_session_turn_requires_continuation, unix_timestamp_ms,
 };
 use vibex_desktop_model::{TimelineConversationTurn, TimelineRow, TimelineRowKind};
 use vibex_remote_client::{
@@ -42,7 +42,7 @@ use crate::lifecycle::MobileLifecycleEvent;
 use crate::pairing::{MobileCredentialBundle, claim_pairing_link, claim_zero_config_lan_pairing};
 use crate::storage::CredentialStorage;
 use crate::workbench::MobileWorkbench;
-use crate::{locale, markdown, scanner, theme};
+use crate::{locale, markdown, notifications, scanner, theme};
 
 const TIMELINE_NEAR_BOTTOM_PX: f32 = 96.0;
 const TIMELINE_LIST_OVERDRAW_PX: f32 = 800.0;
@@ -57,6 +57,15 @@ fn timeline_list_state(turn_count: usize) -> ListState {
         px(TIMELINE_LIST_OVERDRAW_PX),
     )
     .with_uniform_item_height(px(TIMELINE_TURN_ESTIMATED_HEIGHT_PX))
+}
+
+fn should_present_agent_notification(
+    app_backgrounded: bool,
+    workbench_open: bool,
+    selected_session_id: Option<&VibexSessionId>,
+    target_session_id: &VibexSessionId,
+) -> bool {
+    app_backgrounded || workbench_open || selected_session_id != Some(target_session_id)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +229,7 @@ pub struct MobileApp {
     event_forward_task: Option<Task<Result<(), gpui_tokio::JoinError>>>,
     event_consumer_task: Option<Task<()>>,
     resume_recovery_task: Option<Task<()>>,
+    pending_notification_action: Option<notifications::NotificationAction>,
     tasks: Vec<Task<()>>,
 }
 
@@ -279,12 +289,14 @@ impl MobileApp {
             event_forward_task: None,
             event_consumer_task: None,
             resume_recovery_task: None,
+            pending_notification_action: None,
             tasks: Vec::new(),
         };
         if let Ok(Some(bundle)) = stored {
             app.defer_bundle_install(bundle, cx);
         }
         app.start_scanner_result_stream(cx);
+        app.start_notification_action_stream(cx);
         app.start_lan_discovery_event_stream(cx);
         app.start_lifecycle_stream(cx);
         app
@@ -394,6 +406,80 @@ impl MobileApp {
         self.tasks.push(task);
     }
 
+    fn start_notification_action_stream(&mut self, cx: &mut Context<Self>) {
+        let mut sessions = notifications::subscribe_actions();
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            while let Some(action) = sessions.next().await {
+                if entity
+                    .update(cx, |this, cx| this.handle_notification_action(action, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        self.tasks.push(task);
+    }
+
+    fn handle_notification_action(
+        &mut self,
+        action: notifications::NotificationAction,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self
+            .backend
+            .clone()
+            .filter(|_| self.mode == RootMode::Workspace)
+        else {
+            self.pending_notification_action = Some(action);
+            return;
+        };
+        self.pending_notification_action = None;
+        let notification_id = action.notification_id.clone();
+        let opaque_locator = action.opaque_locator.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .resolve_opaque_locator(notification_id, opaque_locator)
+                .await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                match outcome {
+                    Ok(resolution)
+                        if resolution.status == RemoteDeepLinkResolutionStatus::Resolved =>
+                    {
+                        if let Some(session_id) = resolution.session_id {
+                            this.open_session(session_id, cx);
+                        }
+                    }
+                    Ok(_) => {
+                        this.notice = Some(
+                            locale::text(
+                                "This Agent notification is no longer available",
+                                "这条 Agent 通知已失效",
+                                "這則 Agent 通知已失效",
+                            )
+                            .to_string(),
+                        );
+                    }
+                    Err(error) => {
+                        this.pending_notification_action = Some(action);
+                        this.error = Some(error);
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+    }
+
+    fn resolve_pending_notification_action(&mut self, cx: &mut Context<Self>) {
+        if let Some(action) = self.pending_notification_action.take() {
+            self.handle_notification_action(action, cx);
+        }
+    }
+
     fn defer_bundle_install(&mut self, bundle: MobileCredentialBundle, cx: &mut Context<Self>) {
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let _ = entity.update(cx, |this, cx| this.install_bundle(bundle, cx));
@@ -449,6 +535,8 @@ impl MobileApp {
                         this.refresh_sessions(cx);
                         this.refresh_runtime_options(cx);
                         this.refresh_workspaces(cx);
+                        notifications::request_authorization();
+                        this.resolve_pending_notification_action(cx);
                     }
                     Ok(Err(error)) => {
                         this.mode = RootMode::Connecting;
@@ -514,6 +602,19 @@ impl MobileApp {
             while let Some(event) = receiver.next().await {
                 let needs_refetch = entity
                     .update(cx, |this, cx| {
+                        if let BackendEvent::Notification(notification) = &event {
+                            let selected = this.controller.as_ref().and_then(|controller| {
+                                controller.state.selected_session_id.as_ref()
+                            });
+                            if should_present_agent_notification(
+                                this.app_backgrounded,
+                                this.workbench_open,
+                                selected,
+                                &notification.session_id,
+                            ) {
+                                notifications::present(notification);
+                            }
+                        }
                         let should_follow = this.timeline_is_near_bottom();
                         let decision = this
                             .controller
@@ -4515,6 +4616,37 @@ fn flatten_join<T>(outcome: Result<BackendResult<T>, gpui_tokio::JoinError>) -> 
 mod tests {
     use super::*;
     use gpui::{TestAppContext, point};
+
+    #[test]
+    fn agent_notification_is_suppressed_only_for_the_visible_session() {
+        let selected = VibexSessionId::new();
+        let other = VibexSessionId::new();
+
+        assert!(!should_present_agent_notification(
+            false,
+            false,
+            Some(&selected),
+            &selected,
+        ));
+        assert!(should_present_agent_notification(
+            true,
+            false,
+            Some(&selected),
+            &selected,
+        ));
+        assert!(should_present_agent_notification(
+            false,
+            true,
+            Some(&selected),
+            &selected,
+        ));
+        assert!(should_present_agent_notification(
+            false,
+            false,
+            Some(&selected),
+            &other,
+        ));
+    }
 
     struct DrawerScrollIsolationProbe {
         drawer_scroll: UniformListScrollHandle,

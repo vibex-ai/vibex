@@ -6,6 +6,11 @@ extern "C" {
 #endif
 
 void vibex_mobile_main(void);
+void vibex_ios_initialize_notifications(void);
+void vibex_mobile_notification_activated(
+    const char *notification_id,
+    const char *opaque_locator
+);
 
 void vibex_mobile_pairing_qr_scanned(const char *value);
 

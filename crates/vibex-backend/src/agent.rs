@@ -4,13 +4,13 @@ use vibex_core::{
     AgentAuthContextId, AgentAuthContextLogoutPreview, AgentAuthContextLogoutRequest,
     AgentAuthContextMutationResult, AgentAuthContextRefreshModelsRequest,
     AgentAuthContextVerifyRequest, AgentAuthenticationOperation, AgentAuthenticationOperationId,
-    AgentId, AgentSession, AgentSessionRuntimeSelectionEvent, AgentSessionRuntimeSelectionState,
-    AgentUsageStatistics, AgentUsageStatisticsRequest, CancelAgentSessionRuntimeSwitchRequest,
-    ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest,
-    RemoteDeepLinkResolution, RenameAgentSessionRequest, ResolveElicitationRequest,
-    ResolvePermissionRequest, RuntimeSessionEvent, SendAgentMessageRequest,
-    SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, TimelineItem,
-    TimelineLiveEvent, TimelinePage, VibexSessionId,
+    AgentId, AgentNotificationIntent, AgentSession, AgentSessionRuntimeSelectionEvent,
+    AgentSessionRuntimeSelectionState, AgentUsageStatistics, AgentUsageStatisticsRequest,
+    CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
+    FetchTimelineRequest, RemoteDeepLinkResolution, RenameAgentSessionRequest,
+    ResolveElicitationRequest, ResolvePermissionRequest, RuntimeSessionEvent,
+    SendAgentMessageRequest, SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest,
+    TimelineItem, TimelineLiveEvent, TimelinePage, VibexSessionId,
 };
 
 use crate::{BackendBound, BackendFuture, BackendResult, MutationRequest};
@@ -44,6 +44,7 @@ pub struct BackendRefetch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendEvent {
     Timeline(TimelineLiveEvent),
+    Notification(AgentNotificationIntent),
     Runtime(RuntimeSessionEvent),
     RuntimeSelection(AgentSessionRuntimeSelectionEvent),
     ProjectionInvalidated(BackendProjection),

@@ -1133,6 +1133,7 @@ impl TransportInner {
             "device",
             "runtime",
         ]);
+        sync.register_ephemeral_domain("agent_notification");
         Self {
             writer: Shared::new(AsyncMutex::new(None)),
             pending: Shared::new(Mutex::new(BTreeMap::new())),
@@ -1645,6 +1646,7 @@ impl DirectWebSocketTransport {
                 subscription_id: format!("subscription_{}", self.config.client_id),
                 topics: vec![
                     "agent_session".to_string(),
+                    "agent_notification".to_string(),
                     "terminal".to_string(),
                     "file".to_string(),
                     "git".to_string(),
@@ -2405,6 +2407,7 @@ impl RelayE2eeTransport {
                 subscription_id: format!("subscription_{}", self.config.remote.client_id),
                 topics: vec![
                     "agent_session".to_string(),
+                    "agent_notification".to_string(),
                     "terminal".to_string(),
                     "file".to_string(),
                     "git".to_string(),

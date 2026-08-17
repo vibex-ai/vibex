@@ -13,6 +13,61 @@ Evidence: current Agent/runtime code, tests, and completed Agent-session Trellis
 > longer exist. Current callers use the GPUI Backend facade, `DesktopRuntime`, or
 > the versioned Remote protocol.
 
+## Scenario: Authoritative Agent Notification Intents
+
+### 1. Scope / Trigger
+
+- Trigger: changing Agent permission/input persistence, terminal turn state,
+  notification identity, or any desktop/mobile notification presenter.
+- V1 notification kinds are `approval_required`, `input_required`,
+  `turn_completed`, and `turn_failed` only.
+
+### 2. Signatures
+
+```text
+AgentNotificationIntent {
+  notification_id, source_event_id, session_id, kind,
+  created_at_ms, expires_at_ms, opaque_locator
+}
+AgentManager::subscribe_notifications()
+```
+
+### 3. Contracts
+
+- `AgentManager` is the single semantic source. Views and clients must not infer
+  a notification by inspecting rendered deltas, a timeline snapshot, or a
+  refetch result.
+- Publish approval/input only after the pending request and its timeline item
+  are persisted. Publish completion only after a provider reports the turn
+  complete and the authoritative session reaches `Idle`; publish failure only
+  after the error item is persisted and the session reaches `Error`.
+- Notification IDs are deterministic from immutable session/request/timeline
+  identities. Repeated provider snapshots may therefore replace the same OS
+  notification, while timeline replay and refetch never create a new intent.
+- Approval/input intents expire after 15 minutes. Completion/failure intents
+  expire after 24 hours. Presenters must reject an expired intent.
+- The serialized intent contains routing identifiers only. It must not contain
+  prompt or answer text, commands, paths, tool output, approval details, or
+  credentials. `opaque_locator` is not authorization and must be resolved by
+  the authenticated PC before notification-tap navigation.
+- The current broadcast is a live, process-local stream. It is not a durable
+  notification outbox and must not be described as disconnected/background
+  delivery.
+
+### 4. Tests Required
+
+- Core tests freeze stable IDs, TTLs, serde shape, and absence of timeline text.
+- Agent tests prove only pending authoritative requests emit attention intents.
+- Turn lifecycle coverage must keep completion/failure emission after the
+  corresponding authoritative state transition.
+
+### 5. Wrong vs Correct
+
+```text
+Wrong: rendered final-answer delta -> mobile notification
+Correct: persisted turn result + authoritative Idle transition -> one stable intent
+```
+
 ## Session Identity
 
 Persist three independent layers of identity:

@@ -17,6 +17,8 @@ use crate::timeline::{MessageAttachment, TimelineItem, TimelinePage};
 use crate::workspace::WorkspaceMode;
 
 pub const MAX_MESSAGE_IDEMPOTENCY_KEY_LEN: usize = 256;
+pub const AGENT_ATTENTION_NOTIFICATION_TTL_MS: i64 = 15 * 60 * 1000;
+pub const AGENT_TERMINAL_NOTIFICATION_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -28,6 +30,102 @@ pub enum AgentSessionState {
     Error,
     Closed,
     Archived,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    content = "data",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum AgentNotificationKind {
+    ApprovalRequired { request_id: RequestId },
+    InputRequired { request_id: RequestId },
+    TurnCompleted,
+    TurnFailed,
+}
+
+/// Privacy-bounded notification produced by the authoritative Agent runtime.
+/// The locator is routing metadata only and must be resolved through an
+/// authenticated backend before a client displays session details.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentNotificationIntent {
+    pub notification_id: String,
+    pub source_event_id: TimelineItemId,
+    pub session_id: VibexSessionId,
+    pub kind: AgentNotificationKind,
+    pub created_at_ms: i64,
+    pub expires_at_ms: i64,
+    pub opaque_locator: String,
+}
+
+impl AgentNotificationIntent {
+    pub fn approval_required(item: &TimelineItem, request_id: RequestId) -> Self {
+        Self::new(
+            format!(
+                "approval.{}.{}",
+                item.session_id.as_str(),
+                request_id.as_str()
+            ),
+            item,
+            AgentNotificationKind::ApprovalRequired { request_id },
+            AGENT_ATTENTION_NOTIFICATION_TTL_MS,
+        )
+    }
+
+    pub fn input_required(item: &TimelineItem, request_id: RequestId) -> Self {
+        Self::new(
+            format!("input.{}.{}", item.session_id.as_str(), request_id.as_str()),
+            item,
+            AgentNotificationKind::InputRequired { request_id },
+            AGENT_ATTENTION_NOTIFICATION_TTL_MS,
+        )
+    }
+
+    pub fn turn_completed(item: &TimelineItem) -> Self {
+        Self::new(
+            format!(
+                "turn-completed.{}.{}",
+                item.session_id.as_str(),
+                item.id.as_str()
+            ),
+            item,
+            AgentNotificationKind::TurnCompleted,
+            AGENT_TERMINAL_NOTIFICATION_TTL_MS,
+        )
+    }
+
+    pub fn turn_failed(item: &TimelineItem) -> Self {
+        Self::new(
+            format!(
+                "turn-failed.{}.{}",
+                item.session_id.as_str(),
+                item.id.as_str()
+            ),
+            item,
+            AgentNotificationKind::TurnFailed,
+            AGENT_TERMINAL_NOTIFICATION_TTL_MS,
+        )
+    }
+
+    fn new(
+        notification_id: String,
+        item: &TimelineItem,
+        kind: AgentNotificationKind,
+        ttl_ms: i64,
+    ) -> Self {
+        Self {
+            notification_id,
+            source_event_id: item.id.clone(),
+            session_id: item.session_id.clone(),
+            kind,
+            created_at_ms: item.timestamp_ms,
+            expires_at_ms: item.timestamp_ms.saturating_add(ttl_ms),
+            opaque_locator: item.session_id.as_str().to_string(),
+        }
+    }
 }
 
 pub fn agent_session_turn_requires_continuation(
@@ -536,5 +634,61 @@ mod tests {
             dispatched_at_ms: Some(2),
         };
         assert!(!format!("{state:?}").contains("message-state-secret"));
+    }
+
+    #[test]
+    fn notification_intents_have_stable_ids_bounded_ttl_and_no_message_content() {
+        let session_id = VibexSessionId::new();
+        let source_event_id = TimelineItemId::new();
+        let payload = crate::TimelinePayload::AgentMessage(crate::AgentMessagePayload {
+            text: "private answer that must not enter a notification".to_string(),
+            is_final: true,
+        });
+        let item = TimelineItem {
+            id: source_event_id.clone(),
+            session_id: session_id.clone(),
+            sequence: 7,
+            timestamp_ms: 1_000,
+            source: crate::TimelineSource::Agent,
+            kind: payload.kind(),
+            correlation_id: None,
+            provider_correlation_id: None,
+            redaction_state: crate::TimelineRedactionState::None,
+            execution_attribution: None,
+            payload,
+        };
+        let request_id = RequestId::new();
+
+        let approval = AgentNotificationIntent::approval_required(&item, request_id.clone());
+        assert_eq!(
+            approval.notification_id,
+            format!("approval.{}.{}", session_id.as_str(), request_id.as_str())
+        );
+        assert_eq!(approval.source_event_id, source_event_id);
+        assert_eq!(approval.opaque_locator, session_id.as_str());
+        assert_eq!(
+            approval.expires_at_ms - approval.created_at_ms,
+            AGENT_ATTENTION_NOTIFICATION_TTL_MS
+        );
+        assert_eq!(
+            approval,
+            AgentNotificationIntent::approval_required(&item, request_id.clone())
+        );
+        let approval_json = serde_json::to_value(&approval).unwrap();
+        assert_eq!(approval_json["kind"]["type"], "approval_required");
+        assert_eq!(
+            approval_json["kind"]["data"]["requestId"],
+            request_id.as_str()
+        );
+        assert!(approval_json["kind"]["data"].get("request_id").is_none());
+
+        let completed = AgentNotificationIntent::turn_completed(&item);
+        assert_eq!(
+            completed.expires_at_ms - completed.created_at_ms,
+            AGENT_TERMINAL_NOTIFICATION_TTL_MS
+        );
+        let encoded = serde_json::to_string(&completed).unwrap();
+        assert!(!encoded.contains("private answer"));
+        assert!(!format!("{completed:?}").contains("private answer"));
     }
 }

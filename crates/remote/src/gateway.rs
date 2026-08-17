@@ -3258,12 +3258,14 @@ fn update_subscriptions(
 
 struct GatewayEventTasks {
     timeline: JoinHandle<()>,
+    notifications: JoinHandle<()>,
     domains: JoinHandle<()>,
 }
 
 impl GatewayEventTasks {
     fn abort(self) {
         self.timeline.abort();
+        self.notifications.abort();
         self.domains.abort();
     }
 }
@@ -3281,8 +3283,68 @@ fn spawn_gateway_events(
             subscriptions.clone(),
             permission_level,
         ),
+        notifications: spawn_notification_events(
+            state,
+            outbound.clone(),
+            subscriptions.clone(),
+            permission_level,
+        ),
         domains: spawn_domain_events(state, outbound, subscriptions, permission_level),
     }
+}
+
+fn spawn_notification_events(
+    state: &GatewayState,
+    outbound: mpsc::Sender<OutboundFrame>,
+    subscriptions: Arc<Mutex<HashSet<String>>>,
+    permission_level: RemoteDevicePermissionLevel,
+) -> JoinHandle<()> {
+    if !permission_allows(permission_level, RemoteActionClass::ReadAgentSession) {
+        return tokio::spawn(async {});
+    }
+    let Some(agent_manager) = state.dispatcher.state.agent_manager.clone() else {
+        return tokio::spawn(async {});
+    };
+    let mut events = agent_manager.subscribe_notifications();
+    let generation = state.session_epoch;
+    tokio::spawn(async move {
+        let mut sequence = 0_u64;
+        loop {
+            match events.recv().await {
+                Ok(notification) => {
+                    let subscribed = subscriptions
+                        .lock()
+                        .map(|topics| topics.contains("agent_notification"))
+                        .unwrap_or(false);
+                    if !subscribed {
+                        continue;
+                    }
+                    sequence = sequence.saturating_add(1).max(1);
+                    let payload = match serde_json::to_value(notification) {
+                        Ok(payload) => Some(payload),
+                        Err(_) => continue,
+                    };
+                    let event = RemoteEventV2 {
+                        event_id: EventId::new(),
+                        channel: "agent_notification".to_string(),
+                        generation,
+                        sequence,
+                        correlation_id: None,
+                        payload,
+                        emitted_at_ms: unix_timestamp_ms(),
+                    };
+                    if send_json(&outbound, RemoteJsonMessageV2::Event(event))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
 }
 
 fn spawn_timeline_events(
@@ -3434,7 +3496,7 @@ fn subscription_topic_permitted(
     topic: &str,
 ) -> bool {
     let action = match topic {
-        "agent_session" | "runtime" => RemoteActionClass::ReadAgentSession,
+        "agent_session" | "agent_notification" | "runtime" => RemoteActionClass::ReadAgentSession,
         "terminal" | "file" | "git" => RemoteActionClass::ReadProject,
         "provider" => RemoteActionClass::ReadProviderSettings,
         "device" => RemoteActionClass::ReadDeviceManagement,
@@ -4841,9 +4903,10 @@ fn gateway_features(state: &GatewayState) -> Vec<String> {
     features
 }
 
-fn gateway_topics() -> [&'static str; 7] {
+fn gateway_topics() -> [&'static str; 8] {
     [
         "agent_session",
+        "agent_notification",
         "terminal",
         "git",
         "file",
@@ -5101,6 +5164,7 @@ mod tests {
             RemoteDevicePermissionLevel::ReadOnly,
         );
         assert!(accepted.topics.contains(&"agent_session".to_string()));
+        assert!(accepted.topics.contains(&"agent_notification".to_string()));
         assert!(accepted.topics.contains(&"file".to_string()));
         assert!(accepted.topics.contains(&"provider".to_string()));
         assert!(!accepted.topics.contains(&"device".to_string()));
