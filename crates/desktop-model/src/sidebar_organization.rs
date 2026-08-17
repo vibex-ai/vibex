@@ -90,6 +90,7 @@ impl SidebarOrganizationState {
         self.ensure_folder_placements();
         self.enforce_placement_limit();
         self.repair_parents();
+        self.deduplicate_sibling_folder_names();
         self.collapsed_folder_ids
             .retain(|id| self.folders.contains_key(id));
     }
@@ -141,6 +142,7 @@ impl SidebarOrganizationState {
                 placement.parent_folder_id = None;
             }
         }
+        self.deduplicate_sibling_folder_names();
 
         let mut placed = self
             .placements
@@ -191,6 +193,7 @@ impl SidebarOrganizationState {
         self.ensure_folder_placements();
         self.enforce_placement_limit();
         self.repair_parents();
+        self.deduplicate_sibling_folder_names();
         self.collapsed_folder_ids
             .retain(|id| self.folders.contains_key(id));
     }
@@ -213,13 +216,40 @@ impl SidebarOrganizationState {
         if self.folders.len() >= SIDEBAR_FOLDER_LIMIT || self.folders.contains_key(&id) {
             return false;
         }
-        let project_id = project_id.and_then(|id| bounded_text(&id, SIDEBAR_ITEM_ID_MAX_CHARS));
-        let parent_folder_id = parent_folder_id.filter(|parent_id| {
-            self.folders.get(parent_id).is_some_and(|parent| {
-                parent.project_id == project_id
-                    && self.folder_depth(parent_id) < SIDEBAR_FOLDER_DEPTH_LIMIT
-            })
-        });
+        let project_id = match project_id {
+            Some(id) => {
+                let Some(id) = bounded_text(&id, SIDEBAR_ITEM_ID_MAX_CHARS) else {
+                    return false;
+                };
+                Some(id)
+            }
+            None => None,
+        };
+        let parent_folder_id = match parent_folder_id {
+            Some(parent_id) => {
+                let Some(parent_id) = bounded_text(&parent_id, SIDEBAR_ITEM_ID_MAX_CHARS) else {
+                    return false;
+                };
+                let Some(parent) = self.folders.get(&parent_id) else {
+                    return false;
+                };
+                if parent.project_id != project_id
+                    || self.folder_depth(&parent_id) >= SIDEBAR_FOLDER_DEPTH_LIMIT
+                {
+                    return false;
+                }
+                Some(parent_id)
+            }
+            None => None,
+        };
+        if !self.folder_name_is_available_at(
+            None,
+            &name,
+            project_id.as_deref(),
+            parent_folder_id.as_deref(),
+        ) {
+            return false;
+        }
         self.folders
             .insert(id.clone(), SidebarFolderUiState { name, project_id });
         self.placements.push(SidebarOrganizationPlacement {
@@ -234,14 +264,57 @@ impl SidebarOrganizationState {
         let Some(name) = bounded_text(name, SIDEBAR_FOLDER_NAME_MAX_CHARS) else {
             return false;
         };
-        let Some(folder) = self.folders.get_mut(folder_id) else {
+        let Some(folder) = self.folders.get(folder_id) else {
             return false;
         };
         if folder.name == name {
             return false;
         }
+        let project_id = folder.project_id.clone();
+        let parent_folder_id =
+            self.parent_of(&SidebarOrganizationItem::Folder(folder_id.to_string()));
+        if !self.folder_name_is_available_at(
+            Some(folder_id),
+            &name,
+            project_id.as_deref(),
+            parent_folder_id.as_deref(),
+        ) {
+            return false;
+        }
+        let Some(folder) = self.folders.get_mut(folder_id) else {
+            return false;
+        };
         folder.name = name;
         true
+    }
+
+    pub fn folder_name_available(&self, folder_id: &str, name: &str) -> bool {
+        let Some(name) = bounded_text(name, SIDEBAR_FOLDER_NAME_MAX_CHARS) else {
+            return false;
+        };
+        let Some(folder) = self.folders.get(folder_id) else {
+            return false;
+        };
+        let parent_folder_id =
+            self.parent_of(&SidebarOrganizationItem::Folder(folder_id.to_string()));
+        self.folder_name_is_available_at(
+            Some(folder_id),
+            &name,
+            folder.project_id.as_deref(),
+            parent_folder_id.as_deref(),
+        )
+    }
+
+    pub fn next_available_folder_name(
+        &self,
+        preferred_name: &str,
+        project_id: Option<&str>,
+        parent_folder_id: Option<&str>,
+    ) -> Option<String> {
+        let preferred_name = bounded_text(preferred_name, SIDEBAR_FOLDER_NAME_MAX_CHARS)?;
+        Some(next_unique_folder_name(&preferred_name, |candidate| {
+            self.folder_name_is_available_at(None, candidate, project_id, parent_folder_id)
+        }))
     }
 
     pub fn delete_folder(&mut self, folder_id: &str) -> bool {
@@ -259,6 +332,7 @@ impl SidebarOrganizationState {
         });
         self.collapsed_folder_ids.remove(folder_id);
         self.folders.remove(folder_id);
+        self.deduplicate_sibling_folder_names();
         true
     }
 
@@ -347,6 +421,7 @@ impl SidebarOrganizationState {
         let target_parent = self.parent_of(target);
         !matches!(moving, SidebarOrganizationItem::Folder(folder_id) if target_parent.as_deref() == Some(folder_id) || target_parent.as_deref().is_some_and(|parent_id| self.folder_is_descendant_of(parent_id, folder_id)))
             && !matches!(moving, SidebarOrganizationItem::Folder(folder_id) if !self.folder_move_fits(folder_id, target_parent.as_deref()))
+            && !matches!(moving, SidebarOrganizationItem::Folder(folder_id) if !self.folder_name_available_at_parent(folder_id, target_parent.as_deref()))
     }
 
     pub fn can_move_into(
@@ -362,6 +437,7 @@ impl SidebarOrganizationState {
         }
         !matches!(moving, SidebarOrganizationItem::Folder(folder_id) if folder_id == target_folder_id || self.folder_is_descendant_of(target_folder_id, folder_id))
             && !matches!(moving, SidebarOrganizationItem::Folder(folder_id) if !self.folder_move_fits(folder_id, Some(target_folder_id)))
+            && !matches!(moving, SidebarOrganizationItem::Folder(folder_id) if !self.folder_name_available_at_parent(folder_id, Some(target_folder_id)))
     }
 
     pub fn move_relative(
@@ -460,7 +536,7 @@ impl SidebarOrganizationState {
         scope: &SidebarOrganizationScope,
         session_projects: &BTreeMap<String, String>,
     ) -> bool {
-        if self.item_scope(moving, session_projects).as_ref() != Some(scope) {
+        if !self.can_move_to_scope_root(moving, scope, session_projects) {
             return false;
         }
         let Some(source_index) = self
@@ -488,6 +564,16 @@ impl SidebarOrganizationState {
             old_parent.is_some() || insertion_index != source_index.min(self.placements.len());
         self.placements.insert(insertion_index, moving_placement);
         changed
+    }
+
+    pub fn can_move_to_scope_root(
+        &self,
+        moving: &SidebarOrganizationItem,
+        scope: &SidebarOrganizationScope,
+        session_projects: &BTreeMap<String, String>,
+    ) -> bool {
+        self.item_scope(moving, session_projects).as_ref() == Some(scope)
+            && !matches!(moving, SidebarOrganizationItem::Folder(folder_id) if !self.folder_name_available_at_parent(folder_id, None))
     }
 
     pub fn toggle_collapsed(&mut self, folder_id: &str) -> Option<bool> {
@@ -598,6 +684,41 @@ impl SidebarOrganizationState {
             .unwrap_or(1)
     }
 
+    fn folder_name_available_at_parent(
+        &self,
+        folder_id: &str,
+        parent_folder_id: Option<&str>,
+    ) -> bool {
+        let Some(folder) = self.folders.get(folder_id) else {
+            return false;
+        };
+        self.folder_name_is_available_at(
+            Some(folder_id),
+            &folder.name,
+            folder.project_id.as_deref(),
+            parent_folder_id,
+        )
+    }
+
+    fn folder_name_is_available_at(
+        &self,
+        excluded_folder_id: Option<&str>,
+        name: &str,
+        project_id: Option<&str>,
+        parent_folder_id: Option<&str>,
+    ) -> bool {
+        let comparable_name = comparable_folder_name(name);
+        !self.folders.iter().any(|(candidate_id, folder)| {
+            excluded_folder_id != Some(candidate_id.as_str())
+                && folder.project_id.as_deref() == project_id
+                && self
+                    .parent_of(&SidebarOrganizationItem::Folder(candidate_id.clone()))
+                    .as_deref()
+                    == parent_folder_id
+                && comparable_folder_name(&folder.name) == comparable_name
+        })
+    }
+
     fn folder_distance_from(&self, folder_id: &str, ancestor_id: &str) -> Option<usize> {
         let mut current = folder_id.to_string();
         let mut distance = 1_usize;
@@ -702,6 +823,48 @@ impl SidebarOrganizationState {
             }
         }
     }
+
+    fn deduplicate_sibling_folder_names(&mut self) {
+        let mut seen_ids = BTreeSet::new();
+        let mut folder_ids = self
+            .placements
+            .iter()
+            .filter_map(|placement| match &placement.item {
+                SidebarOrganizationItem::Folder(id) if seen_ids.insert(id.clone()) => {
+                    Some(id.clone())
+                }
+                SidebarOrganizationItem::Folder(_)
+                | SidebarOrganizationItem::Project(_)
+                | SidebarOrganizationItem::Session(_) => None,
+            })
+            .collect::<Vec<_>>();
+        folder_ids.extend(
+            self.folders
+                .keys()
+                .filter(|id| seen_ids.insert((*id).clone()))
+                .cloned(),
+        );
+
+        let mut used_names = BTreeMap::<(Option<String>, Option<String>), BTreeSet<String>>::new();
+        for folder_id in folder_ids {
+            let Some(folder) = self.folders.get(&folder_id) else {
+                continue;
+            };
+            let name = folder.name.clone();
+            let scope = folder.project_id.clone();
+            let parent = self.parent_of(&SidebarOrganizationItem::Folder(folder_id.clone()));
+            let names = used_names.entry((scope, parent)).or_default();
+            let unique_name = next_unique_folder_name(&name, |candidate| {
+                !names.contains(&comparable_folder_name(candidate))
+            });
+            names.insert(comparable_folder_name(&unique_name));
+            if unique_name != name
+                && let Some(folder) = self.folders.get_mut(&folder_id)
+            {
+                folder.name = unique_name;
+            }
+        }
+    }
 }
 
 fn normalize_placement(
@@ -737,6 +900,34 @@ fn bounded_text(value: &str, max_chars: usize) -> Option<String> {
     (!value.is_empty()).then(|| value.chars().take(max_chars).collect())
 }
 
+fn comparable_folder_name(name: &str) -> String {
+    name.trim().to_lowercase()
+}
+
+fn next_unique_folder_name(
+    preferred_name: &str,
+    mut available: impl FnMut(&str) -> bool,
+) -> String {
+    if available(preferred_name) {
+        return preferred_name.to_string();
+    }
+    for index in 2..=SIDEBAR_FOLDER_LIMIT + 1 {
+        let suffix = format!(" {index}");
+        let stem_chars = SIDEBAR_FOLDER_NAME_MAX_CHARS.saturating_sub(suffix.chars().count());
+        let stem = preferred_name
+            .chars()
+            .take(stem_chars)
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        let candidate = format!("{stem}{suffix}");
+        if available(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("the folder limit guarantees an available numbered name")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -746,6 +937,106 @@ mod tests {
             ("session-a".to_string(), "project-a".to_string()),
             ("session-b".to_string(), "project-b".to_string()),
         ])
+    }
+
+    #[test]
+    fn sibling_folder_names_are_unique_within_each_scope_and_parent() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_folder("alpha", "Alpha", None, None));
+        assert!(!state.create_folder("duplicate", " alpha ", None, None));
+        assert_eq!(
+            state.next_available_folder_name("Alpha", None, None),
+            Some("Alpha 2".into())
+        );
+
+        assert!(state.create_folder("container", "Container", None, None));
+        assert!(state.create_folder("nested-alpha", "Alpha", None, Some("container".into()),));
+        assert!(state.create_folder("project-alpha", "Alpha", Some("project-a".into()), None,));
+        assert!(state.create_folder("beta", "Beta", None, None));
+        assert!(!state.folder_name_available("beta", "ALPHA"));
+        assert!(!state.rename_folder("beta", "ALPHA"));
+        assert_eq!(
+            state.folder("beta").map(|folder| folder.name.as_str()),
+            Some("Beta")
+        );
+    }
+
+    #[test]
+    fn folder_moves_reject_a_name_collision_at_the_destination() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_folder("left", "Left", None, None));
+        assert!(state.create_folder("right", "Right", None, None));
+        assert!(state.create_folder("left-child", "Shared", None, Some("left".into())));
+        assert!(state.create_folder("right-child", "shared", None, Some("right".into())));
+        let moving = SidebarOrganizationItem::Folder("left-child".into());
+
+        assert!(!state.can_move_into(&moving, "right", &BTreeMap::new()));
+        assert!(!state.move_into(&moving, "right", &BTreeMap::new()));
+        assert_eq!(state.parent_of(&moving).as_deref(), Some("left"));
+
+        assert!(state.rename_folder("right-child", "Other"));
+        assert!(state.move_into(&moving, "right", &BTreeMap::new()));
+        assert_eq!(state.parent_of(&moving).as_deref(), Some("right"));
+
+        assert!(state.create_folder("root-shared", "Shared", None, None));
+        assert!(!state.can_move_to_scope_root(
+            &moving,
+            &SidebarOrganizationScope::Root,
+            &BTreeMap::new(),
+        ));
+        assert!(!state.move_to_scope_root_end(
+            &moving,
+            &SidebarOrganizationScope::Root,
+            &BTreeMap::new(),
+        ));
+        assert_eq!(state.parent_of(&moving).as_deref(), Some("right"));
+    }
+
+    #[test]
+    fn normalization_and_delete_promotion_repair_sibling_name_collisions() {
+        let mut state = SidebarOrganizationState {
+            folders: BTreeMap::from([
+                (
+                    "first".into(),
+                    SidebarFolderUiState {
+                        name: "Duplicate".into(),
+                        project_id: None,
+                    },
+                ),
+                (
+                    "second".into(),
+                    SidebarFolderUiState {
+                        name: "duplicate".into(),
+                        project_id: None,
+                    },
+                ),
+            ]),
+            placements: vec![
+                SidebarOrganizationPlacement {
+                    item: SidebarOrganizationItem::Folder("first".into()),
+                    parent_folder_id: None,
+                },
+                SidebarOrganizationPlacement {
+                    item: SidebarOrganizationItem::Folder("second".into()),
+                    parent_folder_id: None,
+                },
+            ],
+            collapsed_folder_ids: BTreeSet::new(),
+        };
+
+        state.normalize();
+        assert_eq!(state.folder("first").unwrap().name, "Duplicate");
+        assert_eq!(state.folder("second").unwrap().name, "duplicate 2");
+
+        assert!(state.create_folder("parent", "Parent", None, None));
+        assert!(state.create_folder("nested", "Promoted", None, Some("parent".into())));
+        assert!(state.create_folder("root", "Promoted", None, None));
+        assert!(state.delete_folder("parent"));
+        let promoted_names = ["nested", "root"]
+            .into_iter()
+            .map(|id| comparable_folder_name(&state.folder(id).unwrap().name))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(promoted_names.len(), 2);
     }
 
     #[test]
@@ -848,6 +1139,37 @@ mod tests {
             state.parent_of(&SidebarOrganizationItem::Session("session-a".into())),
             None
         );
+    }
+
+    #[test]
+    fn nested_projects_sessions_and_folders_can_transfer_between_folders() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_folder("root-a", "Root A", None, None));
+        assert!(state.create_folder("root-b", "Root B", None, None));
+        assert!(state.create_folder("nested", "Nested", None, Some("root-a".into())));
+        assert!(state.create_folder("project-a", "Project A", Some("project-a".into()), None,));
+        assert!(state.create_folder("project-b", "Project B", Some("project-a".into()), None,));
+        state.reconcile(
+            &["project-a".into()],
+            &[("session-a".into(), "project-a".into())],
+        );
+        let sessions = BTreeMap::from([("session-a".to_string(), "project-a".to_string())]);
+        let project = SidebarOrganizationItem::Project("project-a".into());
+        let session = SidebarOrganizationItem::Session("session-a".into());
+        let folder = SidebarOrganizationItem::Folder("nested".into());
+
+        assert!(state.move_into(&project, "root-a", &sessions));
+        assert!(state.move_into(&project, "root-b", &sessions));
+        assert_eq!(state.parent_of(&project).as_deref(), Some("root-b"));
+
+        assert!(state.move_into(&session, "project-a", &sessions));
+        assert!(state.move_into(&session, "project-b", &sessions));
+        assert_eq!(state.parent_of(&session).as_deref(), Some("project-b"));
+
+        assert!(state.move_into(&folder, "root-b", &sessions));
+        assert_eq!(state.parent_of(&folder).as_deref(), Some("root-b"));
+        assert!(state.move_to_scope_root_end(&folder, &SidebarOrganizationScope::Root, &sessions,));
+        assert_eq!(state.parent_of(&folder), None);
     }
 
     #[test]

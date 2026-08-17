@@ -1763,9 +1763,22 @@ SidebarOrganizationScope::{Root, Project(project_id)}
   enter another Project, even when a stale or malformed persisted placement asks
   for it.
 - Folder, Project, and Session rows support deterministic before/after movement;
-  folders additionally accept into movement and may return to their scope root.
-  Reject self/descendant cycles and any move whose target depth plus the moving
-  folder subtree exceeds 32 levels.
+  folders additionally divide the row into before/into/after drop zones and may
+  return to their scope root. A typed drop handler at the scroll root must finish
+  Project, Session, and folder drags so moving an already nested item does not
+  depend on the source row remaining under the pointer. Reject self/descendant
+  cycles and any move whose target depth plus the moving folder subtree exceeds
+  32 levels.
+- Folder names are unique among siblings within the same scope and parent. Compare
+  trimmed names case-insensitively for create, rename, and cross-parent movement.
+  Persisted legacy collisions are repaired deterministically during normalization,
+  and deleting a folder must also repair collisions caused by promoting children.
+- A localized default folder name is allocated as the first available numbered
+  variant (`New Folder`, `New Folder 2`, ...), scoped to the destination parent.
+  Creation immediately focuses/selects inline rename. Enter keeps empty or
+  duplicate input in edit mode with a localized error; blur or a click elsewhere
+  commits a valid value and exits, while invalid input exits without replacing the
+  last persisted name.
 - Tree projection returns only placements whose `parent_folder_id` matches the
   parent currently being rendered. An item with no placement may fall back only
   at its scope root; never append every remaining available item at nested levels,
@@ -1774,10 +1787,16 @@ SidebarOrganizationScope::{Root, Project(project_id)}
   projection. Folder metadata must not replace `SidebarUiState.session_order` as
   the compatibility order for ordinary drag reordering, and a newly discovered
   Session keeps the existing new-before-manually-ordered default.
+- Project and Session drag previews reorder the rendered rows and animate toward
+  the preview only when the source siblings are flat. A mixed folder tree keeps
+  stable geometry and uses before/into/after indicators instead of applying a
+  fixed row-height translation across variable-height subtrees.
 - The sidebar header, empty/root context menu, Project context menu, and folder
-  context menu expose the scoped create action. A new folder starts with localized
-  default text and immediately focuses/selects inline rename. Empty names remain
-  in rename state with a localized validation error.
+  context menu expose the scoped create action. Row context-menu events stop at
+  the row so a Project menu cannot also open the root menu; the Project action
+  creates only a Project-scoped folder. Folder children retain visible indentation
+  at every supported depth, and Project rows use a distinct Project icon rather
+  than the folder glyph.
 - Rename, collapse, placement, and ordering are persisted in the additive,
   default-empty `DesktopUiStateV1.sidebar.organization` field without changing
   schema version 1. Normalize bounded names/ids/counts, deduplicate items, repair
@@ -1796,9 +1815,16 @@ SidebarOrganizationScope::{Root, Project(project_id)}
 | --- | --- |
 | Older schema-v1 JSON has no `organization` | Decode an empty organization tree. |
 | Root Project is dropped into a root folder | Move the Project row and retain all of its Session children. |
+| Nested Project/folder is dropped into another valid same-scope folder | Move it to that folder; do not require an intermediate move to scope root. |
+| Nested Project/Session/folder is dropped on its scope root target | Clear its parent and append it at that scope root. |
 | Project A Session/folder is dropped in Project B | Reject without changing or persisting placement. |
 | Folder is dropped into itself or a descendant | Reject; never create a cycle. |
 | Moving a subtree would exceed 32 levels | Reject the preview/drop and keep the original parent. |
+| Create or rename matches a sibling after trim/case folding | Reject it; keep the existing persisted name and placement. |
+| Moving a folder would collide with a destination sibling name | Reject the move and keep the original parent. |
+| Localized default name already exists | Allocate the first available numbered suffix in that parent. |
+| Inline rename loses focus with valid input | Commit once and leave rename mode. |
+| Inline rename loses focus with empty/duplicate input | Leave rename mode and keep the last persisted/default name. |
 | A newly created empty folder is rendered | Show exactly one row with no recursive copy below it. |
 | A Session is created after users manually ordered existing Sessions | Show the new Session before the manually ordered unpinned Sessions; retain their relative order. |
 | Two ordinary root Sessions are reordered by drag | Persist both the organization projection and legacy `session_order`, even if one representation was already in the requested order. |
@@ -1814,24 +1840,29 @@ SidebarOrganizationScope::{Root, Project(project_id)}
 - Good: manually reorder two root Sessions, create another Session, and keep the
   new Session ahead of the manually ordered unpinned pair without losing their
   relative order.
+- Good: drag a nested Project back to the root or directly into a sibling folder;
+  flat Project/Session siblings visibly exchange positions during the drag.
 - Base: a user with pre-feature UI state sees the unchanged flat sidebar until
   they create or drag into a folder.
 - Bad: infer folder scope from the current selection, reparent a Session across
-  Projects, delete runtime records with a folder, or persist a cyclic/deeper tree
-  and rely on restart normalization to change what the user saw.
+  Projects, allow duplicate sibling folder names, animate mixed subtrees as fixed
+  rows, delete runtime records with a folder, or persist a cyclic/deeper tree and
+  rely on restart normalization to change what the user saw.
 
 ### 6. Tests Required
 
 - Pure `desktop-model` tests cover cross-Project rejection, cycle and whole-subtree
   depth rejection, exact relative/into/root ordering, direct-parent-only
   projection with root-only unplaced fallback, manual root Session ordering plus
-  new-Session insertion, delete promotion, bounded normalization, and stale-reference
-  cleanup.
+  new-Session insertion, sibling-name validation, destination collision rejection,
+  deterministic default/normalization naming, delete-promotion repair, bounded
+  normalization, and stale-reference cleanup.
 - UI-state tests decode legacy schema-v1 JSON without the additive field and
   round-trip a populated organization tree.
 - GPUI source/interaction coverage asserts scoped create/rename/delete menus,
-  typed Project/Session/folder drags, root drop targets, detailed-mode
-  de-duplication, and selected-Session ancestor reveal.
+  row-level context-menu isolation, blur completion, typed Project/Session/folder
+  drags, root drop targets, flat-list reorder previews, mixed-tree preview guards,
+  detailed-mode de-duplication, and selected-Session ancestor reveal.
 
 ### 7. Wrong vs Correct
 
