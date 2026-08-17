@@ -24168,6 +24168,12 @@ impl VibexWorkbench {
             ));
         }
 
+        let mut file_changes = if turn.complete {
+            self.render_turn_file_changes_card(turn, is_last, cx)
+        } else {
+            None
+        };
+
         if !turn.process_rows.is_empty() || turn.conclusion_row.is_some() || !turn.complete {
             let mut response = v_flex()
                 .w_full()
@@ -24259,8 +24265,13 @@ impl VibexWorkbench {
                 }
             }
             if let Some(conclusion_row) = timeline_turn_conclusion_row(turn) {
-                response =
-                    response.child(self.render_timeline_row(conclusion_row, true, window, cx));
+                response = response.child(self.render_timeline_row(
+                    conclusion_row,
+                    true,
+                    file_changes.take(),
+                    window,
+                    cx,
+                ));
             } else if !turn.complete {
                 let pending_label = if turn.pending_permission {
                     strings.agent_waiting_confirmation.to_string()
@@ -24282,9 +24293,7 @@ impl VibexWorkbench {
             content = content.child(response);
         }
 
-        if turn.complete
-            && let Some(file_changes) = self.render_turn_file_changes_card(turn, is_last, cx)
-        {
+        if let Some(file_changes) = file_changes {
             content = content.child(file_changes);
         }
 
@@ -24895,6 +24904,7 @@ impl VibexWorkbench {
                 elements.push(self.render_timeline_row(
                     &turn.process_rows[row_index],
                     false,
+                    None,
                     window,
                     cx,
                 ));
@@ -24944,19 +24954,24 @@ impl VibexWorkbench {
         &mut self,
         row: &TimelineRow,
         conversation_conclusion: bool,
+        content_before_actions: Option<AnyElement>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         // Keep prose in the document flow and lightweight activity on compact
         // lines. Structured commands use cards only when the session preference
         // enables their enhanced display.
+        let mut content_before_actions = content_before_actions;
         let element = match row.kind {
             TimelineRowKind::UserMessage => {
                 self.render_user_message_row(row, None, false, false, window, cx)
             }
-            TimelineRowKind::AgentMessage => {
-                self.render_agent_message_row(row, conversation_conclusion, cx)
-            }
+            TimelineRowKind::AgentMessage => self.render_agent_message_row(
+                row,
+                conversation_conclusion,
+                content_before_actions.take(),
+                cx,
+            ),
             TimelineRowKind::Reasoning | TimelineRowKind::Plan => {
                 self.render_thought_process_row(row, cx)
             }
@@ -24986,6 +25001,17 @@ impl VibexWorkbench {
             | TimelineRowKind::SystemNotice
             | TimelineRowKind::PermissionResolution
             | TimelineRowKind::ElicitationResolution => self.render_fallback_process_row(row, cx),
+        };
+        let element = if let Some(content) = content_before_actions {
+            v_flex()
+                .w_full()
+                .min_w_0()
+                .gap_3()
+                .child(element)
+                .child(content)
+                .into_any_element()
+        } else {
+            element
         };
         self.highlight_session_search_rows(std::slice::from_ref(row), element, cx)
     }
@@ -25764,6 +25790,7 @@ impl VibexWorkbench {
         &mut self,
         row: &TimelineRow,
         conversation_conclusion: bool,
+        content_before_actions: Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let search_query = self
@@ -25861,6 +25888,9 @@ impl VibexWorkbench {
             })
             .when(!row.body.is_empty(), |this| {
                 this.child(div().w_full().min_w_0().child(markdown_view))
+            })
+            .when_some(content_before_actions, |this, content| {
+                this.child(div().w_full().min_w_0().mt_2().child(content))
             })
             .when(show_answer_actions, |this| {
                 this.child(
@@ -45767,20 +45797,20 @@ mod tests {
     }
 
     #[test]
-    fn turn_file_changes_card_follows_the_conclusion_and_affects_height_signature() {
+    fn turn_file_changes_card_precedes_conclusion_actions_and_affects_height_signature() {
         let source = include_str!("app.rs");
         let renderer = source
             .split_once("    fn render_timeline_turn(")
             .and_then(|(_, tail)| tail.split_once("\n    fn timeline_turn_execution_attribution("))
             .map(|(body, _)| body)
             .expect("turn renderer should remain inspectable");
-        let conclusion = renderer
-            .find("render_timeline_row(conclusion_row")
-            .expect("conclusion renderer");
         let changes = renderer
             .find("render_turn_file_changes_card(turn, is_last, cx)")
             .expect("file changes card");
-        assert!(conclusion < changes);
+        let conclusion = renderer
+            .find("file_changes.take()")
+            .expect("file changes card should be inserted into the conclusion");
+        assert!(changes < conclusion);
         assert!(renderer.contains("review-turn-file-changes:"));
         assert!(renderer.contains("undo-turn-file-changes:"));
         assert!(renderer.contains("toggle-turn-file-changes:"));
@@ -45793,6 +45823,19 @@ mod tests {
             .map(|(body, _)| body)
             .expect("height signature should remain inspectable");
         assert!(signature.contains("timeline_file_changes_expansion"));
+
+        let agent_message = source
+            .split_once("    fn render_agent_message_row(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_thought_process_row("))
+            .map(|(body, _)| body)
+            .expect("agent message renderer should remain inspectable");
+        let changes = agent_message
+            .find(".when_some(content_before_actions")
+            .expect("file changes slot");
+        let actions = agent_message
+            .find(".when(show_answer_actions")
+            .expect("conclusion actions");
+        assert!(changes < actions);
     }
 
     #[test]
