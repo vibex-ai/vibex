@@ -2738,6 +2738,15 @@ fn timeline_should_resume_follow_after_scroll_idle(
         && distance_to_bottom <= AGENT_TIMELINE_NEAR_BOTTOM_THRESHOLD_PX
 }
 
+fn timeline_should_show_bottom_control(
+    following_bottom: bool,
+    unread_count: u32,
+    distance_to_bottom: f32,
+) -> bool {
+    unread_count > 0
+        || (!following_bottom && distance_to_bottom > AGENT_TIMELINE_NEAR_BOTTOM_THRESHOLD_PX)
+}
+
 fn timeline_should_auto_follow_content(
     following_bottom: bool,
     scroll_wheel_active: bool,
@@ -20470,6 +20479,11 @@ impl VibexWorkbench {
         let strings = self.strings();
         let content_max_width = session_content_max_width(self.ui_state.session.content_width);
         let pending_permission = turns_summary.has_pending_permission;
+        let timeline_bottom_control_visible = timeline_should_show_bottom_control(
+            self.timeline_follow.following_bottom,
+            self.timeline_follow.unread_count,
+            self.timeline_distance_to_bottom(),
+        );
         let turn_preview_rail = (self.ui_state.session.turn_preview_rail && !turns.is_empty())
             .then(|| self.render_agent_turn_preview_rail(turns.as_slice(), cx));
         let timeline_surface = div()
@@ -20681,29 +20695,41 @@ impl VibexWorkbench {
                     })
                     .child(timeline_surface),
             )
-            .when(self.timeline_follow.unread_count > 0, |this| {
+            .when(timeline_bottom_control_visible, |this| {
+                let button = Button::new("follow-agent-bottom").small().primary();
+                let button = if self.timeline_follow.unread_count > 0 {
+                    button.label(match self.resolved_locale() {
+                        locale::ResolvedLocale::En => {
+                            format!("{} new", self.timeline_follow.unread_count)
+                        }
+                        locale::ResolvedLocale::ZhCn => {
+                            format!("{} 条新消息", self.timeline_follow.unread_count)
+                        }
+                        locale::ResolvedLocale::ZhTw => {
+                            format!("{} 條新訊息", self.timeline_follow.unread_count)
+                        }
+                    })
+                } else {
+                    button
+                        .icon(
+                            Icon::default()
+                                .path("icons/vibex/vibex-mark.svg")
+                                .size(px(14.0)),
+                        )
+                        .tooltip(match self.resolved_locale() {
+                            locale::ResolvedLocale::En => "Scroll to conversation bottom",
+                            locale::ResolvedLocale::ZhCn => "滚动到会话底部",
+                            locale::ResolvedLocale::ZhTw => "捲動到會話底部",
+                        })
+                };
                 this.child(
                     h_flex().flex_none().justify_center().pb_1().child(
-                        Button::new("follow-agent-bottom")
-                            .small()
-                            .primary()
-                            .label(match self.resolved_locale() {
-                                locale::ResolvedLocale::En => {
-                                    format!("{} new", self.timeline_follow.unread_count)
-                                }
-                                locale::ResolvedLocale::ZhCn => {
-                                    format!("{} 条新消息", self.timeline_follow.unread_count)
-                                }
-                                locale::ResolvedLocale::ZhTw => {
-                                    format!("{} 條新訊息", self.timeline_follow.unread_count)
-                                }
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.timeline_scroll_wheel_idle_task = None;
-                                this.timeline_follow.set_following_bottom(true);
-                                this.request_timeline_scroll_to_latest();
-                                cx.notify();
-                            })),
+                        button.on_click(cx.listener(|this, _, _, cx| {
+                            this.timeline_scroll_wheel_idle_task = None;
+                            this.timeline_follow.set_following_bottom(true);
+                            this.request_timeline_scroll_to_latest();
+                            cx.notify();
+                        })),
                     ),
                 )
             })
@@ -39135,6 +39161,22 @@ mod tests {
             AGENT_TIMELINE_NEAR_BOTTOM_THRESHOLD_PX / 2.0,
             false,
         ));
+    }
+
+    #[test]
+    fn timeline_bottom_control_covers_unread_and_distant_reading_positions() {
+        assert!(!timeline_should_show_bottom_control(true, 0, 500.0));
+        assert!(!timeline_should_show_bottom_control(
+            false,
+            0,
+            AGENT_TIMELINE_NEAR_BOTTOM_THRESHOLD_PX,
+        ));
+        assert!(timeline_should_show_bottom_control(
+            false,
+            0,
+            AGENT_TIMELINE_NEAR_BOTTOM_THRESHOLD_PX + 1.0,
+        ));
+        assert!(timeline_should_show_bottom_control(false, 2, 0.0));
     }
 
     #[test]
