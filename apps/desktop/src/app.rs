@@ -24105,7 +24105,11 @@ impl VibexWorkbench {
                 .unwrap_or(false);
         let toggle_id = row.id.clone();
         let measured_turn_id = row.turn_id.clone();
-        let open_path = operation.path.clone();
+        let open_path = agent_file_operation_preview_path(
+            &operation.path,
+            self.selected_session()
+                .map(|session| session.workspace_root.as_str()),
+        );
         let title = format!(
             "{} {}",
             file_operation_verb(operation.operation),
@@ -24183,23 +24187,25 @@ impl VibexWorkbench {
                                 .child(format!("+{}", preview.added_lines)),
                         )
                     })
-                    .child(
-                        Button::new(format!("open-agent-file-card:{}", row.id))
-                            .xsmall()
-                            .ghost()
-                            .compact()
-                            .size(px(28.0))
-                            .icon(IconName::FolderOpen)
-                            .tooltip(locale::text(
-                                "Open file in Preview",
-                                "在预览中打开文件",
-                                "在預覽中開啟檔案",
-                            ))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.open_code_file(open_path.clone(), window, cx)
-                            })),
-                    )
+                    .when_some(open_path, |this, open_path| {
+                        this.child(
+                            Button::new(format!("open-agent-file-card:{}", row.id))
+                                .xsmall()
+                                .ghost()
+                                .compact()
+                                .size(px(28.0))
+                                .icon(IconName::FolderOpen)
+                                .tooltip(locale::text(
+                                    "Open file in Preview",
+                                    "在预览中打开文件",
+                                    "在預覽中開啟檔案",
+                                ))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.open_code_file(open_path.clone(), window, cx)
+                                })),
+                        )
+                    })
                     .when(has_diff, |this| {
                         this.child(
                             Icon::new(if expanded {
@@ -35548,6 +35554,39 @@ fn agent_markdown_preview_path(
     (!relative.is_empty()).then(|| relative.to_string())
 }
 
+fn agent_file_operation_preview_path(path: &str, workspace_root: Option<&str>) -> Option<String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let path = match url::Url::parse(path) {
+        Ok(url) if url.scheme() == "file" => url.to_file_path().ok()?,
+        Ok(_) if std::path::Path::new(path).is_absolute() => std::path::PathBuf::from(path),
+        Ok(_) => return None,
+        Err(_) => std::path::PathBuf::from(path),
+    };
+    let path = if path.is_absolute() {
+        path.strip_prefix(std::path::Path::new(workspace_root?))
+            .ok()?
+            .to_path_buf()
+    } else {
+        path
+    };
+    let mut relative = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(segment) => relative.push(segment),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                relative.pop().then_some(())?;
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    (!relative.is_empty()).then_some(relative)
+}
+
 fn render_user_message_text_segment(
     id: impl Into<ElementId>,
     value: String,
@@ -42768,6 +42807,52 @@ mod tests {
         assert_eq!(
             agent_markdown_preview_path(resource, Some("/work/vibex")).as_deref(),
             Some("README.md")
+        );
+    }
+
+    #[test]
+    fn agent_file_operation_paths_resolve_inside_the_session_workspace() {
+        let workspace_root = "/work/vibex";
+
+        assert_eq!(
+            agent_file_operation_preview_path(
+                "/work/vibex/.trellis/spec/backend/remote-relay-protocol.md",
+                Some(workspace_root),
+            )
+            .as_deref(),
+            Some(".trellis/spec/backend/remote-relay-protocol.md")
+        );
+        assert_eq!(
+            agent_file_operation_preview_path(
+                "file:///work/vibex/apps/desktop/src/app.rs",
+                Some(workspace_root),
+            )
+            .as_deref(),
+            Some("apps/desktop/src/app.rs")
+        );
+        assert_eq!(
+            agent_file_operation_preview_path(
+                "./crates/core/src/timeline.rs",
+                Some(workspace_root)
+            )
+            .as_deref(),
+            Some("crates/core/src/timeline.rs")
+        );
+    }
+
+    #[test]
+    fn agent_file_operation_paths_reject_workspace_escape() {
+        assert_eq!(
+            agent_file_operation_preview_path("/work/other/private.txt", Some("/work/vibex")),
+            None
+        );
+        assert_eq!(
+            agent_file_operation_preview_path("../../private.txt", Some("/work/vibex")),
+            None
+        );
+        assert_eq!(
+            agent_file_operation_preview_path("https://example.com/file.rs", Some("/work/vibex")),
+            None
         );
     }
 
