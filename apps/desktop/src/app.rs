@@ -2777,6 +2777,19 @@ fn timeline_turn_duration_end(turn_complete: bool, ended_at_ms: Option<i64>) -> 
     turn_complete.then_some(ended_at_ms).flatten()
 }
 
+fn timeline_session_state_for_render(
+    selected_session_id: Option<&VibexSessionId>,
+    timeline_session_id: Option<&VibexSessionId>,
+    agent_loading: bool,
+    session_state: Option<AgentSessionState>,
+) -> Option<AgentSessionState> {
+    if agent_loading || selected_session_id != timeline_session_id {
+        None
+    } else {
+        session_state
+    }
+}
+
 fn timeline_turn_process_expanded(
     turn: &TimelineConversationTurn,
     explicit_expansion: Option<bool>,
@@ -6981,12 +6994,17 @@ impl VibexWorkbench {
     }
 
     fn selected_agent_session_state(&self) -> Option<AgentSessionState> {
-        let state = self.selected_session().map(|session| session.state);
-        if self.agent_turn_pending {
+        let state = if self.agent_turn_pending {
             Some(AgentSessionState::Running)
         } else {
-            state
-        }
+            self.selected_session().map(|session| session.state)
+        };
+        timeline_session_state_for_render(
+            self.selected_session_id.as_ref(),
+            self.timeline.session_id.as_ref(),
+            self.agent_loading,
+            state,
+        )
     }
 
     fn conversation_turns(&self) -> Vec<TimelineConversationTurn> {
@@ -36021,6 +36039,41 @@ mod tests {
         assert_eq!(
             effective_shortcut(&overrides, "open_settings"),
             Some("cmd-shift-,")
+        );
+    }
+
+    #[test]
+    fn timeline_state_does_not_synthesize_a_pending_turn_before_history_is_ready() {
+        let session_id = VibexSessionId::parse("session_loading_state").unwrap();
+
+        let loading_state = timeline_session_state_for_render(
+            Some(&session_id),
+            None,
+            true,
+            Some(AgentSessionState::Running),
+        );
+        assert_eq!(loading_state, None);
+        assert!(timeline_conversation_turns(&[], loading_state, false).is_empty());
+
+        let mismatched_state = timeline_session_state_for_render(
+            Some(&session_id),
+            None,
+            false,
+            Some(AgentSessionState::Running),
+        );
+        assert_eq!(mismatched_state, None);
+        assert!(timeline_conversation_turns(&[], mismatched_state, false).is_empty());
+
+        let render_state = timeline_session_state_for_render(
+            Some(&session_id),
+            Some(&session_id),
+            false,
+            Some(AgentSessionState::Running),
+        );
+        assert_eq!(render_state, Some(AgentSessionState::Running));
+        assert_eq!(
+            timeline_conversation_turns(&[], render_state, false).len(),
+            1
         );
     }
 
