@@ -56,6 +56,22 @@ fn apply_semantic_popover_colors(theme: &mut Theme, is_dark: bool) {
     theme.tokens.popover_foreground = popover_foreground.into();
 }
 
+fn apply_semantic_highlight_colors(theme: &mut Theme, is_dark: bool) {
+    let accent = semantic_color("accent", is_dark);
+    let accent_foreground = semantic_color("accent-foreground", is_dark);
+    theme.accent = accent;
+    theme.tokens.accent = accent.into();
+    theme.accent_foreground = accent_foreground;
+    theme.tokens.accent_foreground = accent_foreground.into();
+
+    let sidebar_accent = semantic_color("sidebar-accent", is_dark);
+    let sidebar_accent_foreground = semantic_color("sidebar-accent-foreground", is_dark);
+    theme.sidebar_accent = sidebar_accent;
+    theme.tokens.sidebar_accent = sidebar_accent.into();
+    theme.sidebar_accent_foreground = sidebar_accent_foreground;
+    theme.tokens.sidebar_accent_foreground = sidebar_accent_foreground.into();
+}
+
 pub fn apply_appearance(appearance: &AppearanceUiState, window: Option<&mut Window>, cx: &mut App) {
     match appearance.theme {
         ThemeMode::Light => Theme::change(ComponentThemeMode::Light, window, cx),
@@ -85,12 +101,11 @@ pub fn apply_appearance(appearance: &AppearanceUiState, window: Option<&mut Wind
     let is_dark = theme.is_dark();
     theme.highlight_theme = shared_highlight_theme(is_dark);
     apply_semantic_popover_colors(theme, is_dark);
+    apply_semantic_highlight_colors(theme, is_dark);
     theme.sidebar = semantic_color("sidebar", is_dark);
     theme.sidebar_foreground = semantic_color("sidebar-foreground", is_dark);
     theme.sidebar_primary = semantic_color("sidebar-primary", is_dark);
     theme.sidebar_primary_foreground = semantic_color("sidebar-primary-foreground", is_dark);
-    theme.sidebar_accent = semantic_color("sidebar-accent", is_dark);
-    theme.sidebar_accent_foreground = semantic_color("sidebar-accent-foreground", is_dark);
     theme.sidebar_border = semantic_color("sidebar-border", is_dark);
     theme.overlay = gpui::black().opacity(0.80);
     if appearance.high_contrast {
@@ -163,6 +178,34 @@ mod tests {
             let expected_foreground = semantic_color("popover-foreground", is_dark);
             assert_eq!(theme.popover_foreground, expected_foreground);
             assert_eq!(theme.tokens.popover_foreground.color, expected_foreground);
+        }
+    }
+
+    #[test]
+    fn semantic_highlight_colors_cover_component_and_custom_paths() {
+        for is_dark in [false, true] {
+            let mut theme = Theme::default();
+            apply_semantic_highlight_colors(&mut theme, is_dark);
+
+            let expected_accent = semantic_color("accent", is_dark);
+            assert_eq!(theme.accent, expected_accent);
+            assert_eq!(theme.tokens.accent.color, expected_accent);
+            let expected_accent_foreground = semantic_color("accent-foreground", is_dark);
+            assert_eq!(theme.accent_foreground, expected_accent_foreground);
+            assert_eq!(
+                theme.tokens.accent_foreground.color,
+                expected_accent_foreground
+            );
+
+            let expected_sidebar_accent = semantic_color("sidebar-accent", is_dark);
+            assert_eq!(theme.sidebar_accent, expected_sidebar_accent);
+            assert_eq!(theme.tokens.sidebar_accent.color, expected_sidebar_accent);
+            let expected_sidebar_foreground = semantic_color("sidebar-accent-foreground", is_dark);
+            assert_eq!(theme.sidebar_accent_foreground, expected_sidebar_foreground);
+            assert_eq!(
+                theme.tokens.sidebar_accent_foreground.color,
+                expected_sidebar_foreground
+            );
         }
     }
 }
