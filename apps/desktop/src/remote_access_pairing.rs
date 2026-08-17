@@ -335,6 +335,13 @@ impl PairingViewState {
         self.active_offer.is_some() && self.pending.is_none()
     }
 
+    fn can_start_zero_config_pairing(&self) -> bool {
+        self.pending.is_none()
+            && self.active_offer.is_none()
+            && self.active_lan_window.is_none()
+            && self.active_zero_config_window.is_none()
+    }
+
     fn safe_snapshot(&self) -> RemoteAccessSafeSnapshot {
         let offer = self.active_offer.as_ref();
         RemoteAccessSafeSnapshot {
@@ -794,10 +801,7 @@ impl RemoteAccessPairing {
     }
 
     fn start_zero_config_pairing(&mut self, cx: &mut Context<Self>) {
-        if self.state.active_offer.is_some()
-            || self.state.active_lan_window.is_some()
-            || self.state.active_zero_config_window.is_some()
-        {
+        if !self.state.can_start_zero_config_pairing() {
             return;
         }
         let controller = self.controller.clone();
@@ -2149,16 +2153,7 @@ impl RemoteAccessPairing {
                 .into_any_element();
         }
 
-        let route_available = self.state.connectivity.as_ref().is_some_and(|snapshot| {
-            snapshot
-                .methods
-                .iter()
-                .any(|method| method.candidate_available)
-        });
-        let pairing_active = self.state.active_offer.is_some()
-            || self.state.active_lan_window.is_some()
-            || self.state.active_zero_config_window.is_some();
-        let pending = self.state.pending.is_some();
+        let can_start = self.state.can_start_zero_config_pairing();
         let entity = cx.weak_entity();
 
         v_flex()
@@ -2192,25 +2187,13 @@ impl RemoteAccessPairing {
                         self.state.pending,
                         Some(RemoteAccessMutation::StartZeroConfigPairing)
                     ))
-                    .disabled(pending || pairing_active || !route_available)
+                    .disabled(!can_start)
                     .on_click(move |_, _, cx| {
                         let _ = entity.update(cx, |this, cx| {
                             this.dispatch_action(RemoteAccessAction::StartZeroConfigPairing, cx)
                         });
                     }),
             )
-            .when(!route_available, |column| {
-                column.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(locale::text(
-                            "Enable a remote connection before pairing",
-                            "请先启用一种远程连接",
-                            "請先啟用一種遠端連線",
-                        )),
-                )
-            })
             .into_any_element()
     }
 }
@@ -3093,6 +3076,27 @@ mod tests {
         assert!(state.can_regenerate_offer());
         state.pending = Some(RemoteAccessMutation::RegenerateOffer);
         assert!(!state.can_regenerate_offer());
+    }
+
+    #[test]
+    fn zero_config_pairing_does_not_require_a_remote_route() {
+        let mut state = PairingViewState::default();
+        assert!(state.can_start_zero_config_pairing());
+
+        let mut snapshot = connectivity(None);
+        snapshot.desired_enabled = false;
+        snapshot.running = false;
+        snapshot.active_route = None;
+        for method in &mut snapshot.methods {
+            method.desired_enabled = false;
+            method.state = RemoteMethodState::Disabled;
+            method.candidate_available = false;
+        }
+        state.apply_connectivity(snapshot);
+
+        assert!(state.can_start_zero_config_pairing());
+        state.pending = Some(RemoteAccessMutation::StartZeroConfigPairing);
+        assert!(!state.can_start_zero_config_pairing());
     }
 
     #[test]
