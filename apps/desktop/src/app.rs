@@ -24305,7 +24305,10 @@ impl VibexWorkbench {
             terminal_id: terminal_id_string.clone(),
             label: title.clone().into(),
         };
+        let hover_group: SharedString =
+            format!("composer-terminal-tab:{terminal_id_string}").into();
         let select_id = terminal_id.clone();
+        let keyboard_select_id = terminal_id.clone();
         let close_id = terminal_id.clone();
         let middle_close_id = terminal_id.clone();
         let context_entity = cx.weak_entity();
@@ -24352,6 +24355,20 @@ impl VibexWorkbench {
                         .opacity(if active { 1.0 } else { 0.62 }))
                     .text_color(cx.theme().foreground)
             })
+            .focus_visible(|style| {
+                style.shadow(vec![
+                    gpui::BoxShadow::new(px(0.0), px(0.0), cx.theme().ring).spread_radius(px(1.0)),
+                ])
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.select_composer_terminal(select_id.clone(), window, cx)
+            }))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "enter" || event.keystroke.key == "space" {
+                    this.select_composer_terminal(keyboard_select_id.clone(), window, cx);
+                    cx.stop_propagation();
+                }
+            }))
             .on_mouse_down(
                 MouseButton::Middle,
                 cx.listener(move |this, _, _, cx| {
@@ -24397,6 +24414,7 @@ impl VibexWorkbench {
                     .size(px(14.0))
                     .flex_none(),
             )
+            .child(div().min_w_0().flex_1().truncate().child(title.clone()))
             .child(
                 div()
                     .size(px(22.0))
@@ -24432,9 +24450,29 @@ impl VibexWorkbench {
                         .left(px(8.0))
                         .right(px(8.0))
                         .h(px(2.0))
+                        .rounded_full()
                         .bg(cx.theme().primary),
                 )
             })
+            .when_some(
+                (cx.has_active_drag())
+                    .then_some(drop_target)
+                    .flatten()
+                    .filter(|target| target.terminal_id == terminal_id_string)
+                    .map(|target| target.after),
+                |tab, after| {
+                    tab.child(
+                        div()
+                            .absolute()
+                            .top(px(4.0))
+                            .bottom(px(4.0))
+                            .w(px(2.0))
+                            .rounded_full()
+                            .bg(cx.theme().drag_border)
+                            .map(|line| if after { line.right_0() } else { line.left_0() }),
+                    )
+                },
+            )
             .context_menu(move |menu, _, _| {
                 let close_entity = context_entity.clone();
                 let close_id = context_close_id.clone();
@@ -24459,10 +24497,7 @@ impl VibexWorkbench {
                         "Close other terminals",
                         "关闭其他终端",
                         "關閉其他終端機",
-        let hover_group: SharedString =
-            format!("composer-terminal-tab:{terminal_id_string}").into();
                     ))
-        let keyboard_select_id = terminal_id.clone();
                     .disabled(mutation_pending || other_ids.is_empty())
                     .on_click(move |_, _, cx| {
                         let ids = other_ids.clone();
@@ -24492,20 +24527,6 @@ impl VibexWorkbench {
                     ))
                     .on_click(move |_, window, cx| {
                         let _ = rename_entity.update(cx, |this, cx| {
-            .focus_visible(|style| {
-                style.shadow(vec![
-                    gpui::BoxShadow::new(px(0.0), px(0.0), cx.theme().ring).spread_radius(px(1.0)),
-                ])
-            })
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.select_composer_terminal(select_id.clone(), window, cx)
-            }))
-            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-                if event.keystroke.key == "enter" || event.keystroke.key == "space" {
-                    this.select_composer_terminal(keyboard_select_id.clone(), window, cx);
-                    cx.stop_propagation();
-                }
-            }))
                             this.prompt_rename_composer_terminal(rename_id.clone(), window, cx)
                         });
                     }),
@@ -24572,7 +24593,6 @@ impl VibexWorkbench {
                 h_flex()
                     .min_w_0()
                     .gap_2()
-            .child(div().min_w_0().flex_1().truncate().child(title.clone()))
                     .child(Icon::new(IconName::SquareTerminal).small())
                     .child(
                         div()
@@ -24596,29 +24616,9 @@ impl VibexWorkbench {
                                 if let Some(terminal_id) = terminal_id.clone() {
                                     let _ = entity.update(cx, |this, cx| {
                                         this.switch_composer_terminal_shell(
-                        .rounded_full()
                                             terminal_id,
                                             shell.clone(),
                                             cx,
-            .when_some(
-                (cx.has_active_drag())
-                    .then_some(drop_target)
-                    .flatten()
-                    .filter(|target| target.terminal_id == terminal_id_string)
-                    .map(|target| target.after),
-                |tab, after| {
-                    tab.child(
-                        div()
-                            .absolute()
-                            .top(px(4.0))
-                            .bottom(px(4.0))
-                            .w(px(2.0))
-                            .rounded_full()
-                            .bg(cx.theme().drag_border)
-                            .map(|line| if after { line.right_0() } else { line.left_0() }),
-                    )
-                },
-            )
                                         )
                                     });
                                 }
@@ -24668,7 +24668,7 @@ impl VibexWorkbench {
                     .bg(card_color)
                     .child(
                         h_flex()
-                            .h(px(34.0))
+                            .h(px(38.0))
                             .flex_none()
                             .min_w_0()
                             .bg(cx.theme().muted.opacity(0.24))
@@ -24705,7 +24705,7 @@ impl VibexWorkbench {
                     )
                     .child(
                         h_flex()
-                            .h(px(38.0))
+                            .h(px(34.0))
                             .flex_none()
                             .min_w_0()
                             .items_center()
@@ -41826,6 +41826,26 @@ mod tests {
     }
 
     #[test]
+    fn composer_terminal_close_action_lives_in_each_tab() {
+        let source = include_str!("app.rs");
+        let tab = source
+            .split_once("    fn render_composer_terminal_tab(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_terminal("))
+            .map(|(body, _)| body)
+            .expect("composer terminal tab renderer should remain inspectable");
+        let terminal = source
+            .split_once("    fn render_composer_terminal(&mut self, cx: &mut Context<Self>)")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_inline_composer_attachments("))
+            .map(|(body, _)| body)
+            .expect("composer terminal renderer should remain inspectable");
+
+        assert!(tab.contains("close-composer-terminal:"));
+        assert!(tab.contains(".aria_selected(active)"));
+        assert!(tab.contains(".bottom_0()"));
+        assert!(!terminal.contains("Button::new(\"kill-composer-terminal\")"));
+    }
+
+    #[test]
     fn sidebar_project_highlight_yields_to_the_selected_session() {
         assert!(sidebar_project_is_active(
             Some("workspace_a"),
@@ -41985,26 +42005,6 @@ mod tests {
             .map(|(body, _)| body)
             .expect("single session deletion should remain inspectable");
         let optimistic_remove = deletion
-    #[test]
-    fn composer_terminal_close_action_lives_in_each_tab() {
-        let source = include_str!("app.rs");
-        let tab = source
-            .split_once("    fn render_composer_terminal_tab(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_terminal("))
-            .map(|(body, _)| body)
-            .expect("composer terminal tab renderer should remain inspectable");
-        let terminal = source
-            .split_once("    fn render_composer_terminal(&mut self, cx: &mut Context<Self>)")
-            .and_then(|(_, tail)| tail.split_once("\n    fn render_inline_composer_attachments("))
-            .map(|(body, _)| body)
-            .expect("composer terminal renderer should remain inspectable");
-
-        assert!(tab.contains("close-composer-terminal:"));
-        assert!(tab.contains(".aria_selected(active)"));
-        assert!(tab.contains(".bottom_0()"));
-        assert!(!terminal.contains("Button::new(\"kill-composer-terminal\")"));
-    }
-
             .find("self.optimistically_remove_sessions(&session_id_set);")
             .expect("single deletion should remove the row locally");
         let repaint = deletion
