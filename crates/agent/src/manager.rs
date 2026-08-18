@@ -24,7 +24,7 @@ use vibex_core::{
     ProviderCapabilitiesResponse, ProviderDefaultScopeKind, ProviderKind, ProviderNativeBinding,
     ProviderProfileDefaultScope, ProviderProfileId, ProviderProfileStatus,
     RenameAgentSessionRequest, ResolveElicitationRequest, ResolvePermissionRequest,
-    RuntimeModelSelection, SendAgentMessageRequest, SessionRuntimeSelection,
+    RuntimeLeaseRole, RuntimeModelSelection, SendAgentMessageRequest, SessionRuntimeSelection,
     SessionRuntimeSelectionStatus, SystemNoticeLevel, SystemNoticePayload, TimelineErrorPayload,
     TimelineItem, TimelineLiveEvent, TimelinePage, TimelinePayload, TimelineRedactionState,
     TimelineSource, TransportKind, TurnExecutionAttribution, UsageExecutionId, UserMessagePayload,
@@ -49,6 +49,7 @@ use crate::adapter::{
 };
 use crate::context_bridge::{ContextBridgeService, PreparedContextBridge};
 use crate::message_submission::MessageSubmissionCoordinator;
+use crate::runtime_lifecycle::{RuntimeLeaseGuard, RuntimeLifecycleService};
 use crate::runtime_selection::RuntimeSelectionService;
 use crate::state_machine::validate_transition;
 
@@ -65,6 +66,7 @@ pub struct AgentManager {
     live_events: broadcast::Sender<TimelineLiveEvent>,
     notification_events: broadcast::Sender<AgentNotificationIntent>,
     runtime_selection: OnceLock<Weak<RuntimeSelectionService>>,
+    runtime_lifecycle: OnceLock<Weak<RuntimeLifecycleService>>,
     message_submission: OnceLock<Weak<MessageSubmissionCoordinator>>,
     usage_telemetry: OnceLock<mpsc::UnboundedSender<AgentUsageTelemetryEvent>>,
     elicitation_resolution_locks: StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
@@ -149,6 +151,7 @@ impl AgentManager {
             live_events,
             notification_events,
             runtime_selection: OnceLock::new(),
+            runtime_lifecycle: OnceLock::new(),
             message_submission: OnceLock::new(),
             usage_telemetry: OnceLock::new(),
             elicitation_resolution_locks: StdMutex::new(HashMap::new()),
@@ -232,6 +235,20 @@ impl AgentManager {
                 VibexError::conflict(
                     "runtime_selection_service_already_installed",
                     "runtime selection service is already installed",
+                )
+            })
+    }
+
+    pub fn install_runtime_lifecycle(
+        &self,
+        lifecycle: &Arc<RuntimeLifecycleService>,
+    ) -> VibexResult<()> {
+        self.runtime_lifecycle
+            .set(Arc::downgrade(lifecycle))
+            .map_err(|_| {
+                VibexError::conflict(
+                    "runtime_lifecycle_already_installed",
+                    "runtime lifecycle is already installed",
                 )
             })
     }
@@ -980,6 +997,13 @@ impl AgentManager {
         }
         drop(conn);
 
+        let _runtime_lease = self
+            .materialize_turn_runtime(
+                request.session_id.clone(),
+                format!("continue:{}", request.session_id.as_str()),
+            )
+            .await?;
+
         self.run_agent_turn(
             AgentTurnRequest {
                 session_id: request.session_id,
@@ -997,6 +1021,26 @@ impl AgentManager {
             },
         )
         .await
+    }
+
+    async fn materialize_turn_runtime(
+        &self,
+        session_id: VibexSessionId,
+        holder: String,
+    ) -> VibexResult<Option<RuntimeLeaseGuard>> {
+        let Some(lifecycle) = self.runtime_lifecycle.get() else {
+            return Ok(None);
+        };
+        let lifecycle = lifecycle.upgrade().ok_or_else(|| {
+            VibexError::process(
+                "agent_runtime_lifecycle_unavailable",
+                "Agent runtime lifecycle is unavailable",
+            )
+        })?;
+        lifecycle
+            .materialize_internal(session_id, RuntimeLeaseRole::BackgroundWorker, holder)
+            .await
+            .map(Some)
     }
 
     pub async fn discover_commands(
@@ -3826,15 +3870,19 @@ mod tests {
     use async_trait::async_trait;
     use vibex_core::{
         AcpAdapterId, AgentRuntimeRouteKey, AgentSessionSafety, MessageSubmissionStatus,
-        NativeStateHomeId, RuntimeBinding, RuntimeBindingId, RuntimeSwitchActiveWorkPolicy,
-        RuntimeSwitchId, RuntimeSwitchPolicy, RuntimeSwitchStatus, SessionRuntimeConfigState,
-        WorkspaceMode,
+        NativeStateHomeId, RuntimeBinding, RuntimeBindingId, RuntimeMaterializationStatus,
+        RuntimeProcessId, RuntimeProcessSnapshot, RuntimeSwitchActiveWorkPolicy, RuntimeSwitchId,
+        RuntimeSwitchPolicy, RuntimeSwitchStatus, SessionRuntimeConfigState, WorkspaceMode,
     };
     use vibex_db::{DesiredRuntimeSwitchEnqueueRequest, WorkspaceRepository};
 
     use super::*;
     use crate::adapter::{
         ProviderCreateRequest, ProviderSessionHandle, ProviderTurnRequest, ProviderTurnResult,
+    };
+    use crate::runtime_lifecycle::{
+        RuntimeBackendSnapshot, RuntimeLeaseTarget, RuntimeLifecycleBackend,
+        RuntimeLifecycleConfig, RuntimeLifecycleService, RuntimeSweepReport,
     };
     use crate::runtime_switch::RuntimeSwitchCoordinator;
 
@@ -3858,6 +3906,46 @@ mod tests {
         identity: ProviderTurnExecutionIdentity,
         discoveries: Mutex<Vec<AgentCommandDiscoverRequest>>,
         executed_turns: Mutex<Vec<String>>,
+    }
+
+    struct FailingContinueRuntimeBackend {
+        materialize_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RuntimeLifecycleBackend for FailingContinueRuntimeBackend {
+        fn snapshot(&self, _session_id: &VibexSessionId) -> VibexResult<RuntimeBackendSnapshot> {
+            Ok(RuntimeBackendSnapshot {
+                materialization_status: RuntimeMaterializationStatus::NotMaterialized,
+                attachment: None,
+            })
+        }
+
+        fn process_snapshot(
+            &self,
+            _process_id: &RuntimeProcessId,
+        ) -> VibexResult<RuntimeProcessSnapshot> {
+            unreachable!("continuation materialization test does not inspect a process")
+        }
+
+        async fn materialize_owner(
+            &self,
+            _session_id: &VibexSessionId,
+        ) -> VibexResult<RuntimeBackendSnapshot> {
+            self.materialize_calls.fetch_add(1, Ordering::SeqCst);
+            Err(VibexError::process(
+                "continue_runtime_materialize_injected",
+                "injected continuation runtime materialization failure",
+            ))
+        }
+
+        async fn sweep(
+            &self,
+            _now_ms: i64,
+            _protected_targets: &[RuntimeLeaseTarget],
+        ) -> VibexResult<RuntimeSweepReport> {
+            Ok(RuntimeSweepReport::default())
+        }
     }
 
     #[async_trait]
@@ -4360,6 +4448,64 @@ mod tests {
             finished_error.code,
             "agent_continue_requires_incomplete_turn"
         );
+
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn continue_turn_materializes_runtime_before_prompt_dispatch() {
+        let db_path = temp_db_path("continue-materializes-runtime");
+        let workspace_root = temp_workspace_path("continue-materializes-runtime");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let manager = AgentManager::new(&db_path).unwrap();
+        let mut conn = manager.open_migrated().unwrap();
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let session = insert_session(
+            &conn,
+            "continue materializes runtime",
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            AgentId::parse("claude").unwrap(),
+            AgentSessionState::Idle,
+        );
+        TimelineRepository::append(
+            &mut conn,
+            &session.id,
+            TimelineSource::User,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "finish the task".into(),
+                attachments: Vec::new(),
+            }),
+            None,
+            None,
+            TimelineRedactionState::None,
+        )
+        .unwrap();
+        drop(conn);
+
+        let backend = Arc::new(FailingContinueRuntimeBackend {
+            materialize_calls: AtomicUsize::new(0),
+        });
+        let lifecycle = Arc::new(
+            RuntimeLifecycleService::new(backend.clone(), RuntimeLifecycleConfig::default())
+                .unwrap(),
+        );
+        manager.install_runtime_lifecycle(&lifecycle).unwrap();
+
+        let error = manager
+            .continue_turn(ContinueAgentTurnRequest {
+                session_id: session.id,
+                correlation_id: None,
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, "continue_runtime_materialize_injected");
+        assert_eq!(backend.materialize_calls.load(Ordering::SeqCst), 1);
 
         cleanup_db(&db_path);
         let _ = fs::remove_dir_all(workspace_root);

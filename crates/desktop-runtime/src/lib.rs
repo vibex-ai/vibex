@@ -954,6 +954,7 @@ impl DesktopRuntime {
             )),
             RuntimeLifecycleConfig::default(),
         )?);
+        manager.install_runtime_lifecycle(&runtime_lifecycle)?;
         runtime_switch_bridge.install_runtime_lifecycle(&runtime_lifecycle)?;
         let runtime_selection = Arc::new(RuntimeSelectionService::new(
             runtime_switch_coordinator,

@@ -1375,10 +1375,17 @@ ContinueAgentTurnRequest {
   adapter versions attach a `messageId` to the same account, capacity, rate,
   or upstream failure; those known terminal error forms must be normalized the
   same way before `end_turn` can synthesize a final Agent message.
-- `continue_turn` reloads the same current `RuntimeBinding`, activation
-  generation, effective selection, and committed ACP attachment used by the
-  failed turn. Missing or mismatched authority fails closed; the fallback must
-  not restore/create another attachment or choose another Profile.
+- After eligibility is confirmed, `continue_turn` materializes the exact
+  DB-current runtime through an internal `BackgroundWorker` lifecycle lease and
+  holds that lease through prompt completion. A missing, swept, or crashed
+  in-memory attachment may be restored from the current `RuntimeBinding`; that
+  lifecycle operation may advance the binding's activation generation through
+  its normal CAS before turn admission.
+- After materialization, `continue_turn` rereads the current `RuntimeBinding`,
+  activation generation, effective selection, and committed ACP attachment.
+  Missing or mismatched authority fails closed; continuation must not choose a
+  different binding, Agent, Profile, or Model, and it must not dispatch against
+  the pre-materialization execution fence.
 
 ### 4. Validation & Error Matrix
 
@@ -1394,14 +1401,22 @@ ContinueAgentTurnRequest {
 - Codex returns an unattributed terminal message plus `end_turn` -> return a
   structured Provider error and leave no final Agent message that could suppress
   continuation.
-- Current RuntimeBinding or committed attachment changed after the failed turn
-  -> a bounded execution-fence conflict; do not send continuation input.
+- Lifecycle materialization cannot restore the DB-current RuntimeBinding ->
+  return its structured runtime/process error and do not send continuation
+  input.
+- Current RuntimeBinding or committed attachment changes after materialization
+  but before prompt admission -> a bounded execution-fence conflict; do not send
+  continuation input.
 
 ### 5. Good/Base/Bad Cases
 
 - Good: a provider stream fails, the session enters `error`, the user clicks
   Continue, the provider receives backend-owned continuation input, and the
   timeline shows only provider/agent follow-up items without a new user bubble.
+- Good: the failed attachment crashed or was swept before Continue; lifecycle
+  materialization restores the exact durable binding, advances its activation
+  generation if needed, and the manager derives the prompt fence from the fresh
+  durable state while the worker lease protects the turn.
 - Base: the user manually types a visible follow-up after an error; this uses
   `send_message`, appends a normal `user_message`, and also transitions the
   session through `running`.
@@ -1415,8 +1430,12 @@ ContinueAgentTurnRequest {
   sends provider input, returns provider items, moves the session to `idle`,
   and does not append a `TimelineItemKind::UserMessage`.
 - Manager/ACP test: a failed turn retains its current durable binding;
-  `continue_turn` sends only through the exact committed attachment and rejects
-  a missing or stale fence without restore/failover.
+  `continue_turn` sends only through the exact committed attachment produced by
+  lifecycle materialization and rejects a stale fence or route failover.
+- Manager unit test: an eligible `continue_turn` materializes the runtime before
+  prompt dispatch. ACP lifecycle coverage proves a swept/crashed attachment is
+  restored only from the DB-current binding, and the internal worker lease
+  protects it until the turn returns.
 - ACP runtime test: a capacity failure delivered as unattributed Codex text plus
   `end_turn` remains a retryable Provider error and emits no Agent delta/final
   message.
