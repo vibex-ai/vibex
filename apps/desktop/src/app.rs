@@ -171,8 +171,8 @@ const TITLE_BAR_NARROW_WINDOW_CONTROL_WIDTH: f32 = 36.0;
 const TITLE_BAR_WIDE_WINDOW_CONTROL_WIDTH: f32 = 44.0;
 const SIDEBAR_FLOATING_MAX_WIDTH: f32 = 320.0;
 const SIDEBAR_FLOATING_VIEWPORT_RATIO: f32 = 0.88;
-const WORKBENCH_MIN_CENTER_WIDTH: f32 = 640.0;
-const WORKBENCH_PREVIEW_MIN_CENTER_WIDTH: f32 = 480.0;
+const WORKBENCH_MIN_CENTER_WIDTH: f32 = 320.0;
+const WORKBENCH_PREVIEW_MIN_CENTER_WIDTH: f32 = 240.0;
 const SIDEBAR_PANEL_MIN_WIDTH: f32 = 256.0;
 const PREVIEW_TERMINAL_TITLE: &str = "Vibex Shell";
 const SIDEBAR_PANEL_MAX_WIDTH: f32 = 480.0;
@@ -1386,7 +1386,6 @@ fn resized_right_panel_width(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WorkbenchAutoCollapseState {
     sidebar: bool,
-    right_rail: bool,
 }
 
 fn calculate_workbench_auto_collapse(
@@ -1397,8 +1396,6 @@ fn calculate_workbench_auto_collapse(
     sidebar_width: f32,
     right_rail_width: f32,
 ) -> WorkbenchAutoCollapseState {
-    let mut sidebar = false;
-    let mut right_rail = false;
     let right_rail_required_width = if right_rail_open {
         right_rail_width
     } else {
@@ -1409,43 +1406,17 @@ fn calculate_workbench_auto_collapse(
     } else {
         0.0
     };
-    let right_rail_min_center_width = if preview_side_open {
+    let minimum_center_width = if preview_side_open {
         WORKBENCH_PREVIEW_MIN_CENTER_WIDTH
     } else {
         WORKBENCH_MIN_CENTER_WIDTH
     };
-    let mut occupied_width = if sidebar_open { sidebar_width } else { 0.0 }
+    let occupied_width = if sidebar_open { sidebar_width } else { 0.0 }
         + right_rail_required_width
         + preview_required_width;
+    let sidebar = sidebar_open && viewport_width as f32 - occupied_width < minimum_center_width;
 
-    if preview_side_open
-        && viewport_width as f32 - occupied_width < WORKBENCH_MIN_CENTER_WIDTH
-        && sidebar_open
-    {
-        sidebar = true;
-        occupied_width -= sidebar_width;
-    }
-
-    if viewport_width as f32 - occupied_width < right_rail_min_center_width {
-        right_rail = true;
-        occupied_width = if sidebar_open && !sidebar {
-            sidebar_width
-        } else {
-            0.0
-        } + preview_required_width;
-    }
-
-    if viewport_width as f32 - occupied_width < WORKBENCH_MIN_CENTER_WIDTH
-        && sidebar_open
-        && !sidebar
-    {
-        sidebar = true;
-    }
-
-    WorkbenchAutoCollapseState {
-        sidebar,
-        right_rail,
-    }
+    WorkbenchAutoCollapseState { sidebar }
 }
 
 fn right_rail_mode_from_activity_id(activity_id: Option<&str>) -> RightRailMode {
@@ -16091,23 +16062,12 @@ impl VibexWorkbench {
             self.last_visibility.layout.viewport_width,
             self.last_visibility.layout.viewport_height,
         );
-        if !visibility.right_rail_docked {
-            return false;
-        }
         let new_session_open = self.new_session_open;
         let preview_fullscreen = !new_session_open && self.preview_fullscreen_active;
-        if self.ui_state.workbench.active_tab != "agent" || preview_fullscreen || new_session_open {
-            return false;
-        }
-        let auto_collapse = calculate_workbench_auto_collapse(
-            visibility.layout.viewport_width,
-            visibility.sidebar_docked && self.ui_state.workbench.sidebar_visible,
-            true,
-            visibility.preview_docked && self.ui_state.workbench.preview_visible,
-            self.sidebar_panel_width(visibility),
-            self.right_rail_panel_width(visibility),
-        );
-        !auto_collapse.right_rail
+        visibility.right_rail_docked
+            && self.ui_state.workbench.active_tab == "agent"
+            && !preview_fullscreen
+            && !new_session_open
     }
 
     fn sidebar_resize_limits(
@@ -38723,7 +38683,6 @@ impl Render for VibexWorkbench {
         );
         let auto_collapse = self.workbench_auto_collapse(visibility, cx);
         visibility.sidebar_docked &= !auto_collapse.sidebar;
-        visibility.right_rail_docked &= !auto_collapse.right_rail;
         let preview_fullscreen = !self.new_session_open && self.preview_fullscreen_active;
         let right_rail_suppressed = self.ui_state.workbench.active_tab != "agent"
             || self.new_session_open
@@ -42332,34 +42291,36 @@ mod tests {
     }
 
     #[test]
-    fn workbench_auto_collapse_matches_tauri_panel_priority() {
+    fn workbench_auto_collapse_preserves_the_docked_right_rail() {
         assert_eq!(
             calculate_workbench_auto_collapse(1_700, true, true, true, 320.0, 336.0),
-            WorkbenchAutoCollapseState {
-                sidebar: false,
-                right_rail: false,
-            }
+            WorkbenchAutoCollapseState { sidebar: false }
         );
         assert_eq!(
             calculate_workbench_auto_collapse(1_600, true, true, true, 320.0, 336.0),
-            WorkbenchAutoCollapseState {
-                sidebar: true,
-                right_rail: false,
-            }
+            WorkbenchAutoCollapseState { sidebar: false }
         );
         assert_eq!(
             calculate_workbench_auto_collapse(1_440, true, true, true, 320.0, 720.0),
-            WorkbenchAutoCollapseState {
-                sidebar: true,
-                right_rail: true,
-            }
+            WorkbenchAutoCollapseState { sidebar: true }
         );
         assert_eq!(
             calculate_workbench_auto_collapse(1_200, true, true, false, 320.0, 336.0),
-            WorkbenchAutoCollapseState {
-                sidebar: false,
-                right_rail: true,
-            }
+            WorkbenchAutoCollapseState { sidebar: false }
+        );
+    }
+
+    #[test]
+    fn workbench_center_width_thresholds_are_halved() {
+        assert_eq!(WORKBENCH_MIN_CENTER_WIDTH, 320.0);
+        assert_eq!(WORKBENCH_PREVIEW_MIN_CENTER_WIDTH, 240.0);
+        assert_eq!(
+            calculate_workbench_auto_collapse(975, true, true, false, 320.0, 336.0),
+            WorkbenchAutoCollapseState { sidebar: true }
+        );
+        assert_eq!(
+            calculate_workbench_auto_collapse(976, true, true, false, 320.0, 336.0),
+            WorkbenchAutoCollapseState { sidebar: false }
         );
     }
 

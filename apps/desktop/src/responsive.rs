@@ -1,5 +1,7 @@
 use vibex_ui::{PanelPresentation, ShellLayout};
 
+const DOCKED_RIGHT_RAIL_MIN_WIDTH: u32 = 900;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WorkbenchVisibility {
     pub layout: ShellLayout,
@@ -17,7 +19,7 @@ impl WorkbenchVisibility {
         Self {
             sidebar_docked: layout.sidebar == PanelPresentation::Docked,
             preview_docked: layout.preview == PanelPresentation::Docked,
-            right_rail_docked: layout.right_rail == PanelPresentation::Docked,
+            right_rail_docked: width >= DOCKED_RIGHT_RAIL_MIN_WIDTH,
             sidebar_toggle_reachable: true,
             preview_toggle_reachable: true,
             right_rail_toggle_reachable: true,
@@ -46,5 +48,12 @@ mod tests {
             assert!(visibility.right_rail_toggle_reachable);
             assert!(visibility.layout.docked_minimum_width() <= width as f32);
         }
+    }
+
+    #[test]
+    fn desktop_keeps_the_right_rail_in_flow_at_supported_widths() {
+        assert!(WorkbenchVisibility::resolve(1_200, 780).right_rail_docked);
+        assert!(WorkbenchVisibility::resolve(900, 720).right_rail_docked);
+        assert!(!WorkbenchVisibility::resolve(899, 720).right_rail_docked);
     }
 }
