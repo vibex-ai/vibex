@@ -1068,6 +1068,17 @@ fn ambiguous_message_submission_notice() -> &'static str {
     )
 }
 
+fn render_top_centered_notification_layer(window: &Window, cx: &App) -> impl IntoElement + use<> {
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .flex()
+        .justify_center()
+        .child(Root::read(window, cx).notification.clone())
+}
+
 fn runtime_status_banner_is_visible(status: SessionRuntimeSelectionStatus) -> bool {
     // Runtime preparation is deliberately presentation-transparent. The
     // composer keeps the desired selection visible while durable submission
@@ -37657,7 +37668,7 @@ impl Render for VibexWorkbench {
         let attachment_image_preview = self.render_attachment_image_preview(cx);
         let sheet_layer = Root::render_sheet_layer(window, cx);
         let dialog_layer = Root::render_dialog_layer(window, cx);
-        let notification_layer = Root::render_notification_layer(window, cx);
+        let notification_layer = render_top_centered_notification_layer(window, cx);
         let startup_loading = self
             .startup_loading
             .then(|| startup_loading_overlay(self.startup_loading_indicator_visible, cx));
@@ -37741,7 +37752,7 @@ impl Render for VibexWorkbench {
             })
             .children(sheet_layer)
             .children(dialog_layer)
-            .children(notification_layer)
+            .child(notification_layer)
             .when_some(attachment_image_preview, |this, preview| {
                 this.child(preview)
             })
@@ -42660,6 +42671,16 @@ mod tests {
     #[test]
     fn ambiguous_submission_uses_a_top_centered_click_dismissable_autohide_notification() {
         let source = include_str!("app.rs");
+        let notification_layer = source
+            .split_once("fn render_top_centered_notification_layer(")
+            .and_then(|(_, tail)| tail.split_once("\nfn runtime_status_banner_is_visible("))
+            .map(|(body, _)| body)
+            .expect("notification layer should remain inspectable");
+        assert!(notification_layer.contains(".left_0()"));
+        assert!(notification_layer.contains(".right_0()"));
+        assert!(notification_layer.contains(".justify_center()"));
+        assert!(notification_layer.contains("Root::read(window, cx).notification.clone()"));
+
         let workbench_setup = source
             .split_once("    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {")
             .and_then(|(_, tail)| tail.split_once("\n    fn begin_runtime_start("))
