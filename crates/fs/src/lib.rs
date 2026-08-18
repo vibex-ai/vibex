@@ -596,7 +596,7 @@ impl WorkspaceFileService {
                     self.search_dir(&path, query, include_content, limit, results)?;
                 }
             } else if include_content && results.len() < limit {
-                self.search_file_content(&path, query, results)?;
+                self.search_file_content(&path, query, limit, results)?;
             }
         }
         Ok(())
@@ -606,6 +606,7 @@ impl WorkspaceFileService {
         &self,
         path: &Path,
         query: &str,
+        limit: usize,
         results: &mut Vec<FileSearchResult>,
     ) -> VibexResult<()> {
         let metadata = path_metadata(path)?;
@@ -619,6 +620,9 @@ impl WorkspaceFileService {
             return Ok(());
         };
         for (index, line) in content.lines().enumerate() {
+            if results.len() >= limit {
+                break;
+            }
             if line.to_lowercase().contains(query) {
                 results.push(FileSearchResult {
                     workspace_id: self.workspace_id.clone(),
@@ -628,7 +632,6 @@ impl WorkspaceFileService {
                     line: Some((index + 1) as u32),
                     snippet: Some(line.trim().chars().take(240).collect()),
                 });
-                break;
             }
         }
         Ok(())
@@ -1479,6 +1482,35 @@ mod tests {
             })
             .unwrap();
         assert_eq!(hits.len(), 1);
+        cleanup(root);
+    }
+
+    #[test]
+    fn content_search_returns_each_matching_line_within_the_global_limit() {
+        let root = temp_root("content-search-lines");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("notes.txt"),
+            "first needle\nsecond NEEDLE\nthird needle\n",
+        )
+        .unwrap();
+        let workspace_id = WorkspaceId::new();
+        let service = WorkspaceFileService::new(&root, workspace_id.clone()).unwrap();
+
+        let hits = service
+            .search(&FileSearchRequest {
+                workspace_id,
+                query: "needle".to_string(),
+                include_content: true,
+                limit: Some(2),
+            })
+            .unwrap();
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].line, Some(1));
+        assert_eq!(hits[0].snippet.as_deref(), Some("first needle"));
+        assert_eq!(hits[1].line, Some(2));
+        assert_eq!(hits[1].snippet.as_deref(), Some("second NEEDLE"));
         cleanup(root);
     }
 
