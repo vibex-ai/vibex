@@ -97,7 +97,8 @@ use vibex_desktop_model::{
     NewSessionLocation, NewSessionProjectTicket, NewSessionSubmissionStage,
     NewSessionWorkspaceState, RUNTIME_SELECTION_PREFERENCE_LIMIT, RuntimeCascadeChoice,
     RuntimeCascadeProjection, SessionContentWidthMode, SessionUiState, SidebarHierarchyMode,
-    SidebarOrganizationItem, SidebarOrganizationScope, SidebarProjectProjection, SidebarState,
+    SidebarOrganizationItem, SidebarOrganizationScope, SidebarProjectAppearance,
+    SidebarProjectLogo, SidebarProjectLogoColor, SidebarProjectProjection, SidebarState,
     SidebarWorkspaceProjection, StartupDestination, TerminalWorkingDirectory,
     ThemeMode as ModelThemeMode, ThrottledUiStateWriter, TimelineConversationTurn,
     TimelineFollowState, TimelineModel, TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
@@ -3533,6 +3534,7 @@ pub struct VibexWorkbench {
     sidebar_hover_preview_suppressed_until: Option<Instant>,
     sidebar_hover_preview_close_task: Option<Task<()>>,
     sidebar_context_menu_target: Option<SidebarContextMenuTarget>,
+    sidebar_project_appearance_popover: Option<String>,
     sidebar_resize_drag: Option<SidebarResizeDragState>,
     right_panel_resize_drag: Option<RightPanelResizeDragState>,
     pair_button_hovered: bool,
@@ -4135,6 +4137,7 @@ impl VibexWorkbench {
             sidebar_hover_preview_suppressed_until: None,
             sidebar_hover_preview_close_task: None,
             sidebar_context_menu_target: None,
+            sidebar_project_appearance_popover: None,
             sidebar_resize_drag: None,
             right_panel_resize_drag: None,
             pair_button_hovered: false,
@@ -15847,7 +15850,77 @@ impl VibexWorkbench {
         }
     }
 
+    fn set_sidebar_project_appearance_popover(
+        &mut self,
+        project_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.sidebar_project_appearance_popover != project_id {
+            self.sidebar_project_appearance_popover = project_id;
+            cx.notify();
+        }
+    }
+
+    fn sidebar_project_appearance(&self, project_id: &str) -> SidebarProjectAppearance {
+        self.ui_state
+            .sidebar
+            .project_appearances
+            .get(project_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn store_sidebar_project_appearance(
+        &mut self,
+        project_id: String,
+        appearance: SidebarProjectAppearance,
+        cx: &mut Context<Self>,
+    ) {
+        if appearance == SidebarProjectAppearance::default() {
+            self.ui_state
+                .sidebar
+                .project_appearances
+                .remove(&project_id);
+        } else {
+            self.ui_state
+                .sidebar
+                .project_appearances
+                .insert(project_id, appearance);
+        }
+        self.queue_ui_state();
+        cx.notify();
+    }
+
+    fn set_sidebar_project_logo(
+        &mut self,
+        project_id: String,
+        logo: SidebarProjectLogo,
+        cx: &mut Context<Self>,
+    ) {
+        let mut appearance = self.sidebar_project_appearance(&project_id);
+        if appearance.logo == logo {
+            return;
+        }
+        appearance.logo = logo;
+        self.store_sidebar_project_appearance(project_id, appearance, cx);
+    }
+
+    fn set_sidebar_project_logo_color(
+        &mut self,
+        project_id: String,
+        color: SidebarProjectLogoColor,
+        cx: &mut Context<Self>,
+    ) {
+        let mut appearance = self.sidebar_project_appearance(&project_id);
+        if appearance.color == color {
+            return;
+        }
+        appearance.color = color;
+        self.store_sidebar_project_appearance(project_id, appearance, cx);
+    }
+
     fn dismiss_sidebar_for_navigation(&mut self) {
+        self.sidebar_project_appearance_popover = None;
         let hover_preview_was_open = self.sidebar_hover_preview_open;
         let next = sidebar_display_after_navigation(
             self.ui_state.workbench.sidebar_visible,
@@ -17510,10 +17583,12 @@ impl VibexWorkbench {
         cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
         let _ = entity.update(cx, |this, _| this.retain_sidebar_hover_preview());
+        let appearance_entity = entity.clone();
         let auto_continue_entity = entity.clone();
         let new_folder_entity = entity.clone();
         let import_entity = entity.clone();
         let delete_entity = entity;
+        let appearance_project_id = target.project_id.clone();
         let auto_continue_project_id = target.project_id.clone();
         let new_folder_project_id = target.project_id.clone();
         let import_workspace = target.import_workspace.clone();
@@ -17525,6 +17600,18 @@ impl VibexWorkbench {
 
         menu.item(PopupMenuItem::label(target.project_name))
             .separator()
+            .item(
+                PopupMenuItem::new(locale::text("Customize Logo", "自定义图标", "自訂圖示"))
+                    .icon(sidebar_icon("icons/vibex/sparkles.svg"))
+                    .on_click(move |_, _, cx| {
+                        let _ = appearance_entity.update(cx, |this, cx| {
+                            this.set_sidebar_project_appearance_popover(
+                                Some(appearance_project_id.as_str().to_string()),
+                                cx,
+                            )
+                        });
+                    }),
+            )
             .item(
                 PopupMenuItem::new(locale::text("New Folder", "新建文件夹", "新建資料夾"))
                     .icon(sidebar_icon("icons/vibex/folder-plus.svg"))
@@ -18181,6 +18268,149 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
+    fn render_sidebar_project_appearance_popover(
+        &mut self,
+        project_id: String,
+        project_name: String,
+        appearance: SidebarProjectAppearance,
+        trigger: Button,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let entity = cx.weak_entity();
+        let mut logo_buttons = Vec::with_capacity(SidebarProjectLogo::ALL.len());
+        for logo in SidebarProjectLogo::ALL {
+            let button_entity = entity.clone();
+            let button_project_id = project_id.clone();
+            logo_buttons.push(
+                Button::new(format!("sidebar-project-logo-choice-{project_id}-{logo:?}"))
+                    .xsmall()
+                    .ghost()
+                    .compact()
+                    .w(px(26.0))
+                    .h(px(26.0))
+                    .selected(appearance.logo == logo)
+                    .icon(
+                        sidebar_project_logo_icon(logo)
+                            .size(px(14.0))
+                            .text_color(sidebar_project_logo_color(appearance.color, cx)),
+                    )
+                    .tooltip(sidebar_project_logo_label(logo))
+                    .on_click(move |_, _, cx| {
+                        let _ = button_entity.update(cx, |this, cx| {
+                            this.set_sidebar_project_logo(button_project_id.clone(), logo, cx)
+                        });
+                    }),
+            );
+        }
+
+        let mut color_buttons = Vec::with_capacity(SidebarProjectLogoColor::ALL.len());
+        for color in SidebarProjectLogoColor::ALL {
+            let selected = appearance.color == color;
+            let swatch_color = sidebar_project_logo_color(color, cx);
+            let button_entity = entity.clone();
+            let button_project_id = project_id.clone();
+            color_buttons.push(
+                Button::new(format!("sidebar-project-logo-color-{project_id}-{color:?}"))
+                    .xsmall()
+                    .ghost()
+                    .compact()
+                    .w(px(26.0))
+                    .h(px(26.0))
+                    .selected(selected)
+                    .tooltip(sidebar_project_logo_color_label(color))
+                    .child(
+                        div()
+                            .size(px(14.0))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(if selected {
+                                cx.theme().foreground
+                            } else {
+                                cx.theme().border
+                            })
+                            .bg(swatch_color),
+                    )
+                    .on_click(move |_, _, cx| {
+                        let _ = button_entity.update(cx, |this, cx| {
+                            this.set_sidebar_project_logo_color(
+                                button_project_id.clone(),
+                                color,
+                                cx,
+                            )
+                        });
+                    }),
+            );
+        }
+
+        let panel = v_flex()
+            .w(px(260.0))
+            .gap_3()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(cx.theme().border.opacity(0.80))
+            .bg(cx.theme().popover)
+            .p_3()
+            .shadow_lg()
+            .text_color(cx.theme().popover_foreground)
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .gap(px(2.0))
+                    .child(div().text_sm().font_semibold().child(locale::text(
+                        "Project logo",
+                        "项目图标",
+                        "專案圖示",
+                    )))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(project_name),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(locale::text("Logo", "图标", "圖示")),
+                    )
+                    .child(h_flex().gap_1().children(logo_buttons)),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(locale::text("Color", "颜色", "顏色")),
+                    )
+                    .child(h_flex().gap_1().children(color_buttons)),
+            );
+
+        let popover_project_id = project_id.clone();
+        Popover::new(format!("sidebar-project-logo-popover-{project_id}"))
+            .anchor(Anchor::TopLeft)
+            .appearance(false)
+            .open(self.sidebar_project_appearance_popover.as_deref() == Some(project_id.as_str()))
+            .on_open_change(cx.listener(move |this, open: &bool, _, cx| {
+                this.set_sidebar_project_appearance_popover(
+                    (*open).then(|| popover_project_id.clone()),
+                    cx,
+                )
+            }))
+            .trigger(trigger)
+            .child(panel)
+            .into_any_element()
+    }
+
     fn render_sidebar_project(
         &mut self,
         group: &SidebarProjectProjection,
@@ -18261,6 +18491,31 @@ impl VibexWorkbench {
         let locale = self.resolved_locale();
         let project_actions_label = sidebar_project_actions_label(locale, &project_name);
         let new_session_label = sidebar_new_session_for_project_label(locale, &project_name);
+        let project_appearance = self.sidebar_project_appearance(&project_id_string);
+        let project_logo_trigger =
+            Button::new(format!("sidebar-project-logo-trigger-{project_id_string}"))
+                .xsmall()
+                .ghost()
+                .compact()
+                .w(px(24.0))
+                .h(px(24.0))
+                .icon(
+                    sidebar_project_logo_icon(project_appearance.logo)
+                        .size(px(14.0))
+                        .text_color(sidebar_project_logo_color(project_appearance.color, cx)),
+                )
+                .tooltip(locale::text(
+                    "Customize project logo",
+                    "自定义项目图标",
+                    "自訂專案圖示",
+                ));
+        let project_logo_popover = self.render_sidebar_project_appearance_popover(
+            project_id_string.clone(),
+            project_name.clone(),
+            project_appearance,
+            project_logo_trigger,
+            cx,
+        );
         let context_menu_hovered = self.sidebar_context_menu_target
             == Some(SidebarContextMenuTarget::Project(project_id_string.clone()));
         let context_menu_hover_entity = cx.weak_entity();
@@ -18405,10 +18660,7 @@ impl VibexWorkbench {
                     } else {
                         cx.theme().sidebar_foreground.opacity(0.78)
                     })
-                    .child(
-                        sidebar_icon("icons/vibex/boxes.svg")
-                            .text_color(cx.theme().sidebar_foreground.opacity(0.72)),
-                    )
+                    .child(project_logo_popover)
                     .child(
                         div()
                             .flex_1()
@@ -33143,6 +33395,58 @@ fn sidebar_icon(path: &'static str) -> Icon {
     Icon::default().path(path).small()
 }
 
+fn sidebar_project_logo_icon(logo: SidebarProjectLogo) -> Icon {
+    sidebar_icon(match logo {
+        SidebarProjectLogo::Boxes => "icons/vibex/boxes.svg",
+        SidebarProjectLogo::Code => "icons/vibex/code-xml.svg",
+        SidebarProjectLogo::Terminal => "icons/vibex/file-terminal.svg",
+        SidebarProjectLogo::Database => "icons/vibex/database.svg",
+        SidebarProjectLogo::GitBranch => "icons/vibex/git-branch.svg",
+        SidebarProjectLogo::Hash => "icons/vibex/hash.svg",
+        SidebarProjectLogo::Book => "icons/vibex/book-open-text.svg",
+        SidebarProjectLogo::Sparkles => "icons/vibex/sparkles.svg",
+    })
+}
+
+fn sidebar_project_logo_color(color: SidebarProjectLogoColor, cx: &App) -> Hsla {
+    match color {
+        SidebarProjectLogoColor::Neutral => cx.theme().sidebar_foreground.opacity(0.72),
+        SidebarProjectLogoColor::Blue => cx.theme().blue,
+        SidebarProjectLogoColor::Cyan => cx.theme().cyan,
+        SidebarProjectLogoColor::Green => cx.theme().green,
+        SidebarProjectLogoColor::Yellow => cx.theme().yellow,
+        SidebarProjectLogoColor::Orange => rgb(0xf97316).into(),
+        SidebarProjectLogoColor::Red => cx.theme().red,
+        SidebarProjectLogoColor::Magenta => cx.theme().magenta,
+    }
+}
+
+fn sidebar_project_logo_label(logo: SidebarProjectLogo) -> &'static str {
+    match logo {
+        SidebarProjectLogo::Boxes => locale::text("Boxes", "模块", "模組"),
+        SidebarProjectLogo::Code => locale::text("Code", "代码", "程式碼"),
+        SidebarProjectLogo::Terminal => locale::text("Terminal", "终端", "終端機"),
+        SidebarProjectLogo::Database => locale::text("Database", "数据库", "資料庫"),
+        SidebarProjectLogo::GitBranch => locale::text("Git branch", "Git 分支", "Git 分支"),
+        SidebarProjectLogo::Hash => locale::text("Hash", "井号", "井號"),
+        SidebarProjectLogo::Book => locale::text("Book", "文档", "文件"),
+        SidebarProjectLogo::Sparkles => locale::text("Sparkles", "闪光", "閃光"),
+    }
+}
+
+fn sidebar_project_logo_color_label(color: SidebarProjectLogoColor) -> &'static str {
+    match color {
+        SidebarProjectLogoColor::Neutral => locale::text("Neutral", "中性", "中性"),
+        SidebarProjectLogoColor::Blue => locale::text("Blue", "蓝色", "藍色"),
+        SidebarProjectLogoColor::Cyan => locale::text("Cyan", "青色", "青色"),
+        SidebarProjectLogoColor::Green => locale::text("Green", "绿色", "綠色"),
+        SidebarProjectLogoColor::Yellow => locale::text("Yellow", "黄色", "黃色"),
+        SidebarProjectLogoColor::Orange => locale::text("Orange", "橙色", "橙色"),
+        SidebarProjectLogoColor::Red => locale::text("Red", "红色", "紅色"),
+        SidebarProjectLogoColor::Magenta => locale::text("Magenta", "洋红", "洋紅"),
+    }
+}
+
 fn sidebar_worktree_lifecycle_label(state: WorktreeLifecycleDisplayState) -> &'static str {
     match state {
         WorktreeLifecycleDisplayState::Working => locale::text("Working", "开发中", "開發中"),
@@ -40721,6 +41025,37 @@ mod tests {
             .expect("the project action button should expose a menu");
         assert!(project[row_menu..].contains("Self::build_sidebar_project_menu("));
         assert!(project[action_menu..].contains("Self::build_sidebar_project_menu("));
+    }
+
+    #[test]
+    fn sidebar_project_logo_picker_is_anchored_and_reachable_from_the_menu() {
+        let source = include_str!("app.rs");
+        let picker = source
+            .split_once("    fn render_sidebar_project_appearance_popover(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_project("))
+            .map(|(body, _)| body)
+            .expect("project logo picker should remain inspectable");
+        let project = source
+            .split_once("    fn render_sidebar_project(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_workspace("))
+            .map(|(body, _)| body)
+            .expect("project renderer should remain inspectable");
+        let menu = source
+            .split_once("    fn build_sidebar_project_menu(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn build_sidebar_root_menu("))
+            .map(|(body, _)| body)
+            .expect("project menu should remain inspectable");
+
+        assert!(picker.contains("Popover::new(format!(\"sidebar-project-logo-popover-"));
+        assert!(picker.contains(".anchor(Anchor::TopLeft)"));
+        assert!(picker.contains("for logo in SidebarProjectLogo::ALL"));
+        assert!(picker.contains("for color in SidebarProjectLogoColor::ALL"));
+        assert!(picker.contains("this.set_sidebar_project_logo("));
+        assert!(picker.contains("this.set_sidebar_project_logo_color("));
+        assert!(project.contains("sidebar-project-logo-trigger-"));
+        assert!(project.contains("render_sidebar_project_appearance_popover("));
+        assert!(menu.contains("Customize Logo"));
+        assert!(menu.contains("set_sidebar_project_appearance_popover("));
     }
 
     #[test]

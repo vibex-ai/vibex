@@ -96,6 +96,67 @@ pub enum TerminalWorkingDirectory {
     CurrentFile,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SidebarProjectLogo {
+    #[default]
+    Boxes,
+    Code,
+    Terminal,
+    Database,
+    GitBranch,
+    Hash,
+    Book,
+    Sparkles,
+}
+
+impl SidebarProjectLogo {
+    pub const ALL: [Self; 8] = [
+        Self::Boxes,
+        Self::Code,
+        Self::Terminal,
+        Self::Database,
+        Self::GitBranch,
+        Self::Hash,
+        Self::Book,
+        Self::Sparkles,
+    ];
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SidebarProjectLogoColor {
+    #[default]
+    Neutral,
+    Blue,
+    Cyan,
+    Green,
+    Yellow,
+    Orange,
+    Red,
+    Magenta,
+}
+
+impl SidebarProjectLogoColor {
+    pub const ALL: [Self; 8] = [
+        Self::Neutral,
+        Self::Blue,
+        Self::Cyan,
+        Self::Green,
+        Self::Yellow,
+        Self::Orange,
+        Self::Red,
+        Self::Magenta,
+    ];
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SidebarProjectAppearance {
+    pub logo: SidebarProjectLogo,
+    pub color: SidebarProjectLogoColor,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FontSetting {
@@ -215,6 +276,8 @@ pub struct SidebarUiState {
     pub hierarchy_mode: SidebarHierarchyMode,
     #[serde(default)]
     pub project_location_preferences: BTreeMap<String, NewSessionLocation>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub project_appearances: BTreeMap<String, SidebarProjectAppearance>,
     #[serde(default)]
     pub organization: SidebarOrganizationState,
 }
@@ -486,6 +549,13 @@ impl DesktopUiStateV1 {
                 })
                 .take(1_000)
                 .collect();
+        self.sidebar.project_appearances = std::mem::take(&mut self.sidebar.project_appearances)
+            .into_iter()
+            .filter_map(|(project_id, appearance)| {
+                bounded_required(&project_id, 256).map(|project_id| (project_id, appearance))
+            })
+            .take(1_000)
+            .collect();
         self.sidebar.organization.normalize();
         normalize_ids(&mut self.preview.pinned_tab_ids, 500);
         self.preview.focused_pane_id = bounded_optional(self.preview.focused_pane_id.take(), 256);
@@ -594,6 +664,9 @@ impl DesktopUiStateV1 {
             .retain(|id| references.project_ids.contains(id));
         self.sidebar
             .project_location_preferences
+            .retain(|id, _| references.project_ids.contains(id));
+        self.sidebar
+            .project_appearances
             .retain(|id, _| references.project_ids.contains(id));
         self.sidebar
             .collapsed_workspace_ids
@@ -1228,11 +1301,32 @@ mod tests {
             .sidebar
             .project_location_preferences
             .insert(" project-1 ".into(), NewSessionLocation::NewWorktree);
+        state.sidebar.project_appearances.insert(
+            " project-1 ".into(),
+            SidebarProjectAppearance {
+                logo: SidebarProjectLogo::Database,
+                color: SidebarProjectLogoColor::Cyan,
+            },
+        );
         state.normalize().unwrap();
         assert_eq!(state.sidebar.hierarchy_mode, SidebarHierarchyMode::Detailed);
         assert_eq!(
             state.sidebar.project_location_preferences.get("project-1"),
             Some(&NewSessionLocation::NewWorktree)
+        );
+        assert_eq!(
+            state.sidebar.project_appearances.get("project-1"),
+            Some(&SidebarProjectAppearance {
+                logo: SidebarProjectLogo::Database,
+                color: SidebarProjectLogoColor::Cyan,
+            })
+        );
+
+        let round_trip: DesktopUiStateV1 =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(
+            round_trip.sidebar.project_appearances,
+            state.sidebar.project_appearances
         );
 
         let mut value = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
@@ -1242,6 +1336,7 @@ mod tests {
             .unwrap();
         sidebar.remove("hierarchyMode");
         sidebar.remove("projectLocationPreferences");
+        sidebar.remove("projectAppearances");
         sidebar.remove("collapsedWorkspaceIds");
         let decoded = decode_and_migrate(&serde_json::to_vec(&value).unwrap()).unwrap();
         assert_eq!(
@@ -1249,6 +1344,7 @@ mod tests {
             SidebarHierarchyMode::Compact
         );
         assert!(decoded.sidebar.project_location_preferences.is_empty());
+        assert!(decoded.sidebar.project_appearances.is_empty());
         assert!(decoded.sidebar.collapsed_workspace_ids.is_empty());
     }
 
@@ -1724,6 +1820,13 @@ mod tests {
     fn authoritative_empty_references_remove_all_stale_ids() {
         let mut state = DesktopUiStateV1::default();
         state.sidebar.project_order = vec!["project".to_string()];
+        state.sidebar.project_appearances.insert(
+            "project".to_string(),
+            SidebarProjectAppearance {
+                logo: SidebarProjectLogo::Sparkles,
+                color: SidebarProjectLogoColor::Magenta,
+            },
+        );
         state.sidebar.session_order = vec!["session".to_string()];
         assert!(state.sidebar.organization.create_folder(
             "folder",
@@ -1761,6 +1864,7 @@ mod tests {
 
         state.cleanup_stale_ids(&UiStateReferences::default());
         assert!(state.sidebar.project_order.is_empty());
+        assert!(state.sidebar.project_appearances.is_empty());
         assert!(state.sidebar.session_order.is_empty());
         assert_eq!(
             state.sidebar.organization,
