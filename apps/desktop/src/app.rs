@@ -33532,17 +33532,33 @@ fn format_sidebar_session_time(
     locale: locale::ResolvedLocale,
     strings: Strings,
 ) -> String {
-    const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
-    let elapsed_ms = unix_timestamp_ms().saturating_sub(timestamp_ms).max(0);
-    let local_time = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(timestamp_ms)
-        .map(|timestamp| timestamp.with_timezone(&chrono::Local));
-    if elapsed_ms < DAY_MS {
-        return local_time
-            .map(|timestamp| timestamp.format("%H:%M").to_string())
-            .unwrap_or_default();
+    let Some(local_time) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(timestamp_ms)
+        .map(|timestamp| timestamp.with_timezone(&chrono::Local).naive_local())
+    else {
+        return String::new();
+    };
+    format_sidebar_session_time_at(
+        local_time,
+        chrono::Local::now().naive_local(),
+        locale,
+        strings,
+    )
+}
+
+fn format_sidebar_session_time_at(
+    local_time: chrono::NaiveDateTime,
+    now: chrono::NaiveDateTime,
+    locale: locale::ResolvedLocale,
+    strings: Strings,
+) -> String {
+    let days = now
+        .date()
+        .signed_duration_since(local_time.date())
+        .num_days();
+    if days <= 0 {
+        return local_time.format("%H:%M").to_string();
     }
-    let days = elapsed_ms / DAY_MS;
-    if days <= 1 {
+    if days == 1 {
         return strings.sidebar_yesterday.to_string();
     }
     if days < 7 {
@@ -33560,9 +33576,7 @@ fn format_sidebar_session_time(
             locale::ResolvedLocale::ZhTw => format!("{weeks} 週前"),
         };
     }
-    local_time
-        .map(|timestamp| timestamp.format("%m/%d").to_string())
-        .unwrap_or_default()
+    local_time.format("%m/%d").to_string()
 }
 
 #[cfg(test)]
@@ -41860,6 +41874,45 @@ mod tests {
             cached
         );
         assert_eq!(sidebar_session_agent_id(&persisted, None, None), persisted);
+    }
+
+    #[test]
+    fn sidebar_session_time_uses_local_calendar_days() {
+        let at = |day, hour, minute| {
+            chrono::NaiveDate::from_ymd_opt(2026, 8, day)
+                .unwrap()
+                .and_hms_opt(hour, minute, 0)
+                .unwrap()
+        };
+        let now = at(18, 0, 1);
+
+        assert_eq!(
+            format_sidebar_session_time_at(
+                at(17, 23, 59),
+                now,
+                locale::ResolvedLocale::ZhCn,
+                locale::strings(locale::ResolvedLocale::ZhCn),
+            ),
+            "昨天"
+        );
+        assert_eq!(
+            format_sidebar_session_time_at(
+                at(18, 0, 0),
+                now,
+                locale::ResolvedLocale::En,
+                locale::strings(locale::ResolvedLocale::En),
+            ),
+            "00:00"
+        );
+        assert_eq!(
+            format_sidebar_session_time_at(
+                at(16, 23, 59),
+                now,
+                locale::ResolvedLocale::En,
+                locale::strings(locale::ResolvedLocale::En),
+            ),
+            "2 days ago"
+        );
     }
 
     #[test]
