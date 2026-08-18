@@ -14461,7 +14461,19 @@ impl VibexWorkbench {
         if !self.ui_state.sidebar.organization.delete_folder(folder_id) {
             return;
         }
-        if self.sidebar_rename_target == Some(SidebarRenameTarget::Folder(folder_id.to_string())) {
+        let rename_target_is_stale =
+            self.sidebar_rename_target
+                .as_ref()
+                .is_some_and(|target| match target {
+                    SidebarRenameTarget::Session(_) => false,
+                    SidebarRenameTarget::Folder(target_id) => !self
+                        .ui_state
+                        .sidebar
+                        .organization
+                        .folders
+                        .contains_key(target_id),
+                });
+        if rename_target_is_stale {
             self.sidebar_rename_target = None;
             self.sidebar_rename_error = None;
         }
