@@ -413,6 +413,13 @@ mod platform {
 mod tests {
     use super::*;
 
+    const ANDROID_MANIFEST: &str = include_str!("../android/app/src/main/AndroidManifest.xml");
+    const ANDROID_ACTIVITY: &str =
+        include_str!("../android/app/src/main/java/ai/vibex/mobile/GpuiNativeActivity.java");
+    const ANDROID_CONNECTION_SERVICE: &str =
+        include_str!("../android/app/src/main/java/ai/vibex/mobile/RemoteConnectionService.java");
+    const BACKGROUND_CONNECTION_SOURCE: &str = include_str!("background_connection.rs");
+
     fn notification() -> BackendEvent {
         BackendEvent::Notification(vibex_core::AgentNotificationIntent {
             notification_id: "notification-a".to_string(),
@@ -444,5 +451,37 @@ mod tests {
         assert!(is_terminal(RemoteConnectionState::Incompatible));
         assert!(!is_terminal(RemoteConnectionState::Online));
         assert!(!is_terminal(RemoteConnectionState::Offline));
+    }
+
+    #[test]
+    fn android_background_connection_packaging_contract_is_complete() {
+        assert!(ANDROID_MANIFEST.contains(
+            r#"<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />"#
+        ));
+        assert!(ANDROID_MANIFEST.contains(
+            r#"<uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />"#
+        ));
+        assert!(ANDROID_MANIFEST.contains(
+            r#"<service
+            android:name=".RemoteConnectionService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice"
+            android:stopWithTask="false" />"#
+        ));
+        assert!(ANDROID_CONNECTION_SERVICE.contains("return START_NOT_STICKY;"));
+
+        for method in [
+            "startRemoteConnectionService",
+            "stopRemoteConnectionService",
+        ] {
+            assert!(
+                ANDROID_ACTIVITY.contains(&format!("public void {method}()")),
+                "Android Activity is missing the {method} JNI bridge"
+            );
+            assert!(
+                BACKGROUND_CONNECTION_SOURCE.contains(&format!(r#"jni::jni_str!("{method}")"#)),
+                "Rust is missing the {method} JNI call"
+            );
+        }
     }
 }

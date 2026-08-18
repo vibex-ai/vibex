@@ -77,7 +77,7 @@ Android RemoteConnectionService = connectedDevice foreground service, START_NOT_
 - Lock-screen copy and native payloads must not include prompt/answer text,
   commands, file paths, tool output, approval details, or any auth material.
 
-### 4. Background Delivery Boundary
+### 4. Validation & Error Matrix
 
 - On Android, a live Remote event plus a local native notification works while
   the authenticated foreground service and process remain alive. The service is
@@ -90,7 +90,24 @@ Android RemoteConnectionService = connectedDevice foreground service, START_NOT_
   and dispatch have their own authenticated Relay contract, UI and docs must
   not claim killed-process background push.
 
-### 5. Tests Required
+| Condition | Required result |
+| --- | --- |
+| The installed APK predates the background-service build or omits either foreground-service permission | Device qualification fails before testing delivery; source files and a locally built APK are not evidence about the installed package. |
+| The launcher is resumed and the Vibex Activity is `STOPPED`, but `RemoteConnectionService` is absent or not foreground | Background delivery qualification fails. |
+| The Activity is `STOPPED` and the Vibex process becomes cached/frozen instead of remaining in the foreground-service state | Background delivery qualification fails. |
+| The user force-stops Vibex, Android kills the process, or the device reboots | Live-only delivery ends without silently claiming push support. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: install the newly built APK, connect in the foreground, open the system
+  launcher, then observe a `connectedDevice` foreground service and a non-cached,
+  non-frozen Vibex process while the Activity is `STOPPED`.
+- Base: foreground notifications continue through the same Rust subscription and
+  native presenter while the Activity is resumed.
+- Bad: inspect the new source manifest or compile an APK, then test an older
+  installed package whose manifest and process state do not contain the service.
+
+### 6. Tests Required
 
 - Core/Agent tests cover stable privacy-bounded intent production.
 - Gateway tests include `agent_notification` in permission-filtered topics.
@@ -100,8 +117,13 @@ Android RemoteConnectionService = connectedDevice foreground service, START_NOT_
   shutdown, background UI-event dropping, and recreated-Activity lifecycle
   state. Android validation covers the non-exported `connectedDevice` service,
   foreground-service permissions, `START_NOT_STICKY`, and JNI bridge signatures.
+- Device qualification installs the freshly built APK and verifies its package
+  update time plus both foreground-service permissions before launch. After an
+  authenticated connection, resume the system launcher and assert with Android
+  system state that the Vibex Activity is `STOPPED`, the service is foreground
+  with type `connectedDevice`, and the process is neither cached nor frozen.
 
-### 6. Wrong vs Correct
+### 7. Wrong vs Correct
 
 ```text
 Wrong: native payload session id -> open session without backend validation
@@ -115,6 +137,9 @@ Correct: foreground service + process Tokio reader -> native presenter; resume -
 
 Wrong: foreground service owns a second socket or credential copy
 Correct: service keeps process runnable; one Rust manager owns the backend and event subscription
+
+Wrong: build new APK -> leave old APK installed -> report background delivery result
+Correct: install new APK -> verify installed manifest/update time -> connect -> background -> inspect Activity/service/process state
 ```
 
 ## Scenario: Remote Protocol v2 Gateway And Pairing
