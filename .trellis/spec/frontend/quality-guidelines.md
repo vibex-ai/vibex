@@ -126,8 +126,11 @@ pnpm build:mobile:ios
   left-moving finger opens the workspace-tools page from the right. Both pages
   follow the pointer continuously after a horizontal threshold, cover the full
   safe-area-adjusted viewport when open, close with the inverse gesture, and
-  snap by final direction or half-page with a faster close animation. A tap and
-  clearly vertical pan remain available to the underlying control or scroller.
+  settle after roughly 35% travel or a decisive final-direction delta, with
+  symmetric hysteresis for opening and closing and a faster close animation.
+  Small release-adjacent direction jitter must not override the travel decision.
+  A tap and clearly vertical pan remain available to the underlying control or
+  scroller.
 - Files, Git, Terminal, Providers, and Runtime live in the right workspace-tools
   page and remain selectable through its internal tabs. Do not duplicate these
   launchers in a strip on the center session page. The center-page swipe must
@@ -193,8 +196,9 @@ pnpm build:mobile:ios
   closes with the inverse gesture.
 - Good: the top-left menu button opens the same full-width Sessions page as the
   right-moving gesture.
-- Base: a slow horizontal drag remains linear and snaps by half-page on release;
-  a vertical pan continues scrolling the timeline or active side page.
+- Base: a slow horizontal drag remains linear and settles after roughly 35% of
+  the distance toward the next page; a vertical pan continues scrolling the
+  timeline or active side page.
 - Bad: make the left page edge-only or button-only, remove the explicit menu
   fallback, keep a fixed-width floating drawer, leave the five workspace
   launchers on the session page, or let a side page and the timeline scroll

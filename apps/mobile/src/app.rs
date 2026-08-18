@@ -4449,7 +4449,7 @@ fn drawer_terminal_target(
         return Some(if cancelled {
             settled_target
         } else {
-            drawer_snap_target(page, offset, last_dx)
+            drawer_snap_target(page, offset, last_dx, settled_target)
         });
     }
     drawer_offset_is_intermediate(offset).then(|| {
@@ -4515,13 +4515,21 @@ fn visible_drawer_page(offset: f32, snap: Option<DrawerSnap>) -> Option<DrawerPa
     }
 }
 
-fn drawer_snap_target(page: DrawerPage, offset: f32, last_dx: f32) -> f32 {
+fn drawer_snap_target(page: DrawerPage, offset: f32, last_dx: f32, settled_target: f32) -> f32 {
     let direction = page.open_offset();
     let directional_delta = last_dx * direction;
     let reveal = (offset * direction).clamp(0.0, 1.0);
-    if directional_delta < -2.0 {
+    if directional_delta < -theme::DRAWER_SNAP_DIRECTION_THRESHOLD {
         0.0
-    } else if directional_delta > 2.0 || reveal > 0.5 {
+    } else if directional_delta > theme::DRAWER_SNAP_DIRECTION_THRESHOLD {
+        direction
+    } else if (settled_target - direction).abs() < 0.001 {
+        if reveal <= 1.0 - theme::DRAWER_SNAP_TRAVEL_RATIO {
+            0.0
+        } else {
+            direction
+        }
+    } else if reveal >= theme::DRAWER_SNAP_TRAVEL_RATIO {
         direction
     } else {
         0.0
@@ -4925,15 +4933,64 @@ mod tests {
     }
 
     #[test]
-    fn drawer_snap_uses_direction_then_half_page() {
-        assert_eq!(drawer_snap_target(DrawerPage::Sessions, 0.2, 3.0), 1.0);
-        assert_eq!(drawer_snap_target(DrawerPage::Sessions, 0.8, -3.0), 0.0);
-        assert_eq!(drawer_snap_target(DrawerPage::Sessions, 0.6, 0.0), 1.0);
-        assert_eq!(drawer_snap_target(DrawerPage::Sessions, 0.4, 0.0), 0.0);
-        assert_eq!(drawer_snap_target(DrawerPage::Workbench, -0.2, -3.0), -1.0);
-        assert_eq!(drawer_snap_target(DrawerPage::Workbench, -0.8, 3.0), 0.0);
-        assert_eq!(drawer_snap_target(DrawerPage::Workbench, -0.6, 0.0), -1.0);
-        assert_eq!(drawer_snap_target(DrawerPage::Workbench, -0.4, 0.0), 0.0);
+    fn drawer_snap_uses_forgiving_travel_hysteresis() {
+        assert_eq!(
+            drawer_snap_target(DrawerPage::Sessions, 0.36, 0.0, 0.0),
+            1.0
+        );
+        assert_eq!(
+            drawer_snap_target(DrawerPage::Sessions, 0.34, 0.0, 0.0),
+            0.0
+        );
+        assert_eq!(
+            drawer_snap_target(DrawerPage::Sessions, 0.64, 0.0, 1.0),
+            0.0
+        );
+        assert_eq!(
+            drawer_snap_target(DrawerPage::Sessions, 0.66, 0.0, 1.0),
+            1.0
+        );
+        assert_eq!(
+            drawer_snap_target(DrawerPage::Workbench, -0.36, 0.0, 0.0),
+            -1.0
+        );
+        assert_eq!(
+            drawer_snap_target(DrawerPage::Workbench, -0.34, 0.0, 0.0),
+            0.0
+        );
+        assert_eq!(
+            drawer_snap_target(DrawerPage::Workbench, -0.64, 0.0, -1.0),
+            0.0
+        );
+        assert_eq!(
+            drawer_snap_target(DrawerPage::Workbench, -0.66, 0.0, -1.0),
+            -1.0
+        );
+    }
+
+    #[test]
+    fn drawer_snap_ignores_release_jitter_but_honors_decisive_direction() {
+        assert_eq!(
+            drawer_snap_target(DrawerPage::Sessions, 0.6, -3.0, 0.0),
+            1.0
+        );
+        assert_eq!(drawer_snap_target(DrawerPage::Sessions, 0.2, 9.0, 0.0), 1.0);
+        assert_eq!(
+            drawer_snap_target(DrawerPage::Sessions, 0.8, -9.0, 0.0),
+            0.0
+        );
+        assert_eq!(
+            drawer_snap_target(DrawerPage::Workbench, -0.6, 3.0, 0.0),
+            -1.0
+        );
+        assert_eq!(
+            drawer_snap_target(DrawerPage::Workbench, -0.2, -9.0, 0.0),
+            -1.0
+        );
+        assert_eq!(
+            drawer_snap_target(DrawerPage::Workbench, -0.8, 9.0, 0.0),
+            0.0
+        );
     }
 
     #[test]

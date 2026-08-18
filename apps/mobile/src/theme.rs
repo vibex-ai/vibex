@@ -68,6 +68,10 @@ pub const DRAWER_ACTION_HEIGHT: f32 = 40.0;
 pub const DRAWER_SECTION_HEIGHT: f32 = 32.0;
 pub const DRAWER_DRAG_THRESHOLD: f32 = 10.0;
 pub const DRAWER_VERTICAL_CANCEL_RATIO: f32 = 1.25;
+/// Fraction of the viewport a page must travel before settling on the next page.
+pub const DRAWER_SNAP_TRAVEL_RATIO: f32 = 0.35;
+/// A single release-adjacent delta above this value overrides travel distance.
+pub const DRAWER_SNAP_DIRECTION_THRESHOLD: f32 = 8.0;
 pub const DRAWER_BACKDROP_OPACITY: f32 = 0.4;
 pub const DRAWER_OPEN_ANIMATION_MS: u64 = 160;
 pub const DRAWER_CLOSE_ANIMATION_MS: u64 = 100;
