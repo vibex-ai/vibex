@@ -1623,10 +1623,11 @@ fn legacy_agent_model_id(agent_id: &AgentId, provider_model_id: &str) -> String 
         return provider_model_id.to_string();
     }
 
-    let context_suffix = provider_model_id
-        .ends_with("[1m]")
-        .then_some("[1m]")
-        .unwrap_or_default();
+    let context_suffix = if provider_model_id.ends_with("[1m]") {
+        "[1m]"
+    } else {
+        ""
+    };
     provider_model_id
         .split(|character: char| !character.is_ascii_alphanumeric())
         .find_map(|part| {
@@ -2145,6 +2146,7 @@ mod tests {
                 "46:runtime_auth_source_nullable_legacy_columns",
                 "47:agent_default_usage_model_nullable",
                 "48:agent_usage_counter_scope",
+                "49:message_submission_runtime_policy",
             ]
         );
         assert_eq!(

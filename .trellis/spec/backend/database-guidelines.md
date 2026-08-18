@@ -94,6 +94,12 @@ Agent timeline items are append-only by default. Each item needs:
 Compaction can add boundary events or summarized records, but must not destroy
 the ability to reconstruct user-visible history needed by remote clients.
 
+Replacing the latest user turn is the only interactive truncation exception.
+The expected timeline end check, latest-user validation, tail deletion, and
+durable edited-message enqueue must share one immediate transaction. The new
+submission preserves the logical session id and records a fresh-runtime policy;
+never commit a truncated timeline without its recoverable submission row.
+
 ## Migrations
 
 - Store migrations in `crates/db`.
@@ -113,6 +119,10 @@ startup recovery scans only current committed rows with an empty marker. The
 migration backfills older committed rows from their commit/update timestamp so
 upgrading does not eagerly restore every historical Agent session. Durable
 bindings remain lazily materializable when real work later needs them.
+
+Migration 49 adds `agent_message_submissions.required_runtime_policy`. Existing
+submissions default to `automatic`; edited-message submissions store
+`force_fresh_session` so restart recovery cannot resume stale provider context.
 
 ## Transactions
 

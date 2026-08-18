@@ -8,9 +8,10 @@ use tokio::time::sleep;
 use vibex_core::{
     AgentSessionRuntimeSelectionState, GetMessageSubmissionRequest, MessageSubmissionId,
     MessageSubmissionState, MessageSubmissionStatus, RuntimeLeaseRole, RuntimeSelectionInteraction,
-    RuntimeSwitchId, RuntimeSwitchStatus, SendAgentMessageRequest, SessionRuntimeSelectionStatus,
-    SetDesiredAgentSessionRuntimeRequest, TimelineItem, TimelinePayload, VibexError, VibexResult,
-    VibexSessionId, unix_timestamp_ms,
+    RuntimeSwitchId, RuntimeSwitchPolicy, RuntimeSwitchStatus, SendAgentMessageRequest,
+    SessionRuntimeSelection, SessionRuntimeSelectionStatus, SetDesiredAgentSessionRuntimeRequest,
+    SwitchAgentSessionRuntimeRequest, SwitchAgentSessionRuntimeResponse, TimelineItem,
+    TimelinePayload, VibexError, VibexResult, VibexSessionId, unix_timestamp_ms,
 };
 use vibex_db::{
     MessageSubmissionRecord, MessageSubmissionRepository, RuntimeSwitchRepository,
@@ -52,6 +53,13 @@ pub struct MessageSubmissionReconcileReport {
     pub ambiguous: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplaceUserMessageRequest {
+    pub user_sequence: i64,
+    pub expected_end_sequence: i64,
+    pub message: SendAgentMessageRequest,
+}
+
 #[async_trait]
 pub trait MessageRuntimeSelection: Send + Sync {
     fn get_selection_state(
@@ -63,6 +71,13 @@ pub trait MessageRuntimeSelection: Send + Sync {
         &self,
         request: SetDesiredAgentSessionRuntimeRequest,
     ) -> VibexResult<AgentSessionRuntimeSelectionState>;
+
+    async fn force_fresh_runtime(
+        &self,
+        session_id: &VibexSessionId,
+        idempotency_key: String,
+        target: SessionRuntimeSelection,
+    ) -> VibexResult<SwitchAgentSessionRuntimeResponse>;
 }
 
 #[async_trait]
@@ -79,6 +94,28 @@ impl MessageRuntimeSelection for RuntimeSelectionService {
         request: SetDesiredAgentSessionRuntimeRequest,
     ) -> VibexResult<AgentSessionRuntimeSelectionState> {
         RuntimeSelectionService::set_desired_runtime(self, request).await
+    }
+
+    async fn force_fresh_runtime(
+        &self,
+        session_id: &VibexSessionId,
+        idempotency_key: String,
+        target: SessionRuntimeSelection,
+    ) -> VibexResult<SwitchAgentSessionRuntimeResponse> {
+        let state = RuntimeSelectionService::get_selection_state(self, session_id)?;
+        RuntimeSelectionService::switch_runtime(
+            self,
+            SwitchAgentSessionRuntimeRequest {
+                session_id: session_id.clone(),
+                idempotency_key,
+                expected_revision: state.session_revision,
+                target,
+                target_adapter_id: None,
+                policy: RuntimeSwitchPolicy::ForceFreshSession,
+                active_work_policy: self.seamless_active_work_policy(),
+            },
+        )
+        .await
     }
 }
 
@@ -221,6 +258,47 @@ impl MessageSubmissionCoordinator {
                     None,
                     None,
                 );
+        }
+        self.start_session_worker(record.session_id.clone())?;
+        self.wait_for_terminal(&record.submission_id).await
+    }
+
+    pub async fn replace_user_message(
+        self: &Arc<Self>,
+        mut request: ReplaceUserMessageRequest,
+    ) -> VibexResult<Vec<TimelineItem>> {
+        request.message.message_idempotency_key =
+            request.message.message_idempotency_key.trim().to_string();
+        if request.message.text.trim().is_empty() && request.message.attachments.is_empty() {
+            return Err(VibexError::validation(
+                "empty_agent_message",
+                "Agent message text or attachments must not be empty",
+            ));
+        }
+        if request.message.reasoning_effort != request.message.desired_runtime.reasoning_effort {
+            return Err(VibexError::validation(
+                "message_submission_runtime_config_mismatch",
+                "message reasoning effort must match the desired runtime selection",
+            ));
+        }
+
+        let proposed_id = MessageSubmissionId::new();
+        let record = {
+            let mut conn = self.open_connection()?;
+            MessageSubmissionRepository::replace_latest_user_message(
+                &mut conn,
+                proposed_id.clone(),
+                &request.message,
+                request.user_sequence,
+                request.expected_end_sequence,
+            )?
+        };
+        if record.submission_id != proposed_id {
+            self.observability.increment(
+                RuntimeMetricName::DuplicateSubmissionPrevented,
+                None,
+                RuntimeMetricResult::Prevented,
+            );
         }
         self.start_session_worker(record.session_id.clone())?;
         self.wait_for_terminal(&record.submission_id).await
@@ -384,6 +462,36 @@ impl MessageSubmissionCoordinator {
             let current = self.required_submission(&record.submission_id)?;
             if current.status != MessageSubmissionStatus::AwaitingRuntime {
                 return Ok(());
+            }
+            if current.required_runtime_policy == RuntimeSwitchPolicy::ForceFreshSession {
+                if let Some(switch_id) = current.required_switch_id.as_ref() {
+                    if self.handle_terminal_switch(&current, switch_id)? {
+                        return Ok(());
+                    }
+                } else {
+                    let result = self
+                        .runtime_selection
+                        .force_fresh_runtime(
+                            &current.session_id,
+                            format!("message-fresh:{}", current.submission_id.as_str()),
+                            current.desired_runtime_selection.clone(),
+                        )
+                        .await;
+                    match result {
+                        Ok(response) => {
+                            let conn = self.open_connection()?;
+                            MessageSubmissionRepository::associate_required_switch(
+                                &conn,
+                                &current.submission_id,
+                                &response.switch_id,
+                            )?;
+                        }
+                        Err(error) if is_runtime_revision_conflict(&error) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                sleep(self.config.poll_interval).await;
+                continue;
             }
             let state = self
                 .runtime_selection
@@ -1032,9 +1140,11 @@ mod tests {
     use super::*;
 
     struct MockRuntimeSelection {
+        db_path: PathBuf,
         states: Mutex<HashMap<VibexSessionId, AgentSessionRuntimeSelectionState>>,
         scripted_reads: Mutex<HashMap<VibexSessionId, VecDeque<AgentSessionRuntimeSelectionState>>>,
         set_calls: AtomicUsize,
+        fresh_calls: AtomicUsize,
     }
 
     #[async_trait]
@@ -1077,6 +1187,81 @@ mod tests {
             state.selection_revision += 1;
             state.pending_switch_id = None;
             Ok(state.clone())
+        }
+
+        async fn force_fresh_runtime(
+            &self,
+            session_id: &VibexSessionId,
+            idempotency_key: String,
+            target: SessionRuntimeSelection,
+        ) -> VibexResult<SwitchAgentSessionRuntimeResponse> {
+            self.fresh_calls.fetch_add(1, Ordering::SeqCst);
+            let mut states = self.states.lock().unwrap();
+            let state = states.get_mut(session_id).ok_or_else(|| {
+                VibexError::validation("session_not_found", "Agent session was not found")
+            })?;
+            let mut conn = open_database(&self.db_path)?;
+            let runtime_switch = RuntimeSwitchRepository::reserve(
+                &mut conn,
+                RuntimeSwitchId::new(),
+                &RuntimeSwitchReserveRequest {
+                    session_id: session_id.clone(),
+                    idempotency_key,
+                    expected_revision: state.session_revision,
+                    expected_current_binding_id: state.current_binding_id.clone(),
+                    desired_selection_revision: state.selection_revision + 1,
+                    target_binding_id: None,
+                    target_agent_id: target.agent_id.clone(),
+                    target_adapter_id: AcpAdapterId::parse("test-acp-adapter")?,
+                    target_auth_source: target.auth_source.clone(),
+                    target_auth_source_revision: 1,
+                    requested_policy: Some(
+                        serde_json::to_value(RuntimeSwitchPolicy::ForceFreshSession)
+                            .expect("fresh runtime policy should serialize"),
+                    ),
+                    active_work_policy: None,
+                    requested_session_config: None,
+                },
+            )?;
+            for (from, to) in [
+                (
+                    RuntimeSwitchStatus::Reserved,
+                    RuntimeSwitchStatus::Preparing,
+                ),
+                (
+                    RuntimeSwitchStatus::Preparing,
+                    RuntimeSwitchStatus::Prepared,
+                ),
+                (
+                    RuntimeSwitchStatus::Prepared,
+                    RuntimeSwitchStatus::Committing,
+                ),
+                (
+                    RuntimeSwitchStatus::Committing,
+                    RuntimeSwitchStatus::Committed,
+                ),
+            ] {
+                RuntimeSwitchRepository::advance_status(
+                    &conn,
+                    &runtime_switch.switch_id,
+                    from,
+                    to,
+                )?;
+            }
+            state.desired = target.clone();
+            state.effective = target;
+            state.status = SessionRuntimeSelectionStatus::Ready;
+            state.session_revision += 1;
+            state.selection_revision += 1;
+            state.activation_generation += 1;
+            state.pending_switch_id = None;
+            Ok(SwitchAgentSessionRuntimeResponse {
+                switch_id: runtime_switch.switch_id,
+                status: RuntimeSwitchStatus::Committed,
+                session_revision: state.session_revision,
+                current_binding_id: state.current_binding_id.clone(),
+                target_binding_id: runtime_switch.target_binding_id,
+            })
         }
     }
 
@@ -1218,6 +1403,7 @@ mod tests {
         Arc<MockDispatcher>,
     ) {
         let runtime = Arc::new(MockRuntimeSelection {
+            db_path: db_path.to_path_buf(),
             states: Mutex::new(HashMap::from([(
                 session_id.clone(),
                 AgentSessionRuntimeSelectionState {
@@ -1234,6 +1420,7 @@ mod tests {
             )])),
             scripted_reads: Mutex::new(HashMap::new()),
             set_calls: AtomicUsize::new(0),
+            fresh_calls: AtomicUsize::new(0),
         });
         let dispatcher = Arc::new(MockDispatcher {
             db_path: db_path.to_path_buf(),
@@ -1274,6 +1461,224 @@ mod tests {
             reasoning_effort: None,
             correlation_id: None,
         }
+    }
+
+    fn seed_timeline_turns(db_path: &Path, session_id: &VibexSessionId) {
+        let mut conn = open_database(db_path).unwrap();
+        for (source, payload) in [
+            (
+                TimelineSource::User,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "first".to_string(),
+                    attachments: Vec::new(),
+                }),
+            ),
+            (
+                TimelineSource::Agent,
+                TimelinePayload::AgentMessage(AgentMessagePayload {
+                    text: "first answer".to_string(),
+                    is_final: true,
+                }),
+            ),
+            (
+                TimelineSource::User,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "original".to_string(),
+                    attachments: Vec::new(),
+                }),
+            ),
+            (
+                TimelineSource::Agent,
+                TimelinePayload::AgentMessage(AgentMessagePayload {
+                    text: "original answer".to_string(),
+                    is_final: true,
+                }),
+            ),
+        ] {
+            TimelineRepository::append(
+                &mut conn,
+                session_id,
+                source,
+                payload,
+                None,
+                None,
+                TimelineRedactionState::None,
+            )
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn replacing_user_message_reuses_session_and_truncates_tail() {
+        let db_path = temp_db_path("replace-in-place");
+        let initial = selection("gpt-5");
+        let session_id = seed_session(&db_path, "replace-in-place", initial.clone());
+        seed_timeline_turns(&db_path, &session_id);
+        let original_request = request(&session_id, "original-submission", initial.clone());
+        {
+            let mut conn = open_database(&db_path).unwrap();
+            let original = MessageSubmissionRepository::enqueue(
+                &mut conn,
+                MessageSubmissionId::new(),
+                &original_request,
+            )
+            .unwrap();
+            MessageSubmissionRepository::advance_status(
+                &conn,
+                &original.submission_id,
+                MessageSubmissionStatus::AwaitingRuntime,
+                MessageSubmissionStatus::ReadyToDispatch,
+            )
+            .unwrap();
+            MessageSubmissionRepository::mark_about_to_prompt(&conn, &original.submission_id)
+                .unwrap();
+            let page = TimelineRepository::fetch_after(&conn, &session_id, None, 20).unwrap();
+            MessageSubmissionRepository::record_dispatch_result(
+                &mut conn,
+                &original.submission_id,
+                &page.items[2].id,
+                Some("original-provider"),
+                3,
+                4,
+            )
+            .unwrap();
+            MessageSubmissionRepository::advance_status(
+                &conn,
+                &original.submission_id,
+                MessageSubmissionStatus::Dispatched,
+                MessageSubmissionStatus::Completed,
+            )
+            .unwrap();
+        }
+        let (coordinator, runtime, dispatcher) =
+            harness(&db_path, &session_id, initial.clone(), false);
+        let replace_request = ReplaceUserMessageRequest {
+            user_sequence: 3,
+            expected_end_sequence: 4,
+            message: request(&session_id, "edit-in-place", initial),
+        };
+        let mut replace_request = replace_request;
+        replace_request.message.text = "edited".to_string();
+
+        let result = coordinator
+            .replace_user_message(replace_request.clone())
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(runtime.fresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            dispatcher.dispatched.lock().unwrap()[0].0,
+            session_id,
+            "edited message must dispatch in the original logical session"
+        );
+
+        let conn = open_database(&db_path).unwrap();
+        let page = TimelineRepository::fetch_after(&conn, &session_id, None, 20).unwrap();
+        assert_eq!(page.items.len(), 4);
+        assert_eq!(page.items[0].sequence, 1);
+        assert_eq!(page.items[1].sequence, 2);
+        assert_eq!(page.items[2].sequence, 3);
+        assert_eq!(page.items[3].sequence, 4);
+        assert!(matches!(
+            &page.items[2].payload,
+            TimelinePayload::UserMessage(message) if message.text == "edited"
+        ));
+        assert!(matches!(
+            &page.items[3].payload,
+            TimelinePayload::AgentMessage(message) if message.text == "completed"
+        ));
+        assert_eq!(SessionRepository::list(&conn, false).unwrap().len(), 1);
+
+        let superseded =
+            MessageSubmissionRepository::get_by_key(&conn, &session_id, "original-submission")
+                .unwrap()
+                .unwrap();
+        assert_eq!(superseded.status, MessageSubmissionStatus::Cancelled);
+        assert_eq!(
+            superseded.error_code.as_deref(),
+            Some("message_submission_superseded_by_edit")
+        );
+        drop(conn);
+
+        coordinator
+            .replace_user_message(replace_request)
+            .await
+            .unwrap();
+        assert_eq!(runtime.fresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 1);
+        let old_retry_error = coordinator.submit(original_request).await.unwrap_err();
+        assert_eq!(
+            old_retry_error.code,
+            "message_submission_superseded_by_edit"
+        );
+        assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 1);
+        cleanup_db(db_path);
+    }
+
+    #[tokio::test]
+    async fn startup_resumes_edited_message_with_fresh_runtime() {
+        let db_path = temp_db_path("replace-startup");
+        let initial = selection("gpt-5");
+        let session_id = seed_session(&db_path, "replace-startup", initial.clone());
+        seed_timeline_turns(&db_path, &session_id);
+        let mut message = request(&session_id, "edit-startup", initial.clone());
+        message.text = "edited after restart".to_string();
+        let record = {
+            let mut conn = open_database(&db_path).unwrap();
+            MessageSubmissionRepository::replace_latest_user_message(
+                &mut conn,
+                MessageSubmissionId::new(),
+                &message,
+                3,
+                4,
+            )
+            .unwrap()
+        };
+        let (coordinator, runtime, dispatcher) = harness(&db_path, &session_id, initial, false);
+
+        let report = coordinator.reconcile_on_startup().unwrap();
+        assert_eq!(report.resumed_sessions, 1);
+        let items = tokio::time::timeout(
+            Duration::from_secs(2),
+            coordinator.wait_for_terminal(&record.submission_id),
+        )
+        .await
+        .expect("startup reconciliation should finish edited submission")
+        .unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(runtime.fresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(dispatcher.dispatched.lock().unwrap()[0].0, session_id);
+        cleanup_db(db_path);
+    }
+
+    #[test]
+    fn replacing_user_message_rejects_stale_timeline_without_mutation() {
+        let db_path = temp_db_path("replace-stale");
+        let initial = selection("gpt-5");
+        let session_id = seed_session(&db_path, "replace-stale", initial.clone());
+        seed_timeline_turns(&db_path, &session_id);
+        let mut conn = open_database(&db_path).unwrap();
+        let mut message = request(&session_id, "edit-stale", initial);
+        message.text = "edited".to_string();
+        let error = MessageSubmissionRepository::replace_latest_user_message(
+            &mut conn,
+            MessageSubmissionId::new(),
+            &message,
+            3,
+            99,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "message_edit_source_changed");
+        let page = TimelineRepository::fetch_after(&conn, &session_id, None, 20).unwrap();
+        assert_eq!(page.items.len(), 4);
+        assert!(
+            MessageSubmissionRepository::get_by_key(&conn, &session_id, "edit-stale")
+                .unwrap()
+                .is_none()
+        );
+        cleanup_db(db_path);
     }
 
     fn enqueue_with_committed_switch(

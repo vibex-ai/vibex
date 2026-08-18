@@ -33,7 +33,7 @@ pub use manager::{
 pub use message_submission::{
     DEFAULT_MESSAGE_SUBMISSION_POLL_INTERVAL, MessageDispatchExecutor, MessageRuntimeSelection,
     MessageSubmissionCoordinator, MessageSubmissionCoordinatorConfig,
-    MessageSubmissionReconcileReport, manager_message_dispatcher,
+    MessageSubmissionReconcileReport, ReplaceUserMessageRequest, manager_message_dispatcher,
 };
 pub use observability::{
     RUNTIME_METRIC_SERIES_LIMIT, RuntimeLogContext, RuntimeLogLevel, RuntimeMetricName,

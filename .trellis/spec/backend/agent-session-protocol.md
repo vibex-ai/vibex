@@ -1793,6 +1793,7 @@ agent_get_capabilities() -> ProviderCapabilitiesResponse
 AgentManager::register_runtime(AgentRuntimeRouteKey, Arc<dyn AgentProvider>)
 RuntimeSelectionService::initialize_new_session(session_id, desired)
 MessageSubmissionCoordinator::submit(SendAgentMessageRequest)
+MessageSubmissionCoordinator::replace_user_message(ReplaceUserMessageRequest)
 ```
 
 Authoritative session/runtime tables:
@@ -1844,6 +1845,19 @@ and `AdapterDiagnosticsRepository`.
   provider command, permission, interrupt, and close resolve the current
   durable selection/binding/generation and synthesize any adapter-local handle
   from that exact fence.
+- Editing the latest completed user message preserves the same logical
+  `VibexSessionId`; it never forks, archives, or replaces the product session.
+  One immediate database transaction must CAS the expected timeline end,
+  verify that the target is the latest user message in an `Idle`/`Error`
+  session with no non-terminal submission, delete that user item and the tail,
+  and enqueue the edited payload. Completed submissions whose recorded result
+  overlaps the removed tail become terminal `superseded_by_edit` records so an
+  old idempotency-key retry cannot resend or read the replacement sequence.
+- An edited-message submission durably requires `ForceFreshSession`. Dispatch
+  may begin only after the stable submission-derived runtime switch commits;
+  startup reconciliation resumes the same switch/submission pair after a
+  crash. This is the controlled exception to the normal append-only timeline
+  rule and prevents stale provider context without changing logical identity.
 - Schema v28 intentionally clears old session-scoped data, drops
   `provider_bindings` and `session_provider_bindings`, and removes legacy
   provider columns from `agent_sessions`. There is no compatibility read path.
@@ -1854,8 +1868,10 @@ and `AdapterDiagnosticsRepository`.
   window and may set `hasOlder = true`; UI code may use it for previews, but
   full conversation restore must use forward pagination so a user/assistant
   turn is not cut in the middle.
-- `agent_timeline_items` is append-only. The repository assigns monotonic
-  per-session sequence numbers inside a transaction.
+- `agent_timeline_items` is append-only except for the atomic latest-user-turn
+  replacement above. The repository assigns monotonic per-session sequence
+  numbers inside a transaction; replacement reuses the deleted tail sequence
+  only inside the same logical session.
 - Permission requests are both `permission_requests` rows and
   `permission_request` timeline payloads. Resolutions append a
   `permission_resolution` timeline payload.
@@ -1905,6 +1921,9 @@ and `AdapterDiagnosticsRepository`.
 - DB migration/repository tests assert clean-data cutover, removed legacy
   tables/columns, initial intent atomicity, current binding, timeline sequence,
   permission request/resolve, archive, and delete behavior.
+- Message-submission tests assert edited-message CAS failure leaves the
+  timeline untouched, successful replacement dispatches once in the original
+  session, and idempotent retry neither truncates nor switches twice.
 - Manager/ACP tests cover exact route registration, initial side-effect order,
   crash recovery, durable message/command/continue/permission/interrupt fences,
   and fail-closed missing ownership.

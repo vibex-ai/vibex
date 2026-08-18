@@ -51,6 +51,7 @@ use gpui_component::{
 use sha2::{Digest as _, Sha256};
 use similar::{ChangeTag, TextDiff};
 use tokio::sync::mpsc;
+use vibex_agent::ReplaceUserMessageRequest;
 use vibex_agent_acp::build_runtime_option_catalog_for_agents;
 use vibex_agent_claude::{ClaudeSessionImportPreviewRequest, preview_claude_external_sessions};
 use vibex_agent_codex::{CodexSessionImportPreviewRequest, preview_codex_external_sessions};
@@ -12525,7 +12526,7 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.agent_action_pending {
+        if self.agent_action_pending || self.session_turn_pending(&source_session_id) {
             return;
         }
         let measured_turn_id = turn_id.clone();
@@ -12559,9 +12560,6 @@ impl VibexWorkbench {
     }
 
     fn submit_inline_user_message_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.agent_action_pending {
-            return;
-        }
         if self.user_message_edit_input.update(cx, |input, cx| {
             EntityInputHandler::marked_text_range(input, window, cx).is_some()
         }) {
@@ -12570,6 +12568,9 @@ impl VibexWorkbench {
         let Some(edit) = self.inline_user_message_edit.clone() else {
             return;
         };
+        if self.agent_action_pending || self.session_turn_pending(&edit.source_session_id) {
+            return;
+        }
         let text = self.user_message_edit_input.read(cx).value().to_string();
         if text.trim().is_empty() && edit.attachments.is_empty() {
             return;
@@ -12594,6 +12595,7 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) {
         if self.agent_action_pending
+            || self.session_turn_pending(&source_session_id)
             || self.selected_session_id.as_ref() != Some(&source_session_id)
             || user_sequence <= 0
             || expected_source_end_sequence < user_sequence
@@ -12615,7 +12617,6 @@ impl VibexWorkbench {
             text: text.clone(),
             attachments: attachments.clone(),
         });
-        self.agent_action_pending = true;
         self.set_session_turn_pending(&source_session_id, true);
         self.agent_error = None;
         if let Some(turn_id) = editing_turn_id {
@@ -12628,97 +12629,73 @@ impl VibexWorkbench {
         let selected_source_session_id = source_session_id.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             let manager = runtime.agent().manager();
-            let replacement = manager
-                .fork_session(ForkAgentSessionRequest {
-                    source_session_id: source_session_id.clone(),
-                    through_sequence: user_sequence.saturating_sub(1),
-                    expected_source_end_sequence: Some(expected_source_end_sequence),
-                })
-                .await?;
             let selection = runtime
                 .agent()
                 .runtime_selection()
-                .get_selection_state(&replacement.id)?
-                .effective;
-            let reasoning_effort = selection.reasoning_effort.clone();
-            let send_result = runtime
-                .agent()
-                .message_submission()
-                .submit(SendAgentMessageRequest {
-                    session_id: replacement.id.clone(),
-                    message_idempotency_key: format!(
-                        "gpui:edit:{}:{}",
-                        replacement.id.as_str(),
-                        unix_timestamp_ms()
-                    ),
-                    desired_runtime: selection,
-                    text,
-                    attachments,
-                    reasoning_effort,
-                    correlation_id: None,
-                })
-                .await;
-            if let Err(error) = send_result {
-                let _ = manager.delete_session(&replacement.id).await;
-                return Err(error);
-            }
-            let replacement = manager.get_session(&replacement.id).await?;
-            let archive_error = manager
-                .archive_session_if_timeline_unchanged(
-                    &source_session_id,
-                    expected_source_end_sequence,
-                )
-                .await
-                .err()
-                .map(|error| format!("{}: {}", error.code, error.message));
-            Ok::<_, vibex_core::VibexError>((replacement, archive_error))
+                .get_selection_state(&source_session_id);
+            let outcome = match selection {
+                Ok(selection) => {
+                    let selection = selection.effective;
+                    let reasoning_effort = selection.reasoning_effort.clone();
+                    runtime
+                        .agent()
+                        .message_submission()
+                        .replace_user_message(ReplaceUserMessageRequest {
+                            user_sequence,
+                            expected_end_sequence: expected_source_end_sequence,
+                            message: SendAgentMessageRequest {
+                                session_id: source_session_id.clone(),
+                                message_idempotency_key: format!(
+                                    "gpui:edit:{}:{user_sequence}:{submitted_at_ms}",
+                                    source_session_id.as_str()
+                                ),
+                                desired_runtime: selection,
+                                text,
+                                attachments,
+                                reasoning_effort,
+                                correlation_id: None,
+                            },
+                        })
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            let session = manager.get_session(&source_session_id).await.ok();
+            (outcome, session)
         });
-        self.agent_action_task = Some(cx.spawn(
+        cx.spawn(
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let outcome = runner.await;
                 let _ = entity.update(cx, |this, cx| {
-                    this.agent_action_pending = false;
                     this.set_session_turn_pending(&selected_source_session_id, false);
                     this.pending_user_message_edit = None;
                     this.rebuild_timeline_sizes();
                     match outcome {
-                        Ok(Ok((replacement, archive_error))) => {
-                            let replacement_id = replacement.id.clone();
-                            if archive_error.is_none() {
-                                this.sessions
-                                    .retain(|session| session.id != selected_source_session_id);
-                                this.agent_session_view_cache
-                                    .remove(selected_source_session_id.as_str());
-                                this.agent_session_view_lru.retain(|session_id| {
-                                    session_id != selected_source_session_id.as_str()
-                                });
+                        Ok((result, session)) => {
+                            if let Some(session) = session {
+                                this.upsert_session_snapshot(session);
+                                this.reconcile_sidebar_state();
                             }
-                            this.upsert_session_snapshot(replacement);
-                            this.reconcile_sidebar_state();
-                            if let Some(error) = archive_error {
-                                this.runtime_note = Some(format!(
-                                    "Edited reply was created, but the previous session could not be archived: {error}"
-                                ));
+                            if let Err(error) = result {
+                                this.agent_error =
+                                    Some(format!("{}: {}", error.code, error.message));
                             }
-                            if this.session_generation == generation
-                                && this.selected_session_id.as_ref()
-                                    == Some(&selected_source_session_id)
-                            {
-                                this.select_session_with_history(replacement_id, false, cx);
-                            }
-                        }
-                        Ok(Err(error)) => {
-                            this.agent_error = Some(format!("{}: {}", error.code, error.message));
                         }
                         Err(error) => {
                             this.agent_error =
                                 Some(format!("edited message submission failed: {error}"));
                         }
                     }
+                    if this.session_generation == generation
+                        && this.selected_session_id.as_ref() == Some(&selected_source_session_id)
+                    {
+                        this.refresh_selected_agent_timeline(cx);
+                    }
                     cx.notify();
                 });
             },
-        ));
+        )
+        .detach();
     }
 
     fn open_new_session(
@@ -25957,7 +25934,11 @@ impl VibexWorkbench {
             .trim()
             .is_empty()
             || !attachments.is_empty();
-        let pending = self.agent_action_pending;
+        let pending = self.agent_action_pending
+            || self
+                .inline_user_message_edit
+                .as_ref()
+                .is_some_and(|edit| self.session_turn_pending(&edit.source_session_id));
         v_flex()
             .w_full()
             .min_w_0()
@@ -26071,7 +26052,11 @@ impl VibexWorkbench {
             turn_complete,
             self.timeline.needs_authoritative_refetch,
             self.selected_agent_session_state(),
-            self.agent_action_pending,
+            self.agent_action_pending
+                || self
+                    .selected_session_id
+                    .as_ref()
+                    .is_some_and(|session_id| self.session_turn_pending(session_id)),
         );
         div()
             .flex()
@@ -45393,6 +45378,18 @@ mod tests {
         assert!(begin.contains("input.set_value(initial"));
         assert!(begin.contains("input.focus(window, cx)"));
         assert!(begin.contains("remove(&measured_turn_id)"));
+        assert!(begin.contains("self.session_turn_pending(&source_session_id)"));
+
+        let replacement = source
+            .split_once("    fn replace_latest_user_message(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn open_new_session("))
+            .map(|(body, _)| body)
+            .expect("inline message replacement should remain inspectable");
+        assert!(replacement.contains(".replace_user_message("));
+        assert!(!replacement.contains(".fork_session("));
+        assert!(!replacement.contains("archive_session_if_timeline_unchanged"));
+        assert!(!replacement.contains("self.agent_action_pending = true"));
+        assert!(replacement.contains("this.refresh_selected_agent_timeline(cx)"));
 
         let renderer = source
             .split_once("    fn render_user_message_row(")

@@ -11,10 +11,10 @@ use std::fmt;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use vibex_core::{
     AcpAdapterId, AgentAuthContextId, AgentId, AgentSessionRestoreCompatibilityKey,
-    AgentSessionRestoreResult, BindingState, EventId, MAX_MESSAGE_IDEMPOTENCY_KEY_LEN,
-    MAX_RUNTIME_SELECTION_ERROR_CODE_LEN, MessageSubmissionId, MessageSubmissionState,
-    MessageSubmissionStatus, NativeStateHomeId, ProviderProfileId, RetrySemantics,
-    RuntimeAuthSource, RuntimeAuthSourceKind, RuntimeBinding, RuntimeBindingId,
+    AgentSessionRestoreResult, AgentSessionState, BindingState, EventId,
+    MAX_MESSAGE_IDEMPOTENCY_KEY_LEN, MAX_RUNTIME_SELECTION_ERROR_CODE_LEN, MessageSubmissionId,
+    MessageSubmissionState, MessageSubmissionStatus, NativeStateHomeId, ProviderProfileId,
+    RetrySemantics, RuntimeAuthSource, RuntimeAuthSourceKind, RuntimeBinding, RuntimeBindingId,
     RuntimeSwitchActiveWorkPolicy, RuntimeSwitchEventKind, RuntimeSwitchEventProjection,
     RuntimeSwitchId, RuntimeSwitchOperationId, RuntimeSwitchPolicy, RuntimeSwitchStatus,
     SendAgentMessageRequest, SessionRuntimeConfigState, SessionRuntimeSelection,
@@ -3695,6 +3695,7 @@ pub struct MessageSubmissionRecord {
     pub message_idempotency_key: String,
     pub submission_sequence: i64,
     pub desired_runtime_selection: SessionRuntimeSelection,
+    pub required_runtime_policy: RuntimeSwitchPolicy,
     pub required_switch_id: Option<RuntimeSwitchId>,
     /// Reference to the durably stored payload; never the raw secret-bearing
     /// payload itself.
@@ -3720,6 +3721,7 @@ impl fmt::Debug for MessageSubmissionRecord {
             .field("session_id", &self.session_id)
             .field("submission_sequence", &self.submission_sequence)
             .field("desired_runtime_selection", &self.desired_runtime_selection)
+            .field("required_runtime_policy", &self.required_runtime_policy)
             .field("required_switch_id", &self.required_switch_id)
             .field("status", &self.status)
             .field(
@@ -3796,32 +3798,236 @@ impl MessageSubmissionRepository {
                 "message_submission_transaction_failed",
                 "failed to start message submission transaction",
             ))?;
+        let record =
+            Self::enqueue_conn(&tx, submission_id, request, RuntimeSwitchPolicy::Automatic)?;
+        tx.commit().map_err(storage_err(
+            "message_submission_transaction_failed",
+            "failed to commit message submission transaction",
+        ))?;
+        Ok(record)
+    }
+
+    /// Atomically replaces the latest user turn and enqueues its edited
+    /// message in the same logical session. Dispatch is held behind a durable
+    /// fresh-runtime requirement so the provider cannot resume stale context.
+    pub fn replace_latest_user_message(
+        conn: &mut Connection,
+        submission_id: MessageSubmissionId,
+        request: &SendAgentMessageRequest,
+        user_sequence: i64,
+        expected_end_sequence: i64,
+    ) -> VibexResult<MessageSubmissionRecord> {
+        Self::validate_idempotency_key(&request.message_idempotency_key)?;
+        if user_sequence <= 0 || expected_end_sequence < user_sequence {
+            return Err(VibexError::validation(
+                "message_edit_timeline_range_invalid",
+                "edited message timeline range is invalid",
+            ));
+        }
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "message_edit_transaction_failed",
+                "failed to start edited message transaction",
+            ))?;
         if let Some(existing) =
             Self::get_by_key_conn(&tx, &request.session_id, &request.message_idempotency_key)?
         {
-            let payload =
-                Self::get_payload_conn(&tx, &existing.submission_id)?.ok_or_else(|| {
-                    VibexError::storage(
-                        "message_submission_payload_missing",
-                        "durable message submission payload was not found",
-                    )
-                })?;
-            if existing.desired_runtime_selection != request.desired_runtime
-                || payload.request != *request
-            {
-                return Err(VibexError::conflict(
-                    "message_submission_idempotency_payload_conflict",
-                    "message submission idempotency key was already used for another payload",
-                ));
-            }
+            Self::validate_existing(
+                &tx,
+                &existing,
+                request,
+                RuntimeSwitchPolicy::ForceFreshSession,
+            )?;
             tx.commit().map_err(storage_err(
-                "message_submission_transaction_failed",
-                "failed to finish message submission transaction",
+                "message_edit_transaction_failed",
+                "failed to finish edited message transaction",
             ))?;
             return Ok(existing);
         }
 
-        let submission_sequence = tx
+        let session = tx
+            .query_row(
+                "SELECT state, archived_at_ms, deleted_at_ms
+                 FROM agent_sessions WHERE session_id = ?1",
+                params![request.session_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_err(
+                "message_edit_session_lookup_failed",
+                "failed to load edited Agent session",
+            ))?
+            .ok_or_else(|| {
+                VibexError::validation("session_not_found", "Agent session was not found")
+            })?;
+        let session_state: AgentSessionState = enum_from_db(session.0)?;
+        if session.1.is_some()
+            || session.2.is_some()
+            || !matches!(
+                session_state,
+                AgentSessionState::Idle | AgentSessionState::Error
+            )
+        {
+            return Err(VibexError::conflict(
+                "message_edit_session_not_editable",
+                "Agent session is not idle and editable",
+            ));
+        }
+
+        let non_terminal_count = tx
+            .query_row(
+                "SELECT COUNT(*) FROM agent_message_submissions
+                 WHERE session_id = ?1 AND status NOT IN (?2, ?3, ?4, ?5)",
+                params![
+                    request.session_id.as_str(),
+                    enum_to_db(&MessageSubmissionStatus::Completed)?,
+                    enum_to_db(&MessageSubmissionStatus::Failed)?,
+                    enum_to_db(&MessageSubmissionStatus::Cancelled)?,
+                    enum_to_db(&MessageSubmissionStatus::AmbiguousPromptDispatch)?,
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(storage_err(
+                "message_edit_pending_submission_lookup_failed",
+                "failed to check pending message submissions",
+            ))?;
+        if non_terminal_count != 0 {
+            return Err(VibexError::conflict(
+                "message_edit_submission_pending",
+                "Agent session already has a pending message submission",
+            ));
+        }
+
+        let actual_end_sequence = tx
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), 0) FROM agent_timeline_items
+                 WHERE session_id = ?1",
+                params![request.session_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(storage_err(
+                "message_edit_timeline_lookup_failed",
+                "failed to load edited Agent timeline",
+            ))?;
+        if actual_end_sequence != expected_end_sequence {
+            return Err(VibexError::conflict(
+                "message_edit_source_changed",
+                "Agent session timeline changed before the edit could be applied",
+            ));
+        }
+        let edit_kind = tx
+            .query_row(
+                "SELECT kind FROM agent_timeline_items
+                 WHERE session_id = ?1 AND sequence = ?2",
+                params![request.session_id.as_str(), user_sequence],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage_err(
+                "message_edit_timeline_lookup_failed",
+                "failed to load edited user message",
+            ))?;
+        if edit_kind.as_deref() != Some(enum_to_db(&TimelineItemKind::UserMessage)?.as_str()) {
+            return Err(VibexError::conflict(
+                "message_edit_user_message_missing",
+                "edited timeline item is not the latest user message",
+            ));
+        }
+        let latest_user_sequence = tx
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), 0) FROM agent_timeline_items
+                 WHERE session_id = ?1 AND kind = ?2",
+                params![
+                    request.session_id.as_str(),
+                    enum_to_db(&TimelineItemKind::UserMessage)?
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(storage_err(
+                "message_edit_timeline_lookup_failed",
+                "failed to load latest user message",
+            ))?;
+        if latest_user_sequence != user_sequence {
+            return Err(VibexError::conflict(
+                "message_edit_user_message_stale",
+                "only the latest user message can be edited",
+            ));
+        }
+
+        let now = unix_timestamp_ms();
+        tx.execute(
+            "UPDATE agent_message_submissions
+             SET status = ?3,
+                 error_code = 'message_submission_superseded_by_edit',
+                 error_detail_redacted = 'message submission was replaced by a user edit',
+                 updated_at_ms = ?4
+             WHERE session_id = ?1
+               AND status = ?5
+               AND submission_id IN (
+                   SELECT submission_id FROM agent_message_submission_payloads
+                   WHERE session_id = ?1 AND result_last_sequence >= ?2
+               )",
+            params![
+                request.session_id.as_str(),
+                user_sequence,
+                enum_to_db(&MessageSubmissionStatus::Cancelled)?,
+                now,
+                enum_to_db(&MessageSubmissionStatus::Completed)?,
+            ],
+        )
+        .map_err(storage_err(
+            "message_edit_submission_supersede_failed",
+            "failed to supersede replaced message submissions",
+        ))?;
+        tx.execute(
+            "DELETE FROM agent_timeline_items WHERE session_id = ?1 AND sequence >= ?2",
+            params![request.session_id.as_str(), user_sequence],
+        )
+        .map_err(storage_err(
+            "message_edit_timeline_truncate_failed",
+            "failed to replace Agent timeline tail",
+        ))?;
+        tx.execute(
+            "UPDATE agent_sessions SET updated_at_ms = ?2 WHERE session_id = ?1",
+            params![request.session_id.as_str(), now],
+        )
+        .map_err(storage_err(
+            "message_edit_session_update_failed",
+            "failed to update edited Agent session",
+        ))?;
+        let record = Self::enqueue_conn(
+            &tx,
+            submission_id,
+            request,
+            RuntimeSwitchPolicy::ForceFreshSession,
+        )?;
+        tx.commit().map_err(storage_err(
+            "message_edit_transaction_failed",
+            "failed to commit edited message transaction",
+        ))?;
+        Ok(record)
+    }
+
+    fn enqueue_conn(
+        conn: &Connection,
+        submission_id: MessageSubmissionId,
+        request: &SendAgentMessageRequest,
+        required_runtime_policy: RuntimeSwitchPolicy,
+    ) -> VibexResult<MessageSubmissionRecord> {
+        if let Some(existing) =
+            Self::get_by_key_conn(conn, &request.session_id, &request.message_idempotency_key)?
+        {
+            Self::validate_existing(conn, &existing, request, required_runtime_policy)?;
+            return Ok(existing);
+        }
+        let submission_sequence = conn
             .query_row(
                 "SELECT COALESCE(MAX(submission_sequence), 0) + 1
                  FROM agent_message_submission_payloads
@@ -3835,19 +4041,21 @@ impl MessageSubmissionRepository {
             ))?;
         let now = unix_timestamp_ms();
         let message_payload_reference = format!("message_payload_{}", submission_id.as_str());
-        tx.execute(
+        conn.execute(
             "
             INSERT INTO agent_message_submissions (
                 submission_id, session_id, message_idempotency_key,
-                desired_runtime_selection_json, required_switch_id,
-                message_payload_reference, status, created_at_ms, updated_at_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+                desired_runtime_selection_json, required_runtime_policy,
+                required_switch_id, message_payload_reference, status,
+                created_at_ms, updated_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
             ",
             params![
                 submission_id.as_str(),
                 request.session_id.as_str(),
                 request.message_idempotency_key,
                 json_to_db(&request.desired_runtime)?,
+                enum_to_db(&required_runtime_policy)?,
                 Option::<&str>::None,
                 message_payload_reference,
                 enum_to_db(&MessageSubmissionStatus::AwaitingRuntime)?,
@@ -3858,7 +4066,7 @@ impl MessageSubmissionRepository {
             "message_submission_insert_failed",
             "failed to insert message submission",
         ))?;
-        tx.execute(
+        conn.execute(
             "INSERT INTO agent_message_submission_payloads (
                 payload_reference, submission_id, session_id, submission_sequence,
                 payload_json, created_at_ms, updated_at_ms
@@ -3876,16 +4084,13 @@ impl MessageSubmissionRepository {
             "message_submission_payload_insert_failed",
             "failed to persist message submission payload",
         ))?;
-        tx.commit().map_err(storage_err(
-            "message_submission_transaction_failed",
-            "failed to commit message submission transaction",
-        ))?;
         Ok(MessageSubmissionRecord {
             submission_id,
             session_id: request.session_id.clone(),
             message_idempotency_key: request.message_idempotency_key.clone(),
             submission_sequence,
             desired_runtime_selection: request.desired_runtime.clone(),
+            required_runtime_policy,
             required_switch_id: None,
             message_payload_reference,
             status: MessageSubmissionStatus::AwaitingRuntime,
@@ -3900,6 +4105,30 @@ impl MessageSubmissionRepository {
             updated_at_ms: now,
             dispatched_at_ms: None,
         })
+    }
+
+    fn validate_existing(
+        conn: &Connection,
+        existing: &MessageSubmissionRecord,
+        request: &SendAgentMessageRequest,
+        required_runtime_policy: RuntimeSwitchPolicy,
+    ) -> VibexResult<()> {
+        let payload = Self::get_payload_conn(conn, &existing.submission_id)?.ok_or_else(|| {
+            VibexError::storage(
+                "message_submission_payload_missing",
+                "durable message submission payload was not found",
+            )
+        })?;
+        if existing.desired_runtime_selection != request.desired_runtime
+            || existing.required_runtime_policy != required_runtime_policy
+            || payload.request != *request
+        {
+            return Err(VibexError::conflict(
+                "message_submission_idempotency_payload_conflict",
+                "message submission idempotency key was already used for another payload",
+            ));
+        }
+        Ok(())
     }
 
     pub fn associate_required_switch(
@@ -4358,7 +4587,8 @@ impl MessageSubmissionRepository {
     const COLUMNS: &'static str = "
         s.submission_id, s.session_id, s.message_idempotency_key,
         p.submission_sequence, s.desired_runtime_selection_json,
-        s.required_switch_id, s.message_payload_reference, s.status,
+        s.required_runtime_policy, s.required_switch_id,
+        s.message_payload_reference, s.status,
         s.user_message_timeline_item_id, s.dispatch_operation_id,
         s.provider_correlation_id, s.error_code, s.error_detail_redacted,
         p.result_first_sequence, p.result_last_sequence,
@@ -4397,19 +4627,20 @@ impl MessageSubmissionRepository {
             message_idempotency_key: row.get(2)?,
             submission_sequence: row.get(3)?,
             desired_runtime_selection_json: row.get(4)?,
-            required_switch_id: row.get(5)?,
-            message_payload_reference: row.get(6)?,
-            status: row.get(7)?,
-            user_message_timeline_item_id: row.get(8)?,
-            dispatch_operation_id: row.get(9)?,
-            provider_correlation_id: row.get(10)?,
-            error_code: row.get(11)?,
-            error_detail_redacted: row.get(12)?,
-            result_first_sequence: row.get(13)?,
-            result_last_sequence: row.get(14)?,
-            created_at_ms: row.get(15)?,
-            updated_at_ms: row.get(16)?,
-            dispatched_at_ms: row.get(17)?,
+            required_runtime_policy: row.get(5)?,
+            required_switch_id: row.get(6)?,
+            message_payload_reference: row.get(7)?,
+            status: row.get(8)?,
+            user_message_timeline_item_id: row.get(9)?,
+            dispatch_operation_id: row.get(10)?,
+            provider_correlation_id: row.get(11)?,
+            error_code: row.get(12)?,
+            error_detail_redacted: row.get(13)?,
+            result_first_sequence: row.get(14)?,
+            result_last_sequence: row.get(15)?,
+            created_at_ms: row.get(16)?,
+            updated_at_ms: row.get(17)?,
+            dispatched_at_ms: row.get(18)?,
         })
     }
 
@@ -4420,6 +4651,7 @@ impl MessageSubmissionRepository {
             message_idempotency_key: raw.message_idempotency_key,
             submission_sequence: raw.submission_sequence,
             desired_runtime_selection: json_from_db(raw.desired_runtime_selection_json)?,
+            required_runtime_policy: enum_from_db(raw.required_runtime_policy)?,
             required_switch_id: raw
                 .required_switch_id
                 .map(|id| parse_id(id, RuntimeSwitchId::parse))
@@ -4569,6 +4801,7 @@ struct RawMessageSubmissionRecord {
     message_idempotency_key: String,
     submission_sequence: i64,
     desired_runtime_selection_json: String,
+    required_runtime_policy: String,
     required_switch_id: Option<String>,
     message_payload_reference: String,
     status: String,

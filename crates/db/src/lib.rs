@@ -72,7 +72,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 48;
+pub const CURRENT_SCHEMA_VERSION: i64 = 49;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -9587,6 +9587,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_runtime_auth_source_table_rebuild(conn, &mut applied)?;
     apply_usage_model_id_nullable_table_rebuild(conn, &mut applied)?;
     apply_usage_counter_scope_column(conn, &mut applied)?;
+    apply_message_submission_runtime_policy(conn, &mut applied)?;
 
     // Seed compatibility Profiles before the v37 backfill while no caller
     // transaction is active. Repository reads may run inside a transaction and
@@ -9594,6 +9595,43 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     ProviderProfileRepository::ensure_local_defaults(conn)?;
     ProviderProjectionCompatibilityRepository::backfill_legacy_profiles(conn)?;
     Ok(applied)
+}
+
+fn apply_message_submission_runtime_policy(
+    conn: &mut Connection,
+    applied: &mut Vec<String>,
+) -> VibexResult<()> {
+    const VERSION: i64 = 49;
+    const NAME: &str = "message_submission_runtime_policy";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    let tx = conn.transaction().map_err(storage_err(
+        "migration_transaction_failed",
+        "failed to start message submission runtime policy migration",
+    ))?;
+    tx.execute(
+        "ALTER TABLE agent_message_submissions ADD COLUMN required_runtime_policy TEXT NOT NULL DEFAULT 'automatic'",
+        [],
+    )
+    .map_err(storage_err(
+        "migration_apply_failed",
+        "failed to add message submission runtime policy",
+    ))?;
+    tx.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record message submission runtime policy migration",
+    ))?;
+    tx.commit().map_err(storage_err(
+        "migration_commit_failed",
+        "failed to commit message submission runtime policy migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
 }
 
 fn apply_runtime_auth_source_table_rebuild(
@@ -12371,7 +12409,8 @@ mod tests {
             apply_migrations(&mut conn).unwrap(),
             [
                 "47:agent_default_usage_model_nullable",
-                "48:agent_usage_counter_scope"
+                "48:agent_usage_counter_scope",
+                "49:message_submission_runtime_policy"
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -12504,6 +12543,7 @@ mod tests {
                 "46:runtime_auth_source_nullable_legacy_columns",
                 "47:agent_default_usage_model_nullable",
                 "48:agent_usage_counter_scope",
+                "49:message_submission_runtime_policy",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -12616,7 +12656,8 @@ mod tests {
                 "45:agent_auth_context_and_runtime_source",
                 "46:runtime_auth_source_nullable_legacy_columns",
                 "47:agent_default_usage_model_nullable",
-                "48:agent_usage_counter_scope"
+                "48:agent_usage_counter_scope",
+                "49:message_submission_runtime_policy"
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -12767,7 +12808,8 @@ mod tests {
                 "45:agent_auth_context_and_runtime_source",
                 "46:runtime_auth_source_nullable_legacy_columns",
                 "47:agent_default_usage_model_nullable",
-                "48:agent_usage_counter_scope"
+                "48:agent_usage_counter_scope",
+                "49:message_submission_runtime_policy"
             ]
         );
         assert_eq!(
@@ -14129,7 +14171,8 @@ mod tests {
                 "45:agent_auth_context_and_runtime_source",
                 "46:runtime_auth_source_nullable_legacy_columns",
                 "47:agent_default_usage_model_nullable",
-                "48:agent_usage_counter_scope"
+                "48:agent_usage_counter_scope",
+                "49:message_submission_runtime_policy"
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
