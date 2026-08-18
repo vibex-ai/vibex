@@ -98,16 +98,17 @@ use vibex_desktop_model::{
     GitSelectionKey, GitWorkbenchMode, LocaleMode, MessageSendKey, NavigationHistory,
     NewSessionLocation, NewSessionProjectTicket, NewSessionSubmissionStage,
     NewSessionWorkspaceState, RUNTIME_SELECTION_PREFERENCE_LIMIT, RuntimeCascadeChoice,
-    RuntimeCascadeProjection, SessionContentWidthMode, SessionUiState, SidebarHierarchyMode,
-    SidebarOrganizationItem, SidebarOrganizationScope, SidebarProjectAppearance,
-    SidebarProjectLogo, SidebarProjectLogoColor, SidebarProjectProjection, SidebarState,
-    SidebarWorkspaceProjection, StartupDestination, TerminalWorkingDirectory,
-    ThemeMode as ModelThemeMode, ThrottledUiStateWriter, TimelineConversationTurn,
-    TimelineFollowState, TimelineModel, TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
-    UiStateStore, WorkbenchRoute, WorkspaceAgentSummary, WorkspaceContextProjection,
-    WorktreeLifecycleDisplayState, active_collaborations, composer_trigger_at, current_agent_plan,
-    custom_worktree_path_is_absolute, sidebar_project_projections,
-    timeline_agent_message_count_after_sequence, timeline_conversation_turns,
+    RuntimeCascadeProjection, SIDEBAR_AUTO_ARCHIVE_MAX_DAYS, SessionContentWidthMode,
+    SessionUiState, SidebarHierarchyMode, SidebarOrganizationItem, SidebarOrganizationScope,
+    SidebarProjectAppearance, SidebarProjectLogo, SidebarProjectLogoColor,
+    SidebarProjectProjection, SidebarState, SidebarWorkspaceProjection, StartupDestination,
+    TerminalWorkingDirectory, ThemeMode as ModelThemeMode, ThrottledUiStateWriter,
+    TimelineConversationTurn, TimelineFollowState, TimelineModel, TimelineProcessActivityGroup,
+    TimelineRow, TimelineRowKind, UiStateStore, WorkbenchRoute, WorkspaceAgentSummary,
+    WorkspaceContextProjection, WorktreeLifecycleDisplayState, active_collaborations,
+    composer_trigger_at, current_agent_plan, custom_worktree_path_is_absolute,
+    sidebar_project_projections, timeline_agent_message_count_after_sequence,
+    timeline_conversation_turns,
 };
 use vibex_desktop_runtime::{
     DesktopEvent, DesktopRuntime, DesktopRuntimeConfig, DesktopRuntimeFacade, PREVIEW_APP_ID,
@@ -263,6 +264,7 @@ const AGENT_TIMELINE_SCROLL_IDLE_DELAY: Duration = Duration::from_millis(160);
 const AGENT_TURN_DURATION_TICK_INTERVAL: Duration = Duration::from_secs(1);
 const AUTO_CONTINUE_COUNTDOWN_SECONDS: u8 = 5;
 const AUTO_CONTINUE_TICK_INTERVAL: Duration = Duration::from_secs(1);
+const SIDEBAR_AUTO_ARCHIVE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const AGENT_TIMELINE_SCROLLBAR_HIT_WIDTH_PX: f32 = 16.0;
 const SESSION_SEARCH_RESULT_LIMIT: usize = 200;
 const SESSION_SEARCH_RESULT_ROW_HEIGHT: f32 = 68.0;
@@ -3304,6 +3306,13 @@ struct SidebarProjectMenuTarget {
     auto_continue_enabled: bool,
 }
 
+struct SidebarFolderMenuTarget {
+    folder_id: String,
+    folder_name: String,
+    project_id: Option<String>,
+    auto_archive_after_days: Option<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SidebarContextMenuTarget {
     Project(String),
@@ -3596,6 +3605,7 @@ pub struct VibexWorkbench {
     sidebar_organization_drop_target: Option<SidebarOrganizationDropTarget>,
     sidebar_organization_root_drop_target:
         Option<(Vec<SidebarOrganizationItem>, SidebarOrganizationScope)>,
+    sidebar_auto_archive_task: Option<Task<()>>,
     new_session_agent_drop_target: Option<NewSessionAgentDropTarget>,
     collapsed_project_restore: Option<BTreeSet<String>>,
     selected_session_id: Option<VibexSessionId>,
@@ -4200,6 +4210,7 @@ impl VibexWorkbench {
             sidebar_folder_drag_state: None,
             sidebar_organization_drop_target: None,
             sidebar_organization_root_drop_target: None,
+            sidebar_auto_archive_task: None,
             new_session_agent_drop_target: None,
             collapsed_project_restore: None,
             selected_session_id,
@@ -4359,6 +4370,7 @@ impl VibexWorkbench {
             _agent_subscriptions: agent_subscriptions,
         };
         this.schedule_startup_loading_indicator(cx);
+        this.start_sidebar_auto_archive_schedule(cx);
         this.begin_runtime_start(cx);
         this.bind_to_window(window, cx);
         this.quit_subscription = Some(cx.on_app_quit(|this, cx| {
@@ -4637,6 +4649,29 @@ impl VibexWorkbench {
                         cx.notify();
                     }
                 });
+            },
+        ));
+    }
+
+    fn start_sidebar_auto_archive_schedule(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_auto_archive_task.is_some() {
+            return;
+        }
+        self.sidebar_auto_archive_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| loop {
+                cx.background_executor()
+                    .timer(SIDEBAR_AUTO_ARCHIVE_CHECK_INTERVAL)
+                    .await;
+                let active = entity
+                    .update(cx, |this, cx| {
+                        if this.apply_sidebar_scheduled_archives(unix_timestamp_ms()) {
+                            cx.notify();
+                        }
+                    })
+                    .is_ok();
+                if !active {
+                    break;
+                }
             },
         ));
     }
@@ -5562,6 +5597,7 @@ impl VibexWorkbench {
             .sidebar
             .organization
             .reconcile(&ordered_project_ids, &ordered_session_projects);
+        self.apply_sidebar_scheduled_archives(unix_timestamp_ms());
         self.sidebar_move_selected_items.retain(|item| match item {
             SidebarOrganizationItem::Project(id) => valid_project_ids.contains(id),
             SidebarOrganizationItem::Session(id) => valid_session_ids.contains(id),
@@ -5588,6 +5624,19 @@ impl VibexWorkbench {
             self.sidebar_rename_error = None;
         }
         self.invalidate_sidebar_projection_cache();
+    }
+
+    fn apply_sidebar_scheduled_archives(&mut self, now_ms: i64) -> bool {
+        let changed = self.ui_state.sidebar.organization.apply_scheduled_archives(
+            &self.sessions,
+            &self.sidebar_state.pinned_ids,
+            now_ms,
+        );
+        if changed {
+            self.invalidate_sidebar_projection_cache();
+            self.queue_ui_state();
+        }
+        changed
     }
 
     fn upsert_session_snapshot(&mut self, session: AgentSession) {
@@ -8690,20 +8739,35 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) -> bool {
         self.notify_for_timeline_events(&events);
+        let mut sidebar_changed = false;
+        for event in &events {
+            if let Some(session) = self
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == event.session_id)
+                && event.item.timestamp_ms > session.last_message_at_ms
+            {
+                session.last_message_at_ms = event.item.timestamp_ms;
+                sidebar_changed = true;
+            }
+        }
+        if sidebar_changed {
+            self.invalidate_sidebar_projection_cache();
+        }
         let unread_changed = update_unread_agent_completions(
             &mut self.unread_agent_completion_session_ids,
             self.selected_session_id.as_ref(),
             &events,
         );
         let Some(selected_session_id) = self.selected_session_id.clone() else {
-            return unread_changed;
+            return unread_changed || sidebar_changed;
         };
         let events = events
             .into_iter()
             .filter(|event| event.session_id == selected_session_id)
             .collect::<Vec<_>>();
         if events.is_empty() {
-            return unread_changed;
+            return unread_changed || sidebar_changed;
         }
 
         let previous_end_sequence = self.timeline.authoritative_end_sequence;
@@ -8787,7 +8851,7 @@ impl VibexWorkbench {
         }
         timeline_batch_should_repaint(
             &self.ui_state.workbench.active_tab,
-            unread_changed,
+            unread_changed || sidebar_changed,
             changed > 0,
             needs_refetch,
         )
@@ -14846,6 +14910,26 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    fn set_sidebar_folder_auto_archive_after_days(
+        &mut self,
+        folder_id: &str,
+        days: Option<u8>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .ui_state
+            .sidebar
+            .organization
+            .set_folder_auto_archive_after_days(folder_id, days)
+        {
+            return;
+        }
+        self.queue_ui_state();
+        self.apply_sidebar_scheduled_archives(unix_timestamp_ms());
+        self.invalidate_sidebar_projection_cache();
+        cx.notify();
+    }
+
     fn confirm_delete_sidebar_folder(
         &mut self,
         folder_id: String,
@@ -18134,20 +18218,31 @@ impl VibexWorkbench {
 
     fn build_sidebar_folder_menu(
         menu: PopupMenu,
-        folder_id: String,
-        folder_name: String,
-        project_id: Option<String>,
+        target: SidebarFolderMenuTarget,
         entity: WeakEntity<Self>,
+        window: &mut Window,
         cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
+        let SidebarFolderMenuTarget {
+            folder_id,
+            folder_name,
+            project_id,
+            auto_archive_after_days,
+        } = target;
         let _ = entity.update(cx, |this, _| this.retain_sidebar_hover_preview());
         let new_folder_entity = entity.clone();
         let rename_entity = entity.clone();
+        let archive_entity = entity.clone();
         let delete_entity = entity;
         let child_parent_id = folder_id.clone();
         let rename_folder_id = folder_id.clone();
+        let archive_folder_id = folder_id.clone();
         let delete_folder_id = folder_id;
-        menu.item(PopupMenuItem::label(folder_name))
+        let project_id_for_child = project_id.clone();
+        let has_project_scope = project_id.is_some();
+        let resolved_locale = locale::current_locale();
+        let mut menu = menu
+            .item(PopupMenuItem::label(folder_name))
             .separator()
             .item(
                 PopupMenuItem::new(locale::text("New Folder", "新建文件夹", "新建資料夾"))
@@ -18155,32 +18250,84 @@ impl VibexWorkbench {
                     .on_click(move |_, window, cx| {
                         let _ = new_folder_entity.update(cx, |this, cx| {
                             this.create_sidebar_folder(
-                                project_id.clone(),
+                                project_id_for_child.clone(),
                                 Some(child_parent_id.clone()),
                                 window,
                                 cx,
                             )
                         });
                     }),
-            )
-            .item(
-                PopupMenuItem::new(locale::text("Rename", "重命名", "重新命名"))
-                    .icon(sidebar_icon("icons/vibex/pencil.svg"))
-                    .on_click(move |_, window, cx| {
-                        let _ = rename_entity.update(cx, |this, cx| {
-                            this.begin_sidebar_folder_rename(rename_folder_id.clone(), window, cx)
-                        });
-                    }),
-            )
-            .item(
-                PopupMenuItem::new(locale::text("Delete Folder", "删除文件夹", "刪除資料夾"))
-                    .icon(sidebar_icon("icons/vibex/trash-2.svg"))
-                    .on_click(move |_, window, cx| {
-                        let _ = delete_entity.update(cx, |this, cx| {
-                            this.confirm_delete_sidebar_folder(delete_folder_id.clone(), window, cx)
-                        });
-                    }),
-            )
+            );
+        if has_project_scope {
+            menu = menu.submenu_with_icon(
+                Some(Icon::new(IconName::Settings2)),
+                locale::text("Advanced properties", "高级属性", "進階屬性"),
+                window,
+                cx,
+                move |mut submenu, _, _| {
+                    submenu = submenu.item(PopupMenuItem::label(locale::text(
+                        "Scheduled archive",
+                        "定时归档",
+                        "定時封存",
+                    )));
+                    let off_entity = archive_entity.clone();
+                    let off_folder_id = archive_folder_id.clone();
+                    submenu = submenu.item(
+                        PopupMenuItem::new(locale::text("Off", "关闭", "關閉"))
+                            .checked(auto_archive_after_days.is_none())
+                            .on_click(move |_, _, cx| {
+                                let _ = off_entity.update(cx, |this, cx| {
+                                    this.set_sidebar_folder_auto_archive_after_days(
+                                        &off_folder_id,
+                                        None,
+                                        cx,
+                                    )
+                                });
+                            }),
+                    );
+                    for days in 1..=SIDEBAR_AUTO_ARCHIVE_MAX_DAYS {
+                        let entity = archive_entity.clone();
+                        let folder_id = archive_folder_id.clone();
+                        submenu = submenu.item(
+                            PopupMenuItem::new(sidebar_auto_archive_days_label(
+                                days,
+                                resolved_locale,
+                            ))
+                            .checked(auto_archive_after_days == Some(days))
+                            .on_click(move |_, _, cx| {
+                                let _ = entity.update(cx, |this, cx| {
+                                    this.set_sidebar_folder_auto_archive_after_days(
+                                        &folder_id,
+                                        Some(days),
+                                        cx,
+                                    )
+                                });
+                            }),
+                        );
+                    }
+                    submenu
+                },
+            );
+            menu = menu.separator();
+        }
+        menu.item(
+            PopupMenuItem::new(locale::text("Rename", "重命名", "重新命名"))
+                .icon(sidebar_icon("icons/vibex/pencil.svg"))
+                .on_click(move |_, window, cx| {
+                    let _ = rename_entity.update(cx, |this, cx| {
+                        this.begin_sidebar_folder_rename(rename_folder_id.clone(), window, cx)
+                    });
+                }),
+        )
+        .item(
+            PopupMenuItem::new(locale::text("Delete Folder", "删除文件夹", "刪除資料夾"))
+                .icon(sidebar_icon("icons/vibex/trash-2.svg"))
+                .on_click(move |_, window, cx| {
+                    let _ = delete_entity.update(cx, |this, cx| {
+                        this.confirm_delete_sidebar_folder(delete_folder_id.clone(), window, cx)
+                    });
+                }),
+        )
     }
 
     fn render_sidebar_root_children(
@@ -18366,12 +18513,12 @@ impl VibexWorkbench {
         depth: usize,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(folder_name) = self
+        let Some((folder_name, auto_archive_after_days)) = self
             .ui_state
             .sidebar
             .organization
             .folder(&folder_id)
-            .map(|folder| folder.name.clone())
+            .map(|folder| (folder.name.clone(), folder.auto_archive_after_days))
         else {
             return Empty.into_any_element();
         };
@@ -18600,7 +18747,7 @@ impl VibexWorkbench {
                 cx.stop_propagation();
             }))
             .when(active_folder_drag, |this| this.opacity(0.45))
-            .context_menu(move |menu, _, cx| {
+            .context_menu(move |menu, window, cx| {
                 let _ = context_hover_entity.update(cx, |this, cx| {
                     this.set_sidebar_context_menu_target(
                         SidebarContextMenuTarget::Folder(context_folder_id.clone()),
@@ -18609,10 +18756,14 @@ impl VibexWorkbench {
                 });
                 Self::build_sidebar_folder_menu(
                     menu,
-                    context_folder_id.clone(),
-                    context_folder_name.clone(),
-                    context_project_id.clone(),
+                    SidebarFolderMenuTarget {
+                        folder_id: context_folder_id.clone(),
+                        folder_name: context_folder_name.clone(),
+                        project_id: context_project_id.clone(),
+                        auto_archive_after_days,
+                    },
                     context_entity.clone(),
+                    window,
                     cx,
                 )
             })
@@ -18642,7 +18793,13 @@ impl VibexWorkbench {
                         })
                         .size(px(14.0))
                         .flex_none()
-                        .text_color(cx.theme().sidebar_foreground.opacity(0.72)),
+                        .text_color(
+                            if auto_archive_after_days.is_some() {
+                                cx.theme().success
+                            } else {
+                                cx.theme().sidebar_foreground.opacity(0.72)
+                            },
+                        ),
                     )
                     .when(!renaming, |this| {
                         this.child(
@@ -18684,13 +18841,17 @@ impl VibexWorkbench {
                                             "文件夹操作",
                                             "資料夾操作",
                                         ))
-                                        .dropdown_menu(move |menu, _, cx| {
+                                        .dropdown_menu(move |menu, window, cx| {
                                             Self::build_sidebar_folder_menu(
                                                 menu,
-                                                menu_folder_id.clone(),
-                                                menu_folder_name.clone(),
-                                                menu_project_id.clone(),
+                                                SidebarFolderMenuTarget {
+                                                    folder_id: menu_folder_id.clone(),
+                                                    folder_name: menu_folder_name.clone(),
+                                                    project_id: menu_project_id.clone(),
+                                                    auto_archive_after_days,
+                                                },
                                                 menu_entity.clone(),
+                                                window,
                                                 cx,
                                             )
                                         })
@@ -34062,6 +34223,20 @@ fn sidebar_icon(path: &'static str) -> Icon {
     Icon::default().path(path).small()
 }
 
+fn sidebar_auto_archive_days_label(days: u8, locale: locale::ResolvedLocale) -> String {
+    match locale {
+        locale::ResolvedLocale::En => {
+            if days == 1 {
+                "After 1 day".to_string()
+            } else {
+                format!("After {days} days")
+            }
+        }
+        locale::ResolvedLocale::ZhCn => format!("{days}天后"),
+        locale::ResolvedLocale::ZhTw => format!("{days}天後"),
+    }
+}
+
 fn sidebar_project_logo_icon(logo: SidebarProjectLogo) -> Icon {
     sidebar_icon(match logo {
         SidebarProjectLogo::Boxes => "icons/vibex/boxes.svg",
@@ -43001,6 +43176,32 @@ mod tests {
             .map(|(body, _)| body)
             .expect("folder menu should remain inspectable");
         assert!(menu.contains("this.confirm_delete_sidebar_folder("));
+    }
+
+    #[test]
+    fn scheduled_archive_folders_keep_their_menu_schedule_and_green_icon_contract() {
+        let source = include_str!("app.rs");
+        let menu = source
+            .split_once("    fn build_sidebar_folder_menu(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_root_children("))
+            .map(|(body, _)| body)
+            .expect("folder menu should remain inspectable");
+        let folder = source
+            .split_once("    fn render_sidebar_folder(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_project("))
+            .map(|(body, _)| body)
+            .expect("folder renderer should remain inspectable");
+
+        assert!(source.contains("SIDEBAR_AUTO_ARCHIVE_CHECK_INTERVAL"));
+        assert!(source.contains("start_sidebar_auto_archive_schedule(cx)"));
+        assert!(source.contains("apply_sidebar_scheduled_archives(unix_timestamp_ms())"));
+        assert!(menu.contains("if has_project_scope"));
+        assert!(menu.contains("Advanced properties"));
+        assert!(menu.contains("Scheduled archive"));
+        assert!(menu.contains("for days in 1..=SIDEBAR_AUTO_ARCHIVE_MAX_DAYS"));
+        assert!(folder.contains("folder.auto_archive_after_days"));
+        assert!(folder.contains("if auto_archive_after_days.is_some()"));
+        assert!(folder.contains("cx.theme().success"));
     }
 
     #[test]

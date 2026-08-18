@@ -1,12 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
+use vibex_core::AgentSession;
 
 const SIDEBAR_FOLDER_LIMIT: usize = 2_000;
 const SIDEBAR_ORGANIZATION_ITEM_LIMIT: usize = 5_000;
 const SIDEBAR_FOLDER_DEPTH_LIMIT: usize = 32;
 const SIDEBAR_ITEM_ID_MAX_CHARS: usize = 256;
 const SIDEBAR_FOLDER_NAME_MAX_CHARS: usize = 160;
+const MILLIS_PER_DAY: i64 = 24 * 60 * 60 * 1_000;
+
+pub const SIDEBAR_AUTO_ARCHIVE_MAX_DAYS: u8 = 14;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "id", rename_all = "snake_case")]
@@ -30,6 +34,8 @@ pub struct SidebarFolderUiState {
     pub name: String,
     #[serde(default)]
     pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_archive_after_days: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,9 +79,14 @@ impl SidebarOrganizationState {
             let project_id = folder
                 .project_id
                 .and_then(|id| bounded_text(&id, SIDEBAR_ITEM_ID_MAX_CHARS));
-            folders
-                .entry(id)
-                .or_insert(SidebarFolderUiState { name, project_id });
+            let auto_archive_after_days = folder.auto_archive_after_days.filter(|days| {
+                project_id.is_some() && (1..=SIDEBAR_AUTO_ARCHIVE_MAX_DAYS).contains(days)
+            });
+            folders.entry(id).or_insert(SidebarFolderUiState {
+                name,
+                project_id,
+                auto_archive_after_days,
+            });
         }
         self.folders = folders;
 
@@ -90,6 +101,7 @@ impl SidebarOrganizationState {
         self.ensure_folder_placements();
         self.enforce_placement_limit();
         self.repair_parents();
+        self.enforce_one_auto_archive_folder_per_project();
         self.deduplicate_sibling_folder_names();
         self.collapsed_folder_ids
             .retain(|id| self.folders.contains_key(id));
@@ -250,8 +262,14 @@ impl SidebarOrganizationState {
         ) {
             return false;
         }
-        self.folders
-            .insert(id.clone(), SidebarFolderUiState { name, project_id });
+        self.folders.insert(
+            id.clone(),
+            SidebarFolderUiState {
+                name,
+                project_id,
+                auto_archive_after_days: None,
+            },
+        );
         let insertion_index = parent_folder_id
             .as_ref()
             .and_then(|parent_id| {
@@ -379,6 +397,126 @@ impl SidebarOrganizationState {
 
     pub fn folder(&self, folder_id: &str) -> Option<&SidebarFolderUiState> {
         self.folders.get(folder_id)
+    }
+
+    pub fn set_folder_auto_archive_after_days(
+        &mut self,
+        folder_id: &str,
+        days: Option<u8>,
+    ) -> bool {
+        if days.is_some_and(|days| !(1..=SIDEBAR_AUTO_ARCHIVE_MAX_DAYS).contains(&days)) {
+            return false;
+        }
+        let Some(project_id) = self
+            .folders
+            .get(folder_id)
+            .and_then(|folder| folder.project_id.clone())
+        else {
+            return false;
+        };
+
+        let mut changed = false;
+        if days.is_some() {
+            for (candidate_id, folder) in &mut self.folders {
+                if candidate_id != folder_id
+                    && folder.project_id.as_deref() == Some(project_id.as_str())
+                    && folder.auto_archive_after_days.take().is_some()
+                {
+                    changed = true;
+                }
+            }
+        }
+        let Some(folder) = self.folders.get_mut(folder_id) else {
+            return changed;
+        };
+        if folder.auto_archive_after_days != days {
+            folder.auto_archive_after_days = days;
+            changed = true;
+        }
+        changed
+    }
+
+    pub fn apply_scheduled_archives(
+        &mut self,
+        sessions: &[AgentSession],
+        pinned_session_ids: &BTreeSet<String>,
+        now_ms: i64,
+    ) -> bool {
+        let targets = self
+            .placements
+            .iter()
+            .filter_map(|placement| {
+                let SidebarOrganizationItem::Folder(folder_id) = &placement.item else {
+                    return None;
+                };
+                let folder = self.folders.get(folder_id)?;
+                Some((
+                    folder_id.clone(),
+                    folder.project_id.clone()?,
+                    folder.auto_archive_after_days?,
+                ))
+            })
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            return false;
+        }
+
+        let session_projects = sessions
+            .iter()
+            .map(|session| {
+                (
+                    session.id.as_str().to_string(),
+                    session.project_id.as_str().to_string(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let activity_by_session = sessions
+            .iter()
+            .map(|session| {
+                (
+                    session.id.as_str().to_string(),
+                    session.last_message_at_ms.max(session.created_at_ms),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let original = self.placements.clone();
+
+        for (folder_id, project_id, days) in targets {
+            let cutoff_ms = now_ms.saturating_sub(i64::from(days) * MILLIS_PER_DAY);
+            let mut moving = sessions
+                .iter()
+                .filter(|session| {
+                    session.project_id.as_str() == project_id
+                        && session.archived_at_ms.is_none()
+                        && session.deleted_at_ms.is_none()
+                        && !pinned_session_ids.contains(session.id.as_str())
+                        && self
+                            .parent_of(&SidebarOrganizationItem::Session(
+                                session.id.as_str().to_string(),
+                            ))
+                            .is_none()
+                        && session.last_message_at_ms.max(session.created_at_ms) <= cutoff_ms
+                })
+                .map(|session| SidebarOrganizationItem::Session(session.id.as_str().to_string()))
+                .collect::<Vec<_>>();
+            moving.sort_by_key(|item| {
+                (
+                    std::cmp::Reverse(
+                        activity_by_session
+                            .get(item.id())
+                            .copied()
+                            .unwrap_or_default(),
+                    ),
+                    item.id().to_string(),
+                )
+            });
+            if !moving.is_empty() {
+                self.move_many_into(&moving, &folder_id, &session_projects);
+            }
+            self.sort_folder_sessions_by_activity(&folder_id, &activity_by_session);
+        }
+
+        self.placements != original
     }
 
     pub fn folder_contains_items(&self, folder_id: &str) -> bool {
@@ -733,6 +871,50 @@ impl SidebarOrganizationState {
                     .all(|item| !matches!(item, SidebarOrganizationItem::Folder(_))))
     }
 
+    fn sort_folder_sessions_by_activity(
+        &mut self,
+        folder_id: &str,
+        activity_by_session: &BTreeMap<String, i64>,
+    ) {
+        let mut sessions = self
+            .placements
+            .iter()
+            .filter(|placement| placement.parent_folder_id.as_deref() == Some(folder_id))
+            .filter(|placement| {
+                matches!(
+                    &placement.item,
+                    SidebarOrganizationItem::Session(session_id)
+                        if activity_by_session.contains_key(session_id)
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        sessions.sort_by_key(|placement| {
+            (
+                std::cmp::Reverse(
+                    activity_by_session
+                        .get(placement.item.id())
+                        .copied()
+                        .unwrap_or_default(),
+                ),
+                placement.item.id().to_string(),
+            )
+        });
+        let mut sessions = sessions.into_iter();
+        for placement in &mut self.placements {
+            if placement.parent_folder_id.as_deref() == Some(folder_id)
+                && matches!(
+                    &placement.item,
+                    SidebarOrganizationItem::Session(session_id)
+                        if activity_by_session.contains_key(session_id)
+                )
+                && let Some(next) = sessions.next()
+            {
+                *placement = next;
+            }
+        }
+    }
+
     pub fn toggle_collapsed(&mut self, folder_id: &str) -> Option<bool> {
         if !self.folders.contains_key(folder_id) {
             return None;
@@ -1022,6 +1204,27 @@ impl SidebarOrganizationState {
             }
         }
     }
+
+    fn enforce_one_auto_archive_folder_per_project(&mut self) {
+        let mut claimed_projects = BTreeSet::new();
+        for placement in &self.placements {
+            let SidebarOrganizationItem::Folder(folder_id) = &placement.item else {
+                continue;
+            };
+            let Some(folder) = self.folders.get_mut(folder_id) else {
+                continue;
+            };
+            let Some(project_id) = folder.project_id.as_ref() else {
+                folder.auto_archive_after_days = None;
+                continue;
+            };
+            if folder.auto_archive_after_days.is_some()
+                && !claimed_projects.insert(project_id.clone())
+            {
+                folder.auto_archive_after_days = None;
+            }
+        }
+    }
 }
 
 fn normalize_placement(
@@ -1088,6 +1291,28 @@ fn next_unique_folder_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vibex_core::{
+        AgentId, AgentSessionSafety, AgentSessionState, ProjectId, WorkspaceId, WorkspaceMode,
+    };
+
+    fn agent_session(project_id: &ProjectId, last_message_at_ms: i64) -> AgentSession {
+        AgentSession {
+            id: vibex_core::VibexSessionId::new(),
+            title: format!("Session {last_message_at_ms}"),
+            project_id: project_id.clone(),
+            workspace_id: WorkspaceId::new(),
+            workspace_root: "/repo".into(),
+            workspace_mode: WorkspaceMode::CurrentCheckout,
+            agent_id: AgentId::parse("codex").unwrap(),
+            state: AgentSessionState::Idle,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: last_message_at_ms.saturating_sub(1),
+            updated_at_ms: last_message_at_ms,
+            last_message_at_ms,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        }
+    }
 
     fn session_projects() -> BTreeMap<String, String> {
         BTreeMap::from([
@@ -1188,6 +1413,7 @@ mod tests {
                     SidebarFolderUiState {
                         name: "Duplicate".into(),
                         project_id: None,
+                        auto_archive_after_days: None,
                     },
                 ),
                 (
@@ -1195,6 +1421,7 @@ mod tests {
                     SidebarFolderUiState {
                         name: "duplicate".into(),
                         project_id: None,
+                        auto_archive_after_days: None,
                     },
                 ),
             ]),
@@ -1607,6 +1834,7 @@ mod tests {
                 SidebarFolderUiState {
                     name: "Folder".into(),
                     project_id: None,
+                    auto_archive_after_days: None,
                 },
             )]),
             placements: (0..SIDEBAR_ORGANIZATION_ITEM_LIMIT)
@@ -1635,6 +1863,7 @@ mod tests {
                     SidebarFolderUiState {
                         name: "A".into(),
                         project_id: None,
+                        auto_archive_after_days: None,
                     },
                 ),
                 (
@@ -1642,6 +1871,7 @@ mod tests {
                     SidebarFolderUiState {
                         name: "B".into(),
                         project_id: None,
+                        auto_archive_after_days: None,
                     },
                 ),
             ]),
@@ -1674,5 +1904,133 @@ mod tests {
         );
         assert!(!state.folder_is_descendant_of("a", "a"));
         assert_eq!(state.collapsed_folder_ids, BTreeSet::from(["a".into()]));
+    }
+
+    #[test]
+    fn scheduled_archive_settings_are_project_scoped_bounded_and_unique() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_folder("root", "Root", None, None));
+        assert!(state.create_folder("first", "First", Some("project-a".into()), None));
+        assert!(state.create_folder("second", "Second", Some("project-a".into()), None));
+
+        assert!(!state.set_folder_auto_archive_after_days("root", Some(3)));
+        assert!(!state.set_folder_auto_archive_after_days("first", Some(0)));
+        assert!(
+            !state.set_folder_auto_archive_after_days(
+                "first",
+                Some(SIDEBAR_AUTO_ARCHIVE_MAX_DAYS + 1),
+            )
+        );
+        assert!(state.set_folder_auto_archive_after_days("first", Some(3)));
+        assert!(state.set_folder_auto_archive_after_days("second", Some(7)));
+        assert_eq!(state.folder("first").unwrap().auto_archive_after_days, None);
+        assert_eq!(
+            state.folder("second").unwrap().auto_archive_after_days,
+            Some(7),
+        );
+        assert!(state.set_folder_auto_archive_after_days("second", None));
+    }
+
+    #[test]
+    fn scheduled_archives_move_only_unfiled_unpinned_inactive_sessions_in_time_order() {
+        let project = ProjectId::new();
+        let other_project = ProjectId::new();
+        let now_ms = 20 * MILLIS_PER_DAY;
+        let recent = agent_session(&project, now_ms - 2 * MILLIS_PER_DAY);
+        let older = agent_session(&project, now_ms - 6 * MILLIS_PER_DAY);
+        let old = agent_session(&project, now_ms - 4 * MILLIS_PER_DAY);
+        let pinned = agent_session(&project, now_ms - 8 * MILLIS_PER_DAY);
+        let organized = agent_session(&project, now_ms - 9 * MILLIS_PER_DAY);
+        let other = agent_session(&other_project, now_ms - 10 * MILLIS_PER_DAY);
+        let sessions = vec![
+            recent.clone(),
+            older.clone(),
+            old.clone(),
+            pinned.clone(),
+            organized.clone(),
+            other.clone(),
+        ];
+
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_folder(
+            "archive",
+            "Archive",
+            Some(project.as_str().to_string()),
+            None,
+        ));
+        assert!(state.create_folder("manual", "Manual", Some(project.as_str().to_string()), None,));
+        state.reconcile(
+            &[
+                project.as_str().to_string(),
+                other_project.as_str().to_string(),
+            ],
+            &sessions
+                .iter()
+                .map(|session| {
+                    (
+                        session.id.as_str().to_string(),
+                        session.project_id.as_str().to_string(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        let session_projects = sessions
+            .iter()
+            .map(|session| {
+                (
+                    session.id.as_str().to_string(),
+                    session.project_id.as_str().to_string(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert!(state.move_into(
+            &SidebarOrganizationItem::Session(organized.id.as_str().to_string()),
+            "manual",
+            &session_projects,
+        ));
+        assert!(state.set_folder_auto_archive_after_days("archive", Some(3)));
+
+        assert!(state.apply_scheduled_archives(
+            &sessions,
+            &BTreeSet::from([pinned.id.as_str().to_string()]),
+            now_ms,
+        ));
+        for session in [&old, &older] {
+            assert_eq!(
+                state
+                    .parent_of(&SidebarOrganizationItem::Session(
+                        session.id.as_str().to_string(),
+                    ))
+                    .as_deref(),
+                Some("archive"),
+            );
+        }
+        for session in [&recent, &pinned, &other] {
+            assert_eq!(
+                state.parent_of(&SidebarOrganizationItem::Session(
+                    session.id.as_str().to_string(),
+                )),
+                None,
+            );
+        }
+        assert_eq!(
+            state
+                .parent_of(&SidebarOrganizationItem::Session(
+                    organized.id.as_str().to_string(),
+                ))
+                .as_deref(),
+            Some("manual"),
+        );
+        let archived = [
+            SidebarOrganizationItem::Session(older.id.as_str().to_string()),
+            SidebarOrganizationItem::Session(old.id.as_str().to_string()),
+        ];
+        assert_eq!(
+            state.ordered_children(Some("archive"), &archived),
+            [
+                SidebarOrganizationItem::Session(old.id.as_str().to_string()),
+                SidebarOrganizationItem::Session(older.id.as_str().to_string()),
+            ],
+        );
     }
 }
