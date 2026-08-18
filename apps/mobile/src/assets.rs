@@ -21,6 +21,19 @@ const ICONS: &[&str] = &[
     "icons/send.svg",
     "icons/stop.svg",
     "icons/x.svg",
+    "icons/settings.svg",
+    "icons/activity.svg",
+    "icons/server.svg",
+    "icons/chevron-right.svg",
+    "icons/chevron-left.svg",
+    "icons/chevron-down.svg",
+    "icons/message-square.svg",
+    "icons/pin.svg",
+    "icons/pencil.svg",
+    "icons/file-archive.svg",
+    "icons/trash-2.svg",
+    "icons/openai.svg",
+    "icons/claude.svg",
 ];
 
 pub struct MobileAssets;
@@ -46,6 +59,25 @@ impl AssetSource for MobileAssets {
             "icons/send.svg" => Some(include_bytes!("../assets/icons/send.svg")),
             "icons/stop.svg" => Some(include_bytes!("../assets/icons/stop.svg")),
             "icons/x.svg" => Some(include_bytes!("../assets/icons/x.svg")),
+            "icons/settings.svg" => Some(include_bytes!("../assets/icons/settings.svg")),
+            "icons/activity.svg" => Some(include_bytes!("../assets/icons/activity.svg")),
+            "icons/server.svg" => Some(include_bytes!("../assets/icons/server.svg")),
+            "icons/chevron-right.svg" => Some(include_bytes!("../assets/icons/chevron-right.svg")),
+            "icons/chevron-left.svg" => Some(include_bytes!("../assets/icons/chevron-left.svg")),
+            "icons/chevron-down.svg" => Some(include_bytes!("../assets/icons/chevron-down.svg")),
+            "icons/message-square.svg" => {
+                Some(include_bytes!("../assets/icons/message-square.svg"))
+            }
+            "icons/pin.svg" => Some(include_bytes!("../assets/icons/pin.svg")),
+            "icons/pencil.svg" => Some(include_bytes!("../../desktop/assets/icons/pencil.svg")),
+            "icons/file-archive.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/file-archive.svg"
+            )),
+            "icons/trash-2.svg" => Some(include_bytes!("../../desktop/assets/icons/trash-2.svg")),
+            // Reuse the reviewed desktop provider marks so the compact client
+            // and desktop sidebar show the same Agent identity.
+            "icons/openai.svg" => Some(include_bytes!("../../desktop/assets/icons/openai.svg")),
+            "icons/claude.svg" => Some(include_bytes!("../../desktop/assets/icons/claude.svg")),
             _ => None,
         };
         Ok(bytes.map(Cow::Borrowed))

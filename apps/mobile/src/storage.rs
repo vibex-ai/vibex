@@ -2,12 +2,24 @@ use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use vibex_backend::{BackendError, BackendResult};
 
 use crate::pairing::MobileCredentialBundle;
 
 const CREDENTIAL_FILE: &str = "remote-credentials.json";
+const HOSTS_FILE: &str = "remote-hosts.json";
 const MAX_CREDENTIAL_BYTES: u64 = 64 * 1024;
+const MAX_HOSTS: usize = 32;
+const MAX_HOST_BYTES: u64 = 2 * 1024 * 1024;
+const HOSTS_SCHEMA_VERSION: &str = "vibex-native-mobile-hosts.v1";
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredHosts {
+    schema_version: String,
+    hosts: Vec<MobileCredentialBundle>,
+}
 
 #[derive(Clone, Debug)]
 pub struct CredentialStorage {
@@ -21,6 +33,10 @@ impl CredentialStorage {
 
     pub fn path(&self) -> PathBuf {
         self.data_dir.join(CREDENTIAL_FILE)
+    }
+
+    pub fn hosts_path(&self) -> PathBuf {
+        self.data_dir.join(HOSTS_FILE)
     }
 
     pub fn load(&self) -> BackendResult<Option<MobileCredentialBundle>> {
@@ -90,11 +106,100 @@ impl CredentialStorage {
         outcome
     }
 
+    pub fn load_hosts(&self) -> BackendResult<Vec<MobileCredentialBundle>> {
+        let path = self.hosts_path();
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(_) => return Err(storage_error("mobile_hosts_read_failed")),
+        };
+        if metadata.len() == 0 || metadata.len() > MAX_HOST_BYTES {
+            return self.reject_invalid_hosts(&path);
+        }
+        let bytes = fs::read(&path).map_err(|_| storage_error("mobile_hosts_read_failed"))?;
+        let stored: StoredHosts = match serde_json::from_slice(&bytes) {
+            Ok(stored) => stored,
+            Err(_) => return self.reject_invalid_hosts(&path),
+        };
+        if stored.schema_version != HOSTS_SCHEMA_VERSION || stored.hosts.len() > MAX_HOSTS {
+            return self.reject_invalid_hosts(&path);
+        }
+        for bundle in &stored.hosts {
+            if bundle.validate().is_err() {
+                return self.reject_invalid_hosts(&path);
+            }
+        }
+        Ok(stored.hosts)
+    }
+
+    pub fn save_hosts(&self, hosts: &[MobileCredentialBundle]) -> BackendResult<()> {
+        if hosts.len() > MAX_HOSTS {
+            return Err(storage_error("mobile_hosts_invalid"));
+        }
+        for bundle in hosts {
+            bundle.validate()?;
+        }
+        fs::create_dir_all(&self.data_dir)
+            .map_err(|_| storage_error("mobile_hosts_write_failed"))?;
+        let stored = StoredHosts {
+            schema_version: HOSTS_SCHEMA_VERSION.to_string(),
+            hosts: hosts.to_vec(),
+        };
+        let encoded =
+            serde_json::to_vec(&stored).map_err(|_| storage_error("mobile_hosts_encode_failed"))?;
+        if encoded.is_empty() || encoded.len() as u64 > MAX_HOST_BYTES {
+            return Err(storage_error("mobile_hosts_invalid"));
+        }
+        let path = self.hosts_path();
+        let temporary = temporary_path(&path);
+        match fs::remove_file(&temporary) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(storage_error("mobile_hosts_write_failed")),
+        }
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let outcome = (|| {
+            let mut file = options
+                .open(&temporary)
+                .map_err(|_| storage_error("mobile_hosts_write_failed"))?;
+            file.write_all(&encoded)
+                .and_then(|_| file.sync_all())
+                .map_err(|_| storage_error("mobile_hosts_write_failed"))?;
+            fs::rename(&temporary, &path)
+                .map_err(|_| storage_error("mobile_hosts_write_failed"))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                    .map_err(|_| storage_error("mobile_hosts_write_failed"))?;
+            }
+            Ok(())
+        })();
+        if outcome.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        outcome
+    }
+
     pub fn clear(&self) -> BackendResult<()> {
         match fs::remove_file(self.path()) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(_) => Err(storage_error("mobile_credentials_clear_failed")),
+        }
+    }
+
+    pub fn clear_hosts(&self) -> BackendResult<()> {
+        match fs::remove_file(self.hosts_path()) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(storage_error("mobile_hosts_clear_failed")),
         }
     }
 
@@ -105,6 +210,16 @@ impl CredentialStorage {
                 Err(storage_error("mobile_credentials_invalid"))
             }
             Err(_) => Err(storage_error("mobile_credentials_clear_failed")),
+        }
+    }
+
+    fn reject_invalid_hosts(&self, path: &Path) -> BackendResult<Vec<MobileCredentialBundle>> {
+        match fs::remove_file(path) {
+            Ok(()) => Err(storage_error("mobile_hosts_invalid")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(storage_error("mobile_hosts_invalid"))
+            }
+            Err(_) => Err(storage_error("mobile_hosts_clear_failed")),
         }
     }
 }
@@ -160,6 +275,33 @@ mod tests {
         assert_eq!(storage.load().unwrap().unwrap(), fixture);
         storage.clear().unwrap();
         assert!(storage.load().unwrap().is_none());
+    }
+
+    #[test]
+    fn hosts_round_trip_and_clear() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        let first = fixture();
+        let mut second = fixture();
+        second.expected_server_id = "second-desktop".to_string();
+        storage
+            .save_hosts(&[first.clone(), second.clone()])
+            .unwrap();
+        assert_eq!(storage.load_hosts().unwrap(), vec![first, second]);
+        storage.clear_hosts().unwrap();
+        assert!(storage.load_hosts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_hosts_are_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        fs::create_dir_all(temp.path()).unwrap();
+        fs::write(storage.hosts_path(), b"not-json").unwrap();
+
+        let error = storage.load_hosts().unwrap_err();
+        assert_eq!(error.code, "mobile_hosts_invalid");
+        assert!(!storage.hosts_path().exists());
     }
 
     #[test]

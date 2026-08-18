@@ -55,6 +55,9 @@ pub const ICON_STATUS: f32 = 6.0;
 /// The compact top bar stays below the native status-bar inset supplied by GPUI.
 pub const HEADER_HEIGHT: f32 = 40.0;
 pub const HEADER_BUTTON_SIZE: f32 = 40.0;
+/// Drawer and overlay headers have a little more room for the compact action
+/// cluster while the session page keeps the shorter workbench header.
+pub const DRAWER_HEADER_HEIGHT: f32 = 56.0;
 /// Minimum tappable edge for controls that are not header buttons.
 pub const TOUCH_TARGET: f32 = 44.0;
 /// Caps centered panel content so tablets do not stretch a phone layout.
@@ -64,6 +67,7 @@ pub const RADIUS_CARD: f32 = 8.0;
 pub const RADIUS_CONTROL: f32 = 6.0;
 
 pub const DRAWER_ROW_HEIGHT: f32 = 52.0;
+pub const SIDEBAR_ROW_HEIGHT: f32 = 44.0;
 pub const DRAWER_ACTION_HEIGHT: f32 = 40.0;
 pub const DRAWER_SECTION_HEIGHT: f32 = 32.0;
 pub const DRAWER_DRAG_THRESHOLD: f32 = 10.0;

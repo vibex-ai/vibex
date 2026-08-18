@@ -7,13 +7,13 @@ use futures_util::StreamExt as _;
 use gpui::{
     Animation, AnimationExt as _, App, AppContext as _, Context, ElementId, Entity, FontWeight,
     IntoElement, KeyBinding, ListAlignment, ListState, MouseButton, MouseUpEvent,
-    ParentElement as _, Render, ScrollDelta, ScrollWheelEvent, Styled as _, Task, TouchPhase,
-    UniformListScrollHandle, WeakEntity, Window, div, ease_in_out, ease_out_quint, list,
-    prelude::*, px, rgb, svg, uniform_list,
+    ParentElement as _, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, Styled as _, Task,
+    TouchPhase, UniformListScrollHandle, WeakEntity, Window, div, ease_in_out, ease_out_quint,
+    list, prelude::*, px, rgb, svg, uniform_list,
 };
 use vibex_backend::{
     AgentBackend as _, BackendError, BackendEvent, BackendFuture, BackendOperation, BackendResult,
-    MutationRequest, WorkspaceBackend as _,
+    MutationRequest, WorkspaceBackend as _, WorkspaceSummary,
 };
 use vibex_core::{
     AgentSessionState, ContinueAgentTurnRequest, CreateAgentSessionRequest, ElicitationFieldKind,
@@ -26,8 +26,8 @@ use vibex_core::{
     WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
-    RuntimeCascadeChoice, RuntimeCascadeProjection, TimelineConversationTurn, TimelineRow,
-    TimelineRowKind,
+    AgentSidebarRow, AgentSidebarRowKind, RuntimeCascadeChoice, RuntimeCascadeProjection,
+    SidebarState, TimelineConversationTurn, TimelineRow, TimelineRowKind, project_sidebar_rows,
 };
 use vibex_remote_client::{
     RemoteConnectionState, RemoteLifecycleSignal, WebRemoteBackend, ZeroConfigLanPairingSession,
@@ -45,7 +45,7 @@ use crate::input::{
 use crate::lifecycle::MobileLifecycleEvent;
 use crate::pairing::{MobileCredentialBundle, claim_pairing_link, claim_zero_config_lan_pairing};
 use crate::storage::CredentialStorage;
-use crate::workbench::MobileWorkbench;
+use crate::workbench::{MobileWorkbench, WorkbenchSurface};
 use crate::{locale, markdown, notifications, scanner, theme};
 
 const TIMELINE_NEAR_BOTTOM_PX: f32 = 96.0;
@@ -132,6 +132,30 @@ enum DrawerPage {
     Workbench,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MobileOverlay {
+    Hosts,
+    Settings,
+    Usage,
+}
+
+#[derive(Clone)]
+struct MobileHostEntry {
+    id: String,
+    label: String,
+    bundle: MobileCredentialBundle,
+}
+
+impl MobileHostEntry {
+    fn from_bundle(bundle: &MobileCredentialBundle) -> Self {
+        Self {
+            id: bundle.host_id().to_string(),
+            label: bundle.host_label(),
+            bundle: bundle.clone(),
+        }
+    }
+}
+
 impl DrawerPage {
     const fn open_offset(self) -> f32 {
         match self {
@@ -200,11 +224,13 @@ pub struct MobileApp {
     backend: Option<Arc<WebRemoteBackend>>,
     controller: Option<AgentWorkflowController>,
     workbench: Option<Entity<MobileWorkbench>>,
+    pending_workbench_surface: Option<WorkbenchSurface>,
     workbench_open: bool,
     composer_input: Entity<TextInput>,
     timeline_turns: Arc<Vec<TimelineConversationTurn>>,
     timeline_list: ListState,
     drawer_scroll: UniformListScrollHandle,
+    settings_scroll: ScrollHandle,
     drawer_open: bool,
     drawer_offset: f32,
     drawer_gesture: Option<DrawerGesture>,
@@ -214,6 +240,14 @@ pub struct MobileApp {
     expanded_process: BTreeSet<String>,
     expanded_approval: BTreeSet<String>,
     workspaces: Vec<WorkspaceRecord>,
+    workspace_summaries: Vec<WorkspaceSummary>,
+    sidebar_state: SidebarState,
+    overlay: Option<MobileOverlay>,
+    overlay_parent: Option<MobileOverlay>,
+    overlay_returns_to_drawer: bool,
+    known_hosts: Vec<MobileHostEntry>,
+    active_host_id: Option<String>,
+    pairing_from_hosts: bool,
     elicitation_request_id: Option<RequestId>,
     elicitation_inputs: BTreeMap<String, Entity<TextInput>>,
     elicitation_draft: Option<ElicitationFormDraft>,
@@ -246,17 +280,23 @@ impl MobileApp {
     pub fn new(data_dir: PathBuf, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let storage = CredentialStorage::new(data_dir);
         let stored = storage.load();
+        let stored_hosts = storage.load_hosts();
         let mode = if matches!(stored, Ok(Some(_))) {
             RootMode::Connecting
         } else {
             RootMode::Pairing
         };
+        let known_hosts = stored_hosts
+            .as_ref()
+            .map(|hosts| hosts.iter().map(MobileHostEntry::from_bundle).collect())
+            .unwrap_or_default();
         let mut app = Self {
             storage,
             mode,
             backend: None,
             controller: None,
             workbench: None,
+            pending_workbench_surface: None,
             workbench_open: false,
             composer_input: cx.new(|cx| {
                 TextInput::new(
@@ -267,6 +307,7 @@ impl MobileApp {
             timeline_turns: Arc::new(Vec::new()),
             timeline_list: timeline_list_state(0),
             drawer_scroll: UniformListScrollHandle::new(),
+            settings_scroll: ScrollHandle::new(),
             drawer_open: false,
             drawer_offset: 0.0,
             drawer_gesture: None,
@@ -276,6 +317,14 @@ impl MobileApp {
             expanded_process: BTreeSet::new(),
             expanded_approval: BTreeSet::new(),
             workspaces: Vec::new(),
+            workspace_summaries: Vec::new(),
+            sidebar_state: SidebarState::default(),
+            overlay: None,
+            overlay_parent: None,
+            overlay_returns_to_drawer: false,
+            known_hosts,
+            active_host_id: None,
+            pairing_from_hosts: false,
             elicitation_request_id: None,
             elicitation_inputs: BTreeMap::new(),
             elicitation_draft: None,
@@ -298,7 +347,11 @@ impl MobileApp {
             runtime_switch_busy_generation: None,
             runtime_switch_error: None,
             notice: None,
-            error: stored.as_ref().err().cloned(),
+            error: stored
+                .as_ref()
+                .err()
+                .cloned()
+                .or_else(|| stored_hosts.as_ref().err().cloned()),
             app_backgrounded: crate::lifecycle::is_backgrounded(),
             event_consumer_task: None,
             resume_recovery_task: None,
@@ -510,13 +563,18 @@ impl MobileApp {
         self.nearby_pairing_state = NearbyPairingState::Idle;
         match bundle.backend() {
             Ok(backend) => {
+                self.remember_host(&bundle);
                 if let Some(workbench) = self.workbench.take() {
                     workbench.update(cx, |workbench, _| workbench.suspend());
                 }
                 self.reset_drawers();
+                self.pending_workbench_surface = None;
+                self.clear_overlay();
+                self.pairing_from_hosts = false;
                 self.mode = RootMode::Connecting;
                 self.error = None;
                 self.backend = Some(backend.clone());
+                self.persist_known_hosts();
                 self.connect_backend(backend, cx);
             }
             Err(error) => {
@@ -526,6 +584,28 @@ impl MobileApp {
                 let _ = self.storage.clear();
                 cx.notify();
             }
+        }
+    }
+
+    fn remember_host(&mut self, bundle: &MobileCredentialBundle) {
+        let entry = MobileHostEntry::from_bundle(bundle);
+        let id = entry.id.clone();
+        if let Some(existing) = self.known_hosts.iter_mut().find(|host| host.id == id) {
+            *existing = entry;
+        } else {
+            self.known_hosts.push(entry);
+        }
+        self.active_host_id = Some(id);
+    }
+
+    fn persist_known_hosts(&mut self) {
+        let bundles = self
+            .known_hosts
+            .iter()
+            .map(|host| host.bundle.clone())
+            .collect::<Vec<_>>();
+        if let Err(error) = self.storage.save_hosts(&bundles) {
+            self.error = Some(error);
         }
     }
 
@@ -1003,6 +1083,7 @@ impl MobileApp {
                 {
                     this.error = Some(error);
                 }
+                this.sync_sidebar_state();
                 if selected.is_none()
                     && let Some(session_id) = first
                 {
@@ -1310,6 +1391,7 @@ impl MobileApp {
             let _ = entity.update(cx, |this, cx| {
                 match outcome {
                     Ok(summaries) => {
+                        this.workspace_summaries = summaries.clone();
                         this.workspaces = summaries
                             .into_iter()
                             .map(|summary| summary.workspace)
@@ -1351,10 +1433,14 @@ impl MobileApp {
             .controller
             .as_ref()
             .and_then(|controller| controller.state.selected_session_id.clone());
+        let pending_surface = self.pending_workbench_surface.take();
         if let Some(workbench) = self.workbench.as_ref() {
             workbench.update(cx, |workbench, cx| {
                 workbench.set_workspace(workspace_id, cx);
                 workbench.set_session(session_id, cx);
+                if let Some(surface) = pending_surface {
+                    workbench.set_surface(surface, cx);
+                }
             });
             return;
         }
@@ -1363,6 +1449,11 @@ impl MobileApp {
         };
         self.workbench =
             Some(cx.new(|cx| MobileWorkbench::new(backend, workspace_id, session_id, cx)));
+        if let Some(surface) = pending_surface
+            && let Some(workbench) = self.workbench.as_ref()
+        {
+            workbench.update(cx, |workbench, cx| workbench.set_surface(surface, cx));
+        }
     }
 
     fn close_workbench(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1590,6 +1681,10 @@ impl MobileApp {
 
     fn open_session(&mut self, session_id: VibexSessionId, cx: &mut Context<Self>) {
         self.reset_runtime_options();
+        self.sidebar_state.selected_ids.clear();
+        self.sidebar_state
+            .selected_ids
+            .insert(session_id.as_str().to_string());
         let Some(controller) = self.controller.as_mut() else {
             return;
         };
@@ -1630,6 +1725,186 @@ impl MobileApp {
         });
         self.tasks.push(task);
         cx.notify();
+    }
+
+    fn sync_sidebar_state(&mut self) {
+        let Some(sessions) = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.sessions.value.as_ref())
+        else {
+            return;
+        };
+        let collapsed = self.sidebar_state.collapsed_ids.clone();
+        self.sidebar_state.reconcile(
+            sessions
+                .iter()
+                .map(|session| session.id.as_str().to_string()),
+        );
+        self.sidebar_state.collapsed_ids = collapsed;
+        self.sidebar_state.selected_ids.clear();
+        if let Some(selected) = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.as_ref())
+        {
+            self.sidebar_state
+                .selected_ids
+                .insert(selected.as_str().to_string());
+        }
+    }
+
+    fn toggle_project(&mut self, project_id: String, cx: &mut Context<Self>) {
+        if !self.sidebar_state.collapsed_ids.insert(project_id.clone()) {
+            self.sidebar_state.collapsed_ids.remove(&project_id);
+        }
+        cx.notify();
+    }
+
+    fn show_overlay(
+        &mut self,
+        overlay: MobileOverlay,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous = self.overlay;
+        if previous.is_none() {
+            self.overlay_returns_to_drawer = self.drawer_open;
+        } else {
+            self.overlay_parent = previous;
+        }
+        self.overlay = Some(overlay);
+        self.start_drawer_snap(0.0, Some(window), cx);
+        cx.notify();
+    }
+
+    fn clear_overlay(&mut self) {
+        self.overlay = None;
+        self.overlay_parent = None;
+        self.overlay_returns_to_drawer = false;
+    }
+
+    fn close_overlay(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.dismiss_overlay(Some(window), cx);
+    }
+
+    fn dismiss_overlay(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        if let Some(parent) = self.overlay_parent.take() {
+            self.overlay = Some(parent);
+            cx.notify();
+            return;
+        }
+        let return_to_drawer = self.overlay_returns_to_drawer;
+        self.overlay = None;
+        self.overlay_returns_to_drawer = false;
+        if return_to_drawer {
+            self.start_drawer_snap(DrawerPage::Sessions.open_offset(), window, cx);
+        }
+        cx.notify();
+    }
+
+    fn open_hosts(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_overlay(MobileOverlay::Hosts, window, cx);
+    }
+
+    fn open_settings(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_overlay(MobileOverlay::Settings, window, cx);
+    }
+
+    fn open_usage(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_overlay(MobileOverlay::Usage, window, cx);
+    }
+
+    fn open_workbench_surface(
+        &mut self,
+        surface: WorkbenchSurface,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.clear_overlay();
+        if let Some(workbench) = self.workbench.as_ref() {
+            workbench.update(cx, |workbench, cx| workbench.set_surface(surface, cx));
+        } else {
+            self.pending_workbench_surface = Some(surface);
+            self.refresh_workspaces(cx);
+        }
+        self.start_drawer_snap(DrawerPage::Workbench.open_offset(), Some(window), cx);
+    }
+
+    fn begin_pairing_host(
+        &mut self,
+        _: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.stop_connection_tasks();
+        crate::background_connection::disconnect();
+        self.backend = None;
+        self.controller = None;
+        self.pending_workbench_surface = None;
+        if let Some(workbench) = self.workbench.take() {
+            workbench.update(cx, |workbench, _| workbench.suspend());
+        }
+        self.reset_drawers();
+        self.clear_overlay();
+        self.mode = RootMode::Pairing;
+        self.pairing_from_hosts = true;
+        self.error = None;
+        self.workspaces.clear();
+        self.workspace_summaries.clear();
+        self.sidebar_state = SidebarState::default();
+        window.hide_soft_keyboard();
+        cx.notify();
+    }
+
+    fn switch_host(
+        &mut self,
+        host_id: String,
+        _: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_host_id.as_deref() == Some(host_id.as_str())
+            && self.mode == RootMode::Workspace
+        {
+            self.dismiss_overlay(Some(window), cx);
+            return;
+        }
+        let Some(entry) = self
+            .known_hosts
+            .iter()
+            .find(|host| host.id == host_id)
+            .cloned()
+        else {
+            return;
+        };
+        if let Err(error) = self.storage.save(&entry.bundle) {
+            self.error = Some(error);
+            cx.notify();
+            return;
+        }
+        self.clear_overlay();
+        self.install_bundle(entry.bundle, cx);
+    }
+
+    fn cancel_pairing_host(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(host_id) = self.active_host_id.clone() else {
+            return;
+        };
+        let Some(entry) = self
+            .known_hosts
+            .iter()
+            .find(|host| host.id == host_id)
+            .cloned()
+        else {
+            return;
+        };
+        if let Err(error) = self.storage.save(&entry.bundle) {
+            self.error = Some(error);
+            cx.notify();
+            return;
+        }
+        self.install_bundle(entry.bundle, cx);
     }
 
     fn reload_selected_session(&mut self, cx: &mut Context<Self>) {
@@ -2218,6 +2493,7 @@ impl MobileApp {
         self.backend = None;
         crate::background_connection::disconnect();
         let _ = self.storage.clear();
+        let _ = self.storage.clear_hosts();
         if let Some(workbench) = self.workbench.take() {
             workbench.update(cx, |workbench, _| workbench.suspend());
         }
@@ -2226,7 +2502,14 @@ impl MobileApp {
         self.timeline_turns = Arc::new(Vec::new());
         self.timeline_list.reset(0);
         self.reset_drawers();
+        self.pending_workbench_surface = None;
+        self.clear_overlay();
         self.workspaces.clear();
+        self.workspace_summaries.clear();
+        self.sidebar_state = SidebarState::default();
+        self.known_hosts.clear();
+        self.active_host_id = None;
+        self.pairing_from_hosts = false;
         self.expanded_process.clear();
         self.expanded_approval.clear();
         self.elicitation_request_id = None;
@@ -2253,6 +2536,7 @@ impl MobileApp {
                 if self.drawer_snap.is_some()
                     || self.session_action.is_some()
                     || self.runtime_options_open
+                    || self.overlay.is_some()
                 {
                     return;
                 }
@@ -2476,7 +2760,26 @@ impl MobileApp {
                             } else {
                                 locale::common("Use QR Code")
                             }),
-                    ),
+                    )
+                    .when(self.pairing_from_hosts, |panel| {
+                        panel.child(
+                            div()
+                                .id("back-to-mobile-hosts")
+                                .h(px(theme::TOUCH_TARGET))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(theme::FONT_CAPTION))
+                                .text_color(theme::text_muted())
+                                .cursor_pointer()
+                                .active(|style| style.opacity(0.7))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(Self::cancel_pairing_host),
+                                )
+                                .child(locale::common("Back to hosts")),
+                        )
+                    }),
             )
     }
 
@@ -2739,6 +3042,7 @@ impl MobileApp {
     fn render_connecting(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .items_center()
@@ -2833,8 +3137,30 @@ impl MobileApp {
                                     )
                                     .child(locale::common("Disconnect")),
                             )
+                            .when(!self.known_hosts.is_empty(), |panel| {
+                                panel.child(
+                                    div()
+                                        .id("switch-host-while-connecting")
+                                        .h(px(theme::TOUCH_TARGET))
+                                        .px(px(theme::SPACING_MD))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_color(theme::text_secondary())
+                                        .cursor_pointer()
+                                        .active(|style| style.opacity(0.7))
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(Self::open_hosts),
+                                        )
+                                        .child(locale::common("Switch host")),
+                                )
+                            })
                     }),
             )
+            .when(self.overlay == Some(MobileOverlay::Hosts), |root| {
+                root.child(self.render_hosts(cx))
+            })
     }
 
     fn render_workspace(&mut self, page_width: f32, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2872,6 +3198,7 @@ impl MobileApp {
         let drawer_page = visible_drawer_page(self.drawer_offset, self.drawer_snap);
         let workbench = self.workbench.clone();
         let session_action = self.session_action.clone();
+        let overlay = self.overlay;
         let can_create_session = self.backend.as_ref().is_some_and(|backend| {
             backend
                 .capability_snapshot()
@@ -3058,6 +3385,9 @@ impl MobileApp {
             })
             .when(self.runtime_options_open, |root| {
                 root.child(self.render_runtime_options_sheet(cx))
+            })
+            .when_some(overlay, |root, overlay| {
+                root.child(self.render_mobile_overlay(overlay, cx))
             })
     }
 
@@ -4705,62 +5035,174 @@ impl MobileApp {
             )
     }
 
-    fn render_drawer_session(
+    fn mobile_sidebar_rows(&self) -> Vec<AgentSidebarRow> {
+        let sessions = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.sessions.value.as_deref())
+            .unwrap_or_default();
+        let mut sidebar = self.sidebar_state.clone();
+        sidebar.selected_ids.clear();
+        if let Some(selected) = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.as_ref())
+        {
+            sidebar.selected_ids.insert(selected.as_str().to_string());
+        }
+        let mut rows = project_sidebar_rows(sessions, &sidebar, "");
+        let project_labels = self
+            .workspace_summaries
+            .iter()
+            .map(|summary| {
+                (
+                    summary.project.id.as_str().to_string(),
+                    summary.project.name.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for row in &mut rows {
+            if row.kind == AgentSidebarRowKind::Project
+                && let Some(label) = project_labels.get(&row.project_id)
+                && !label.trim().is_empty()
+            {
+                row.label = label.clone();
+            }
+        }
+        rows
+    }
+
+    fn render_sidebar_row(
         &self,
-        session: &vibex_core::AgentSession,
-        selected: Option<&VibexSessionId>,
+        row: &AgentSidebarRow,
+        sessions: &[vibex_core::AgentSession],
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let session_id = session.id.clone();
-        let is_selected = selected == Some(&session.id);
-        let status = match session.state {
-            AgentSessionState::Running => theme::ACCENT_GREEN,
-            AgentSessionState::NeedsInput => theme::ACCENT_YELLOW,
-            AgentSessionState::Error => theme::ACCENT_RED,
-            AgentSessionState::Initializing => theme::ACCENT_BLUE,
-            _ => theme::ACCENT_DIM,
-        };
-        let workspace = workspace_label(&session.workspace_root);
-        let age = session_age_label(session.last_message_at_ms);
-
-        div()
-            .id(format!("session:{}", session.id))
-            .mx(px(theme::SPACING_SM))
-            .h(px(theme::DRAWER_ROW_HEIGHT))
-            .min_h(px(theme::DRAWER_ROW_HEIGHT))
-            .rounded(px(theme::RADIUS_CONTROL))
-            .px(px(theme::SPACING_MD))
-            .flex()
-            .items_center()
-            .gap(px(theme::SPACING_MD))
-            .when(is_selected, |row| {
-                row.bg(theme::bg_card())
-                    .border_1()
-                    .border_color(theme::border_default())
-            })
-            .cursor_pointer()
-            .active(|style| style.bg(theme::row_pressed_bg()))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| this.open_session(session_id.clone(), cx)),
-            )
-            .child(
+        match row.kind {
+            AgentSidebarRowKind::Project => {
+                let project_id = row.project_id.clone();
+                let chevron = if row.collapsed {
+                    "icons/chevron-right.svg"
+                } else {
+                    "icons/chevron-down.svg"
+                };
                 div()
-                    .size(px(theme::ICON_STATUS))
-                    .flex_shrink_0()
-                    .rounded_full()
-                    .bg(rgb(status)),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
+                    .id(format!("mobile-project-row-{}", row.project_id))
+                    .mx(px(theme::SPACING_SM))
+                    .h(px(theme::SIDEBAR_ROW_HEIGHT))
+                    .min_h(px(theme::SIDEBAR_ROW_HEIGHT))
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .px(px(theme::SPACING_SM))
                     .flex()
-                    .flex_col()
-                    .justify_center()
-                    .gap(px(2.0))
+                    .items_center()
+                    .gap(px(theme::SPACING_SM))
+                    .cursor_pointer()
+                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.toggle_project(project_id.clone(), cx)
+                        }),
+                    )
+                    .child(
+                        svg()
+                            .path(chevron)
+                            .size(px(theme::ICON_STATUS + 8.0))
+                            .text_color(theme::text_muted()),
+                    )
+                    .child(
+                        svg()
+                            .path("brand/logo.svg")
+                            .size(px(theme::ICON_SM))
+                            .text_color(rgb(0xc678dd)),
+                    )
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(px(theme::FONT_BODY))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text_secondary())
+                            .child(row.label.clone()),
+                    )
+                    .into_any_element()
+            }
+            AgentSidebarRowKind::Session => {
+                let Some(session_id) = row.session_id.as_ref() else {
+                    return div().into_any_element();
+                };
+                let Some(session) = sessions.iter().find(|session| &session.id == session_id)
+                else {
+                    return div().into_any_element();
+                };
+                let is_selected = row.selected;
+                let status = match row.state.unwrap_or(session.state) {
+                    AgentSessionState::Running => theme::ACCENT_GREEN,
+                    AgentSessionState::NeedsInput => theme::ACCENT_YELLOW,
+                    AgentSessionState::Error => theme::ACCENT_RED,
+                    AgentSessionState::Initializing => theme::ACCENT_BLUE,
+                    _ => theme::ACCENT_DIM,
+                };
+                let session_id = session.id.clone();
+                let agent_icon = agent_icon_path(&session.agent_id.to_string());
+                let time = session_age_label(session.last_message_at_ms);
+                let row_id = session.id.as_str().to_string();
+                div()
+                    .id(format!("mobile-session-row-{row_id}"))
+                    .mx(px(theme::SPACING_SM))
+                    .h(px(theme::SIDEBAR_ROW_HEIGHT))
+                    .min_h(px(theme::SIDEBAR_ROW_HEIGHT))
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .px(px(theme::SPACING_MD))
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_SM))
+                    .when(is_selected, |row| {
+                        row.bg(theme::bg_card())
+                            .border_1()
+                            .border_color(theme::border_default())
+                    })
+                    .cursor_pointer()
+                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.open_session(session_id.clone(), cx)
+                        }),
+                    )
+                    .child(
+                        div()
+                            .size(px(theme::ICON_STATUS))
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .bg(rgb(status)),
+                    )
+                    .child(
+                        svg()
+                            .path(agent_icon)
+                            .size(px(theme::ICON_SM))
+                            .flex_shrink_0()
+                            .text_color(if is_selected {
+                                theme::text_primary()
+                            } else {
+                                theme::text_muted()
+                            }),
+                    )
+                    .when(row.pinned, |row| {
+                        row.child(
+                            svg()
+                                .path("icons/pin.svg")
+                                .size(px(theme::ICON_STATUS + 6.0))
+                                .text_color(rgb(theme::ACCENT_YELLOW)),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
@@ -4770,19 +5212,41 @@ impl MobileApp {
                             } else {
                                 theme::text_secondary()
                             })
-                            .child(session.title.clone()),
+                            .child(row.label.clone()),
                     )
                     .child(
                         div()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
+                            .flex_shrink_0()
                             .text_size(px(theme::FONT_MICRO))
                             .text_color(theme::text_muted())
-                            .child(format!("{workspace}  {age}")),
-                    ),
-            )
-            .into_any_element()
+                            .child(time),
+                    )
+                    .into_any_element()
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn render_drawer_session(
+        &self,
+        session: &vibex_core::AgentSession,
+        selected: Option<&VibexSessionId>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let row = AgentSidebarRow {
+            id: format!("session:{}", session.id),
+            kind: AgentSidebarRowKind::Session,
+            project_id: session.project_id.as_str().to_string(),
+            workspace_id: session.workspace_id.as_str().to_string(),
+            session_id: Some(session.id.clone()),
+            label: session.title.clone(),
+            depth: 1,
+            pinned: false,
+            selected: selected == Some(&session.id),
+            collapsed: false,
+            state: Some(session.state),
+        };
+        self.render_sidebar_row(&row, std::slice::from_ref(session), cx)
     }
 
     fn render_workbench_drawer(
@@ -4850,7 +5314,7 @@ impl MobileApp {
             .child(body)
     }
 
-    fn render_drawer(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_drawer_legacy(&self, cx: &mut Context<Self>) -> gpui::Div {
         let sessions = self
             .controller
             .as_ref()
@@ -5135,6 +5599,603 @@ impl MobileApp {
     }
 }
 
+impl MobileApp {
+    fn render_selected_session_actions(
+        &self,
+        sessions: &[vibex_core::AgentSession],
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let selected_id = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.as_ref())?;
+        let session = sessions.iter().find(|session| &session.id == selected_id)?;
+        let can_manage_session = self.backend.as_ref().is_some_and(|backend| {
+            backend
+                .capability_snapshot()
+                .agent
+                .supports(BackendOperation::AgentManageSession)
+        });
+        if !can_manage_session {
+            return None;
+        }
+        let session_id = session.id.clone();
+        let title = session.title.clone();
+        let rename_id = session_id.clone();
+        let archive_id = session_id.clone();
+        let delete_id = session_id;
+        let rename_title = title.clone();
+        let archive_title = title.clone();
+        let delete_title = title;
+        Some(
+            div()
+                .mx(px(theme::SPACING_SM))
+                .mb(px(theme::SPACING_SM))
+                .flex()
+                .items_center()
+                .gap(px(theme::SPACING_XS))
+                .children(
+                    [
+                        (
+                            "mobile-session-rename",
+                            "icons/pencil.svg",
+                            locale::common("Rename"),
+                            theme::text_muted(),
+                            SessionActionKind::Rename,
+                            rename_id,
+                            rename_title,
+                        ),
+                        (
+                            "mobile-session-archive",
+                            "icons/file-archive.svg",
+                            locale::common("Archive"),
+                            theme::text_muted(),
+                            SessionActionKind::Archive,
+                            archive_id,
+                            archive_title,
+                        ),
+                        (
+                            "mobile-session-delete",
+                            "icons/trash-2.svg",
+                            locale::common("Delete"),
+                            rgb(theme::ACCENT_RED).into(),
+                            SessionActionKind::Delete,
+                            delete_id,
+                            delete_title,
+                        ),
+                    ]
+                    .into_iter()
+                    .map(|(id, icon, label, color, kind, session_id, title)| {
+                        div()
+                            .id(id)
+                            .h(px(theme::DRAWER_ACTION_HEIGHT))
+                            .flex_1()
+                            .min_w_0()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(theme::border_subtle())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .gap(px(theme::SPACING_XS))
+                            .text_size(px(theme::FONT_MICRO))
+                            .text_color(color)
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.begin_session_action(
+                                        kind,
+                                        session_id.clone(),
+                                        title.clone(),
+                                        cx,
+                                    )
+                                }),
+                            )
+                            .child(
+                                svg()
+                                    .path(icon)
+                                    .size(px(theme::ICON_STATUS + 6.0))
+                                    .text_color(color),
+                            )
+                            .child(label)
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>(),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_drawer(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let sessions = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.sessions.value.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        let rows = self.mobile_sidebar_rows();
+        let capabilities = self
+            .backend
+            .as_ref()
+            .map(|backend| backend.capability_snapshot().agent);
+        let can_create_session = capabilities.as_ref().is_some_and(|capabilities| {
+            capabilities.supports(BackendOperation::AgentCreateSession)
+        });
+        let rows_for_list = rows.clone();
+        let sessions_for_list = sessions.clone();
+        let selected_actions = self.render_selected_session_actions(&sessions, cx);
+        let host_label = self.active_host_label();
+        let host_url = self.active_host_url();
+        let host_online = self.backend.as_ref().is_some_and(|backend| {
+            backend.connection_state().state == RemoteConnectionState::Online
+        });
+
+        div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .bg(theme::bg_primary())
+            .border_r_1()
+            .border_color(theme::border_default())
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(theme::DRAWER_HEADER_HEIGHT))
+                    .flex_shrink_0()
+                    .border_b_1()
+                    .border_color(theme::border_subtle())
+                    .px(px(theme::SPACING_LG))
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_XS))
+                    .child(
+                        svg()
+                            .path("icons/message-square.svg")
+                            .size(px(theme::ICON_MD))
+                            .text_color(theme::text_secondary()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(theme::FONT_HEADING))
+                            .text_color(theme::text_primary())
+                            .child(locale::common("Sessions")),
+                    )
+                    .child(
+                        div()
+                            .id("mobile-drawer-new-session")
+                            .aria_label(locale::common("New session"))
+                            .size(px(theme::HEADER_BUTTON_SIZE))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(can_create_session, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(Self::create_session),
+                                    )
+                            })
+                            .when(!can_create_session, |button| button.opacity(0.45))
+                            .child(
+                                svg()
+                                    .path("icons/plus.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_secondary()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("mobile-drawer-usage")
+                            .aria_label(locale::common("Usage Statistics"))
+                            .size(px(theme::HEADER_BUTTON_SIZE))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::open_usage))
+                            .child(
+                                svg()
+                                    .path("icons/activity.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_secondary()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("close-session-drawer")
+                            .aria_label(locale::common("Close"))
+                            .size(px(theme::HEADER_BUTTON_SIZE))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .active(|style| style.opacity(0.6))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::close_drawer))
+                            .child(
+                                svg()
+                                    .path("icons/x.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_muted()),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .id("drawer-scroll")
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .h(px(theme::DRAWER_SECTION_HEIGHT))
+                            .px(px(theme::SPACING_LG))
+                            .flex()
+                            .items_end()
+                            .text_size(px(theme::FONT_CAPTION))
+                            .text_color(theme::text_muted())
+                            .child(locale::common("Projects")),
+                    )
+                    .when_some(selected_actions, |body, actions| body.child(actions))
+                    .when(rows.is_empty(), |body| {
+                        body.child(
+                            div()
+                                .mx(px(theme::SPACING_LG))
+                                .mt(px(theme::SPACING_SM))
+                                .rounded(px(theme::RADIUS_CONTROL))
+                                .border_1()
+                                .border_color(theme::border_subtle())
+                                .bg(theme::bg_card_dim())
+                                .p(px(theme::SPACING_MD))
+                                .text_size(px(theme::FONT_CAPTION))
+                                .text_color(theme::text_muted())
+                                .child(locale::text(
+                                    "No sessions yet",
+                                    "还没有会话",
+                                    "尚無工作階段",
+                                )),
+                        )
+                    })
+                    .child(
+                        uniform_list(
+                            "drawer-project-sessions",
+                            rows.len(),
+                            cx.processor(
+                                move |this, range: std::ops::Range<usize>, _window, cx| {
+                                    range
+                                        .filter_map(|index| {
+                                            rows_for_list.get(index).map(|row| {
+                                                this.render_sidebar_row(row, &sessions_for_list, cx)
+                                            })
+                                        })
+                                        .collect::<Vec<_>>()
+                                },
+                            ),
+                        )
+                        .track_scroll(&self.drawer_scroll)
+                        .on_scroll_wheel(cx.listener(Self::consume_drawer_scroll))
+                        .w_full()
+                        .flex_1()
+                        .min_h_0()
+                        .py(px(theme::SPACING_SM)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .border_t_1()
+                    .border_color(theme::border_subtle())
+                    .p(px(theme::SPACING_SM))
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_SM))
+                    .child(
+                        div()
+                            .id("mobile-host-switcher")
+                            .h(px(theme::TOUCH_TARGET))
+                            .flex_1()
+                            .min_w_0()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .px(px(theme::SPACING_MD))
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACING_SM))
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::open_hosts))
+                            .child(div().size(px(8.0)).flex_shrink_0().rounded_full().bg(rgb(
+                                if host_online {
+                                    theme::ACCENT_GREEN
+                                } else {
+                                    theme::ACCENT_RED
+                                },
+                            )))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(1.0))
+                                    .child(
+                                        div()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .text_size(px(theme::FONT_BODY))
+                                            .text_color(theme::text_secondary())
+                                            .child(host_label),
+                                    )
+                                    .child(
+                                        div()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .text_size(px(theme::FONT_MICRO))
+                                            .text_color(theme::text_muted())
+                                            .child(host_url),
+                                    ),
+                            )
+                            .child(
+                                svg()
+                                    .path("icons/chevron-right.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_muted()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("mobile-settings-button")
+                            .aria_label(locale::common("Settings"))
+                            .size(px(theme::TOUCH_TARGET))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::open_settings))
+                            .child(
+                                svg()
+                                    .path("icons/settings.svg")
+                                    .size(px(theme::ICON_MD))
+                                    .text_color(theme::text_secondary()),
+                            ),
+                    ),
+            )
+    }
+
+    fn active_host_label(&self) -> String {
+        self.active_host_id
+            .as_deref()
+            .and_then(|id| self.known_hosts.iter().find(|host| host.id == id))
+            .map(|host| host.label.clone())
+            .unwrap_or_else(|| locale::text("Desktop", "桌面端", "桌面版").to_string())
+    }
+
+    fn active_host_url(&self) -> String {
+        self.active_host_id
+            .as_deref()
+            .and_then(|id| self.known_hosts.iter().find(|host| host.id == id))
+            .map(|host| host.bundle.record.server_url.clone())
+            .unwrap_or_else(|| locale::common("Connected").to_string())
+    }
+}
+
+impl MobileApp {
+    fn render_overlay_header(
+        &self,
+        id: &'static str,
+        title: &'static str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .h(px(theme::DRAWER_HEADER_HEIGHT))
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(theme::border_subtle())
+            .px(px(theme::SPACING_LG))
+            .flex()
+            .items_center()
+            .gap(px(theme::SPACING_SM))
+            .child(
+                div()
+                    .id(format!("{id}-back"))
+                    .aria_label(locale::common("Back"))
+                    .size(px(theme::HEADER_BUTTON_SIZE))
+                    .ml(px(-theme::SPACING_SM))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .active(|style| style.opacity(0.65))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::close_overlay))
+                    .child(
+                        svg()
+                            .path("icons/chevron-left.svg")
+                            .size(px(theme::ICON_SM))
+                            .text_color(theme::text_secondary()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(theme::FONT_HEADING))
+                    .text_color(theme::text_primary())
+                    .child(locale::common(title)),
+            )
+            .child(
+                div()
+                    .id(format!("{id}-close"))
+                    .aria_label(locale::common("Close"))
+                    .size(px(theme::HEADER_BUTTON_SIZE))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .active(|style| style.opacity(0.65))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::close_overlay))
+                    .child(
+                        svg()
+                            .path("icons/x.svg")
+                            .size(px(theme::ICON_SM))
+                            .text_color(theme::text_muted()),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_hosts(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let active_id = self.active_host_id.clone();
+        let hosts = self.known_hosts.clone();
+        let active_online = self.backend.as_ref().is_some_and(|backend| {
+            backend.connection_state().state == RemoteConnectionState::Online
+        });
+        div()
+            .absolute()
+            .inset_0()
+            .bg(theme::bg_primary())
+            .block_mouse_except_scroll()
+            .flex()
+            .flex_col()
+            .child(self.render_overlay_header("mobile-hosts", "Hosts", cx))
+            .child(
+                div()
+                    .id("mobile-hosts-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .on_scroll_wheel(cx.listener(Self::consume_drawer_scroll))
+                    .px(px(theme::SPACING_LG))
+                    .py(px(theme::SPACING_MD))
+                    .child(
+                        div()
+                            .mb(px(theme::SPACING_SM))
+                            .text_size(px(theme::FONT_CAPTION))
+                            .text_color(theme::text_muted())
+                            .child(locale::common("Connection")),
+                    )
+                    .when(hosts.is_empty(), |body| {
+                        body.child(
+                            div()
+                                .rounded(px(theme::RADIUS_CONTROL))
+                                .border_1()
+                                .border_color(theme::border_subtle())
+                                .bg(theme::bg_card_dim())
+                                .p(px(theme::SPACING_MD))
+                                .text_size(px(theme::FONT_BODY))
+                                .text_color(theme::text_muted())
+                                .child(locale::common("No hosts paired")),
+                        )
+                    })
+                    .children(hosts.into_iter().map(|host| {
+                        let selected = active_id.as_deref() == Some(host.id.as_str());
+                        let host_id = host.id.clone();
+                        div()
+                            .id(format!("mobile-host-{}", host.id))
+                            .w_full()
+                            .min_h(px(theme::TOUCH_TARGET))
+                            .mb(px(theme::SPACING_XS))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(if selected {
+                                theme::border_default()
+                            } else {
+                                theme::border_subtle()
+                            })
+                            .when(selected, |row| row.bg(theme::bg_card()))
+                            .px(px(theme::SPACING_MD))
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACING_SM))
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, event, window, cx| {
+                                    this.switch_host(host_id.clone(), event, window, cx)
+                                }),
+                            )
+                            .child(div().size(px(8.0)).rounded_full().bg(if selected {
+                                rgb(if active_online {
+                                    theme::ACCENT_GREEN
+                                } else {
+                                    theme::ACCENT_RED
+                                })
+                            } else {
+                                rgb(theme::ACCENT_DIM)
+                            }))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(1.0))
+                                    .child(
+                                        div()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .text_size(px(theme::FONT_BODY))
+                                            .text_color(if selected {
+                                                theme::text_primary()
+                                            } else {
+                                                theme::text_secondary()
+                                            })
+                                            .child(host.label),
+                                    )
+                                    .child(
+                                        div()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .text_size(px(theme::FONT_MICRO))
+                                            .text_color(theme::text_muted())
+                                            .child(host.bundle.record.server_url),
+                                    ),
+                            )
+                    }))
+                    .child(
+                        div()
+                            .id("mobile-add-host")
+                            .mt(px(theme::SPACING_LG))
+                            .h(px(theme::TOUCH_TARGET))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(theme::border_default())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .gap(px(theme::SPACING_SM))
+                            .text_size(px(theme::FONT_BODY))
+                            .text_color(theme::text_secondary())
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::begin_pairing_host))
+                            .child(
+                                svg()
+                                    .path("icons/plus.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_secondary()),
+                            )
+                            .child(locale::common("Add host")),
+                    ),
+            )
+            .into_any_element()
+    }
+}
+
 impl Render for MobileApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_elicitation_form(cx);
@@ -5161,6 +6222,500 @@ fn workspace_page_width(window: &Window) -> f32 {
     let viewport = window.viewport_size();
     let insets = window.insets().effective();
     (f32::from(viewport.width) - f32::from(insets.left) - f32::from(insets.right)).max(1.0)
+}
+
+fn settings_section_heading(label: &'static str) -> gpui::AnyElement {
+    div()
+        .mt(px(theme::SPACING_LG))
+        .mb(px(theme::SPACING_SM))
+        .text_size(px(theme::FONT_CAPTION))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(theme::text_muted())
+        .child(locale::common(label))
+        .into_any_element()
+}
+
+fn settings_info_row(
+    id: &'static str,
+    icon: &'static str,
+    title: String,
+    detail: String,
+    accent: gpui::Hsla,
+) -> gpui::AnyElement {
+    div()
+        .id(id)
+        .w_full()
+        .min_h(px(theme::TOUCH_TARGET))
+        .mb(px(theme::SPACING_XS))
+        .rounded(px(theme::RADIUS_CONTROL))
+        .border_1()
+        .border_color(theme::border_subtle())
+        .bg(theme::bg_card_dim())
+        .px(px(theme::SPACING_MD))
+        .flex()
+        .items_center()
+        .gap(px(theme::SPACING_SM))
+        .child(svg().path(icon).size(px(theme::ICON_SM)).text_color(accent))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(1.0))
+                .child(
+                    div()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_size(px(theme::FONT_BODY))
+                        .text_color(theme::text_secondary())
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_size(px(theme::FONT_MICRO))
+                        .text_color(theme::text_muted())
+                        .child(detail),
+                ),
+        )
+        .into_any_element()
+}
+
+impl MobileApp {
+    fn render_settings(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let host_label = self.active_host_label();
+        let host_url = self.active_host_url();
+        let server_id = self
+            .active_host_id
+            .as_deref()
+            .and_then(|id| self.known_hosts.iter().find(|host| host.id == id))
+            .map(|host| host.bundle.expected_server_id.clone())
+            .unwrap_or_default();
+        let connection_online = self.backend.as_ref().is_some_and(|backend| {
+            backend.connection_state().state == RemoteConnectionState::Online
+        });
+        div()
+            .absolute()
+            .inset_0()
+            .bg(theme::bg_primary())
+            .block_mouse_except_scroll()
+            .flex()
+            .flex_col()
+            .child(self.render_overlay_header("mobile-settings", "Settings", cx))
+            .child(
+                div()
+                    .id("mobile-settings-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .track_scroll(&self.settings_scroll)
+                    .overflow_y_scroll()
+                    .on_scroll_wheel(cx.listener(Self::consume_drawer_scroll))
+                    .px(px(theme::SPACING_LG))
+                    .py(px(theme::SPACING_MD))
+                    .child(settings_section_heading("Connection"))
+                    .child(settings_info_row(
+                        "mobile-settings-host",
+                        "icons/server.svg",
+                        host_label,
+                        if connection_online {
+                            locale::common("Connected").to_string()
+                        } else {
+                            locale::common("Offline").to_string()
+                        },
+                        if connection_online {
+                            rgb(theme::ACCENT_GREEN).into()
+                        } else {
+                            rgb(theme::ACCENT_RED).into()
+                        },
+                    ))
+                    .child(settings_info_row(
+                        "mobile-settings-host-url",
+                        "icons/server.svg",
+                        locale::text("Host", "主机", "主機").to_string(),
+                        host_url,
+                        theme::text_muted(),
+                    ))
+                    .when(!server_id.is_empty(), |body| {
+                        body.child(settings_info_row(
+                            "mobile-settings-server-id",
+                            "icons/server.svg",
+                            "Server ID".to_string(),
+                            server_id,
+                            theme::text_muted(),
+                        ))
+                    })
+                    .child(
+                        div()
+                            .id("mobile-settings-switch-host")
+                            .w_full()
+                            .min_h(px(theme::TOUCH_TARGET))
+                            .mb(px(theme::SPACING_XS))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(theme::border_default())
+                            .px(px(theme::SPACING_MD))
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACING_SM))
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::open_hosts))
+                            .child(
+                                svg()
+                                    .path("icons/server.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_secondary()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(px(theme::FONT_BODY))
+                                    .text_color(theme::text_secondary())
+                                    .child(locale::common("Switch host")),
+                            )
+                            .child(
+                                svg()
+                                    .path("icons/chevron-right.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_muted()),
+                            ),
+                    )
+                    .child(settings_section_heading("Agent access"))
+                    .child(
+                        div()
+                            .id("mobile-settings-providers")
+                            .w_full()
+                            .min_h(px(theme::TOUCH_TARGET))
+                            .mb(px(theme::SPACING_XS))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(theme::border_subtle())
+                            .bg(theme::bg_card_dim())
+                            .px(px(theme::SPACING_MD))
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACING_SM))
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    this.open_workbench_surface(
+                                        WorkbenchSurface::Providers,
+                                        window,
+                                        cx,
+                                    )
+                                }),
+                            )
+                            .child(
+                                svg()
+                                    .path("brand/logo.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(rgb(0xc678dd)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(1.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(theme::FONT_BODY))
+                                            .text_color(theme::text_secondary())
+                                            .child(locale::common("Provider settings")),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(theme::FONT_MICRO))
+                                            .text_color(theme::text_muted())
+                                            .child(locale::text(
+                                                "Read and manage desktop Agent profiles",
+                                                "查看并管理桌面端 Agent 配置",
+                                                "檢視並管理桌面版 Agent 設定檔",
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                svg()
+                                    .path("icons/chevron-right.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_muted()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("mobile-settings-runtime")
+                            .w_full()
+                            .min_h(px(theme::TOUCH_TARGET))
+                            .mb(px(theme::SPACING_XS))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(theme::border_subtle())
+                            .bg(theme::bg_card_dim())
+                            .px(px(theme::SPACING_MD))
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACING_SM))
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    this.open_workbench_surface(
+                                        WorkbenchSurface::Runtime,
+                                        window,
+                                        cx,
+                                    )
+                                }),
+                            )
+                            .child(
+                                svg()
+                                    .path("icons/activity.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(rgb(theme::ACCENT_BLUE)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(1.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(theme::FONT_BODY))
+                                            .text_color(theme::text_secondary())
+                                            .child(locale::common("Runtime options")),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(theme::FONT_MICRO))
+                                            .text_color(theme::text_muted())
+                                            .child(locale::text(
+                                                "Choose the runtime for the active session",
+                                                "选择当前会话的运行时",
+                                                "選擇目前工作階段的執行環境",
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                svg()
+                                    .path("icons/chevron-right.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_muted()),
+                            ),
+                    )
+                    .child(settings_section_heading("Appearance"))
+                    .child(settings_info_row(
+                        "mobile-settings-dark",
+                        "icons/activity.svg",
+                        locale::common("Dark appearance").to_string(),
+                        locale::text(
+                            "Vibex mobile uses the desktop dark palette",
+                            "移动端使用桌面端深色配色",
+                            "行動端使用桌面版深色配色",
+                        )
+                        .to_string(),
+                        theme::text_muted(),
+                    ))
+                    .child(settings_info_row(
+                        "mobile-settings-language",
+                        "icons/message-square.svg",
+                        locale::text("Language", "语言", "語言").to_string(),
+                        locale::common("Follows system language").to_string(),
+                        theme::text_muted(),
+                    ))
+                    .child(settings_section_heading("Notifications"))
+                    .child(
+                        div()
+                            .id("mobile-settings-notifications")
+                            .w_full()
+                            .min_h(px(theme::TOUCH_TARGET))
+                            .mb(px(theme::SPACING_XS))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(theme::border_subtle())
+                            .bg(theme::bg_card_dim())
+                            .px(px(theme::SPACING_MD))
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACING_SM))
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|_, _, _, cx| {
+                                    notifications::request_authorization();
+                                    cx.notify();
+                                }),
+                            )
+                            .child(
+                                svg()
+                                    .path("icons/activity.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_secondary()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(1.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(theme::FONT_BODY))
+                                            .text_color(theme::text_secondary())
+                                            .child(locale::common("Enable notifications")),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(theme::FONT_MICRO))
+                                            .text_color(theme::text_muted())
+                                            .child(locale::text(
+                                                "Allow approval and Agent completion alerts",
+                                                "允许审批和 Agent 完成通知",
+                                                "允許核准與 Agent 完成通知",
+                                            )),
+                                    ),
+                            ),
+                    )
+                    .child(settings_section_heading("About"))
+                    .child(settings_info_row(
+                        "mobile-settings-version",
+                        "brand/logo.svg",
+                        locale::common("Version").to_string(),
+                        env!("CARGO_PKG_VERSION").to_string(),
+                        theme::text_muted(),
+                    ))
+                    .child(
+                        div()
+                            .id("mobile-settings-disconnect")
+                            .mt(px(theme::SPACING_LG))
+                            .mb(px(theme::SPACING_XL))
+                            .h(px(theme::TOUCH_TARGET))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(rgb(theme::ACCENT_RED))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(theme::FONT_BODY))
+                            .text_color(rgb(theme::ACCENT_RED))
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::forget_desktop))
+                            .child(locale::text(
+                                "Disconnect desktop",
+                                "断开桌面端",
+                                "中斷桌面版連線",
+                            )),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_usage(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let session_count = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.sessions.value.as_ref())
+            .map_or(0, Vec::len);
+        div()
+            .absolute()
+            .inset_0()
+            .bg(theme::bg_primary())
+            .block_mouse_except_scroll()
+            .flex()
+            .flex_col()
+            .child(self.render_overlay_header("mobile-usage", "Usage Statistics", cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .px(px(theme::SPACING_LG))
+                    .py(px(theme::SPACING_XL))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(theme::SPACING_LG))
+                    .child(
+                        div()
+                            .size(px(56.0))
+                            .rounded(px(theme::RADIUS_CARD))
+                            .bg(theme::bg_card_dim())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                svg()
+                                    .path("icons/activity.svg")
+                                    .size(px(theme::ICON_MD))
+                                    .text_color(rgb(theme::ACCENT_BLUE)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(theme::FONT_HEADING))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text_primary())
+                            .child(locale::common("Usage Statistics")),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .rounded(px(theme::RADIUS_CARD))
+                            .border_1()
+                            .border_color(theme::border_subtle())
+                            .bg(theme::bg_card_dim())
+                            .p(px(theme::SPACING_MD))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(theme::FONT_BODY))
+                                    .text_color(theme::text_secondary())
+                                    .child(locale::common("Sessions")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(theme::FONT_HEADING))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::text_primary())
+                                    .child(session_count.to_string()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(theme::FONT_BODY))
+                            .text_color(theme::text_muted())
+                            .text_center()
+                            .child(locale::common(
+                                "Usage details are available on the desktop host.",
+                            )),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_mobile_overlay(
+        &self,
+        overlay: MobileOverlay,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        match overlay {
+            MobileOverlay::Hosts => self.render_hosts(cx),
+            MobileOverlay::Settings => self.render_settings(cx),
+            MobileOverlay::Usage => self.render_usage(cx),
+        }
+    }
 }
 
 fn drawer_snap_duration_ms(from: f32, target: f32) -> u64 {
@@ -5554,6 +7109,17 @@ fn workspace_label(root: &str) -> &str {
     root.rsplit(['/', '\\'])
         .find(|segment| !segment.is_empty())
         .unwrap_or(root)
+}
+
+fn agent_icon_path(agent_id: &str) -> &'static str {
+    let normalized = agent_id.to_ascii_lowercase();
+    if normalized.contains("claude") {
+        "icons/claude.svg"
+    } else if normalized.contains("openai") || normalized.contains("codex") {
+        "icons/openai.svg"
+    } else {
+        "brand/logo.svg"
+    }
 }
 
 fn session_age_label(timestamp_ms: i64) -> String {

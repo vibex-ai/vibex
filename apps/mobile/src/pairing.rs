@@ -120,6 +120,41 @@ impl fmt::Debug for MobileRelayCandidate {
 }
 
 impl MobileCredentialBundle {
+    /// Stable, non-secret identity used by the compact host picker. The server
+    /// id is part of the authenticated pairing contract and remains stable
+    /// across route changes for the same desktop.
+    pub fn host_id(&self) -> &str {
+        &self.expected_server_id
+    }
+
+    /// Prefer the human-readable route authority for the mobile picker, then
+    /// fall back to a bounded server-id label for QR/relay-only credentials.
+    pub fn host_label(&self) -> String {
+        let route_urls = self.route.as_ref().into_iter().flat_map(|route| {
+            route
+                .local_network
+                .as_ref()
+                .map(|candidate| candidate.url.as_str())
+                .into_iter()
+                .chain(route.direct_candidates.iter().map(String::as_str))
+                .chain(route.relay.as_ref().map(|candidate| candidate.url.as_str()))
+        });
+        for url in route_urls {
+            if let Ok(parsed) = Url::parse(url)
+                && let Some(host) = parsed.host_str()
+                && !host.trim().is_empty()
+            {
+                return host.to_string();
+            }
+        }
+        let fallback = self.expected_server_id.trim();
+        if fallback.is_empty() {
+            "Desktop".to_string()
+        } else {
+            fallback.chars().take(32).collect()
+        }
+    }
+
     pub fn validate(&self) -> BackendResult<()> {
         if self.schema_version != MOBILE_CREDENTIAL_SCHEMA_VERSION
             || self.client_type != RemoteClientType::Mobile
@@ -522,6 +557,36 @@ mod tests {
         assert!(!debug.contains("private-desktop-id"));
         assert!(debug.contains("has_auth_token: true"));
         assert!(debug.contains("has_identity_private_key: true"));
+    }
+
+    #[test]
+    fn host_picker_label_prefers_route_authority_and_bounds_fallback() {
+        let mut bundle = MobileCredentialBundle {
+            schema_version: MOBILE_CREDENTIAL_SCHEMA_VERSION.to_string(),
+            record: RemoteCredentialRecord {
+                server_url: "https://desktop.example".to_string(),
+                auth: RemoteAuthProof {
+                    device_id: DeviceId::new(),
+                    auth_token: "grant".to_string(),
+                },
+                device_identity_public_key: "public-key".to_string(),
+                server_identity_public_key: Some("server-key".to_string()),
+            },
+            identity_private_key: "private-key".to_string(),
+            expected_server_id: "server-id".to_string(),
+            client_type: RemoteClientType::Mobile,
+            allow_insecure_local_dev: false,
+            route: Some(MobileRemoteRouteBundle {
+                local_network: None,
+                direct_candidates: vec!["https://dev.example:443".to_string()],
+                relay: None,
+            }),
+        };
+        assert_eq!(bundle.host_id(), "server-id");
+        assert_eq!(bundle.host_label(), "dev.example");
+        bundle.route = None;
+        bundle.expected_server_id = "server-abcdefghijklmnopqrstuvwxyz-0123456789".to_string();
+        assert_eq!(bundle.host_label().chars().count(), 32);
     }
 
     #[test]
