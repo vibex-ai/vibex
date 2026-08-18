@@ -1,8 +1,9 @@
 use std::{future::Future, sync::Arc, time::Duration};
 
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, Entity, IntoElement, Render, RenderImage,
-    SharedString, Subscription, Task, WeakEntity, Window, div, img, prelude::*, px,
+    AnyElement, App, ClipboardItem, Context, Entity, IntoElement, KeyDownEvent, Render,
+    RenderImage, Role, SharedString, Subscription, Task, WeakEntity, Window, div, img, prelude::*,
+    px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _,
@@ -58,20 +59,44 @@ enum RemoteAccessMutation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PairingMode {
-    QrCode,
+enum RemoteAccessEntry {
+    TailscaleServe,
+    Direct,
+    SelfHostedRelay,
     LocalNetwork,
 }
 
-impl PairingMode {
-    const ALL: [Self; 2] = [Self::QrCode, Self::LocalNetwork];
+impl RemoteAccessEntry {
+    const ALL: [Self; 4] = [
+        Self::TailscaleServe,
+        Self::Direct,
+        Self::SelfHostedRelay,
+        Self::LocalNetwork,
+    ];
+
+    fn remote_method(self) -> Option<RemoteConnectivityMethod> {
+        match self {
+            Self::TailscaleServe => Some(RemoteConnectivityMethod::TailscaleServe),
+            Self::Direct => Some(RemoteConnectivityMethod::Direct),
+            Self::SelfHostedRelay => Some(RemoteConnectivityMethod::SelfHostedRelay),
+            Self::LocalNetwork => None,
+        }
+    }
+
+    fn from_remote_method(method: RemoteConnectivityMethod) -> Self {
+        match method {
+            RemoteConnectivityMethod::TailscaleServe => Self::TailscaleServe,
+            RemoteConnectivityMethod::Direct => Self::Direct,
+            RemoteConnectivityMethod::SelfHostedRelay => Self::SelfHostedRelay,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RemoteAccessAction {
     Refresh,
     SelectMethod(RemoteConnectivityMethod),
-    SelectPairingMode(PairingMode),
+    SelectConnectionEntry(RemoteAccessEntry),
     EnableMethod(RemoteConnectivityMethod),
     ConfirmTailscalePort(u16),
     DisableMethod(RemoteConnectivityMethod),
@@ -295,7 +320,7 @@ pub enum RemoteAccessPairingE2eAction {
 struct PairingViewState {
     connectivity: Option<RemoteConnectivitySnapshot>,
     selected_method: RemoteConnectivityMethod,
-    selected_pairing_mode: PairingMode,
+    selected_entry: RemoteAccessEntry,
     permission: RemoteDevicePermissionLevel,
     zero_config_permission: RemoteDevicePermissionLevel,
     active_offer: Option<ActivePairingOffer>,
@@ -311,7 +336,7 @@ impl Default for PairingViewState {
         Self {
             connectivity: None,
             selected_method: RemoteConnectivityMethod::TailscaleServe,
-            selected_pairing_mode: PairingMode::QrCode,
+            selected_entry: RemoteAccessEntry::TailscaleServe,
             permission: RemoteDevicePermissionLevel::ReadOnly,
             zero_config_permission: RemoteDevicePermissionLevel::ReadOnly,
             active_offer: None,
@@ -339,7 +364,6 @@ impl PairingViewState {
         self.active_offer = None;
         let offer = ActivePairingOffer::from_response(response, self.preferred_entry())?;
         self.permission = offer.summary.permission_level;
-        self.selected_pairing_mode = PairingMode::QrCode;
         self.active_offer = Some(offer);
         self.notice = None;
         Ok(())
@@ -524,11 +548,15 @@ impl RemoteAccessPairing {
             RemoteAccessAction::Refresh => self.refresh(cx),
             RemoteAccessAction::SelectMethod(method) => {
                 self.state.selected_method = method;
+                self.state.selected_entry = RemoteAccessEntry::from_remote_method(method);
                 self.state.error_code = None;
                 cx.notify();
             }
-            RemoteAccessAction::SelectPairingMode(mode) => {
-                self.state.selected_pairing_mode = mode;
+            RemoteAccessAction::SelectConnectionEntry(entry) => {
+                self.state.selected_entry = entry;
+                if let Some(method) = entry.remote_method() {
+                    self.state.selected_method = method;
+                }
                 self.state.error_code = None;
                 cx.notify();
             }
@@ -641,7 +669,7 @@ impl RemoteAccessPairing {
                             ));
                         }
                         Ok(Ok(RemoteAccessMutationOutcome::LanWindow(snapshot))) => {
-                            this.state.selected_pairing_mode = PairingMode::QrCode;
+                            this.state.selected_entry = RemoteAccessEntry::Direct;
                             this.state.active_lan_window = Some(snapshot);
                             this.schedule_lan_poll(cx);
                         }
@@ -654,7 +682,7 @@ impl RemoteAccessPairing {
                             ));
                         }
                         Ok(Ok(RemoteAccessMutationOutcome::ZeroConfigWindow(snapshot))) => {
-                            this.state.selected_pairing_mode = PairingMode::LocalNetwork;
+                            this.state.selected_entry = RemoteAccessEntry::LocalNetwork;
                             this.state.active_zero_config_window = Some(snapshot);
                             this.schedule_zero_config_poll(cx);
                         }
@@ -782,7 +810,8 @@ impl RemoteAccessPairing {
         if self.state.active_zero_config_window.is_some() {
             return;
         }
-        self.state.selected_pairing_mode = PairingMode::QrCode;
+        self.state.selected_entry =
+            RemoteAccessEntry::from_remote_method(self.state.selected_method);
         let controller = self.controller.clone();
         let permission = self.state.permission;
         self.begin_mutation(RemoteAccessMutation::CreateOffer, cx, async move {
@@ -826,7 +855,7 @@ impl RemoteAccessPairing {
         if !self.state.can_start_zero_config_pairing() {
             return;
         }
-        self.state.selected_pairing_mode = PairingMode::LocalNetwork;
+        self.state.selected_entry = RemoteAccessEntry::LocalNetwork;
         let controller = self.controller.clone();
         let permission = self.state.zero_config_permission;
         self.begin_mutation(
@@ -1402,26 +1431,233 @@ impl RemoteAccessPairing {
         });
     }
 
-    fn render_method_selector(&self, cx: &mut Context<Self>) -> AnyElement {
-        let entity = cx.weak_entity();
-        TabBar::new("remote-access-methods")
-            .segmented()
-            .selected_index(method_index(self.state.selected_method))
-            .children(
-                RemoteConnectivityMethod::ALL
-                    .into_iter()
-                    .map(|method| Tab::new().flex_1().label(method_selector_label(method))),
+    fn render_connection_entry_selector(&self, cx: &mut Context<Self>) -> AnyElement {
+        let disabled = self.has_active_pairing();
+        v_flex()
+            .w_full()
+            .gap_2()
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_2()
+                    .child(self.render_connection_entry_card(
+                        RemoteAccessEntry::TailscaleServe,
+                        disabled,
+                        cx,
+                    ))
+                    .child(self.render_connection_entry_card(
+                        RemoteAccessEntry::Direct,
+                        disabled,
+                        cx,
+                    )),
             )
-            .on_click(move |index, _, cx| {
-                let method = RemoteConnectivityMethod::ALL
-                    .get(*index)
-                    .copied()
-                    .unwrap_or(RemoteConnectivityMethod::TailscaleServe);
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_2()
+                    .child(self.render_connection_entry_card(
+                        RemoteAccessEntry::SelfHostedRelay,
+                        disabled,
+                        cx,
+                    ))
+                    .child(self.render_connection_entry_card(
+                        RemoteAccessEntry::LocalNetwork,
+                        disabled,
+                        cx,
+                    )),
+            )
+            .into_any_element()
+    }
+
+    fn render_connection_entry_card(
+        &self,
+        entry: RemoteAccessEntry,
+        disabled: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selected = self.state.selected_entry == entry;
+        let entity = cx.weak_entity();
+        let keyboard_entity = entity.clone();
+        let action = entry
+            .remote_method()
+            .map(RemoteAccessAction::SelectMethod)
+            .unwrap_or(RemoteAccessAction::SelectConnectionEntry(entry));
+        let keyboard_action = action.clone();
+        let (status, status_color) = match entry {
+            RemoteAccessEntry::LocalNetwork => {
+                if self.state.active_zero_config_window.is_some() {
+                    (
+                        locale::text("Discovering", "发现中", "探索中"),
+                        cx.theme().success,
+                    )
+                } else {
+                    (
+                        locale::text("Ready", "待开启", "待開啟"),
+                        cx.theme().muted_foreground,
+                    )
+                }
+            }
+            RemoteAccessEntry::TailscaleServe
+            | RemoteAccessEntry::Direct
+            | RemoteAccessEntry::SelfHostedRelay => {
+                let method = entry.remote_method().expect("remote entry has a method");
+                let snapshot = self
+                    .state
+                    .connectivity
+                    .as_ref()
+                    .and_then(|connectivity| connectivity.method(method));
+                let state = snapshot.map_or(RemoteMethodState::Disabled, |snapshot| snapshot.state);
+                (method_state_label(state), method_state_color(state, cx))
+            }
+        };
+        let icon = match entry {
+            RemoteAccessEntry::LocalNetwork => IconName::Network,
+            RemoteAccessEntry::TailscaleServe
+            | RemoteAccessEntry::Direct
+            | RemoteAccessEntry::SelfHostedRelay => {
+                method_icon(entry.remote_method().expect("remote entry has a method"))
+            }
+        };
+        let label = connection_entry_label(entry);
+        let description = connection_entry_description(entry);
+        let accessibility_label = format!("{label}: {description}");
+
+        v_flex()
+            .id(SharedString::from(format!(
+                "remote-access-entry-{}",
+                connection_entry_index(entry)
+            )))
+            .flex_1()
+            .min_w_0()
+            .min_h(px(92.0))
+            .justify_between()
+            .gap_3()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(if selected {
+                cx.theme().primary.opacity(0.72)
+            } else {
+                cx.theme().border.opacity(0.72)
+            })
+            .bg(if selected {
+                cx.theme().primary.opacity(0.08)
+            } else {
+                cx.theme().background.opacity(0.55)
+            })
+            .p_3()
+            .cursor_pointer()
+            .focusable()
+            .tab_stop(!disabled)
+            .role(Role::Button)
+            .aria_label(accessibility_label)
+            .aria_selected(selected)
+            .hover(|style| {
+                style.bg(if selected {
+                    cx.theme().primary.opacity(0.12)
+                } else {
+                    cx.theme().accent
+                })
+            })
+            .focus_visible(|style| {
+                style.shadow(vec![
+                    gpui::BoxShadow::new(px(0.0), px(0.0), cx.theme().ring).spread_radius(px(2.0)),
+                ])
+            })
+            .when(disabled, |card| card.opacity(0.62).cursor_default())
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_start()
+                    .gap_2()
+                    .child(
+                        div()
+                            .size(px(28.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.0))
+                            .bg(if selected {
+                                cx.theme().primary.opacity(0.14)
+                            } else {
+                                cx.theme().muted.opacity(0.32)
+                            })
+                            .child(Icon::new(icon).size(px(15.0)).text_color(if selected {
+                                cx.theme().primary
+                            } else {
+                                cx.theme().muted_foreground
+                            })),
+                    )
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .gap_1()
+                            .child(div().text_sm().font_semibold().child(label))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(description),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .font_medium()
+                    .text_color(status_color)
+                    .child(status),
+            )
+            .on_click(move |_, _, cx| {
+                if disabled {
+                    return;
+                }
                 let _ = entity.update(cx, |this, cx| {
-                    this.dispatch_action(RemoteAccessAction::SelectMethod(method), cx);
+                    this.dispatch_action(action.clone(), cx);
                 });
             })
+            .on_key_down(move |event: &KeyDownEvent, _, cx| {
+                if disabled {
+                    return;
+                }
+                if event.keystroke.key == "enter" || event.keystroke.key == "space" {
+                    let _ = keyboard_entity.update(cx, |this, cx| {
+                        this.dispatch_action(keyboard_action.clone(), cx);
+                    });
+                    cx.stop_propagation();
+                }
+            })
             .into_any_element()
+    }
+
+    fn has_active_pairing(&self) -> bool {
+        self.state.pending.is_some()
+            || self.state.active_lan_window.is_some()
+            || self.state.active_zero_config_window.is_some()
+            || self
+                .state
+                .active_offer
+                .as_ref()
+                .is_some_and(|offer| !offer.is_terminal(unix_timestamp_ms()))
+    }
+
+    fn render_connection_entry_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        match self.state.selected_entry {
+            RemoteAccessEntry::TailscaleServe => {
+                self.render_method_panel(RemoteConnectivityMethod::TailscaleServe, cx)
+            }
+            RemoteAccessEntry::Direct => {
+                self.render_method_panel(RemoteConnectivityMethod::Direct, cx)
+            }
+            RemoteAccessEntry::SelfHostedRelay => {
+                self.render_method_panel(RemoteConnectivityMethod::SelfHostedRelay, cx)
+            }
+            RemoteAccessEntry::LocalNetwork => self.render_local_network_panel(cx),
+        }
     }
 
     fn render_method_panel(
@@ -1447,6 +1683,7 @@ impl RemoteAccessPairing {
 
         let mut panel = v_flex()
             .w_full()
+            .min_w_0()
             .gap_3()
             .rounded(px(8.0))
             .border_1()
@@ -1627,59 +1864,23 @@ impl RemoteAccessPairing {
         panel.into_any_element()
     }
 
-    fn render_pairing_mode_selector(&self, cx: &mut Context<Self>) -> AnyElement {
-        let entity = cx.weak_entity();
-        TabBar::new("pairing-modes")
-            .segmented()
-            .selected_index(pairing_mode_index(self.state.selected_pairing_mode))
-            .children(
-                PairingMode::ALL
-                    .into_iter()
-                    .map(|mode| Tab::new().flex_1().label(pairing_mode_label(mode))),
-            )
-            .on_click(move |index, _, cx| {
-                let mode = PairingMode::ALL
-                    .get(*index)
-                    .copied()
-                    .unwrap_or(PairingMode::QrCode);
-                let _ = entity.update(cx, |this, cx| {
-                    this.dispatch_action(RemoteAccessAction::SelectPairingMode(mode), cx);
-                });
-            })
-            .into_any_element()
-    }
-
-    fn render_pairing_mode_panel(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mode = self.state.selected_pairing_mode;
-        let (icon, title, description) = match mode {
-            PairingMode::QrCode => (
-                IconName::Globe,
-                locale::text("Scan a QR code", "扫描二维码", "掃描 QR Code"),
-                locale::text(
-                    "Use an online remote entry or copy a one-time pairing link",
-                    "使用在线远程入口，或复制一次性配对链接",
-                    "使用上線遠端入口，或複製一次性配對連結",
-                ),
-            ),
-            PairingMode::LocalNetwork => (
-                IconName::Network,
-                locale::text("Discover on local network", "局域网发现", "區域網路探索"),
-                locale::text(
-                    "Temporarily allow mobile devices on this network to find this computer",
-                    "临时允许同一网络中的移动设备发现此电脑",
-                    "暫時允許同一網路中的行動裝置探索此電腦",
-                ),
-            ),
+    fn render_local_network_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let active = self.state.active_zero_config_window.is_some();
+        let status_color = if active {
+            cx.theme().success
+        } else {
+            cx.theme().muted_foreground
         };
-        let content = match mode {
-            PairingMode::QrCode => self.render_offer(cx),
-            PairingMode::LocalNetwork => self.render_zero_config_pairing(cx),
+        let status = if active {
+            locale::text("Discovering", "发现中", "探索中")
+        } else {
+            locale::text("Ready when needed", "按需开启", "需要時開啟")
         };
 
         v_flex()
             .w_full()
             .min_w_0()
-            .gap_4()
+            .gap_3()
             .rounded(px(8.0))
             .border_1()
             .border_color(cx.theme().border.opacity(0.72))
@@ -1688,39 +1889,83 @@ impl RemoteAccessPairing {
             .child(
                 h_flex()
                     .w_full()
-                    .min_w_0()
                     .items_start()
+                    .justify_between()
                     .gap_3()
                     .child(
-                        div()
-                            .size(px(32.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(6.0))
-                            .bg(cx.theme().primary.opacity(0.10))
+                        h_flex()
+                            .min_w_0()
+                            .items_start()
+                            .gap_3()
                             .child(
-                                Icon::new(icon)
-                                    .size(px(16.0))
-                                    .text_color(cx.theme().primary),
+                                div()
+                                    .size(px(32.0))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(6.0))
+                                    .bg(cx.theme().primary.opacity(0.10))
+                                    .child(
+                                        Icon::new(IconName::Network)
+                                            .size(px(17.0))
+                                            .text_color(cx.theme().primary),
+                                    ),
+                            )
+                            .child(
+                                v_flex()
+                                    .min_w_0()
+                                    .gap_1()
+                                    .child(
+                                        div().text_sm().font_semibold().child(locale::text(
+                                            "Local network",
+                                            "局域网",
+                                            "區域網路",
+                                        )),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(locale::text(
+                                                "A private HTTPS entry for devices on the same network",
+                                                "供同一网络设备使用的私有 HTTPS 入口",
+                                                "供同一網路裝置使用的私人 HTTPS 入口",
+                                            )),
+                                    ),
                             ),
                     )
                     .child(
-                        v_flex()
-                            .min_w_0()
-                            .gap_1()
-                            .child(div().text_sm().font_semibold().child(title))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(description),
-                            ),
+                        div()
+                            .rounded(px(4.0))
+                            .bg(status_color.opacity(0.12))
+                            .px_2()
+                            .py(px(2.0))
+                            .text_xs()
+                            .text_color(status_color)
+                            .child(status),
                     ),
             )
-            .child(content)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(locale::text(
+                        "This entry does not require Tailscale, Direct, or Relay.",
+                        "此入口不依赖 Tailscale、Direct 或 Relay。",
+                        "此入口不依賴 Tailscale、Direct 或 Relay。",
+                    )),
+            )
             .into_any_element()
+    }
+
+    fn render_pairing_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        match self.state.selected_entry {
+            RemoteAccessEntry::LocalNetwork => self.render_zero_config_pairing(cx),
+            RemoteAccessEntry::TailscaleServe
+            | RemoteAccessEntry::Direct
+            | RemoteAccessEntry::SelfHostedRelay => self.render_offer(cx),
+        }
     }
 
     fn render_permission_selector(&self, zero_config: bool, cx: &mut Context<Self>) -> AnyElement {
@@ -1827,11 +2072,7 @@ impl RemoteAccessPairing {
                             self.state.pending,
                             Some(RemoteAccessMutation::CreateOffer)
                         ))
-                        .disabled(
-                            pending
-                                || !route_available
-                                || self.state.active_zero_config_window.is_some(),
-                        )
+                        .disabled(pending || !route_available)
                         .on_click(move |_, _, cx| {
                             let _ = entity.update(cx, |this, cx| {
                                 this.dispatch_action(RemoteAccessAction::CreateOffer, cx)
@@ -1847,18 +2088,6 @@ impl RemoteAccessPairing {
                                 "No validated remote entry is online",
                                 "当前没有已验证的远程入口",
                                 "目前沒有已驗證的遠端入口",
-                            )),
-                    )
-                })
-                .when(self.state.active_zero_config_window.is_some(), |column| {
-                    column.child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(locale::text(
-                                "Stop local network pairing before creating a QR code",
-                                "请先停止当前局域网配对",
-                                "請先停止目前的區域網路配對",
                             )),
                     )
                 })
@@ -1924,8 +2153,7 @@ impl RemoteAccessPairing {
             });
 
         let offer_visual = v_flex()
-            .w_full()
-            .min_w_0()
+            .flex_none()
             .items_center()
             .gap_2()
             .when_some(qr, |column, qr| {
@@ -1969,7 +2197,7 @@ impl RemoteAccessPairing {
             });
 
         let offer_controls = v_flex()
-            .w_full()
+            .flex_1()
             .min_w_0()
             .gap_3()
             .child(
@@ -1996,9 +2224,9 @@ impl RemoteAccessPairing {
                     .w_full()
                     .gap_2()
                     .child(div().text_xs().font_medium().child(locale::text(
-                        "Connection entry",
-                        "连接入口",
-                        "連線入口",
+                        "QR code entry",
+                        "二维码使用的入口",
+                        "QR Code 使用的入口",
                     )))
                     .child(entry_selector),
             )
@@ -2054,10 +2282,15 @@ impl RemoteAccessPairing {
 
         v_flex()
             .w_full()
-            .items_center()
-            .gap_4()
-            .child(offer_visual)
-            .child(offer_controls)
+            .child(
+                h_flex()
+                    .w_full()
+                    .flex_wrap()
+                    .items_start()
+                    .gap_4()
+                    .child(offer_visual)
+                    .child(offer_controls),
+            )
             .into_any_element()
     }
 
@@ -2101,24 +2334,50 @@ impl RemoteAccessPairing {
         };
         let mut column = v_flex()
             .w_full()
+            .min_w_0()
             .gap_3()
-            .child(self.render_permission_selector(zero_config, cx))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(cx.theme().border.opacity(0.72))
+            .bg(cx.theme().muted.opacity(0.12))
+            .p_4()
             .child(
                 h_flex()
                     .w_full()
-                    .items_center()
+                    .items_start()
                     .justify_between()
                     .gap_3()
                     .child(
-                        v_flex()
+                        h_flex()
                             .min_w_0()
-                            .gap_1()
-                            .child(div().text_sm().font_semibold().child(pairing_title))
+                            .items_start()
+                            .gap_3()
                             .child(
                                 div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(window.advertisement.display_name.clone()),
+                                    .size(px(30.0))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(6.0))
+                                    .bg(cx.theme().primary.opacity(0.10))
+                                    .child(
+                                        Icon::new(IconName::Network)
+                                            .size(px(16.0))
+                                            .text_color(cx.theme().primary),
+                                    ),
+                            )
+                            .child(
+                                v_flex()
+                                    .min_w_0()
+                                    .gap_1()
+                                    .child(div().text_sm().font_semibold().child(pairing_title))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(window.advertisement.display_name.clone()),
+                                    ),
                             ),
                     )
                     .child(
@@ -2154,7 +2413,8 @@ impl RemoteAccessPairing {
                                 }),
                             ),
                     ),
-            );
+            )
+            .child(self.render_permission_selector(zero_config, cx));
 
         if window.pending_requests.is_empty() {
             column = column.child(
@@ -2310,16 +2570,10 @@ impl RemoteAccessPairing {
 
     fn render_zero_config_pairing(&self, cx: &mut Context<Self>) -> AnyElement {
         if let Some(window) = self.state.active_zero_config_window.as_ref() {
-            return v_flex()
-                .w_full()
-                .gap_3()
-                .child(self.render_lan_window(window, true, cx))
-                .into_any_element();
+            return self.render_lan_window(window, true, cx);
         }
 
         let can_start = self.state.can_start_zero_config_pairing();
-        let blocked_by_other_pairing =
-            self.state.active_offer.is_some() || self.state.active_lan_window.is_some();
         let entity = cx.weak_entity();
 
         v_flex()
@@ -2347,18 +2601,16 @@ impl RemoteAccessPairing {
                         });
                     }),
             )
-            .when(blocked_by_other_pairing, |column| {
-                column.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(locale::text(
-                            "Finish the current QR code pairing before starting local discovery",
-                            "请先结束当前二维码配对",
-                            "請先結束目前的 QR Code 配對",
-                        )),
-                )
-            })
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(locale::text(
+                        "The local entry is independent and does not need another remote route.",
+                        "局域网入口独立工作，不需要先启用其他远程连接。",
+                        "區域網路入口可獨立運作，不需要先啟用其他遠端連線。",
+                    )),
+            )
             .into_any_element()
     }
 }
@@ -2472,7 +2724,7 @@ impl Render for RemoteAccessPairingE2eDriver {
 impl Render for RemoteAccessPairing {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pending = self.state.pending.is_some();
-        let selected_method = self.state.selected_method;
+        let selected_entry = self.state.selected_entry;
         let disable_entity = cx.weak_entity();
         let error = self.state.error_code.as_deref().map(remote_error_label);
         let notice = self.state.notice;
@@ -2482,10 +2734,50 @@ impl Render for RemoteAccessPairing {
             .id("remote-access-pairing")
             .size_full()
             .min_h_0()
-            .gap_5()
+            .gap_4()
             .overflow_y_scroll()
             .pr_1()
             .pb_1()
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .items_center()
+                            .gap_2()
+                            .child(Icon::new(IconName::Network).size(px(18.0)))
+                            .child(div().text_sm().font_semibold().child(locale::text(
+                                "Connect a mobile device",
+                                "连接移动设备",
+                                "連接行動裝置",
+                            ))),
+                    )
+                    .child(
+                        Button::new("disable-all-remote-access")
+                            .small()
+                            .outline()
+                            .icon(IconName::Pause)
+                            .label(locale::text("Disable all", "全部停用", "全部停用"))
+                            .disabled(
+                                pending
+                                    || self
+                                        .state
+                                        .connectivity
+                                        .as_ref()
+                                        .is_none_or(|snapshot| !snapshot.desired_enabled),
+                            )
+                            .on_click(move |_, window, cx| {
+                                let _ = disable_entity.update(cx, |this, cx| {
+                                    this.present_disable_all_confirmation(window, cx)
+                                });
+                            }),
+                    ),
+            )
             .when_some(error, |column, error| {
                 column.child(
                     h_flex()
@@ -2533,79 +2825,18 @@ impl Render for RemoteAccessPairing {
                     .w_full()
                     .min_w_0()
                     .gap_3()
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .min_w_0()
-                            .flex_wrap()
-                            .items_start()
-                            .justify_between()
-                            .gap_3()
-                            .child(
-                                h_flex()
-                                    .min_w_0()
-                                    .items_start()
-                                    .gap_3()
-                                    .child(
-                                        div()
-                                            .size(px(24.0))
-                                            .flex_none()
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .rounded(px(6.0))
-                                            .bg(cx.theme().primary.opacity(0.10))
-                                            .text_xs()
-                                            .font_semibold()
-                                            .text_color(cx.theme().primary)
-                                            .child("1"),
-                                    )
-                                    .child(
-                                        v_flex()
-                                            .min_w_0()
-                                            .gap_1()
-                                            .child(div().text_sm().font_semibold().child(
-                                                locale::text(
-                                                    "Connection entry",
-                                                    "连接入口",
-                                                    "連線入口",
-                                                ),
-                                            ))
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .child(locale::text(
-                                                        "Configure the route used for remote QR code pairing",
-                                                        "配置二维码配对使用的远程连接方式",
-                                                        "設定 QR Code 配對使用的遠端連線方式",
-                                                    )),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                Button::new("disable-all-remote-access")
-                                    .small()
-                                    .outline()
-                                    .icon(IconName::Pause)
-                                    .label(locale::text("Disable all", "全部停用", "全部停用"))
-                                    .disabled(
-                                        pending
-                                            || self
-                                                .state
-                                                .connectivity
-                                                .as_ref()
-                                                .is_none_or(|snapshot| !snapshot.desired_enabled),
-                                    )
-                                    .on_click(move |_, window, cx| {
-                                        let _ = disable_entity.update(cx, |this, cx| {
-                                            this.present_disable_all_confirmation(window, cx)
-                                        });
-                                    }),
-                            ),
-                    )
-                    .child(self.render_method_selector(cx))
-                    .child(self.render_method_panel(selected_method, cx)),
+                    .child(step_heading(
+                        "1",
+                        locale::text("Connection entry", "连接入口", "連線入口"),
+                        locale::text(
+                            "Choose where the mobile device will connect",
+                            "选择移动设备连接到此电脑的入口",
+                            "選擇行動裝置連線到此電腦的入口",
+                        ),
+                        cx,
+                    ))
+                    .child(self.render_connection_entry_selector(cx))
+                    .child(self.render_connection_entry_panel(cx)),
             )
             .child(div().w_full().border_t_1().border_color(cx.theme().border))
             .child(
@@ -2613,49 +2844,13 @@ impl Render for RemoteAccessPairing {
                     .w_full()
                     .min_w_0()
                     .gap_3()
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .min_w_0()
-                            .items_start()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .size(px(24.0))
-                                    .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(6.0))
-                                    .bg(cx.theme().primary.opacity(0.10))
-                                    .text_xs()
-                                    .font_semibold()
-                                    .text_color(cx.theme().primary)
-                                    .child("2"),
-                            )
-                            .child(
-                                v_flex()
-                                    .min_w_0()
-                                    .gap_1()
-                                    .child(div().text_sm().font_semibold().child(locale::text(
-                                        "Pair a mobile device",
-                                        "配对移动设备",
-                                        "配對行動裝置",
-                                    )))
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(locale::text(
-                                                "Choose a QR code or local network discovery",
-                                                "选择二维码或局域网发现",
-                                                "選擇 QR Code 或區域網路探索",
-                                            )),
-                                    ),
-                            ),
-                    )
-                    .child(self.render_pairing_mode_selector(cx))
-                    .child(self.render_pairing_mode_panel(cx)),
+                    .child(step_heading(
+                        "2",
+                        locale::text("Pair the mobile device", "配对移动设备", "配對行動裝置"),
+                        connection_entry_pairing_description(selected_entry),
+                        cx,
+                    ))
+                    .child(self.render_pairing_section(cx)),
             )
     }
 }
@@ -2899,11 +3094,102 @@ fn method_index(method: RemoteConnectivityMethod) -> usize {
     }
 }
 
-fn pairing_mode_index(mode: PairingMode) -> usize {
-    PairingMode::ALL
+fn connection_entry_index(entry: RemoteAccessEntry) -> usize {
+    RemoteAccessEntry::ALL
         .iter()
-        .position(|candidate| *candidate == mode)
+        .position(|candidate| *candidate == entry)
         .unwrap_or(0)
+}
+
+fn connection_entry_label(entry: RemoteAccessEntry) -> &'static str {
+    match entry {
+        RemoteAccessEntry::TailscaleServe => "Tailscale",
+        RemoteAccessEntry::Direct => "Direct",
+        RemoteAccessEntry::SelfHostedRelay => "Relay",
+        RemoteAccessEntry::LocalNetwork => locale::text("Local network", "局域网", "區域網路"),
+    }
+}
+
+fn connection_entry_description(entry: RemoteAccessEntry) -> &'static str {
+    match entry {
+        RemoteAccessEntry::TailscaleServe => locale::text(
+            "Private access through your Tailnet",
+            "通过 Tailnet 私密连接",
+            "透過 Tailnet 私密連線",
+        ),
+        RemoteAccessEntry::Direct => locale::text(
+            "Use a validated HTTPS address",
+            "使用已验证的 HTTPS 地址",
+            "使用已驗證的 HTTPS 位址",
+        ),
+        RemoteAccessEntry::SelfHostedRelay => locale::text(
+            "Route through your encrypted relay",
+            "通过自建加密 Relay 转发",
+            "透過自建加密 Relay 轉送",
+        ),
+        RemoteAccessEntry::LocalNetwork => locale::text(
+            "Discover this computer on the same network",
+            "在同一网络中发现此电脑",
+            "在同一網路中探索此電腦",
+        ),
+    }
+}
+
+fn connection_entry_pairing_description(entry: RemoteAccessEntry) -> &'static str {
+    match entry {
+        RemoteAccessEntry::LocalNetwork => locale::text(
+            "Set the permission, then open a temporary discovery window",
+            "设置设备权限，然后开启临时发现窗口",
+            "設定裝置權限，然後開啟暫時探索視窗",
+        ),
+        RemoteAccessEntry::TailscaleServe
+        | RemoteAccessEntry::Direct
+        | RemoteAccessEntry::SelfHostedRelay => locale::text(
+            "Set the permission, then generate a one-time QR code",
+            "设置设备权限，然后生成一次性二维码",
+            "設定裝置權限，然後產生一次性 QR Code",
+        ),
+    }
+}
+
+fn step_heading(
+    step: &'static str,
+    title: &'static str,
+    description: &'static str,
+    cx: &App,
+) -> AnyElement {
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .items_start()
+        .gap_3()
+        .child(
+            div()
+                .size(px(24.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.0))
+                .bg(cx.theme().primary.opacity(0.10))
+                .text_xs()
+                .font_semibold()
+                .text_color(cx.theme().primary)
+                .child(step),
+        )
+        .child(
+            v_flex()
+                .min_w_0()
+                .gap_1()
+                .child(div().text_sm().font_semibold().child(title))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(description),
+                ),
+        )
+        .into_any_element()
 }
 
 fn permission_index(permission: RemoteDevicePermissionLevel) -> usize {
@@ -2937,14 +3223,6 @@ fn method_label(method: RemoteConnectivityMethod) -> &'static str {
     }
 }
 
-fn method_selector_label(method: RemoteConnectivityMethod) -> &'static str {
-    match method {
-        RemoteConnectivityMethod::TailscaleServe => "Tailscale",
-        RemoteConnectivityMethod::Direct => "Direct",
-        RemoteConnectivityMethod::SelfHostedRelay => "Relay",
-    }
-}
-
 fn method_description(method: RemoteConnectivityMethod) -> &'static str {
     match method {
         RemoteConnectivityMethod::TailscaleServe => locale::text(
@@ -2962,13 +3240,6 @@ fn method_description(method: RemoteConnectivityMethod) -> &'static str {
             "通过自建加密 Relay 连接",
             "透過自建加密 Relay 連線",
         ),
-    }
-}
-
-fn pairing_mode_label(mode: PairingMode) -> &'static str {
-    match mode {
-        PairingMode::QrCode => locale::text("QR code", "二维码", "QR Code"),
-        PairingMode::LocalNetwork => locale::text("Local network", "局域网", "區域網路"),
     }
 }
 
@@ -3243,14 +3514,12 @@ mod tests {
     }
 
     #[test]
-    fn remote_access_pairing_offer_selects_qr_read_only_and_tailnet() {
+    fn remote_access_pairing_defaults_to_read_only_and_tailnet() {
         let mut state = PairingViewState::default();
         state.apply_connectivity(connectivity(None));
-        state.selected_pairing_mode = PairingMode::LocalNetwork;
         state.install_offer(offer_response()).unwrap();
 
         assert_eq!(state.permission, RemoteDevicePermissionLevel::ReadOnly);
-        assert_eq!(state.selected_pairing_mode, PairingMode::QrCode);
         assert_eq!(
             state.active_offer.as_ref().unwrap().selected_entry,
             RemoteConnectivityMethod::TailscaleServe
@@ -3425,6 +3694,19 @@ mod tests {
         let wide = (1_440.0_f32 - 32.0).clamp(280.0, DIALOG_MAX_WIDTH);
         assert_eq!(narrow, 328.0);
         assert_eq!(wide, DIALOG_MAX_WIDTH);
+    }
+
+    #[test]
+    fn connection_entries_keep_local_network_as_an_independent_fourth_entry() {
+        assert_eq!(RemoteAccessEntry::ALL.len(), 4);
+        assert_eq!(connection_entry_index(RemoteAccessEntry::TailscaleServe), 0);
+        assert_eq!(connection_entry_index(RemoteAccessEntry::Direct), 1);
+        assert_eq!(
+            connection_entry_index(RemoteAccessEntry::SelfHostedRelay),
+            2
+        );
+        assert_eq!(connection_entry_index(RemoteAccessEntry::LocalNetwork), 3);
+        assert!(RemoteAccessEntry::LocalNetwork.remote_method().is_none());
     }
 
     #[test]
