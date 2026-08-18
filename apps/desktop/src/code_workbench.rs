@@ -160,10 +160,23 @@ enum FileSearchMode {
 }
 
 impl FileSearchMode {
-    fn title(self) -> &'static str {
+    fn toggled(self) -> Self {
         match self {
-            Self::Name => locale::text("Name", "名称", "名稱"),
-            Self::Content => locale::text("Content", "内容", "內容"),
+            Self::Name => Self::Content,
+            Self::Content => Self::Name,
+        }
+    }
+
+    fn toggle_label(self) -> &'static str {
+        match self {
+            Self::Name => locale::text(
+                "Switch to content search",
+                "切换为内容搜索",
+                "切換為內容搜尋",
+            ),
+            Self::Content => {
+                locale::text("Switch to name search", "切换为名称搜索", "切換為名稱搜尋")
+            }
         }
     }
 }
@@ -6823,6 +6836,10 @@ impl CodeRightRail {
         cx.notify();
     }
 
+    fn toggle_file_search_mode(&mut self, cx: &mut Context<Self>) {
+        self.set_file_search_mode(self.file_search_mode.toggled(), cx);
+    }
+
     fn clear_file_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.file_search_generation = self.file_search_generation.wrapping_add(1);
         self.file_search_task = None;
@@ -7677,42 +7694,17 @@ impl CodeRightRail {
                                     this.clear_file_search(window, cx)
                                 })),
                         )
-                    }),
-            )
-            .child(
-                h_flex()
-                    .h_7()
-                    .w_full()
-                    .min_w_0()
-                    .rounded(cx.theme().radius)
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .bg(cx.theme().muted.opacity(0.35))
+                    })
                     .child(
-                        Button::new("file-search-mode-name")
+                        Button::new("toggle-file-search-mode")
                             .xsmall()
                             .ghost()
-                            .h_full()
-                            .flex_1()
-                            .rounded(cx.theme().radius)
-                            .label(FileSearchMode::Name.title())
-                            .selected(mode == FileSearchMode::Name)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.set_file_search_mode(FileSearchMode::Name, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("file-search-mode-content")
-                            .xsmall()
-                            .ghost()
-                            .h_full()
-                            .flex_1()
-                            .rounded(cx.theme().radius)
-                            .label(FileSearchMode::Content.title())
-                            .selected(mode == FileSearchMode::Content)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.set_file_search_mode(FileSearchMode::Content, cx)
-                            })),
+                            .compact()
+                            .icon(IconName::ChevronsUpDown)
+                            .tooltip(mode.toggle_label())
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.toggle_file_search_mode(cx)),
+                            ),
                     ),
             )
             .into_any_element()
@@ -12955,6 +12947,12 @@ mod tests {
         );
         assert_eq!(file_search_reveal_range(content, "missing", 2), None);
         assert_eq!(file_search_reveal_range(content, "zed", 8), None);
+    }
+
+    #[test]
+    fn file_search_mode_toggle_switches_between_names_and_content() {
+        assert_eq!(FileSearchMode::Name.toggled(), FileSearchMode::Content);
+        assert_eq!(FileSearchMode::Content.toggled(), FileSearchMode::Name);
     }
 
     #[test]
