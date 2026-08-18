@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use futures_channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -9,17 +10,27 @@ pub enum MobileLifecycleEvent {
     Resumed,
 }
 
+static APP_BACKGROUNDED: AtomicBool = AtomicBool::new(false);
+
 fn event_sender() -> &'static Mutex<Option<UnboundedSender<MobileLifecycleEvent>>> {
     static SENDER: OnceLock<Mutex<Option<UnboundedSender<MobileLifecycleEvent>>>> = OnceLock::new();
     SENDER.get_or_init(|| Mutex::new(None))
 }
 
 fn enqueue(event: MobileLifecycleEvent) {
+    APP_BACKGROUNDED.store(
+        event == MobileLifecycleEvent::Backgrounded,
+        Ordering::Release,
+    );
     if let Ok(sender) = event_sender().lock()
         && let Some(sender) = sender.as_ref()
     {
         let _ = sender.unbounded_send(event);
     }
+}
+
+pub fn is_backgrounded() -> bool {
+    APP_BACKGROUNDED.load(Ordering::Acquire)
 }
 
 fn transition(backgrounded: &mut bool, phase: AppLifecyclePhase) -> Option<MobileLifecycleEvent> {

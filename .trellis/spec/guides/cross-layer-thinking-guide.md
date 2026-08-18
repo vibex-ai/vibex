@@ -31,6 +31,9 @@ For each arrow, ask:
 - What format is the data in?
 - What could go wrong?
 - Who is responsible for validation?
+- If the final effect must happen while a native app is backgrounded, which
+  executor is still runnable? Do not assume a foreground UI dispatcher will
+  drain work after the lifecycle callback fires.
 
 ### Step 2: Identify Boundaries
 

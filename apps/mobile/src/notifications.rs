@@ -171,7 +171,12 @@ mod platform {
             env.call_method(
                 activity,
                 jni::jni_str!("showAgentNotification"),
-                jni::jni_sig!((String, String, String, String) -> ()),
+                jni::jni_sig!((
+                    notification_id: JString,
+                    title: JString,
+                    body: JString,
+                    opaque_locator: JString,
+                ) -> ()),
                 &[
                     (&notification_id).into(),
                     (&title).into(),

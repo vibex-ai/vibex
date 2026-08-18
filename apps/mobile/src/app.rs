@@ -69,6 +69,23 @@ fn should_present_agent_notification(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MobileEventRoute {
+    ForwardToUi,
+    PresentNotificationInBackground,
+    IgnoreUntilResume,
+}
+
+fn mobile_event_route(event: &BackendEvent, app_backgrounded: bool) -> MobileEventRoute {
+    if !app_backgrounded {
+        MobileEventRoute::ForwardToUi
+    } else if matches!(event, BackendEvent::Notification(_)) {
+        MobileEventRoute::PresentNotificationInBackground
+    } else {
+        MobileEventRoute::IgnoreUntilResume
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RootMode {
     Pairing,
     Connecting,
@@ -587,12 +604,24 @@ impl MobileApp {
             loop {
                 match subscription.next().await {
                     Ok(Some(event)) => {
+                        match mobile_event_route(&event, crate::lifecycle::is_backgrounded()) {
+                            MobileEventRoute::ForwardToUi => {}
+                            MobileEventRoute::PresentNotificationInBackground => {
+                                if let BackendEvent::Notification(notification) = &event {
+                                    notifications::present(notification);
+                                }
+                                continue;
+                            }
+                            MobileEventRoute::IgnoreUntilResume => continue,
+                        }
                         if sender.unbounded_send(event).is_err() {
                             break;
                         }
                     }
                     Ok(None) | Err(_) => {
-                        let _ = sender.unbounded_send(BackendEvent::Disconnected);
+                        if !crate::lifecycle::is_backgrounded() {
+                            let _ = sender.unbounded_send(BackendEvent::Disconnected);
+                        }
                         break;
                     }
                 }
@@ -4649,6 +4678,32 @@ mod tests {
             Some(&selected),
             &other,
         ));
+    }
+
+    #[test]
+    fn background_events_present_notifications_without_waiting_for_gpui() {
+        let notification = vibex_core::AgentNotificationIntent {
+            notification_id: "notification-a".to_string(),
+            source_event_id: vibex_core::TimelineItemId::new(),
+            session_id: VibexSessionId::new(),
+            kind: vibex_core::AgentNotificationKind::TurnCompleted,
+            created_at_ms: 1,
+            expires_at_ms: 2,
+            opaque_locator: "opaque-session-locator".to_string(),
+        };
+
+        assert_eq!(
+            mobile_event_route(&BackendEvent::Notification(notification.clone()), false),
+            MobileEventRoute::ForwardToUi
+        );
+        assert_eq!(
+            mobile_event_route(&BackendEvent::Notification(notification), true),
+            MobileEventRoute::PresentNotificationInBackground
+        );
+        assert_eq!(
+            mobile_event_route(&BackendEvent::Disconnected, true),
+            MobileEventRoute::IgnoreUntilResume
+        );
     }
 
     struct DrawerScrollIsolationProbe {

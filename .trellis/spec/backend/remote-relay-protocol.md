@@ -46,6 +46,14 @@ AgentBackend::resolve_opaque_locator(notification_id, opaque_locator)
   while its target session is visibly selected in the foreground. Otherwise it
   presents generic, localized copy with the stable notification ID so the OS can
   replace a duplicate delivery.
+- The native lifecycle callback publishes background state before enqueueing the
+  GPUI lifecycle event. While backgrounded, the Tokio live-event reader invokes
+  the native notification presenter directly; it must not wait for a GPUI
+  foreground task, because that executor may stop being polled as soon as the
+  application leaves the foreground.
+- Non-notification live events received while backgrounded are not queued for the
+  paused UI. Resume performs the existing authoritative refetch and installs a
+  fresh event stream before applying more presentation state.
 - Ask for OS notification permission only after a paired backend connects.
   Existing paired installs receive the same one-time Android request on upgrade;
   Android persists that the request was made rather than prompting at every
@@ -74,8 +82,9 @@ AgentBackend::resolve_opaque_locator(notification_id, opaque_locator)
 - Core/Agent tests cover stable privacy-bounded intent production.
 - Gateway tests include `agent_notification` in permission-filtered topics.
 - Remote-client tests decode the topic into `BackendEvent::Notification`.
-- Mobile tests cover bounded action validation and cold-start buffering;
-  `pnpm check:mobile-native` covers Android/iOS host contract drift.
+- Mobile tests cover bounded action validation, cold-start buffering, foreground
+  forwarding, background native notification routing, and background UI-event
+  dropping; `pnpm check:mobile-native` covers Android/iOS host contract drift.
 
 ### 6. Wrong vs Correct
 
@@ -85,6 +94,9 @@ Correct: buffered id + opaque locator -> authenticated PC resolve -> open sessio
 
 Wrong: put the self-hosted Relay operator bearer in a pairing bundle
 Correct: keep online delivery live-only until a paired-device push auth contract exists
+
+Wrong: background event -> GPUI foreground task -> native local notification
+Correct: lifecycle state -> Tokio event reader -> native presenter; resume -> authoritative refetch
 ```
 
 ## Scenario: Remote Protocol v2 Gateway And Pairing
