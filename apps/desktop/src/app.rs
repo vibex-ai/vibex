@@ -6265,22 +6265,21 @@ impl VibexWorkbench {
                 | (SidebarOrganizationItem::Session(_), SidebarMoveSelectionKind::Session) => {
                     output.push(item);
                 }
-                (SidebarOrganizationItem::Folder(folder_id), _) => {
+                (SidebarOrganizationItem::Folder(folder_id), _)
                     if !self
                         .ui_state
                         .sidebar
                         .organization
                         .collapsed_folder_ids
-                        .contains(folder_id)
-                    {
-                        self.collect_sidebar_move_selection_items(
-                            available,
-                            Some(folder_id),
-                            kind,
-                            output,
-                            depth + 1,
-                        );
-                    }
+                        .contains(folder_id) =>
+                {
+                    self.collect_sidebar_move_selection_items(
+                        available,
+                        Some(folder_id),
+                        kind,
+                        output,
+                        depth + 1,
+                    );
                 }
                 _ => {}
             }
