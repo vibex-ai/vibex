@@ -18,8 +18,10 @@ use vibex_core::{
     RuntimeSwitchActiveWorkPolicy, RuntimeSwitchEventKind, RuntimeSwitchEventProjection,
     RuntimeSwitchId, RuntimeSwitchOperationId, RuntimeSwitchPolicy, RuntimeSwitchStatus,
     SendAgentMessageRequest, SessionRuntimeConfigState, SessionRuntimeSelection,
-    SessionRuntimeSelectionStatus, SwitchOperationStatus, TimelineItemId, TimelineItemKind,
-    TransportKind, UsageExecutionId, VibexError, VibexResult, VibexSessionId, unix_timestamp_ms,
+    SessionRuntimeSelectionStatus, SwitchOperationStatus, TimelineItem, TimelineItemId,
+    TimelineItemKind, TimelinePayload, TimelineRedactionState, TimelineSource, TransportKind,
+    UsageExecutionId, UserMessagePayload, VibexError, VibexResult, VibexSessionId,
+    unix_timestamp_ms,
 };
 
 use crate::{enum_from_db, enum_to_db, json_from_db, json_to_db, parse_id, storage_err};
@@ -4401,33 +4403,145 @@ impl MessageSubmissionRepository {
         ))
     }
 
-    /// Cancels queued submissions that have not crossed the provider prompt
-    /// boundary. `AboutToPrompt` and later states require provider-aware
-    /// reconciliation and must not be rewritten by this path.
+    /// Cancels queued submissions while preserving each submitted user message
+    /// in the authoritative session timeline. The timeline append and status
+    /// transition share one transaction so an interrupt cannot leave a durable
+    /// submission without its user-visible history item. `AboutToPrompt` and
+    /// later states require provider-aware reconciliation and are not rewritten.
     pub fn cancel_before_dispatch_for_session(
-        conn: &Connection,
+        conn: &mut Connection,
         session_id: &VibexSessionId,
-    ) -> VibexResult<usize> {
-        conn.execute(
-            "UPDATE agent_message_submissions
-             SET status = ?2,
-                 error_code = ?3,
-                 error_detail_redacted = NULL,
-                 updated_at_ms = ?4
-             WHERE session_id = ?1 AND status IN (?5, ?6)",
-            params![
-                session_id.as_str(),
-                enum_to_db(&MessageSubmissionStatus::Cancelled)?,
-                "message_submission_interrupted_before_dispatch",
-                unix_timestamp_ms(),
-                enum_to_db(&MessageSubmissionStatus::AwaitingRuntime)?,
-                enum_to_db(&MessageSubmissionStatus::ReadyToDispatch)?,
-            ],
-        )
-        .map_err(storage_err(
-            "message_submission_cancel_failed",
-            "failed to cancel message submissions before dispatch",
-        ))
+    ) -> VibexResult<Vec<TimelineItem>> {
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "message_submission_cancel_transaction_failed",
+                "failed to start message submission cancellation transaction",
+            ))?;
+        let rows = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT s.submission_id, p.payload_json
+                     FROM agent_message_submissions s
+                     JOIN agent_message_submission_payloads p
+                       ON p.payload_reference = s.message_payload_reference
+                     WHERE s.session_id = ?1 AND s.status IN (?2, ?3)
+                     ORDER BY p.submission_sequence ASC",
+                )
+                .map_err(storage_err(
+                    "message_submission_cancel_lookup_failed",
+                    "failed to load queued message submissions before interrupt",
+                ))?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        session_id.as_str(),
+                        enum_to_db(&MessageSubmissionStatus::AwaitingRuntime)?,
+                        enum_to_db(&MessageSubmissionStatus::ReadyToDispatch)?,
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .map_err(storage_err(
+                    "message_submission_cancel_lookup_failed",
+                    "failed to query queued message submissions before interrupt",
+                ))?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(storage_err(
+                "message_submission_cancel_lookup_failed",
+                "failed to read queued message submissions before interrupt",
+            ))?
+        };
+
+        let now = unix_timestamp_ms();
+        let mut items = Vec::with_capacity(rows.len());
+        for (submission_id, payload_json) in rows {
+            let request: SendAgentMessageRequest = json_from_db(payload_json)?;
+            if request.session_id != *session_id {
+                return Err(VibexError::storage(
+                    "message_submission_cancel_payload_mismatch",
+                    "queued message submission payload does not match its session",
+                ));
+            }
+            let item = super::append_timeline_in_transaction(
+                &tx,
+                session_id,
+                TimelineSource::User,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: request.text,
+                    attachments: request.attachments,
+                }),
+                None,
+                request.correlation_id.as_ref(),
+                None,
+                TimelineRedactionState::None,
+                None,
+            )?;
+            let payload_changed = tx
+                .execute(
+                    "UPDATE agent_message_submission_payloads
+                 SET result_first_sequence = ?2,
+                     result_last_sequence = ?2,
+                     updated_at_ms = ?3
+                 WHERE submission_id = ?1
+                   AND result_first_sequence IS NULL
+                   AND result_last_sequence IS NULL",
+                    params![submission_id, item.sequence, now],
+                )
+                .map_err(storage_err(
+                    "message_submission_cancel_result_update_failed",
+                    "failed to persist the interrupted message Timeline range",
+                ))?;
+            if payload_changed != 1 {
+                return Err(VibexError::storage(
+                    "message_submission_cancel_result_conflict",
+                    "interrupted message Timeline range is already recorded or missing",
+                ));
+            }
+            let submission_changed = tx
+                .execute(
+                    "UPDATE agent_message_submissions
+                 SET status = ?2,
+                     error_code = ?3,
+                     error_detail_redacted = NULL,
+                     user_message_timeline_item_id = ?4,
+                     updated_at_ms = ?5
+                 WHERE submission_id = ?1 AND status IN (?6, ?7)",
+                    params![
+                        submission_id,
+                        enum_to_db(&MessageSubmissionStatus::Cancelled)?,
+                        "message_submission_interrupted_before_dispatch",
+                        item.id.as_str(),
+                        now,
+                        enum_to_db(&MessageSubmissionStatus::AwaitingRuntime)?,
+                        enum_to_db(&MessageSubmissionStatus::ReadyToDispatch)?,
+                    ],
+                )
+                .map_err(storage_err(
+                    "message_submission_cancel_failed",
+                    "failed to cancel message submission before dispatch",
+                ))?;
+            if submission_changed != 1 {
+                return Err(VibexError::storage(
+                    "message_submission_cancel_status_conflict",
+                    "queued message submission changed before it could be cancelled",
+                ));
+            }
+            items.push(item);
+        }
+        if !items.is_empty() {
+            tx.execute(
+                "UPDATE agent_sessions SET updated_at_ms = ?2 WHERE session_id = ?1",
+                params![session_id.as_str(), now],
+            )
+            .map_err(storage_err(
+                "message_submission_cancel_session_update_failed",
+                "failed to update the interrupted Agent session",
+            ))?;
+        }
+        tx.commit().map_err(storage_err(
+            "message_submission_cancel_transaction_failed",
+            "failed to commit message submission cancellation transaction",
+        ))?;
+        Ok(items)
     }
 
     /// Advances the submission status with a CAS on the expected current
@@ -7830,8 +7944,12 @@ mod tests {
         MessageSubmissionRepository::mark_about_to_prompt(&conn, &prompting.submission_id).unwrap();
 
         assert_eq!(
-            MessageSubmissionRepository::cancel_before_dispatch_for_session(&conn, &session_id)
-                .unwrap(),
+            MessageSubmissionRepository::cancel_before_dispatch_for_session(
+                &mut conn,
+                &session_id,
+            )
+            .unwrap()
+            .len(),
             2
         );
         for submission_id in [&awaiting.submission_id, &ready.submission_id] {
@@ -7850,6 +7968,100 @@ mod tests {
                 .unwrap()
                 .status,
             MessageSubmissionStatus::AboutToPrompt
+        );
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn message_submission_interrupt_preserves_queued_user_message_in_timeline() {
+        let temp = temp_db_path("submission-session-interrupt-timeline");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let session_id = seeded_session(&conn, "submission-session-interrupt-timeline");
+        let submission = MessageSubmissionRepository::enqueue(
+            &mut conn,
+            MessageSubmissionId::new(),
+            &message_request(&session_id, "interrupt-timeline", "keep this message"),
+        )
+        .unwrap();
+
+        let items =
+            MessageSubmissionRepository::cancel_before_dispatch_for_session(&mut conn, &session_id)
+                .unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(matches!(
+            &items[0].payload,
+            TimelinePayload::UserMessage(UserMessagePayload { text, .. })
+                if text == "keep this message"
+        ));
+
+        let cancelled = MessageSubmissionRepository::get(&conn, &submission.submission_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.status, MessageSubmissionStatus::Cancelled);
+        assert_eq!(
+            cancelled.user_message_timeline_item_id,
+            Some(items[0].id.clone())
+        );
+        assert_eq!(cancelled.result_first_sequence, Some(items[0].sequence));
+        assert_eq!(cancelled.result_last_sequence, Some(items[0].sequence));
+        assert!(
+            MessageSubmissionRepository::cancel_before_dispatch_for_session(
+                &mut conn,
+                &session_id,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn message_submission_interrupt_rolls_back_mismatched_payload() {
+        let temp = temp_db_path("submission-session-interrupt-payload-mismatch");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let session_id = seeded_session(&conn, "submission-session-interrupt-payload-mismatch");
+        let other_session_id = seeded_session(&conn, "submission-session-interrupt-other");
+        let submission = MessageSubmissionRepository::enqueue(
+            &mut conn,
+            MessageSubmissionId::new(),
+            &message_request(
+                &session_id,
+                "interrupt-payload-mismatch",
+                "keep this message",
+            ),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE agent_message_submission_payloads
+             SET payload_json = ?2 WHERE submission_id = ?1",
+            params![
+                submission.submission_id.as_str(),
+                json_to_db(&message_request(
+                    &other_session_id,
+                    "interrupt-payload-mismatch",
+                    "wrong session",
+                ))
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let error =
+            MessageSubmissionRepository::cancel_before_dispatch_for_session(&mut conn, &session_id)
+                .unwrap_err();
+        assert_eq!(error.code, "message_submission_cancel_payload_mismatch");
+        assert_eq!(
+            TimelineRepository::latest_sequence(&conn, &session_id).unwrap(),
+            0
+        );
+        assert_eq!(
+            MessageSubmissionRepository::get(&conn, &submission.submission_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            MessageSubmissionStatus::AwaitingRuntime
         );
         cleanup_db(temp);
     }

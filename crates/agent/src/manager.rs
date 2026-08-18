@@ -2216,7 +2216,7 @@ impl AgentManager {
     }
 
     pub async fn interrupt(&self, session_id: &VibexSessionId) -> VibexResult<()> {
-        let conn = self.open_migrated()?;
+        let mut conn = self.open_migrated()?;
         let session = SessionRepository::get(&conn, session_id)?.ok_or_else(|| {
             VibexError::validation("session_not_found", "Agent session was not found")
         })?;
@@ -2239,10 +2239,13 @@ impl AgentManager {
                 // that no provider turn can have started, so the durable
                 // submission status is the authoritative cancellation fence.
                 let cancelled = MessageSubmissionRepository::cancel_before_dispatch_for_session(
-                    &conn,
+                    &mut conn,
                     &session.id,
                 )?;
-                if cancelled > 0 {
+                if !cancelled.is_empty() {
+                    for item in cancelled {
+                        self.publish_timeline_item(item)?;
+                    }
                     return Ok(());
                 }
                 return Err(error);
@@ -5446,7 +5449,15 @@ mod tests {
         .unwrap();
         drop(conn);
 
+        let mut live_events = manager.subscribe();
         manager.interrupt(&session.id).await.unwrap();
+        let live_event = live_events.try_recv().unwrap();
+        assert_eq!(live_event.session_id, session.id);
+        assert!(matches!(
+            live_event.item.payload,
+            TimelinePayload::UserMessage(UserMessagePayload { ref text, .. })
+                if text == "hello"
+        ));
 
         let conn = manager.open_migrated().unwrap();
         let cancelled = MessageSubmissionRepository::get(&conn, &submission.submission_id)
@@ -5464,6 +5475,20 @@ mod tests {
                 .status,
             RuntimeSwitchStatus::Requested
         );
+        let timeline = TimelineRepository::fetch_range(
+            &conn,
+            &session.id,
+            cancelled.result_first_sequence.unwrap(),
+            cancelled.result_last_sequence.unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            timeline.as_slice(),
+            [TimelineItem {
+                payload: TimelinePayload::UserMessage(UserMessagePayload { text, .. }),
+                ..
+            }] if text == "hello"
+        ));
 
         drop(conn);
         cleanup_db(&db_path);
@@ -5549,6 +5574,20 @@ mod tests {
             cancelled.error_code.as_deref(),
             Some("message_submission_interrupted_before_dispatch")
         );
+        let timeline = TimelineRepository::fetch_range(
+            &conn,
+            &session.id,
+            cancelled.result_first_sequence.unwrap(),
+            cancelled.result_last_sequence.unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            timeline.as_slice(),
+            [TimelineItem {
+                payload: TimelinePayload::UserMessage(UserMessagePayload { text, .. }),
+                ..
+            }] if text == "hello"
+        ));
 
         drop(conn);
         cleanup_db(&db_path);

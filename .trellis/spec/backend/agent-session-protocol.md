@@ -3884,7 +3884,8 @@ prepare committed execution identity
 
 - Trigger: Desktop or Remote submits an ordinary message to an ACP Logical
   Session, retries that action, changes the desired runtime between queued
-  messages, disconnects while waiting, or restarts after prompt admission.
+  messages, interrupts during initial runtime preparation, disconnects while
+  waiting, or restarts after prompt admission.
 - `crates/core` owns the provider-neutral request/query contract, `crates/db`
   owns enqueue/sequence/result transactions, `crates/agent` owns ordered
   workers and prompt admission, and ACP owns the final attachment fence.
@@ -3898,6 +3899,8 @@ SendAgentMessageRequest {
 }
 GetMessageSubmissionRequest { sessionId, messageIdempotencyKey }
 MessageSubmissionCoordinator::{submit, get_submission, reconcile_on_startup}
+MessageSubmissionRepository::cancel_before_dispatch_for_session
+  (&mut Connection, &VibexSessionId) -> Vec<TimelineItem>
 ProviderTurnRequest::{message_submission_id, required_runtime, execution_identity}
 AcpSendTurnRequest::{message_submission_id, required_runtime, execution_identity}
 
@@ -3922,10 +3925,14 @@ agent_message_submission_payloads(
   falls back to the previous runtime.
 - Interrupting an `Initializing` session before a ready effective binding exists
   cancels its `AwaitingRuntime` and `ReadyToDispatch` submissions with
-  `message_submission_interrupted_before_dispatch`. It does not cancel the
-  linked runtime switch and never rewrites `AboutToPrompt` or a later state;
-  those states require the normal provider-aware interrupt and reconciliation
-  path.
+  `message_submission_interrupted_before_dispatch`. In the same immediate
+  transaction, materialize each cancelled payload as a user Timeline item in
+  submission order, store that one-item result range and user-item id, and
+  update the session timestamp. Publish the committed items through the normal
+  live-event stream. This preserves the user's submitted history without
+  calling the provider. It does not cancel the linked runtime switch and never
+  rewrites `AboutToPrompt` or a later state; those states require the normal
+  provider-aware interrupt and reconciliation path.
 - A previous switch failure may be cleared before enqueue only by successful
   lifecycle materialization of the exact DB-current binding and activation
   generation. The recovery CAS also requires `desired == effective`, no
@@ -3937,9 +3944,12 @@ agent_message_submission_payloads(
   is Ready/effective at the requested runtime, and fail only when that fresh state
   still diverges.
 - `ReadyToDispatch -> AboutToPrompt` is the durable no-replay boundary. The
-  manager creates the user Timeline item only after that CAS, immediately
-  before provider admission. Success stores the user item and Timeline range
-  atomically with `Dispatched`, then advances to `Completed`.
+  manager normally creates the user Timeline item only after that CAS,
+  immediately before provider admission. Success stores the user item and
+  Timeline range atomically with `Dispatched`, then advances to `Completed`.
+  The initialization-time interrupt path above is the only pre-boundary
+  materialization exception, and it finishes as `Cancelled` without provider
+  admission.
 - After claiming the session `Running`, a durable ACP turn rereads the DB
   runtime state and current `RuntimeBinding`. It must match desired/effective,
   Ready, no pending switch, Agent/AuthSource/Model/Effort/Mode, binding state,
@@ -3978,7 +3988,8 @@ agent_message_submission_payloads(
 | Same key with another payload/runtime | `message_submission_idempotency_payload_conflict`; no second sequence or prompt. |
 | Request effort differs from desired runtime | `message_submission_runtime_config_mismatch`; zero enqueue. |
 | Runtime gate changes before manager admission | `message_submission_runtime_gate_changed`; no provider call. |
-| Interrupt during initial runtime preparation | Cancel only `AwaitingRuntime` / `ReadyToDispatch`; return success when at least one submission was cancelled, otherwise preserve the runtime readiness error. |
+| Interrupt during initial runtime preparation | Atomically append each queued user payload to Timeline and cancel only `AwaitingRuntime` / `ReadyToDispatch`; publish the committed items and return success when at least one submission was cancelled, otherwise preserve the runtime readiness error. |
+| Queued payload/session mismatch or cancellation CAS inconsistency | Roll back every Timeline/status write and return `message_submission_cancel_*`; never publish a partial user history. |
 | Old `FailedUsingPrevious` state retries the already effective selection and exact current runtime materializes successfully | CAS the selection to `Ready`, clear only the session projection error, and retain the failed switch journal. |
 | Linked switch commits between selection and switch reads | Reread selection; dispatch once if it converged, otherwise `message_submission_runtime_changed_after_commit`. |
 | Current binding missing, stale, non-current, or config/generation mismatch | `message_submission_runtime_binding_*`; no provider call. |
@@ -3994,6 +4005,9 @@ agent_message_submission_payloads(
   durable send prompts only the DB-current target attachment once.
 - Good: two queued messages with different desired runtimes switch and prompt
   in sequence; dropping either caller does not stop the worker.
+- Good: the user interrupts a new session before runtime preparation completes;
+  the submitted text remains in authoritative Timeline while no provider prompt
+  is admitted.
 - Base: a Claude or Codex ACP session with no explicit Effort/Mode uses the
   Adapter-converged defaults and still dispatches through the exact current
   binding once.
@@ -4001,12 +4015,15 @@ agent_message_submission_payloads(
   binding, auto-fail over to another Profile, or replace durable current
   authority with an adapter-local binding.
 - Bad: classify an unknown post-prompt error as Failed and resend on startup.
+- Bad: cancel an initialization-time submission without first materializing its
+  durable payload, leaving the selected session with an empty Timeline.
 
 ### 6. Tests Required
 
 - Core tests cover serde fields and Debug redaction for send/query/state.
 - DB tests cover atomic enqueue, exact conflict, sequence ordering, switch
-  cancellation, session interrupt before the prompt boundary, CAS transitions,
+  cancellation, session interrupt before the prompt boundary, atomic user
+  Timeline preservation, idempotency, mismatch rollback, CAS transitions,
   dispatch-result transaction, and range load.
 - Coordinator tests cover concurrent same-key submit, caller drop, per-session
   order, cross-session parallelism, desired gate, terminal switch outcomes,
@@ -4015,7 +4032,9 @@ agent_message_submission_payloads(
 - Manager/ACP tests cover dropped-coordinator fail-closed, no durable
   failover/history bridge/binding update, prepare/send identity mismatch, and
   ForceFresh dispatch exclusively to the current target native session. Manager
-  tests also cover initialization-time interrupt without an effective binding.
+  tests also cover initialization-time interrupt without an effective binding
+  and assert that both `Initializing` and projected-`Running` snapshots preserve
+  the submitted user Timeline item.
 - Selection-service/ACP-lifecycle/DB tests cover healing stale
   `FailedUsingPrevious` through same-selection retry only after the exact
   current attachment activates; Ready same-selection remains a no-op, while
@@ -4043,6 +4062,11 @@ enqueue payload + desired runtime
   -> ACP revalidates current committed attachment under admission lock
   -> prompt once -> atomically persist Timeline result fence
   -> unknown post-boundary outcome stays Ambiguous
+
+initialization-time interrupt
+  -> immediate transaction appends queued user payloads in submission order
+  -> records each one-item result range and marks the submissions Cancelled
+  -> commit -> publish user Timeline items -> no provider prompt
 ```
 
 ## Scenario: Hidden Context Bridge Injection And Success-Only Cursor Commit
