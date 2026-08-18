@@ -11783,6 +11783,20 @@ impl VibexWorkbench {
                 match outcome {
                     Ok(Ok(Some(summary))) => {
                         let project_id = summary.project.id.clone();
+                        let is_new_project = this
+                            .workspaces
+                            .iter()
+                            .all(|(project, _)| project.id != project_id);
+                        if is_new_project {
+                            this.store_sidebar_project_appearance(
+                                project_id.as_str().to_string(),
+                                SidebarProjectAppearance {
+                                    logo: SidebarProjectLogo::default(),
+                                    color: sidebar_project_logo_color_for_new_project(&project_id),
+                                },
+                                cx,
+                            );
+                        }
                         this.workspaces
                             .retain(|(_, workspace)| workspace.id != summary.workspace.id);
                         this.workspaces.push((summary.project, summary.workspace));
@@ -33422,6 +33436,12 @@ fn sidebar_project_logo_color(color: SidebarProjectLogoColor, cx: &App) -> Hsla 
     }
 }
 
+fn sidebar_project_logo_color_for_new_project(project_id: &ProjectId) -> SidebarProjectLogoColor {
+    let accent_colors = &SidebarProjectLogoColor::ALL[1..];
+    let digest = Sha256::digest(project_id.as_str().as_bytes());
+    accent_colors[usize::from(digest[0]) % accent_colors.len()]
+}
+
 fn sidebar_project_logo_label(logo: SidebarProjectLogo) -> &'static str {
     match logo {
         SidebarProjectLogo::Boxes => locale::text("Boxes", "模块", "模組"),
@@ -41057,6 +41077,29 @@ mod tests {
         assert!(project.contains("render_sidebar_project_appearance_popover("));
         assert!(menu.contains("Customize Logo"));
         assert!(menu.contains("set_sidebar_project_appearance_popover("));
+    }
+
+    #[test]
+    fn new_projects_receive_an_accent_color_and_keep_the_default_logo() {
+        let source = include_str!("app.rs");
+        let chooser = source
+            .split_once("    fn choose_project_for_new_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn import_external_path_bufs("))
+            .map(|(body, _)| body)
+            .expect("new project selection should remain inspectable");
+
+        assert!(chooser.contains("let is_new_project = this"));
+        assert!(chooser.contains("if is_new_project {"));
+        assert!(chooser.contains("logo: SidebarProjectLogo::default()"));
+        assert!(chooser.contains("sidebar_project_logo_color_for_new_project(&project_id)"));
+
+        for index in 0..64 {
+            let project_id = ProjectId::parse(format!("project_random_color_{index}"))
+                .expect("test project id should be valid");
+            let color = sidebar_project_logo_color_for_new_project(&project_id);
+            assert_ne!(color, SidebarProjectLogoColor::Neutral);
+            assert!(SidebarProjectLogoColor::ALL.contains(&color));
+        }
     }
 
     #[test]
