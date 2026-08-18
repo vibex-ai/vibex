@@ -321,18 +321,48 @@ impl SidebarOrganizationState {
         if !self.folders.contains_key(folder_id) {
             return false;
         }
-        let parent = self.parent_of(&SidebarOrganizationItem::Folder(folder_id.to_string()));
-        for placement in &mut self.placements {
-            if placement.parent_folder_id.as_deref() == Some(folder_id) {
-                placement.parent_folder_id = parent.clone();
+
+        // Folder deletion removes the complete local classification subtree. The
+        // referenced Project/Session records remain authoritative and become
+        // unplaced, so the next root projection can show them again safely.
+        let mut deleted_folder_ids = BTreeSet::from([folder_id.to_string()]);
+        loop {
+            let descendants = self
+                .placements
+                .iter()
+                .filter_map(|placement| {
+                    let SidebarOrganizationItem::Folder(candidate_id) = &placement.item else {
+                        return None;
+                    };
+                    placement
+                        .parent_folder_id
+                        .as_ref()
+                        .filter(|parent_id| deleted_folder_ids.contains(*parent_id))
+                        .and_then(|_| {
+                            (!deleted_folder_ids.contains(candidate_id)).then_some(candidate_id)
+                        })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if descendants.is_empty() {
+                break;
             }
+            deleted_folder_ids.extend(descendants);
         }
+
+        self.folders
+            .retain(|id, _| !deleted_folder_ids.contains(id));
+        self.collapsed_folder_ids
+            .retain(|id| !deleted_folder_ids.contains(id));
         self.placements.retain(|placement| {
-            placement.item != SidebarOrganizationItem::Folder(folder_id.to_string())
+            !matches!(
+                &placement.item,
+                SidebarOrganizationItem::Folder(id) if deleted_folder_ids.contains(id)
+            ) && !placement
+                .parent_folder_id
+                .as_ref()
+                .is_some_and(|parent_id| deleted_folder_ids.contains(parent_id))
         });
-        self.collapsed_folder_ids.remove(folder_id);
-        self.folders.remove(folder_id);
-        self.deduplicate_sibling_folder_names();
         true
     }
 
@@ -993,7 +1023,7 @@ mod tests {
     }
 
     #[test]
-    fn normalization_and_delete_promotion_repair_sibling_name_collisions() {
+    fn normalization_repairs_names_and_delete_removes_nested_subtree() {
         let mut state = SidebarOrganizationState {
             folders: BTreeMap::from([
                 (
@@ -1032,11 +1062,9 @@ mod tests {
         assert!(state.create_folder("nested", "Promoted", None, Some("parent".into())));
         assert!(state.create_folder("root", "Promoted", None, None));
         assert!(state.delete_folder("parent"));
-        let promoted_names = ["nested", "root"]
-            .into_iter()
-            .map(|id| comparable_folder_name(&state.folder(id).unwrap().name))
-            .collect::<BTreeSet<_>>();
-        assert_eq!(promoted_names.len(), 2);
+        assert!(!state.folders.contains_key("parent"));
+        assert!(!state.folders.contains_key("nested"));
+        assert!(state.folders.contains_key("root"));
     }
 
     #[test]
@@ -1077,7 +1105,7 @@ mod tests {
     }
 
     #[test]
-    fn deleting_a_folder_promotes_contents_without_deleting_them() {
+    fn deleting_a_folder_removes_nested_classification_and_unplaces_contents() {
         let mut state = SidebarOrganizationState::default();
         assert!(state.create_folder("parent", "Parent", None, None));
         assert!(state.create_folder("child", "Child", None, Some("parent".into())));
@@ -1089,15 +1117,56 @@ mod tests {
         ));
 
         assert!(state.delete_folder("parent"));
-        assert_eq!(
-            state.parent_of(&SidebarOrganizationItem::Folder("child".into())),
-            None
-        );
+        assert!(!state.folders.contains_key("parent"));
+        assert!(!state.folders.contains_key("child"));
         assert_eq!(
             state.parent_of(&SidebarOrganizationItem::Project("project-a".into())),
             None
         );
-        assert!(state.folders.contains_key("child"));
+        assert_eq!(
+            state.ordered_children(
+                None,
+                &[SidebarOrganizationItem::Project("project-a".into())],
+            ),
+            [SidebarOrganizationItem::Project("project-a".into())]
+        );
+    }
+
+    #[test]
+    fn deleting_a_project_folder_removes_nested_session_classification() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_folder("parent", "Parent", Some("project-a".into()), None,));
+        assert!(state.create_folder(
+            "child",
+            "Child",
+            Some("project-a".into()),
+            Some("parent".into()),
+        ));
+        state.reconcile(
+            &["project-a".into()],
+            &[("session-a".into(), "project-a".into())],
+        );
+        let sessions = BTreeMap::from([("session-a".to_string(), "project-a".to_string())]);
+        assert!(state.move_into(
+            &SidebarOrganizationItem::Session("session-a".into()),
+            "child",
+            &sessions,
+        ));
+
+        assert!(state.delete_folder("parent"));
+        assert!(!state.folders.contains_key("parent"));
+        assert!(!state.folders.contains_key("child"));
+        assert_eq!(
+            state.parent_of(&SidebarOrganizationItem::Session("session-a".into())),
+            None
+        );
+        assert_eq!(
+            state.ordered_children(
+                None,
+                &[SidebarOrganizationItem::Session("session-a".into())],
+            ),
+            [SidebarOrganizationItem::Session("session-a".into())]
+        );
     }
 
     #[test]

@@ -1769,10 +1769,13 @@ SidebarOrganizationScope::{Root, Project(project_id)}
   depend on the source row remaining under the pointer. Reject self/descendant
   cycles and any move whose target depth plus the moving folder subtree exceeds
   32 levels.
+- GPUI drag-move listeners must be attached to the concrete row or empty-root
+  hitbox they represent and ignore positions outside that element's bounds before
+  stopping propagation. Never put the root fallback target on the list ancestor:
+  an ancestor callback can run after a valid child-row target and overwrite it.
 - Folder names are unique among siblings within the same scope and parent. Compare
   trimmed names case-insensitively for create, rename, and cross-parent movement.
-  Persisted legacy collisions are repaired deterministically during normalization,
-  and deleting a folder must also repair collisions caused by promoting children.
+  Persisted legacy collisions are repaired deterministically during normalization.
 - A localized default folder name is allocated as the first available numbered
   variant (`New Folder`, `New Folder 2`, ...), scoped to the destination parent.
   Creation immediately focuses/selects inline rename. Enter keeps empty or
@@ -1801,9 +1804,10 @@ SidebarOrganizationScope::{Root, Project(project_id)}
   default-empty `DesktopUiStateV1.sidebar.organization` field without changing
   schema version 1. Normalize bounded names/ids/counts, deduplicate items, repair
   invalid parents/cycles, and remove stale Project/Session references.
-- Deleting a folder deletes only its classification node. Promote its direct
-  children to the deleted folder's parent without deleting Projects, Sessions,
-  nested folders, or authoritative runtime data.
+- Deleting a folder removes its complete classification subtree: the folder,
+  nested folders, and every placement below them are removed together. The
+  authoritative Project and Session records remain intact and become unplaced,
+  so they are rendered again at their scope root rather than being deleted.
 - Detailed hierarchy renders Sessions placed in Project folders only through the
   organization tree, not again below their Workspace. Locating the selected
   Session expands both Project/Workspace disclosure and every organization-folder
@@ -1820,6 +1824,7 @@ SidebarOrganizationScope::{Root, Project(project_id)}
 | Project A Session/folder is dropped in Project B | Reject without changing or persisting placement. |
 | Folder is dropped into itself or a descendant | Reject; never create a cycle. |
 | Moving a subtree would exceed 32 levels | Reject the preview/drop and keep the original parent. |
+| Deleting a folder with nested folders or placed items | Remove the entire local classification subtree; keep authoritative Projects/Sessions and show them at scope root. |
 | Create or rename matches a sibling after trim/case folding | Reject it; keep the existing persisted name and placement. |
 | Moving a folder would collide with a destination sibling name | Reject the move and keep the original parent. |
 | Localized default name already exists | Allocate the first available numbered suffix in that parent. |

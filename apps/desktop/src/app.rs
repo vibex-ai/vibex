@@ -17411,38 +17411,6 @@ impl VibexWorkbench {
                     } else {
                         cx.theme().transparent
                     })
-                    .on_drag_move(cx.listener(
-                        |this, event: &DragMoveEvent<SidebarProjectDrag>, _, cx| {
-                            let drag = event.drag(cx);
-                            this.set_sidebar_organization_root_drop_target(
-                                SidebarOrganizationItem::Project(drag.project_id.clone()),
-                                SidebarOrganizationScope::Root,
-                                cx,
-                            );
-                        },
-                    ))
-                    .on_drag_move(cx.listener(
-                        |this, event: &DragMoveEvent<SidebarFolderDrag>, _, cx| {
-                            let drag = event.drag(cx);
-                            this.set_sidebar_organization_root_drop_target(
-                                SidebarOrganizationItem::Folder(drag.folder_id.clone()),
-                                SidebarOrganizationScope::Root,
-                                cx,
-                            );
-                        },
-                    ))
-                    .on_drag_move(cx.listener(
-                        |this, event: &DragMoveEvent<SidebarSessionDrag>, _, cx| {
-                            let drag = event.drag(cx);
-                            this.set_sidebar_organization_root_drop_target(
-                                SidebarOrganizationItem::Session(
-                                    drag.session_id.as_str().to_string(),
-                                ),
-                                SidebarOrganizationScope::Root,
-                                cx,
-                            );
-                        },
-                    ))
                     .on_drop(cx.listener(|this, drag: &SidebarProjectDrag, _, cx| {
                         this.finish_sidebar_project_drag(&drag.project_id, cx);
                         cx.stop_propagation();
@@ -17455,9 +17423,6 @@ impl VibexWorkbench {
                         this.finish_sidebar_session_drag(&drag.workspace_id, &drag.session_id, cx);
                         cx.stop_propagation();
                     }))
-                    .context_menu(move |menu, _, cx| {
-                        Self::build_sidebar_root_menu(menu, root_menu_entity.clone(), cx)
-                    })
                     .px_4()
                     .py_3()
                     .when(group_elements.is_empty(), |this| {
@@ -17473,7 +17438,66 @@ impl VibexWorkbench {
                                 .child(strings.sidebar_no_matching_sessions),
                         )
                     })
-                    .children(group_elements),
+                    .children(group_elements)
+                    // Keep root-only drops and the root context menu on a
+                    // sibling hitbox instead of an ancestor of every row.
+                    .child(
+                        div()
+                            .id("sidebar-root-drop-target")
+                            .w_full()
+                            .flex_1()
+                            .min_h(px(24.0))
+                            .rounded(px(8.0))
+                            .bg(if root_drop_active {
+                                cx.theme().sidebar_accent.opacity(0.20)
+                            } else {
+                                cx.theme().transparent
+                            })
+                            .on_drag_move(cx.listener(
+                                |this, event: &DragMoveEvent<SidebarProjectDrag>, _, cx| {
+                                    if !event.bounds.contains(&event.event.position) {
+                                        return;
+                                    }
+                                    let drag = event.drag(cx);
+                                    this.set_sidebar_organization_root_drop_target(
+                                        SidebarOrganizationItem::Project(drag.project_id.clone()),
+                                        SidebarOrganizationScope::Root,
+                                        cx,
+                                    );
+                                },
+                            ))
+                            .on_drag_move(cx.listener(
+                                |this, event: &DragMoveEvent<SidebarFolderDrag>, _, cx| {
+                                    if !event.bounds.contains(&event.event.position) {
+                                        return;
+                                    }
+                                    let drag = event.drag(cx);
+                                    this.set_sidebar_organization_root_drop_target(
+                                        SidebarOrganizationItem::Folder(drag.folder_id.clone()),
+                                        SidebarOrganizationScope::Root,
+                                        cx,
+                                    );
+                                },
+                            ))
+                            .on_drag_move(cx.listener(
+                                |this, event: &DragMoveEvent<SidebarSessionDrag>, _, cx| {
+                                    if !event.bounds.contains(&event.event.position) {
+                                        return;
+                                    }
+                                    let drag = event.drag(cx);
+                                    this.set_sidebar_organization_root_drop_target(
+                                        SidebarOrganizationItem::Session(
+                                            drag.session_id.as_str().to_string(),
+                                        ),
+                                        SidebarOrganizationScope::Root,
+                                        cx,
+                                    );
+                                },
+                            ))
+                            .context_menu(move |menu, _, cx| {
+                                Self::build_sidebar_root_menu(menu, root_menu_entity.clone(), cx)
+                            }),
+                    ),
             )
             .into_any_element()
     }
@@ -17947,6 +17971,9 @@ impl VibexWorkbench {
                 })
                 .on_drag_move(cx.listener(
                     move |this, event: &DragMoveEvent<SidebarProjectDrag>, _, cx| {
+                        if !event.bounds.contains(&event.event.position) {
+                            return;
+                        }
                         cx.stop_propagation();
                         let drag = event.drag(cx);
                         let position = if event.event.position.y
@@ -17970,6 +17997,9 @@ impl VibexWorkbench {
                 ))
                 .on_drag_move(cx.listener(
                     move |this, event: &DragMoveEvent<SidebarSessionDrag>, _, cx| {
+                        if !event.bounds.contains(&event.event.position) {
+                            return;
+                        }
                         cx.stop_propagation();
                         let drag = event.drag(cx);
                         let position = if event.event.position.y
@@ -17993,6 +18023,9 @@ impl VibexWorkbench {
                 ))
                 .on_drag_move(cx.listener(
                     move |this, event: &DragMoveEvent<SidebarFolderDrag>, _, cx| {
+                        if !event.bounds.contains(&event.event.position) {
+                            return;
+                        }
                         cx.stop_propagation();
                         let drag = event.drag(cx);
                         let position = if event.event.position.y
@@ -18232,6 +18265,9 @@ impl VibexWorkbench {
             == Some(SidebarContextMenuTarget::Project(project_id_string.clone()));
         let context_menu_hover_entity = cx.weak_entity();
         let context_menu_project_id = project_id_string.clone();
+        let drag_target_project_id = project_id_string.clone();
+        let folder_drag_target_project_id = project_id_string.clone();
+        let session_root_target_project_id = project_id_string.clone();
 
         let project_row = div()
             .id(format!("sidebar-project-row-{project_id_string}"))
@@ -18267,6 +18303,80 @@ impl VibexWorkbench {
                     cx,
                 )
             }))
+            .on_drag_move(cx.listener(
+                move |this, event: &DragMoveEvent<SidebarProjectDrag>, _, cx| {
+                    let position = event.event.position;
+                    let inside_target = position.x
+                        >= event.bounds.left() - px(SIDEBAR_DRAG_HORIZONTAL_SLOP)
+                        && position.x <= event.bounds.right() + px(SIDEBAR_DRAG_HORIZONTAL_SLOP)
+                        && position.y >= event.bounds.top() - px(SIDEBAR_PROJECT_REORDER_GAP / 2.0)
+                        && position.y
+                            <= event.bounds.bottom() + px(SIDEBAR_PROJECT_REORDER_GAP / 2.0);
+                    if !inside_target {
+                        return;
+                    }
+                    cx.stop_propagation();
+                    let drag = event.drag(cx).clone();
+                    if drag.project_id != drag_target_project_id {
+                        this.preview_sidebar_project_reorder(
+                            &drag,
+                            &drag_target_project_id,
+                            position.y >= event.bounds.center().y,
+                            cx,
+                        );
+                    } else {
+                        this.set_sidebar_organization_drop_target(
+                            SidebarOrganizationItem::Project(drag.project_id),
+                            SidebarOrganizationItem::Project(drag_target_project_id.clone()),
+                            SidebarOrganizationDropPosition::Before,
+                            cx,
+                        );
+                    }
+                },
+            ))
+            .on_drag_move(cx.listener(
+                move |this, event: &DragMoveEvent<SidebarFolderDrag>, _, cx| {
+                    if !event.bounds.contains(&event.event.position) {
+                        return;
+                    }
+                    cx.stop_propagation();
+                    let drag = event.drag(cx);
+                    let project_scope =
+                        SidebarOrganizationScope::Project(folder_drag_target_project_id.clone());
+                    if drag.scope == project_scope {
+                        this.set_sidebar_organization_root_drop_target(
+                            SidebarOrganizationItem::Folder(drag.folder_id.clone()),
+                            project_scope,
+                            cx,
+                        );
+                    } else {
+                        this.set_sidebar_organization_drop_target(
+                            SidebarOrganizationItem::Folder(drag.folder_id.clone()),
+                            SidebarOrganizationItem::Project(folder_drag_target_project_id.clone()),
+                            if event.event.position.y >= event.bounds.center().y {
+                                SidebarOrganizationDropPosition::After
+                            } else {
+                                SidebarOrganizationDropPosition::Before
+                            },
+                            cx,
+                        );
+                    }
+                },
+            ))
+            .on_drag_move(cx.listener(
+                move |this, event: &DragMoveEvent<SidebarSessionDrag>, _, cx| {
+                    if !event.bounds.contains(&event.event.position) {
+                        return;
+                    }
+                    cx.stop_propagation();
+                    let drag = event.drag(cx);
+                    this.set_sidebar_organization_root_drop_target(
+                        SidebarOrganizationItem::Session(drag.session_id.as_str().to_string()),
+                        SidebarOrganizationScope::Project(session_root_target_project_id.clone()),
+                        cx,
+                    );
+                },
+            ))
             .context_menu(move |menu, _, cx| {
                 let _ = context_menu_hover_entity.update(cx, |this, cx| {
                     this.set_sidebar_context_menu_target(
@@ -18451,9 +18561,6 @@ impl VibexWorkbench {
                 )
             });
         let drag_entity = cx.weak_entity();
-        let drag_target_project_id = project_id_string.clone();
-        let folder_drag_target_project_id = project_id_string.clone();
-        let session_root_target_project_id = project_id_string.clone();
         let release_project_id = project_id_string.clone();
         let release_out_project_id = project_id_string.clone();
         let project = v_flex()
@@ -18503,83 +18610,6 @@ impl VibexWorkbench {
                     });
                     cx.new(|_| drag.clone())
                 })
-                .on_drag_move(cx.listener(
-                    move |this, event: &DragMoveEvent<SidebarProjectDrag>, _, cx| {
-                        cx.stop_propagation();
-                        let drag = event.drag(cx).clone();
-                        let position = event.event.position;
-                        let inside_target = position.x
-                            >= event.bounds.left() - px(SIDEBAR_DRAG_HORIZONTAL_SLOP)
-                            && position.x
-                                <= event.bounds.right() + px(SIDEBAR_DRAG_HORIZONTAL_SLOP)
-                            && position.y
-                                >= event.bounds.top() - px(SIDEBAR_PROJECT_REORDER_GAP / 2.0)
-                            && position.y
-                                <= event.bounds.bottom() + px(SIDEBAR_PROJECT_REORDER_GAP / 2.0);
-                        let next = (inside_target && drag.project_id != drag_target_project_id)
-                            .then_some(SidebarProjectDropTarget {
-                                project_id: drag_target_project_id.clone(),
-                                after: position.y >= event.bounds.center().y,
-                            });
-                        if let Some(next) = next {
-                            this.preview_sidebar_project_reorder(
-                                &drag,
-                                &next.project_id,
-                                next.after,
-                                cx,
-                            );
-                        } else {
-                            this.set_sidebar_organization_drop_target(
-                                SidebarOrganizationItem::Project(drag.project_id.clone()),
-                                SidebarOrganizationItem::Project(drag_target_project_id.clone()),
-                                SidebarOrganizationDropPosition::Before,
-                                cx,
-                            );
-                        }
-                    },
-                ))
-                .on_drag_move(cx.listener(
-                    move |this, event: &DragMoveEvent<SidebarFolderDrag>, _, cx| {
-                        cx.stop_propagation();
-                        let drag = event.drag(cx);
-                        let project_scope = SidebarOrganizationScope::Project(
-                            folder_drag_target_project_id.clone(),
-                        );
-                        if drag.scope == project_scope {
-                            this.set_sidebar_organization_root_drop_target(
-                                SidebarOrganizationItem::Folder(drag.folder_id.clone()),
-                                project_scope,
-                                cx,
-                            );
-                        } else {
-                            this.set_sidebar_organization_drop_target(
-                                SidebarOrganizationItem::Folder(drag.folder_id.clone()),
-                                SidebarOrganizationItem::Project(
-                                    folder_drag_target_project_id.clone(),
-                                ),
-                                if event.event.position.y >= event.bounds.center().y {
-                                    SidebarOrganizationDropPosition::After
-                                } else {
-                                    SidebarOrganizationDropPosition::Before
-                                },
-                                cx,
-                            );
-                        }
-                    },
-                ))
-                .on_drag_move(cx.listener(
-                    move |this, event: &DragMoveEvent<SidebarSessionDrag>, _, cx| {
-                        cx.stop_propagation();
-                        let drag = event.drag(cx);
-                        this.set_sidebar_organization_root_drop_target(
-                            SidebarOrganizationItem::Session(drag.session_id.as_str().to_string()),
-                            SidebarOrganizationScope::Project(
-                                session_root_target_project_id.clone(),
-                            ),
-                            cx,
-                        );
-                    },
-                ))
             })
             .when(
                 active_project_drag
@@ -19120,8 +19150,6 @@ impl VibexWorkbench {
                 })
                 .on_drag_move(cx.listener(
                     move |this, event: &DragMoveEvent<SidebarSessionDrag>, _, cx| {
-                        cx.stop_propagation();
-                        let drag = event.drag(cx).clone();
                         let position = event.event.position;
                         let inside_target = position.x
                             >= event.bounds.left() - px(SIDEBAR_DRAG_HORIZONTAL_SLOP)
@@ -19131,6 +19159,11 @@ impl VibexWorkbench {
                                 >= event.bounds.top() - px(SIDEBAR_SESSION_REORDER_GAP / 2.0)
                             && position.y
                                 <= event.bounds.bottom() + px(SIDEBAR_SESSION_REORDER_GAP / 2.0);
+                        if !inside_target {
+                            return;
+                        }
+                        cx.stop_propagation();
+                        let drag = event.drag(cx).clone();
                         let next = (inside_target
                             && drag.session_id != drag_target_session_id
                             && drag.project_id == drag_target_project_id
@@ -19162,6 +19195,9 @@ impl VibexWorkbench {
                 ))
                 .on_drag_move(cx.listener(
                     move |this, event: &DragMoveEvent<SidebarFolderDrag>, _, cx| {
+                        if !event.bounds.contains(&event.event.position) {
+                            return;
+                        }
                         cx.stop_propagation();
                         let drag = event.drag(cx);
                         this.set_sidebar_organization_drop_target(
@@ -41718,6 +41754,47 @@ mod tests {
         assert!(source.contains("flat_preview_enabled"));
         assert!(source.contains(".on_drop(cx.listener(|this, drag: &SidebarProjectDrag"));
         assert!(source.contains(".on_drop(cx.listener(|this, drag: &SidebarSessionDrag"));
+    }
+
+    #[test]
+    fn sidebar_drag_targets_are_owned_by_concrete_hitboxes() {
+        let source = include_str!("app.rs");
+        let folder = source
+            .split_once("    fn render_sidebar_folder(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_project("))
+            .map(|(body, _)| body)
+            .expect("folder renderer should remain inspectable");
+        let project = source
+            .split_once("    fn render_sidebar_project(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_workspace("))
+            .map(|(body, _)| body)
+            .expect("project renderer should remain inspectable");
+        let project_row = project
+            .split_once("        let project_row = div()")
+            .and_then(|(_, tail)| tail.split_once("\n        let mut session_elements"))
+            .map(|(body, _)| body)
+            .expect("project row should remain inspectable");
+        let project_container = project
+            .split_once("        let project = v_flex()")
+            .map(|(_, body)| body)
+            .expect("project container should remain inspectable");
+        let session = source
+            .split_once("    fn render_sidebar_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_choice_popover("))
+            .map(|(body, _)| body)
+            .expect("session renderer should remain inspectable");
+
+        assert_eq!(project_row.matches(".on_drag_move(").count(), 3);
+        assert!(!project_container.contains(".on_drag_move("));
+        assert_eq!(
+            folder
+                .matches("if !event.bounds.contains(&event.event.position)")
+                .count(),
+            3
+        );
+        assert!(session.contains("if !inside_target"));
+        assert!(session.contains("if !event.bounds.contains(&event.event.position)"));
+        assert!(source.contains(".id(\"sidebar-root-drop-target\")"));
     }
 
     #[test]
