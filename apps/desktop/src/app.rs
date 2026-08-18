@@ -14,11 +14,11 @@ use gpui::{
     AccessibleAction, Anchor, Animation, AnimationExt as _, AnyElement, AnyWindowHandle, App,
     Bounds, ClickEvent, ClipboardEntry, ClipboardItem, Context, Decorations, DragMoveEvent,
     ElementId, Empty, Entity, EntityInputHandler, ExternalPaths, FocusHandle, Focusable as _,
-    FontWeight, HighlightStyle, Hsla, Image, IntoElement, KeyBinding, KeyDownEvent, Keystroke,
-    MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, Orientation, ParentElement as _,
-    PathBuilder, Pixels, Render, Rgba, Role, ScrollDelta, ScrollStrategy, ScrollWheelEvent,
-    SharedString, Size, StatefulInteractiveElement as _, StyleRefinement, Styled as _,
-    StyledImage as _, StyledText, Subscription, Task, Unbind, WeakEntity, Window,
+    FontWeight, HighlightStyle, Hsla, Image, ImageFormat, IntoElement, KeyBinding, KeyDownEvent,
+    Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, Orientation,
+    ParentElement as _, PathBuilder, Pixels, Render, Rgba, Role, ScrollDelta, ScrollStrategy,
+    ScrollWheelEvent, SharedString, Size, StatefulInteractiveElement as _, StyleRefinement,
+    Styled as _, StyledImage as _, StyledText, Subscription, Task, Unbind, WeakEntity, Window,
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowDecorations, WindowOptions,
     canvas, div, img, linear_color_stop, linear_gradient, point, prelude::*, px, relative, rgb,
     size,
@@ -11145,6 +11145,39 @@ impl VibexWorkbench {
     fn close_attachment_preview(&mut self, cx: &mut Context<Self>) {
         self.attachment_image_preview = None;
         cx.notify();
+    }
+
+    fn copy_attachment_preview_image(
+        &mut self,
+        source: &str,
+        mime_type: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        let result = (|| {
+            let bytes = std::fs::read(source)?;
+            if bytes.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "image is empty",
+                ));
+            }
+            let format = attachment_preview_image_format(std::path::Path::new(source), mime_type)
+                .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "image format is unsupported",
+                )
+            })?;
+            Ok(Image::from_bytes(format, bytes))
+        })();
+
+        match result {
+            Ok(image) => cx.write_to_clipboard(ClipboardItem::new_image(&image)),
+            Err(error) => {
+                self.agent_error = Some(format!("image copy failed: {error}"));
+                cx.notify();
+            }
+        }
     }
 
     fn set_attachment_preview_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) {
@@ -24766,6 +24799,9 @@ impl VibexWorkbench {
         let zoom_label = format!("{}%", (preview.zoom * 100.0).round() as u32);
         let save_source = preview.attachment.path.clone().unwrap_or_default();
         let save_label = preview.attachment.label.clone();
+        let copy_source = save_source.clone();
+        let copy_mime_type = preview.attachment.mime_type.clone();
+        let copy_entity = cx.weak_entity();
         let image_source = preview.image_source;
 
         Some(
@@ -24849,6 +24885,30 @@ impl VibexWorkbench {
                                         cx.stop_propagation();
                                     }),
                                 )
+                                .context_menu(move |menu, _, _| {
+                                    let copy_entity = copy_entity.clone();
+                                    let source = copy_source.clone();
+                                    let mime_type = copy_mime_type.clone();
+                                    menu.item(
+                                        PopupMenuItem::new(locale::text(
+                                            "Copy image",
+                                            "复制图片",
+                                            "複製圖片",
+                                        ))
+                                        .icon(IconName::Copy)
+                                        .on_click(
+                                            move |_, _, cx| {
+                                                let _ = copy_entity.update(cx, |this, cx| {
+                                                    this.copy_attachment_preview_image(
+                                                        &source,
+                                                        mime_type.as_deref(),
+                                                        cx,
+                                                    );
+                                                });
+                                            },
+                                        ),
+                                    )
+                                })
                                 .child(
                                     img(image_source).size_full().object_fit(ObjectFit::Contain),
                                 ),
@@ -33790,6 +33850,27 @@ fn safe_attachment_file_name(label: &str, source: &str) -> String {
         name.push_str(extension);
     }
     name
+}
+
+fn attachment_preview_image_format(
+    path: &std::path::Path,
+    mime_type: Option<&str>,
+) -> Option<ImageFormat> {
+    mime_type.and_then(ImageFormat::from_mime_type).or_else(|| {
+        let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+        match extension.as_str() {
+            "png" => Some(ImageFormat::Png),
+            "jpg" | "jpeg" => Some(ImageFormat::Jpeg),
+            "gif" => Some(ImageFormat::Gif),
+            "webp" => Some(ImageFormat::Webp),
+            "svg" => Some(ImageFormat::Svg),
+            "bmp" => Some(ImageFormat::Bmp),
+            "tif" | "tiff" => Some(ImageFormat::Tiff),
+            "ico" => Some(ImageFormat::Ico),
+            "pbm" | "pgm" | "ppm" | "pnm" => Some(ImageFormat::Pnm),
+            _ => None,
+        }
+    })
 }
 
 fn fitted_attachment_preview_size(
@@ -45416,6 +45497,29 @@ mod tests {
         assert_eq!(
             user_message_inline_segments(text, &[]),
             vec![UserMessageInlineSegment::Text(text.into())]
+        );
+    }
+
+    #[test]
+    fn attachment_preview_image_format_prefers_mime_and_falls_back_to_extension() {
+        assert_eq!(
+            attachment_preview_image_format(
+                std::path::Path::new("image.unknown"),
+                Some("image/png")
+            ),
+            Some(ImageFormat::Png)
+        );
+        assert_eq!(
+            attachment_preview_image_format(std::path::Path::new("image.JPEG"), None),
+            Some(ImageFormat::Jpeg)
+        );
+        assert_eq!(
+            attachment_preview_image_format(std::path::Path::new("image.svg"), None),
+            Some(ImageFormat::Svg)
+        );
+        assert_eq!(
+            attachment_preview_image_format(std::path::Path::new("image.bin"), None),
+            None
         );
     }
 
