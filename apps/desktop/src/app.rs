@@ -3313,6 +3313,15 @@ struct SidebarFolderMenuTarget {
     auto_archive_after_days: Option<u8>,
 }
 
+#[derive(Clone, Copy)]
+struct SidebarToolbarMoreMenuState {
+    strings: Strings,
+    hierarchy_mode: SidebarHierarchyMode,
+    batch_mode: bool,
+    sessions_empty: bool,
+    import_disabled: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SidebarContextMenuTarget {
     Project(String),
@@ -17660,6 +17669,14 @@ impl VibexWorkbench {
         let root_drop_active =
             self.sidebar_organization_root_drop_active(&SidebarOrganizationScope::Root);
         let root_menu_entity = cx.weak_entity();
+        let toolbar_more_entity = cx.weak_entity();
+        let toolbar_more_state = SidebarToolbarMoreMenuState {
+            strings,
+            hierarchy_mode: self.ui_state.sidebar.hierarchy_mode,
+            batch_mode: self.sidebar_batch_mode,
+            sessions_empty: self.sessions.is_empty(),
+            import_disabled: self.agent_action_pending || self.sidebar_picker_task.is_some(),
+        };
 
         v_flex()
             .id("agent-sidebar")
@@ -17758,84 +17775,6 @@ impl VibexWorkbench {
                             .items_center()
                             .gap_1()
                             .child(
-                                Button::new("sidebar-new-folder")
-                                    .small()
-                                    .ghost()
-                                    .compact()
-                                    .w(px(28.0))
-                                    .h(px(28.0))
-                                    .icon(sidebar_icon("icons/vibex/folder-plus.svg"))
-                                    .tooltip(locale::text("New Folder", "新建文件夹", "新建資料夾"))
-                                    .disabled(self.sidebar_batch_mode)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.create_sidebar_folder(None, None, window, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("sidebar-toggle-hierarchy")
-                                    .small()
-                                    .ghost()
-                                    .compact()
-                                    .w(px(28.0))
-                                    .h(px(28.0))
-                                    .selected(
-                                        self.ui_state.sidebar.hierarchy_mode
-                                            == SidebarHierarchyMode::Detailed,
-                                    )
-                                    .icon(
-                                        if self.ui_state.sidebar.hierarchy_mode
-                                            == SidebarHierarchyMode::Detailed
-                                        {
-                                            IconName::Folder
-                                        } else {
-                                            IconName::Menu
-                                        },
-                                    )
-                                    .tooltip(
-                                        if self.ui_state.sidebar.hierarchy_mode
-                                            == SidebarHierarchyMode::Detailed
-                                        {
-                                            locale::text(
-                                                "Detailed workspace hierarchy",
-                                                "详细工作区层级",
-                                                "詳細工作區層級",
-                                            )
-                                        } else {
-                                            locale::text(
-                                                "Compact session hierarchy",
-                                                "简洁会话层级",
-                                                "簡潔工作階段層級",
-                                            )
-                                        },
-                                    )
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.toggle_sidebar_hierarchy_mode(cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("sidebar-toggle-batch")
-                                    .small()
-                                    .ghost()
-                                    .compact()
-                                    .w(px(28.0))
-                                    .h(px(28.0))
-                                    .selected(self.sidebar_batch_mode)
-                                    .icon(if self.sidebar_batch_mode {
-                                        Icon::new(IconName::Close)
-                                    } else {
-                                        sidebar_icon("icons/vibex/list-checks.svg")
-                                    })
-                                    .tooltip(if self.sidebar_batch_mode {
-                                        strings.sidebar_exit_batch
-                                    } else {
-                                        strings.sidebar_batch
-                                    })
-                                    .disabled(!self.sidebar_batch_mode && self.sessions.is_empty())
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.toggle_sidebar_batch_mode(cx)
-                                    })),
-                            )
-                            .child(
                                 Button::new("sidebar-locate-session")
                                     .small()
                                     .ghost()
@@ -17872,21 +17811,23 @@ impl VibexWorkbench {
                                     })),
                             )
                             .child(
-                                Button::new("sidebar-import-sessions")
+                                Button::new("sidebar-toolbar-more")
                                     .small()
                                     .ghost()
                                     .compact()
                                     .w(px(28.0))
                                     .h(px(28.0))
-                                    .icon(sidebar_icon("icons/vibex/import.svg"))
-                                    .tooltip(strings.sidebar_import_sessions)
-                                    .disabled(
-                                        self.agent_action_pending
-                                            || self.sidebar_picker_task.is_some(),
-                                    )
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_external_import_dialog(None, None, window, cx)
-                                    })),
+                                    .icon(IconName::Ellipsis)
+                                    .tooltip(locale::text("More", "更多", "更多"))
+                                    .dropdown_menu(move |menu, _, cx| {
+                                        Self::build_sidebar_toolbar_more_menu(
+                                            menu,
+                                            toolbar_more_entity.clone(),
+                                            toolbar_more_state,
+                                            cx,
+                                        )
+                                    })
+                                    .anchor(gpui::Anchor::TopRight),
                             )
                             .child(
                                 Button::new("sidebar-new-project")
@@ -18101,6 +18042,67 @@ impl VibexWorkbench {
                     ),
             )
             .into_any_element()
+    }
+
+    fn build_sidebar_toolbar_more_menu(
+        menu: PopupMenu,
+        entity: WeakEntity<Self>,
+        state: SidebarToolbarMoreMenuState,
+        cx: &mut Context<PopupMenu>,
+    ) -> PopupMenu {
+        let _ = entity.update(cx, |this, _| this.retain_sidebar_hover_preview());
+        let new_folder_entity = entity.clone();
+        let hierarchy_entity = entity.clone();
+        let batch_entity = entity.clone();
+        let import_entity = entity;
+
+        menu.item(
+            PopupMenuItem::new(locale::text("New Folder", "新建文件夹", "新建資料夾"))
+                .icon(sidebar_icon("icons/vibex/folder-plus.svg"))
+                .disabled(state.batch_mode)
+                .on_click(move |_, window, cx| {
+                    let _ = new_folder_entity.update(cx, |this, cx| {
+                        this.create_sidebar_folder(None, None, window, cx)
+                    });
+                }),
+        )
+        .item(
+            PopupMenuItem::new(locale::text(
+                "Detailed workspace hierarchy",
+                "详细工作区层级",
+                "詳細工作區層級",
+            ))
+            .icon(IconName::Folder)
+            .checked(state.hierarchy_mode == SidebarHierarchyMode::Detailed)
+            .on_click(move |_, _, cx| {
+                let _ =
+                    hierarchy_entity.update(cx, |this, cx| this.toggle_sidebar_hierarchy_mode(cx));
+            }),
+        )
+        .item(
+            PopupMenuItem::new(if state.batch_mode {
+                state.strings.sidebar_exit_batch
+            } else {
+                state.strings.sidebar_batch
+            })
+            .icon(sidebar_icon("icons/vibex/list-checks.svg"))
+            .checked(state.batch_mode)
+            .disabled(!state.batch_mode && state.sessions_empty)
+            .on_click(move |_, _, cx| {
+                let _ = batch_entity.update(cx, |this, cx| this.toggle_sidebar_batch_mode(cx));
+            }),
+        )
+        .separator()
+        .item(
+            PopupMenuItem::new(state.strings.sidebar_import_sessions)
+                .icon(sidebar_icon("icons/vibex/import.svg"))
+                .disabled(state.import_disabled)
+                .on_click(move |_, window, cx| {
+                    let _ = import_entity.update(cx, |this, cx| {
+                        this.open_external_import_dialog(None, None, window, cx)
+                    });
+                }),
+        )
     }
 
     fn build_sidebar_project_menu(
@@ -45911,25 +45913,45 @@ mod tests {
         let source = include_str!("app.rs");
         let sidebar = source
             .split_once("    fn render_agent_sidebar(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn build_sidebar_project_menu("))
+            .and_then(|(_, tail)| tail.split_once("\n    fn build_sidebar_toolbar_more_menu("))
             .map(|(body, _)| body)
             .expect("sidebar renderer should remain inspectable");
-        let batch = sidebar
-            .find("Button::new(\"sidebar-toggle-batch\")")
-            .expect("batch control should exist");
-        let locate = sidebar
-            .find("Button::new(\"sidebar-locate-session\")")
-            .expect("locate control should exist");
         let collapse = sidebar
             .find("Button::new(\"sidebar-collapse-all\")")
             .expect("collapse control should exist");
+        let locate = sidebar
+            .find("Button::new(\"sidebar-locate-session\")")
+            .expect("locate control should exist");
+        let more = sidebar
+            .find("Button::new(\"sidebar-toolbar-more\")")
+            .expect("more control should exist");
+        let create = sidebar
+            .find("Button::new(\"sidebar-new-project\")")
+            .expect("project creation control should exist");
+        let search = sidebar
+            .find("Button::new(\"sidebar-search-sessions\")")
+            .expect("search control should exist");
 
-        assert!(batch < locate && locate < collapse);
+        assert!(locate < collapse && collapse < more && more < create && create < search);
+        assert!(!sidebar.contains("Button::new(\"sidebar-new-folder\")"));
+        assert!(!sidebar.contains("Button::new(\"sidebar-toggle-hierarchy\")"));
+        assert!(!sidebar.contains("Button::new(\"sidebar-toggle-batch\")"));
+        assert!(!sidebar.contains("Button::new(\"sidebar-import-sessions\")"));
         assert!(sidebar.contains("icons/vibex/crosshair.svg"));
         assert!(sidebar.contains(".disabled(self.selected_session_id.is_none())"));
         assert!(sidebar.contains("this.locate_selected_session(window, cx)"));
         assert!(sidebar.contains(".track_scroll(&self.sidebar_scroll)"));
         assert!(sidebar.contains(".vertical_scrollbar(&self.sidebar_scroll)"));
+
+        let more_menu = source
+            .split_once("    fn build_sidebar_toolbar_more_menu(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn build_sidebar_project_menu("))
+            .map(|(body, _)| body)
+            .expect("sidebar toolbar more menu should remain inspectable");
+        assert!(more_menu.contains("New Folder"));
+        assert!(more_menu.contains("Detailed workspace hierarchy"));
+        assert!(more_menu.contains("state.strings.sidebar_batch"));
+        assert!(more_menu.contains("state.strings.sidebar_import_sessions"));
 
         let locator = source
             .split_once("    fn locate_selected_session(")
@@ -46773,7 +46795,9 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_choice_popover("))
             .map(|(body, _)| body)
             .expect("sidebar hierarchy should remain inspectable");
-        assert!(sidebar.contains("sidebar-toggle-hierarchy"));
+        assert!(sidebar.contains("sidebar-toolbar-more"));
+        assert!(sidebar.contains("Detailed workspace hierarchy"));
+        assert!(sidebar.contains("toggle_sidebar_hierarchy_mode"));
         assert!(sidebar.contains("SidebarHierarchyMode::Compact"));
         assert!(sidebar.contains("SidebarHierarchyMode::Detailed"));
         assert!(sidebar.contains("NewSessionOpenTarget::Workspace"));
