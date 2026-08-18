@@ -2739,7 +2739,10 @@ impl MobileApp {
                     .id("drawer-backdrop")
                     .absolute()
                     .inset_0()
-                    .occlude()
+                    // Keep the root gesture host in the scroll hit chain while the
+                    // moving page is on top. Ordinary taps remain blocked below.
+                    .block_mouse_except_scroll()
+                    .on_scroll_wheel(cx.listener(Self::consume_drawer_scroll))
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(Self::close_drawer_from_backdrop),
@@ -2749,7 +2752,7 @@ impl MobileApp {
                     DrawerPage::Workbench => self.render_workbench_drawer(workbench.clone(), cx),
                 }
                 .w(px(page_width))
-                .occlude();
+                .block_mouse_except_scroll();
                 let (backdrop, drawer) = if let Some(snap) = self.drawer_snap {
                     let duration = drawer_animation(snap.from, snap.target);
                     let from_opacity = drawer_backdrop_opacity(snap.from);
@@ -4799,6 +4802,71 @@ mod tests {
     fn header_button_targets_the_full_sessions_page() {
         assert_eq!(sessions_button_target(false), 1.0);
         assert_eq!(sessions_button_target(true), 0.0);
+    }
+
+    #[gpui::test]
+    fn rendered_workspace_pan_reconciles_after_touch_end(cx: &mut TestAppContext) {
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = MobileApp::new(data_dir.path().to_path_buf(), window, cx);
+            app.mode = RootMode::Workspace;
+            app
+        });
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let page_width = cx.update(|window, _| workspace_page_width(window));
+        let position = point(px(120.0), px(120.0));
+        cx.simulate_event(ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(24.0), px(0.0))),
+            modifiers: Default::default(),
+            touch_phase: TouchPhase::Started,
+        });
+        cx.simulate_event(ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(80.0), px(0.0))),
+            modifiers: Default::default(),
+            touch_phase: TouchPhase::Moved,
+        });
+
+        let offset_after_move = app.read_with(cx, |app, _| app.drawer_offset);
+        assert!(
+            (offset_after_move - 104.0 / page_width).abs() < 0.0001,
+            "drawer did not receive the full move stream: offset={offset_after_move}, width={page_width}"
+        );
+        assert!(app.read_with(cx, |app, _| {
+            matches!(app.drawer_gesture, Some(DrawerGesture::Dragging { .. }))
+                && app.drawer_offset > 0.0
+                && app.drawer_snap.is_none()
+        }));
+
+        cx.simulate_event(ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0.0, 0.0)),
+            modifiers: Default::default(),
+            touch_phase: TouchPhase::Ended,
+        });
+        cx.run_until_parked();
+
+        let after_end = app.read_with(cx, |app, _| {
+            (
+                app.drawer_offset,
+                app.drawer_snap.is_some(),
+                app.drawer_gesture,
+            )
+        });
+        assert!(
+            after_end.1,
+            "drawer state after terminal event: {after_end:?}"
+        );
+        assert!(after_end.2.is_none());
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        assert_eq!(app.read_with(cx, |app, _| app.drawer_offset), 1.0);
     }
 
     #[test]

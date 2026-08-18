@@ -148,6 +148,12 @@ pnpm build:mobile:ios
   handles. A wheel or touch-pan routed inside the open page is consumed there so
   the timeline does not move behind it; this event isolation is separate from
   platform drag and momentum fidelity, and both behaviors must be verified.
+- A full-page overlay that appears during an active horizontal pan must preserve
+  the same `ScrollWheelEvent` hit chain. Use `block_mouse_except_scroll` (or a
+  persistent gesture host) for the overlay; `occlude` removes the center-page
+  capture host from later move/end events and leaves the page at its first
+  partial offset. The overlay must consume scroll events that are not claimed
+  by the horizontal drawer gesture so the page underneath remains isolated.
 - A mobile client can create a session through the shared typed backend using
   an available runtime and desktop-owned workspace. Pending ACP elicitation
   forms render as explicit text/number/boolean/single/multi controls and resolve
@@ -174,6 +180,7 @@ pnpm build:mobile:ios
 | A touch is held still before release or a new touch begins during momentum | Do not fling after the hold; cancel existing momentum immediately when the new touch lands. |
 | A variable-height timeline opens at the bottom before off-screen Turns are measured | Its estimated maximum offset already covers every Turn, so the first upward gesture is not clamped to the measured tail. |
 | A horizontal pan starts on the center session page | Right-moving fingers reveal the left project/session page; left-moving fingers reveal the right workspace-tools page, one physical pixel per reported pointer pixel. |
+| A side page is inserted before the current touch ends | Keep the root capture host in the scroll hit chain and deliver every later move/end event to the same gesture owner; never leave the first partial offset as a settled state. |
 | A side page reaches its open state after an inset or viewport-width change | Resolve its travel from the current safe-area-adjusted viewport width and cover the center page completely; do not retain a fixed drawer width. |
 | The project/session page is open and receives a vertical scroll | Move only that page's list; the timeline offset remains unchanged. |
 | Approval or composer action is unavailable while the server is busy | The control is disabled with an explicit busy state; no duplicate mutation is sent. |
@@ -194,11 +201,14 @@ pnpm build:mobile:ios
   together.
 - Good: a moving touch preserves the final release delta and decelerates smoothly
   while its drawer or timeline remains the scroll target.
+- Good: once a side page appears during a drag, later move and end events still
+  reach the drawer owner and the page settles at a full endpoint.
 - Base: a stationary hold does not reuse an older movement sample to create a
   fling.
-- Bad: the platform emits only raw move deltas with no momentum, the view scales
-  those deltas to compensate, or unmeasured virtual Turns contribute zero height
-  to the first-frame scroll range.
+- Bad: an occluding overlay cuts off the active gesture after its first move, the
+  platform emits only raw move deltas with no momentum, the view scales those
+  deltas to compensate, or unmeasured virtual Turns contribute zero height to the
+  first-frame scroll range.
 
 ### 6. Tests Required
 
@@ -206,8 +216,9 @@ pnpm build:mobile:ios
   malformed-file removal, secret-redacted `Debug`, UTF-8/UTF-16 IME editing,
   empty-placeholder hit testing, stale selection clamping, both main-page swipe
   directions, inverse side-page closing, terminal/cancelled gesture recovery,
-  the menu-button fallback, full-viewport travel, snap decisions, Markdown block
-  projection, and route bundle validation.
+  the menu-button fallback, rendered move/end delivery after an overlay appears,
+  full-viewport travel, snap decisions, Markdown block projection, and route
+  bundle validation.
 - `cargo test -p vibex-ui --locked` covers the shared controller, timeline
   projection, approval surfaces, and compact shell semantics.
 - `node scripts/check-mobile-native.mjs --self-test` covers the negative source
