@@ -24156,23 +24156,40 @@ impl VibexWorkbench {
         h_flex()
             .id(format!("composer-terminal-tab:{terminal_id_string}"))
             .h_full()
-            .min_w(px(144.0))
+            .min_w(px(120.0))
+            .max_w(px(220.0))
             .flex_none()
             .relative()
-            .px_1()
+            .items_center()
+            .gap_1p5()
+            .px_2()
             .border_r_1()
-            .border_color(cx.theme().border)
+            .border_color(cx.theme().border.opacity(0.72))
+            .cursor_pointer()
+            .focusable()
+            .tab_stop(true)
+            .role(Role::Button)
+            .aria_label(title.clone())
+            .aria_selected(active)
+            .group(hover_group.clone())
+            .text_xs()
+            .text_color(if active {
+                cx.theme().foreground
+            } else {
+                cx.theme().muted_foreground
+            })
             .bg(if active {
                 cx.theme().background
             } else {
                 cx.theme().transparent
             })
             .hover(|style| {
-                style.bg(if active {
-                    cx.theme().background
-                } else {
-                    cx.theme().muted.opacity(0.50)
-                })
+                style
+                    .bg(cx
+                        .theme()
+                        .background
+                        .opacity(if active { 1.0 } else { 0.62 }))
+                    .text_color(cx.theme().foreground)
             })
             .on_mouse_down(
                 MouseButton::Middle,
@@ -24180,13 +24197,6 @@ impl VibexWorkbench {
                     this.kill_composer_terminal(middle_close_id.clone(), cx);
                     cx.stop_propagation();
                 }),
-            )
-            .when(
-                cx.has_active_drag()
-                    && drop_target
-                        .as_ref()
-                        .is_some_and(|target| target.terminal_id == terminal_id_string),
-                |tab| tab.border_b_2().border_color(cx.theme().drag_border),
             )
             .on_drag(drag_payload, |drag, _, _, cx| cx.new(|_| drag.clone()))
             .on_drag_move(cx.listener(
@@ -24222,46 +24232,44 @@ impl VibexWorkbench {
                 }),
             )
             .child(
-                Button::new(format!("focus-composer-terminal:{terminal_id_string}"))
-                    .ghost()
-                    .compact()
-                    .w_full()
-                    .justify_start()
-                    .text_color(if active {
-                        cx.theme().foreground
-                    } else {
-                        cx.theme().muted_foreground
-                    })
-                    .hover(|style| style.text_color(cx.theme().foreground))
-                    .icon(IconName::SquareTerminal)
-                    .label(title.clone())
-                    .tooltip(title.clone())
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.select_composer_terminal(select_id.clone(), window, cx)
-                    })),
+                Icon::new(IconName::SquareTerminal)
+                    .size(px(14.0))
+                    .flex_none(),
             )
             .child(
-                Button::new(format!("close-composer-terminal:{terminal_id_string}"))
-                    .ghost()
-                    .compact()
-                    .icon(IconName::Close)
-                    .tooltip(format!(
-                        "{}{}",
-                        locale::text("Close ", "关闭", "關閉"),
-                        title
-                    ))
-                    .disabled(mutation_pending)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.kill_composer_terminal(close_id.clone(), cx)
-                    })),
+                div()
+                    .size(px(22.0))
+                    .flex_none()
+                    .opacity(if active { 0.72 } else { 0.0 })
+                    .group_hover(&hover_group, |style| style.opacity(1.0))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_down(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        Button::new(format!("close-composer-terminal:{terminal_id_string}"))
+                            .xsmall()
+                            .ghost()
+                            .compact()
+                            .size(px(22.0))
+                            .icon(IconName::Close)
+                            .tooltip(format!(
+                                "{}{}",
+                                locale::text("Close ", "关闭", "關閉"),
+                                title
+                            ))
+                            .disabled(mutation_pending)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.kill_composer_terminal(close_id.clone(), cx);
+                                cx.stop_propagation();
+                            })),
+                    ),
             )
             .when(active, |tab| {
                 tab.child(
                     div()
                         .absolute()
-                        .top_0()
-                        .left_0()
-                        .right_0()
+                        .bottom_0()
+                        .left(px(8.0))
+                        .right(px(8.0))
                         .h(px(2.0))
                         .bg(cx.theme().primary),
                 )
@@ -24290,7 +24298,10 @@ impl VibexWorkbench {
                         "Close other terminals",
                         "关闭其他终端",
                         "關閉其他終端機",
+        let hover_group: SharedString =
+            format!("composer-terminal-tab:{terminal_id_string}").into();
                     ))
+        let keyboard_select_id = terminal_id.clone();
                     .disabled(mutation_pending || other_ids.is_empty())
                     .on_click(move |_, _, cx| {
                         let ids = other_ids.clone();
@@ -24320,6 +24331,20 @@ impl VibexWorkbench {
                     ))
                     .on_click(move |_, window, cx| {
                         let _ = rename_entity.update(cx, |this, cx| {
+            .focus_visible(|style| {
+                style.shadow(vec![
+                    gpui::BoxShadow::new(px(0.0), px(0.0), cx.theme().ring).spread_radius(px(1.0)),
+                ])
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.select_composer_terminal(select_id.clone(), window, cx)
+            }))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "enter" || event.keystroke.key == "space" {
+                    this.select_composer_terminal(keyboard_select_id.clone(), window, cx);
+                    cx.stop_propagation();
+                }
+            }))
                             this.prompt_rename_composer_terminal(rename_id.clone(), window, cx)
                         });
                     }),
@@ -24386,6 +24411,7 @@ impl VibexWorkbench {
                 h_flex()
                     .min_w_0()
                     .gap_2()
+            .child(div().min_w_0().flex_1().truncate().child(title.clone()))
                     .child(Icon::new(IconName::SquareTerminal).small())
                     .child(
                         div()
@@ -24409,9 +24435,29 @@ impl VibexWorkbench {
                                 if let Some(terminal_id) = terminal_id.clone() {
                                     let _ = entity.update(cx, |this, cx| {
                                         this.switch_composer_terminal_shell(
+                        .rounded_full()
                                             terminal_id,
                                             shell.clone(),
                                             cx,
+            .when_some(
+                (cx.has_active_drag())
+                    .then_some(drop_target)
+                    .flatten()
+                    .filter(|target| target.terminal_id == terminal_id_string)
+                    .map(|target| target.after),
+                |tab, after| {
+                    tab.child(
+                        div()
+                            .absolute()
+                            .top(px(4.0))
+                            .bottom(px(4.0))
+                            .w(px(2.0))
+                            .rounded_full()
+                            .bg(cx.theme().drag_border)
+                            .map(|line| if after { line.right_0() } else { line.left_0() }),
+                    )
+                },
+            )
                                         )
                                     });
                                 }
@@ -24455,17 +24501,16 @@ impl VibexWorkbench {
                     .h(px(terminal_height))
                     .min_w_0()
                     .overflow_hidden()
-                    .rounded(px(12.0))
+                    .rounded(px(8.0))
                     .border_1()
                     .border_color(cx.theme().border)
                     .bg(card_color)
-                    .shadow_lg()
                     .child(
                         h_flex()
-                            .h(px(36.0))
+                            .h(px(34.0))
                             .flex_none()
                             .min_w_0()
-                            .bg(cx.theme().muted.opacity(0.30))
+                            .bg(cx.theme().muted.opacity(0.24))
                             .border_b_1()
                             .border_color(cx.theme().border)
                             .child(
@@ -24482,11 +24527,10 @@ impl VibexWorkbench {
                                     .ghost()
                                     .compact()
                                     .h_full()
-                                    .w(px(36.0))
+                                    .w(px(38.0))
                                     .rounded_none()
                                     .border_l_1()
                                     .border_color(cx.theme().border)
-                                    .bg(cx.theme().muted.opacity(0.40))
                                     .icon(IconName::Plus)
                                     .tooltip(locale::text("New terminal", "新建终端", "新增終端機"))
                                     .disabled(
@@ -24500,7 +24544,7 @@ impl VibexWorkbench {
                     )
                     .child(
                         h_flex()
-                            .h(px(36.0))
+                            .h(px(38.0))
                             .flex_none()
                             .min_w_0()
                             .items_center()
@@ -24546,25 +24590,7 @@ impl VibexWorkbench {
                                             !this.composer_terminal_expanded;
                                         cx.notify();
                                     })),
-                            )
-                            .when_some(selected_id, |toolbar, terminal_id| {
-                                toolbar.child(
-                                    Button::new("kill-composer-terminal")
-                                        .xsmall()
-                                        .ghost()
-                                        .compact()
-                                        .icon(Icon::default().path("icons/vibex/trash-2.svg"))
-                                        .tooltip(locale::text(
-                                            "Close terminal",
-                                            "关闭终端",
-                                            "關閉終端機",
-                                        ))
-                                        .disabled(self.agent_action_pending)
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.kill_composer_terminal(terminal_id.clone(), cx)
-                                        })),
-                                )
-                            }),
+                            ),
                     )
                     .child(
                         div()
@@ -41784,6 +41810,26 @@ mod tests {
             .map(|(body, _)| body)
             .expect("single session deletion should remain inspectable");
         let optimistic_remove = deletion
+    #[test]
+    fn composer_terminal_close_action_lives_in_each_tab() {
+        let source = include_str!("app.rs");
+        let tab = source
+            .split_once("    fn render_composer_terminal_tab(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_terminal("))
+            .map(|(body, _)| body)
+            .expect("composer terminal tab renderer should remain inspectable");
+        let terminal = source
+            .split_once("    fn render_composer_terminal(&mut self, cx: &mut Context<Self>)")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_inline_composer_attachments("))
+            .map(|(body, _)| body)
+            .expect("composer terminal renderer should remain inspectable");
+
+        assert!(tab.contains("close-composer-terminal:"));
+        assert!(tab.contains(".aria_selected(active)"));
+        assert!(tab.contains(".bottom_0()"));
+        assert!(!terminal.contains("Button::new(\"kill-composer-terminal\")"));
+    }
+
             .find("self.optimistically_remove_sessions(&session_id_set);")
             .expect("single deletion should remove the row locally");
         let repaint = deletion
