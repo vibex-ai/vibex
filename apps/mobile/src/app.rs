@@ -20,10 +20,15 @@ use vibex_core::{
     ElicitationResolutionAction, PermissionResolution, PermissionResponseKind,
     PermissionRiskCategory, RemoteDeepLinkResolutionStatus, RemoteLanPairingRequestState,
     RenameAgentSessionRequest, RequestId, ResolvePermissionRequest, RuntimeOptionAvailability,
-    SendAgentMessageRequest, TimelinePayload, VibexSessionId, WorkspaceMode, WorkspaceRecord,
-    agent_session_turn_requires_continuation, unix_timestamp_ms,
+    RuntimeSelectionInteraction, SendAgentMessageRequest, SessionRuntimeFeature,
+    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
+    SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest, TimelinePayload, VibexSessionId,
+    WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation, unix_timestamp_ms,
 };
-use vibex_desktop_model::{TimelineConversationTurn, TimelineRow, TimelineRowKind};
+use vibex_desktop_model::{
+    RuntimeCascadeChoice, RuntimeCascadeProjection, TimelineConversationTurn, TimelineRow,
+    TimelineRowKind,
+};
 use vibex_remote_client::{
     RemoteConnectionState, RemoteLifecycleSignal, WebRemoteBackend, ZeroConfigLanPairingSession,
 };
@@ -48,6 +53,7 @@ const TIMELINE_LIST_OVERDRAW_PX: f32 = 800.0;
 const TIMELINE_TURN_ESTIMATED_HEIGHT_PX: f32 = 180.0;
 const RESUME_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const RESUME_RECOVERY_POLL_ATTEMPTS: usize = 600;
+const RUNTIME_FEATURE_VALUE_LIMIT: usize = 256;
 
 fn timeline_list_state(turn_count: usize) -> ListState {
     ListState::new(
@@ -221,6 +227,12 @@ pub struct MobileApp {
     session_action: Option<SessionActionPrompt>,
     session_action_input: Entity<TextInput>,
     session_action_busy: bool,
+    runtime_options_open: bool,
+    runtime_draft: Option<SessionRuntimeSelection>,
+    runtime_feature_inputs: BTreeMap<String, Entity<TextInput>>,
+    runtime_switch_generation: u64,
+    runtime_switch_busy_generation: Option<u64>,
+    runtime_switch_error: Option<BackendError>,
     notice: Option<String>,
     error: Option<BackendError>,
     app_backgrounded: bool,
@@ -279,6 +291,12 @@ impl MobileApp {
                 TextInput::new(locale::text("Session name", "会话名称", "工作階段名稱"), cx)
             }),
             session_action_busy: false,
+            runtime_options_open: false,
+            runtime_draft: None,
+            runtime_feature_inputs: BTreeMap::new(),
+            runtime_switch_generation: 0,
+            runtime_switch_busy_generation: None,
+            runtime_switch_error: None,
             notice: None,
             error: stored.as_ref().err().cloned(),
             app_backgrounded: crate::lifecycle::is_backgrounded(),
@@ -486,6 +504,7 @@ impl MobileApp {
     fn install_bundle(&mut self, bundle: MobileCredentialBundle, cx: &mut Context<Self>) {
         crate::discovery::stop();
         self.stop_connection_tasks();
+        self.reset_runtime_options();
         self.lan_pairing_task = None;
         self.nearby_candidates.clear();
         self.nearby_pairing_state = NearbyPairingState::Idle;
@@ -1005,10 +1024,274 @@ impl MobileApp {
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
             let _ = entity.update(cx, |this, cx| {
-                if let Some(controller) = this.controller.as_mut()
-                    && let Err(error) = controller.apply_runtime_options(outcome)
+                let applied = if let Some(controller) = this.controller.as_mut() {
+                    match controller.apply_runtime_options(outcome) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            if this.runtime_options_open {
+                                this.runtime_switch_error = Some(error);
+                            } else {
+                                this.error = Some(error);
+                            }
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                if applied && this.runtime_options_open {
+                    this.sync_runtime_feature_inputs(cx);
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    fn open_runtime_options(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.runtime_switch_busy_generation.is_some() || self.session_action.is_some() {
+            return;
+        }
+        let can_switch = self.backend.as_ref().is_some_and(|backend| {
+            backend
+                .capability_snapshot()
+                .agent
+                .supports(BackendOperation::AgentSwitchRuntime)
+        });
+        if !can_switch {
+            return;
+        }
+        let Some((desired, has_catalog)) = self.controller.as_ref().and_then(|controller| {
+            controller
+                .state
+                .runtime_selection
+                .value
+                .as_ref()
+                .map(|state| {
+                    (
+                        state.desired.clone(),
+                        controller.state.runtime_options.value.is_some(),
+                    )
+                })
+        }) else {
+            self.error = Some(BackendError::loading(
+                "mobile_runtime_selection_loading",
+                locale::text(
+                    "The session runtime selection is not available yet.",
+                    "会话运行时选择尚不可用。",
+                    "工作階段執行環境選擇尚無法使用。",
+                ),
+            ));
+            cx.notify();
+            return;
+        };
+        self.runtime_draft = Some(desired);
+        self.runtime_options_open = true;
+        self.runtime_switch_error = None;
+        self.sync_runtime_feature_inputs(cx);
+        if !has_catalog {
+            self.refresh_runtime_options(cx);
+        }
+        cx.notify();
+    }
+
+    fn close_runtime_options(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.runtime_switch_busy_generation.is_none() {
+            self.runtime_options_open = false;
+            self.runtime_draft = None;
+            self.runtime_feature_inputs.clear();
+            self.runtime_switch_error = None;
+            cx.notify();
+        }
+    }
+
+    fn reset_runtime_options(&mut self) {
+        self.runtime_switch_generation = self.runtime_switch_generation.wrapping_add(1);
+        self.runtime_switch_busy_generation = None;
+        self.runtime_options_open = false;
+        self.runtime_draft = None;
+        self.runtime_feature_inputs.clear();
+        self.runtime_switch_error = None;
+    }
+
+    fn choose_runtime_selection(
+        &mut self,
+        selection: SessionRuntimeSelection,
+        cx: &mut Context<Self>,
+    ) {
+        if self.runtime_switch_busy_generation.is_some() {
+            return;
+        }
+        self.runtime_draft = Some(selection);
+        self.runtime_switch_error = None;
+        self.sync_runtime_feature_inputs(cx);
+        cx.notify();
+    }
+
+    fn choose_default_runtime_reasoning(&mut self, cx: &mut Context<Self>) {
+        if let Some(draft) = self.runtime_draft.as_mut() {
+            draft.reasoning_effort = None;
+        }
+        self.runtime_switch_error = None;
+        cx.notify();
+    }
+
+    fn choose_default_runtime_mode(&mut self, cx: &mut Context<Self>) {
+        if let Some(draft) = self.runtime_draft.as_mut() {
+            draft.mode_id = None;
+        }
+        self.runtime_switch_error = None;
+        cx.notify();
+    }
+
+    fn choose_runtime_feature(
+        &mut self,
+        feature_id: String,
+        value: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.runtime_switch_busy_generation.is_some() {
+            return;
+        }
+        if let Some(draft) = self.runtime_draft.as_mut() {
+            if let Some(value) = value {
+                draft.config_values.insert(feature_id, value);
+            } else {
+                draft.config_values.remove(&feature_id);
+            }
+        }
+        self.runtime_switch_error = None;
+        cx.notify();
+    }
+
+    fn sync_runtime_feature_inputs(&mut self, cx: &mut Context<Self>) {
+        let features = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.runtime_options.value.as_ref())
+            .zip(self.runtime_draft.as_ref())
+            .map(|(catalog, draft)| RuntimeCascadeProjection::from_catalog(catalog, draft).features)
+            .unwrap_or_default();
+        let config_values = self
+            .runtime_draft
+            .as_ref()
+            .map(|draft| draft.config_values.clone())
+            .unwrap_or_default();
+        self.runtime_feature_inputs = features
+            .into_iter()
+            .filter(|feature| feature.kind == SessionRuntimeFeatureKind::String)
+            .map(|feature| {
+                let value = config_values.get(&feature.id).cloned().unwrap_or_default();
+                let input = cx.new(|cx| {
+                    let mut input = TextInput::new(locale::common("Value"), cx);
+                    input.set_text(value, cx);
+                    input
+                });
+                (feature.id, input)
+            })
+            .collect();
+    }
+
+    fn apply_runtime_feature_inputs(&mut self, cx: &mut Context<Self>) -> BackendResult<()> {
+        let Some(draft) = self.runtime_draft.as_mut() else {
+            return Ok(());
+        };
+        for (feature_id, input) in &self.runtime_feature_inputs {
+            let value = input.read(cx).text().to_string();
+            match runtime_string_override(value)? {
+                Some(value) => {
+                    draft.config_values.insert(feature_id.clone(), value);
+                }
+                None => {
+                    draft.config_values.remove(feature_id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_runtime_options(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.runtime_switch_busy_generation.is_some() {
+            return;
+        }
+        if let Err(error) = self.apply_runtime_feature_inputs(cx) {
+            self.runtime_switch_error = Some(error);
+            cx.notify();
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let Some((session_id, state, catalog)) = self.controller.as_ref().and_then(|controller| {
+            Some((
+                controller.state.selected_session_id.clone()?,
+                controller.state.runtime_selection.value.clone()?,
+                controller.state.runtime_options.value.clone()?,
+            ))
+        }) else {
+            return;
+        };
+        let Some(desired) = self.runtime_draft.clone() else {
+            return;
+        };
+        if !runtime_selection_is_available(&catalog.options, &desired) {
+            self.runtime_switch_error = Some(BackendError::failed(
+                "mobile_runtime_option_unavailable",
+                locale::text(
+                    "This runtime option is no longer available.",
+                    "此运行时选项已不可用。",
+                    "此執行環境選項已無法使用。",
+                ),
+            ));
+            cx.notify();
+            return;
+        }
+
+        self.runtime_switch_generation = self.runtime_switch_generation.wrapping_add(1);
+        let generation = self.runtime_switch_generation;
+        self.runtime_switch_busy_generation = Some(generation);
+        self.runtime_switch_error = None;
+        let requested_session_id = session_id.clone();
+        let request = MutationRequest::new(SetDesiredAgentSessionRuntimeRequest {
+            session_id,
+            idempotency_key: RequestId::new().into_string(),
+            expected_revision: state.session_revision,
+            expected_selection_revision: state.selection_revision,
+            desired,
+            interaction: RuntimeSelectionInteraction::Seamless,
+        });
+        let runner =
+            gpui_tokio::Tokio::spawn(
+                cx,
+                async move { backend.set_desired_runtime(request).await },
+            );
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                let selected_session_id = this
+                    .controller
+                    .as_ref()
+                    .and_then(|controller| controller.state.selected_session_id.as_ref());
+                if this.runtime_switch_generation != generation
+                    || selected_session_id != Some(&requested_session_id)
                 {
-                    this.error = Some(error);
+                    return;
+                }
+                this.runtime_switch_busy_generation = None;
+                match outcome {
+                    Ok(state) => {
+                        if let Some(controller) = this.controller.as_mut() {
+                            controller.state.runtime_selection.resolve(state);
+                        }
+                        this.runtime_options_open = false;
+                        this.runtime_draft = None;
+                        this.runtime_feature_inputs.clear();
+                        this.runtime_switch_error = None;
+                        this.notice =
+                            Some(locale::common("Runtime selection sent to desktop").to_string());
+                    }
+                    Err(error) => this.runtime_switch_error = Some(error),
                 }
                 cx.notify();
             });
@@ -1306,6 +1589,7 @@ impl MobileApp {
     }
 
     fn open_session(&mut self, session_id: VibexSessionId, cx: &mut Context<Self>) {
+        self.reset_runtime_options();
         let Some(controller) = self.controller.as_mut() else {
             return;
         };
@@ -1396,7 +1680,7 @@ impl MobileApp {
     }
 
     fn send_message(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.operation_busy {
+        if self.operation_busy || self.runtime_switch_busy_generation.is_some() {
             return;
         }
         let text = self.composer_input.read(cx).text().trim().to_string();
@@ -1948,6 +2232,7 @@ impl MobileApp {
         self.elicitation_request_id = None;
         self.elicitation_inputs.clear();
         self.elicitation_draft = None;
+        self.reset_runtime_options();
         self.notice = None;
         self.error = None;
         cx.notify();
@@ -1965,7 +2250,10 @@ impl MobileApp {
         match drawer_pan_input(event) {
             DrawerPanInput::Started { delta_x, delta_y } => {
                 self.drawer_gesture = None;
-                if self.drawer_snap.is_some() || self.session_action.is_some() {
+                if self.drawer_snap.is_some()
+                    || self.session_action.is_some()
+                    || self.runtime_options_open
+                {
                     return;
                 }
                 let origin = drawer_drag_origin(self.drawer_offset);
@@ -2768,6 +3056,9 @@ impl MobileApp {
             .when_some(session_action, |root, prompt| {
                 root.child(self.render_session_action_prompt(&prompt, cx))
             })
+            .when(self.runtime_options_open, |root| {
+                root.child(self.render_runtime_options_sheet(cx))
+            })
     }
 
     fn render_session_action_prompt(
@@ -2926,6 +3217,503 @@ impl MobileApp {
                             ),
                     ),
             )
+    }
+
+    fn render_runtime_options_sheet(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let catalog = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.runtime_options.value.as_ref().cloned());
+        let draft = self.runtime_draft.clone();
+        let projection = catalog
+            .as_ref()
+            .zip(draft.as_ref())
+            .map(|(catalog, draft)| RuntimeCascadeProjection::from_catalog(catalog, draft))
+            .unwrap_or_default();
+        let RuntimeCascadeProjection {
+            agents,
+            auth_sources,
+            models,
+            reasoning_efforts,
+            modes,
+            features,
+        } = projection;
+        let busy = self.runtime_switch_busy_generation.is_some();
+        let selection_available = catalog.as_ref().is_some_and(|catalog| {
+            draft
+                .as_ref()
+                .is_some_and(|draft| runtime_selection_is_available(&catalog.options, draft))
+        });
+        let can_switch = self.backend.as_ref().is_some_and(|backend| {
+            backend
+                .capability_snapshot()
+                .agent
+                .supports(BackendOperation::AgentSwitchRuntime)
+        });
+        let can_apply = can_switch && selection_available && !busy;
+        let selected_agent = draft.as_ref().map(|draft| draft.agent_id.to_string());
+        let selected_auth_source = draft
+            .as_ref()
+            .map(|draft| draft.auth_source.id().to_string());
+        let selected_model = draft.as_ref().map(|draft| draft.model.clone());
+        let selected_reasoning = draft
+            .as_ref()
+            .and_then(|draft| draft.reasoning_effort.clone());
+        let selected_mode = draft.as_ref().and_then(|draft| draft.mode_id.clone());
+
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme::backdrop(0.72))
+            .pt(px(56.0))
+            .flex()
+            .flex_col()
+            .items_center()
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(520.0))
+                    .flex_1()
+                    .min_h_0()
+                    .rounded(px(theme::RADIUS_CARD))
+                    .border_1()
+                    .border_color(theme::border_default())
+                    .bg(theme::bg_primary())
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .h(px(52.0))
+                            .flex_shrink_0()
+                            .border_b_1()
+                            .border_color(theme::border_subtle())
+                            .px_4()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(theme::FONT_HEADING))
+                                    .text_color(theme::text_primary())
+                                    .child(locale::text(
+                                        "Runtime options",
+                                        "运行时选项",
+                                        "執行環境選項",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .id("close-runtime-options")
+                                    .size(px(theme::TOUCH_TARGET))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .when(!busy, |button| {
+                                        button
+                                            .cursor_pointer()
+                                            .active(|style| style.opacity(0.6))
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(Self::close_runtime_options),
+                                            )
+                                    })
+                                    .child(
+                                        svg()
+                                            .path("icons/x.svg")
+                                            .size(px(theme::ICON_SM))
+                                            .text_color(theme::text_secondary()),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("runtime-options-scroll")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .when(catalog.is_none(), |body| {
+                                body.child(
+                                    div()
+                                        .p_4()
+                                        .text_size(px(theme::FONT_CAPTION))
+                                        .text_color(theme::text_muted())
+                                        .child(locale::text(
+                                            "Loading runtime options...",
+                                            "正在加载运行时选项…",
+                                            "正在載入執行環境選項…",
+                                        )),
+                                )
+                            })
+                            .when(
+                                catalog.is_some() && draft.is_some() && !selection_available,
+                                |body| {
+                                    body.child(
+                                        div()
+                                            .mx_3()
+                                            .mt_3()
+                                            .rounded(px(theme::RADIUS_CONTROL))
+                                            .border_1()
+                                            .border_color(rgb(theme::ACCENT_YELLOW))
+                                            .bg(theme::bg_card_dim())
+                                            .p_3()
+                                            .text_size(px(theme::FONT_CAPTION))
+                                            .text_color(rgb(theme::ACCENT_YELLOW))
+                                            .child(locale::text(
+                                                "The current runtime is unavailable. Select an available option.",
+                                                "当前运行时不可用，请选择一个可用选项。",
+                                                "目前執行環境無法使用，請選擇可用選項。",
+                                            )),
+                                    )
+                                },
+                            )
+                            .when(!agents.is_empty(), |body| {
+                                body.child(runtime_section_heading(locale::text(
+                                    "Agent", "Agent", "Agent",
+                                )))
+                                .child(
+                                    div()
+                                        .px_3()
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap_2()
+                                        .children(agents.into_iter().map(|choice| {
+                                            let selected = selected_agent.as_deref()
+                                                == Some(choice.value.as_str());
+                                            self.render_runtime_choice(
+                                                "agent",
+                                                choice,
+                                                selected,
+                                                cx,
+                                            )
+                                        })),
+                                )
+                            })
+                            .when(!auth_sources.is_empty(), |body| {
+                                body.child(runtime_section_heading(locale::text(
+                                    "Authentication",
+                                    "身份来源",
+                                    "身分來源",
+                                )))
+                                .child(
+                                    div()
+                                        .px_3()
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap_2()
+                                        .children(auth_sources.into_iter().map(|choice| {
+                                            let selected = selected_auth_source.as_deref()
+                                                == Some(choice.value.as_str());
+                                            self.render_runtime_choice(
+                                                "authentication",
+                                                choice,
+                                                selected,
+                                                cx,
+                                            )
+                                        })),
+                                )
+                            })
+                            .when(!models.is_empty(), |body| {
+                                body.child(runtime_section_heading(locale::text(
+                                    "Model", "模型", "模型",
+                                )))
+                                .child(
+                                    div()
+                                        .px_3()
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap_2()
+                                        .children(models.into_iter().map(|choice| {
+                                            let selected = selected_model.as_ref()
+                                                == Some(&choice.selection.model);
+                                            self.render_runtime_choice(
+                                                "model", choice, selected, cx,
+                                            )
+                                        })),
+                                )
+                            })
+                            .when(!reasoning_efforts.is_empty(), |body| {
+                                body.child(runtime_section_heading(locale::common("Reasoning")))
+                                    .child(
+                                        div()
+                                            .px_3()
+                                            .flex()
+                                            .flex_wrap()
+                                            .gap_2()
+                                            .child(
+                                                runtime_choice_button(
+                                                    "runtime-reasoning:default",
+                                                    locale::common("Default"),
+                                                    selected_reasoning.is_none(),
+                                                )
+                                                .when(!busy, |button| {
+                                                    button
+                                                        .cursor_pointer()
+                                                        .active(|style| {
+                                                            style.bg(theme::row_pressed_bg())
+                                                        })
+                                                        .on_mouse_up(
+                                                            MouseButton::Left,
+                                                            cx.listener(|this, _, _, cx| {
+                                                                this.choose_default_runtime_reasoning(cx)
+                                                            }),
+                                                        )
+                                                }),
+                                            )
+                                            .children(reasoning_efforts.into_iter().map(|choice| {
+                                                let selected = selected_reasoning.as_deref()
+                                                    == Some(choice.value.as_str());
+                                                self.render_runtime_choice(
+                                                    "reasoning",
+                                                    choice,
+                                                    selected,
+                                                    cx,
+                                                )
+                                            })),
+                                    )
+                            })
+                            .when(!modes.is_empty(), |body| {
+                                body.child(runtime_section_heading(locale::common("Mode")))
+                                    .child(
+                                        div()
+                                            .px_3()
+                                            .flex()
+                                            .flex_wrap()
+                                            .gap_2()
+                                            .child(
+                                                runtime_choice_button(
+                                                    "runtime-mode:default",
+                                                    locale::common("Default"),
+                                                    selected_mode.is_none(),
+                                                )
+                                                .when(!busy, |button| {
+                                                    button
+                                                        .cursor_pointer()
+                                                        .active(|style| {
+                                                            style.bg(theme::row_pressed_bg())
+                                                        })
+                                                        .on_mouse_up(
+                                                            MouseButton::Left,
+                                                            cx.listener(|this, _, _, cx| {
+                                                                this.choose_default_runtime_mode(cx)
+                                                            }),
+                                                        )
+                                                }),
+                                            )
+                                            .children(modes.into_iter().map(|choice| {
+                                                let selected = selected_mode.as_deref()
+                                                    == Some(choice.value.as_str());
+                                                self.render_runtime_choice(
+                                                    "mode", choice, selected, cx,
+                                                )
+                                            })),
+                                    )
+                            })
+                            .when(!features.is_empty(), |body| {
+                                body.child(runtime_section_heading(locale::common(
+                                    "Session options",
+                                )))
+                                .children(features.into_iter().map(|feature| {
+                                    self.render_runtime_feature(feature, cx)
+                                }))
+                            })
+                            .when_some(self.runtime_switch_error.as_ref(), |body, error| {
+                                body.child(
+                                    div()
+                                        .mx_3()
+                                        .my_3()
+                                        .rounded(px(theme::RADIUS_CONTROL))
+                                        .border_1()
+                                        .border_color(rgb(theme::ACCENT_RED))
+                                        .bg(theme::bg_card_dim())
+                                        .p_3()
+                                        .text_size(px(theme::FONT_CAPTION))
+                                        .text_color(rgb(theme::ACCENT_RED))
+                                        .child(error.message.clone()),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .border_t_1()
+                            .border_color(theme::border_subtle())
+                            .p_3()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                runtime_sheet_action_button(
+                                    "cancel-runtime-options",
+                                    locale::common("Cancel"),
+                                    false,
+                                )
+                                .when(!busy, |button| {
+                                    button
+                                        .cursor_pointer()
+                                        .active(|style| style.opacity(0.7))
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(Self::close_runtime_options),
+                                        )
+                                }),
+                            )
+                            .child(
+                                runtime_sheet_action_button(
+                                    "apply-runtime-options",
+                                    if busy {
+                                        locale::common("Applying...")
+                                    } else {
+                                        locale::common("Apply runtime")
+                                    },
+                                    true,
+                                )
+                                .when(can_apply, |button| {
+                                    button
+                                        .cursor_pointer()
+                                        .active(|style| style.opacity(0.7))
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(Self::apply_runtime_options),
+                                        )
+                                })
+                                .when(!can_apply, |button| button.opacity(0.5)),
+                            ),
+                    ),
+            )
+    }
+
+    fn render_runtime_choice(
+        &self,
+        group: &'static str,
+        choice: RuntimeCascadeChoice,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let selection = choice.selection;
+        runtime_choice_button(
+            format!("runtime-{group}:{}", choice.value),
+            choice.label,
+            selected,
+        )
+        .when(self.runtime_switch_busy_generation.is_none(), |button| {
+            button
+                .cursor_pointer()
+                .active(|style| style.bg(theme::row_pressed_bg()))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.choose_runtime_selection(selection.clone(), cx)
+                    }),
+                )
+        })
+        .into_any_element()
+    }
+
+    fn render_runtime_feature(
+        &self,
+        feature: SessionRuntimeFeature,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let feature_id = feature.id.clone();
+        let selected_value = self
+            .runtime_draft
+            .as_ref()
+            .and_then(|draft| draft.config_values.get(&feature_id))
+            .cloned();
+        let choices = match feature.kind {
+            SessionRuntimeFeatureKind::Toggle => vec![
+                (locale::common("Default").to_string(), None),
+                (locale::common("On").to_string(), Some("true".to_string())),
+                (locale::common("Off").to_string(), Some("false".to_string())),
+            ],
+            SessionRuntimeFeatureKind::Select => {
+                std::iter::once((locale::common("Default").to_string(), None))
+                    .chain(feature.values.iter().map(|value| {
+                        (
+                            value.label.clone().unwrap_or_else(|| value.value.clone()),
+                            Some(value.value.clone()),
+                        )
+                    }))
+                    .collect()
+            }
+            SessionRuntimeFeatureKind::String => Vec::new(),
+        };
+        let row = div()
+            .px_3()
+            .pb_3()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(px(theme::FONT_CAPTION))
+                    .text_color(theme::text_secondary())
+                    .child(feature.label.clone()),
+            )
+            .when_some(feature.description.clone(), |row, description| {
+                row.child(
+                    div()
+                        .text_size(px(theme::FONT_MICRO))
+                        .text_color(theme::text_muted())
+                        .child(description),
+                )
+            });
+        if feature.kind == SessionRuntimeFeatureKind::String {
+            return match self.runtime_feature_inputs.get(&feature_id) {
+                Some(input) => row
+                    .child(runtime_feature_input(input.clone()))
+                    .into_any_element(),
+                None => row
+                    .child(
+                        div()
+                            .text_size(px(theme::FONT_MICRO))
+                            .text_color(theme::text_muted())
+                            .child(locale::common("Loading value...")),
+                    )
+                    .into_any_element(),
+            };
+        }
+        row.child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .children(
+                    choices
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, (label, value))| {
+                            let selected = selected_value == value;
+                            let selected_feature_id = feature_id.clone();
+                            let selected_value = value.clone();
+                            runtime_choice_button(
+                                format!("runtime-feature:{feature_id}:{index}"),
+                                label,
+                                selected,
+                            )
+                            .when(
+                                self.runtime_switch_busy_generation.is_none(),
+                                |button| {
+                                    button
+                                        .cursor_pointer()
+                                        .active(|style| style.bg(theme::row_pressed_bg()))
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.choose_runtime_feature(
+                                                    selected_feature_id.clone(),
+                                                    selected_value.clone(),
+                                                    cx,
+                                                )
+                                            }),
+                                        )
+                                },
+                            )
+                        }),
+                ),
+        )
+        .into_any_element()
     }
 
     fn render_header(
@@ -3729,7 +4517,30 @@ impl MobileApp {
         let needs_continue = state.is_some_and(|state| {
             agent_session_turn_requires_continuation(state, latest_ended_normally)
         });
-        let action_enabled = state.is_some() && !self.operation_busy;
+        let runtime_switch_pending = self.runtime_switch_busy_generation.is_some();
+        let action_enabled =
+            state.is_some() && !self.operation_busy && (running || !runtime_switch_pending);
+        let runtime_selection = self.controller.as_ref().and_then(|controller| {
+            controller
+                .state
+                .runtime_selection
+                .value
+                .as_ref()
+                .map(|state| &state.desired)
+        });
+        let runtime_catalog = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.runtime_options.value.as_ref());
+        let runtime_summary = runtime_selection_summary(runtime_catalog, runtime_selection);
+        let runtime_trigger_enabled = state.is_some()
+            && !runtime_switch_pending
+            && self.backend.as_ref().is_some_and(|backend| {
+                backend
+                    .capability_snapshot()
+                    .agent
+                    .supports(BackendOperation::AgentSwitchRuntime)
+            });
         div()
             .flex_shrink_0()
             .border_t_1()
@@ -3828,6 +4639,68 @@ impl MobileApp {
                                         theme::text_secondary()
                                     }),
                             ),
+                    ),
+            )
+            .child(
+                div()
+                    .id("composer-runtime-options")
+                    .mt(px(theme::SPACING_SM))
+                    .h(px(theme::TOUCH_TARGET))
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .border_1()
+                    .border_color(theme::border_subtle())
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .when(runtime_trigger_enabled, |row| {
+                        row.cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::open_runtime_options))
+                    })
+                    .when(!runtime_trigger_enabled, |row| row.opacity(0.62))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(theme::FONT_MICRO))
+                            .text_color(theme::text_muted())
+                            .child(locale::common("Runtime")),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .truncate()
+                                    .text_size(px(theme::FONT_CAPTION))
+                                    .text_color(if runtime_summary.available {
+                                        theme::text_primary()
+                                    } else {
+                                        rgb(theme::ACCENT_YELLOW).into()
+                                    })
+                                    .child(runtime_summary.primary),
+                            )
+                            .when(!runtime_summary.secondary.is_empty(), |summary| {
+                                summary.child(
+                                    div()
+                                        .w_full()
+                                        .truncate()
+                                        .text_size(px(theme::FONT_MICRO))
+                                        .text_color(theme::text_muted())
+                                        .child(runtime_summary.secondary),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(theme::FONT_BODY))
+                            .text_color(theme::text_muted())
+                            .child(if runtime_switch_pending { "..." } else { ">" }),
                     ),
             )
     }
@@ -4486,6 +5359,197 @@ fn drawer_backdrop_opacity(offset: f32) -> f32 {
     offset.abs().clamp(0.0, 1.0) * theme::DRAWER_BACKDROP_OPACITY
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeSelectionSummary {
+    primary: String,
+    secondary: String,
+    available: bool,
+}
+
+fn runtime_selection_summary(
+    catalog: Option<&SessionRuntimeOptionCatalog>,
+    selection: Option<&SessionRuntimeSelection>,
+) -> RuntimeSelectionSummary {
+    let Some(selection) = selection else {
+        return RuntimeSelectionSummary {
+            primary: locale::common("Select an Agent session first").to_string(),
+            secondary: String::new(),
+            available: false,
+        };
+    };
+    let option = catalog.and_then(|catalog| matching_runtime_option(&catalog.options, selection));
+    let agent_label = option
+        .map(|option| option.agent_label.clone())
+        .unwrap_or_else(|| selection.agent_id.to_string());
+    let model_label = option
+        .map(|option| option.model_label.clone())
+        .unwrap_or_else(|| match &selection.model {
+            vibex_core::RuntimeModelSelection::AgentDefault => {
+                locale::common("Default").to_string()
+            }
+            vibex_core::RuntimeModelSelection::Explicit { model_id } => model_id.clone(),
+        });
+    let mut details = vec![
+        option
+            .map(|option| option.auth_source_label.clone())
+            .unwrap_or_else(|| selection.auth_source.id().to_string()),
+    ];
+    if let Some(reasoning) = selection.reasoning_effort.as_ref() {
+        details.push(format!("{}: {reasoning}", locale::common("Reasoning")));
+    }
+    if let Some(mode) = selection.mode_id.as_ref() {
+        details.push(format!("{}: {mode}", locale::common("Mode")));
+    }
+    RuntimeSelectionSummary {
+        primary: format!("{agent_label} / {model_label}"),
+        secondary: details.join(" / "),
+        available: catalog.is_none_or(|_| {
+            option.is_some_and(|option| option.availability == RuntimeOptionAvailability::Available)
+        }),
+    }
+}
+
+fn runtime_string_override(value: String) -> BackendResult<Option<String>> {
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    if value.len() > RUNTIME_FEATURE_VALUE_LIMIT {
+        return Err(BackendError::failed(
+            "mobile_runtime_feature_value_too_long",
+            locale::text(
+                "Runtime option values must be at most 256 bytes.",
+                "运行时选项值最多为 256 字节。",
+                "執行環境選項值最多為 256 位元組。",
+            ),
+        ));
+    }
+    Ok(Some(value))
+}
+
+fn runtime_option_matches(
+    option: &SessionRuntimeOption,
+    selection: &SessionRuntimeSelection,
+) -> bool {
+    option.selection.agent_id == selection.agent_id
+        && option.selection.auth_source == selection.auth_source
+        && option.selection.model == selection.model
+}
+
+fn matching_runtime_option<'a>(
+    options: &'a [SessionRuntimeOption],
+    selection: &SessionRuntimeSelection,
+) -> Option<&'a SessionRuntimeOption> {
+    options
+        .iter()
+        .find(|option| runtime_option_matches(option, selection))
+}
+
+fn runtime_selection_is_available(
+    options: &[SessionRuntimeOption],
+    selection: &SessionRuntimeSelection,
+) -> bool {
+    matching_runtime_option(options, selection)
+        .is_some_and(|option| option.availability == RuntimeOptionAvailability::Available)
+}
+
+fn runtime_section_heading(label: impl Into<String>) -> gpui::Div {
+    div()
+        .h(px(36.0))
+        .px_3()
+        .flex()
+        .items_center()
+        .text_size(px(theme::FONT_CAPTION))
+        .text_color(theme::text_muted())
+        .child(label.into())
+}
+
+fn runtime_choice_button(
+    id: impl Into<ElementId>,
+    label: impl Into<String>,
+    selected: bool,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .min_w_0()
+        .max_w_full()
+        .h(px(theme::TOUCH_TARGET))
+        .px_3()
+        .rounded(px(theme::RADIUS_CONTROL))
+        .border_1()
+        .border_color(if selected {
+            rgb(theme::ACCENT_BLUE).into()
+        } else {
+            theme::border_default()
+        })
+        .bg(if selected {
+            theme::bg_card()
+        } else {
+            theme::bg_card_dim()
+        })
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(theme::FONT_CAPTION))
+        .text_color(if selected {
+            theme::text_primary()
+        } else {
+            theme::text_secondary()
+        })
+        .child(
+            div()
+                .max_w_full()
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .child(label.into()),
+        )
+}
+
+fn runtime_sheet_action_button(
+    id: impl Into<ElementId>,
+    label: impl Into<String>,
+    primary: bool,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .h(px(theme::TOUCH_TARGET))
+        .px_4()
+        .rounded(px(theme::RADIUS_CONTROL))
+        .border_1()
+        .border_color(if primary {
+            rgb(theme::TEXT_PRIMARY).into()
+        } else {
+            theme::border_default()
+        })
+        .bg(if primary {
+            rgb(theme::TEXT_PRIMARY).into()
+        } else {
+            theme::bg_card()
+        })
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(theme::FONT_BODY))
+        .text_color(if primary {
+            rgb(theme::BG_PRIMARY).into()
+        } else {
+            theme::text_secondary()
+        })
+        .child(label.into())
+}
+
+fn runtime_feature_input(input: Entity<TextInput>) -> gpui::Div {
+    div()
+        .h(px(theme::TOUCH_TARGET))
+        .w_full()
+        .rounded(px(theme::RADIUS_CONTROL))
+        .border_1()
+        .border_color(theme::border_default())
+        .bg(theme::bg_card())
+        .px_1()
+        .child(input)
+}
+
 fn workspace_label(root: &str) -> &str {
     root.rsplit(['/', '\\'])
         .find(|segment| !segment.is_empty())
@@ -4595,6 +5659,22 @@ mod tests {
     use super::*;
     use gpui::{TestAppContext, point};
 
+    fn runtime_option(
+        selection: SessionRuntimeSelection,
+        availability: RuntimeOptionAvailability,
+    ) -> SessionRuntimeOption {
+        SessionRuntimeOption {
+            selection,
+            agent_label: "Codex".to_string(),
+            auth_source_label: "Work account".to_string(),
+            model_label: "GPT-5".to_string(),
+            reasoning_efforts: Vec::new(),
+            modes: Vec::new(),
+            features: Vec::new(),
+            availability,
+        }
+    }
+
     #[test]
     fn agent_notification_is_suppressed_only_for_the_visible_session() {
         let selected = VibexSessionId::new();
@@ -4624,6 +5704,73 @@ mod tests {
             Some(&selected),
             &other,
         ));
+    }
+
+    #[test]
+    fn composer_runtime_summary_uses_catalog_labels_and_selected_dimensions() {
+        let mut selection = SessionRuntimeSelection::provider(
+            vibex_core::AgentId::parse("codex").unwrap(),
+            vibex_core::ProviderProfileId::new(),
+            "gpt-5",
+        );
+        selection.reasoning_effort = Some("high".to_string());
+        selection.mode_id = Some("plan".to_string());
+        let catalog = SessionRuntimeOptionCatalog {
+            revision: 1,
+            agents: Vec::new(),
+            auth_sources: Vec::new(),
+            options: vec![runtime_option(
+                selection.clone(),
+                RuntimeOptionAvailability::Available,
+            )],
+        };
+
+        let summary = runtime_selection_summary(Some(&catalog), Some(&selection));
+
+        assert_eq!(summary.primary, "Codex / GPT-5");
+        assert!(summary.secondary.contains("Work account"));
+        assert!(summary.secondary.contains("high"));
+        assert!(summary.secondary.contains("plan"));
+        assert!(summary.available);
+    }
+
+    #[test]
+    fn unavailable_composer_runtime_is_visible_but_cannot_be_applied() {
+        let selection = SessionRuntimeSelection::provider(
+            vibex_core::AgentId::parse("codex").unwrap(),
+            vibex_core::ProviderProfileId::new(),
+            "gpt-5",
+        );
+        let catalog = SessionRuntimeOptionCatalog {
+            revision: 1,
+            agents: Vec::new(),
+            auth_sources: Vec::new(),
+            options: vec![runtime_option(
+                selection.clone(),
+                RuntimeOptionAvailability::RequiresConfiguration,
+            )],
+        };
+
+        assert!(!runtime_selection_summary(Some(&catalog), Some(&selection)).available);
+        assert!(!runtime_selection_is_available(
+            &catalog.options,
+            &selection
+        ));
+    }
+
+    #[test]
+    fn composer_runtime_string_values_are_bounded_without_trimming() {
+        assert_eq!(runtime_string_override("   ".to_string()).unwrap(), None);
+        assert_eq!(
+            runtime_string_override("  explicit  ".to_string()).unwrap(),
+            Some("  explicit  ".to_string())
+        );
+        assert_eq!(
+            runtime_string_override("x".repeat(RUNTIME_FEATURE_VALUE_LIMIT + 1))
+                .unwrap_err()
+                .code,
+            "mobile_runtime_feature_value_too_long"
+        );
     }
 
     struct DrawerScrollIsolationProbe {
