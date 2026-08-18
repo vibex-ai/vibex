@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="remote_connection_channel_name">桌面端连接</string>
+    <string name="remote_connection_channel_description">Vibex 桌面端连接状态</string>
+    <string name="remote_connection_notification_title">Vibex</string>
+    <string name="remote_connection_notification_body">已连接到桌面端</string>
+</resources>

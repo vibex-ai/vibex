@@ -5,6 +5,7 @@
 
 mod app;
 mod assets;
+mod background_connection;
 mod discovery;
 mod input;
 mod lifecycle;
@@ -25,11 +26,12 @@ pub use pairing::{MobileCredentialBundle, MobileRemoteRouteBundle};
 
 fn run(data_dir: PathBuf) {
     let platform = gpui_platform::current_platform(false);
+    let tokio_handle = background_connection::tokio_handle();
     lifecycle::attach(platform.as_ref());
     gpui::Application::with_platform(platform)
         .with_assets(assets::MobileAssets)
         .run(move |cx: &mut App| {
-            gpui_tokio::init(cx);
+            gpui_tokio::init_from_handle(cx, tokio_handle.clone());
             app::bind_keys(cx);
             // Resolve the native platform's preferred language before the
             // first window is created so the initial pairing screen is never
@@ -83,6 +85,7 @@ pub fn android_main(android_app: gpui_android::AndroidApp) {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     initialize_android_tls(&android_app);
+    background_connection::initialize_android(&android_app);
     discovery::initialize_android(&android_app);
     notifications::initialize_android(&android_app);
     scanner::initialize_android(&android_app);

@@ -252,10 +252,21 @@ impl SidebarOrganizationState {
         }
         self.folders
             .insert(id.clone(), SidebarFolderUiState { name, project_id });
-        self.placements.push(SidebarOrganizationPlacement {
-            item: SidebarOrganizationItem::Folder(id),
-            parent_folder_id,
-        });
+        let insertion_index = parent_folder_id
+            .as_ref()
+            .and_then(|parent_id| {
+                self.placements.iter().position(|placement| {
+                    placement.item == SidebarOrganizationItem::Folder(parent_id.clone())
+                })
+            })
+            .map_or(0, |index| index + 1);
+        self.placements.insert(
+            insertion_index,
+            SidebarOrganizationPlacement {
+                item: SidebarOrganizationItem::Folder(id),
+                parent_folder_id,
+            },
+        );
         self.enforce_placement_limit();
         true
     }
@@ -370,6 +381,21 @@ impl SidebarOrganizationState {
         self.folders.get(folder_id)
     }
 
+    pub fn folder_contains_items(&self, folder_id: &str) -> bool {
+        self.folders.contains_key(folder_id)
+            && self.placements.iter().any(|placement| {
+                matches!(
+                    placement.item,
+                    SidebarOrganizationItem::Project(_) | SidebarOrganizationItem::Session(_)
+                ) && placement
+                    .parent_folder_id
+                    .as_deref()
+                    .is_some_and(|parent_id| {
+                        parent_id == folder_id || self.folder_is_descendant_of(parent_id, folder_id)
+                    })
+            })
+    }
+
     pub fn folder_scope(&self, folder_id: &str) -> Option<SidebarOrganizationScope> {
         self.folders.get(folder_id).map(|folder| {
             folder.project_id.clone().map_or(
@@ -477,46 +503,76 @@ impl SidebarOrganizationState {
         after: bool,
         session_projects: &BTreeMap<String, String>,
     ) -> bool {
-        if !self.can_move_relative(moving, target, session_projects) {
+        self.move_many_relative(
+            std::slice::from_ref(moving),
+            target,
+            after,
+            session_projects,
+        )
+    }
+
+    pub fn can_move_many_relative(
+        &self,
+        moving: &[SidebarOrganizationItem],
+        target: &SidebarOrganizationItem,
+        session_projects: &BTreeMap<String, String>,
+    ) -> bool {
+        self.valid_moving_items(moving)
+            && !moving.contains(target)
+            && moving
+                .iter()
+                .all(|item| self.can_move_relative(item, target, session_projects))
+    }
+
+    pub fn move_many_relative(
+        &mut self,
+        moving: &[SidebarOrganizationItem],
+        target: &SidebarOrganizationItem,
+        after: bool,
+        session_projects: &BTreeMap<String, String>,
+    ) -> bool {
+        if !self.can_move_many_relative(moving, target, session_projects) {
             return false;
         }
-        let Some(source_index) = self
+        let Some(target_parent) = self
             .placements
             .iter()
-            .position(|placement| &placement.item == moving)
+            .find(|placement| &placement.item == target)
+            .map(|placement| placement.parent_folder_id.clone())
         else {
             return false;
         };
-        let Some(original_target_index) = self
-            .placements
+        let moving_placements = moving
             .iter()
-            .position(|placement| &placement.item == target)
-        else {
+            .map(|item| {
+                self.placements
+                    .iter()
+                    .find(|placement| &placement.item == item)
+                    .cloned()
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(mut moving_placements) = moving_placements else {
             return false;
         };
-        let old_parent = self.placements[source_index].parent_folder_id.clone();
-        let target_parent = self.placements[original_target_index]
-            .parent_folder_id
-            .clone();
-        if old_parent == target_parent
-            && ((!after && source_index + 1 == original_target_index)
-                || (after && original_target_index + 1 == source_index))
-        {
-            return false;
-        }
-        let mut moving_placement = self.placements.remove(source_index);
+        let original = self.placements.clone();
+        let moving_set = moving.iter().cloned().collect::<BTreeSet<_>>();
+        self.placements
+            .retain(|placement| !moving_set.contains(&placement.item));
         let Some(target_index) = self
             .placements
             .iter()
             .position(|placement| &placement.item == target)
         else {
-            self.placements.insert(source_index, moving_placement);
+            self.placements = original;
             return false;
         };
-        moving_placement.parent_folder_id = self.placements[target_index].parent_folder_id.clone();
+        for placement in &mut moving_placements {
+            placement.parent_folder_id.clone_from(&target_parent);
+        }
         let insertion_index = target_index + usize::from(after);
-        self.placements.insert(insertion_index, moving_placement);
-        true
+        self.placements
+            .splice(insertion_index..insertion_index, moving_placements);
+        self.placements != original
     }
 
     pub fn move_into(
@@ -525,19 +581,53 @@ impl SidebarOrganizationState {
         target_folder_id: &str,
         session_projects: &BTreeMap<String, String>,
     ) -> bool {
-        if !self.can_move_into(moving, target_folder_id, session_projects) {
+        self.move_many_into(
+            std::slice::from_ref(moving),
+            target_folder_id,
+            session_projects,
+        )
+    }
+
+    pub fn can_move_many_into(
+        &self,
+        moving: &[SidebarOrganizationItem],
+        target_folder_id: &str,
+        session_projects: &BTreeMap<String, String>,
+    ) -> bool {
+        self.valid_moving_items(moving)
+            && moving
+                .iter()
+                .all(|item| self.can_move_into(item, target_folder_id, session_projects))
+    }
+
+    pub fn move_many_into(
+        &mut self,
+        moving: &[SidebarOrganizationItem],
+        target_folder_id: &str,
+        session_projects: &BTreeMap<String, String>,
+    ) -> bool {
+        if !self.can_move_many_into(moving, target_folder_id, session_projects) {
             return false;
         }
-        let Some(source_index) = self
-            .placements
+        let moving_placements = moving
             .iter()
-            .position(|placement| &placement.item == moving)
-        else {
+            .map(|item| {
+                self.placements
+                    .iter()
+                    .find(|placement| &placement.item == item)
+                    .cloned()
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(mut moving_placements) = moving_placements else {
             return false;
         };
-        let old_parent = self.placements[source_index].parent_folder_id.clone();
-        let mut moving_placement = self.placements.remove(source_index);
-        moving_placement.parent_folder_id = Some(target_folder_id.to_string());
+        let original = self.placements.clone();
+        let moving_set = moving.iter().cloned().collect::<BTreeSet<_>>();
+        self.placements
+            .retain(|placement| !moving_set.contains(&placement.item));
+        for placement in &mut moving_placements {
+            placement.parent_folder_id = Some(target_folder_id.to_string());
+        }
         let insertion_index = self
             .placements
             .iter()
@@ -554,10 +644,9 @@ impl SidebarOrganizationState {
                 },
                 |index| index + 1,
             );
-        let changed = old_parent.as_deref() != Some(target_folder_id)
-            || insertion_index != source_index.min(self.placements.len());
-        self.placements.insert(insertion_index, moving_placement);
-        changed
+        self.placements
+            .splice(insertion_index..insertion_index, moving_placements);
+        self.placements != original
     }
 
     pub fn move_to_scope_root_end(
@@ -566,19 +655,49 @@ impl SidebarOrganizationState {
         scope: &SidebarOrganizationScope,
         session_projects: &BTreeMap<String, String>,
     ) -> bool {
-        if !self.can_move_to_scope_root(moving, scope, session_projects) {
+        self.move_many_to_scope_root_end(std::slice::from_ref(moving), scope, session_projects)
+    }
+
+    pub fn can_move_many_to_scope_root(
+        &self,
+        moving: &[SidebarOrganizationItem],
+        scope: &SidebarOrganizationScope,
+        session_projects: &BTreeMap<String, String>,
+    ) -> bool {
+        self.valid_moving_items(moving)
+            && moving
+                .iter()
+                .all(|item| self.can_move_to_scope_root(item, scope, session_projects))
+    }
+
+    pub fn move_many_to_scope_root_end(
+        &mut self,
+        moving: &[SidebarOrganizationItem],
+        scope: &SidebarOrganizationScope,
+        session_projects: &BTreeMap<String, String>,
+    ) -> bool {
+        if !self.can_move_many_to_scope_root(moving, scope, session_projects) {
             return false;
         }
-        let Some(source_index) = self
-            .placements
+        let moving_placements = moving
             .iter()
-            .position(|placement| &placement.item == moving)
-        else {
+            .map(|item| {
+                self.placements
+                    .iter()
+                    .find(|placement| &placement.item == item)
+                    .cloned()
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(mut moving_placements) = moving_placements else {
             return false;
         };
-        let old_parent = self.placements[source_index].parent_folder_id.clone();
-        let mut moving_placement = self.placements.remove(source_index);
-        moving_placement.parent_folder_id = None;
+        let original = self.placements.clone();
+        let moving_set = moving.iter().cloned().collect::<BTreeSet<_>>();
+        self.placements
+            .retain(|placement| !moving_set.contains(&placement.item));
+        for placement in &mut moving_placements {
+            placement.parent_folder_id = None;
+        }
         let insertion_index = self
             .placements
             .iter()
@@ -590,10 +709,9 @@ impl SidebarOrganizationState {
             .map(|(index, _)| index + 1)
             .next_back()
             .unwrap_or(self.placements.len());
-        let changed =
-            old_parent.is_some() || insertion_index != source_index.min(self.placements.len());
-        self.placements.insert(insertion_index, moving_placement);
-        changed
+        self.placements
+            .splice(insertion_index..insertion_index, moving_placements);
+        self.placements != original
     }
 
     pub fn can_move_to_scope_root(
@@ -604,6 +722,15 @@ impl SidebarOrganizationState {
     ) -> bool {
         self.item_scope(moving, session_projects).as_ref() == Some(scope)
             && !matches!(moving, SidebarOrganizationItem::Folder(folder_id) if !self.folder_name_available_at_parent(folder_id, None))
+    }
+
+    fn valid_moving_items(&self, moving: &[SidebarOrganizationItem]) -> bool {
+        !moving.is_empty()
+            && moving.iter().cloned().collect::<BTreeSet<_>>().len() == moving.len()
+            && (moving.len() == 1
+                || moving
+                    .iter()
+                    .all(|item| !matches!(item, SidebarOrganizationItem::Folder(_))))
     }
 
     pub fn toggle_collapsed(&mut self, folder_id: &str) -> Option<bool> {
@@ -992,6 +1119,36 @@ mod tests {
     }
 
     #[test]
+    fn new_folders_are_inserted_before_existing_siblings() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_folder("older", "Older", None, None));
+        assert!(state.create_folder("newer", "Newer", None, None));
+        assert!(state.create_folder("child-older", "Child Older", None, Some("older".into())));
+        assert!(state.create_folder("child-newer", "Child Newer", None, Some("older".into())));
+
+        let available = state
+            .folders
+            .keys()
+            .cloned()
+            .map(SidebarOrganizationItem::Folder)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            state.ordered_children(None, &available),
+            [
+                SidebarOrganizationItem::Folder("newer".into()),
+                SidebarOrganizationItem::Folder("older".into()),
+            ]
+        );
+        assert_eq!(
+            state.ordered_children(Some("older"), &available),
+            [
+                SidebarOrganizationItem::Folder("child-newer".into()),
+                SidebarOrganizationItem::Folder("child-older".into()),
+            ]
+        );
+    }
+
+    #[test]
     fn folder_moves_reject_a_name_collision_at_the_destination() {
         let mut state = SidebarOrganizationState::default();
         assert!(state.create_folder("left", "Left", None, None));
@@ -1115,6 +1272,8 @@ mod tests {
             "parent",
             &BTreeMap::new(),
         ));
+        assert!(state.folder_contains_items("parent"));
+        assert!(!state.folder_contains_items("child"));
 
         assert!(state.delete_folder("parent"));
         assert!(!state.folders.contains_key("parent"));
@@ -1211,6 +1370,73 @@ mod tests {
     }
 
     #[test]
+    fn multiple_items_move_as_one_ordered_block() {
+        let mut state = SidebarOrganizationState::default();
+        state.reconcile(
+            &[
+                "project-a".into(),
+                "project-b".into(),
+                "project-c".into(),
+                "project-d".into(),
+            ],
+            &[],
+        );
+        let moving = [
+            SidebarOrganizationItem::Project("project-b".into()),
+            SidebarOrganizationItem::Project("project-d".into()),
+        ];
+        assert!(state.move_many_relative(
+            &moving,
+            &SidebarOrganizationItem::Project("project-a".into()),
+            false,
+            &BTreeMap::new(),
+        ));
+        assert_eq!(
+            state.ordered_children(
+                None,
+                &[
+                    SidebarOrganizationItem::Project("project-a".into()),
+                    SidebarOrganizationItem::Project("project-b".into()),
+                    SidebarOrganizationItem::Project("project-c".into()),
+                    SidebarOrganizationItem::Project("project-d".into()),
+                ],
+            ),
+            [
+                SidebarOrganizationItem::Project("project-b".into()),
+                SidebarOrganizationItem::Project("project-d".into()),
+                SidebarOrganizationItem::Project("project-a".into()),
+                SidebarOrganizationItem::Project("project-c".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn multiple_sessions_move_into_a_folder_together() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_folder("sessions", "Sessions", Some("project-a".into()), None,));
+        state.reconcile(
+            &["project-a".into()],
+            &[
+                ("session-a".into(), "project-a".into()),
+                ("session-b".into(), "project-a".into()),
+                ("session-c".into(), "project-a".into()),
+            ],
+        );
+        let sessions = BTreeMap::from([
+            ("session-a".to_string(), "project-a".to_string()),
+            ("session-b".to_string(), "project-a".to_string()),
+            ("session-c".to_string(), "project-a".to_string()),
+        ]);
+        let moving = [
+            SidebarOrganizationItem::Session("session-c".into()),
+            SidebarOrganizationItem::Session("session-a".into()),
+        ];
+        assert!(state.move_many_into(&moving, "sessions", &sessions));
+        assert_eq!(state.ordered_children(Some("sessions"), &moving), moving);
+        assert!(state.folder_contains_items("sessions"));
+    }
+
+    #[test]
     fn nested_projects_sessions_and_folders_can_transfer_between_folders() {
         let mut state = SidebarOrganizationState::default();
         assert!(state.create_folder("root-a", "Root A", None, None));
@@ -1293,9 +1519,9 @@ mod tests {
                 ],
             ),
             [
-                SidebarOrganizationItem::Folder("folder-a".into()),
                 moving,
                 target,
+                SidebarOrganizationItem::Folder("folder-a".into()),
             ]
         );
     }
@@ -1316,8 +1542,8 @@ mod tests {
         assert_eq!(
             state.ordered_children(None, &available),
             [
-                SidebarOrganizationItem::Folder("root".into()),
                 SidebarOrganizationItem::Folder("sibling".into()),
+                SidebarOrganizationItem::Folder("root".into()),
                 SidebarOrganizationItem::Project("unplaced".into()),
             ]
         );

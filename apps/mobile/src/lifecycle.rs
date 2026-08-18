@@ -22,6 +22,9 @@ fn enqueue(event: MobileLifecycleEvent) {
         event == MobileLifecycleEvent::Backgrounded,
         Ordering::Release,
     );
+    if event == MobileLifecycleEvent::Backgrounded {
+        crate::background_connection::suspend_ui_events();
+    }
     if let Ok(sender) = event_sender().lock()
         && let Some(sender) = sender.as_ref()
     {
@@ -51,7 +54,7 @@ fn transition(backgrounded: &mut bool, phase: AppLifecyclePhase) -> Option<Mobil
 }
 
 pub fn attach(platform: &dyn gpui::Platform) {
-    let mut backgrounded = false;
+    let mut backgrounded = is_backgrounded();
     platform.on_app_lifecycle(Box::new(move |phase| {
         if let Some(event) = transition(&mut backgrounded, phase) {
             enqueue(event);
@@ -99,5 +102,16 @@ mod tests {
             transition(&mut backgrounded, AppLifecyclePhase::Active),
             None
         );
+    }
+
+    #[test]
+    fn recreated_activity_clears_the_process_background_state() {
+        let mut backgrounded = true;
+
+        assert_eq!(
+            transition(&mut backgrounded, AppLifecyclePhase::Foreground),
+            Some(MobileLifecycleEvent::Resumed)
+        );
+        assert!(!backgrounded);
     }
 }

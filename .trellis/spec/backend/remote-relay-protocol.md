@@ -27,6 +27,7 @@ Current evidence: [Architecture Baseline](../guides/architecture-baseline.md), `
 Remote v2 topic/channel = "agent_notification"
 BackendEvent::Notification(AgentNotificationIntent)
 AgentBackend::resolve_opaque_locator(notification_id, opaque_locator)
+Android RemoteConnectionService = connectedDevice foreground service, START_NOT_STICKY
 ```
 
 ### 3. Contracts
@@ -46,11 +47,21 @@ AgentBackend::resolve_opaque_locator(notification_id, opaque_locator)
   while its target session is visibly selected in the foreground. Otherwise it
   presents generic, localized copy with the stable notification ID so the OS can
   replace a duplicate delivery.
-- The native lifecycle callback publishes background state before enqueueing the
-  GPUI lifecycle event. While backgrounded, the Tokio live-event reader invokes
-  the native notification presenter directly; it must not wait for a GPUI
-  foreground task, because that executor may stop being polled as soon as the
-  application leaves the foreground.
+- The native lifecycle callback publishes background state and detaches the UI
+  event receiver before enqueueing the GPUI lifecycle event. The connection and
+  its only domain-event subscription run on a process-lifetime Tokio runtime,
+  never on a GPUI-owned task. While backgrounded, that reader invokes the native
+  notification presenter directly and drops other UI events.
+- After an authenticated Android connection succeeds in the foreground, start a
+  non-exported `connectedDevice` foreground service with a generic ongoing
+  notification. Android backgrounding must keep the selected transport online
+  instead of applying `AppBackgrounded`, because that signal intentionally
+  degrades and reselects transports that are expected to be suspended. Resume
+  may still apply `AppResumed` to recover a socket that actually went offline.
+- The foreground service owns no credential, socket, event queue, or business
+  state. It only keeps the Rust process eligible to run. Stop it when the user
+  disconnects or replaces the desktop, or when the connection becomes revoked
+  or incompatible.
 - Non-notification live events received while backgrounded are not queued for the
   paused UI. Resume performs the existing authoritative refetch and installs a
   fresh event stream before applying more presentation state.
@@ -68,9 +79,11 @@ AgentBackend::resolve_opaque_locator(notification_id, opaque_locator)
 
 ### 4. Background Delivery Boundary
 
-- A live Remote event plus a local native notification works while the mobile
-  process retains its authenticated connection. It does not promise delivery
-  after iOS/Android suspends or kills the process.
+- On Android, a live Remote event plus a local native notification works while
+  the authenticated foreground service and process remain alive. The service is
+  `START_NOT_STICKY` and does not promise delivery after force-stop, process
+  kill, reboot, or credential revocation. iOS can still suspend the live
+  connection after backgrounding.
 - True background delivery requires the user's self-hosted Relay and its
   operator-configured APNs/FCM adapter. Never copy the Relay operator bearer
   into pairing offers or mobile credentials. Until paired-device registration
@@ -83,8 +96,10 @@ AgentBackend::resolve_opaque_locator(notification_id, opaque_locator)
 - Gateway tests include `agent_notification` in permission-filtered topics.
 - Remote-client tests decode the topic into `BackendEvent::Notification`.
 - Mobile tests cover bounded action validation, cold-start buffering, foreground
-  forwarding, background native notification routing, and background UI-event
-  dropping; `pnpm check:mobile-native` covers Android/iOS host contract drift.
+  forwarding, background native notification routing, terminal connection
+  shutdown, background UI-event dropping, and recreated-Activity lifecycle
+  state. Android validation covers the non-exported `connectedDevice` service,
+  foreground-service permissions, `START_NOT_STICKY`, and JNI bridge signatures.
 
 ### 6. Wrong vs Correct
 
@@ -95,8 +110,11 @@ Correct: buffered id + opaque locator -> authenticated PC resolve -> open sessio
 Wrong: put the self-hosted Relay operator bearer in a pairing bundle
 Correct: keep online delivery live-only until a paired-device push auth contract exists
 
-Wrong: background event -> GPUI foreground task -> native local notification
-Correct: lifecycle state -> Tokio event reader -> native presenter; resume -> authoritative refetch
+Wrong: Android background event -> GPUI-owned Tokio task -> native local notification
+Correct: foreground service + process Tokio reader -> native presenter; resume -> authoritative refetch
+
+Wrong: foreground service owns a second socket or credential copy
+Correct: service keeps process runnable; one Rust manager owns the backend and event subscription
 ```
 
 ## Scenario: Remote Protocol v2 Gateway And Pairing

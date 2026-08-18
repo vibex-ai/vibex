@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="remote_connection_channel_name">Desktop connection</string>
+    <string name="remote_connection_channel_description">Vibex desktop connection status</string>
+    <string name="remote_connection_notification_title">Vibex</string>
+    <string name="remote_connection_notification_body">Connected to desktop</string>
+</resources>

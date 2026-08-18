@@ -103,6 +103,14 @@ public final class GpuiNativeActivity extends NativeActivity {
         });
     }
 
+    public void startRemoteConnectionService() {
+        RemoteConnectionService.start(getApplicationContext());
+    }
+
+    public void stopRemoteConnectionService() {
+        RemoteConnectionService.stop(getApplicationContext());
+    }
+
     public void showAgentNotification(
             String notificationId, String title, String body, String opaqueLocator) {
         runOnUiThread(() -> {

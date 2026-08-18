@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_channel::mpsc;
 use futures_util::StreamExt as _;
 use gpui::{
     Animation, AnimationExt as _, App, AppContext as _, Context, ElementId, Entity, FontWeight,
@@ -66,23 +65,6 @@ fn should_present_agent_notification(
     target_session_id: &VibexSessionId,
 ) -> bool {
     app_backgrounded || workbench_open || selected_session_id != Some(target_session_id)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MobileEventRoute {
-    ForwardToUi,
-    PresentNotificationInBackground,
-    IgnoreUntilResume,
-}
-
-fn mobile_event_route(event: &BackendEvent, app_backgrounded: bool) -> MobileEventRoute {
-    if !app_backgrounded {
-        MobileEventRoute::ForwardToUi
-    } else if matches!(event, BackendEvent::Notification(_)) {
-        MobileEventRoute::PresentNotificationInBackground
-    } else {
-        MobileEventRoute::IgnoreUntilResume
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,8 +224,6 @@ pub struct MobileApp {
     notice: Option<String>,
     error: Option<BackendError>,
     app_backgrounded: bool,
-    event_stream_generation: u64,
-    event_forward_task: Option<Task<Result<(), gpui_tokio::JoinError>>>,
     event_consumer_task: Option<Task<()>>,
     resume_recovery_task: Option<Task<()>>,
     pending_notification_action: Option<notifications::NotificationAction>,
@@ -301,9 +281,7 @@ impl MobileApp {
             session_action_busy: false,
             notice: None,
             error: stored.as_ref().err().cloned(),
-            app_backgrounded: false,
-            event_stream_generation: 0,
-            event_forward_task: None,
+            app_backgrounded: crate::lifecycle::is_backgrounded(),
             event_consumer_task: None,
             resume_recovery_task: None,
             pending_notification_action: None,
@@ -350,6 +328,7 @@ impl MobileApp {
                 if let Some(workbench) = self.workbench.as_ref() {
                     workbench.update(cx, |workbench, _| workbench.suspend());
                 }
+                #[cfg(not(target_os = "android"))]
                 if let Some(backend) = self.backend.as_ref() {
                     backend.apply_lifecycle_signal(RemoteLifecycleSignal::AppBackgrounded);
                 }
@@ -522,6 +501,7 @@ impl MobileApp {
                 self.connect_backend(backend, cx);
             }
             Err(error) => {
+                crate::background_connection::disconnect();
                 self.mode = RootMode::Pairing;
                 self.error = Some(error);
                 let _ = self.storage.clear();
@@ -532,12 +512,9 @@ impl MobileApp {
 
     fn connect_backend(&mut self, backend: Arc<WebRemoteBackend>, cx: &mut Context<Self>) {
         self.operation_busy = true;
-        let runner = gpui_tokio::Tokio::spawn(cx, {
-            let backend = backend.clone();
-            async move { backend.connect().await }
-        });
+        let connection = crate::background_connection::connect(backend.clone());
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            let outcome = runner.await;
+            let outcome = connection.await;
             let _ = entity.update(cx, |this, cx| {
                 this.operation_busy = false;
                 match outcome {
@@ -591,42 +568,10 @@ impl MobileApp {
     }
 
     fn start_event_stream(&mut self, cx: &mut Context<Self>) {
-        let Some(backend) = self.backend.clone() else {
+        if self.backend.is_none() || self.app_backgrounded {
             return;
-        };
-        let Ok(mut subscription) = backend.subscribe() else {
-            return;
-        };
-        self.event_stream_generation = self.event_stream_generation.wrapping_add(1);
-        let generation = self.event_stream_generation;
-        let (sender, mut receiver) = mpsc::unbounded::<BackendEvent>();
-        self.event_forward_task = Some(gpui_tokio::Tokio::spawn(cx, async move {
-            loop {
-                match subscription.next().await {
-                    Ok(Some(event)) => {
-                        match mobile_event_route(&event, crate::lifecycle::is_backgrounded()) {
-                            MobileEventRoute::ForwardToUi => {}
-                            MobileEventRoute::PresentNotificationInBackground => {
-                                if let BackendEvent::Notification(notification) = &event {
-                                    notifications::present(notification);
-                                }
-                                continue;
-                            }
-                            MobileEventRoute::IgnoreUntilResume => continue,
-                        }
-                        if sender.unbounded_send(event).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) | Err(_) => {
-                        if !crate::lifecycle::is_backgrounded() {
-                            let _ = sender.unbounded_send(BackendEvent::Disconnected);
-                        }
-                        break;
-                    }
-                }
-            }
-        }));
+        }
+        let mut receiver = crate::background_connection::subscribe_ui_events();
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             while let Some(event) = receiver.next().await {
                 let needs_refetch = entity
@@ -682,18 +627,12 @@ impl MobileApp {
                     let _ = entity.update(cx, |this, cx| this.reload_selected_session(cx));
                 }
             }
-            let _ = entity.update(cx, |this, _| {
-                if this.event_stream_generation == generation {
-                    this.event_forward_task = None;
-                }
-            });
         });
         self.event_consumer_task = Some(task);
     }
 
     fn stop_connection_tasks(&mut self) {
-        self.event_stream_generation = self.event_stream_generation.wrapping_add(1);
-        self.event_forward_task = None;
+        crate::background_connection::suspend_ui_events();
         self.event_consumer_task = None;
         self.resume_recovery_task = None;
     }
@@ -1992,9 +1931,8 @@ impl MobileApp {
 
     fn forget_desktop(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.stop_connection_tasks();
-        if let Some(backend) = self.backend.take() {
-            gpui_tokio::Tokio::spawn(cx, async move { backend.disconnect().await }).detach();
-        }
+        self.backend = None;
+        crate::background_connection::disconnect();
         let _ = self.storage.clear();
         if let Some(workbench) = self.workbench.take() {
             workbench.update(cx, |workbench, _| workbench.suspend());
@@ -4686,32 +4624,6 @@ mod tests {
             Some(&selected),
             &other,
         ));
-    }
-
-    #[test]
-    fn background_events_present_notifications_without_waiting_for_gpui() {
-        let notification = vibex_core::AgentNotificationIntent {
-            notification_id: "notification-a".to_string(),
-            source_event_id: vibex_core::TimelineItemId::new(),
-            session_id: VibexSessionId::new(),
-            kind: vibex_core::AgentNotificationKind::TurnCompleted,
-            created_at_ms: 1,
-            expires_at_ms: 2,
-            opaque_locator: "opaque-session-locator".to_string(),
-        };
-
-        assert_eq!(
-            mobile_event_route(&BackendEvent::Notification(notification.clone()), false),
-            MobileEventRoute::ForwardToUi
-        );
-        assert_eq!(
-            mobile_event_route(&BackendEvent::Notification(notification), true),
-            MobileEventRoute::PresentNotificationInBackground
-        );
-        assert_eq!(
-            mobile_event_route(&BackendEvent::Disconnected, true),
-            MobileEventRoute::IgnoreUntilResume
-        );
     }
 
     struct DrawerScrollIsolationProbe {
