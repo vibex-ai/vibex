@@ -9903,9 +9903,32 @@ impl VibexWorkbench {
         let composition_active = input.update(cx, |input, cx| {
             EntityInputHandler::marked_text_range(input, window, cx).is_some()
         });
-        if !composition_active && self.paste_composer_clipboard_to(new_session, window, cx) {
+        if composition_active {
+            return;
+        }
+
+        let captured = self.paste_composer_clipboard_to(new_session, window, cx);
+        self.schedule_composer_cursor_reveal(input, window, cx);
+        if captured {
             cx.stop_propagation();
         }
+    }
+
+    /// Re-run the input's cursor visibility calculation after paste has updated
+    /// its text and selection. The next-frame boundary lets custom clipboard
+    /// insertion and the native input paste path share the same layout state.
+    fn schedule_composer_cursor_reveal(
+        &self,
+        input: Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.on_next_frame(window, move |_, _, cx| {
+            input.update(cx, |input, cx| {
+                let selection = input.selected_range();
+                input.set_selected_range(selection, cx);
+            });
+        });
     }
 
     fn handle_composer_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -44236,6 +44259,27 @@ mod tests {
             .expect("composer renderer should remain inspectable");
         assert!(composer.contains("Button::new(\"send-agent-message\")"));
         assert!(composer.contains("this.submit_composer(window, cx)"));
+    }
+
+    #[test]
+    fn composer_paste_reveals_the_cursor_after_custom_clipboard_insertion() {
+        let source = include_str!("app.rs");
+        let paste = source
+            .split_once("    fn capture_composer_paste(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn handle_composer_enter("))
+            .map(|(body, _)| body)
+            .expect("composer paste handling should remain inspectable");
+        assert!(paste.contains("let captured = self.paste_composer_clipboard_to"));
+        assert!(paste.contains("self.schedule_composer_cursor_reveal(input, window, cx);"));
+        assert!(paste.contains("cx.stop_propagation();"));
+
+        let reveal = source
+            .split_once("    fn schedule_composer_cursor_reveal(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn handle_composer_enter("))
+            .map(|(body, _)| body)
+            .expect("composer cursor reveal should remain inspectable");
+        assert!(reveal.contains("let selection = input.selected_range();"));
+        assert!(reveal.contains("input.set_selected_range(selection, cx);"));
     }
 
     #[test]
