@@ -14725,12 +14725,16 @@ impl VibexWorkbench {
         let Some(runtime) = self.runtime.clone() else {
             return;
         };
+        let session_id_set = BTreeSet::from([session_id.as_str().to_string()]);
         self.agent_action_pending = true;
+        self.optimistically_remove_sessions(&session_id_set);
+        self.queue_agent_ui_state();
+        cx.notify();
         let generation = self.session_generation;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             runtime.agent().manager().delete_session(&session_id).await
         });
-        self.finish_session_mutation(generation, runner, cx);
+        self.finish_optimistic_session_deletion(generation, runner, cx);
     }
 
     fn confirm_delete_selected_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -41101,6 +41105,29 @@ mod tests {
             completion.contains("this.optimistic_session_deletion_reconciliation_pending = true;")
         );
         assert!(completion.contains("this.load_agent_overview(cx);"));
+    }
+
+    #[test]
+    fn single_session_delete_updates_the_sidebar_before_background_deletion() {
+        let source = include_str!("app.rs");
+        let deletion = source
+            .split_once("    fn delete_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn confirm_delete_selected_sessions("))
+            .map(|(body, _)| body)
+            .expect("single session deletion should remain inspectable");
+        let optimistic_remove = deletion
+            .find("self.optimistically_remove_sessions(&session_id_set);")
+            .expect("single deletion should remove the row locally");
+        let repaint = deletion
+            .find("cx.notify();\n        let generation")
+            .expect("single deletion should repaint before background deletion");
+        let background_delete = deletion
+            .find("let runner = gpui_tokio::Tokio::spawn")
+            .expect("authoritative deletion should remain asynchronous");
+
+        assert!(optimistic_remove < repaint);
+        assert!(repaint < background_delete);
+        assert!(deletion.contains("self.finish_optimistic_session_deletion("));
     }
 
     #[test]
