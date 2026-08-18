@@ -400,6 +400,36 @@ impl AgentUsageRepository {
         get_fact(conn, usage_execution_id)
     }
 
+    pub fn latest_observed_fact_for_binding(
+        conn: &Connection,
+        session_id: &VibexSessionId,
+        binding_id: &RuntimeBindingId,
+    ) -> VibexResult<Option<AgentTurnUsageFact>> {
+        let raw = conn
+            .query_row(
+                &format!(
+                    "
+                    SELECT {}
+                    FROM agent_turn_usage_facts f
+                    WHERE f.session_id = ?1
+                      AND f.binding_id = ?2
+                      AND f.last_observed_at_ms IS NOT NULL
+                    ORDER BY f.last_observed_at_ms DESC, f.rowid DESC
+                    LIMIT 1
+                    ",
+                    fact_columns("f")
+                ),
+                params![session_id.as_str(), binding_id.as_str()],
+                read_raw_fact,
+            )
+            .optional()
+            .map_err(storage_err(
+                "agent_usage_latest_fact_get_failed",
+                "failed to load the latest Agent usage fact",
+            ))?;
+        raw.map(decode_raw_fact).transpose()
+    }
+
     pub fn list_facts_in_range(
         conn: &Connection,
         start_at_ms: i64,

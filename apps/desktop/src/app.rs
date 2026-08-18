@@ -775,12 +775,7 @@ fn runtime_token_usage_snapshot(
     runtime: &DesktopRuntime,
     session_id: &VibexSessionId,
 ) -> vibex_core::VibexResult<Option<AgentTokenUsage>> {
-    Ok(runtime
-        .agent()
-        .runtime_lifecycle()
-        .get_session_attachment_snapshot(session_id)?
-        .attachment
-        .and_then(|attachment| attachment.usage))
+    runtime.agent_token_usage_snapshot(session_id)
 }
 
 async fn announce_created_session_before_initial_message<C, F, T>(

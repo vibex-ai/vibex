@@ -45,9 +45,10 @@ use vibex_core::{
     AgentAuthContextMutationResult, AgentAuthContextRefreshModelsRequest,
     AgentAuthContextVerifyRequest, AgentAuthenticateRequest, AgentAuthenticateResult,
     AgentAuthenticationCancelRequest, AgentLogoutRequest, AgentRuntimeKind, AgentSession,
-    FetchTimelineRequest, OpenWorkspaceRequest, ProjectId, ProjectRecord, ProviderProfileId,
-    TerminalCreateRequest, TerminalId, TerminalSession, TerminalSwitchShellRequest, TimelinePage,
-    TimelinePayload, VibexError, VibexResult, WorkspaceId, WorkspaceMode, WorkspaceRecord,
+    AgentTokenUsage, FetchTimelineRequest, OpenWorkspaceRequest, ProjectId, ProjectRecord,
+    ProviderProfileId, TerminalCreateRequest, TerminalId, TerminalSession,
+    TerminalSwitchShellRequest, TimelinePage, TimelinePayload, VibexError, VibexResult,
+    VibexSessionId, WorkspaceId, WorkspaceMode, WorkspaceRecord,
 };
 use vibex_db::{
     TerminalSessionRepository, WorkspaceRepository, apply_migrations, default_database_path,
@@ -1736,6 +1737,23 @@ impl DesktopRuntime {
         self.usage.clone()
     }
 
+    pub fn agent_token_usage_snapshot(
+        &self,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<Option<AgentTokenUsage>> {
+        let attachment = self
+            .agent
+            .runtime_lifecycle()
+            .get_session_attachment_snapshot(session_id)?
+            .attachment;
+        let binding_id = attachment.as_ref().map(|attachment| &attachment.binding_id);
+        let persisted = self.usage.latest_token_usage(session_id, binding_id)?;
+        Ok(merge_token_usage_snapshots(
+            persisted,
+            attachment.and_then(|attachment| attachment.usage),
+        ))
+    }
+
     pub fn workspace(&self) -> WorkspaceHandle {
         self.workspace.clone()
     }
@@ -1984,6 +2002,41 @@ impl DesktopRuntime {
     }
 }
 
+fn merge_token_usage_snapshots(
+    persisted: Option<AgentTokenUsage>,
+    live: Option<AgentTokenUsage>,
+) -> Option<AgentTokenUsage> {
+    let mut usage = persisted.or_else(|| live.clone())?;
+    let Some(live) = live else {
+        return Some(usage);
+    };
+    if live.input_tokens.is_some() {
+        usage.input_tokens = live.input_tokens;
+    }
+    if live.output_tokens.is_some() {
+        usage.output_tokens = live.output_tokens;
+    }
+    if live.thought_tokens.is_some() {
+        usage.thought_tokens = live.thought_tokens;
+    }
+    if live.cached_read_tokens.is_some() {
+        usage.cached_read_tokens = live.cached_read_tokens;
+    }
+    if live.cached_write_tokens.is_some() {
+        usage.cached_write_tokens = live.cached_write_tokens;
+    }
+    if live.total_tokens.is_some() {
+        usage.total_tokens = live.total_tokens;
+    }
+    if live.context_window_used_tokens.is_some() {
+        usage.context_window_used_tokens = live.context_window_used_tokens;
+    }
+    if live.context_window_size_tokens.is_some() {
+        usage.context_window_size_tokens = live.context_window_size_tokens;
+    }
+    Some(usage)
+}
+
 fn update_channel_for_mode(mode: DesktopRuntimeMode) -> UpdateChannel {
     match mode {
         DesktopRuntimeMode::Stable | DesktopRuntimeMode::ReleaseStable => UpdateChannel::Stable,
@@ -2099,6 +2152,31 @@ mod tests {
         AgentAuthContextRepository, AgentAuthModelCatalogRepository, AgentSessionRuntimeRepository,
         SessionRepository,
     };
+
+    #[test]
+    fn live_token_usage_overlays_the_persisted_snapshot() {
+        let persisted = AgentTokenUsage {
+            input_tokens: Some(600),
+            output_tokens: Some(400),
+            cached_read_tokens: Some(300),
+            total_tokens: Some(1_000),
+            context_window_used_tokens: Some(1_000),
+            context_window_size_tokens: Some(200_000),
+            ..AgentTokenUsage::default()
+        };
+        let live = AgentTokenUsage {
+            input_tokens: Some(650),
+            context_window_used_tokens: Some(1_100),
+            ..AgentTokenUsage::default()
+        };
+
+        let merged = merge_token_usage_snapshots(Some(persisted), Some(live)).unwrap();
+        assert_eq!(merged.input_tokens, Some(650));
+        assert_eq!(merged.output_tokens, Some(400));
+        assert_eq!(merged.cached_read_tokens, Some(300));
+        assert_eq!(merged.context_window_used_tokens, Some(1_100));
+        assert_eq!(merged.context_window_size_tokens, Some(200_000));
+    }
 
     #[test]
     fn managed_agent_bootstrap_stays_off_the_runtime_ready_path() {

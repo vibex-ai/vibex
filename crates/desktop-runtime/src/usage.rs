@@ -1,28 +1,31 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use chrono::{
     Datelike, Duration, FixedOffset, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone,
 };
 use vibex_agent::AgentUsageTelemetryEvent;
 use vibex_core::{
-    AgentTurnUsageFact, AgentUsageAggregate, AgentUsageAnnualDay, AgentUsageAnnualProjection,
-    AgentUsageCacheHitRate, AgentUsageCounterOrigin, AgentUsageCoverage, AgentUsageCoverageSummary,
-    AgentUsageDailyModelUsage, AgentUsageDimension, AgentUsageDimensionRow,
-    AgentUsageEffectiveRange, AgentUsageFilterOption, AgentUsageFilterOptions,
-    AgentUsageMetricCoverage, AgentUsageMetricValue, AgentUsageRange, AgentUsageSortDirection,
-    AgentUsageSortMetric, AgentUsageStatistics, AgentUsageStatisticsRequest, AgentUsageTimeZone,
-    AgentUsageTrendBucket, VibexError, VibexResult, unix_timestamp_ms,
+    AgentTokenUsage, AgentTurnUsageFact, AgentUsageAggregate, AgentUsageAnnualDay,
+    AgentUsageAnnualProjection, AgentUsageCacheHitRate, AgentUsageCounterOrigin,
+    AgentUsageCoverage, AgentUsageCoverageSummary, AgentUsageDailyModelUsage, AgentUsageDimension,
+    AgentUsageDimensionRow, AgentUsageEffectiveRange, AgentUsageFilterOption,
+    AgentUsageFilterOptions, AgentUsageMetricCoverage, AgentUsageMetricValue, AgentUsageRange,
+    AgentUsageSortDirection, AgentUsageSortMetric, AgentUsageStatistics,
+    AgentUsageStatisticsRequest, AgentUsageTimeZone, AgentUsageTrendBucket, RuntimeBindingId,
+    VibexError, VibexResult, VibexSessionId, unix_timestamp_ms,
 };
 use vibex_db::{
-    AgentUsageFactProjection, AgentUsageRepository, MAX_AGENT_USAGE_QUERY_ROWS,
-    RuntimeBindingRepository, apply_migrations, open_database,
+    AgentSessionRuntimeRepository, AgentUsageFactProjection, AgentUsageRepository,
+    MAX_AGENT_USAGE_QUERY_ROWS, RuntimeBindingRepository, apply_migrations, open_database,
 };
 
 #[derive(Clone)]
 pub struct AgentUsageService {
     db_path: PathBuf,
+    token_usage_cache: Arc<Mutex<BTreeMap<(String, String), Option<AgentTokenUsage>>>>,
 }
 
 impl AgentUsageService {
@@ -30,7 +33,10 @@ impl AgentUsageService {
         let db_path = db_path.into();
         let mut connection = open_database(&db_path)?;
         apply_migrations(&mut connection)?;
-        Ok(Self { db_path })
+        Ok(Self {
+            db_path,
+            token_usage_cache: Arc::new(Mutex::new(BTreeMap::new())),
+        })
     }
 
     pub fn database_path(&self) -> &Path {
@@ -62,13 +68,72 @@ impl AgentUsageService {
                 AgentUsageRepository::record_execution(&connection, &execution)
             }
             AgentUsageTelemetryEvent::Observation(observation) => {
-                AgentUsageRepository::apply_observation(&mut connection, &observation)
-                    .map(|outcome| outcome.changed())
+                let cache_key = (
+                    observation.stream.session_id.as_str().to_string(),
+                    observation.stream.binding_id.as_str().to_string(),
+                );
+                let changed =
+                    AgentUsageRepository::apply_observation(&mut connection, &observation)?
+                        .changed();
+                if changed && let Ok(mut cache) = self.token_usage_cache.lock() {
+                    cache.remove(&cache_key);
+                }
+                Ok(changed)
             }
             AgentUsageTelemetryEvent::ExecutionStatus(update) => {
                 AgentUsageRepository::record_execution_status(&connection, &update)
             }
         }
+    }
+
+    pub fn latest_token_usage(
+        &self,
+        session_id: &VibexSessionId,
+        binding_id: Option<&RuntimeBindingId>,
+    ) -> VibexResult<Option<AgentTokenUsage>> {
+        let mut connection = None;
+        let binding_id = match binding_id {
+            Some(binding_id) => Some(binding_id.clone()),
+            None => {
+                let mut opened = open_database(&self.db_path)?;
+                apply_migrations(&mut opened)?;
+                let binding_id =
+                    AgentSessionRuntimeRepository::get_runtime_state(&opened, session_id)?
+                        .and_then(|state| state.current_binding_id);
+                connection = Some(opened);
+                binding_id
+            }
+        };
+        let Some(binding_id) = binding_id else {
+            return Ok(None);
+        };
+        let cache_key = (
+            session_id.as_str().to_string(),
+            binding_id.as_str().to_string(),
+        );
+        if let Ok(cache) = self.token_usage_cache.lock()
+            && let Some(usage) = cache.get(&cache_key)
+        {
+            return Ok(usage.clone());
+        }
+        let connection = match connection {
+            Some(connection) => connection,
+            None => {
+                let mut connection = open_database(&self.db_path)?;
+                apply_migrations(&mut connection)?;
+                connection
+            }
+        };
+        let usage = AgentUsageRepository::latest_observed_fact_for_binding(
+            &connection,
+            session_id,
+            &binding_id,
+        )
+        .map(|fact| fact.map(token_usage_from_fact))?;
+        if let Ok(mut cache) = self.token_usage_cache.lock() {
+            cache.insert(cache_key, usage.clone());
+        }
+        Ok(usage)
     }
 
     pub fn query_statistics(
@@ -167,6 +232,19 @@ impl AgentUsageService {
             filter_options,
             annual: Some(annual),
         })
+    }
+}
+
+fn token_usage_from_fact(fact: AgentTurnUsageFact) -> AgentTokenUsage {
+    AgentTokenUsage {
+        input_tokens: fact.cumulative_after.input_tokens,
+        output_tokens: fact.cumulative_after.output_tokens,
+        thought_tokens: fact.cumulative_after.thought_tokens,
+        cached_read_tokens: fact.cumulative_after.cached_read_tokens,
+        cached_write_tokens: fact.cumulative_after.cached_write_tokens,
+        total_tokens: fact.cumulative_after.total_tokens,
+        context_window_used_tokens: fact.context_window_used_tokens,
+        context_window_size_tokens: fact.context_window_size_tokens,
     }
 }
 
@@ -1171,6 +1249,80 @@ mod tests {
             time_zone: AgentUsageTimeZone::FixedOffset { offset_minutes: 0 },
             ..AgentUsageStatisticsRequest::default()
         }
+    }
+
+    #[test]
+    fn latest_token_usage_restores_current_binding_snapshot() {
+        let (_directory, service, session) = seeded_service();
+        let stream = stream(
+            &service,
+            &session,
+            session.agent_id.as_str(),
+            ProviderProfileId::new(),
+            "test-model",
+        );
+        let observed_execution = execution(&service, &session, &stream, 9);
+        service
+            .apply_telemetry_event(dispatched_event(observed_execution.clone()))
+            .unwrap();
+        service
+            .apply_telemetry_event(AgentUsageTelemetryEvent::Observation(observation(
+                observed_execution,
+                1,
+                600,
+                400,
+                300,
+                1_000,
+            )))
+            .unwrap();
+
+        let later_unobserved = execution(&service, &session, &stream, 10);
+        service
+            .apply_telemetry_event(dispatched_event(later_unobserved.clone()))
+            .unwrap();
+        let connection = open_database(service.database_path()).unwrap();
+        connection
+            .execute(
+                "UPDATE agent_sessions SET current_binding_id = ?2 WHERE session_id = ?1",
+                rusqlite::params![session.id.as_str(), stream.binding_id.as_str()],
+            )
+            .unwrap();
+
+        let restored = service
+            .latest_token_usage(&session.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.input_tokens, Some(600));
+        assert_eq!(restored.output_tokens, Some(400));
+        assert_eq!(restored.cached_read_tokens, Some(300));
+        assert_eq!(restored.total_tokens, Some(1_000));
+        assert_eq!(restored.context_window_used_tokens, Some(1_000));
+        assert_eq!(restored.context_window_size_tokens, Some(200_000));
+
+        service
+            .apply_telemetry_event(AgentUsageTelemetryEvent::Observation(observation(
+                later_unobserved,
+                2,
+                700,
+                450,
+                325,
+                1_150,
+            )))
+            .unwrap();
+        assert_eq!(
+            service
+                .latest_token_usage(&session.id, Some(&stream.binding_id))
+                .unwrap()
+                .unwrap()
+                .input_tokens,
+            Some(700)
+        );
+        assert_eq!(
+            service
+                .latest_token_usage(&session.id, Some(&RuntimeBindingId::new()))
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
