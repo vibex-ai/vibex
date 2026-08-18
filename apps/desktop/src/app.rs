@@ -17775,22 +17775,23 @@ impl VibexWorkbench {
                             .items_center()
                             .gap_1()
                             .child(
-                                Button::new("sidebar-locate-session")
+                                Button::new("sidebar-toolbar-more")
                                     .small()
                                     .ghost()
                                     .compact()
                                     .w(px(28.0))
                                     .h(px(28.0))
-                                    .icon(sidebar_icon("icons/vibex/crosshair.svg"))
-                                    .tooltip(locale::text(
-                                        "Locate Current Session",
-                                        "定位当前会话",
-                                        "定位目前工作階段",
-                                    ))
-                                    .disabled(self.selected_session_id.is_none())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.locate_selected_session(window, cx)
-                                    })),
+                                    .icon(IconName::Ellipsis)
+                                    .tooltip(locale::text("More", "更多", "更多"))
+                                    .dropdown_menu(move |menu, _, cx| {
+                                        Self::build_sidebar_toolbar_more_menu(
+                                            menu,
+                                            toolbar_more_entity.clone(),
+                                            toolbar_more_state,
+                                            cx,
+                                        )
+                                    })
+                                    .anchor(gpui::Anchor::TopRight),
                             )
                             .child(
                                 Button::new("sidebar-collapse-all")
@@ -17811,23 +17812,22 @@ impl VibexWorkbench {
                                     })),
                             )
                             .child(
-                                Button::new("sidebar-toolbar-more")
+                                Button::new("sidebar-locate-session")
                                     .small()
                                     .ghost()
                                     .compact()
                                     .w(px(28.0))
                                     .h(px(28.0))
-                                    .icon(IconName::Ellipsis)
-                                    .tooltip(locale::text("More", "更多", "更多"))
-                                    .dropdown_menu(move |menu, _, cx| {
-                                        Self::build_sidebar_toolbar_more_menu(
-                                            menu,
-                                            toolbar_more_entity.clone(),
-                                            toolbar_more_state,
-                                            cx,
-                                        )
-                                    })
-                                    .anchor(gpui::Anchor::TopRight),
+                                    .icon(sidebar_icon("icons/vibex/crosshair.svg"))
+                                    .tooltip(locale::text(
+                                        "Locate Current Session",
+                                        "定位当前会话",
+                                        "定位目前工作階段",
+                                    ))
+                                    .disabled(self.selected_session_id.is_none())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.locate_selected_session(window, cx)
+                                    })),
                             )
                             .child(
                                 Button::new("sidebar-new-project")
@@ -45932,7 +45932,7 @@ mod tests {
             .find("Button::new(\"sidebar-search-sessions\")")
             .expect("search control should exist");
 
-        assert!(locate < collapse && collapse < more && more < create && create < search);
+        assert!(more < collapse && collapse < locate && locate < create && create < search);
         assert!(!sidebar.contains("Button::new(\"sidebar-new-folder\")"));
         assert!(!sidebar.contains("Button::new(\"sidebar-toggle-hierarchy\")"));
         assert!(!sidebar.contains("Button::new(\"sidebar-toggle-batch\")"));
