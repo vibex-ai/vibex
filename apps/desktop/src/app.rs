@@ -253,6 +253,9 @@ const AGENT_TURN_PREVIEW_VISIBLE_FILE_COUNT: usize = 2;
 const AGENT_TURN_PREVIEW_RAIL_TRANSITION_DURATION: Duration = Duration::from_millis(160);
 const AGENT_TURN_PREVIEW_CARD_TRANSITION_DURATION: Duration = Duration::from_millis(150);
 const AGENT_TIMELINE_NEAR_BOTTOM_THRESHOLD_PX: f32 = 96.0;
+const AGENT_TIMELINE_BOTTOM_CONTROL_REVEAL_THRESHOLD_PX: f32 = 240.0;
+const AGENT_TIMELINE_BOTTOM_CONTROL_HEIGHT_PX: f32 = 32.0;
+const AGENT_TIMELINE_BOTTOM_CONTROL_TRANSITION_DURATION: Duration = Duration::from_millis(140);
 const AGENT_TIMELINE_SCROLL_IDLE_DELAY: Duration = Duration::from_millis(160);
 const AGENT_TURN_DURATION_TICK_INTERVAL: Duration = Duration::from_secs(1);
 const AUTO_CONTINUE_COUNTDOWN_SECONDS: u8 = 5;
@@ -2803,12 +2806,14 @@ fn timeline_should_resume_follow_after_scroll_idle(
 fn timeline_should_show_bottom_control(
     scrollable: bool,
     following_bottom: bool,
-    unread_count: u32,
     distance_to_bottom: f32,
+    currently_visible: bool,
 ) -> bool {
     scrollable
-        && (unread_count > 0
-            || (!following_bottom && distance_to_bottom > AGENT_TIMELINE_NEAR_BOTTOM_THRESHOLD_PX))
+        && !following_bottom
+        && distance_to_bottom > AGENT_TIMELINE_NEAR_BOTTOM_THRESHOLD_PX
+        && (currently_visible
+            || distance_to_bottom >= AGENT_TIMELINE_BOTTOM_CONTROL_REVEAL_THRESHOLD_PX)
 }
 
 fn timeline_should_auto_follow_content(
@@ -3639,6 +3644,9 @@ pub struct VibexWorkbench {
     timeline_scroll: VirtualListScrollHandle,
     timeline_scroll_to_latest_pending: bool,
     timeline_scroll_wheel_idle_task: Option<Task<()>>,
+    timeline_bottom_control_visible: bool,
+    timeline_bottom_control_mounted: bool,
+    timeline_bottom_control_close_task: Option<Task<()>>,
     timeline_duration_tick_task: Option<Task<()>>,
     timeline_scrollbar_interaction_active: bool,
     timeline_row_sizes: Rc<Vec<Size<gpui::Pixels>>>,
@@ -4237,6 +4245,9 @@ impl VibexWorkbench {
             timeline_scroll: VirtualListScrollHandle::new(),
             timeline_scroll_to_latest_pending: false,
             timeline_scroll_wheel_idle_task: None,
+            timeline_bottom_control_visible: false,
+            timeline_bottom_control_mounted: false,
+            timeline_bottom_control_close_task: None,
             timeline_duration_tick_task: None,
             timeline_scrollbar_interaction_active: false,
             timeline_row_sizes: Rc::new(Vec::new()),
@@ -7815,6 +7826,9 @@ impl VibexWorkbench {
         self.agent_error = None;
         self.timeline_scroll_to_latest_pending = false;
         self.timeline_scroll_wheel_idle_task = None;
+        self.timeline_bottom_control_visible = false;
+        self.timeline_bottom_control_mounted = false;
+        self.timeline_bottom_control_close_task = None;
         self.timeline_duration_tick_task = None;
         self.timeline_scrollbar_interaction_active = false;
         self.composer_terminals.clear();
@@ -8915,6 +8929,46 @@ impl VibexWorkbench {
 
     fn timeline_is_near_bottom(&self) -> bool {
         self.timeline_distance_to_bottom() <= AGENT_TIMELINE_NEAR_BOTTOM_THRESHOLD_PX
+    }
+
+    fn sync_timeline_bottom_control(&mut self, scrollable: bool, cx: &mut Context<Self>) {
+        let should_be_visible = timeline_should_show_bottom_control(
+            scrollable,
+            self.timeline_follow.following_bottom,
+            self.timeline_distance_to_bottom(),
+            self.timeline_bottom_control_visible,
+        );
+        if self.timeline_bottom_control_visible == should_be_visible {
+            if !should_be_visible
+                && self.timeline_bottom_control_mounted
+                && self.ui_state.appearance.reduced_motion
+            {
+                self.timeline_bottom_control_close_task = None;
+                self.timeline_bottom_control_mounted = false;
+            }
+            return;
+        }
+
+        self.timeline_bottom_control_close_task = None;
+        self.timeline_bottom_control_visible = should_be_visible;
+        if should_be_visible {
+            self.timeline_bottom_control_mounted = true;
+        } else if self.ui_state.appearance.reduced_motion {
+            self.timeline_bottom_control_mounted = false;
+        } else if self.timeline_bottom_control_mounted {
+            self.timeline_bottom_control_close_task = Some(cx.spawn(async move |entity, cx| {
+                cx.background_executor()
+                    .timer(AGENT_TIMELINE_BOTTOM_CONTROL_TRANSITION_DURATION)
+                    .await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.timeline_bottom_control_close_task = None;
+                    if !this.timeline_bottom_control_visible {
+                        this.timeline_bottom_control_mounted = false;
+                        cx.notify();
+                    }
+                });
+            }));
+        }
     }
 
     fn sync_timeline_duration_tick(&mut self, has_incomplete_turn: bool, cx: &mut Context<Self>) {
@@ -22197,12 +22251,9 @@ impl VibexWorkbench {
         let strings = self.strings();
         let content_max_width = session_content_max_width(self.ui_state.session.content_width);
         let pending_permission = turns_summary.has_pending_permission;
-        let timeline_bottom_control_visible = timeline_should_show_bottom_control(
-            self.timeline_scroll.max_offset().y > px(0.0),
-            self.timeline_follow.following_bottom,
-            self.timeline_follow.unread_count,
-            self.timeline_distance_to_bottom(),
-        );
+        self.sync_timeline_bottom_control(self.timeline_scroll.max_offset().y > px(0.0), cx);
+        let timeline_bottom_control_visible = self.timeline_bottom_control_visible;
+        let timeline_bottom_control_mounted = self.timeline_bottom_control_mounted;
         let turn_preview_rail = (self.ui_state.session.turn_preview_rail && !turns.is_empty())
             .then(|| self.render_agent_turn_preview_rail(turns.as_slice(), cx));
         let timeline_surface = div()
@@ -22414,7 +22465,7 @@ impl VibexWorkbench {
                     })
                     .child(timeline_surface),
             )
-            .when(timeline_bottom_control_visible, |this| {
+            .when(timeline_bottom_control_mounted, |this| {
                 let button = Button::new("follow-agent-bottom").small().primary();
                 let button = if self.timeline_follow.unread_count > 0 {
                     button.label(match self.resolved_locale() {
@@ -22437,16 +22488,36 @@ impl VibexWorkbench {
                             locale::ResolvedLocale::ZhTw => "捲動到會話底部",
                         })
                 };
-                this.child(
-                    h_flex().flex_none().justify_center().pb_1().child(
-                        button.on_click(cx.listener(|this, _, _, cx| {
-                            this.timeline_scroll_wheel_idle_task = None;
-                            this.timeline_follow.set_following_bottom(true);
-                            this.request_timeline_scroll_to_latest();
-                            cx.notify();
-                        })),
-                    ),
-                )
+                let control = h_flex()
+                    .flex_none()
+                    .h(px(AGENT_TIMELINE_BOTTOM_CONTROL_HEIGHT_PX))
+                    .items_center()
+                    .justify_center()
+                    .overflow_hidden()
+                    .child(button.on_click(cx.listener(|this, _, _, cx| {
+                        this.timeline_scroll_wheel_idle_task = None;
+                        this.timeline_follow.set_following_bottom(true);
+                        this.request_timeline_scroll_to_latest();
+                        cx.notify();
+                    })));
+                let control = if self.ui_state.appearance.reduced_motion {
+                    control.into_any_element()
+                } else if timeline_bottom_control_visible {
+                    Transition::new(AGENT_TIMELINE_BOTTOM_CONTROL_TRANSITION_DURATION)
+                        .ease(ease_out_cubic)
+                        .height(px(0.0), px(AGENT_TIMELINE_BOTTOM_CONTROL_HEIGHT_PX))
+                        .fade(0.0, 1.0)
+                        .apply(control, "agent-timeline-bottom-control-open")
+                        .into_any_element()
+                } else {
+                    Transition::new(AGENT_TIMELINE_BOTTOM_CONTROL_TRANSITION_DURATION)
+                        .ease(ease_out_cubic)
+                        .height(px(AGENT_TIMELINE_BOTTOM_CONTROL_HEIGHT_PX), px(0.0))
+                        .fade(1.0, 0.0)
+                        .apply(control, "agent-timeline-bottom-control-close")
+                        .into_any_element()
+                };
+                this.child(control)
             })
             .child(composer)
             .into_any_element()
@@ -41964,23 +42035,43 @@ mod tests {
     }
 
     #[test]
-    fn timeline_bottom_control_covers_unread_and_distant_reading_positions() {
-        assert!(!timeline_should_show_bottom_control(false, false, 0, 500.0));
-        assert!(!timeline_should_show_bottom_control(true, true, 0, 500.0));
+    fn timeline_bottom_control_uses_reveal_and_near_bottom_hysteresis() {
+        assert!(!timeline_should_show_bottom_control(
+            false, false, 500.0, false
+        ));
+        assert!(!timeline_should_show_bottom_control(
+            true, true, 500.0, false
+        ));
         assert!(!timeline_should_show_bottom_control(
             true,
             false,
-            0,
             AGENT_TIMELINE_NEAR_BOTTOM_THRESHOLD_PX,
+            true,
+        ));
+        assert!(!timeline_should_show_bottom_control(
+            true,
+            false,
+            AGENT_TIMELINE_BOTTOM_CONTROL_REVEAL_THRESHOLD_PX - 1.0,
+            false,
         ));
         assert!(timeline_should_show_bottom_control(
             true,
             false,
-            0,
-            AGENT_TIMELINE_NEAR_BOTTOM_THRESHOLD_PX + 1.0,
+            AGENT_TIMELINE_BOTTOM_CONTROL_REVEAL_THRESHOLD_PX,
+            false,
         ));
-        assert!(!timeline_should_show_bottom_control(false, false, 2, 0.0));
-        assert!(timeline_should_show_bottom_control(true, false, 2, 0.0));
+        assert!(timeline_should_show_bottom_control(
+            true,
+            false,
+            AGENT_TIMELINE_NEAR_BOTTOM_THRESHOLD_PX + 1.0,
+            true,
+        ));
+        assert!(!timeline_should_show_bottom_control(
+            true,
+            false,
+            AGENT_TIMELINE_NEAR_BOTTOM_THRESHOLD_PX,
+            false,
+        ));
 
         let source = include_str!("app.rs");
         let workbench = source
@@ -41989,6 +42080,10 @@ mod tests {
             .map(|(body, _)| body)
             .expect("agent workbench renderer should remain inspectable");
         assert!(workbench.contains("Icon::new(IconName::ArrowDown)"));
+        assert!(workbench.contains("agent-timeline-bottom-control-open"));
+        assert!(workbench.contains("agent-timeline-bottom-control-close"));
+        assert!(workbench.contains(".fade(0.0, 1.0)"));
+        assert!(workbench.contains(".fade(1.0, 0.0)"));
         assert!(!workbench.contains("icons/vibex/vibex-mark.svg"));
     }
 
