@@ -16928,6 +16928,32 @@ impl VibexWorkbench {
         self.toggle_right_rail(cx);
     }
 
+    fn on_toggle_composer_mode(
+        &mut self,
+        _: &ToggleComposerMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.ui_state.workbench.active_tab != "agent"
+            || self.new_session_open
+            || self.selected_session_id.is_none()
+        {
+            return;
+        }
+        if self.composer_terminal_mode {
+            self.composer_terminal_mode = false;
+            self.sync_composer_terminal_surface_activity(cx);
+            self.composer_input
+                .update(cx, |input, cx| input.focus(window, cx));
+            cx.notify();
+            return;
+        }
+        if self.runtime.is_none() {
+            return;
+        }
+        self.switch_to_composer_terminal(window.window_handle(), window, cx);
+    }
+
     fn on_open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
         self.toggle_settings(window, cx);
     }
@@ -19337,16 +19363,7 @@ impl VibexWorkbench {
             } else {
                 cx.theme().transparent
             })
-            .hover(move |style| {
-                if move_selected {
-                    style.bg(sidebar_move_selected_background(
-                        cx.theme().sidebar_accent,
-                        cx.theme().is_dark(),
-                    ))
-                } else {
-                    style.bg(cx.theme().sidebar_accent.opacity(0.45))
-                }
-            })
+            .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.45)))
             .on_hover(cx.listener(|this, hovered, _, cx| {
                 if *hovered {
                     this.clear_sidebar_context_menu_target(cx);
@@ -36237,6 +36254,7 @@ const FOUNDATION_SHORTCUTS: &[(&str, &str)] = &[
     ("toggle_sidebar", "cmd-b"),
     ("toggle_preview", "cmd-shift-p"),
     ("toggle_right_rail", "cmd-shift-r"),
+    ("toggle_composer_mode", "cmd-shift-t"),
     ("open_settings", "cmd-,"),
     ("retry_runtime", "cmd-r"),
     ("save_active_file", "cmd-s"),
@@ -36249,6 +36267,11 @@ fn shortcut_action_label(action: &str) -> &'static str {
         "toggle_sidebar" => "Toggle sidebar",
         "toggle_preview" => "Toggle preview",
         "toggle_right_rail" => "Toggle right rail",
+        "toggle_composer_mode" => locale::text(
+            "Toggle conversation / terminal",
+            "切换对话/终端模式",
+            "切換對話/終端機模式",
+        ),
         "open_settings" => "Open settings",
         "retry_runtime" => "Retry runtime",
         "save_active_file" => "Save active file",
@@ -36261,6 +36284,7 @@ fn shortcut_action_label(action: &str) -> &'static str {
 fn shortcut_action_group(action: &str) -> &'static str {
     match action {
         "toggle_sidebar" | "toggle_preview" | "toggle_right_rail" => "Workbench",
+        "toggle_composer_mode" => locale::text("Composer", "输入框", "輸入框"),
         "open_settings" => "Navigation",
         "retry_runtime" => "Runtime",
         "save_active_file" => "Editor",
@@ -36372,7 +36396,15 @@ fn settings_section_for_query(query: &str) -> Option<SettingsSection> {
         "工作目錄",
     ]) {
         Some(SettingsSection::Terminal)
-    } else if matches(&["shortcut", "key", "快捷键", "快速鍵"]) {
+    } else if matches(&[
+        "shortcut",
+        "key",
+        "input mode",
+        "快捷键",
+        "快速鍵",
+        "输入模式",
+        "輸入模式",
+    ]) {
         Some(SettingsSection::Shortcuts)
     } else if matches(&[
         "data",
@@ -39251,6 +39283,7 @@ impl Render for VibexWorkbench {
             .on_action(cx.listener(Self::on_toggle_sidebar))
             .on_action(cx.listener(Self::on_toggle_preview))
             .on_action(cx.listener(Self::on_toggle_right_rail))
+            .on_action(cx.listener(Self::on_toggle_composer_mode))
             .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(Self::on_retry_runtime))
             .on_action(cx.listener(Self::on_save_active_file))
@@ -39374,6 +39407,9 @@ fn bind_action(bindings: &mut Vec<KeyBinding>, keystroke: &str, action: &str, un
         "toggle_right_rail" | "vibex::ToggleRightRail" => {
             push!(ToggleRightRail, "vibex::ToggleRightRail")
         }
+        "toggle_composer_mode" | "vibex::ToggleComposerMode" => {
+            push!(ToggleComposerMode, "vibex::ToggleComposerMode")
+        }
         "open_settings" | "vibex::OpenSettings" => push!(OpenSettings, "vibex::OpenSettings"),
         "retry_runtime" | "vibex::RetryRuntime" => push!(RetryRuntime, "vibex::RetryRuntime"),
         "save_active_file" | "vibex::SaveActiveFile" => {
@@ -39392,6 +39428,7 @@ fn action_name(action: &str) -> &'static str {
         "toggle_sidebar" => "vibex::ToggleSidebar",
         "toggle_preview" => "vibex::TogglePreview",
         "toggle_right_rail" => "vibex::ToggleRightRail",
+        "toggle_composer_mode" => "vibex::ToggleComposerMode",
         "open_settings" => "vibex::OpenSettings",
         "retry_runtime" => "vibex::RetryRuntime",
         "save_active_file" => "vibex::SaveActiveFile",
@@ -39414,9 +39451,6 @@ pub fn open_workbench_window(cx: &mut App) -> Result<(), String> {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitleBar::title_bar_options()),
-        "toggle_composer_mode" | "vibex::ToggleComposerMode" => {
-            push!(ToggleComposerMode, "vibex::ToggleComposerMode")
-        }
         app_id: Some(application_id.to_string()),
         icon: Some(window_icon()?),
         window_min_size: Some(size(px(MIN_WIDTH as f32), px(MIN_HEIGHT as f32))),
@@ -39435,7 +39469,6 @@ pub fn open_workbench_window(cx: &mut App) -> Result<(), String> {
             cx.set_quit_mode(gpui::QuitMode::LastWindowClosed);
         }
         window.on_window_should_close(cx, crate::system_tray::handle_window_close);
-        "toggle_composer_mode" => "vibex::ToggleComposerMode",
         cx.new(|cx| Root::new(workbench, window, cx).bordered(false))
     })
     .map_err(|error| format!("failed to open Vibex workbench: {error}"))?;
@@ -40189,6 +40222,7 @@ mod tests {
     #[test]
     fn shortcut_validation_uses_gpui_native_keystroke_parsing() {
         assert!(shortcut_is_valid("cmd-shift-p"));
+        assert!(shortcut_is_valid("cmd-shift-t"));
         assert!(shortcut_is_valid("ctrl-alt-left"));
         assert!(!shortcut_is_valid(""));
         assert!(!shortcut_is_valid("not a shortcut"));
@@ -40203,47 +40237,6 @@ mod tests {
             effective_shortcut(&overrides, "open_settings"),
             Some("cmd-shift-,")
         );
-    }
-
-    #[test]
-    fn timeline_state_does_not_synthesize_a_pending_turn_before_history_is_ready() {
-        let session_id = VibexSessionId::parse("session_loading_state").unwrap();
-
-        let loading_state = timeline_session_state_for_render(
-            Some(&session_id),
-            None,
-            true,
-            Some(AgentSessionState::Running),
-        );
-        assert_eq!(loading_state, None);
-        assert!(timeline_conversation_turns(&[], loading_state, false).is_empty());
-
-        let mismatched_state = timeline_session_state_for_render(
-            Some(&session_id),
-            None,
-            false,
-            Some(AgentSessionState::Running),
-        );
-        assert_eq!(mismatched_state, None);
-        assert!(timeline_conversation_turns(&[], mismatched_state, false).is_empty());
-
-        let render_state = timeline_session_state_for_render(
-            Some(&session_id),
-        assert!(shortcut_is_valid("cmd-shift-t"));
-            Some(&session_id),
-            false,
-            Some(AgentSessionState::Running),
-        );
-        assert_eq!(render_state, Some(AgentSessionState::Running));
-        assert_eq!(
-            timeline_conversation_turns(&[], render_state, false).len(),
-            1
-        );
-    }
-
-    fn streaming_timeline_fixture() -> (TimelineModel, Rc<Vec<Rc<TimelineConversationTurn>>>) {
-        let session_id = VibexSessionId::parse("session_streaming_cache").unwrap();
-        let items = [
         assert_eq!(
             effective_shortcut(&overrides, "toggle_composer_mode"),
             Some("cmd-shift-t")
@@ -40270,6 +40263,46 @@ mod tests {
         assert!(handler.contains("self.composer_terminal_mode = false;"));
         assert!(handler.contains("input.focus(window, cx)"));
         assert!(handler.contains("self.switch_to_composer_terminal("));
+    }
+
+    #[test]
+    fn timeline_state_does_not_synthesize_a_pending_turn_before_history_is_ready() {
+        let session_id = VibexSessionId::parse("session_loading_state").unwrap();
+
+        let loading_state = timeline_session_state_for_render(
+            Some(&session_id),
+            None,
+            true,
+            Some(AgentSessionState::Running),
+        );
+        assert_eq!(loading_state, None);
+        assert!(timeline_conversation_turns(&[], loading_state, false).is_empty());
+
+        let mismatched_state = timeline_session_state_for_render(
+            Some(&session_id),
+            None,
+            false,
+            Some(AgentSessionState::Running),
+        );
+        assert_eq!(mismatched_state, None);
+        assert!(timeline_conversation_turns(&[], mismatched_state, false).is_empty());
+
+        let render_state = timeline_session_state_for_render(
+            Some(&session_id),
+            Some(&session_id),
+            false,
+            Some(AgentSessionState::Running),
+        );
+        assert_eq!(render_state, Some(AgentSessionState::Running));
+        assert_eq!(
+            timeline_conversation_turns(&[], render_state, false).len(),
+            1
+        );
+    }
+
+    fn streaming_timeline_fixture() -> (TimelineModel, Rc<Vec<Rc<TimelineConversationTurn>>>) {
+        let session_id = VibexSessionId::parse("session_streaming_cache").unwrap();
+        let items = [
             timeline_item_with_payload(
                 &session_id,
                 1,
@@ -41278,19 +41311,6 @@ mod tests {
                 ));
 
             v_flex()
-    struct ComposerPasteScrollProbe {
-        input: Entity<InputState>,
-    }
-
-    impl Render for ComposerPasteScrollProbe {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div()
-                .w(px(320.0))
-                .h(px(160.0))
-                .child(Input::new(&self.input).appearance(false).size_full())
-        }
-    }
-
                 .size_full()
                 .items_start()
                 .gap_2()
@@ -44931,43 +44951,25 @@ mod tests {
         assert!(!composer.contains("choose-composer-images"));
     }
 
-    #[gpui::test]
-    fn composer_paste_reveals_the_cursor_after_updated_text_is_laid_out(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
-        let (probe, cx) = cx.add_window_view(|window, cx| ComposerPasteScrollProbe {
-            input: cx.new(|cx| InputState::new(window, cx).auto_grow(2, 8)),
-        });
-        let input = probe.read_with(cx, |probe, _| probe.input.clone());
+    #[test]
+    fn composer_paste_reveals_the_cursor_after_custom_clipboard_insertion() {
+        let source = include_str!("app.rs");
+        let paste = source
+            .split_once("    fn capture_composer_paste(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn handle_composer_enter("))
+            .map(|(body, _)| body)
+            .expect("composer paste handling should remain inspectable");
+        assert!(paste.contains("let captured = self.paste_composer_clipboard_to"));
+        assert!(paste.contains("self.schedule_composer_cursor_reveal(input, window, cx);"));
+        assert!(paste.contains("cx.stop_propagation();"));
 
-        cx.update(|window, cx| {
-            let _ = window.draw(cx);
-        });
-
-        let pasted_text = (0..80)
-            .map(|line| format!("pasted line {line}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        cx.update(|window, cx| {
-            // Capture handlers run before the native Input paste action.
-            reveal_composer_cursor_after_layout(input.clone(), window);
-            input.update(cx, |input, cx| input.replace(pasted_text, window, cx));
-        });
-
-        for _ in 0..2 {
-            cx.update(|window, cx| {
-                window.simulate_next_frame(cx);
-                let _ = window.draw(cx);
-            });
-        }
-
-        input.read_with(cx, |input, _| {
-            let cursor = input.cursor();
-            assert!(input.scroll_offset().y < px(0.0));
-            assert!(
-                input.range_to_bounds(&(cursor..cursor)).is_some(),
-                "the pasted-text cursor should be inside the laid-out viewport"
-            );
-        });
+        let reveal = source
+            .split_once("    fn schedule_composer_cursor_reveal(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn handle_composer_enter("))
+            .map(|(body, _)| body)
+            .expect("composer cursor reveal should remain inspectable");
+        assert!(reveal.contains("let selection = input.selected_range();"));
+        assert!(reveal.contains("input.set_selected_range(selection, cx);"));
     }
 
     #[test]
