@@ -8165,6 +8165,7 @@ impl VibexWorkbench {
         record_history: bool,
         cx: &mut Context<Self>,
     ) {
+        self.clear_sidebar_move_selection();
         self.new_session_open = false;
         self.new_session_error = None;
         mark_agent_session_read(&mut self.unread_agent_completion_session_ids, &session_id);
@@ -45328,6 +45329,12 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn update_pending_new_session_workspace("))
             .map(|(body, _)| body)
             .expect("pending-session navigation should remain inspectable");
+        let selection = source
+            .split_once("    fn select_session_with_history(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn load_agent_session_timeline("))
+            .map(|(body, _)| body)
+            .expect("pending-session selection should remain inspectable");
+        assert!(selection.contains("self.clear_sidebar_move_selection();"));
         let snapshot = pending_open
             .find("self.upsert_session_snapshot(session);")
             .expect("the pending Session should enter the sidebar source immediately");
