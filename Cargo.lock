@@ -10116,6 +10116,7 @@ name = "vibex-mobile"
 version = "0.1.0-rc.1"
 dependencies = [
  "base64",
+ "chrono",
  "futures-channel",
  "futures-util",
  "gpui",

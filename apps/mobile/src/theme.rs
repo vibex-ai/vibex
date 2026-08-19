@@ -24,6 +24,13 @@ pub const ACCENT_BLUE: u32 = 0x61afef;
 pub const ACCENT_YELLOW: u32 = 0xe5c07b;
 pub const ACCENT_RED: u32 = 0xe06c75;
 pub const ACCENT_DIM: u32 = 0x505050;
+pub const ACCENT_PURPLE: u32 = 0xc678dd;
+
+pub const SIDEBAR_BG: u32 = 0x161617;
+pub const SIDEBAR_SELECTED_BG: u32 = 0x252527;
+pub const SIDEBAR_TEXT_PRIMARY: u32 = 0xe7e7e7;
+pub const SIDEBAR_TEXT_SECONDARY: u32 = 0xb8b8b8;
+pub const SIDEBAR_TEXT_MUTED: u32 = 0x747474;
 
 // ---------------------------------------------------------------------------
 // Spacing and typography
@@ -57,7 +64,7 @@ pub const HEADER_HEIGHT: f32 = 40.0;
 pub const HEADER_BUTTON_SIZE: f32 = 40.0;
 /// Drawer and overlay headers have a little more room for the compact action
 /// cluster while the session page keeps the shorter workbench header.
-pub const DRAWER_HEADER_HEIGHT: f32 = 56.0;
+pub const DRAWER_HEADER_HEIGHT: f32 = 52.0;
 /// Minimum tappable edge for controls that are not header buttons.
 pub const TOUCH_TARGET: f32 = 44.0;
 /// Caps centered panel content so tablets do not stretch a phone layout.
@@ -67,9 +74,9 @@ pub const RADIUS_CARD: f32 = 8.0;
 pub const RADIUS_CONTROL: f32 = 6.0;
 
 pub const DRAWER_ROW_HEIGHT: f32 = 52.0;
-pub const SIDEBAR_ROW_HEIGHT: f32 = 44.0;
+pub const SIDEBAR_ROW_HEIGHT: f32 = 40.0;
 pub const DRAWER_ACTION_HEIGHT: f32 = 40.0;
-pub const DRAWER_SECTION_HEIGHT: f32 = 32.0;
+pub const DRAWER_SECTION_HEIGHT: f32 = 40.0;
 pub const DRAWER_DRAG_THRESHOLD: f32 = 10.0;
 pub const DRAWER_VERTICAL_CANCEL_RATIO: f32 = 1.25;
 /// Fraction of the viewport a page must travel before settling on the next page.
@@ -120,6 +127,26 @@ pub fn border_subtle() -> Hsla {
 
 pub fn row_pressed_bg() -> Hsla {
     hsla(0.0, 0.0, 1.0, 0.10)
+}
+
+pub fn sidebar_bg() -> Hsla {
+    rgb(SIDEBAR_BG).into()
+}
+
+pub fn sidebar_selected_bg() -> Hsla {
+    rgb(SIDEBAR_SELECTED_BG).into()
+}
+
+pub fn sidebar_text_primary() -> Hsla {
+    rgb(SIDEBAR_TEXT_PRIMARY).into()
+}
+
+pub fn sidebar_text_secondary() -> Hsla {
+    rgb(SIDEBAR_TEXT_SECONDARY).into()
+}
+
+pub fn sidebar_text_muted() -> Hsla {
+    rgb(SIDEBAR_TEXT_MUTED).into()
 }
 
 pub fn backdrop(opacity: f32) -> Hsla {

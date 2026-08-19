@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use futures_util::StreamExt as _;
 use gpui::{
-    Animation, AnimationExt as _, App, AppContext as _, Context, ElementId, Entity, FontWeight,
-    IntoElement, KeyBinding, ListAlignment, ListState, MouseButton, MouseUpEvent,
+    Animation, AnimationExt as _, App, AppContext as _, Context, ElementId, Entity, Focusable,
+    FontWeight, IntoElement, KeyBinding, ListAlignment, ListState, MouseButton, MouseUpEvent,
     ParentElement as _, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, Styled as _, Task,
     TouchPhase, UniformListScrollHandle, WeakEntity, Window, div, ease_in_out, ease_out_quint,
     list, prelude::*, px, rgb, svg, uniform_list,
@@ -17,13 +17,14 @@ use vibex_backend::{
 };
 use vibex_core::{
     AgentSessionState, ContinueAgentTurnRequest, CreateAgentSessionRequest, ElicitationFieldKind,
-    ElicitationResolutionAction, PermissionResolution, PermissionResponseKind,
-    PermissionRiskCategory, RemoteDeepLinkResolutionStatus, RemoteLanPairingRequestState,
-    RenameAgentSessionRequest, RequestId, ResolvePermissionRequest, RuntimeOptionAvailability,
-    RuntimeSelectionInteraction, SendAgentMessageRequest, SessionRuntimeFeature,
-    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
-    SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest, TimelinePayload, VibexSessionId,
-    WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation, unix_timestamp_ms,
+    ElicitationResolutionAction, OpenWorkspaceRequest, PermissionResolution,
+    PermissionResponseKind, PermissionRiskCategory, RemoteDeepLinkResolutionStatus,
+    RemoteLanPairingRequestState, RenameAgentSessionRequest, RequestId, ResolvePermissionRequest,
+    RuntimeOptionAvailability, RuntimeSelectionInteraction, SendAgentMessageRequest,
+    SessionRuntimeFeature, SessionRuntimeFeatureKind, SessionRuntimeOption,
+    SessionRuntimeOptionCatalog, SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest,
+    TimelinePayload, VibexSessionId, WorkspaceMode, WorkspaceRecord,
+    agent_session_turn_requires_continuation, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     AgentSidebarRow, AgentSidebarRowKind, RuntimeCascadeChoice, RuntimeCascadeProjection,
@@ -137,6 +138,7 @@ enum MobileOverlay {
     Hosts,
     Settings,
     Usage,
+    NewProject,
 }
 
 #[derive(Clone)]
@@ -231,6 +233,10 @@ pub struct MobileApp {
     timeline_list: ListState,
     drawer_scroll: UniformListScrollHandle,
     settings_scroll: ScrollHandle,
+    sidebar_search_input: Entity<TextInput>,
+    sidebar_search_open: bool,
+    sidebar_projects_initialized: bool,
+    _sidebar_search_subscription: gpui::Subscription,
     drawer_open: bool,
     drawer_offset: f32,
     drawer_gesture: Option<DrawerGesture>,
@@ -258,6 +264,9 @@ pub struct MobileApp {
     lan_pairing_task: Option<Task<()>>,
     operation_busy: bool,
     new_session_busy: bool,
+    new_project_input: Entity<TextInput>,
+    new_project_busy: bool,
+    new_project_error: Option<String>,
     session_action: Option<SessionActionPrompt>,
     session_action_input: Entity<TextInput>,
     session_action_busy: bool,
@@ -290,6 +299,8 @@ impl MobileApp {
             .as_ref()
             .map(|hosts| hosts.iter().map(MobileHostEntry::from_bundle).collect())
             .unwrap_or_default();
+        let sidebar_search_input = cx.new(|cx| TextInput::new(locale::common("Search"), cx));
+        let sidebar_search_subscription = cx.observe(&sidebar_search_input, |_, _, cx| cx.notify());
         let mut app = Self {
             storage,
             mode,
@@ -308,6 +319,10 @@ impl MobileApp {
             timeline_list: timeline_list_state(0),
             drawer_scroll: UniformListScrollHandle::new(),
             settings_scroll: ScrollHandle::new(),
+            sidebar_search_input,
+            sidebar_search_open: false,
+            sidebar_projects_initialized: false,
+            _sidebar_search_subscription: sidebar_search_subscription,
             drawer_open: false,
             drawer_offset: 0.0,
             drawer_gesture: None,
@@ -335,6 +350,10 @@ impl MobileApp {
             lan_pairing_task: None,
             operation_busy: false,
             new_session_busy: false,
+            new_project_input: cx
+                .new(|cx| TextInput::new(locale::text("Project path", "项目路径", "專案路徑"), cx)),
+            new_project_busy: false,
+            new_project_error: None,
             session_action: None,
             session_action_input: cx.new(|cx| {
                 TextInput::new(locale::text("Session name", "会话名称", "工作階段名稱"), cx)
@@ -568,6 +587,9 @@ impl MobileApp {
                     workbench.update(cx, |workbench, _| workbench.suspend());
                 }
                 self.reset_drawers();
+                self.reset_sidebar_ui(cx);
+                self.workspaces.clear();
+                self.workspace_summaries.clear();
                 self.pending_workbench_surface = None;
                 self.clear_overlay();
                 self.pairing_from_hosts = false;
@@ -1741,7 +1763,12 @@ impl MobileApp {
                 .iter()
                 .map(|session| session.id.as_str().to_string()),
         );
-        self.sidebar_state.collapsed_ids = collapsed;
+        self.sidebar_state.collapsed_ids = if self.sidebar_projects_initialized {
+            collapsed
+        } else {
+            self.sidebar_projects_initialized = true;
+            BTreeSet::new()
+        };
         self.sidebar_state.selected_ids.clear();
         if let Some(selected) = self
             .controller
@@ -1754,9 +1781,61 @@ impl MobileApp {
         }
     }
 
+    fn reset_sidebar_ui(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_state = SidebarState::default();
+        self.sidebar_projects_initialized = false;
+        self.sidebar_search_open = false;
+        self.sidebar_search_input
+            .update(cx, |input, cx| input.set_text("", cx));
+    }
+
     fn toggle_project(&mut self, project_id: String, cx: &mut Context<Self>) {
         if !self.sidebar_state.collapsed_ids.insert(project_id.clone()) {
             self.sidebar_state.collapsed_ids.remove(&project_id);
+        }
+        cx.notify();
+    }
+
+    fn toggle_all_projects(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let project_ids = self
+            .mobile_sidebar_rows("")
+            .into_iter()
+            .filter(|row| row.kind == AgentSidebarRowKind::Project)
+            .map(|row| row.project_id)
+            .collect::<BTreeSet<_>>();
+        if project_ids.is_empty() {
+            return;
+        }
+        let should_collapse = project_ids
+            .iter()
+            .any(|project_id| !self.sidebar_state.collapsed_ids.contains(project_id));
+        if should_collapse {
+            self.sidebar_state.collapsed_ids.extend(project_ids);
+        } else {
+            self.sidebar_state
+                .collapsed_ids
+                .retain(|project_id| !project_ids.contains(project_id));
+        }
+        cx.notify();
+    }
+
+    fn toggle_sidebar_search(
+        &mut self,
+        _: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sidebar_search_open = !self.sidebar_search_open;
+        if self.sidebar_search_open {
+            self.sidebar_search_input
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window, cx);
+            window.show_soft_keyboard();
+        } else {
+            self.sidebar_search_input
+                .update(cx, |input, cx| input.set_text("", cx));
+            window.hide_soft_keyboard();
         }
         cx.notify();
     }
@@ -1815,6 +1894,92 @@ impl MobileApp {
         self.show_overlay(MobileOverlay::Usage, window, cx);
     }
 
+    fn open_new_project(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.new_project_busy {
+            return;
+        }
+        self.new_project_error = None;
+        self.new_project_input
+            .update(cx, |input, cx| input.set_text("", cx));
+        self.show_overlay(MobileOverlay::NewProject, window, cx);
+        self.new_project_input
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window, cx);
+        window.show_soft_keyboard();
+    }
+
+    fn submit_new_project(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.new_project_busy {
+            return;
+        }
+        let root_path = self.new_project_input.read(cx).text().trim().to_string();
+        if root_path.is_empty() {
+            self.new_project_error = Some(
+                locale::text(
+                    "Enter a project path on the desktop host.",
+                    "请输入桌面端上的项目路径。",
+                    "請輸入桌面版上的專案路徑。",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if !backend
+            .capability_snapshot()
+            .workspace
+            .supports(BackendOperation::WorkspaceOpen)
+        {
+            self.new_project_error = Some(
+                locale::text(
+                    "This host cannot open a project remotely.",
+                    "当前主机不支持远程打开项目。",
+                    "目前主機不支援遠端開啟專案。",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let request = MutationRequest::new(OpenWorkspaceRequest {
+            root_path,
+            mode: Some(WorkspaceMode::CurrentCheckout),
+        });
+        let runner =
+            gpui_tokio::Tokio::spawn(cx, async move { backend.open_workspace(request).await });
+        self.new_project_busy = true;
+        self.new_project_error = None;
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.new_project_busy = false;
+                match outcome {
+                    Ok(summary) => {
+                        this.workspaces
+                            .retain(|workspace| workspace.id != summary.workspace.id);
+                        this.workspaces.push(summary.workspace.clone());
+                        this.workspace_summaries
+                            .retain(|candidate| candidate.workspace.id != summary.workspace.id);
+                        this.workspace_summaries.push(summary.clone());
+                        this.ensure_workbench(summary.workspace.id, cx);
+                        this.notice = Some(locale::common("Project added").to_string());
+                        this.dismiss_overlay(None, cx);
+                    }
+                    Err(error) => {
+                        this.new_project_error = Some(error.message);
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
     fn open_workbench_surface(
         &mut self,
         surface: WorkbenchSurface,
@@ -1852,7 +2017,7 @@ impl MobileApp {
         self.error = None;
         self.workspaces.clear();
         self.workspace_summaries.clear();
-        self.sidebar_state = SidebarState::default();
+        self.reset_sidebar_ui(cx);
         window.hide_soft_keyboard();
         cx.notify();
     }
@@ -2506,7 +2671,7 @@ impl MobileApp {
         self.clear_overlay();
         self.workspaces.clear();
         self.workspace_summaries.clear();
-        self.sidebar_state = SidebarState::default();
+        self.reset_sidebar_ui(cx);
         self.known_hosts.clear();
         self.active_host_id = None;
         self.pairing_from_hosts = false;
@@ -5035,7 +5200,7 @@ impl MobileApp {
             )
     }
 
-    fn mobile_sidebar_rows(&self) -> Vec<AgentSidebarRow> {
+    fn mobile_sidebar_rows(&self, query: &str) -> Vec<AgentSidebarRow> {
         let sessions = self
             .controller
             .as_ref()
@@ -5050,7 +5215,7 @@ impl MobileApp {
         {
             sidebar.selected_ids.insert(selected.as_str().to_string());
         }
-        let mut rows = project_sidebar_rows(sessions, &sidebar, "");
+        let mut rows = project_sidebar_rows(sessions, &sidebar, query);
         let project_labels = self
             .workspace_summaries
             .iter()
@@ -5068,6 +5233,44 @@ impl MobileApp {
             {
                 row.label = label.clone();
             }
+        }
+        let normalized_query = query.trim().to_lowercase();
+        let mut visible_project_ids = rows
+            .iter()
+            .filter(|row| row.kind == AgentSidebarRowKind::Project)
+            .map(|row| row.project_id.clone())
+            .collect::<BTreeSet<_>>();
+        for summary in &self.workspace_summaries {
+            let project_id = summary.project.id.as_str().to_string();
+            if visible_project_ids.contains(&project_id)
+                || (!normalized_query.is_empty()
+                    && !summary
+                        .project
+                        .name
+                        .to_lowercase()
+                        .contains(&normalized_query)
+                    && !summary
+                        .project
+                        .root_path
+                        .to_lowercase()
+                        .contains(&normalized_query))
+            {
+                continue;
+            }
+            visible_project_ids.insert(project_id.clone());
+            rows.push(AgentSidebarRow {
+                id: format!("project:{project_id}"),
+                kind: AgentSidebarRowKind::Project,
+                project_id: project_id.clone(),
+                workspace_id: summary.workspace.id.as_str().to_string(),
+                session_id: None,
+                label: summary.project.name.clone(),
+                depth: 0,
+                pinned: false,
+                selected: false,
+                collapsed: sidebar.collapsed_ids.contains(&project_id),
+                state: None,
+            });
         }
         rows
     }
@@ -5092,10 +5295,10 @@ impl MobileApp {
                     .h(px(theme::SIDEBAR_ROW_HEIGHT))
                     .min_h(px(theme::SIDEBAR_ROW_HEIGHT))
                     .rounded(px(theme::RADIUS_CONTROL))
-                    .px(px(theme::SPACING_SM))
+                    .px(px(theme::SPACING_MD))
                     .flex()
                     .items_center()
-                    .gap(px(theme::SPACING_SM))
+                    .gap(px(6.0))
                     .cursor_pointer()
                     .active(|style| style.bg(theme::row_pressed_bg()))
                     .on_mouse_up(
@@ -5107,14 +5310,14 @@ impl MobileApp {
                     .child(
                         svg()
                             .path(chevron)
-                            .size(px(theme::ICON_STATUS + 8.0))
-                            .text_color(theme::text_muted()),
+                            .size(px(12.0))
+                            .text_color(theme::sidebar_text_muted()),
                     )
                     .child(
                         svg()
                             .path("brand/logo.svg")
-                            .size(px(theme::ICON_SM))
-                            .text_color(rgb(0xc678dd)),
+                            .size(px(14.0))
+                            .text_color(rgb(theme::ACCENT_PURPLE)),
                     )
                     .child(
                         div()
@@ -5125,7 +5328,7 @@ impl MobileApp {
                             .whitespace_nowrap()
                             .text_size(px(theme::FONT_BODY))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::text_secondary())
+                            .text_color(theme::sidebar_text_primary())
                             .child(row.label.clone()),
                     )
                     .into_any_element()
@@ -5148,7 +5351,7 @@ impl MobileApp {
                 };
                 let session_id = session.id.clone();
                 let agent_icon = agent_icon_path(&session.agent_id.to_string());
-                let time = session_age_label(session.last_message_at_ms);
+                let time = session_sidebar_time_label(session.last_message_at_ms);
                 let row_id = session.id.as_str().to_string();
                 div()
                     .id(format!("mobile-session-row-{row_id}"))
@@ -5156,15 +5359,11 @@ impl MobileApp {
                     .h(px(theme::SIDEBAR_ROW_HEIGHT))
                     .min_h(px(theme::SIDEBAR_ROW_HEIGHT))
                     .rounded(px(theme::RADIUS_CONTROL))
-                    .px(px(theme::SPACING_MD))
+                    .px(px(theme::SPACING_SM))
                     .flex()
                     .items_center()
-                    .gap(px(theme::SPACING_SM))
-                    .when(is_selected, |row| {
-                        row.bg(theme::bg_card())
-                            .border_1()
-                            .border_color(theme::border_default())
-                    })
+                    .gap(px(7.0))
+                    .when(is_selected, |row| row.bg(theme::sidebar_selected_bg()))
                     .cursor_pointer()
                     .active(|style| style.bg(theme::row_pressed_bg()))
                     .on_mouse_up(
@@ -5173,29 +5372,23 @@ impl MobileApp {
                             this.open_session(session_id.clone(), cx)
                         }),
                     )
-                    .child(
-                        div()
-                            .size(px(theme::ICON_STATUS))
-                            .flex_shrink_0()
-                            .rounded_full()
-                            .bg(rgb(status)),
-                    )
+                    .child(div().w(px(24.0)).flex_shrink_0())
                     .child(
                         svg()
                             .path(agent_icon)
-                            .size(px(theme::ICON_SM))
+                            .size(px(14.0))
                             .flex_shrink_0()
                             .text_color(if is_selected {
                                 theme::text_primary()
                             } else {
-                                theme::text_muted()
+                                theme::sidebar_text_muted()
                             }),
                     )
                     .when(row.pinned, |row| {
                         row.child(
                             svg()
                                 .path("icons/pin.svg")
-                                .size(px(theme::ICON_STATUS + 6.0))
+                                .size(px(11.0))
                                 .text_color(rgb(theme::ACCENT_YELLOW)),
                         )
                     })
@@ -5210,16 +5403,28 @@ impl MobileApp {
                             .text_color(if is_selected {
                                 theme::text_primary()
                             } else {
-                                theme::text_secondary()
+                                theme::sidebar_text_secondary()
                             })
                             .child(row.label.clone()),
                     )
                     .child(
                         div()
+                            .w(px(60.0))
                             .flex_shrink_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_right()
                             .text_size(px(theme::FONT_MICRO))
-                            .text_color(theme::text_muted())
+                            .text_color(theme::sidebar_text_muted())
                             .child(time),
+                    )
+                    .child(
+                        div()
+                            .size(px(theme::ICON_STATUS))
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .bg(rgb(status)),
                     )
                     .into_any_element()
             }
@@ -5600,114 +5805,6 @@ impl MobileApp {
 }
 
 impl MobileApp {
-    fn render_selected_session_actions(
-        &self,
-        sessions: &[vibex_core::AgentSession],
-        cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyElement> {
-        let selected_id = self
-            .controller
-            .as_ref()
-            .and_then(|controller| controller.state.selected_session_id.as_ref())?;
-        let session = sessions.iter().find(|session| &session.id == selected_id)?;
-        let can_manage_session = self.backend.as_ref().is_some_and(|backend| {
-            backend
-                .capability_snapshot()
-                .agent
-                .supports(BackendOperation::AgentManageSession)
-        });
-        if !can_manage_session {
-            return None;
-        }
-        let session_id = session.id.clone();
-        let title = session.title.clone();
-        let rename_id = session_id.clone();
-        let archive_id = session_id.clone();
-        let delete_id = session_id;
-        let rename_title = title.clone();
-        let archive_title = title.clone();
-        let delete_title = title;
-        Some(
-            div()
-                .mx(px(theme::SPACING_SM))
-                .mb(px(theme::SPACING_SM))
-                .flex()
-                .items_center()
-                .gap(px(theme::SPACING_XS))
-                .children(
-                    [
-                        (
-                            "mobile-session-rename",
-                            "icons/pencil.svg",
-                            locale::common("Rename"),
-                            theme::text_muted(),
-                            SessionActionKind::Rename,
-                            rename_id,
-                            rename_title,
-                        ),
-                        (
-                            "mobile-session-archive",
-                            "icons/file-archive.svg",
-                            locale::common("Archive"),
-                            theme::text_muted(),
-                            SessionActionKind::Archive,
-                            archive_id,
-                            archive_title,
-                        ),
-                        (
-                            "mobile-session-delete",
-                            "icons/trash-2.svg",
-                            locale::common("Delete"),
-                            rgb(theme::ACCENT_RED).into(),
-                            SessionActionKind::Delete,
-                            delete_id,
-                            delete_title,
-                        ),
-                    ]
-                    .into_iter()
-                    .map(|(id, icon, label, color, kind, session_id, title)| {
-                        div()
-                            .id(id)
-                            .h(px(theme::DRAWER_ACTION_HEIGHT))
-                            .flex_1()
-                            .min_w_0()
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .border_1()
-                            .border_color(theme::border_subtle())
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .gap(px(theme::SPACING_XS))
-                            .text_size(px(theme::FONT_MICRO))
-                            .text_color(color)
-                            .cursor_pointer()
-                            .active(|style| style.bg(theme::row_pressed_bg()))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.begin_session_action(
-                                        kind,
-                                        session_id.clone(),
-                                        title.clone(),
-                                        cx,
-                                    )
-                                }),
-                            )
-                            .child(
-                                svg()
-                                    .path(icon)
-                                    .size(px(theme::ICON_STATUS + 6.0))
-                                    .text_color(color),
-                            )
-                            .child(label)
-                            .into_any_element()
-                    })
-                    .collect::<Vec<_>>(),
-                )
-                .into_any_element(),
-        )
-    }
-
     fn render_drawer(&self, cx: &mut Context<Self>) -> gpui::Div {
         let sessions = self
             .controller
@@ -5715,19 +5812,36 @@ impl MobileApp {
             .and_then(|controller| controller.state.sessions.value.as_ref())
             .cloned()
             .unwrap_or_default();
-        let rows = self.mobile_sidebar_rows();
+        let search_query = self.sidebar_search_input.read(cx).text().to_string();
+        let rows = self.mobile_sidebar_rows(&search_query);
         let capabilities = self
             .backend
             .as_ref()
-            .map(|backend| backend.capability_snapshot().agent);
+            .map(|backend| backend.capability_snapshot());
         let can_create_session = capabilities.as_ref().is_some_and(|capabilities| {
-            capabilities.supports(BackendOperation::AgentCreateSession)
+            capabilities
+                .agent
+                .supports(BackendOperation::AgentCreateSession)
+        });
+        let can_open_project = capabilities.as_ref().is_some_and(|capabilities| {
+            capabilities
+                .workspace
+                .supports(BackendOperation::WorkspaceOpen)
         });
         let rows_for_list = rows.clone();
         let sessions_for_list = sessions.clone();
-        let selected_actions = self.render_selected_session_actions(&sessions, cx);
+        let has_search_query = !search_query.trim().is_empty();
+        let has_sidebar_items = !sessions.is_empty() || !self.workspace_summaries.is_empty();
+        let project_ids = rows
+            .iter()
+            .filter(|row| row.kind == AgentSidebarRowKind::Project)
+            .map(|row| row.project_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let all_projects_collapsed = !project_ids.is_empty()
+            && project_ids
+                .iter()
+                .all(|project_id| self.sidebar_state.collapsed_ids.contains(*project_id));
         let host_label = self.active_host_label();
-        let host_url = self.active_host_url();
         let host_online = self.backend.as_ref().is_some_and(|backend| {
             backend.connection_state().state == RemoteConnectionState::Online
         });
@@ -5736,7 +5850,7 @@ impl MobileApp {
             .absolute()
             .top_0()
             .bottom_0()
-            .bg(theme::bg_primary())
+            .bg(theme::sidebar_bg())
             .border_r_1()
             .border_color(theme::border_default())
             .flex()
@@ -5745,31 +5859,31 @@ impl MobileApp {
                 div()
                     .h(px(theme::DRAWER_HEADER_HEIGHT))
                     .flex_shrink_0()
-                    .border_b_1()
-                    .border_color(theme::border_subtle())
-                    .px(px(theme::SPACING_LG))
+                    .px(px(theme::SPACING_MD))
                     .flex()
                     .items_center()
-                    .gap(px(theme::SPACING_XS))
+                    .gap(px(theme::SPACING_SM))
                     .child(
                         svg()
                             .path("icons/message-square.svg")
-                            .size(px(theme::ICON_MD))
-                            .text_color(theme::text_secondary()),
+                            .size(px(theme::ICON_SM))
+                            .text_color(theme::sidebar_text_secondary()),
                     )
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .text_size(px(theme::FONT_HEADING))
-                            .text_color(theme::text_primary())
-                            .child(locale::common("Sessions")),
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::sidebar_text_primary())
+                            .child("Sessions"),
                     )
                     .child(
                         div()
                             .id("mobile-drawer-new-session")
                             .aria_label(locale::common("New session"))
-                            .size(px(theme::HEADER_BUTTON_SIZE))
+                            .size(px(36.0))
+                            .rounded(px(theme::RADIUS_CONTROL))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -5782,19 +5896,20 @@ impl MobileApp {
                                         cx.listener(Self::create_session),
                                     )
                             })
-                            .when(!can_create_session, |button| button.opacity(0.45))
+                            .when(!can_create_session, |button| button.opacity(0.38))
                             .child(
                                 svg()
                                     .path("icons/plus.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(theme::text_secondary()),
+                                    .size(px(17.0))
+                                    .text_color(theme::sidebar_text_secondary()),
                             ),
                     )
                     .child(
                         div()
                             .id("mobile-drawer-usage")
                             .aria_label(locale::common("Usage Statistics"))
-                            .size(px(theme::HEADER_BUTTON_SIZE))
+                            .size(px(36.0))
+                            .rounded(px(theme::RADIUS_CONTROL))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -5804,15 +5919,15 @@ impl MobileApp {
                             .child(
                                 svg()
                                     .path("icons/activity.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(theme::text_secondary()),
+                                    .size(px(17.0))
+                                    .text_color(theme::sidebar_text_secondary()),
                             ),
                     )
                     .child(
                         div()
                             .id("close-session-drawer")
                             .aria_label(locale::common("Close"))
-                            .size(px(theme::HEADER_BUTTON_SIZE))
+                            .size(px(36.0))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -5822,8 +5937,8 @@ impl MobileApp {
                             .child(
                                 svg()
                                     .path("icons/x.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(theme::text_muted()),
+                                    .size(px(17.0))
+                                    .text_color(theme::sidebar_text_muted()),
                             ),
                     ),
             )
@@ -5838,31 +5953,188 @@ impl MobileApp {
                         div()
                             .flex_shrink_0()
                             .h(px(theme::DRAWER_SECTION_HEIGHT))
-                            .px(px(theme::SPACING_LG))
+                            .px(px(theme::SPACING_MD))
                             .flex()
-                            .items_end()
-                            .text_size(px(theme::FONT_CAPTION))
-                            .text_color(theme::text_muted())
-                            .child(locale::common("Projects")),
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(theme::FONT_CAPTION))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::sidebar_text_muted())
+                                    .child(locale::common("Projects")),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(2.0))
+                                    .child(
+                                        div()
+                                            .id("mobile-drawer-new-project")
+                                            .aria_label(locale::common("New project"))
+                                            .size(px(32.0))
+                                            .rounded(px(theme::RADIUS_CONTROL))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .when(can_open_project, |button| {
+                                                button
+                                                    .cursor_pointer()
+                                                    .active(|style| {
+                                                        style.bg(theme::row_pressed_bg())
+                                                    })
+                                                    .on_mouse_up(
+                                                        MouseButton::Left,
+                                                        cx.listener(Self::open_new_project),
+                                                    )
+                                            })
+                                            .when(!can_open_project, |button| button.opacity(0.38))
+                                            .child(
+                                                svg()
+                                                    .path("icons/circle-plus.svg")
+                                                    .size(px(16.0))
+                                                    .text_color(theme::sidebar_text_secondary()),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("mobile-drawer-toggle-projects")
+                                            .aria_label(locale::common(if all_projects_collapsed {
+                                                "Expand projects"
+                                            } else {
+                                                "Collapse projects"
+                                            }))
+                                            .size(px(32.0))
+                                            .rounded(px(theme::RADIUS_CONTROL))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .when(all_projects_collapsed, |button| {
+                                                button.bg(theme::sidebar_selected_bg())
+                                            })
+                                            .when(!project_ids.is_empty(), |button| {
+                                                button
+                                                    .cursor_pointer()
+                                                    .active(|style| {
+                                                        style.bg(theme::row_pressed_bg())
+                                                    })
+                                                    .on_mouse_up(
+                                                        MouseButton::Left,
+                                                        cx.listener(Self::toggle_all_projects),
+                                                    )
+                                            })
+                                            .when(project_ids.is_empty(), |button| {
+                                                button.opacity(0.38)
+                                            })
+                                            .child(
+                                                svg()
+                                                    .path("icons/sliders-horizontal.svg")
+                                                    .size(px(16.0))
+                                                    .text_color(theme::sidebar_text_secondary()),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("mobile-drawer-search")
+                                            .aria_label(locale::common("Search sessions"))
+                                            .size(px(32.0))
+                                            .rounded(px(theme::RADIUS_CONTROL))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .when(self.sidebar_search_open, |button| {
+                                                button.bg(theme::sidebar_selected_bg())
+                                            })
+                                            .when(has_sidebar_items, |button| {
+                                                button
+                                                    .cursor_pointer()
+                                                    .active(|style| {
+                                                        style.bg(theme::row_pressed_bg())
+                                                    })
+                                                    .on_mouse_up(
+                                                        MouseButton::Left,
+                                                        cx.listener(Self::toggle_sidebar_search),
+                                                    )
+                                            })
+                                            .when(!has_sidebar_items, |button| button.opacity(0.38))
+                                            .child(
+                                                svg()
+                                                    .path("icons/search.svg")
+                                                    .size(px(16.0))
+                                                    .text_color(theme::sidebar_text_secondary()),
+                                            ),
+                                    ),
+                            ),
                     )
-                    .when_some(selected_actions, |body, actions| body.child(actions))
+                    .when(self.sidebar_search_open, |body| {
+                        body.child(
+                            div()
+                                .id("mobile-drawer-search-field")
+                                .h(px(theme::TOUCH_TARGET))
+                                .flex_shrink_0()
+                                .mx(px(theme::SPACING_MD))
+                                .mb(px(theme::SPACING_XS))
+                                .rounded(px(theme::RADIUS_CONTROL))
+                                .border_1()
+                                .border_color(theme::border_default())
+                                .bg(theme::bg_card_dim())
+                                .flex()
+                                .items_center()
+                                .child(
+                                    svg()
+                                        .path("icons/search.svg")
+                                        .ml(px(theme::SPACING_SM))
+                                        .size(px(15.0))
+                                        .flex_shrink_0()
+                                        .text_color(theme::sidebar_text_muted()),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .h_full()
+                                        .child(self.sidebar_search_input.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .id("mobile-drawer-search-close")
+                                        .aria_label(locale::common("Close search"))
+                                        .size(px(32.0))
+                                        .mr(px(2.0))
+                                        .flex_shrink_0()
+                                        .rounded(px(theme::RADIUS_CONTROL))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .active(|style| style.opacity(0.6))
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(Self::toggle_sidebar_search),
+                                        )
+                                        .child(
+                                            svg()
+                                                .path("icons/x.svg")
+                                                .size(px(14.0))
+                                                .text_color(theme::sidebar_text_muted()),
+                                        ),
+                                ),
+                        )
+                    })
                     .when(rows.is_empty(), |body| {
                         body.child(
                             div()
                                 .mx(px(theme::SPACING_LG))
-                                .mt(px(theme::SPACING_SM))
-                                .rounded(px(theme::RADIUS_CONTROL))
-                                .border_1()
-                                .border_color(theme::border_subtle())
-                                .bg(theme::bg_card_dim())
-                                .p(px(theme::SPACING_MD))
+                                .mt(px(theme::SPACING_LG))
                                 .text_size(px(theme::FONT_CAPTION))
-                                .text_color(theme::text_muted())
-                                .child(locale::text(
-                                    "No sessions yet",
-                                    "还没有会话",
-                                    "尚無工作階段",
-                                )),
+                                .text_color(theme::sidebar_text_muted())
+                                .child(if has_search_query {
+                                    locale::common("No matching sessions")
+                                } else {
+                                    locale::text("No sessions yet", "还没有会话", "尚無工作階段")
+                                }),
                         )
                     })
                     .child(
@@ -5886,7 +6158,7 @@ impl MobileApp {
                         .w_full()
                         .flex_1()
                         .min_h_0()
-                        .py(px(theme::SPACING_SM)),
+                        .py(px(2.0)),
                     ),
             )
             .child(
@@ -5923,33 +6195,12 @@ impl MobileApp {
                                 div()
                                     .flex_1()
                                     .min_w_0()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(1.0))
-                                    .child(
-                                        div()
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .whitespace_nowrap()
-                                            .text_size(px(theme::FONT_BODY))
-                                            .text_color(theme::text_secondary())
-                                            .child(host_label),
-                                    )
-                                    .child(
-                                        div()
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .whitespace_nowrap()
-                                            .text_size(px(theme::FONT_MICRO))
-                                            .text_color(theme::text_muted())
-                                            .child(host_url),
-                                    ),
-                            )
-                            .child(
-                                svg()
-                                    .path("icons/chevron-right.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(theme::text_muted()),
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(px(theme::FONT_BODY))
+                                    .text_color(theme::sidebar_text_secondary())
+                                    .child(host_label),
                             ),
                     )
                     .child(
@@ -5967,8 +6218,8 @@ impl MobileApp {
                             .child(
                                 svg()
                                     .path("icons/settings.svg")
-                                    .size(px(theme::ICON_MD))
-                                    .text_color(theme::text_secondary()),
+                                    .size(px(18.0))
+                                    .text_color(theme::sidebar_text_secondary()),
                             ),
                     ),
             )
@@ -6286,6 +6537,91 @@ fn settings_info_row(
 }
 
 impl MobileApp {
+    fn render_new_project(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let can_open_project = self.backend.as_ref().is_some_and(|backend| {
+            backend
+                .capability_snapshot()
+                .workspace
+                .supports(BackendOperation::WorkspaceOpen)
+        });
+        div()
+            .absolute()
+            .inset_0()
+            .bg(theme::bg_primary())
+            .block_mouse_except_scroll()
+            .flex()
+            .flex_col()
+            .child(self.render_overlay_header("mobile-new-project", "New project", cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .px(px(theme::SPACING_LG))
+                    .py(px(theme::SPACING_MD))
+                    .child(
+                        div()
+                            .mb(px(theme::SPACING_SM))
+                            .text_size(px(theme::FONT_CAPTION))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text_muted())
+                            .child(locale::common("Project path")),
+                    )
+                    .child(
+                        div()
+                            .h(px(theme::TOUCH_TARGET))
+                            .w_full()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(theme::border_default())
+                            .bg(theme::bg_card())
+                            .child(self.new_project_input.clone()),
+                    )
+                    .when_some(self.new_project_error.as_ref(), |body, error| {
+                        body.child(
+                            div()
+                                .mt(px(theme::SPACING_SM))
+                                .text_size(px(theme::FONT_CAPTION))
+                                .text_color(rgb(theme::ACCENT_RED))
+                                .child(error.clone()),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id("mobile-new-project-submit")
+                            .h(px(theme::TOUCH_TARGET))
+                            .w_full()
+                            .mt(px(theme::SPACING_LG))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(theme::border_default())
+                            .bg(theme::bg_card())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(theme::FONT_BODY))
+                            .text_color(theme::text_primary())
+                            .when(can_open_project && !self.new_project_busy, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(Self::submit_new_project),
+                                    )
+                            })
+                            .when(!can_open_project || self.new_project_busy, |button| {
+                                button.opacity(0.45)
+                            })
+                            .child(if self.new_project_busy {
+                                locale::common("Opening...")
+                            } else {
+                                locale::common("Open project")
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_settings(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let host_label = self.active_host_label();
         let host_url = self.active_host_url();
@@ -6714,6 +7050,7 @@ impl MobileApp {
             MobileOverlay::Hosts => self.render_hosts(cx),
             MobileOverlay::Settings => self.render_settings(cx),
             MobileOverlay::Usage => self.render_usage(cx),
+            MobileOverlay::NewProject => self.render_new_project(cx),
         }
     }
 }
@@ -7133,33 +7470,54 @@ fn agent_icon_path(agent_id: &str) -> &'static str {
     }
 }
 
-fn session_age_label(timestamp_ms: i64) -> String {
-    session_age_label_for(locale::current(), timestamp_ms)
-}
-
-fn session_age_label_for(resolved: vibex_ui::locale::Locale, timestamp_ms: i64) -> String {
+fn session_sidebar_time_label(timestamp_ms: i64) -> String {
     if timestamp_ms <= 0 {
         return String::new();
     }
-    let elapsed_seconds = unix_timestamp_ms().saturating_sub(timestamp_ms).max(0) / 1_000;
-    match elapsed_seconds {
-        0..=59 => locale::text_for(resolved, "now", "刚刚", "剛剛").to_string(),
-        60..=3_599 => match resolved {
-            vibex_ui::locale::Locale::En => format!("{}m", elapsed_seconds / 60),
-            vibex_ui::locale::Locale::ZhCn => format!("{} 分钟", elapsed_seconds / 60),
-            vibex_ui::locale::Locale::ZhTw => format!("{} 分鐘", elapsed_seconds / 60),
-        },
-        3_600..=86_399 => match resolved {
-            vibex_ui::locale::Locale::En => format!("{}h", elapsed_seconds / 3_600),
-            vibex_ui::locale::Locale::ZhCn => format!("{} 小时", elapsed_seconds / 3_600),
-            vibex_ui::locale::Locale::ZhTw => format!("{} 小時", elapsed_seconds / 3_600),
-        },
-        days => match resolved {
-            vibex_ui::locale::Locale::En => format!("{}d", days / 86_400),
-            vibex_ui::locale::Locale::ZhCn => format!("{} 天", days / 86_400),
-            vibex_ui::locale::Locale::ZhTw => format!("{} 天", days / 86_400),
-        },
+    let Some(local_time) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(timestamp_ms)
+        .map(|timestamp| timestamp.with_timezone(&chrono::Local).naive_local())
+    else {
+        return String::new();
+    };
+    session_sidebar_time_label_at(
+        local_time,
+        chrono::Local::now().naive_local(),
+        locale::current(),
+    )
+}
+
+fn session_sidebar_time_label_at(
+    local_time: chrono::NaiveDateTime,
+    now: chrono::NaiveDateTime,
+    resolved: vibex_ui::locale::Locale,
+) -> String {
+    let days = now
+        .date()
+        .signed_duration_since(local_time.date())
+        .num_days();
+    if days <= 0 {
+        return local_time.format("%H:%M").to_string();
     }
+    if days == 1 {
+        return locale::text_for(resolved, "Yesterday", "昨天", "昨天").to_string();
+    }
+    if days < 7 {
+        return match resolved {
+            vibex_ui::locale::Locale::En => format!("{days} days ago"),
+            vibex_ui::locale::Locale::ZhCn | vibex_ui::locale::Locale::ZhTw => {
+                format!("{days} 天前")
+            }
+        };
+    }
+    if days < 30 {
+        let weeks = days / 7;
+        return match resolved {
+            vibex_ui::locale::Locale::En => format!("{weeks} weeks ago"),
+            vibex_ui::locale::Locale::ZhCn => format!("{weeks} 周前"),
+            vibex_ui::locale::Locale::ZhTw => format!("{weeks} 週前"),
+        };
+    }
+    local_time.format("%m/%d").to_string()
 }
 
 fn timeline_distance_to_bottom(offset_y: f32, max_offset_y: f32) -> f32 {
@@ -7703,11 +8061,19 @@ mod tests {
         assert_eq!(workspace_label("/work/vibex/"), "vibex");
         assert_eq!(workspace_label("C:\\work\\vibex"), "vibex");
         let locale = vibex_ui::locale::Locale::En;
-        assert_eq!(session_age_label_for(locale, 0), "");
-        assert_eq!(session_age_label_for(locale, unix_timestamp_ms()), "now");
+        assert_eq!(session_sidebar_time_label(0), "");
+        let now = chrono::Local::now().naive_local();
         assert_eq!(
-            session_age_label_for(locale, unix_timestamp_ms() - 60_000),
-            "1m"
+            session_sidebar_time_label_at(now, now, locale),
+            now.format("%H:%M").to_string()
+        );
+        assert_eq!(
+            session_sidebar_time_label_at(
+                now - chrono::Duration::days(1),
+                now,
+                vibex_ui::locale::Locale::ZhCn,
+            ),
+            "昨天"
         );
     }
 

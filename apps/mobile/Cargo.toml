@@ -12,6 +12,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 base64.workspace = true
+chrono = "0.4.45"
 futures-channel.workspace = true
 futures-util.workspace = true
 gpui.workspace = true
