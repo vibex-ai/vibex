@@ -19340,6 +19340,8 @@ impl VibexWorkbench {
         let drag_target_project_id = project_id_string.clone();
         let folder_drag_target_project_id = project_id_string.clone();
         let session_root_target_project_id = project_id_string.clone();
+        let sidebar_accent = cx.theme().sidebar_accent;
+        let sidebar_is_dark = cx.theme().is_dark();
 
         let project_row = div()
             .id(format!("sidebar-project-row-{project_id_string}"))
@@ -19355,7 +19357,7 @@ impl VibexWorkbench {
             .bg(if project_scope_drop_active {
                 cx.theme().tokens.drop_target.into()
             } else if move_selected {
-                cx.theme().sidebar_accent.opacity(0.52)
+                sidebar_move_selected_background(cx.theme().sidebar_accent, cx.theme().is_dark())
             } else if active {
                 cx.theme().sidebar_accent.opacity(0.60)
             } else if context_menu_hovered {
@@ -19363,7 +19365,16 @@ impl VibexWorkbench {
             } else {
                 cx.theme().transparent
             })
-            .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.45)))
+            .hover(move |style| {
+                if move_selected {
+                    style.bg(sidebar_move_selected_background(
+                        sidebar_accent,
+                        sidebar_is_dark,
+                    ))
+                } else {
+                    style.bg(sidebar_accent.opacity(0.45))
+                }
+            })
             .on_hover(cx.listener(|this, hovered, _, cx| {
                 if *hovered {
                     this.clear_sidebar_context_menu_target(cx);
@@ -19976,7 +19987,7 @@ impl VibexWorkbench {
         let row_background = if selected {
             sidebar_selected_session_background(cx.theme().sidebar_accent, cx.theme().is_dark())
         } else if move_selected {
-            cx.theme().sidebar_accent.opacity(0.52)
+            sidebar_move_selected_background(cx.theme().sidebar_accent, cx.theme().is_dark())
         } else {
             cx.theme().transparent
         };
@@ -33357,6 +33368,14 @@ fn sidebar_selected_session_background(accent: Hsla, is_dark: bool) -> Hsla {
     }
 }
 
+fn sidebar_move_selected_background(accent: Hsla, is_dark: bool) -> Hsla {
+    if is_dark {
+        accent.lighten(0.30)
+    } else {
+        accent.darken(0.12)
+    }
+}
+
 fn sidebar_selection_indicator(state: SidebarSelectionState, cx: &App) -> AnyElement {
     div()
         .size(px(14.0))
@@ -42238,6 +42257,19 @@ mod tests {
         let dark_accent = theme::semantic_color("sidebar-accent", true);
         let dark_selected = sidebar_selected_session_background(dark_accent, true);
         assert!(dark_selected.l > dark_accent.l);
+    }
+
+    #[test]
+    fn modifier_selected_sidebar_rows_use_stronger_contrast_than_active_rows() {
+        let light_accent = theme::semantic_color("sidebar-accent", false);
+        let light_active = sidebar_selected_session_background(light_accent, false);
+        let light_move = sidebar_move_selected_background(light_accent, false);
+        assert!(light_move.l < light_active.l);
+
+        let dark_accent = theme::semantic_color("sidebar-accent", true);
+        let dark_active = sidebar_selected_session_background(dark_accent, true);
+        let dark_move = sidebar_move_selected_background(dark_accent, true);
+        assert!(dark_move.l > dark_active.l);
     }
 
     #[test]
