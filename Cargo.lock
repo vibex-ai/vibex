@@ -9963,6 +9963,7 @@ dependencies = [
  "sha2 0.10.9",
  "similar",
  "sys-locale",
+ "tempfile",
  "tokio",
  "tray-icon",
  "url",

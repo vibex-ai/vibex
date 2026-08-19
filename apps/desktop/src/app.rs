@@ -4,6 +4,7 @@ use std::{
     future::Future,
     hash::{Hash as _, Hasher as _},
     ops::Range,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
@@ -107,8 +108,8 @@ use vibex_desktop_model::{
     TimelineRow, TimelineRowKind, UiStateStore, WorkbenchRoute, WorkspaceAgentSummary,
     WorkspaceContextProjection, WorktreeLifecycleDisplayState, active_collaborations,
     composer_trigger_at, current_agent_plan, custom_worktree_path_is_absolute,
-    sidebar_project_projections, timeline_agent_message_count_after_sequence,
-    timeline_conversation_turns,
+    sidebar_project_custom_logo_file_is_valid, sidebar_project_projections,
+    timeline_agent_message_count_after_sequence, timeline_conversation_turns,
 };
 use vibex_desktop_runtime::{
     DesktopEvent, DesktopRuntime, DesktopRuntimeConfig, DesktopRuntimeFacade, PREVIEW_APP_ID,
@@ -168,6 +169,11 @@ enum ReleaseChannel {
 const WORKBENCH_NAVIGATION_LIMIT: usize = 60;
 const TITLE_BAR_HEIGHT: f32 = 44.0;
 const TITLE_BAR_COLLAPSED_SIDEBAR_WIDTH: f32 = 112.0;
+const SIDEBAR_PROJECT_LOGO_DIRECTORY: &str = "project-icons";
+const SIDEBAR_LOGO_DISPLAY_SIZE: f32 = 14.0;
+const SIDEBAR_PROJECT_LOGO_IMAGE_SIZE: u32 = 256;
+const SIDEBAR_PROJECT_LOGO_MAX_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+const SIDEBAR_PROJECT_LOGO_MAX_SOURCE_PIXELS: u64 = 40_000_000;
 const TITLE_BAR_NARROW_WINDOW_CONTROL_WIDTH: f32 = 36.0;
 const TITLE_BAR_WIDE_WINDOW_CONTROL_WIDTH: f32 = 44.0;
 const SIDEBAR_FLOATING_MAX_WIDTH: f32 = 320.0;
@@ -3537,6 +3543,7 @@ pub struct VibexWorkbench {
     sidebar_hover_preview_close_task: Option<Task<()>>,
     sidebar_context_menu_target: Option<SidebarContextMenuTarget>,
     sidebar_project_appearance_popover: Option<String>,
+    sidebar_project_logo_upload_task: Option<Task<()>>,
     sidebar_resize_drag: Option<SidebarResizeDragState>,
     right_panel_resize_drag: Option<RightPanelResizeDragState>,
     pair_button_hovered: bool,
@@ -4143,6 +4150,7 @@ impl VibexWorkbench {
             sidebar_hover_preview_close_task: None,
             sidebar_context_menu_target: None,
             sidebar_project_appearance_popover: None,
+            sidebar_project_logo_upload_task: None,
             sidebar_resize_drag: None,
             right_panel_resize_drag: None,
             pair_button_hovered: false,
@@ -12239,6 +12247,7 @@ impl VibexWorkbench {
                                 SidebarProjectAppearance {
                                     logo: SidebarProjectLogo::default(),
                                     color: sidebar_project_logo_color_for_new_project(&project_id),
+                                    custom_logo_file: None,
                                 },
                                 cx,
                             );
@@ -16395,7 +16404,7 @@ impl VibexWorkbench {
             .sidebar
             .project_appearances
             .get(project_id)
-            .copied()
+            .cloned()
             .unwrap_or_default()
     }
 
@@ -16427,10 +16436,11 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) {
         let mut appearance = self.sidebar_project_appearance(&project_id);
-        if appearance.logo == logo {
+        if appearance.logo == logo && appearance.custom_logo_file.is_none() {
             return;
         }
         appearance.logo = logo;
+        appearance.custom_logo_file = None;
         self.store_sidebar_project_appearance(project_id, appearance, cx);
     }
 
@@ -16446,6 +16456,101 @@ impl VibexWorkbench {
         }
         appearance.color = color;
         self.store_sidebar_project_appearance(project_id, appearance, cx);
+    }
+
+    fn clear_sidebar_project_custom_logo(&mut self, project_id: String, cx: &mut Context<Self>) {
+        let mut appearance = self.sidebar_project_appearance(&project_id);
+        if appearance.custom_logo_file.take().is_some() {
+            self.store_sidebar_project_appearance(project_id, appearance, cx);
+        }
+    }
+
+    fn choose_sidebar_project_custom_logo(
+        &mut self,
+        project_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.sidebar_project_logo_upload_task.is_some() {
+            return;
+        }
+        let Some(home) = self.config.as_ref().map(|config| config.home_dir.clone()) else {
+            window.push_notification(
+                Notification::error(locale::text(
+                    "Project icon storage is unavailable",
+                    "项目图标存储不可用",
+                    "專案圖示儲存空間無法使用",
+                )),
+                cx,
+            );
+            return;
+        };
+        let picker = gpui_tokio::Tokio::spawn(cx, async move {
+            let Some(file) = rfd::AsyncFileDialog::new()
+                .set_title(locale::text(
+                    "Choose project icon",
+                    "选择项目图标",
+                    "選擇專案圖示",
+                ))
+                .add_filter(
+                    "Images",
+                    &[
+                        "png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "ico",
+                    ],
+                )
+                .pick_file()
+                .await
+            else {
+                return Ok(None);
+            };
+            import_sidebar_project_logo(file.path(), &home).map(Some)
+        });
+        self.sidebar_project_logo_upload_task =
+            Some(cx.spawn_in(window, async move |entity, cx| {
+                let outcome = picker.await;
+                let _ = entity.update_in(cx, |this, window, cx| {
+                    this.sidebar_project_logo_upload_task = None;
+                    match outcome {
+                        Ok(Ok(Some(file_name))) => {
+                            let mut appearance = this.sidebar_project_appearance(&project_id);
+                            appearance.custom_logo_file = Some(file_name);
+                            this.store_sidebar_project_appearance(
+                                project_id.clone(),
+                                appearance,
+                                cx,
+                            );
+                        }
+                        Ok(Ok(None)) => {}
+                        Ok(Err(error)) => {
+                            window.push_notification(
+                                Notification::error(format!(
+                                    "{}: {error}",
+                                    locale::text(
+                                        "Could not use project icon",
+                                        "无法使用项目图标",
+                                        "無法使用專案圖示",
+                                    )
+                                )),
+                                cx,
+                            );
+                        }
+                        Err(error) => {
+                            window.push_notification(
+                                Notification::error(format!(
+                                    "{}: {error}",
+                                    locale::text(
+                                        "Could not open project icon",
+                                        "无法打开项目图标",
+                                        "無法開啟專案圖示",
+                                    )
+                                )),
+                                cx,
+                            );
+                        }
+                    }
+                    cx.notify();
+                });
+            }));
     }
 
     fn dismiss_sidebar_for_navigation(&mut self) {
@@ -18904,6 +19009,7 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let entity = cx.weak_entity();
+        let custom_logo_uploaded = appearance.custom_logo_file.is_some();
         let mut logo_buttons = Vec::with_capacity(SidebarProjectLogo::ALL.len());
         for logo in SidebarProjectLogo::ALL {
             let button_entity = entity.clone();
@@ -18915,7 +19021,7 @@ impl VibexWorkbench {
                     .compact()
                     .w(px(26.0))
                     .h(px(26.0))
-                    .selected(appearance.logo == logo)
+                    .selected(!custom_logo_uploaded && appearance.logo == logo)
                     .icon(
                         sidebar_project_logo_icon(logo)
                             .size(px(14.0))
@@ -18929,6 +19035,44 @@ impl VibexWorkbench {
                     }),
             );
         }
+
+        let upload_entity = entity.clone();
+        let upload_project_id = project_id.clone();
+        let upload_button = Button::new(format!("sidebar-project-logo-upload-{project_id}"))
+            .small()
+            .outline()
+            .compact()
+            .flex_1()
+            .icon(Icon::default().path("icons/vibex/upload.svg"))
+            .label(if custom_logo_uploaded {
+                locale::text("Replace image", "替换图片", "替換圖片")
+            } else {
+                locale::text("Upload image", "上传图片", "上傳圖片")
+            })
+            .on_click(move |_, window, cx| {
+                let _ = upload_entity.update(cx, |this, cx| {
+                    this.choose_sidebar_project_custom_logo(upload_project_id.clone(), window, cx)
+                });
+            });
+        let clear_button = custom_logo_uploaded.then(|| {
+            let clear_entity = entity.clone();
+            let clear_project_id = project_id.clone();
+            Button::new(format!("sidebar-project-logo-remove-{project_id}"))
+                .small()
+                .ghost()
+                .compact()
+                .icon(Icon::default().path("icons/vibex/trash-2.svg"))
+                .tooltip(locale::text(
+                    "Remove uploaded image",
+                    "移除上传图片",
+                    "移除上傳圖片",
+                ))
+                .on_click(move |_, _, cx| {
+                    let _ = clear_entity.update(cx, |this, cx| {
+                        this.clear_sidebar_project_custom_logo(clear_project_id.clone(), cx)
+                    });
+                })
+        });
 
         let mut color_buttons = Vec::with_capacity(SidebarProjectLogoColor::ALL.len());
         for color in SidebarProjectLogoColor::ALL {
@@ -19008,6 +19152,13 @@ impl VibexWorkbench {
                             .child(locale::text("Logo", "图标", "圖示")),
                     )
                     .child(h_flex().gap_1().children(logo_buttons)),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_1()
+                    .child(upload_button)
+                    .when_some(clear_button, |this, button| this.child(button)),
             )
             .child(
                 v_flex()
@@ -19129,6 +19280,12 @@ impl VibexWorkbench {
         let project_actions_label = sidebar_project_actions_label(locale, &project_name);
         let new_session_label = sidebar_new_session_for_project_label(locale, &project_name);
         let project_appearance = self.sidebar_project_appearance(&project_id_string);
+        let project_logo = sidebar_project_logo(
+            &project_appearance,
+            self.config.as_ref().map(|config| config.home_dir.as_path()),
+            px(SIDEBAR_LOGO_DISPLAY_SIZE),
+            cx,
+        );
         let project_logo_trigger =
             Button::new(format!("sidebar-project-logo-trigger-{project_id_string}"))
                 .xsmall()
@@ -19136,11 +19293,7 @@ impl VibexWorkbench {
                 .compact()
                 .w(px(26.0))
                 .h(px(26.0))
-                .icon(
-                    sidebar_project_logo_icon(project_appearance.logo)
-                        .size(px(16.0))
-                        .text_color(sidebar_project_logo_color(project_appearance.color, cx)),
-                )
+                .child(project_logo)
                 .tooltip(locale::text(
                     "Customize project logo",
                     "自定义项目图标",
@@ -34252,6 +34405,83 @@ fn sidebar_project_logo_icon(logo: SidebarProjectLogo) -> Icon {
     })
 }
 
+fn sidebar_project_logo(
+    appearance: &SidebarProjectAppearance,
+    home: Option<&Path>,
+    size: Pixels,
+    cx: &App,
+) -> AnyElement {
+    if let Some(path) = appearance
+        .custom_logo_file
+        .as_deref()
+        .and_then(|file_name| sidebar_project_logo_path(home?, file_name))
+        .filter(|path| path.is_file())
+    {
+        return img(path)
+            .size(size)
+            .flex_none()
+            .overflow_hidden()
+            .rounded(px(3.0))
+            .object_fit(ObjectFit::Cover)
+            .into_any_element();
+    }
+    sidebar_project_logo_icon(appearance.logo)
+        .size(size)
+        .text_color(sidebar_project_logo_color(appearance.color, cx))
+        .into_any_element()
+}
+
+fn sidebar_project_logo_path(home: &Path, file_name: &str) -> Option<PathBuf> {
+    sidebar_project_custom_logo_file_is_valid(file_name)
+        .then(|| home.join(SIDEBAR_PROJECT_LOGO_DIRECTORY).join(file_name))
+}
+
+fn import_sidebar_project_logo(source: &Path, home: &Path) -> Result<String, String> {
+    let metadata = std::fs::metadata(source)
+        .map_err(|error| format!("could not read selected file: {error}"))?;
+    if !metadata.is_file() {
+        return Err("the selected path is not a file".to_string());
+    }
+    if metadata.len() > SIDEBAR_PROJECT_LOGO_MAX_SOURCE_BYTES {
+        return Err("the selected image is larger than 16 MB".to_string());
+    }
+    let (width, height) = image::image_dimensions(source)
+        .map_err(|error| format!("unsupported or invalid image: {error}"))?;
+    if width == 0
+        || height == 0
+        || u64::from(width) * u64::from(height) > SIDEBAR_PROJECT_LOGO_MAX_SOURCE_PIXELS
+    {
+        return Err("the selected image dimensions are too large".to_string());
+    }
+
+    let image = image::open(source)
+        .map_err(|error| format!("could not decode selected image: {error}"))?
+        .resize_to_fill(
+            SIDEBAR_PROJECT_LOGO_IMAGE_SIZE,
+            SIDEBAR_PROJECT_LOGO_IMAGE_SIZE,
+            image::imageops::FilterType::Lanczos3,
+        )
+        .to_rgba8();
+    let digest = format!("{:x}", Sha256::digest(image.as_raw()));
+    let file_name = format!("{digest}.png");
+    let directory = home.join(SIDEBAR_PROJECT_LOGO_DIRECTORY);
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("could not create project icon storage: {error}"))?;
+    let destination = directory.join(&file_name);
+    if !destination.exists() {
+        let temporary = directory.join(format!(".{digest}.tmp"));
+        if let Err(error) = image.save_with_format(&temporary, image::ImageFormat::Png) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(format!("could not save project icon: {error}"));
+        }
+        if let Err(error) = std::fs::rename(&temporary, &destination) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(format!("could not install project icon: {error}"));
+        }
+    }
+    Ok(file_name)
+}
+
 fn sidebar_project_logo_color(color: SidebarProjectLogoColor, cx: &App) -> Hsla {
     match color {
         SidebarProjectLogoColor::Neutral => cx.theme().sidebar_foreground.opacity(0.72),
@@ -34606,7 +34836,7 @@ fn sidebar_session_agent_id(
 fn sidebar_agent_logo(identity: &str, active: bool, cx: &App) -> AnyElement {
     agent_brand_icon(
         identity,
-        px(14.0),
+        px(SIDEBAR_LOGO_DISPLAY_SIZE),
         Some(if active {
             cx.theme().sidebar_foreground.opacity(0.80)
         } else {
@@ -41921,6 +42151,9 @@ mod tests {
         assert!(picker.contains("for color in SidebarProjectLogoColor::ALL"));
         assert!(picker.contains("this.set_sidebar_project_logo("));
         assert!(picker.contains("this.set_sidebar_project_logo_color("));
+        assert!(picker.contains("this.choose_sidebar_project_custom_logo("));
+        assert!(picker.contains("this.clear_sidebar_project_custom_logo("));
+        assert!(picker.contains("Upload image"));
         assert!(project.contains("sidebar-project-logo-trigger-"));
         assert!(project.contains("render_sidebar_project_appearance_popover("));
         assert!(menu.contains("Customize Logo"));
@@ -43072,7 +43305,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_project_row_uses_the_larger_logo_size() {
+    fn sidebar_project_and_session_rows_use_the_same_logo_size() {
         let source = include_str!("app.rs");
         let trigger = source
             .split_once("        let project_logo_trigger =")
@@ -43081,7 +43314,29 @@ mod tests {
             .expect("project logo trigger should remain inspectable");
         assert!(trigger.contains(".w(px(26.0))"));
         assert!(trigger.contains(".h(px(26.0))"));
-        assert!(trigger.contains(".size(px(16.0))"));
+        assert!(trigger.contains(".child(project_logo)"));
+        assert!(source.contains("const SIDEBAR_LOGO_DISPLAY_SIZE: f32 = 14.0;"));
+        assert!(source.contains("px(SIDEBAR_LOGO_DISPLAY_SIZE),\n        Some(if active"));
+        assert!(source.contains("px(SIDEBAR_LOGO_DISPLAY_SIZE),\n            cx,"));
+    }
+
+    #[test]
+    fn sidebar_project_logo_import_is_square_and_content_addressed() {
+        let home = tempfile::tempdir().unwrap();
+        let source = home.path().join("source.png");
+        image::RgbaImage::from_fn(32, 16, |x, y| image::Rgba([x as u8, y as u8, 128, 255]))
+            .save(&source)
+            .unwrap();
+
+        let file_name = import_sidebar_project_logo(&source, home.path()).unwrap();
+        let installed = sidebar_project_logo_path(home.path(), &file_name).unwrap();
+        assert_eq!(file_name.len(), 68);
+        assert_eq!(image::image_dimensions(&installed).unwrap(), (256, 256));
+        assert_eq!(
+            import_sidebar_project_logo(&source, home.path()).unwrap(),
+            file_name
+        );
+        assert!(sidebar_project_logo_path(home.path(), "../outside.png").is_none());
     }
 
     #[test]

@@ -16,7 +16,7 @@ gpui_platform.workspace = true
 gpui_tokio.workspace = true
 gpui-component.workspace = true
 gpui-component-assets.workspace = true
-image = { workspace = true, features = ["png"] }
+image = { workspace = true, features = ["bmp", "gif", "ico", "jpeg", "png", "tiff", "webp"] }
 qrcode.workspace = true
 pdfium-render.workspace = true
 serde.workspace = true
@@ -52,6 +52,7 @@ tray-icon = { workspace = true, features = ["gtk"] }
 [dev-dependencies]
 axum.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
+tempfile = "3"
 vibex-db = { path = "../../crates/db" }
 vibex-remote-client = { path = "../../crates/vibex-remote-client" }
 vibex-remote = { path = "../../crates/remote" }

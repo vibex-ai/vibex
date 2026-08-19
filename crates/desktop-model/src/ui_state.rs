@@ -150,11 +150,20 @@ impl SidebarProjectLogoColor {
     ];
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SidebarProjectAppearance {
     pub logo: SidebarProjectLogo,
     pub color: SidebarProjectLogoColor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_logo_file: Option<String>,
+}
+
+pub fn sidebar_project_custom_logo_file_is_valid(file_name: &str) -> bool {
+    let Some(digest) = file_name.strip_suffix(".png") else {
+        return false;
+    };
+    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -551,8 +560,12 @@ impl DesktopUiStateV1 {
                 .collect();
         self.sidebar.project_appearances = std::mem::take(&mut self.sidebar.project_appearances)
             .into_iter()
-            .filter_map(|(project_id, appearance)| {
-                bounded_required(&project_id, 256).map(|project_id| (project_id, appearance))
+            .filter_map(|(project_id, mut appearance)| {
+                let project_id = bounded_required(&project_id, 256)?;
+                appearance.custom_logo_file =
+                    bounded_optional(appearance.custom_logo_file.take(), 128)
+                        .filter(|file_name| sidebar_project_custom_logo_file_is_valid(file_name));
+                Some((project_id, appearance))
             })
             .take(1_000)
             .collect();
@@ -1306,6 +1319,7 @@ mod tests {
             SidebarProjectAppearance {
                 logo: SidebarProjectLogo::Database,
                 color: SidebarProjectLogoColor::Cyan,
+                custom_logo_file: Some(format!("{}.png", "a".repeat(64))),
             },
         );
         state.normalize().unwrap();
@@ -1319,6 +1333,7 @@ mod tests {
             Some(&SidebarProjectAppearance {
                 logo: SidebarProjectLogo::Database,
                 color: SidebarProjectLogoColor::Cyan,
+                custom_logo_file: Some(format!("{}.png", "a".repeat(64))),
             })
         );
 
@@ -1328,6 +1343,14 @@ mod tests {
             round_trip.sidebar.project_appearances,
             state.sidebar.project_appearances
         );
+        let legacy_appearance: SidebarProjectAppearance =
+            serde_json::from_value(serde_json::json!({"logo": "code", "color": "green"})).unwrap();
+        assert_eq!(legacy_appearance.custom_logo_file, None);
+        assert!(sidebar_project_custom_logo_file_is_valid(&format!(
+            "{}.png",
+            "f".repeat(64)
+        )));
+        assert!(!sidebar_project_custom_logo_file_is_valid("../icon.png"));
 
         let mut value = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
         let sidebar = value
@@ -1825,6 +1848,7 @@ mod tests {
             SidebarProjectAppearance {
                 logo: SidebarProjectLogo::Sparkles,
                 color: SidebarProjectLogoColor::Magenta,
+                custom_logo_file: None,
             },
         );
         state.sidebar.session_order = vec!["session".to_string()];

@@ -42,6 +42,92 @@ Persisted preferences:
   list plus bounded numeric font size and font weight values. Do not store
   arbitrary CSS strings or backend-synced configuration.
 
+## Scenario: Desktop Project Icons
+
+### 1. Scope / Trigger
+
+- Trigger: GPUI Desktop changes project-logo rendering, the project appearance
+  picker, uploaded image formats, or persisted sidebar appearance state.
+
+### 2. Signatures
+
+```rust
+SidebarProjectAppearance {
+    logo: SidebarProjectLogo,
+    color: SidebarProjectLogoColor,
+    custom_logo_file: Option<String>,
+}
+
+import_sidebar_project_logo(source: &Path, home: &Path) -> Result<String, String>
+```
+
+### 3. Contracts
+
+- Project and session rows use the same fixed `SIDEBAR_LOGO_DISPLAY_SIZE`; a
+  `Button` child renders the project logo because `Button::icon` derives its
+  glyph size from the button size and may override an explicit `Icon` size.
+- `custom_logo_file` contains only a bounded content-addressed PNG file name,
+  never an external absolute path or image bytes. The image lives under
+  `<runtime-home>/project-icons/<sha256>.png`.
+- Import accepts the picker-supported raster formats, rejects oversized input,
+  center-crops and resizes the first decoded frame to `256x256`, and writes PNG
+  through a temporary file before rename. Equal normalized content reuses the
+  same file.
+- Selecting an uploaded image preserves the last built-in logo and color as the
+  fallback. Selecting a built-in logo or removing the uploaded image clears
+  `custom_logo_file`.
+- A missing home, malformed file name, or missing stored file renders the
+  built-in logo. The sidebar must not render an empty project-logo slot.
+- Legacy appearance JSON without `customLogoFile` decodes with `None`.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Source is not a regular decodable image | Reject and show a localized notification |
+| Source exceeds 16 MiB or 40 million pixels | Reject before full decode |
+| Storage directory/write/rename fails | Keep the previous appearance and report failure |
+| Persisted name is not exactly 64 hex characters plus `.png` | Ignore it and render the built-in logo |
+| Persisted file is missing | Render the built-in logo |
+| User cancels the picker | Preserve appearance without an error |
+
+### 5. Good/Base/Bad Cases
+
+- Good: upload a rectangular JPEG, store one square content-addressed PNG, and
+  restore it after restart at the same size as session Agent logos.
+- Base: existing built-in logo/color preferences round-trip unchanged and old
+  JSON defaults `custom_logo_file` to `None`.
+- Bad: persist the selected external path, keep original multi-megabyte bytes in
+  UI-state JSON, let `Button::icon` silently shrink the row logo, or show a blank
+  image when the managed file is absent.
+
+### 6. Tests Required
+
+- `vibex-desktop-model` covers legacy decode, normalization bounds, and JSON
+  round-trip for `custom_logo_file`.
+- `vibex-desktop` imports a non-square fixture, asserts a `256x256` PNG and
+  stable content-addressed name, rejects traversal-like stored names, and keeps
+  project/session rows on the shared logo-size constant.
+- Run `cargo test -p vibex-desktop-model --locked`, targeted sidebar tests, and
+  `cargo fmt --all -- --check` before commit.
+
+### 7. Wrong vs Correct
+
+```rust
+// Wrong: external files can move, and Button::icon rewrites the glyph size.
+appearance.custom_logo_file = Some(selected_path.display().to_string());
+Button::new("project-logo").xsmall().icon(icon.size(px(14.0)));
+
+// Correct: persist a managed file name and render an exact-size child.
+appearance.custom_logo_file = Some(import_sidebar_project_logo(&selected_path, home)?);
+Button::new("project-logo").xsmall().child(sidebar_project_logo(
+    &appearance,
+    Some(home),
+    px(SIDEBAR_LOGO_DISPLAY_SIZE),
+    cx,
+));
+```
+
 ## Scenario: Native First-Launch Locale
 
 ### 1. Scope / Trigger
