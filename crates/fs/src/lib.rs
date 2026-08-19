@@ -617,7 +617,7 @@ impl WorkspaceFileService {
             })?;
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
-            if is_hidden_name(&name) {
+            if name == ".git" {
                 continue;
             }
             let kind = kind_for_path(&path)?;
@@ -632,12 +632,12 @@ impl WorkspaceFileService {
                     match_start: u32::try_from(matched.start).ok(),
                     match_end: u32::try_from(matched.end).ok(),
                     matched_text: Some(name[matched].to_string()),
+                    snippet_match_start: None,
+                    snippet_match_end: None,
                 });
             }
             if kind == FileEntryKind::Directory {
-                if name != ".git" {
-                    self.search_dir(&path, matcher, include_content, limit, results)?;
-                }
+                self.search_dir(&path, matcher, include_content, limit, results)?;
             } else if include_content && results.len() < limit {
                 self.search_file_content(&path, matcher, limit, results)?;
             }
@@ -667,7 +667,8 @@ impl WorkspaceFileService {
                 break;
             }
             if let Some(matched) = matcher.find(line) {
-                let (snippet, matched_text) = content_search_snippet(line, matched.clone());
+                let (snippet, matched_text, snippet_match) =
+                    content_search_snippet(line, matched.clone());
                 results.push(FileSearchResult {
                     workspace_id: self.workspace_id.clone(),
                     path: self.relative_path(path)?.unwrap_or_default(),
@@ -678,6 +679,8 @@ impl WorkspaceFileService {
                     match_start: u32::try_from(matched.start).ok(),
                     match_end: u32::try_from(matched.end).ok(),
                     matched_text: Some(matched_text),
+                    snippet_match_start: u32::try_from(snippet_match.start).ok(),
+                    snippet_match_end: u32::try_from(snippet_match.end).ok(),
                 });
             }
         }
@@ -1372,7 +1375,10 @@ fn file_name(path: &Path) -> String {
         .to_string()
 }
 
-fn content_search_snippet(line: &str, matched: std::ops::Range<usize>) -> (String, String) {
+fn content_search_snippet(
+    line: &str,
+    matched: std::ops::Range<usize>,
+) -> (String, String, std::ops::Range<usize>) {
     let characters = line.chars().collect::<Vec<_>>();
     let match_start = line[..matched.start].chars().count();
     let match_end = match_start.saturating_add(line[matched].chars().count());
@@ -1387,9 +1393,21 @@ fn content_search_snippet(line: &str, matched: std::ops::Range<usize>) -> (Strin
         .saturating_add(MAX_SEARCH_SNIPPET_CHARS)
         .min(characters.len());
     let visible_match_end = match_end.min(end);
+    let snippet_match_start = characters[start..match_start]
+        .iter()
+        .map(|character| character.len_utf8())
+        .sum::<usize>();
+    let snippet_match_len = characters[match_start..visible_match_end]
+        .iter()
+        .map(|character| character.len_utf8())
+        .sum::<usize>();
+    let snippet_match_end = snippet_match_start.saturating_add(snippet_match_len);
+    let snippet = characters[start..end].iter().collect();
+    let matched_text = characters[match_start..visible_match_end].iter().collect();
     (
-        characters[start..end].iter().collect(),
-        characters[match_start..visible_match_end].iter().collect(),
+        snippet,
+        matched_text,
+        snippet_match_start..snippet_match_end,
     )
 }
 
@@ -1589,20 +1607,33 @@ mod tests {
         assert_eq!(hits[0].matched_text.as_deref(), Some("needle"));
         assert_eq!(hits[0].match_start, Some(6));
         assert_eq!(hits[0].match_end, Some(12));
+        assert_eq!(hits[0].snippet_match_start, Some(6));
+        assert_eq!(hits[0].snippet_match_end, Some(12));
+        assert_exact_snippet_match(&hits[0]);
         assert_eq!(hits[1].line, Some(2));
         assert_eq!(hits[1].snippet.as_deref(), Some("second NEEDLE"));
+        assert_exact_snippet_match(&hits[1]);
         cleanup(root);
     }
 
     #[test]
-    fn name_search_includes_directories_and_honors_content_match_options() {
+    fn content_search_snippet_reports_utf8_byte_offsets_after_truncation() {
+        let line = format!("{}needle{}", "界".repeat(200), "尾".repeat(200));
+        let matched_start = line.find("needle").unwrap();
+        let (snippet, matched_text, snippet_match) =
+            content_search_snippet(&line, matched_start..matched_start + "needle".len());
+
+        assert_eq!(snippet.chars().count(), MAX_SEARCH_SNIPPET_CHARS);
+        assert_eq!(matched_text, "needle");
+        assert!(snippet.is_char_boundary(snippet_match.start));
+        assert!(snippet.is_char_boundary(snippet_match.end));
+        assert_eq!(&snippet[snippet_match], "needle");
+    }
+
+    #[test]
+    fn name_search_includes_directories() {
         let root = temp_root("search-options");
         fs::create_dir_all(root.join("Needle Folder")).unwrap();
-        fs::write(
-            root.join("Needle Folder").join("notes.txt"),
-            "Needle needle NEEDLE\nneedlework\n",
-        )
-        .unwrap();
         let workspace_id = WorkspaceId::new();
         let service = WorkspaceFileService::new(&root, workspace_id.clone()).unwrap();
 
@@ -1619,6 +1650,45 @@ mod tests {
             .unwrap();
         assert_eq!(names.len(), 1);
         assert_eq!(names[0].kind, FileEntryKind::Directory);
+        cleanup(root);
+    }
+
+    #[test]
+    fn content_search_options_filter_results_and_report_the_exact_match() {
+        let root = temp_root("content-search-options");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("notes.txt"),
+            "Needle needle exact\nneedlework\nneedle exact\nNEEDLE42\nneedle42\n",
+        )
+        .unwrap();
+        let workspace_id = WorkspaceId::new();
+        let service = WorkspaceFileService::new(&root, workspace_id.clone()).unwrap();
+
+        let case_sensitive = service
+            .search(&FileSearchRequest {
+                workspace_id: workspace_id.clone(),
+                query: "needle".to_string(),
+                include_content: true,
+                case_sensitive: true,
+                whole_word: false,
+                regex: false,
+                limit: Some(10),
+            })
+            .unwrap();
+        assert_eq!(
+            case_sensitive
+                .iter()
+                .filter_map(|result| result.line)
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 5]
+        );
+        assert_eq!(case_sensitive[0].match_start, Some(7));
+        assert_eq!(case_sensitive[0].snippet_match_start, Some(7));
+        for result in &case_sensitive {
+            assert_eq!(result.matched_text.as_deref(), Some("needle"));
+            assert_exact_snippet_match(result);
+        }
 
         let whole_word = service
             .search(&FileSearchRequest {
@@ -1631,23 +1701,33 @@ mod tests {
                 limit: Some(10),
             })
             .unwrap();
-        assert_eq!(whole_word.len(), 1);
-        assert_eq!(whole_word[0].line, Some(1));
-        assert_eq!(whole_word[0].matched_text.as_deref(), Some("needle"));
+        assert_eq!(
+            whole_word
+                .iter()
+                .filter_map(|result| result.line)
+                .collect::<Vec<_>>(),
+            [1, 3]
+        );
+        for result in &whole_word {
+            assert_eq!(result.matched_text.as_deref(), Some("needle"));
+            assert_exact_snippet_match(result);
+        }
 
         let regex = service
             .search(&FileSearchRequest {
                 workspace_id: workspace_id.clone(),
-                query: r"needle\s+needle".to_string(),
+                query: r"^needle\d+$".to_string(),
                 include_content: true,
-                case_sensitive: false,
+                case_sensitive: true,
                 whole_word: false,
                 regex: true,
                 limit: Some(10),
             })
             .unwrap();
         assert_eq!(regex.len(), 1);
-        assert_eq!(regex[0].matched_text.as_deref(), Some("Needle needle"));
+        assert_eq!(regex[0].line, Some(5));
+        assert_eq!(regex[0].matched_text.as_deref(), Some("needle42"));
+        assert_exact_snippet_match(&regex[0]);
 
         let error = service
             .search(&FileSearchRequest {
@@ -1661,6 +1741,63 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(error.code, "file_search_invalid_regex");
+        cleanup(root);
+    }
+
+    #[test]
+    fn search_includes_gitignored_and_hidden_paths_but_skips_git_metadata() {
+        let root = temp_root("search-ignored-hidden");
+        fs::create_dir_all(root.join("ignored")).unwrap();
+        fs::create_dir_all(root.join(".hidden")).unwrap();
+        fs::create_dir_all(root.join(".git").join("objects")).unwrap();
+        fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+        fs::write(root.join("ignored").join("secret.txt"), "search needle\n").unwrap();
+        fs::write(root.join(".hidden").join("secret.txt"), "search needle\n").unwrap();
+        fs::write(
+            root.join(".git").join("objects").join("secret.txt"),
+            "search needle\n",
+        )
+        .unwrap();
+        let workspace_id = WorkspaceId::new();
+        let service = WorkspaceFileService::new(&root, workspace_id.clone()).unwrap();
+
+        let name_paths = service
+            .search(&FileSearchRequest {
+                workspace_id: workspace_id.clone(),
+                query: "secret".to_string(),
+                include_content: false,
+                case_sensitive: false,
+                whole_word: false,
+                regex: false,
+                limit: Some(10),
+            })
+            .unwrap()
+            .into_iter()
+            .map(|result| result.path)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            name_paths,
+            BTreeSet::from([
+                ".hidden/secret.txt".to_string(),
+                "ignored/secret.txt".to_string(),
+            ])
+        );
+
+        let content_paths = service
+            .search(&FileSearchRequest {
+                workspace_id,
+                query: "needle".to_string(),
+                include_content: true,
+                case_sensitive: false,
+                whole_word: false,
+                regex: false,
+                limit: Some(10),
+            })
+            .unwrap()
+            .into_iter()
+            .map(|result| result.path)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(content_paths, name_paths);
         cleanup(root);
     }
 
@@ -2067,6 +2204,16 @@ mod tests {
             .iter()
             .find(|entry| entry.path == path)
             .unwrap_or_else(|| panic!("missing file tree entry: {path}"))
+    }
+
+    fn assert_exact_snippet_match(result: &FileSearchResult) {
+        let snippet = result.snippet.as_deref().unwrap();
+        let range = result
+            .snippet_match_start
+            .zip(result.snippet_match_end)
+            .map(|(start, end)| start as usize..end as usize)
+            .unwrap();
+        assert_eq!(&snippet[range], result.matched_text.as_deref().unwrap());
     }
 
     fn cleanup(path: PathBuf) {

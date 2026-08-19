@@ -202,6 +202,25 @@ enum FileSearchOption {
     Regex,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileNameSearchTreeNode {
+    path: String,
+    name: String,
+    kind: FileEntryKind,
+    matched: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileNameSearchTreeRow {
+    path: String,
+    name: String,
+    kind: FileEntryKind,
+    depth: usize,
+    matched: bool,
+    has_children: bool,
+    expanded: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodeWorkbenchFixtureKind {
     Files,
@@ -6782,6 +6801,7 @@ pub struct CodeRightRail {
     file_search_mode: FileSearchMode,
     file_search_options: FileSearchOptions,
     file_search_results: Vec<FileSearchResult>,
+    file_search_collapsed_paths: BTreeSet<String>,
     file_search_loading: bool,
     file_search_error: Option<String>,
     file_search_generation: u64,
@@ -6830,6 +6850,7 @@ impl CodeRightRail {
             this.projection = next;
             if this.projection.revision.workspace_generation != previous_workspace_generation {
                 this.file_search_results.clear();
+                this.file_search_collapsed_paths.clear();
                 this.file_search_error = None;
                 this.schedule_file_search(cx);
             }
@@ -6865,6 +6886,7 @@ impl CodeRightRail {
             file_search_mode: FileSearchMode::Name,
             file_search_options: FileSearchOptions::default(),
             file_search_results: Vec::new(),
+            file_search_collapsed_paths: BTreeSet::new(),
             file_search_loading: false,
             file_search_error: None,
             file_search_generation: 0,
@@ -6919,6 +6941,7 @@ impl CodeRightRail {
         }
         self.file_search_mode = mode;
         self.file_search_results.clear();
+        self.file_search_collapsed_paths.clear();
         self.file_search_error = None;
         self.schedule_file_search(cx);
         cx.notify();
@@ -6941,6 +6964,7 @@ impl CodeRightRail {
             }
         }
         self.file_search_results.clear();
+        self.file_search_collapsed_paths.clear();
         self.file_search_error = None;
         self.schedule_file_search(cx);
         cx.notify();
@@ -6952,6 +6976,7 @@ impl CodeRightRail {
         self.file_search_loading = false;
         self.file_search_error = None;
         self.file_search_results.clear();
+        self.file_search_collapsed_paths.clear();
         self.file_search_input
             .update(cx, |input, cx| input.set_value("", window, cx));
         cx.notify();
@@ -6969,6 +6994,7 @@ impl CodeRightRail {
         self.file_search_generation = self.file_search_generation.wrapping_add(1);
         let generation = self.file_search_generation;
         self.file_search_task = None;
+        self.file_search_collapsed_paths.clear();
         let query = self.file_search_input.read(cx).value().trim().to_string();
         if query.is_empty() {
             self.file_search_loading = false;
@@ -7044,6 +7070,38 @@ impl CodeRightRail {
                 cx.notify();
             });
         }));
+    }
+
+    fn toggle_file_name_search_directory(&mut self, path: String, cx: &mut Context<Self>) {
+        if !self.file_search_collapsed_paths.insert(path.clone()) {
+            self.file_search_collapsed_paths.remove(&path);
+        }
+        cx.notify();
+    }
+
+    fn activate_file_name_search_row(
+        &mut self,
+        path: String,
+        kind: FileEntryKind,
+        has_children: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if kind == FileEntryKind::Directory && has_children {
+            self.toggle_file_name_search_directory(path, cx);
+            return;
+        }
+        if kind == FileEntryKind::Directory {
+            self.clear_file_search(window, cx);
+            let _ = self.workbench.update(cx, |workbench, cx| {
+                workbench.reveal_file_search_directory(path, cx);
+            });
+        } else {
+            let _ = self.workbench.update(cx, |workbench, cx| {
+                workbench.request_preview_panel(cx);
+                workbench.open_file(path, false, window, cx);
+            });
+        }
     }
 
     fn begin_inline_file_action(
@@ -7870,60 +7928,82 @@ impl CodeRightRail {
     fn render_file_search_name_result(
         &mut self,
         index: usize,
-        result: FileSearchResult,
+        row: FileNameSearchTreeRow,
         query: &str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let path = result.path.clone();
-        let kind = result.kind;
-        let parent = relative_parent_path(&path).to_string();
-        let descriptor = file_icon_descriptor(&result.name, result.kind);
-        let controller = self.workbench.downgrade();
+        let path = row.path.clone();
+        let kind = row.kind;
+        let descriptor = file_icon_descriptor(&row.name, row.kind);
+        let has_children = row.has_children;
+        let expanded = row.expanded;
+        let click_path = path.clone();
+        let keyboard_path = path.clone();
+        let disclosure = if has_children {
+            Icon::new(if expanded {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            })
+            .size(px(14.0))
+            .text_color(cx.theme().muted_foreground)
+            .into_any_element()
+        } else {
+            div().w(px(14.0)).flex_none().into_any_element()
+        };
         h_flex()
-            .id(format!("file-name-search-result:{index}:{}", result.path))
-            .h(px(40.0))
+            .id(format!("file-name-search-result:{index}:{}", row.path))
+            .relative()
+            .h(px(FILE_ROW_HEIGHT))
             .w_full()
             .min_w_0()
             .flex_none()
-            .gap_2()
-            .px_2()
+            .items_center()
+            .px_1()
             .rounded(cx.theme().radius)
             .cursor_pointer()
-            .aria_label(result.path.clone())
+            .focusable()
+            .tab_index(0)
+            .role(Role::Button)
+            .aria_label(row.path.clone())
+            .when(has_children, |this| this.aria_expanded(expanded))
+            .children(file_tree_guides(row.depth, cx))
+            .child(div().w(px(row.depth as f32 * FILE_TREE_INDENT)).flex_none())
+            .child(disclosure)
             .child(file_tree_icon(descriptor.kind, false, cx))
             .child(
-                v_flex()
+                div()
                     .min_w_0()
                     .flex_1()
+                    .ml_1p5()
+                    .truncate()
                     .child(render_file_name_match(
-                        &result.name,
-                        query,
+                        &row.name,
+                        if row.matched { query } else { "" },
                         cx.theme().sidebar_foreground,
                         cx,
-                    ))
-                    .when(!parent.is_empty(), |this| {
-                        this.child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(parent),
-                        )
-                    }),
+                    )),
             )
             .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.45)))
             .on_click(cx.listener(move |this, _, window, cx| {
-                if kind == FileEntryKind::Directory {
-                    this.clear_file_search(window, cx);
-                    let _ = controller.update(cx, |workbench, cx| {
-                        workbench.reveal_file_search_directory(path.clone(), cx);
-                    });
-                } else {
-                    let _ = controller.update(cx, |workbench, cx| {
-                        workbench.request_preview_panel(cx);
-                        workbench.open_file(path.clone(), false, window, cx);
-                    });
+                this.activate_file_name_search_row(
+                    click_path.clone(),
+                    kind,
+                    has_children,
+                    window,
+                    cx,
+                );
+            }))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "enter" || event.keystroke.key == "space" {
+                    this.activate_file_name_search_row(
+                        keyboard_path.clone(),
+                        kind,
+                        has_children,
+                        window,
+                        cx,
+                    );
+                    cx.stop_propagation();
                 }
             }))
             .into_any_element()
@@ -7977,11 +8057,10 @@ impl CodeRightRail {
         let path = result.path.clone();
         let line = result.line.unwrap_or(1);
         let snippet = result.snippet.unwrap_or_default();
-        let matched_text = result
-            .matched_text
-            .clone()
-            .filter(|matched| !matched.is_empty())
-            .unwrap_or_else(|| query.to_string());
+        let snippet_match_range = result
+            .snippet_match_start
+            .zip(result.snippet_match_end)
+            .map(|(start, end)| start as usize..end as usize);
         let reveal_query = query.to_string();
         let match_start = result.match_start;
         let match_end = result.match_end;
@@ -8010,7 +8089,12 @@ impl CodeRightRail {
                     .child(line.to_string()),
             )
             .child(div().min_w_0().flex_1().overflow_hidden().text_xs().child(
-                render_file_name_match(&snippet, &matched_text, cx.theme().sidebar_foreground, cx),
+                render_highlighted_text_range(
+                    &snippet,
+                    snippet_match_range,
+                    cx.theme().sidebar_foreground,
+                    cx,
+                ),
             ))
             .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.45)))
             .on_click(move |_, window, cx| {
@@ -8081,8 +8165,10 @@ impl CodeRightRail {
         let mut rows = Vec::new();
         match self.file_search_mode {
             FileSearchMode::Name => {
-                for (index, result) in results.into_iter().enumerate() {
-                    rows.push(self.render_file_search_name_result(index, result, &query, cx));
+                let tree_rows =
+                    file_name_search_tree_rows(&results, &self.file_search_collapsed_paths);
+                for (index, row) in tree_rows.into_iter().enumerate() {
+                    rows.push(self.render_file_search_name_result(index, row, &query, cx));
                 }
             }
             FileSearchMode::Content => {
@@ -11970,19 +12056,33 @@ fn render_file_name_match(
     color: Hsla,
     cx: &Context<CodeRightRail>,
 ) -> AnyElement {
-    let Some(range) = file_name_match_range(name, query) else {
+    render_highlighted_text_range(name, file_name_match_range(name, query), color, cx)
+}
+
+fn render_highlighted_text_range(
+    text: &str,
+    range: Option<std::ops::Range<usize>>,
+    color: Hsla,
+    cx: &Context<CodeRightRail>,
+) -> AnyElement {
+    let Some(range) = range.filter(|range| {
+        range.start < range.end
+            && range.end <= text.len()
+            && text.is_char_boundary(range.start)
+            && text.is_char_boundary(range.end)
+    }) else {
         return div()
             .flex_none()
             .whitespace_nowrap()
             .text_color(color)
-            .child(name.to_string())
+            .child(text.to_string())
             .into_any_element();
     };
     h_flex()
         .flex_none()
         .whitespace_nowrap()
         .text_color(color)
-        .child(name[..range.start].to_string())
+        .child(text[..range.start].to_string())
         .child(
             div()
                 .rounded(px(3.0))
@@ -11991,9 +12091,9 @@ fn render_file_name_match(
                 .px(px(2.0))
                 .bg(cx.theme().primary.opacity(0.25))
                 .text_color(cx.theme().foreground)
-                .child(name[range.clone()].to_string()),
+                .child(text[range.clone()].to_string()),
         )
-        .child(name[range.end..].to_string())
+        .child(text[range.end..].to_string())
         .into_any_element()
 }
 
@@ -12559,6 +12659,114 @@ fn diff_row_height(code_font_size: u16) -> f32 {
     (f32::from(code_font_size.clamp(10, 24)) * 1.5 + DIFF_LINE_VERTICAL_PADDING * 2.0)
         .ceil()
         .max(DIFF_ROW_MIN_HEIGHT)
+}
+
+fn file_name_search_tree_rows(
+    results: &[FileSearchResult],
+    collapsed_paths: &BTreeSet<String>,
+) -> Vec<FileNameSearchTreeRow> {
+    let mut nodes = BTreeMap::<String, FileNameSearchTreeNode>::new();
+    for result in results {
+        let Some(path) = normalized_relative_path(&result.path) else {
+            continue;
+        };
+        let segments = path.split('/').map(str::to_string).collect::<Vec<_>>();
+        let mut current_path = String::new();
+        for (index, segment) in segments.iter().enumerate() {
+            if !current_path.is_empty() {
+                current_path.push('/');
+            }
+            current_path.push_str(segment);
+            let is_match = index + 1 == segments.len();
+            let node =
+                nodes
+                    .entry(current_path.clone())
+                    .or_insert_with(|| FileNameSearchTreeNode {
+                        path: current_path.clone(),
+                        name: segment.clone(),
+                        kind: if is_match {
+                            result.kind
+                        } else {
+                            FileEntryKind::Directory
+                        },
+                        matched: is_match,
+                    });
+            if is_match {
+                node.name = if result.name.is_empty() {
+                    segment.clone()
+                } else {
+                    result.name.clone()
+                };
+                node.kind = result.kind;
+                node.matched = true;
+            } else {
+                node.kind = FileEntryKind::Directory;
+            }
+        }
+    }
+
+    let mut children = BTreeMap::<String, Vec<String>>::new();
+    for path in nodes.keys() {
+        children
+            .entry(relative_parent_path(path).to_string())
+            .or_default()
+            .push(path.clone());
+    }
+    for siblings in children.values_mut() {
+        siblings.sort_by(|left, right| {
+            let left = &nodes[left];
+            let right = &nodes[right];
+            let left_directory = left.kind == FileEntryKind::Directory;
+            let right_directory = right.kind == FileEntryKind::Directory;
+            right_directory
+                .cmp(&left_directory)
+                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+                .then_with(|| left.path.cmp(&right.path))
+        });
+    }
+
+    let mut rows = Vec::with_capacity(nodes.len());
+    append_file_name_search_tree_rows("", 0, &nodes, &children, collapsed_paths, &mut rows);
+    rows
+}
+
+fn append_file_name_search_tree_rows(
+    parent: &str,
+    depth: usize,
+    nodes: &BTreeMap<String, FileNameSearchTreeNode>,
+    children: &BTreeMap<String, Vec<String>>,
+    collapsed_paths: &BTreeSet<String>,
+    rows: &mut Vec<FileNameSearchTreeRow>,
+) {
+    let Some(child_paths) = children.get(parent) else {
+        return;
+    };
+    for child_path in child_paths {
+        let node = &nodes[child_path];
+        let has_children = children
+            .get(child_path)
+            .is_some_and(|children| !children.is_empty());
+        let expanded = has_children && !collapsed_paths.contains(child_path);
+        rows.push(FileNameSearchTreeRow {
+            path: node.path.clone(),
+            name: node.name.clone(),
+            kind: node.kind,
+            depth,
+            matched: node.matched,
+            has_children,
+            expanded,
+        });
+        if expanded {
+            append_file_name_search_tree_rows(
+                child_path,
+                depth.saturating_add(1),
+                nodes,
+                children,
+                collapsed_paths,
+                rows,
+            );
+        }
+    }
 }
 
 fn normalized_relative_path(path: &str) -> Option<String> {
@@ -13191,6 +13399,57 @@ mod tests {
     fn file_search_mode_toggle_switches_between_names_and_content() {
         assert_eq!(FileSearchMode::Name.toggled(), FileSearchMode::Content);
         assert_eq!(FileSearchMode::Content.toggled(), FileSearchMode::Name);
+    }
+
+    #[test]
+    fn file_name_search_results_project_to_a_collapsible_directory_first_tree() {
+        let workspace_id = WorkspaceId::new();
+        let result = |path: &str, name: &str, kind: FileEntryKind| FileSearchResult {
+            workspace_id: workspace_id.clone(),
+            path: path.to_string(),
+            name: name.to_string(),
+            kind,
+            line: None,
+            snippet: None,
+            match_start: Some(0),
+            match_end: u32::try_from(name.len()).ok(),
+            matched_text: Some(name.to_string()),
+            snippet_match_start: None,
+            snippet_match_end: None,
+        };
+        let results = vec![
+            result("README.md", "README.md", FileEntryKind::File),
+            result("src/main.rs", "main.rs", FileEntryKind::File),
+            result("src/tools/build.rs", "build.rs", FileEntryKind::File),
+            result("src/tools", "tools", FileEntryKind::Directory),
+        ];
+
+        let rows = file_name_search_tree_rows(&results, &BTreeSet::new());
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.path.as_str(), row.depth))
+                .collect::<Vec<_>>(),
+            [
+                ("src", 0),
+                ("src/tools", 1),
+                ("src/tools/build.rs", 2),
+                ("src/main.rs", 1),
+                ("README.md", 0),
+            ]
+        );
+        assert!(!rows[0].matched);
+        assert!(rows[0].has_children);
+        assert!(rows[0].expanded);
+        assert!(rows[1].matched);
+        assert_eq!(rows[1].kind, FileEntryKind::Directory);
+
+        let collapsed = BTreeSet::from(["src".to_string()]);
+        let rows = file_name_search_tree_rows(&results, &collapsed);
+        assert_eq!(
+            rows.iter().map(|row| row.path.as_str()).collect::<Vec<_>>(),
+            ["src", "README.md"]
+        );
+        assert!(!rows[0].expanded);
     }
 
     #[test]

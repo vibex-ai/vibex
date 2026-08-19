@@ -955,6 +955,8 @@ mod tests {
                     match_start: Some(3),
                     match_end: Some(7),
                     matched_text: Some("main".into()),
+                    snippet_match_start: Some(3),
+                    snippet_match_end: Some(7),
                 }])
             })
         }

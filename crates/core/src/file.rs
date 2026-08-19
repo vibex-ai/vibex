@@ -145,6 +145,10 @@ pub struct FileSearchResult {
     pub match_end: Option<u32>,
     #[serde(default)]
     pub matched_text: Option<String>,
+    #[serde(default)]
+    pub snippet_match_start: Option<u32>,
+    #[serde(default)]
+    pub snippet_match_end: Option<u32>,
 }
 
 #[cfg(test)]
@@ -176,5 +180,7 @@ mod tests {
         assert_eq!(result.match_start, None);
         assert_eq!(result.match_end, None);
         assert_eq!(result.matched_text, None);
+        assert_eq!(result.snippet_match_start, None);
+        assert_eq!(result.snippet_match_end, None);
     }
 }
