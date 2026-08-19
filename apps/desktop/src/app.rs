@@ -128,8 +128,8 @@ use vibex_ui::{
 };
 
 use crate::actions::{
-    NavigateBack, NavigateForward, OpenSettings, RetryRuntime, SaveActiveFile, TogglePreview,
-    ToggleRightRail, ToggleSidebar,
+    NavigateBack, NavigateForward, OpenSettings, RetryRuntime, SaveActiveFile, ToggleComposerMode,
+    TogglePreview, ToggleRightRail, ToggleSidebar,
 };
 use crate::assets::{agent_brand_icon, agent_brand_logo, model_brand_icon, window_icon};
 use crate::code_workbench::{
@@ -19344,7 +19344,16 @@ impl VibexWorkbench {
             } else {
                 cx.theme().transparent
             })
-            .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.45)))
+            .hover(move |style| {
+                if move_selected {
+                    style.bg(sidebar_move_selected_background(
+                        cx.theme().sidebar_accent,
+                        cx.theme().is_dark(),
+                    ))
+                } else {
+                    style.bg(cx.theme().sidebar_accent.opacity(0.45))
+                }
+            })
             .on_hover(cx.listener(|this, hovered, _, cx| {
                 if *hovered {
                     this.clear_sidebar_context_menu_target(cx);
@@ -39409,6 +39418,9 @@ pub fn open_workbench_window(cx: &mut App) -> Result<(), String> {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitleBar::title_bar_options()),
+        "toggle_composer_mode" | "vibex::ToggleComposerMode" => {
+            push!(ToggleComposerMode, "vibex::ToggleComposerMode")
+        }
         app_id: Some(application_id.to_string()),
         icon: Some(window_icon()?),
         window_min_size: Some(size(px(MIN_WIDTH as f32), px(MIN_HEIGHT as f32))),
@@ -39427,6 +39439,7 @@ pub fn open_workbench_window(cx: &mut App) -> Result<(), String> {
             cx.set_quit_mode(gpui::QuitMode::LastWindowClosed);
         }
         window.on_window_should_close(cx, crate::system_tray::handle_window_close);
+        "toggle_composer_mode" => "vibex::ToggleComposerMode",
         cx.new(|cx| Root::new(workbench, window, cx).bordered(false))
     })
     .map_err(|error| format!("failed to open Vibex workbench: {error}"))?;
@@ -40220,6 +40233,7 @@ mod tests {
 
         let render_state = timeline_session_state_for_render(
             Some(&session_id),
+        assert!(shortcut_is_valid("cmd-shift-t"));
             Some(&session_id),
             false,
             Some(AgentSessionState::Running),
@@ -40234,6 +40248,32 @@ mod tests {
     fn streaming_timeline_fixture() -> (TimelineModel, Rc<Vec<Rc<TimelineConversationTurn>>>) {
         let session_id = VibexSessionId::parse("session_streaming_cache").unwrap();
         let items = [
+        assert_eq!(
+            effective_shortcut(&overrides, "toggle_composer_mode"),
+            Some("cmd-shift-t")
+        );
+    }
+
+    #[test]
+    fn composer_mode_toggle_is_registered_as_a_customizable_action() {
+        let source = include_str!("app.rs");
+        let handler = source
+            .split_once("    fn on_toggle_composer_mode(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn on_open_settings("))
+            .map(|(body, _)| body)
+            .expect("composer mode toggle handler should remain inspectable");
+        assert!(source.contains("(\"toggle_composer_mode\", \"cmd-shift-t\")"));
+        assert!(source.contains("ToggleComposerMode"));
+        assert!(source.contains(".on_action(cx.listener(Self::on_toggle_composer_mode))"));
+        assert!(source.contains("\"Toggle conversation / terminal\""));
+        assert!(source.contains("\"切换对话/终端模式\""));
+        assert_eq!(
+            settings_section_for_query("输入模式"),
+            Some(SettingsSection::Shortcuts)
+        );
+        assert!(handler.contains("self.composer_terminal_mode = false;"));
+        assert!(handler.contains("input.focus(window, cx)"));
+        assert!(handler.contains("self.switch_to_composer_terminal("));
             timeline_item_with_payload(
                 &session_id,
                 1,
@@ -41242,6 +41282,19 @@ mod tests {
                 ));
 
             v_flex()
+    struct ComposerPasteScrollProbe {
+        input: Entity<InputState>,
+    }
+
+    impl Render for ComposerPasteScrollProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(320.0))
+                .h(px(160.0))
+                .child(Input::new(&self.input).appearance(false).size_full())
+        }
+    }
+
                 .size_full()
                 .items_start()
                 .gap_2()
@@ -44842,24 +44895,83 @@ mod tests {
     }
 
     #[test]
-    fn composer_paste_reveals_the_cursor_after_custom_clipboard_insertion() {
+    fn composer_attachment_picker_accepts_files_and_has_one_entry_per_composer() {
         let source = include_str!("app.rs");
-        let paste = source
-            .split_once("    fn capture_composer_paste(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn handle_composer_enter("))
+        let picker = source
+            .split_once("    fn choose_composer_attachments(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn choose_attachment_save_copy("))
             .map(|(body, _)| body)
-            .expect("composer paste handling should remain inspectable");
-        assert!(paste.contains("let captured = self.paste_composer_clipboard_to"));
-        assert!(paste.contains("self.schedule_composer_cursor_reveal(input, window, cx);"));
-        assert!(paste.contains("cx.stop_propagation();"));
+            .expect("composer attachment picker should remain inspectable");
+        assert!(picker.contains("Attach files"));
+        assert!(picker.contains(".pick_files()"));
+        assert!(!picker.contains(".add_filter("));
 
-        let reveal = source
-            .split_once("    fn schedule_composer_cursor_reveal(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn handle_composer_enter("))
+        let new_session = source
+            .split_once("    fn render_new_session_panel(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn show_turn_preview_rail("))
             .map(|(body, _)| body)
-            .expect("composer cursor reveal should remain inspectable");
-        assert!(reveal.contains("let selection = input.selected_range();"));
-        assert!(reveal.contains("input.set_selected_range(selection, cx);"));
+            .expect("new-session composer should remain inspectable");
+        assert_eq!(
+            new_session
+                .matches("\"new-session-choose-attachments\"")
+                .count(),
+            1
+        );
+        assert!(!new_session.contains("new-session-attach-image"));
+        let attachment = new_session
+            .find("new-session-choose-attachments")
+            .expect("new-session attachment control should be present");
+        let runtime_controls = new_session
+            .find(".children(runtime_controls)")
+            .expect("new-session runtime controls should be present");
+        assert!(attachment < runtime_controls);
+
+        let composer = source
+            .split_once("    fn render_composer(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
+            .map(|(body, _)| body)
+            .expect("session composer should remain inspectable");
+        assert_eq!(composer.matches("choose-composer-attachments").count(), 1);
+        assert!(!composer.contains("choose-composer-images"));
+    }
+
+    #[gpui::test]
+    fn composer_paste_reveals_the_cursor_after_updated_text_is_laid_out(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (probe, cx) = cx.add_window_view(|window, cx| ComposerPasteScrollProbe {
+            input: cx.new(|cx| InputState::new(window, cx).auto_grow(2, 8)),
+        });
+        let input = probe.read_with(cx, |probe, _| probe.input.clone());
+
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let pasted_text = (0..80)
+            .map(|line| format!("pasted line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        cx.update(|window, cx| {
+            // Capture handlers run before the native Input paste action.
+            reveal_composer_cursor_after_layout(input.clone(), window);
+            input.update(cx, |input, cx| input.replace(pasted_text, window, cx));
+        });
+
+        for _ in 0..2 {
+            cx.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                let _ = window.draw(cx);
+            });
+        }
+
+        input.read_with(cx, |input, _| {
+            let cursor = input.cursor();
+            assert!(input.scroll_offset().y < px(0.0));
+            assert!(
+                input.range_to_bounds(&(cursor..cursor)).is_some(),
+                "the pasted-text cursor should be inside the laid-out viewport"
+            );
+        });
     }
 
     #[test]

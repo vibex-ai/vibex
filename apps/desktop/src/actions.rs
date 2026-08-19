@@ -14,6 +14,10 @@ pub struct ToggleRightRail;
 
 #[derive(Action, Clone, PartialEq)]
 #[action(namespace = vibex, no_json)]
+pub struct ToggleComposerMode;
+
+#[derive(Action, Clone, PartialEq)]
+#[action(namespace = vibex, no_json)]
 pub struct OpenSettings;
 
 #[derive(Action, Clone, PartialEq)]
