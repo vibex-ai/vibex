@@ -11114,21 +11114,14 @@ impl VibexWorkbench {
         captured
     }
 
-    fn choose_composer_images(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn choose_composer_attachments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.composer_attachment_task.is_some() {
             return;
         }
         let new_session = self.new_session_open;
         let picker = gpui_tokio::Tokio::spawn(cx, async move {
             rfd::AsyncFileDialog::new()
-                .set_title("Attach images")
-                .add_filter(
-                    "Images",
-                    &[
-                        "png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "tif", "tiff", "ico",
-                        "pbm", "pgm", "ppm", "pnm",
-                    ],
-                )
+                .set_title(locale::text("Attach files", "添加附件", "新增附件"))
                 .pick_files()
                 .await
         });
@@ -22917,27 +22910,6 @@ impl VibexWorkbench {
                                             .flex_none()
                                             .gap(px(6.0))
                                             .child(
-                                                Button::new("new-session-attach-image")
-                                                    .ghost()
-                                                    .compact()
-                                                    .size(px(36.0))
-                                                    .rounded(px(18.0))
-                                                    .bg(muted_color)
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .icon(IconName::Plus)
-                                                    .tooltip(locale::text(
-                                                        "Add image",
-                                                        "添加图片",
-                                                        "新增圖片",
-                                                    ))
-                                                    .disabled(self.agent_action_pending)
-                                                    .on_click(cx.listener(
-                                                        |this, _, window, cx| {
-                                                            this.choose_composer_images(window, cx)
-                                                        },
-                                                    )),
-                                            )
-                                            .child(
                                                 Button::new("new-session-choose-workspace")
                                                     .ghost()
                                                     .compact()
@@ -22978,6 +22950,28 @@ impl VibexWorkbench {
                                                         .min_w_0()
                                                         .flex_wrap()
                                                         .gap_1()
+                                                        .child(
+                                                            Button::new(
+                                                                "new-session-choose-attachments",
+                                                            )
+                                                            .ghost()
+                                                            .compact()
+                                                            .size(px(32.0))
+                                                            .icon(IconName::Plus)
+                                                            .tooltip(locale::text(
+                                                                "Add attachments",
+                                                                "添加附件",
+                                                                "新增附件",
+                                                            ))
+                                                            .disabled(self.agent_action_pending)
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.choose_composer_attachments(
+                                                                        window, cx,
+                                                                    )
+                                                                },
+                                                            )),
+                                                        )
                                                         .children(runtime_controls),
                                                 )
                                                 .child(
@@ -30437,20 +30431,22 @@ impl VibexWorkbench {
                                             .gap_1()
                                             .overflow_x_scroll()
                                             .child(
-                                                Button::new("choose-composer-images")
+                                                Button::new("choose-composer-attachments")
                                                     .ghost()
                                                     .compact()
                                                     .size(px(32.0))
                                                     .icon(IconName::Plus)
                                                     .tooltip(locale::text(
-                                                        "Add images",
-                                                        "添加图片",
-                                                        "新增圖片",
+                                                        "Add attachments",
+                                                        "添加附件",
+                                                        "新增附件",
                                                     ))
                                                     .disabled(self.agent_action_pending)
                                                     .on_click(cx.listener(
                                                         |this, _, window, cx| {
-                                                            this.choose_composer_images(window, cx)
+                                                            this.choose_composer_attachments(
+                                                                window, cx,
+                                                            )
                                                         },
                                                     )),
                                             )
