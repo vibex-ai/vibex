@@ -653,6 +653,17 @@ impl VibexMessageClipboard {
     }
 }
 
+fn reveal_composer_cursor_after_layout(input: Entity<InputState>, window: &mut Window) {
+    window.on_next_frame(move |window, _| {
+        window.on_next_frame(move |_, cx| {
+            input.update(cx, |input, cx| {
+                let selection = input.selected_range();
+                input.set_selected_range(selection, cx);
+            });
+        });
+    });
+}
+
 fn composer_runtime_controls_are_compact(viewport_width: u32) -> bool {
     viewport_width <= NEW_SESSION_COMPACT_SELECTOR_MAX_WIDTH
 }
@@ -9960,27 +9971,10 @@ impl VibexWorkbench {
         }
 
         let captured = self.paste_composer_clipboard_to(new_session, window, cx);
-        self.schedule_composer_cursor_reveal(input, window, cx);
+        reveal_composer_cursor_after_layout(input, window);
         if captured {
             cx.stop_propagation();
         }
-    }
-
-    /// Re-run the input's cursor visibility calculation after paste has updated
-    /// its text and selection. The next-frame boundary lets custom clipboard
-    /// insertion and the native input paste path share the same layout state.
-    fn schedule_composer_cursor_reveal(
-        &self,
-        input: Entity<InputState>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        cx.on_next_frame(window, move |_, _, cx| {
-            input.update(cx, |input, cx| {
-                let selection = input.selected_range();
-                input.set_selected_range(selection, cx);
-            });
-        });
     }
 
     fn handle_composer_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -39997,7 +39991,7 @@ fn render_user_message_bubble(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     use super::*;
     use crate::assets::{AgentBrandAsset, agent_brand_asset};
@@ -41288,6 +41282,19 @@ mod tests {
 
     struct RuntimeSelectorScrollProbe {
         scroll: gpui::ScrollHandle,
+    }
+
+    struct ComposerPasteScrollProbe {
+        input: Entity<InputState>,
+    }
+
+    impl Render for ComposerPasteScrollProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(320.0))
+                .h(px(160.0))
+                .child(Input::new(&self.input).appearance(false).size_full())
+        }
     }
 
     impl Render for RuntimeSelectorScrollProbe {
@@ -44983,25 +44990,51 @@ mod tests {
         assert!(!composer.contains("choose-composer-images"));
     }
 
-    #[test]
-    fn composer_paste_reveals_the_cursor_after_custom_clipboard_insertion() {
-        let source = include_str!("app.rs");
-        let paste = source
-            .split_once("    fn capture_composer_paste(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn handle_composer_enter("))
-            .map(|(body, _)| body)
-            .expect("composer paste handling should remain inspectable");
-        assert!(paste.contains("let captured = self.paste_composer_clipboard_to"));
-        assert!(paste.contains("self.schedule_composer_cursor_reveal(input, window, cx);"));
-        assert!(paste.contains("cx.stop_propagation();"));
+    #[gpui::test]
+    fn composer_paste_reveals_the_cursor_after_updated_text_is_laid_out(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let input_slot = Rc::new(RefCell::new(None));
+        let input_slot_for_view = input_slot.clone();
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let input = cx.new(|cx| InputState::new(window, cx).auto_grow(2, 8));
+            *input_slot_for_view.borrow_mut() = Some(input.clone());
+            let probe = cx.new(|_| ComposerPasteScrollProbe { input });
+            gpui_component::Root::new(probe, window, cx)
+        });
+        let input = input_slot
+            .borrow()
+            .clone()
+            .expect("composer input should be created with the root view");
 
-        let reveal = source
-            .split_once("    fn schedule_composer_cursor_reveal(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn handle_composer_enter("))
-            .map(|(body, _)| body)
-            .expect("composer cursor reveal should remain inspectable");
-        assert!(reveal.contains("let selection = input.selected_range();"));
-        assert!(reveal.contains("input.set_selected_range(selection, cx);"));
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let pasted_text = (0..80)
+            .map(|line| format!("pasted line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        cx.update(|window, cx| {
+            // Capture handlers run before the native Input paste action.
+            reveal_composer_cursor_after_layout(input.clone(), window);
+            input.update(cx, |input, cx| input.replace(pasted_text, window, cx));
+        });
+
+        for _ in 0..2 {
+            cx.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                let _ = window.draw(cx);
+            });
+        }
+
+        input.read_with(cx, |input, _| {
+            let cursor = input.cursor();
+            assert!(input.scroll_offset().y < px(0.0));
+            assert!(
+                input.range_to_bounds(&(cursor..cursor)).is_some(),
+                "the pasted-text cursor should be inside the laid-out viewport"
+            );
+        });
     }
 
     #[test]

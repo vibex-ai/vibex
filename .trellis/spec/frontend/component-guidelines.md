@@ -93,6 +93,22 @@ GPUI fixture because compile-only and model tests do not execute `Button::render
 The Code Workbench source contract additionally rejects a direct hover override on
 its preview-tab add button.
 
+### GPUI Post-Mutation Scroll Timing
+
+When a GPUI action changes text or other content whose layout determines a scroll
+range, do not calculate the final scroll target in the first `on_next_frame`
+callback. GPUI runs next-frame callbacks before that frame's `draw`, so the first
+callback can still observe the pre-mutation layout and clamp the requested offset
+against a stale scroll range. Use the first callback as a layout barrier and apply
+the cursor or item reveal from a second next-frame callback after the updated
+content has been drawn.
+
+Cover this behavior with a real GPUI layout test. The test must perform the content
+mutation in the same action order as production, advance both frame boundaries,
+and assert that the target range is actually laid out inside the viewport. A
+source-string assertion or a test that only checks callback registration does not
+prove scroll behavior.
+
 Production GPUI workbench roots must mount the component overlay hosts after the
 main shell content. Append `Root::render_sheet_layer`,
 `Root::render_dialog_layer`, and `Root::render_notification_layer` in that
