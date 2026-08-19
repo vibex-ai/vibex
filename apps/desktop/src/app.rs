@@ -3615,6 +3615,7 @@ pub struct VibexWorkbench {
     workspaces: Vec<(ProjectRecord, WorkspaceRecord)>,
     sessions: Vec<AgentSession>,
     optimistically_removed_session_ids: BTreeSet<String>,
+    pending_session_deletion_ids: BTreeSet<String>,
     optimistic_session_deletion_reconciliation_pending: bool,
     sidebar_state: SidebarState,
     sidebar_projection_revision: u64,
@@ -4222,6 +4223,7 @@ impl VibexWorkbench {
             workspaces: Vec::new(),
             sessions: Vec::new(),
             optimistically_removed_session_ids: BTreeSet::new(),
+            pending_session_deletion_ids: BTreeSet::new(),
             optimistic_session_deletion_reconciliation_pending: false,
             sidebar_state,
             sidebar_projection_revision: 0,
@@ -15265,14 +15267,18 @@ impl VibexWorkbench {
     }
 
     fn delete_session(&mut self, session_id: VibexSessionId, cx: &mut Context<Self>) {
-        if self.agent_action_pending {
+        if self
+            .pending_session_deletion_ids
+            .contains(session_id.as_str())
+        {
             return;
         }
         let Some(runtime) = self.runtime.clone() else {
             return;
         };
         let session_id_set = BTreeSet::from([session_id.as_str().to_string()]);
-        self.agent_action_pending = true;
+        self.pending_session_deletion_ids
+            .extend(session_id_set.iter().cloned());
         self.optimistically_remove_sessions(&session_id_set);
         self.queue_agent_ui_state();
         cx.notify();
@@ -15280,7 +15286,7 @@ impl VibexWorkbench {
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             runtime.agent().manager().delete_session(&session_id).await
         });
-        self.finish_optimistic_session_deletion(generation, runner, cx);
+        self.finish_optimistic_session_deletion(generation, session_id_set, runner, cx);
     }
 
     fn confirm_delete_selected_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -15332,10 +15338,15 @@ impl VibexWorkbench {
             .collect::<Vec<_>>();
         self.sidebar_batch_mode = false;
         self.sidebar_state.clear_selection();
-        if self.agent_action_pending
-            || !self.optimistically_removed_session_ids.is_empty()
-            || session_ids.is_empty()
-        {
+        let session_ids = session_ids
+            .into_iter()
+            .filter(|session_id| {
+                !self
+                    .pending_session_deletion_ids
+                    .contains(session_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        if session_ids.is_empty() {
             cx.notify();
             return;
         }
@@ -15347,7 +15358,8 @@ impl VibexWorkbench {
             .iter()
             .map(|session_id| session_id.as_str().to_string())
             .collect::<BTreeSet<_>>();
-        self.agent_action_pending = true;
+        self.pending_session_deletion_ids
+            .extend(session_id_set.iter().cloned());
         self.optimistically_remove_sessions(&session_id_set);
         self.queue_agent_ui_state();
         cx.notify();
@@ -15366,7 +15378,7 @@ impl VibexWorkbench {
             }
             Ok::<(), vibex_core::VibexError>(())
         });
-        self.finish_optimistic_session_deletion(generation, runner, cx);
+        self.finish_optimistic_session_deletion(generation, session_id_set, runner, cx);
     }
 
     fn optimistically_remove_sessions(&mut self, session_ids: &BTreeSet<String>) {
@@ -15456,6 +15468,7 @@ impl VibexWorkbench {
     fn finish_optimistic_session_deletion(
         &mut self,
         generation: u64,
+        session_ids: BTreeSet<String>,
         runner: Task<Result<Result<(), vibex_core::VibexError>, tokio::task::JoinError>>,
         cx: &mut Context<Self>,
     ) {
@@ -15463,10 +15476,14 @@ impl VibexWorkbench {
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let outcome = runner.await;
                 let _ = entity.update(cx, |this, cx| {
-                    this.agent_action_pending = false;
+                    this.pending_session_deletion_ids
+                        .retain(|session_id| !session_ids.contains(session_id));
                     let active = this.session_generation == generation;
-                    this.optimistic_session_deletion_reconciliation_pending = true;
-                    this.load_agent_overview(cx);
+                    let should_reconcile = this.pending_session_deletion_ids.is_empty();
+                    if should_reconcile {
+                        this.optimistic_session_deletion_reconciliation_pending = true;
+                        this.load_agent_overview(cx);
+                    }
                     match outcome {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) if active => {
@@ -20110,6 +20127,9 @@ impl VibexWorkbench {
         let context_rename_id = session.id.clone();
         let context_delete_id = session.id.clone();
         let mutation_pending = self.agent_action_pending;
+        let session_deletion_pending = self
+            .pending_session_deletion_ids
+            .contains(session.id.as_str());
         let auto_continue_enabled = self.auto_continue_enabled(&session.id);
         let auto_continue_label = locale::text("Auto continue", "自动继续", "自動繼續");
         let pin_label = if pinned {
@@ -20411,7 +20431,7 @@ impl VibexWorkbench {
                         .item(
                             PopupMenuItem::new(strings.sidebar_delete)
                                 .icon(sidebar_icon("icons/vibex/trash-2.svg"))
-                                .disabled(mutation_pending)
+                                .disabled(session_deletion_pending)
                                 .on_click(move |_, window, cx| {
                                     let _ = delete_entity.update(cx, |this, cx| {
                                         this.confirm_delete_session(delete_id.clone(), window, cx)
@@ -20625,7 +20645,7 @@ impl VibexWorkbench {
                                 .h(px(24.0))
                                 .icon(sidebar_icon("icons/vibex/trash-2.svg"))
                                 .tooltip(strings.sidebar_delete)
-                                .disabled(self.agent_action_pending)
+                                .disabled(session_deletion_pending)
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.confirm_delete_session(
                                         delete_session_id.clone(),
@@ -42500,6 +42520,9 @@ mod tests {
         assert!(
             completion.contains("this.optimistic_session_deletion_reconciliation_pending = true;")
         );
+        assert!(completion.contains("this.pending_session_deletion_ids"));
+        assert!(completion.contains("if should_reconcile {"));
+        assert!(!completion.contains("this.agent_action_pending = false;"));
         assert!(completion.contains("this.load_agent_overview(cx);"));
     }
 
@@ -42524,6 +42547,28 @@ mod tests {
         assert!(optimistic_remove < repaint);
         assert!(repaint < background_delete);
         assert!(deletion.contains("self.finish_optimistic_session_deletion("));
+        assert!(deletion.contains("self.pending_session_deletion_ids"));
+        assert!(!deletion.contains("self.agent_action_pending = true;"));
+    }
+
+    #[test]
+    fn session_delete_controls_use_per_session_pending_state() {
+        let source = include_str!("app.rs");
+        let row = source
+            .split_once("Button::new(format!(\"sidebar-delete-{session_id_string}\"))")
+            .and_then(|(_, tail)| tail.split_once(".on_click(cx.listener"))
+            .map(|(body, _)| body)
+            .expect("sidebar session delete button should remain inspectable");
+        assert!(row.contains(".disabled(session_deletion_pending)"));
+        assert!(!row.contains("self.agent_action_pending"));
+
+        let menu = source
+            .split_once("PopupMenuItem::new(strings.sidebar_delete)")
+            .and_then(|(_, tail)| tail.split_once(".on_click(move |_, window, cx|"))
+            .map(|(body, _)| body)
+            .expect("sidebar session delete menu item should remain inspectable");
+        assert!(menu.contains(".disabled(session_deletion_pending)"));
+        assert!(!menu.contains("mutation_pending"));
     }
 
     #[test]
