@@ -13299,41 +13299,6 @@ impl VibexWorkbench {
         cx.notify();
     }
 
-    fn close_new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.agent_action_pending {
-            return;
-        }
-        self.reset_new_session_project_menu(window, cx);
-        self.new_session_open = false;
-        self.new_session_draft_initialized = false;
-        self.initial_new_session_setup_pending = false;
-        self.new_session_runtime_menu_open = false;
-        self.runtime_choice_menu_open = None;
-        self.new_session_runtime_menu_auth_source = None;
-        self.new_session_workspace_mode_menu_open = false;
-        self.new_session_base_ref_menu_open = false;
-        self.new_session_base_ref_search
-            .update(cx, |input, cx| input.set_value("", window, cx));
-        self.new_session_eligibility_error = None;
-        self.new_session_eligibility_task = None;
-        self.new_session_error = None;
-        self.new_session_attachments.clear();
-        self.new_session_command_entry = None;
-        self.clear_suggestions();
-        self.new_session_workspace.clear(
-            RequestId::new().to_string(),
-            self.new_session_managed_root(),
-        );
-        self.new_session_input
-            .update(cx, |input, cx| input.set_value("", window, cx));
-        self.sync_new_session_worktree_inputs(window, cx);
-        if self.selected_session_id.is_some() {
-            self.composer_input
-                .update(cx, |input, cx| input.focus(window, cx));
-        }
-        cx.notify();
-    }
-
     fn clear_submitted_new_session_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.clear_new_session_message_draft(window, cx);
         self.new_session_draft_initialized = false;
@@ -22710,18 +22675,18 @@ impl VibexWorkbench {
                     .justify_between()
                     .gap_2()
                     .px_2()
-                    .child(div().flex_none().child(workspace_button))
                     .child(
                         h_flex()
                             .min_w_0()
                             .flex_1()
                             .flex_wrap()
                             .items_center()
-                            .justify_end()
+                            .justify_start()
                             .gap_1()
                             .child(location_control)
                             .when(worktree_selected, |this| this.child(base_ref_button)),
-                    ),
+                    )
+                    .child(div().flex_none().child(workspace_button)),
             )
             .when_some(
                 (can_create_worktree && !fixed_workspace && !worktree_ready)
@@ -23014,30 +22979,6 @@ impl VibexWorkbench {
                                                     .h_full(),
                                             ),
                                     )
-                                    .child(
-                                        v_flex()
-                                            .flex_none()
-                                            .gap(px(6.0))
-                                            .child(
-                                                Button::new("new-session-choose-workspace")
-                                                    .ghost()
-                                                    .compact()
-                                                    .size(px(36.0))
-                                                    .rounded(px(18.0))
-                                                    .bg(muted_color)
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .icon(IconName::Folder)
-                                                    .tooltip(strings.new_session_choose_project)
-                                                    .disabled(self.agent_action_pending)
-                                                    .on_click(cx.listener(
-                                                        |this, _, window, cx| {
-                                                            this.choose_project_for_new_session(
-                                                                window, cx,
-                                                            )
-                                                        },
-                                                    )),
-                                            ),
-                                    ),
                             )
                             .child(
                                 v_flex()
@@ -23088,22 +23029,6 @@ impl VibexWorkbench {
                                                         .flex_none()
                                                         .items_center()
                                                         .gap_2()
-                                                        .child(
-                                                            Button::new("new-session-cancel")
-                                                                .small()
-                                                                .ghost()
-                                                                .h(px(32.0))
-                                                                .px_3()
-                                                                .label(strings.new_session_cancel)
-                                                                .disabled(self.agent_action_pending)
-                                                                .on_click(cx.listener(
-                                                                    |this, _, window, cx| {
-                                                                        this.close_new_session(
-                                                                            window, cx,
-                                                                        )
-                                                                    },
-                                                                )),
-                                                        )
                                                         .child(
                                                             Button::new("new-session-submit")
                                                                 .primary()
@@ -45577,7 +45502,7 @@ mod tests {
 
         let open_new_session = source
             .split_once("    fn open_new_session(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn close_new_session("))
+            .and_then(|(_, tail)| tail.split_once("\n    fn clear_submitted_new_session_draft("))
             .map(|(body, _)| body)
             .expect("new-session navigation should remain inspectable");
         assert!(!open_new_session.contains("if self.agent_action_pending"));
@@ -45651,7 +45576,7 @@ mod tests {
         let source = include_str!("app.rs");
         let open_new_session = source
             .split_once("    fn open_new_session(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn close_new_session("))
+            .and_then(|(_, tail)| tail.split_once("\n    fn clear_submitted_new_session_draft("))
             .map(|(body, _)| body)
             .expect("new-session navigation should remain inspectable");
         let initialize = open_new_session
@@ -47615,8 +47540,8 @@ mod tests {
         let branch_control = workspace_toolbar
             .find("base_ref_button")
             .expect("base branch should remain in the workspace toolbar");
-        assert!(project_control < location_control);
         assert!(location_control < branch_control);
+        assert!(branch_control < project_control);
 
         let context_row = panel
             .rfind(".child(workspace_controls)")
