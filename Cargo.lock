@@ -9957,6 +9957,7 @@ dependencies = [
  "image",
  "pdfium-render",
  "qrcode",
+ "resvg 0.46.0",
  "rfd",
  "serde",
  "serde_json",

@@ -91,6 +91,12 @@ pulldown-cmark = { version = "=0.13.0", default-features = false, features = ["h
 pdfium-render = { version = "=0.9.3", default-features = false, features = ["pdfium_7881", "thread_safe"] }
 quick-xml = "=0.41.0"
 qrcode = { version = "0.14.1", default-features = false }
+resvg = { version = "0.46.0", default-features = false, features = [
+  "text",
+  "system-fonts",
+  "memmap-fonts",
+  "raster-images",
+] }
 hkdf = "0.12"
 hmac = "0.12"
 ignore = "0.4"

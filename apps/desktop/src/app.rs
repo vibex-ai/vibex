@@ -16495,7 +16495,7 @@ impl VibexWorkbench {
                 .add_filter(
                     "Images",
                     &[
-                        "png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "ico",
+                        "png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "ico", "svg",
                     ],
                 )
                 .pick_file()
@@ -34445,23 +34445,26 @@ fn import_sidebar_project_logo(source: &Path, home: &Path) -> Result<String, Str
     if metadata.len() > SIDEBAR_PROJECT_LOGO_MAX_SOURCE_BYTES {
         return Err("the selected image is larger than 16 MB".to_string());
     }
-    let (width, height) = image::image_dimensions(source)
-        .map_err(|error| format!("unsupported or invalid image: {error}"))?;
-    if width == 0
-        || height == 0
-        || u64::from(width) * u64::from(height) > SIDEBAR_PROJECT_LOGO_MAX_SOURCE_PIXELS
-    {
-        return Err("the selected image dimensions are too large".to_string());
-    }
+    let is_svg = source
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"));
+    let image = if is_svg {
+        rasterize_sidebar_project_svg(source)?
+    } else {
+        let (width, height) = image::image_dimensions(source)
+            .map_err(|error| format!("unsupported or invalid image: {error}"))?;
+        validate_sidebar_project_logo_dimensions(u64::from(width), u64::from(height))?;
+        image::open(source)
+            .map_err(|error| format!("could not decode selected image: {error}"))?
+            .resize_to_fill(
+                SIDEBAR_PROJECT_LOGO_IMAGE_SIZE,
+                SIDEBAR_PROJECT_LOGO_IMAGE_SIZE,
+                image::imageops::FilterType::Lanczos3,
+            )
+            .to_rgba8()
+    };
 
-    let image = image::open(source)
-        .map_err(|error| format!("could not decode selected image: {error}"))?
-        .resize_to_fill(
-            SIDEBAR_PROJECT_LOGO_IMAGE_SIZE,
-            SIDEBAR_PROJECT_LOGO_IMAGE_SIZE,
-            image::imageops::FilterType::Lanczos3,
-        )
-        .to_rgba8();
     let digest = format!("{:x}", Sha256::digest(image.as_raw()));
     let file_name = format!("{digest}.png");
     let directory = home.join(SIDEBAR_PROJECT_LOGO_DIRECTORY);
@@ -34480,6 +34483,59 @@ fn import_sidebar_project_logo(source: &Path, home: &Path) -> Result<String, Str
         }
     }
     Ok(file_name)
+}
+
+fn validate_sidebar_project_logo_dimensions(width: u64, height: u64) -> Result<(), String> {
+    if width == 0
+        || height == 0
+        || width
+            .checked_mul(height)
+            .is_none_or(|pixels| pixels > SIDEBAR_PROJECT_LOGO_MAX_SOURCE_PIXELS)
+    {
+        return Err("the selected image dimensions are too large".to_string());
+    }
+    Ok(())
+}
+
+fn rasterize_sidebar_project_svg(source: &Path) -> Result<image::RgbaImage, String> {
+    let bytes =
+        std::fs::read(source).map_err(|error| format!("could not read selected SVG: {error}"))?;
+    let options = resvg::usvg::Options::default();
+    let tree = resvg::usvg::Tree::from_data(&bytes, &options)
+        .map_err(|error| format!("unsupported or invalid SVG: {error}"))?;
+    let source_size = tree.size();
+    let source_width = source_size.width();
+    let source_height = source_size.height();
+    if !source_width.is_finite() || !source_height.is_finite() {
+        return Err("the selected image dimensions are too large".to_string());
+    }
+    validate_sidebar_project_logo_dimensions(
+        source_width.ceil() as u64,
+        source_height.ceil() as u64,
+    )?;
+
+    let output_size = SIDEBAR_PROJECT_LOGO_IMAGE_SIZE;
+    let output_size_f32 = output_size as f32;
+    let scale = (output_size_f32 / source_width).max(output_size_f32 / source_height);
+    let translate_x = (output_size_f32 - source_width * scale) / 2.0;
+    let translate_y = (output_size_f32 - source_height * scale) / 2.0;
+    let transform =
+        resvg::tiny_skia::Transform::from_row(scale, 0.0, 0.0, scale, translate_x, translate_y);
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(output_size, output_size)
+        .ok_or_else(|| "could not allocate project icon image".to_string())?;
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+    let mut pixels = pixmap.take();
+    for pixel in pixels.chunks_exact_mut(4) {
+        let alpha = u16::from(pixel[3]);
+        if alpha > 0 {
+            for channel in &mut pixel[..3] {
+                *channel = ((u16::from(*channel) * 255 + alpha / 2) / alpha).min(255) as u8;
+            }
+        }
+    }
+    image::RgbaImage::from_raw(output_size, output_size, pixels)
+        .ok_or_else(|| "could not create project icon image".to_string())
 }
 
 fn sidebar_project_logo_color(color: SidebarProjectLogoColor, cx: &App) -> Hsla {
@@ -42154,6 +42210,14 @@ mod tests {
         assert!(picker.contains("this.choose_sidebar_project_custom_logo("));
         assert!(picker.contains("this.clear_sidebar_project_custom_logo("));
         assert!(picker.contains("Upload image"));
+        let chooser = source
+            .split_once("    fn choose_sidebar_project_custom_logo(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn render_sidebar_project_appearance_popover(")
+            })
+            .map(|(body, _)| body)
+            .expect("project logo chooser should remain inspectable");
+        assert!(chooser.contains("\"svg\""));
         assert!(project.contains("sidebar-project-logo-trigger-"));
         assert!(project.contains("render_sidebar_project_appearance_popover("));
         assert!(menu.contains("Customize Logo"));
@@ -43337,6 +43401,48 @@ mod tests {
             file_name
         );
         assert!(sidebar_project_logo_path(home.path(), "../outside.png").is_none());
+    }
+
+    #[test]
+    fn sidebar_project_logo_import_rasterizes_svg_to_managed_png() {
+        let home = tempfile::tempdir().unwrap();
+        let source = home.path().join("source.svg");
+        std::fs::write(
+            &source,
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="16" viewBox="0 0 32 16"><rect width="32" height="16" fill="#1273de"/></svg>"##,
+        )
+        .unwrap();
+
+        let file_name = import_sidebar_project_logo(&source, home.path()).unwrap();
+        let installed = sidebar_project_logo_path(home.path(), &file_name).unwrap();
+        assert!(file_name.ends_with(".png"));
+        assert_eq!(image::image_dimensions(&installed).unwrap(), (256, 256));
+        assert_eq!(
+            image::open(installed)
+                .unwrap()
+                .to_rgba8()
+                .get_pixel(128, 128),
+            &image::Rgba([0x12, 0x73, 0xde, 0xff])
+        );
+    }
+
+    #[test]
+    fn sidebar_project_logo_import_rejects_invalid_or_oversized_svg() {
+        let home = tempfile::tempdir().unwrap();
+        let invalid = home.path().join("invalid.svg");
+        std::fs::write(&invalid, b"not an svg").unwrap();
+        assert!(import_sidebar_project_logo(&invalid, home.path()).is_err());
+
+        let oversized = home.path().join("oversized.svg");
+        std::fs::write(
+            &oversized,
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="10000" height="10000"/>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            import_sidebar_project_logo(&oversized, home.path()).unwrap_err(),
+            "the selected image dimensions are too large"
+        );
     }
 
     #[test]

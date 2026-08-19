@@ -18,6 +18,7 @@ gpui-component.workspace = true
 gpui-component-assets.workspace = true
 image = { workspace = true, features = ["bmp", "gif", "ico", "jpeg", "png", "tiff", "webp"] }
 qrcode.workspace = true
+resvg.workspace = true
 pdfium-render.workspace = true
 serde.workspace = true
 sys-locale.workspace = true

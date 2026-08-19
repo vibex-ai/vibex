@@ -69,10 +69,11 @@ import_sidebar_project_logo(source: &Path, home: &Path) -> Result<String, String
 - `custom_logo_file` contains only a bounded content-addressed PNG file name,
   never an external absolute path or image bytes. The image lives under
   `<runtime-home>/project-icons/<sha256>.png`.
-- Import accepts the picker-supported raster formats, rejects oversized input,
-  center-crops and resizes the first decoded frame to `256x256`, and writes PNG
-  through a temporary file before rename. Equal normalized content reuses the
-  same file.
+- Import accepts the picker-supported raster formats and SVG, rejects oversized
+  input, center-crops and resizes raster images or rasterizes SVG to `256x256`,
+  and writes PNG through a temporary file before rename. Raw SVG content and
+  external source paths are never persisted. Equal normalized content reuses
+  the same file.
 - Selecting an uploaded image preserves the last built-in logo and color as the
   fallback. Selecting a built-in logo or removing the uploaded image clears
   `custom_logo_file`.
@@ -84,7 +85,7 @@ import_sidebar_project_logo(source: &Path, home: &Path) -> Result<String, String
 
 | Condition | Required result |
 | --- | --- |
-| Source is not a regular decodable image | Reject and show a localized notification |
+| Source is not a regular decodable raster image or valid SVG | Reject and show a localized notification |
 | Source exceeds 16 MiB or 40 million pixels | Reject before full decode |
 | Storage directory/write/rename fails | Keep the previous appearance and report failure |
 | Persisted name is not exactly 64 hex characters plus `.png` | Ignore it and render the built-in logo |
@@ -93,8 +94,8 @@ import_sidebar_project_logo(source: &Path, home: &Path) -> Result<String, String
 
 ### 5. Good/Base/Bad Cases
 
-- Good: upload a rectangular JPEG, store one square content-addressed PNG, and
-  restore it after restart at the same size as session Agent logos.
+- Good: upload a rectangular JPEG or SVG, store one square content-addressed
+  PNG, and restore it after restart at the same size as session Agent logos.
 - Base: existing built-in logo/color preferences round-trip unchanged and old
   JSON defaults `custom_logo_file` to `None`.
 - Bad: persist the selected external path, keep original multi-megabyte bytes in
@@ -105,9 +106,10 @@ import_sidebar_project_logo(source: &Path, home: &Path) -> Result<String, String
 
 - `vibex-desktop-model` covers legacy decode, normalization bounds, and JSON
   round-trip for `custom_logo_file`.
-- `vibex-desktop` imports a non-square fixture, asserts a `256x256` PNG and
-  stable content-addressed name, rejects traversal-like stored names, and keeps
-  project/session rows on the shared logo-size constant.
+- `vibex-desktop` imports non-square raster and SVG fixtures, asserts a
+  `256x256` PNG and stable content-addressed name, rejects invalid SVG and
+  traversal-like stored names, and keeps project/session rows on the shared
+  logo-size constant.
 - Run `cargo test -p vibex-desktop-model --locked`, targeted sidebar tests, and
   `cargo fmt --all -- --check` before commit.
 
