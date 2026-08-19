@@ -6,6 +6,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use regex::{Regex, RegexBuilder};
 use sha2::{Digest as _, Sha256};
 use vibex_core::{
     FileEncoding, FileEntryKind, FileLineEnding, FileMutationRequest, FilePreviewKind,
@@ -15,6 +16,7 @@ use vibex_core::{
 
 const DEFAULT_MAX_READ_BYTES: u64 = 1024 * 1024;
 const MAX_SEARCH_RESULTS: usize = 200;
+const MAX_SEARCH_SNIPPET_CHARS: usize = 240;
 const MAX_TREE_ENTRIES: usize = 2000;
 pub const MAX_NATIVE_TREE_ENTRIES: usize = 100_000;
 const FILE_READ_CHUNK_BYTES: usize = 64 * 1024;
@@ -24,6 +26,50 @@ static TEMP_FILE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 
 struct FileMutationGuard {
     paths: Vec<PathBuf>,
+}
+
+struct FileSearchMatcher {
+    regex: Regex,
+}
+
+impl FileSearchMatcher {
+    fn new(request: &FileSearchRequest) -> VibexResult<Self> {
+        let query = request.query.trim();
+        if query.is_empty() {
+            return Err(VibexError::validation(
+                "file_search_empty_query",
+                "file search query must not be empty",
+            ));
+        }
+        let source = if request.regex {
+            query.to_string()
+        } else {
+            regex::escape(query)
+        };
+        let pattern = if request.whole_word {
+            format!(r"\b(?:{source})\b")
+        } else {
+            source
+        };
+        let regex = RegexBuilder::new(&pattern)
+            .case_insensitive(!request.case_sensitive)
+            .size_limit(1024 * 1024)
+            .build()
+            .map_err(|_| {
+                VibexError::validation(
+                    "file_search_invalid_regex",
+                    "search pattern is not a valid regular expression",
+                )
+            })?;
+        Ok(Self { regex })
+    }
+
+    fn find(&self, value: &str) -> Option<std::ops::Range<usize>> {
+        self.regex
+            .find_iter(value)
+            .find(|matched| !matched.is_empty())
+            .map(|matched| matched.range())
+    }
 }
 
 impl FileMutationGuard {
@@ -452,13 +498,7 @@ impl WorkspaceFileService {
 
     pub fn search(&self, request: &FileSearchRequest) -> VibexResult<Vec<FileSearchResult>> {
         self.ensure_workspace(&request.workspace_id)?;
-        let query = request.query.trim().to_lowercase();
-        if query.is_empty() {
-            return Err(VibexError::validation(
-                "file_search_empty_query",
-                "file search query must not be empty",
-            ));
-        }
+        let matcher = FileSearchMatcher::new(request)?;
         let limit = request
             .limit
             .unwrap_or(MAX_SEARCH_RESULTS as u32)
@@ -466,7 +506,7 @@ impl WorkspaceFileService {
         let mut results = Vec::new();
         self.search_dir(
             &self.root,
-            &query,
+            &matcher,
             request.include_content,
             limit,
             &mut results,
@@ -551,7 +591,7 @@ impl WorkspaceFileService {
     fn search_dir(
         &self,
         dir: &Path,
-        query: &str,
+        matcher: &FileSearchMatcher,
         include_content: bool,
         limit: usize,
         results: &mut Vec<FileSearchResult>,
@@ -581,7 +621,7 @@ impl WorkspaceFileService {
                 continue;
             }
             let kind = kind_for_path(&path)?;
-            if name.to_lowercase().contains(query) {
+            if !include_content && let Some(matched) = matcher.find(&name) {
                 results.push(FileSearchResult {
                     workspace_id: self.workspace_id.clone(),
                     path: self.relative_path(&path)?.unwrap_or_default(),
@@ -589,14 +629,17 @@ impl WorkspaceFileService {
                     kind,
                     line: None,
                     snippet: None,
+                    match_start: u32::try_from(matched.start).ok(),
+                    match_end: u32::try_from(matched.end).ok(),
+                    matched_text: Some(name[matched].to_string()),
                 });
             }
             if kind == FileEntryKind::Directory {
                 if name != ".git" {
-                    self.search_dir(&path, query, include_content, limit, results)?;
+                    self.search_dir(&path, matcher, include_content, limit, results)?;
                 }
             } else if include_content && results.len() < limit {
-                self.search_file_content(&path, query, limit, results)?;
+                self.search_file_content(&path, matcher, limit, results)?;
             }
         }
         Ok(())
@@ -605,7 +648,7 @@ impl WorkspaceFileService {
     fn search_file_content(
         &self,
         path: &Path,
-        query: &str,
+        matcher: &FileSearchMatcher,
         limit: usize,
         results: &mut Vec<FileSearchResult>,
     ) -> VibexResult<()> {
@@ -623,14 +666,18 @@ impl WorkspaceFileService {
             if results.len() >= limit {
                 break;
             }
-            if line.to_lowercase().contains(query) {
+            if let Some(matched) = matcher.find(line) {
+                let (snippet, matched_text) = content_search_snippet(line, matched.clone());
                 results.push(FileSearchResult {
                     workspace_id: self.workspace_id.clone(),
                     path: self.relative_path(path)?.unwrap_or_default(),
                     name: file_name(path),
                     kind: FileEntryKind::File,
                     line: Some((index + 1) as u32),
-                    snippet: Some(line.trim().chars().take(240).collect()),
+                    snippet: Some(snippet),
+                    match_start: u32::try_from(matched.start).ok(),
+                    match_end: u32::try_from(matched.end).ok(),
+                    matched_text: Some(matched_text),
                 });
             }
         }
@@ -1325,6 +1372,27 @@ fn file_name(path: &Path) -> String {
         .to_string()
 }
 
+fn content_search_snippet(line: &str, matched: std::ops::Range<usize>) -> (String, String) {
+    let characters = line.chars().collect::<Vec<_>>();
+    let match_start = line[..matched.start].chars().count();
+    let match_end = match_start.saturating_add(line[matched].chars().count());
+    let visible_match_len = match_end
+        .saturating_sub(match_start)
+        .min(MAX_SEARCH_SNIPPET_CHARS);
+    let leading_capacity = MAX_SEARCH_SNIPPET_CHARS.saturating_sub(visible_match_len) / 2;
+    let start = match_start
+        .saturating_sub(leading_capacity)
+        .min(characters.len().saturating_sub(MAX_SEARCH_SNIPPET_CHARS));
+    let end = start
+        .saturating_add(MAX_SEARCH_SNIPPET_CHARS)
+        .min(characters.len());
+    let visible_match_end = match_end.min(end);
+    (
+        characters[start..end].iter().collect(),
+        characters[match_start..visible_match_end].iter().collect(),
+    )
+}
+
 fn is_hidden_name(name: &str) -> bool {
     name.starts_with('.')
 }
@@ -1391,6 +1459,9 @@ pub fn run_files_smoke(root: impl AsRef<Path>) -> VibexResult<FileSmokeResult> {
         workspace_id,
         query: "vibex-files-smoke".to_string(),
         include_content: false,
+        case_sensitive: false,
+        whole_word: false,
+        regex: false,
         limit: Some(10),
     })?;
     Ok(FileSmokeResult {
@@ -1478,6 +1549,9 @@ mod tests {
                 workspace_id,
                 query: "main.rs".to_string(),
                 include_content: false,
+                case_sensitive: false,
+                whole_word: false,
+                regex: false,
                 limit: Some(10),
             })
             .unwrap();
@@ -1502,6 +1576,9 @@ mod tests {
                 workspace_id,
                 query: "needle".to_string(),
                 include_content: true,
+                case_sensitive: false,
+                whole_word: false,
+                regex: false,
                 limit: Some(2),
             })
             .unwrap();
@@ -1509,8 +1586,81 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].line, Some(1));
         assert_eq!(hits[0].snippet.as_deref(), Some("first needle"));
+        assert_eq!(hits[0].matched_text.as_deref(), Some("needle"));
+        assert_eq!(hits[0].match_start, Some(6));
+        assert_eq!(hits[0].match_end, Some(12));
         assert_eq!(hits[1].line, Some(2));
         assert_eq!(hits[1].snippet.as_deref(), Some("second NEEDLE"));
+        cleanup(root);
+    }
+
+    #[test]
+    fn name_search_includes_directories_and_honors_content_match_options() {
+        let root = temp_root("search-options");
+        fs::create_dir_all(root.join("Needle Folder")).unwrap();
+        fs::write(
+            root.join("Needle Folder").join("notes.txt"),
+            "Needle needle NEEDLE\nneedlework\n",
+        )
+        .unwrap();
+        let workspace_id = WorkspaceId::new();
+        let service = WorkspaceFileService::new(&root, workspace_id.clone()).unwrap();
+
+        let names = service
+            .search(&FileSearchRequest {
+                workspace_id: workspace_id.clone(),
+                query: "needle folder".to_string(),
+                include_content: false,
+                case_sensitive: false,
+                whole_word: false,
+                regex: false,
+                limit: Some(10),
+            })
+            .unwrap();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].kind, FileEntryKind::Directory);
+
+        let whole_word = service
+            .search(&FileSearchRequest {
+                workspace_id: workspace_id.clone(),
+                query: "needle".to_string(),
+                include_content: true,
+                case_sensitive: true,
+                whole_word: true,
+                regex: false,
+                limit: Some(10),
+            })
+            .unwrap();
+        assert_eq!(whole_word.len(), 1);
+        assert_eq!(whole_word[0].line, Some(1));
+        assert_eq!(whole_word[0].matched_text.as_deref(), Some("needle"));
+
+        let regex = service
+            .search(&FileSearchRequest {
+                workspace_id: workspace_id.clone(),
+                query: r"needle\s+needle".to_string(),
+                include_content: true,
+                case_sensitive: false,
+                whole_word: false,
+                regex: true,
+                limit: Some(10),
+            })
+            .unwrap();
+        assert_eq!(regex.len(), 1);
+        assert_eq!(regex[0].matched_text.as_deref(), Some("Needle needle"));
+
+        let error = service
+            .search(&FileSearchRequest {
+                workspace_id,
+                query: "[".to_string(),
+                include_content: true,
+                case_sensitive: false,
+                whole_word: false,
+                regex: true,
+                limit: Some(10),
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "file_search_invalid_regex");
         cleanup(root);
     }
 

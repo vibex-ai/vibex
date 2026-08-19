@@ -1102,6 +1102,9 @@ fn baseline_file_tree_search(root: &Path) -> VibexResult<PerformanceBaselineChec
         workspace_id,
         query: "needle".to_string(),
         include_content: true,
+        case_sensitive: false,
+        whole_word: false,
+        regex: false,
         limit: Some(120),
     })?;
     let elapsed_ms = elapsed_ms(started);

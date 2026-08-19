@@ -326,6 +326,9 @@ impl MobileWorkbench {
             workspace_id: self.workspace_id.clone(),
             query,
             include_content: true,
+            case_sensitive: false,
+            whole_word: false,
+            regex: false,
             limit: Some(100),
         };
         let runner = gpui_tokio::Tokio::spawn(cx, self.files.search_files(request));

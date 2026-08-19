@@ -121,6 +121,12 @@ pub struct FileSearchRequest {
     pub workspace_id: WorkspaceId,
     pub query: String,
     pub include_content: bool,
+    #[serde(default)]
+    pub case_sensitive: bool,
+    #[serde(default)]
+    pub whole_word: bool,
+    #[serde(default)]
+    pub regex: bool,
     pub limit: Option<u32>,
 }
 
@@ -133,4 +139,42 @@ pub struct FileSearchResult {
     pub kind: FileEntryKind,
     pub line: Option<u32>,
     pub snippet: Option<String>,
+    #[serde(default)]
+    pub match_start: Option<u32>,
+    #[serde(default)]
+    pub match_end: Option<u32>,
+    #[serde(default)]
+    pub matched_text: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_file_search_payloads_default_new_match_fields() {
+        let request: FileSearchRequest = serde_json::from_value(serde_json::json!({
+            "workspaceId": "workspace_legacy",
+            "query": "needle",
+            "includeContent": true,
+            "limit": 20
+        }))
+        .unwrap();
+        assert!(!request.case_sensitive);
+        assert!(!request.whole_word);
+        assert!(!request.regex);
+
+        let result: FileSearchResult = serde_json::from_value(serde_json::json!({
+            "workspaceId": "workspace_legacy",
+            "path": "src/lib.rs",
+            "name": "lib.rs",
+            "kind": "file",
+            "line": 1,
+            "snippet": "needle"
+        }))
+        .unwrap();
+        assert_eq!(result.match_start, None);
+        assert_eq!(result.match_end, None);
+        assert_eq!(result.matched_text, None);
+    }
 }

@@ -179,6 +179,27 @@ impl FileSearchMode {
             }
         }
     }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Name => locale::text("Name", "名称", "名稱"),
+            Self::Content => locale::text("Content", "内容", "內容"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FileSearchOptions {
+    case_sensitive: bool,
+    whole_word: bool,
+    regex: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileSearchOption {
+    CaseSensitive,
+    WholeWord,
+    Regex,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,6 +269,8 @@ struct FileSearchReveal {
     path: String,
     query: String,
     line: u32,
+    match_start: Option<u32>,
+    match_end: Option<u32>,
 }
 
 enum FilePresentation {
@@ -775,6 +798,7 @@ pub struct CodeWorkbench {
     markdown_scrolls: BTreeMap<String, ScrollHandle>,
     preview_revealed_tab_ids: BTreeMap<String, String>,
     pending_file_search_reveal: Option<FileSearchReveal>,
+    pending_file_search_directory_reveal: Option<String>,
     preview_tab_drop_target: Option<PreviewTabDropTarget>,
     preview_pane_drop_target: Option<PreviewPaneDropTarget>,
     restore_hydration_scheduled: bool,
@@ -911,6 +935,7 @@ impl CodeWorkbench {
             markdown_scrolls: BTreeMap::new(),
             preview_revealed_tab_ids: BTreeMap::new(),
             pending_file_search_reveal: None,
+            pending_file_search_directory_reveal: None,
             preview_tab_drop_target: None,
             preview_pane_drop_target: None,
             restore_hydration_scheduled: false,
@@ -1389,6 +1414,7 @@ impl CodeWorkbench {
         self.markdown_scrolls.clear();
         self.preview_revealed_tab_ids.clear();
         self.pending_file_search_reveal = None;
+        self.pending_file_search_directory_reveal = None;
         self.preview_diff_lists.clear();
         self.preview_commit_lists.clear();
         self.preview_commit_focus_requests.clear();
@@ -1489,6 +1515,7 @@ impl CodeWorkbench {
         self.markdown_scrolls.clear();
         self.preview_revealed_tab_ids.clear();
         self.pending_file_search_reveal = None;
+        self.pending_file_search_directory_reveal = None;
         self.preview_diff_lists.clear();
         self.preview_commit_lists.clear();
         self.preview_commit_focus_requests.clear();
@@ -1998,6 +2025,7 @@ impl CodeWorkbench {
                             .apply_entries(&workspace.id, ticket, &task_path, entries)
                         {
                             this.reconcile_file_selection();
+                            this.continue_file_search_directory_reveal(cx);
                         }
                         this.note = None;
                     }
@@ -3041,22 +3069,17 @@ impl CodeWorkbench {
         cx.notify();
     }
 
-    pub(crate) fn open_file_search_result(
+    fn open_file_search_result(
         &mut self,
-        path: String,
-        query: String,
-        line: u32,
+        mut reveal: FileSearchReveal,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(path) = normalized_relative_path(&path) else {
+        let Some(path) = normalized_relative_path(&reveal.path) else {
             return;
         };
-        self.pending_file_search_reveal = Some(FileSearchReveal {
-            path: path.clone(),
-            query,
-            line,
-        });
+        reveal.path = path.clone();
+        self.pending_file_search_reveal = Some(reveal);
         if content_preview_kind_for_path(&path) == ContentPreviewKind::Markdown {
             self.markdown_edit_paths.insert(path.clone());
         }
@@ -3109,17 +3132,80 @@ impl CodeWorkbench {
             return false;
         };
         let content = input.read(cx).value().to_string();
-        let Some(range) = file_search_reveal_range(&content, &reveal.query, reveal.line) else {
+        let match_range = reveal
+            .match_start
+            .zip(reveal.match_end)
+            .map(|(start, end)| start as usize..end as usize);
+        let Some(range) =
+            file_search_reveal_range(&content, &reveal.query, reveal.line, match_range)
+        else {
             self.pending_file_search_reveal = None;
             return false;
         };
         input.update(cx, |input, cx| {
-            input.set_selected_range(range, cx);
+            input.set_selected_range(range.clone(), cx);
             input.focus(window, cx);
+        });
+        let target_line = reveal.line;
+        cx.on_next_frame(window, move |_, _, cx| {
+            input.update(cx, |input, cx| center_input_line(input, target_line, cx));
         });
         self.pending_file_search_reveal = None;
         cx.notify();
         true
+    }
+
+    pub(crate) fn reveal_file_search_directory(&mut self, path: String, cx: &mut Context<Self>) {
+        let Some(path) = normalized_relative_path(&path) else {
+            return;
+        };
+        self.pending_file_search_directory_reveal = Some(path);
+        self.continue_file_search_directory_reveal(cx);
+    }
+
+    fn continue_file_search_directory_reveal(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.pending_file_search_directory_reveal.clone() else {
+            return;
+        };
+        let path_chain = relative_directory_path_chain(&path);
+        let loaded_chain = path_chain
+            .iter()
+            .take_while(|candidate| self.file_tree.contains_path(candidate))
+            .cloned()
+            .collect::<Vec<_>>();
+        if self.file_tree.contains_path(&path) {
+            self.file_tree.set_chain_expanded(&path_chain, true);
+            self.file_tree.clear_selected_directory();
+            self.file_tree.select(&path, false, false);
+            if let Some(index) = self.file_tree.visible_row_position(&path) {
+                self.file_scroll
+                    .scroll_to_item(index, gpui::ScrollStrategy::Center);
+            }
+            if !matches!(
+                self.file_tree.load_state(&path),
+                FileTreeLoadState::Loaded | FileTreeLoadState::Loading
+            ) {
+                self.load_tree_path(path.clone(), cx);
+            }
+            self.pending_file_search_directory_reveal = None;
+            self.persist(cx);
+            cx.notify();
+            return;
+        }
+        if !loaded_chain.is_empty() {
+            self.file_tree.set_chain_expanded(&loaded_chain, true);
+        }
+        let base = loaded_chain.last().cloned().unwrap_or_default();
+        match self.file_tree.load_state(&base) {
+            FileTreeLoadState::Loaded => {
+                self.pending_file_search_directory_reveal = None;
+            }
+            FileTreeLoadState::Loading => {}
+            FileTreeLoadState::Unloaded | FileTreeLoadState::Error { .. } => {
+                self.load_tree_path(base, cx);
+            }
+        }
+        cx.notify();
     }
 
     pub fn register_terminal(&mut self, terminal: TerminalSession, cx: &mut Context<Self>) {
@@ -6694,6 +6780,7 @@ pub struct CodeRightRail {
     projection: CodeRightRailProjection,
     file_search_input: Entity<InputState>,
     file_search_mode: FileSearchMode,
+    file_search_options: FileSearchOptions,
     file_search_results: Vec<FileSearchResult>,
     file_search_loading: bool,
     file_search_error: Option<String>,
@@ -6776,6 +6863,7 @@ impl CodeRightRail {
             projection,
             file_search_input,
             file_search_mode: FileSearchMode::Name,
+            file_search_options: FileSearchOptions::default(),
             file_search_results: Vec::new(),
             file_search_loading: false,
             file_search_error: None,
@@ -6840,6 +6928,24 @@ impl CodeRightRail {
         self.set_file_search_mode(self.file_search_mode.toggled(), cx);
     }
 
+    fn toggle_file_search_option(&mut self, option: FileSearchOption, cx: &mut Context<Self>) {
+        match option {
+            FileSearchOption::CaseSensitive => {
+                self.file_search_options.case_sensitive = !self.file_search_options.case_sensitive;
+            }
+            FileSearchOption::WholeWord => {
+                self.file_search_options.whole_word = !self.file_search_options.whole_word;
+            }
+            FileSearchOption::Regex => {
+                self.file_search_options.regex = !self.file_search_options.regex;
+            }
+        }
+        self.file_search_results.clear();
+        self.file_search_error = None;
+        self.schedule_file_search(cx);
+        cx.notify();
+    }
+
     fn clear_file_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.file_search_generation = self.file_search_generation.wrapping_add(1);
         self.file_search_task = None;
@@ -6890,10 +6996,14 @@ impl CodeRightRail {
             return;
         };
         let mode = self.file_search_mode;
+        let options = self.file_search_options;
         let request = FileSearchRequest {
             workspace_id: workspace.id,
             query,
             include_content: mode == FileSearchMode::Content,
+            case_sensitive: mode == FileSearchMode::Content && options.case_sensitive,
+            whole_word: mode == FileSearchMode::Content && options.whole_word,
+            regex: mode == FileSearchMode::Content && options.regex,
             limit: Some(FILE_SEARCH_RESULT_LIMIT),
         };
         self.file_search_loading = true;
@@ -6916,9 +7026,7 @@ impl CodeRightRail {
                 match outcome {
                     Ok(Ok(mut results)) => {
                         results.retain(|result| match mode {
-                            FileSearchMode::Name => {
-                                result.line.is_none() && result.kind != FileEntryKind::Directory
-                            }
+                            FileSearchMode::Name => result.line.is_none(),
                             FileSearchMode::Content => result.line.is_some(),
                         });
                         this.file_search_results = results;
@@ -7645,10 +7753,10 @@ impl CodeRightRail {
     fn render_file_search_controls(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let query_present = !self.file_search_input.read(cx).value().is_empty();
         let mode = self.file_search_mode;
+        let options = self.file_search_options;
         v_flex()
             .w_full()
             .flex_none()
-            .gap_1p5()
             .p_2()
             .border_b_1()
             .border_color(cx.theme().border)
@@ -7695,12 +7803,61 @@ impl CodeRightRail {
                                 })),
                         )
                     })
+                    .when(mode == FileSearchMode::Content, |this| {
+                        this.child(
+                            Button::new("file-search-case-sensitive")
+                                .xsmall()
+                                .ghost()
+                                .compact()
+                                .label("Aa")
+                                .selected(options.case_sensitive)
+                                .tooltip(locale::text("Match case", "区分大小写", "區分大小寫"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.toggle_file_search_option(
+                                        FileSearchOption::CaseSensitive,
+                                        cx,
+                                    )
+                                })),
+                        )
+                        .child(
+                            Button::new("file-search-whole-word")
+                                .xsmall()
+                                .ghost()
+                                .compact()
+                                .label("ab")
+                                .selected(options.whole_word)
+                                .tooltip(locale::text(
+                                    "Match whole word",
+                                    "匹配整个词",
+                                    "符合整個詞",
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.toggle_file_search_option(FileSearchOption::WholeWord, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("file-search-regex")
+                                .xsmall()
+                                .ghost()
+                                .compact()
+                                .label(".*")
+                                .selected(options.regex)
+                                .tooltip(locale::text(
+                                    "Use regular expression",
+                                    "使用正则表达式",
+                                    "使用正規表示式",
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.toggle_file_search_option(FileSearchOption::Regex, cx)
+                                })),
+                        )
+                    })
                     .child(
                         Button::new("toggle-file-search-mode")
                             .xsmall()
                             .ghost()
                             .compact()
-                            .icon(IconName::ChevronsUpDown)
+                            .label(mode.title())
                             .tooltip(mode.toggle_label())
                             .on_click(
                                 cx.listener(|this, _, _, cx| this.toggle_file_search_mode(cx)),
@@ -7718,6 +7875,7 @@ impl CodeRightRail {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let path = result.path.clone();
+        let kind = result.kind;
         let parent = relative_parent_path(&path).to_string();
         let descriptor = file_icon_descriptor(&result.name, result.kind);
         let controller = self.workbench.downgrade();
@@ -7755,12 +7913,19 @@ impl CodeRightRail {
                     }),
             )
             .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.45)))
-            .on_click(move |_, window, cx| {
-                let _ = controller.update(cx, |workbench, cx| {
-                    workbench.request_preview_panel(cx);
-                    workbench.open_file(path.clone(), false, window, cx);
-                });
-            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if kind == FileEntryKind::Directory {
+                    this.clear_file_search(window, cx);
+                    let _ = controller.update(cx, |workbench, cx| {
+                        workbench.reveal_file_search_directory(path.clone(), cx);
+                    });
+                } else {
+                    let _ = controller.update(cx, |workbench, cx| {
+                        workbench.request_preview_panel(cx);
+                        workbench.open_file(path.clone(), false, window, cx);
+                    });
+                }
+            }))
             .into_any_element()
     }
 
@@ -7812,7 +7977,14 @@ impl CodeRightRail {
         let path = result.path.clone();
         let line = result.line.unwrap_or(1);
         let snippet = result.snippet.unwrap_or_default();
+        let matched_text = result
+            .matched_text
+            .clone()
+            .filter(|matched| !matched.is_empty())
+            .unwrap_or_else(|| query.to_string());
         let reveal_query = query.to_string();
+        let match_start = result.match_start;
+        let match_end = result.match_end;
         let controller = self.workbench.downgrade();
         h_flex()
             .id(format!("file-content-search-result:{index}:{path}:{line}"))
@@ -7838,15 +8010,19 @@ impl CodeRightRail {
                     .child(line.to_string()),
             )
             .child(div().min_w_0().flex_1().overflow_hidden().text_xs().child(
-                render_file_name_match(&snippet, query, cx.theme().sidebar_foreground, cx),
+                render_file_name_match(&snippet, &matched_text, cx.theme().sidebar_foreground, cx),
             ))
             .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.45)))
             .on_click(move |_, window, cx| {
                 let _ = controller.update(cx, |workbench, cx| {
                     workbench.open_file_search_result(
-                        path.clone(),
-                        reveal_query.clone(),
-                        line,
+                        FileSearchReveal {
+                            path: path.clone(),
+                            query: reveal_query.clone(),
+                            line,
+                            match_start,
+                            match_end,
+                        },
                         window,
                         cx,
                     );
@@ -7865,7 +8041,14 @@ impl CodeRightRail {
         }
         if self.file_search_results.is_empty() {
             return rail_empty(
-                locale::text("No matching files", "没有匹配的文件", "沒有匹配的檔案"),
+                match self.file_search_mode {
+                    FileSearchMode::Name => {
+                        locale::text("No matching items", "没有匹配项", "沒有符合項目")
+                    }
+                    FileSearchMode::Content => {
+                        locale::text("No matching files", "没有匹配的文件", "沒有匹配的檔案")
+                    }
+                },
                 cx,
             );
         }
@@ -7875,14 +8058,23 @@ impl CodeRightRail {
             .map(|result| result.path.as_str())
             .collect::<BTreeSet<_>>()
             .len();
-        let summary = match locale::current_locale() {
-            locale::ResolvedLocale::En => {
+        let summary = match (self.file_search_mode, locale::current_locale()) {
+            (FileSearchMode::Name, locale::ResolvedLocale::En) => {
+                format!("{} matching items", results.len())
+            }
+            (FileSearchMode::Name, locale::ResolvedLocale::ZhCn) => {
+                format!("{} 个匹配项", results.len())
+            }
+            (FileSearchMode::Name, locale::ResolvedLocale::ZhTw) => {
+                format!("{} 個符合項目", results.len())
+            }
+            (FileSearchMode::Content, locale::ResolvedLocale::En) => {
                 format!("{} results in {} files", results.len(), file_count)
             }
-            locale::ResolvedLocale::ZhCn => {
+            (FileSearchMode::Content, locale::ResolvedLocale::ZhCn) => {
                 format!("{} 个结果，位于 {} 个文件中", results.len(), file_count)
             }
-            locale::ResolvedLocale::ZhTw => {
+            (FileSearchMode::Content, locale::ResolvedLocale::ZhTw) => {
                 format!("{} 個結果，位於 {} 個檔案中", results.len(), file_count)
             }
         };
@@ -11696,18 +11888,38 @@ fn file_search_reveal_range(
     content: &str,
     query: &str,
     line: u32,
+    match_range: Option<std::ops::Range<usize>>,
 ) -> Option<std::ops::Range<usize>> {
     let target_line = line.saturating_sub(1) as usize;
     let mut line_start = 0_usize;
     for (index, segment) in content.split_inclusive('\n').enumerate() {
         if index == target_line {
             let line_text = segment.trim_end_matches(['\r', '\n']);
-            return file_name_match_range(line_text, query)
-                .map(|range| line_start + range.start..line_start + range.end);
+            let range = match_range
+                .filter(|range| {
+                    range.start < range.end
+                        && range.end <= line_text.len()
+                        && line_text.is_char_boundary(range.start)
+                        && line_text.is_char_boundary(range.end)
+                })
+                .or_else(|| file_name_match_range(line_text, query))?;
+            return Some(line_start + range.start..line_start + range.end);
         }
         line_start = line_start.saturating_add(segment.len());
     }
     None
+}
+
+fn center_input_line(input: &mut InputState, line: u32, cx: &mut Context<InputState>) {
+    let (Some(visible_rows), Some(line_height)) = (input.visible_row_range(), input.line_height())
+    else {
+        return;
+    };
+    let target_row = line.saturating_sub(1) as usize;
+    let top_row = target_row.saturating_sub(visible_rows.len().saturating_sub(1) / 2);
+    let mut offset = input.scroll_offset();
+    offset.y = -(line_height * top_row);
+    input.set_scroll_offset(offset, cx);
 }
 
 fn open_tool_element(tool_id: &str, size: gpui::Pixels, cx: &gpui::App) -> AnyElement {
@@ -12365,6 +12577,20 @@ fn relative_parent_path(path: &str) -> &str {
         .unwrap_or("")
 }
 
+fn relative_directory_path_chain(path: &str) -> Vec<String> {
+    let mut current = String::new();
+    path.split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| {
+            if !current.is_empty() {
+                current.push('/');
+            }
+            current.push_str(segment);
+            current.clone()
+        })
+        .collect()
+}
+
 fn join_relative_path(parent: &str, name: &str) -> String {
     let parent = parent.trim_matches('/');
     let name = name.trim_matches('/');
@@ -12942,11 +13168,23 @@ mod tests {
         let content = "other zed\r\n这里是 ZED 结果\r\nlast zed\r\n";
         let expected_start = content.find("ZED").unwrap();
         assert_eq!(
-            file_search_reveal_range(content, "zed", 2),
+            file_search_reveal_range(content, "zed", 2, None),
             Some(expected_start..expected_start + "ZED".len())
         );
-        assert_eq!(file_search_reveal_range(content, "missing", 2), None);
-        assert_eq!(file_search_reveal_range(content, "zed", 8), None);
+        assert_eq!(file_search_reveal_range(content, "missing", 2, None), None);
+        assert_eq!(file_search_reveal_range(content, "zed", 8, None), None);
+        assert_eq!(
+            file_search_reveal_range(content, "ignored", 2, Some(10..13)),
+            Some(expected_start..expected_start + 3)
+        );
+    }
+
+    #[test]
+    fn relative_directory_path_chain_builds_each_ancestor() {
+        assert_eq!(
+            relative_directory_path_chain("vendor/zed/crates"),
+            ["vendor", "vendor/zed", "vendor/zed/crates"]
+        );
     }
 
     #[test]

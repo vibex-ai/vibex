@@ -952,6 +952,9 @@ mod tests {
                     kind: FileEntryKind::File,
                     line: Some(1),
                     snippet: Some("fn main".into()),
+                    match_start: Some(3),
+                    match_end: Some(7),
+                    matched_text: Some("main".into()),
                 }])
             })
         }
@@ -1248,6 +1251,9 @@ mod tests {
                 workspace_id,
                 query: "lib".into(),
                 include_content: true,
+                case_sensitive: false,
+                whole_word: false,
+                regex: false,
                 limit: Some(10_000),
             })
             .await
