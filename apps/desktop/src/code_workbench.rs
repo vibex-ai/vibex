@@ -6,23 +6,28 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, AnyWindowHandle, ClipboardItem, Context, DragMoveEvent, Entity, FocusHandle, Hsla,
-    Image, ImageFormat, InteractiveElement as _, IntoElement, KeyDownEvent, ListAlignment,
-    ListHorizontalSizingBehavior, ListOffset, ListState, MouseButton, ParentElement as _, Render,
-    Role, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _,
-    StyleRefinement, Styled as _, Subscription, Task, UniformListScrollHandle, WeakEntity, Window,
-    canvas, div, img, list, point, prelude::*, px, relative, uniform_list,
+    AccessibleAction, AnyElement, AnyWindowHandle, App, ClipboardItem, Context, DragMoveEvent,
+    Entity, FocusHandle, Hsla, Image, ImageFormat, InteractiveElement as _, IntoElement,
+    KeyDownEvent, ListAlignment, ListHorizontalSizingBehavior, ListOffset, ListState, MouseButton,
+    MouseDownEvent, Orientation, ParentElement as _, PathBuilder, Render, Role, ScrollHandle,
+    ScrollWheelEvent, SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled as _,
+    Subscription, Task, UniformListScrollHandle, WeakEntity, Window, canvas, div, img, list, point,
+    prelude::*, px, relative, uniform_list,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
-    StyledExt as _, WindowExt as _,
+    ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath,
+    Selectable as _, Sizable as _, StyledExt as _, WindowExt as _,
     button::{Button, ButtonRounded, ButtonVariants as _},
+    calendar::Date,
+    date_picker::{DatePicker, DatePickerEvent, DatePickerState},
     dialog::{DialogAction, DialogClose, DialogFooter},
     h_flex,
     input::{Input, InputEvent, InputState},
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem},
     resizable::{h_resizable, resizable_panel, v_resizable},
     scroll::ScrollableElement as _,
+    searchable_list::SearchableListItem,
+    select::{Select, SelectEvent, SelectState},
     v_flex,
 };
 use sha2::{Digest as _, Sha256};
@@ -80,10 +85,13 @@ const FILE_TREE_GUIDE_OFFSET: f32 = 16.0;
 const FILE_MANAGER_OPEN_TOOL_ID: &str = "file_manager";
 const NATIVE_TERMINAL_OPEN_TOOL_ID: &str = "native_terminal";
 const GIT_ROW_HEIGHT: f32 = 30.0;
-const GIT_HISTORY_ROW_HEIGHT: f32 = 92.0;
-const GIT_HISTORY_DRAWER_MIN_HEIGHT: f32 = 160.0;
+const GIT_HISTORY_ROW_HEIGHT: f32 = 64.0;
+const GIT_HISTORY_GRAPH_LANE_WIDTH: f32 = 12.0;
+const GIT_HISTORY_GRAPH_MAX_LANES: usize = 8;
+const GIT_HISTORY_DRAWER_MIN_HEIGHT: f32 = 52.0;
+const GIT_HISTORY_DRAWER_CLOSE_THRESHOLD: f32 = 92.0;
 const GIT_HISTORY_DRAWER_DEFAULT_HEIGHT: f32 = 260.0;
-const GIT_HISTORY_DRAWER_MAX_HEIGHT: f32 = 440.0;
+const GIT_HISTORY_DRAWER_KEYBOARD_STEP: f32 = 24.0;
 const GIT_COMMIT_MESSAGE_HEIGHT: f32 = 80.0;
 const GIT_COMMIT_TYPES: [&str; 11] = [
     "feat", "fix", "refactor", "test", "docs", "style", "perf", "chore", "build", "ci", "revert",
@@ -99,6 +107,7 @@ const GIT_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const HIDDEN_WORKSPACE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const EDITOR_RECOVERY_PERSIST_DELAY: Duration = Duration::from_millis(200);
 const FILE_SEARCH_DEBOUNCE: Duration = Duration::from_millis(140);
+const GIT_HISTORY_SEARCH_DEBOUNCE: Duration = Duration::from_millis(180);
 const FILE_SEARCH_RESULT_LIMIT: u32 = 200;
 const WORKTREE_CONFLICT_RENDER_LIMIT: usize = 256;
 pub const CODE_WORKBENCH_MAX_EAGER_ROWS: usize = 5_000;
@@ -399,6 +408,106 @@ impl Render for PreviewTabDrag {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct GitHistoryBranchChoice {
+    name: String,
+    current_ahead: u32,
+    current_behind: u32,
+}
+
+impl SearchableListItem for GitHistoryBranchChoice {
+    type Value = String;
+
+    fn title(&self) -> SharedString {
+        format!(
+            "{}  ↓{} ↑{}",
+            self.name, self.current_ahead, self.current_behind
+        )
+        .into()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.name
+    }
+
+    fn render(&self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .gap_2()
+            .child(div().min_w_0().flex_1().truncate().child(self.name.clone()))
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_1p5()
+                    .font_family("monospace")
+                    .text_xs()
+                    .child(
+                        div()
+                            .text_color(cx.theme().info)
+                            .child(format!("↓{}", self.current_ahead)),
+                    )
+                    .child(
+                        div()
+                            .text_color(cx.theme().success)
+                            .child(format!("↑{}", self.current_behind)),
+                    ),
+            )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitHistoryAuthorChoice {
+    label: String,
+    value: Option<String>,
+}
+
+impl SearchableListItem for GitHistoryAuthorChoice {
+    type Value = Option<String>;
+
+    fn title(&self) -> SharedString {
+        self.label.clone().into()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.value
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GitHistoryDrawerResizeState {
+    start_window_y: f32,
+    start_height: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GitHistoryDrawerResizeDrag;
+
+impl Render for GitHistoryDrawerResizeDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitGraphEdge {
+    from: usize,
+    to: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitGraphRow {
+    lane: usize,
+    top_edges: Vec<GitGraphEdge>,
+    bottom_edges: Vec<GitGraphEdge>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitGraphLayout {
+    rows: Vec<GitGraphRow>,
+    lane_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PreviewTabDropTarget {
     pane_id: String,
     tab_id: String,
@@ -521,6 +630,9 @@ struct CodeRightRailGitProjection {
     authors: Arc<Vec<GitHistoryAuthor>>,
     selected_branch: Option<String>,
     selected_author: Option<String>,
+    history_query: Option<String>,
+    history_authored_after_ms: Option<i64>,
+    history_authored_before_ms: Option<i64>,
     selected_hash: Option<String>,
     selected_commit: Option<GitCommitSummary>,
     commit_detail_loaded: bool,
@@ -656,6 +768,9 @@ fn right_rail_git_projection(
         authors: Arc::new(git.history_authors.clone()),
         selected_branch: git.history_filter.ref_name.clone(),
         selected_author: git.history_filter.author.clone(),
+        history_query: git.history_filter.query.clone(),
+        history_authored_after_ms: git.history_filter.authored_after_ms,
+        history_authored_before_ms: git.history_filter.authored_before_ms,
         selected_hash,
         selected_commit,
         commit_detail_loaded: selected_detail.is_some(),
@@ -2891,12 +3006,9 @@ impl CodeWorkbench {
         if self.git.history_filter.ref_name.as_deref() == Some(branch.as_str()) {
             return;
         }
-        let author = self.git.history_filter.author.clone();
-        self.git
-            .set_history_filter(vibex_desktop_model::GitHistoryFilter {
-                ref_name: Some(branch),
-                author,
-            });
+        let mut filter = self.git.history_filter.clone();
+        filter.ref_name = Some(branch);
+        self.git.set_history_filter(filter);
         self.load_history(false, cx);
     }
 
@@ -2904,9 +3016,41 @@ impl CodeWorkbench {
         if self.git.history_filter.author == author {
             return;
         }
-        let ref_name = self.git.history_filter.ref_name.clone();
-        self.git
-            .set_history_filter(vibex_desktop_model::GitHistoryFilter { ref_name, author });
+        let mut filter = self.git.history_filter.clone();
+        filter.author = author;
+        self.git.set_history_filter(filter);
+        self.load_history(false, cx);
+    }
+
+    pub(crate) fn set_history_query(&mut self, query: Option<String>, cx: &mut Context<Self>) {
+        let query = query.and_then(|query| {
+            let query = query.trim().to_string();
+            (!query.is_empty()).then_some(query)
+        });
+        if self.git.history_filter.query == query {
+            return;
+        }
+        let mut filter = self.git.history_filter.clone();
+        filter.query = query;
+        self.git.set_history_filter(filter);
+        self.load_history(false, cx);
+    }
+
+    pub(crate) fn set_history_date_range(
+        &mut self,
+        authored_after_ms: Option<i64>,
+        authored_before_ms: Option<i64>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.git.history_filter.authored_after_ms == authored_after_ms
+            && self.git.history_filter.authored_before_ms == authored_before_ms
+        {
+            return;
+        }
+        let mut filter = self.git.history_filter.clone();
+        filter.authored_after_ms = authored_after_ms;
+        filter.authored_before_ms = authored_before_ms;
+        self.git.set_history_filter(filter);
         self.load_history(false, cx);
     }
 
@@ -2935,12 +3079,9 @@ impl CodeWorkbench {
         let Some(branch) = branch else {
             return false;
         };
-        let author = self.git.history_filter.author.clone();
-        self.git
-            .set_history_filter(vibex_desktop_model::GitHistoryFilter {
-                ref_name: Some(branch),
-                author,
-            });
+        let mut filter = self.git.history_filter.clone();
+        filter.ref_name = Some(branch);
+        self.git.set_history_filter(filter);
         true
     }
 
@@ -2956,7 +3097,7 @@ impl CodeWorkbench {
             .then(|| self.git.history.last().map(|commit| commit.hash.clone()))
             .flatten();
         let key = format!(
-            "{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}",
             self.git
                 .history_filter
                 .ref_name
@@ -2966,6 +3107,15 @@ impl CodeWorkbench {
                 .history_filter
                 .author
                 .as_deref()
+                .unwrap_or_default(),
+            self.git.history_filter.query.as_deref().unwrap_or_default(),
+            self.git
+                .history_filter
+                .authored_after_ms
+                .unwrap_or_default(),
+            self.git
+                .history_filter
+                .authored_before_ms
                 .unwrap_or_default(),
             before_commit.as_deref().unwrap_or_default()
         );
@@ -2978,6 +3128,9 @@ impl CodeWorkbench {
             before_commit,
             ref_name: self.git.history_filter.ref_name.clone(),
             author: self.git.history_filter.author.clone(),
+            query: self.git.history_filter.query.clone(),
+            authored_after_ms: self.git.history_filter.authored_after_ms,
+            authored_before_ms: self.git.history_filter.authored_before_ms,
         };
         self.history_loading = true;
         let runner = gpui_tokio::Tokio::spawn(cx, async move { runtime.git().history(&request) });
@@ -6806,6 +6959,15 @@ pub struct CodeRightRail {
     file_search_error: Option<String>,
     file_search_generation: u64,
     file_search_task: Option<Task<()>>,
+    history_search_input: Entity<InputState>,
+    history_search_generation: u64,
+    history_search_task: Option<Task<()>>,
+    history_branch_select: Entity<SelectState<Vec<GitHistoryBranchChoice>>>,
+    history_author_select: Entity<SelectState<Vec<GitHistoryAuthorChoice>>>,
+    history_date_picker: Entity<DatePickerState>,
+    history_drawer_height: f32,
+    history_body_height: f32,
+    history_drawer_resize: Option<GitHistoryDrawerResizeState>,
     inline_path_input: Entity<InputState>,
     inline_file_action: Option<InlineFileAction>,
     inline_file_error: Option<String>,
@@ -6837,25 +6999,74 @@ impl CodeRightRail {
             cx.new(|cx| InputState::new(window, cx).placeholder(inline_path_placeholder(None)));
         let file_tree_focus = cx.focus_handle().tab_stop(true);
         let projection = workbench.read(cx).right_rail_projection();
-        let workbench_subscription = cx.observe(&workbench, |this, workbench, cx| {
-            let previous_workspace_generation = this.projection.revision.workspace_generation;
-            let next = {
-                let workbench = workbench.read(cx);
-                let revision = workbench.right_rail_revision();
-                if revision == this.projection.revision {
-                    return;
-                }
-                workbench.right_rail_projection()
-            };
-            this.projection = next;
-            if this.projection.revision.workspace_generation != previous_workspace_generation {
-                this.file_search_results.clear();
-                this.file_search_collapsed_paths.clear();
-                this.file_search_error = None;
-                this.schedule_file_search(cx);
-            }
-            cx.notify();
+        let history_search_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(locale::text(
+                    "Search commits",
+                    "搜索提交信息或代码",
+                    "搜尋提交資訊或代碼",
+                ))
+                .default_value(projection.git.history_query.clone().unwrap_or_default())
         });
+        let branch_choices = git_history_branch_choices(
+            projection.git.branches.as_ref(),
+            projection.git.remotes.as_ref(),
+        );
+        let branch_selected = projection
+            .git
+            .selected_branch
+            .as_ref()
+            .and_then(|selected| {
+                branch_choices
+                    .iter()
+                    .position(|choice| &choice.name == selected)
+                    .map(IndexPath::new)
+            });
+        let history_branch_select = cx.new(|cx| {
+            SelectState::new(branch_choices, branch_selected, window, cx).searchable(true)
+        });
+        let author_choices = git_history_author_choices(projection.git.authors.as_ref());
+        let selected_author_value = projection.git.selected_author.clone();
+        let author_selected = author_choices
+            .iter()
+            .position(|choice| choice.value == selected_author_value)
+            .map(IndexPath::new);
+        let history_author_select = cx.new(|cx| {
+            SelectState::new(author_choices, author_selected, window, cx).searchable(true)
+        });
+        let history_date_picker =
+            cx.new(|cx| DatePickerState::range(window, cx).date_format("%Y-%m-%d"));
+        let initial_date = git_history_filter_date(
+            projection.git.history_authored_after_ms,
+            projection.git.history_authored_before_ms,
+        );
+        history_date_picker.update(cx, |picker, cx| picker.set_date(initial_date, window, cx));
+        let workbench_subscription =
+            cx.observe_in(&workbench, window, |this, workbench, window, cx| {
+                let previous_workspace_generation = this.projection.revision.workspace_generation;
+                let next = {
+                    let workbench = workbench.read(cx);
+                    let revision = workbench.right_rail_revision();
+                    if revision == this.projection.revision {
+                        return;
+                    }
+                    workbench.right_rail_projection()
+                };
+                this.projection = next;
+                if this.projection.revision.workspace_generation != previous_workspace_generation {
+                    this.file_search_results.clear();
+                    this.file_search_collapsed_paths.clear();
+                    this.file_search_error = None;
+                    this.schedule_file_search(cx);
+                    this.history_search_generation = this.history_search_generation.wrapping_add(1);
+                    this.history_search_task = None;
+                    this.history_search_input
+                        .update(cx, |input, cx| input.set_value("", window, cx));
+                    this.history_drawer_height = GIT_HISTORY_DRAWER_DEFAULT_HEIGHT;
+                }
+                this.sync_history_filter_controls(window, cx);
+                cx.notify();
+            });
         let file_search_subscription = cx.subscribe_in(
             &file_search_input,
             window,
@@ -6877,6 +7088,43 @@ impl CodeRightRail {
                 _ => {}
             },
         );
+        let history_search_subscription = cx.subscribe_in(
+            &history_search_input,
+            window,
+            |this, _, event, _, cx| match event {
+                InputEvent::Change => this.schedule_history_search(cx),
+                InputEvent::PressEnter { shift: false, .. } => this.start_history_search(cx),
+                _ => {}
+            },
+        );
+        let history_branch_subscription = cx.subscribe(
+            &history_branch_select,
+            |this, _, event: &SelectEvent<Vec<GitHistoryBranchChoice>>, cx| {
+                let SelectEvent::Confirm(branch) = event;
+                let Some(branch) = branch.clone() else {
+                    return;
+                };
+                this.update_workbench(cx, |workbench, cx| workbench.set_history_branch(branch, cx));
+            },
+        );
+        let history_author_subscription = cx.subscribe(
+            &history_author_select,
+            |this, _, event: &SelectEvent<Vec<GitHistoryAuthorChoice>>, cx| {
+                let SelectEvent::Confirm(author) = event;
+                let author = author.clone().flatten();
+                this.update_workbench(cx, |workbench, cx| workbench.set_history_author(author, cx));
+            },
+        );
+        let history_date_subscription = cx.subscribe(
+            &history_date_picker,
+            |this, _, event: &DatePickerEvent, cx| {
+                let DatePickerEvent::Change(date) = event;
+                let (after_ms, before_ms) = git_history_date_bounds(*date);
+                this.update_workbench(cx, |workbench, cx| {
+                    workbench.set_history_date_range(after_ms, before_ms, cx)
+                });
+            },
+        );
         let file_tree_blur_subscription =
             cx.on_blur(&file_tree_focus, window, Self::on_file_tree_blur);
         Self {
@@ -6891,6 +7139,15 @@ impl CodeRightRail {
             file_search_error: None,
             file_search_generation: 0,
             file_search_task: None,
+            history_search_input,
+            history_search_generation: 0,
+            history_search_task: None,
+            history_branch_select,
+            history_author_select,
+            history_date_picker,
+            history_drawer_height: GIT_HISTORY_DRAWER_DEFAULT_HEIGHT,
+            history_body_height: GIT_HISTORY_DRAWER_DEFAULT_HEIGHT,
+            history_drawer_resize: None,
             inline_path_input,
             inline_file_action: None,
             inline_file_error: None,
@@ -6904,6 +7161,10 @@ impl CodeRightRail {
                 workbench_subscription,
                 file_search_subscription,
                 input_subscription,
+                history_search_subscription,
+                history_branch_subscription,
+                history_author_subscription,
+                history_date_subscription,
                 file_tree_blur_subscription,
             ],
             #[cfg(test)]
@@ -6928,11 +7189,127 @@ impl CodeRightRail {
                 cx,
             )
         });
+        self.history_search_input.update(cx, |input, cx| {
+            input.set_placeholder(
+                locale::text("Search commits", "搜索提交信息或代码", "搜尋提交資訊或代碼"),
+                window,
+                cx,
+            )
+        });
         let placeholder = inline_path_placeholder(self.inline_file_action.as_ref());
         self.inline_path_input.update(cx, |input, cx| {
             input.set_placeholder(placeholder, window, cx)
         });
         cx.notify();
+    }
+
+    fn sync_history_filter_controls(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let branch_choices = git_history_branch_choices(
+            self.projection.git.branches.as_ref(),
+            self.projection.git.remotes.as_ref(),
+        );
+        let selected_branch = self.projection.git.selected_branch.clone();
+        self.history_branch_select.update(cx, |select, cx| {
+            select.set_items(branch_choices, window, cx);
+            if let Some(selected) = selected_branch.as_ref() {
+                select.set_selected_value(selected, window, cx);
+            } else {
+                select.set_selected_index(None, window, cx);
+            }
+        });
+
+        let author_choices = git_history_author_choices(self.projection.git.authors.as_ref());
+        let selected_author = self.projection.git.selected_author.clone();
+        self.history_author_select.update(cx, |select, cx| {
+            select.set_items(author_choices, window, cx);
+            select.set_selected_value(&selected_author, window, cx);
+        });
+
+        let date = git_history_filter_date(
+            self.projection.git.history_authored_after_ms,
+            self.projection.git.history_authored_before_ms,
+        );
+        self.history_date_picker.update(cx, |picker, cx| {
+            if picker.date() != date {
+                picker.set_date(date, window, cx);
+            }
+        });
+    }
+
+    fn schedule_history_search(&mut self, cx: &mut Context<Self>) {
+        self.launch_history_search(GIT_HISTORY_SEARCH_DEBOUNCE, cx);
+    }
+
+    fn start_history_search(&mut self, cx: &mut Context<Self>) {
+        self.launch_history_search(Duration::ZERO, cx);
+    }
+
+    fn launch_history_search(&mut self, delay: Duration, cx: &mut Context<Self>) {
+        self.history_search_generation = self.history_search_generation.wrapping_add(1);
+        let generation = self.history_search_generation;
+        self.history_search_task = None;
+        let query = self
+            .history_search_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        self.history_search_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            if !delay.is_zero() {
+                cx.background_executor().timer(delay).await;
+            }
+            let _ = entity.update(cx, |this, cx| {
+                if this.history_search_generation != generation {
+                    return;
+                }
+                this.history_search_task = None;
+                let query = (!query.is_empty()).then_some(query.clone());
+                this.update_workbench(cx, |workbench, cx| workbench.set_history_query(query, cx));
+            });
+        }));
+    }
+
+    fn set_history_drawer_height(&mut self, height: f32, cx: &mut Context<Self>) {
+        let max_height = self.history_body_height.max(GIT_HISTORY_DRAWER_MIN_HEIGHT);
+        let height = height
+            .round()
+            .clamp(GIT_HISTORY_DRAWER_MIN_HEIGHT, max_height);
+        if (height - self.history_drawer_height).abs() < f32::EPSILON {
+            return;
+        }
+        self.history_drawer_height = height;
+        cx.notify();
+    }
+
+    fn update_history_drawer_resize(&mut self, window_y: f32, cx: &mut Context<Self>) {
+        let Some(drag) = self.history_drawer_resize else {
+            return;
+        };
+        self.set_history_drawer_height(drag.start_height + drag.start_window_y - window_y, cx);
+    }
+
+    fn finish_history_drawer_resize(&mut self, cx: &mut Context<Self>) {
+        if self.history_drawer_resize.take().is_none() {
+            return;
+        }
+        if git_history_drawer_should_close(self.history_drawer_height) {
+            self.update_workbench(cx, |workbench, cx| {
+                workbench.git.clear_commit_selection();
+                cx.notify();
+            });
+        }
+        cx.notify();
+    }
+
+    fn record_history_body_height(&mut self, height: f32, cx: &mut Context<Self>) {
+        if height.is_finite() && height > 0.0 {
+            self.history_body_height = height;
+            let drawer_height = self.history_drawer_height.min(height);
+            if (drawer_height - self.history_drawer_height).abs() >= f32::EPSILON {
+                self.history_drawer_height = drawer_height;
+                cx.notify();
+            }
+        }
     }
 
     fn set_file_search_mode(&mut self, mode: FileSearchMode, cx: &mut Context<Self>) {
@@ -9673,13 +10050,14 @@ impl CodeRightRail {
         let additions = git.additions;
         let deletions = git.deletions;
         let change_count = git.change_count;
+        let history_search_input = self.history_search_input.clone();
 
         v_flex()
             .size_full()
             .min_h_0()
             .child(
                 h_flex()
-                    .h(px(48.0))
+                    .h(px(40.0))
                     .flex_none()
                     .border_b_1()
                     .border_color(cx.theme().border)
@@ -9758,7 +10136,7 @@ impl CodeRightRail {
             })
             .child(
                 h_flex()
-                    .h(px(48.0))
+                    .h(px(40.0))
                     .flex_none()
                     .gap_2()
                     .px_3()
@@ -9820,6 +10198,48 @@ impl CodeRightRail {
                                 this.update_workbench(cx, |workbench, cx| workbench.refresh_git(cx))
                             })),
                     )
+                    .when(history_active, |this| {
+                        this.child(
+                            h_flex()
+                                .h(px(28.0))
+                                .min_w_0()
+                                .flex_1()
+                                .max_w(px(260.0))
+                                .gap_1()
+                                .rounded(cx.theme().radius)
+                                .border_1()
+                                .border_color(cx.theme().input)
+                                .bg(cx.theme().background)
+                                .px_1p5()
+                                .child(
+                                    Icon::new(IconName::Search)
+                                        .xsmall()
+                                        .text_color(cx.theme().muted_foreground),
+                                )
+                                .child(div().min_w_0().flex_1().child(
+                                    Input::new(&history_search_input).small().appearance(false),
+                                ))
+                                .child(
+                                    Button::new("clear-git-history-search-toolbar")
+                                        .xsmall()
+                                        .ghost()
+                                        .compact()
+                                        .p_0()
+                                        .icon(IconName::Close)
+                                        .tooltip(locale::text(
+                                            "Clear commit search",
+                                            "清除提交搜索",
+                                            "清除提交搜尋",
+                                        ))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.history_search_input.update(cx, |input, cx| {
+                                                input.set_value("", window, cx)
+                                            });
+                                            this.start_history_search(cx);
+                                        })),
+                                ),
+                        )
+                    })
                     .when(changes_active, |this| {
                         this.child(
                             Button::new("revert-selected-toolbar")
@@ -10277,8 +10697,27 @@ impl CodeRightRail {
                                             .ghost()
                                             .rounded_none()
                                             .h_full()
-                                            .px_4()
-                                            .label(locale::text("Commit", "提交", "提交"))
+                                            .px_3()
+                                            .child(
+                                                h_flex()
+                                                    .gap_1p5()
+                                                    .child(locale::text("Commit", "提交", "提交"))
+                                                    .child(
+                                                        div()
+                                                            .min_w(px(18.0))
+                                                            .h(px(18.0))
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .rounded(px(4.0))
+                                                            .bg(cx.theme().primary.opacity(0.18))
+                                                            .px_1()
+                                                            .font_family("monospace")
+                                                            .text_xs()
+                                                            .text_color(cx.theme().foreground)
+                                                            .child(selected_count.to_string()),
+                                                    ),
+                                            )
                                             .loading(pending || lifecycle_pending)
                                             .disabled(action_pending || selected_count == 0)
                                             .on_click(cx.listener(|this, _, window, cx| {
@@ -10637,47 +11076,35 @@ impl CodeRightRail {
 
     fn render_git_history(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let git = &self.projection.git;
-        let history_row_count = git.history.len();
-        let branches = git.branches.clone();
-        let remotes = git.remotes.clone();
-        let authors = git.authors.clone();
-        let selected_branch = git.selected_branch.clone();
-        let selected_author = git.selected_author.clone();
-        let selected_hash = git.selected_hash.clone();
-        let loading = git.history_loading;
-        let scroll_handle = git.scroll.clone();
         let history = git.history.clone();
-        let remote_names = remotes
-            .iter()
-            .map(|remote| remote.name.as_str())
-            .collect::<BTreeSet<_>>();
-        // Match the Tauri rail: the current branch leads the local branch group.
-        let mut local_branches = branches
-            .iter()
-            .filter(|branch| !git_branch_is_remote(&branch.name, &remote_names))
-            .map(|branch| (branch.name.clone(), branch.current))
-            .collect::<Vec<_>>();
-        local_branches.sort_by_key(|(_, current)| !*current);
-        let local_branches = local_branches
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect::<Vec<_>>();
-        let remote_branches = branches
-            .iter()
-            .filter(|branch| git_branch_is_remote(&branch.name, &remote_names))
-            .map(|branch| branch.name.clone())
-            .collect::<Vec<_>>();
-        let branch_workbench = self.workbench.downgrade();
-        let active_branch = selected_branch
-            .clone()
-            .unwrap_or_else(|| locale::text("Branch", "分支", "分支").to_string());
-        let branch_checked = selected_branch.clone();
-        let author_workbench = self.workbench.downgrade();
-        let active_author = selected_author
-            .clone()
-            .unwrap_or_else(|| locale::text("All Users", "所有用户", "所有使用者").to_string());
-        let author_checked = selected_author.clone();
+        let history_row_count = history.len();
+        let loading = git.history_loading;
+        let selected_hash = git.selected_hash.clone();
         let selected_hash_for_rows = selected_hash.clone();
+        let scroll_handle = git.scroll.clone();
+        let graph = git_graph_layout(&history);
+        let branch_select = Select::new(&self.history_branch_select)
+            .small()
+            .h(px(30.0))
+            .w_full()
+            .text_xs()
+            .placeholder(locale::text("Branch", "分支", "分支"))
+            .search_placeholder(locale::text("Search branches", "搜索分支", "搜尋分支"));
+        let author_select = Select::new(&self.history_author_select)
+            .small()
+            .h(px(30.0))
+            .w_full()
+            .text_xs()
+            .placeholder(locale::text("All Users", "所有用户", "所有使用者"))
+            .search_placeholder(locale::text("Search users", "搜索用户", "搜尋使用者"));
+        let date_picker = DatePicker::new(&self.history_date_picker)
+            .small()
+            .h(px(30.0))
+            .w(px(180.0))
+            .text_xs()
+            .cleanable(true)
+            .placeholder(locale::text("Any date", "任意日期", "任何日期"));
+        let body_size_target = cx.weak_entity();
 
         let history_list = if history_row_count == 0 {
             if loading {
@@ -10707,27 +11134,18 @@ impl CodeRightRail {
                                 history_row_count,
                                 CODE_WORKBENCH_MAX_EAGER_ROWS,
                             );
-                            let rows = range
+                            range
                                 .filter_map(|index| {
-                                    let commit = history.get(index)?.clone();
-                                    let previous_date = index
-                                        .checked_sub(1)
-                                        .and_then(|previous| history.get(previous))
-                                        .map(|previous| {
-                                            git_history_date_key(previous.authored_at_ms)
-                                        });
-                                    let current_date = git_history_date_key(commit.authored_at_ms);
                                     Some((
-                                        commit,
-                                        previous_date.as_deref() != Some(current_date.as_str()),
+                                        history.get(index)?.clone(),
+                                        graph.rows.get(index)?.clone(),
                                     ))
                                 })
-                                .collect::<Vec<_>>();
-                            rows.into_iter()
-                                .map(|(commit, show_date)| {
+                                .map(|(commit, graph_row)| {
                                     this.render_git_history_row(
                                         commit,
-                                        show_date,
+                                        graph_row,
+                                        graph.lane_count,
                                         selected_hash_for_rows.as_deref(),
                                         cx,
                                     )
@@ -10741,24 +11159,27 @@ impl CodeRightRail {
                 .into_any_element()
         };
         let history_body = if let Some(hash) = selected_hash {
-            v_resizable("git-history-layout")
+            let drawer_height = self.history_drawer_height;
+            v_flex()
+                .relative()
+                .size_full()
+                .min_h_0()
+                .child(v_flex().flex_1().min_h_0().child(history_list))
                 .child(
-                    resizable_panel()
-                        .size_range(px(100.0)..gpui::Pixels::MAX)
-                        .child(history_list),
-                )
-                .child(
-                    resizable_panel()
-                        .size(px(GIT_HISTORY_DRAWER_DEFAULT_HEIGHT))
-                        .size_range(
-                            px(GIT_HISTORY_DRAWER_MIN_HEIGHT)..px(GIT_HISTORY_DRAWER_MAX_HEIGHT),
-                        )
+                    v_flex()
+                        .h(px(drawer_height))
+                        .min_h(px(GIT_HISTORY_DRAWER_MIN_HEIGHT))
                         .flex_none()
-                        .child(self.render_git_commit_drawer(hash, cx)),
+                        .child(self.render_git_history_drawer_resize_handle(cx))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .child(self.render_git_commit_drawer(hash, cx)),
+                        ),
                 )
-                .into_any_element()
         } else {
-            history_list
+            v_flex().size_full().min_h_0().child(history_list)
         };
 
         v_flex()
@@ -10767,163 +11188,134 @@ impl CodeRightRail {
             .child(
                 h_flex()
                     .flex_none()
-                    .gap_2()
-                    .p_3()
+                    .h(px(38.0))
+                    .gap_1p5()
+                    .px_2()
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .child(
-                        div().min_w_0().flex_1().child(
-                            Button::new("git-history-branch")
-                                .small()
-                                .outline()
-                                .w_full()
-                                .h(px(32.0))
-                                .justify_between()
-                                .tooltip(active_branch.clone())
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .truncate()
-                                        .text_xs()
-                                        .text_left()
-                                        .child(active_branch),
-                                )
-                                .dropdown_caret(true)
-                                .disabled(local_branches.is_empty() && remote_branches.is_empty())
-                                .dropdown_menu(move |mut menu, _, _| {
-                                    if !local_branches.is_empty() {
-                                        menu = menu.item(PopupMenuItem::label(locale::text(
-                                            "Local Branches",
-                                            "本地分支",
-                                            "本機分支",
-                                        )));
-                                        for branch in &local_branches {
-                                            let workbench = branch_workbench.clone();
-                                            let value = branch.clone();
-                                            menu = menu.item(
-                                                PopupMenuItem::new(branch.clone())
-                                                    .checked(
-                                                        branch_checked.as_deref()
-                                                            == Some(branch.as_str()),
-                                                    )
-                                                    .on_click(move |_, _, cx| {
-                                                        let _ = workbench.update(
-                                                            cx,
-                                                            |workbench, cx| {
-                                                                workbench.set_history_branch(
-                                                                    value.clone(),
-                                                                    cx,
-                                                                )
-                                                            },
-                                                        );
-                                                    }),
-                                            );
-                                        }
-                                    }
-                                    if !remote_branches.is_empty() {
-                                        menu = menu.item(PopupMenuItem::label(locale::text(
-                                            "Remote Branches",
-                                            "远程分支",
-                                            "遠端分支",
-                                        )));
-                                        for branch in &remote_branches {
-                                            let workbench = branch_workbench.clone();
-                                            let value = branch.clone();
-                                            menu = menu.item(
-                                                PopupMenuItem::new(branch.clone())
-                                                    .checked(
-                                                        branch_checked.as_deref()
-                                                            == Some(branch.as_str()),
-                                                    )
-                                                    .on_click(move |_, _, cx| {
-                                                        let _ = workbench.update(
-                                                            cx,
-                                                            |workbench, cx| {
-                                                                workbench.set_history_branch(
-                                                                    value.clone(),
-                                                                    cx,
-                                                                )
-                                                            },
-                                                        );
-                                                    }),
-                                            );
-                                        }
-                                    }
-                                    menu
-                                }),
-                        ),
-                    )
-                    .child(
-                        div().min_w_0().flex_1().child(
-                            Button::new("git-history-author")
-                                .small()
-                                .outline()
-                                .w_full()
-                                .h(px(32.0))
-                                .justify_between()
-                                .tooltip(active_author.clone())
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .truncate()
-                                        .text_xs()
-                                        .text_left()
-                                        .child(active_author),
-                                )
-                                .dropdown_caret(true)
-                                .dropdown_menu(move |mut menu, _, _| {
-                                    let all_workbench = author_workbench.clone();
-                                    menu =
-                                        menu.item(
-                                            PopupMenuItem::new(locale::text(
-                                                "All Users",
-                                                "所有用户",
-                                                "所有使用者",
-                                            ))
-                                            .checked(author_checked.is_none())
-                                            .on_click(move |_, _, cx| {
-                                                let _ =
-                                                    all_workbench.update(cx, |workbench, cx| {
-                                                        workbench.set_history_author(None, cx)
-                                                    });
-                                            }),
-                                        );
-                                    for author in authors.iter() {
-                                        let workbench = author_workbench.clone();
-                                        let value = format!("{} <{}>", author.name, author.email);
-                                        let label = value.clone();
-                                        menu = menu.item(
-                                            PopupMenuItem::new(label)
-                                                .checked(
-                                                    author_checked.as_deref()
-                                                        == Some(value.as_str()),
-                                                )
-                                                .on_click(move |_, _, cx| {
-                                                    let _ =
-                                                        workbench.update(cx, |workbench, cx| {
-                                                            workbench.set_history_author(
-                                                                Some(value.clone()),
-                                                                cx,
-                                                            )
-                                                        });
-                                                }),
-                                        );
-                                    }
-                                    menu
-                                }),
-                        ),
-                    ),
+                    .child(div().min_w_0().flex_1().child(branch_select))
+                    .child(div().min_w_0().flex_1().child(author_select))
+                    .child(date_picker),
             )
-            .child(div().flex_1().min_h_0().child(history_body))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .on_prepaint(move |bounds, _, cx| {
+                        let _ = body_size_target.update(cx, |this, cx| {
+                            this.record_history_body_height(f32::from(bounds.size.height), cx)
+                        });
+                    })
+                    .child(history_body),
+            )
+            .into_any_element()
+    }
+
+    fn render_git_history_drawer_resize_handle(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let active = self.history_drawer_resize.is_some();
+        let increment_target = cx.weak_entity();
+        let decrement_target = cx.weak_entity();
+        div()
+            .id("git-history-drawer-resize")
+            .role(Role::Splitter)
+            .aria_label(locale::text(
+                "Resize changed files drawer",
+                "调整变更文件抽屉",
+                "調整變更檔案抽屜",
+            ))
+            .aria_orientation(Orientation::Horizontal)
+            .aria_numeric_value(self.history_drawer_height as f64)
+            .aria_numeric_value_step(GIT_HISTORY_DRAWER_KEYBOARD_STEP as f64)
+            .aria_min_numeric_value(GIT_HISTORY_DRAWER_MIN_HEIGHT as f64)
+            .aria_max_numeric_value(
+                self.history_body_height.max(GIT_HISTORY_DRAWER_MIN_HEIGHT) as f64
+            )
+            .focusable()
+            .tab_index(0)
+            .h(px(12.0))
+            .w_full()
+            .flex_none()
+            .cursor_ns_resize()
+            .items_center()
+            .justify_center()
+            .bg(if active {
+                cx.theme().accent.opacity(0.24)
+            } else {
+                cx.theme().sidebar
+            })
+            .hover(|style| style.bg(cx.theme().accent.opacity(0.20)))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                let next = match event.keystroke.key.as_str() {
+                    "up" => this.history_drawer_height + GIT_HISTORY_DRAWER_KEYBOARD_STEP,
+                    "down" => this.history_drawer_height - GIT_HISTORY_DRAWER_KEYBOARD_STEP,
+                    "home" => GIT_HISTORY_DRAWER_MIN_HEIGHT,
+                    "end" => this.history_body_height,
+                    _ => return,
+                };
+                this.set_history_drawer_height(next, cx);
+                cx.stop_propagation();
+            }))
+            .on_a11y_action(AccessibleAction::Increment, move |_, _, cx| {
+                let _ = increment_target.update(cx, |this, cx| {
+                    this.set_history_drawer_height(
+                        this.history_drawer_height + GIT_HISTORY_DRAWER_KEYBOARD_STEP,
+                        cx,
+                    )
+                });
+            })
+            .on_a11y_action(AccessibleAction::Decrement, move |_, _, cx| {
+                let _ = decrement_target.update(cx, |this, cx| {
+                    this.set_history_drawer_height(
+                        this.history_drawer_height - GIT_HISTORY_DRAWER_KEYBOARD_STEP,
+                        cx,
+                    )
+                });
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    window.prevent_default();
+                    this.history_drawer_resize = Some(GitHistoryDrawerResizeState {
+                        start_window_y: f32::from(event.position.y),
+                        start_height: this.history_drawer_height,
+                    });
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .on_drag(GitHistoryDrawerResizeDrag, |_, _, _, cx| {
+                cx.new(|_| GitHistoryDrawerResizeDrag)
+            })
+            .on_drag_move(cx.listener(
+                |this, event: &DragMoveEvent<GitHistoryDrawerResizeDrag>, _, cx| {
+                    cx.stop_propagation();
+                    this.update_history_drawer_resize(f32::from(event.event.position.y), cx);
+                },
+            ))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.finish_history_drawer_resize(cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.finish_history_drawer_resize(cx)),
+            )
+            .child(
+                div()
+                    .h(px(4.0))
+                    .w(px(42.0))
+                    .rounded_full()
+                    .bg(cx.theme().border),
+            )
             .into_any_element()
     }
 
     fn render_git_history_row(
         &mut self,
         commit: vibex_core::GitCommitSummary,
-        show_date: bool,
+        graph_row: GitGraphRow,
+        graph_lane_count: usize,
         selected_hash: Option<&str>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -10938,116 +11330,209 @@ impl CodeRightRail {
         );
         let click_workbench = self.workbench.downgrade();
         let keyboard_workbench = click_workbench.clone();
+        let graph_width = graph_lane_count.clamp(1, GIT_HISTORY_GRAPH_MAX_LANES) as f32
+            * GIT_HISTORY_GRAPH_LANE_WIDTH
+            + 4.0;
+        let graph_colors = [
+            cx.theme().primary,
+            cx.theme().info,
+            cx.theme().success,
+            cx.theme().warning,
+            cx.theme().danger,
+            cx.theme().accent_foreground,
+            cx.theme().muted_foreground,
+            cx.theme().foreground,
+        ];
+        let refs = commit.refs.iter().take(2).cloned().collect::<Vec<_>>();
 
-        v_flex()
+        h_flex()
             .h(px(GIT_HISTORY_ROW_HEIGHT))
             .w_full()
             .flex_none()
-            .px_3()
-            .pt_1()
+            .min_w_0()
+            .pr_2()
             .child(
-                div()
-                    .h(px(18.0))
-                    .flex_none()
-                    .text_xs()
-                    .font_semibold()
-                    .text_color(cx.theme().sidebar_foreground.opacity(0.50))
-                    .child(if show_date {
-                        git_history_date_label(commit.authored_at_ms).to_uppercase()
-                    } else {
-                        String::new()
-                    }),
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        let top = bounds.origin.y;
+                        let bottom = bounds.origin.y + bounds.size.height;
+                        let middle = bounds.origin.y + bounds.size.height / 2.0;
+                        let lane_x = |lane: usize| {
+                            bounds.origin.x
+                                + px(2.0 + lane as f32 * GIT_HISTORY_GRAPH_LANE_WIDTH)
+                                + px(GIT_HISTORY_GRAPH_LANE_WIDTH / 2.0)
+                        };
+                        for edge in &graph_row.top_edges {
+                            let from = lane_x(edge.from);
+                            let to = lane_x(edge.to);
+                            let mut path = PathBuilder::stroke(px(1.5));
+                            path.move_to(point(from, top));
+                            if edge.from == edge.to {
+                                path.line_to(point(to, middle));
+                            } else {
+                                path.cubic_bezier_to(
+                                    point(to, middle),
+                                    point(from, top + bounds.size.height / 6.0),
+                                    point(to, middle - bounds.size.height / 6.0),
+                                );
+                            }
+                            if let Ok(path) = path.build() {
+                                window.paint_path(path, graph_colors[edge.to % graph_colors.len()]);
+                            }
+                        }
+                        for edge in &graph_row.bottom_edges {
+                            let from = lane_x(edge.from);
+                            let to = lane_x(edge.to);
+                            let mut path =
+                                PathBuilder::stroke(px(if edge.from == graph_row.lane {
+                                    1.8
+                                } else {
+                                    1.5
+                                }));
+                            path.move_to(point(from, middle));
+                            if edge.from == edge.to {
+                                path.line_to(point(to, bottom));
+                            } else {
+                                path.cubic_bezier_to(
+                                    point(to, bottom),
+                                    point(from, middle + bounds.size.height / 6.0),
+                                    point(to, bottom - bounds.size.height / 6.0),
+                                );
+                            }
+                            if let Ok(path) = path.build() {
+                                window.paint_path(path, graph_colors[edge.to % graph_colors.len()]);
+                            }
+                        }
+                        let radius = px(if selected { 4.5 } else { 3.5 });
+                        let center = point(lane_x(graph_row.lane), middle);
+                        let mut node = PathBuilder::fill();
+                        node.move_to(point(center.x + radius, center.y));
+                        node.arc_to(
+                            point(radius, radius),
+                            px(0.0),
+                            false,
+                            true,
+                            point(center.x - radius, center.y),
+                        );
+                        node.arc_to(
+                            point(radius, radius),
+                            px(0.0),
+                            false,
+                            true,
+                            point(center.x + radius, center.y),
+                        );
+                        node.close();
+                        if let Ok(path) = node.build() {
+                            window.paint_path(
+                                path,
+                                graph_colors[graph_row.lane % graph_colors.len()],
+                            );
+                        }
+                    },
+                )
+                .h_full()
+                .w(px(graph_width))
+                .flex_none()
+                .into_any_element(),
             )
             .child(
-                h_flex()
-                    .h(px(66.0))
+                v_flex()
+                    .id(format!("git-history-card:{}", commit.hash))
+                    .h(px(56.0))
                     .min_w_0()
-                    .gap_2()
+                    .flex_1()
+                    .justify_center()
+                    .gap_1()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(if selected {
+                        cx.theme().primary.opacity(0.52)
+                    } else {
+                        cx.theme().border.opacity(0.55)
+                    })
+                    .bg(if selected {
+                        cx.theme().primary.opacity(0.10)
+                    } else {
+                        cx.theme().background.opacity(0.50)
+                    })
+                    .px_2()
+                    .focusable()
+                    .tab_index(0)
+                    .aria_label(accessible_name)
+                    .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.60)))
                     .child(
-                        v_flex()
-                            .w(px(10.0))
-                            .h_full()
-                            .flex_none()
-                            .items_center()
-                            .pt_3()
-                            .child(div().size(px(7.0)).rounded_full().bg(cx.theme().primary))
-                            .child(div().w(px(1.0)).flex_1().bg(cx.theme().border)),
-                    )
-                    .child(
-                        v_flex()
-                            .id(format!("git-history-card:{}", commit.hash))
-                            .h_full()
+                        h_flex()
                             .min_w_0()
                             .flex_1()
-                            .justify_center()
-                            .gap_2()
-                            .rounded(px(12.0))
-                            .border_1()
-                            .border_color(if selected {
-                                cx.theme().primary.opacity(0.52)
-                            } else {
-                                cx.theme().border.opacity(0.72)
-                            })
-                            .bg(if selected {
-                                cx.theme().primary.opacity(0.10)
-                            } else {
-                                cx.theme().background.opacity(0.72)
-                            })
-                            .px_3()
-                            .focusable()
-                            .tab_index(0)
-                            .aria_label(accessible_name)
-                            .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.60)))
                             .child(
                                 div()
                                     .min_w_0()
+                                    .flex_1()
                                     .truncate()
                                     .text_xs()
                                     .font_semibold()
                                     .child(commit.subject.clone()),
                             )
-                            .child(
-                                h_flex()
-                                    .min_w_0()
-                                    .gap_2()
+                            .children(refs.into_iter().map(|reference| {
+                                div()
+                                    .max_w(px(92.0))
+                                    .flex_none()
+                                    .truncate()
+                                    .rounded(px(3.0))
+                                    .bg(cx.theme().accent.opacity(0.55))
+                                    .px_1()
                                     .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .child(git_history_time(commit.authored_at_ms)),
-                                    )
-                                    .child(div().min_w_0().truncate().child(commit.author_name))
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .font_family("monospace")
-                                            .font_weight(code_font_weight(cx))
-                                            .child(commit.short_hash),
-                                    ),
+                                    .text_color(cx.theme().accent_foreground)
+                                    .child(reference)
+                            })),
+                    )
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .gap_2()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .child(git_history_relative_time(commit.authored_at_ms)),
                             )
-                            .on_click(move |_, _, cx| {
-                                let hash = hash.clone();
-                                let subject = subject.clone();
-                                let _ = click_workbench.update(cx, |workbench, cx| {
-                                    workbench.request_preview_panel(cx);
-                                    workbench.open_commit(hash, subject, cx);
-                                });
-                            })
-                            .on_key_down(move |event: &KeyDownEvent, _, cx| {
-                                if event.keystroke.key != "enter" && event.keystroke.key != "space"
-                                {
-                                    return;
-                                }
-                                let hash = keyboard_hash.clone();
-                                let subject = keyboard_subject.clone();
-                                let _ = keyboard_workbench.update(cx, |workbench, cx| {
-                                    workbench.request_preview_panel(cx);
-                                    workbench.open_commit(hash, subject, cx);
-                                });
-                                cx.stop_propagation();
-                            }),
-                    ),
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .truncate()
+                                    .child(commit.author_name),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .font_family("monospace")
+                                    .font_weight(code_font_weight(cx))
+                                    .child(commit.short_hash),
+                            ),
+                    )
+                    .on_click(move |_, _, cx| {
+                        let hash = hash.clone();
+                        let subject = subject.clone();
+                        let _ = click_workbench.update(cx, |workbench, cx| {
+                            workbench.request_preview_panel(cx);
+                            workbench.open_commit(hash, subject, cx);
+                        });
+                    })
+                    .on_key_down(move |event: &KeyDownEvent, _, cx| {
+                        if event.keystroke.key != "enter" && event.keystroke.key != "space" {
+                            return;
+                        }
+                        let hash = keyboard_hash.clone();
+                        let subject = keyboard_subject.clone();
+                        let _ = keyboard_workbench.update(cx, |workbench, cx| {
+                            workbench.request_preview_panel(cx);
+                            workbench.open_commit(hash, subject, cx);
+                        });
+                        cx.stop_propagation();
+                    }),
             )
             .into_any_element()
     }
@@ -11106,22 +11591,6 @@ impl CodeRightRail {
             .border_color(cx.theme().border)
             .bg(cx.theme().sidebar)
             .child(
-                div()
-                    .h(px(12.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_row_resize()
-                    .child(
-                        div()
-                            .h(px(4.0))
-                            .w(px(40.0))
-                            .rounded_full()
-                            .bg(cx.theme().border),
-                    ),
-            )
-            .child(
                 v_flex()
                     .flex_none()
                     .min_w_0()
@@ -11160,7 +11629,7 @@ impl CodeRightRail {
                             .child(
                                 h_flex()
                                     .flex_none()
-                                    .gap_3()
+                                    .gap_1p5()
                                     .font_family("monospace")
                                     .font_weight(code_font_weight(cx))
                                     .text_xs()
@@ -11191,11 +11660,12 @@ impl CodeRightRail {
                             )
                             .child(
                                 Button::new("close-git-commit-drawer")
+                                    .ml_1()
                                     .small()
                                     .ghost()
                                     .compact()
-                                    .w(px(20.0))
-                                    .h(px(20.0))
+                                    .w(px(32.0))
+                                    .h(px(32.0))
                                     .p_0()
                                     .icon(IconName::Close)
                                     .tooltip(locale::text(
@@ -11833,43 +12303,259 @@ fn git_branch_is_remote(branch: &str, remote_names: &BTreeSet<&str>) -> bool {
         .any(|remote| branch == *remote || branch.starts_with(&format!("{remote}/")))
 }
 
-fn git_history_date_key(authored_at_ms: Option<i64>) -> String {
-    authored_at_ms
-        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
-        .map(|timestamp| {
-            timestamp
-                .with_timezone(&chrono::Local)
-                .format("%Y-%m-%d")
-                .to_string()
+fn git_history_branch_choices(
+    branches: &[GitBranchSummary],
+    remotes: &[GitRemoteSummary],
+) -> Vec<GitHistoryBranchChoice> {
+    let remote_names = remotes
+        .iter()
+        .map(|remote| remote.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut choices = branches
+        .iter()
+        .map(|branch| GitHistoryBranchChoice {
+            name: branch.name.clone(),
+            current_ahead: branch.current_ahead,
+            current_behind: branch.current_behind,
         })
-        .unwrap_or_else(|| "unknown".to_string())
+        .collect::<Vec<_>>();
+    choices.sort_by(|left, right| {
+        let left_current = branches
+            .iter()
+            .find(|branch| branch.name == left.name)
+            .is_some_and(|branch| branch.current);
+        let right_current = branches
+            .iter()
+            .find(|branch| branch.name == right.name)
+            .is_some_and(|branch| branch.current);
+        let left_remote = git_branch_is_remote(&left.name, &remote_names);
+        let right_remote = git_branch_is_remote(&right.name, &remote_names);
+        right_current
+            .cmp(&left_current)
+            .then_with(|| left_remote.cmp(&right_remote))
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+    });
+    choices
 }
 
-fn git_history_date_label(authored_at_ms: Option<i64>) -> String {
+fn git_history_author_choices(authors: &[GitHistoryAuthor]) -> Vec<GitHistoryAuthorChoice> {
+    let mut choices = vec![GitHistoryAuthorChoice {
+        label: locale::text("All Users", "所有用户", "所有使用者").to_string(),
+        value: None,
+    }];
+    choices.extend(authors.iter().map(|author| GitHistoryAuthorChoice {
+        label: format!("{} <{}>", author.name, author.email),
+        value: Some(format!("{} <{}>", author.name, author.email)),
+    }));
+    choices
+}
+
+fn local_date_bounds(date: chrono::NaiveDate) -> (i64, i64) {
+    use chrono::TimeZone as _;
+    let start = date
+        .and_hms_opt(0, 0, 0)
+        .and_then(|value| chrono::Local.from_local_datetime(&value).single())
+        .map(|value| value.timestamp_millis())
+        .unwrap_or_else(|| {
+            date.and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp_millis()
+        });
+    let end_date = date.succ_opt().unwrap_or(date);
+    let end = end_date
+        .and_hms_opt(0, 0, 0)
+        .and_then(|value| chrono::Local.from_local_datetime(&value).single())
+        .map(|value| value.timestamp_millis())
+        .unwrap_or_else(|| {
+            end_date
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp_millis()
+        });
+    (start, end)
+}
+
+fn git_history_filter_date(after_ms: Option<i64>, before_ms: Option<i64>) -> Date {
+    let start = after_ms.and_then(|value| {
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(value)
+            .map(|value| value.with_timezone(&chrono::Local).date_naive())
+    });
+    let end = before_ms.and_then(|value| {
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(value.saturating_sub(1))
+            .map(|value| value.with_timezone(&chrono::Local).date_naive())
+    });
+    Date::Range(start, end)
+}
+
+fn git_history_date_bounds(date: Date) -> (Option<i64>, Option<i64>) {
+    let start = date.start().map(local_date_bounds).map(|(start, _)| start);
+    let end = date.end().map(local_date_bounds).map(|(_, end)| end);
+    (start, end)
+}
+
+fn git_history_drawer_should_close(height: f32) -> bool {
+    height <= GIT_HISTORY_DRAWER_CLOSE_THRESHOLD
+}
+
+fn git_history_relative_time(authored_at_ms: Option<i64>) -> String {
+    git_history_relative_time_at(
+        authored_at_ms,
+        chrono::Local::now(),
+        locale::current_locale(),
+    )
+}
+
+fn git_history_relative_time_at(
+    authored_at_ms: Option<i64>,
+    now: chrono::DateTime<chrono::Local>,
+    resolved_locale: locale::ResolvedLocale,
+) -> String {
     let Some(timestamp) = authored_at_ms
         .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
         .map(|timestamp| timestamp.with_timezone(&chrono::Local))
     else {
-        return locale::text("Unknown date", "未知日期", "未知日期").to_string();
+        return match resolved_locale {
+            locale::ResolvedLocale::En => "Unknown",
+            locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => "未知",
+        }
+        .to_string();
     };
-    match locale::current_locale() {
-        locale::ResolvedLocale::En => timestamp.format("%b %d, %Y").to_string(),
+    let age = now.signed_duration_since(timestamp);
+    let seconds = age.num_seconds().max(0);
+    let day_delta = now
+        .date_naive()
+        .signed_duration_since(timestamp.date_naive())
+        .num_days();
+    if seconds < 60 {
+        match resolved_locale {
+            locale::ResolvedLocale::En => format!("{seconds}s ago"),
+            locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => {
+                format!("{seconds}秒前")
+            }
+        }
+    } else if seconds < 3_600 {
+        let minutes = seconds / 60;
+        match resolved_locale {
+            locale::ResolvedLocale::En => format!("{minutes}m ago"),
+            locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => {
+                format!("{minutes}分钟前")
+            }
+        }
+    } else if seconds < 6 * 3_600 {
+        let hours = seconds / 3_600;
+        match resolved_locale {
+            locale::ResolvedLocale::En => format!("{hours}h ago"),
+            locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => {
+                format!("{hours}小时前")
+            }
+        }
+    } else if day_delta == 0 {
+        let relative = match resolved_locale {
+            locale::ResolvedLocale::En => "today",
+            locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => "今天",
+        };
+        format!("{relative} {}", timestamp.format("%H:%M"))
+    } else if day_delta == 1 {
+        let relative = match resolved_locale {
+            locale::ResolvedLocale::En => "yesterday",
+            locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => "昨天",
+        };
+        format!("{relative} {}", timestamp.format("%H:%M"))
+    } else {
+        format!(
+            "{} {}",
+            git_history_date_label(timestamp, resolved_locale),
+            timestamp.format("%H:%M")
+        )
+    }
+}
+
+fn git_graph_layout(commits: &[GitCommitSummary]) -> GitGraphLayout {
+    let mut lanes: Vec<String> = Vec::new();
+    let mut rows = Vec::with_capacity(commits.len());
+    let mut lane_count = 1;
+    for commit in commits {
+        let top_lanes = lanes.clone();
+        let mut middle_lanes = top_lanes.clone();
+        let lane = middle_lanes
+            .iter()
+            .position(|hash| hash == &commit.hash)
+            .filter(|lane| *lane < GIT_HISTORY_GRAPH_MAX_LANES)
+            .unwrap_or_else(|| {
+                middle_lanes.retain(|hash| hash != &commit.hash);
+                middle_lanes.insert(0, commit.hash.clone());
+                0
+            });
+        middle_lanes.truncate(GIT_HISTORY_GRAPH_MAX_LANES);
+
+        let top_edges = top_lanes
+            .iter()
+            .enumerate()
+            .filter(|(from, _)| *from < GIT_HISTORY_GRAPH_MAX_LANES)
+            .filter_map(|(from, hash)| {
+                middle_lanes
+                    .iter()
+                    .position(|candidate| candidate == hash)
+                    .map(|to| GitGraphEdge { from, to })
+            })
+            .collect::<Vec<_>>();
+
+        let mut next = middle_lanes.clone();
+        next.remove(lane);
+        let mut inserted_parents = 0;
+        for parent in &commit.parents {
+            if next.iter().any(|candidate| candidate == parent) {
+                continue;
+            }
+            let insert_at = lane.saturating_add(inserted_parents).min(next.len());
+            next.insert(insert_at, parent.clone());
+            inserted_parents += 1;
+        }
+        next.truncate(GIT_HISTORY_GRAPH_MAX_LANES);
+
+        let mut bottom_edges = middle_lanes
+            .iter()
+            .enumerate()
+            .filter(|(from, _)| *from != lane)
+            .filter_map(|(from, hash)| {
+                next.iter()
+                    .position(|candidate| candidate == hash)
+                    .map(|to| GitGraphEdge { from, to })
+            })
+            .collect::<Vec<_>>();
+        bottom_edges.extend(commit.parents.iter().filter_map(|parent| {
+            next.iter()
+                .position(|candidate| candidate == parent)
+                .map(|to| GitGraphEdge { from: lane, to })
+        }));
+        bottom_edges.dedup();
+
+        lane_count = lane_count
+            .max(top_lanes.len())
+            .max(middle_lanes.len())
+            .max(next.len());
+        rows.push(GitGraphRow {
+            lane,
+            top_edges,
+            bottom_edges,
+        });
+        lanes = next;
+    }
+    GitGraphLayout { rows, lane_count }
+}
+
+fn git_history_date_label(
+    timestamp: chrono::DateTime<chrono::Local>,
+    resolved_locale: locale::ResolvedLocale,
+) -> String {
+    match resolved_locale {
+        locale::ResolvedLocale::En => timestamp.format("%Y-%m-%d").to_string(),
         locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => {
             timestamp.format("%Y年%-m月%-d日").to_string()
         }
     }
-}
-
-fn git_history_time(authored_at_ms: Option<i64>) -> String {
-    authored_at_ms
-        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
-        .map(|timestamp| {
-            timestamp
-                .with_timezone(&chrono::Local)
-                .format("%H:%M")
-                .to_string()
-        })
-        .unwrap_or_else(|| locale::text("Unknown", "未知", "未知").to_string())
 }
 
 fn git_commit_authored_at(authored_at_ms: Option<i64>) -> String {
@@ -13630,6 +14316,116 @@ mod tests {
         );
         assert_eq!(normalize_git_commit_message("docs", "   "), "");
         assert_eq!(git_commit_placeholder("test"), "test: commit message");
+    }
+
+    #[test]
+    fn git_graph_layout_tracks_linear_forks_and_merges() {
+        let commit = |hash: &str, parents: &[&str]| GitCommitSummary {
+            hash: hash.to_string(),
+            short_hash: hash.to_string(),
+            parents: parents.iter().map(|parent| (*parent).to_string()).collect(),
+            author_name: "Ada".into(),
+            author_email: "ada@example.test".into(),
+            authored_at_ms: None,
+            subject: hash.to_string(),
+            refs: Vec::new(),
+        };
+
+        let linear =
+            git_graph_layout(&[commit("a", &["b"]), commit("b", &["c"]), commit("c", &[])]);
+        assert_eq!(linear.lane_count, 1);
+        assert!(linear.rows[0].top_edges.is_empty());
+        assert_eq!(
+            linear.rows[0].bottom_edges,
+            [GitGraphEdge { from: 0, to: 0 }]
+        );
+        assert_eq!(linear.rows[1].top_edges, [GitGraphEdge { from: 0, to: 0 }]);
+
+        let merged = git_graph_layout(&[
+            commit("merge", &["left", "right"]),
+            commit("left", &["base"]),
+            commit("right", &["base"]),
+            commit("base", &[]),
+        ]);
+        assert_eq!(merged.lane_count, 2);
+        assert_eq!(
+            merged.rows[0].bottom_edges,
+            [
+                GitGraphEdge { from: 0, to: 0 },
+                GitGraphEdge { from: 0, to: 1 },
+            ]
+        );
+        assert_eq!(merged.rows[1].lane, 0);
+        assert_eq!(merged.rows[2].lane, 1);
+        assert!(
+            merged.rows[2]
+                .bottom_edges
+                .contains(&GitGraphEdge { from: 1, to: 0 })
+        );
+        assert_eq!(merged.rows[3].lane, 0);
+
+        let wide_merge = std::iter::once(commit(
+            "wide",
+            &["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9"],
+        ))
+        .chain((0..10).map(|index| commit(&format!("p{index}"), &[])))
+        .collect::<Vec<_>>();
+        let capped = git_graph_layout(&wide_merge);
+        assert_eq!(capped.lane_count, GIT_HISTORY_GRAPH_MAX_LANES);
+        assert!(capped.rows.iter().all(|row| {
+            row.lane < GIT_HISTORY_GRAPH_MAX_LANES
+                && row.top_edges.iter().all(|edge| {
+                    edge.from < GIT_HISTORY_GRAPH_MAX_LANES && edge.to < GIT_HISTORY_GRAPH_MAX_LANES
+                })
+                && row.bottom_edges.iter().all(|edge| {
+                    edge.from < GIT_HISTORY_GRAPH_MAX_LANES && edge.to < GIT_HISTORY_GRAPH_MAX_LANES
+                })
+        }));
+    }
+
+    #[test]
+    fn git_history_relative_times_cover_recent_and_calendar_dates() {
+        use chrono::TimeZone as _;
+
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 8, 19, 12, 0, 0)
+            .single()
+            .unwrap();
+        let label = |age: chrono::Duration| {
+            git_history_relative_time_at(
+                Some((now - age).timestamp_millis()),
+                now,
+                locale::ResolvedLocale::En,
+            )
+        };
+        assert_eq!(label(chrono::Duration::seconds(12)), "12s ago");
+        assert_eq!(label(chrono::Duration::minutes(5)), "5m ago");
+        assert_eq!(label(chrono::Duration::hours(3)), "3h ago");
+        assert!(label(chrono::Duration::hours(8)).starts_with("today "));
+        assert!(label(chrono::Duration::hours(26)).starts_with("yesterday "));
+        assert!(label(chrono::Duration::days(3)).contains("2026"));
+    }
+
+    #[test]
+    fn git_history_date_ranges_round_trip_local_calendar_days() {
+        let start = chrono::NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
+        let end = chrono::NaiveDate::from_ymd_opt(2026, 8, 19).unwrap();
+        let (after_ms, before_ms) = git_history_date_bounds(Date::Range(Some(start), Some(end)));
+        assert!(before_ms.unwrap() > after_ms.unwrap());
+        assert_eq!(
+            git_history_filter_date(after_ms, before_ms),
+            Date::Range(Some(start), Some(end))
+        );
+    }
+
+    #[test]
+    fn a_short_git_history_drawer_is_treated_as_closed() {
+        assert!(git_history_drawer_should_close(
+            GIT_HISTORY_DRAWER_CLOSE_THRESHOLD
+        ));
+        assert!(!git_history_drawer_should_close(
+            GIT_HISTORY_DRAWER_CLOSE_THRESHOLD + 1.0
+        ));
     }
 
     #[test]

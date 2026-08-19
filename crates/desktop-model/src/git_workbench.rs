@@ -124,6 +124,9 @@ pub struct GitMutationScope {
 pub struct GitHistoryFilter {
     pub ref_name: Option<String>,
     pub author: Option<String>,
+    pub query: Option<String>,
+    pub authored_after_ms: Option<i64>,
+    pub authored_before_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -494,6 +497,7 @@ impl GitWorkbenchState {
         self.history.clear();
         self.history_has_more = false;
         self.history_authors.clear();
+        self.history_filter = GitHistoryFilter::default();
         self.selected_commit_hash = None;
         self.commit_detail = None;
         self.commit_documents.clear();
@@ -787,6 +791,9 @@ impl GitWorkbenchState {
         self.history_filter = GitHistoryFilter {
             ref_name: filter.ref_name.and_then(normalized_optional),
             author: filter.author.and_then(normalized_optional),
+            query: filter.query.and_then(normalized_optional),
+            authored_after_ms: filter.authored_after_ms,
+            authored_before_ms: filter.authored_before_ms,
         };
         self.history.clear();
         self.history_has_more = false;
@@ -1741,6 +1748,33 @@ mod tests {
         state.invalidate_queries();
         assert!(!state.apply_status(&ticket, status(&workspace_id)));
         assert!(state.status.is_none());
+    }
+
+    #[test]
+    fn history_filter_normalizes_search_fields_and_keeps_date_bounds() {
+        let mut state = GitWorkbenchState::default();
+        state.set_history_filter(GitHistoryFilter {
+            ref_name: Some("  main  ".into()),
+            author: Some("  Ada  ".into()),
+            query: Some("  deadbeef  ".into()),
+            authored_after_ms: Some(1_700_000_000_000),
+            authored_before_ms: Some(1_700_086_400_000),
+        });
+
+        assert_eq!(state.history_filter.ref_name.as_deref(), Some("main"));
+        assert_eq!(state.history_filter.author.as_deref(), Some("Ada"));
+        assert_eq!(state.history_filter.query.as_deref(), Some("deadbeef"));
+        assert_eq!(
+            state.history_filter.authored_after_ms,
+            Some(1_700_000_000_000)
+        );
+        assert_eq!(
+            state.history_filter.authored_before_ms,
+            Some(1_700_086_400_000)
+        );
+
+        state.reset_workspace(WorkspaceId::new());
+        assert_eq!(state.history_filter, GitHistoryFilter::default());
     }
 
     #[test]

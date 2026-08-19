@@ -25,6 +25,8 @@ pub use identity::*;
 const MAX_DIFF_BYTES: usize = 512 * 1024;
 const MAX_HISTORY_LIMIT: u32 = 100;
 const DEFAULT_HISTORY_LIMIT: u32 = 50;
+const MAX_HISTORY_SEARCH_SCAN: u32 = 10_000;
+const MAX_HISTORY_QUERY_BYTES: usize = 256;
 const MAX_BLAME_LINES: u32 = 500;
 const VIBEX_GIT_MUTATION_LOCK_FILE: &str = "vibex-mutation.lock";
 
@@ -179,14 +181,42 @@ pub fn history(
         validate_existing_commitish(&root, ref_name)?;
     }
     let author = normalized_optional(&request.author);
+    let query = normalized_optional(&request.query);
+    if query.is_some_and(|query| query.len() > MAX_HISTORY_QUERY_BYTES) {
+        return Err(VibexError::validation(
+            "git_history_query_too_long",
+            "git history query is too long",
+        ));
+    }
+    if request
+        .authored_after_ms
+        .zip(request.authored_before_ms)
+        .is_some_and(|(after, before)| after >= before)
+    {
+        return Err(VibexError::validation(
+            "git_history_invalid_date_range",
+            "git history start date must be before the end date",
+        ));
+    }
 
     let limit = request
         .limit
         .unwrap_or(DEFAULT_HISTORY_LIMIT)
         .clamp(1, MAX_HISTORY_LIMIT);
+    // Git's --since/--until use committer dates, while the history contract
+    // exposes authored_at_ms. Scan a bounded window and filter authored dates
+    // locally so the UI's range is exact for the timestamp it displays.
+    let requires_local_scan = query.is_some()
+        || request.authored_after_ms.is_some()
+        || request.authored_before_ms.is_some();
+    let command_limit = if requires_local_scan {
+        MAX_HISTORY_SEARCH_SCAN
+    } else {
+        limit + 1
+    };
     let mut args = vec![
         "log".to_string(),
-        format!("-n{}", limit + 1),
+        format!("-n{command_limit}"),
         "--decorate=short".to_string(),
         "--date=unix".to_string(),
         "--pretty=format:%H%x1f%h%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%D%x1f%s%x1e".to_string(),
@@ -203,7 +233,27 @@ pub fn history(
     let authors = history_authors(&root, ref_name)?;
     let output = run_git_owned(&root, &args)?;
     let mut commits = parse_history_output(&output)?;
-    let has_more = commits.len() as u32 > limit;
+    let scan_exhausted = requires_local_scan && commits.len() as u32 >= command_limit;
+    if let Some(query) = query {
+        let query = query.to_lowercase();
+        commits.retain(|commit| {
+            commit.hash.to_ascii_lowercase().contains(&query)
+                || commit.short_hash.to_ascii_lowercase().contains(&query)
+                || commit.subject.to_lowercase().contains(&query)
+        });
+    }
+    commits.retain(|commit| {
+        request.authored_after_ms.is_none_or(|after| {
+            commit
+                .authored_at_ms
+                .is_some_and(|timestamp| timestamp >= after)
+        }) && request.authored_before_ms.is_none_or(|before| {
+            commit
+                .authored_at_ms
+                .is_some_and(|timestamp| timestamp < before)
+        })
+    });
+    let has_more = commits.len() as u32 > limit || (scan_exhausted && !commits.is_empty());
     if has_more {
         commits.truncate(limit as usize);
     }
@@ -2184,30 +2234,55 @@ fn list_branches(root: &Path) -> VibexResult<Vec<GitBranchSummary>> {
             "refs/remotes",
         ],
     )?;
+    let records = output
+        .trim_end_matches('\x1e')
+        .split('\x1e')
+        .filter_map(|record| {
+            if record.trim().is_empty() {
+                return None;
+            }
+            let fields = record
+                .trim_start_matches('\n')
+                .split('\x1f')
+                .collect::<Vec<_>>();
+            (fields.len() == 3 && !fields[0].ends_with("/HEAD")).then(|| {
+                (
+                    fields[0].to_string(),
+                    fields[1] == "*",
+                    (!fields[2].is_empty()).then(|| fields[2].to_string()),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let current_ref = records
+        .iter()
+        .find(|(_, current, _)| *current)
+        .map(|(name, _, _)| name.clone())
+        .or_else(|| {
+            run_git_optional(root, &["rev-parse", "--verify", "HEAD"])
+                .ok()
+                .flatten()
+                .map(|_| "HEAD".to_string())
+        });
     let mut branches = Vec::new();
-    for record in output.trim_end_matches('\x1e').split('\x1e') {
-        if record.trim().is_empty() {
-            continue;
-        }
-        let fields: Vec<&str> = record.trim_start_matches('\n').split('\x1f').collect();
-        if fields.len() != 3 {
-            continue;
-        }
-        if fields[0].ends_with("/HEAD") {
-            continue;
-        }
-        let upstream = (!fields[2].is_empty()).then(|| fields[2].to_string());
-        let (ahead, behind) = if let Some(upstream) = upstream.as_deref() {
-            ahead_behind(root, fields[0], upstream).unwrap_or((0, 0))
-        } else {
-            (0, 0)
-        };
+    for (name, current, upstream) in records {
+        let (ahead, behind) = upstream
+            .as_deref()
+            .map(|upstream| ahead_behind(root, &name, upstream).unwrap_or((0, 0)))
+            .unwrap_or((0, 0));
+        let (current_ahead, current_behind) = current_ref
+            .as_deref()
+            .filter(|current_ref| *current_ref != name)
+            .map(|current_ref| ahead_behind(root, current_ref, &name).unwrap_or((0, 0)))
+            .unwrap_or((0, 0));
         branches.push(GitBranchSummary {
-            name: fields[0].to_string(),
-            current: fields[1] == "*",
+            name,
+            current,
             upstream,
             ahead,
             behind,
+            current_ahead,
+            current_behind,
             detached: false,
         });
     }
@@ -2220,6 +2295,8 @@ fn list_branches(root: &Path) -> VibexResult<Vec<GitBranchSummary>> {
             upstream: None,
             ahead: 0,
             behind: 0,
+            current_ahead: 0,
+            current_behind: 0,
             detached: true,
         });
     }
@@ -2851,6 +2928,9 @@ mod tests {
                 before_commit: None,
                 ref_name: None,
                 author: None,
+                query: None,
+                authored_after_ms: None,
+                authored_before_ms: None,
             },
         )
         .unwrap();
@@ -2942,6 +3022,9 @@ mod tests {
                 before_commit: None,
                 ref_name: Some("feature/history-filter".to_string()),
                 author: Some("Bob".to_string()),
+                query: None,
+                authored_after_ms: None,
+                authored_before_ms: None,
             },
         )
         .unwrap();
@@ -2971,6 +3054,134 @@ mod tests {
                 .authors
                 .iter()
                 .any(|author| author.name == "Bob" && author.email == "bob@example.invalid")
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn history_filters_by_message_hash_and_authored_date() {
+        let root = temp_repo("history-search-date");
+        std::fs::create_dir_all(&root).unwrap();
+        run_raw(&root, &["init"]).unwrap();
+        run_raw(&root, &["config", "user.email", "vibex@example.invalid"]).unwrap();
+        run_raw(&root, &["config", "user.name", "Vibex Test"]).unwrap();
+        commit_file_at(
+            &root,
+            "first.txt",
+            "first\n",
+            "ordinary change",
+            1_700_000_000,
+        );
+        commit_file_at(
+            &root,
+            "second.txt",
+            "second\n",
+            "Needle feature",
+            1_700_086_400,
+        );
+
+        let workspace_id = WorkspaceId::new();
+        let request = |query: Option<String>, after, before| GitHistoryRequest {
+            workspace_id: workspace_id.clone(),
+            limit: Some(10),
+            before_commit: None,
+            ref_name: None,
+            author: None,
+            query,
+            authored_after_ms: after,
+            authored_before_ms: before,
+        };
+        let by_message = history(&root, &request(Some("NEEDLE".into()), None, None)).unwrap();
+        assert_eq!(by_message.commits.len(), 1);
+        assert_eq!(by_message.commits[0].subject, "Needle feature");
+
+        let full_hash = by_message.commits[0].hash.clone();
+        let short_hash = by_message.commits[0].short_hash.clone();
+        let by_full_hash = history(&root, &request(Some(full_hash), None, None)).unwrap();
+        assert_eq!(by_full_hash.commits.len(), 1);
+        assert_eq!(by_full_hash.commits[0].subject, "Needle feature");
+        let by_short_hash = history(&root, &request(Some(short_hash), None, None)).unwrap();
+        assert_eq!(by_short_hash.commits.len(), 1);
+        assert_eq!(by_short_hash.commits[0].subject, "Needle feature");
+
+        let second_timestamp_ms = 1_700_086_400_000;
+        let by_date = history(
+            &root,
+            &request(
+                None,
+                Some(second_timestamp_ms),
+                Some(second_timestamp_ms + 1_000),
+            ),
+        )
+        .unwrap();
+        assert_eq!(by_date.commits.len(), 1);
+        assert_eq!(by_date.commits[0].subject, "Needle feature");
+
+        let error = history(
+            &root,
+            &request(None, Some(second_timestamp_ms), Some(second_timestamp_ms)),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "git_history_invalid_date_range");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn branch_list_reports_divergence_from_the_current_branch() {
+        let root = temp_repo("branch-divergence");
+        std::fs::create_dir_all(&root).unwrap();
+        init_repo_with_commit(&root, "base.txt", "base\n", "base");
+        let current_branch = run_git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        let current_branch = current_branch.trim();
+
+        run_raw(&root, &["switch", "-c", "feature/diverged"]).unwrap();
+        commit_file_at(
+            &root,
+            "feature.txt",
+            "feature\n",
+            "feature commit",
+            1_700_000_100,
+        );
+        run_raw(&root, &["switch", current_branch]).unwrap();
+        commit_file_at(&root, "main-one.txt", "one\n", "main one", 1_700_000_200);
+        commit_file_at(&root, "main-two.txt", "two\n", "main two", 1_700_000_300);
+
+        let response = branch_list(WorkspaceId::new(), &root).unwrap();
+        let feature = response
+            .branches
+            .iter()
+            .find(|branch| branch.name == "feature/diverged")
+            .unwrap();
+        assert_eq!(feature.current_ahead, 2);
+        assert_eq!(feature.current_behind, 1);
+        let current = response
+            .branches
+            .iter()
+            .find(|branch| branch.current)
+            .unwrap();
+        assert_eq!((current.current_ahead, current.current_behind), (0, 0));
+
+        run_raw(&root, &["switch", "--detach"]).unwrap();
+        let detached_response = branch_list(WorkspaceId::new(), &root).unwrap();
+        let detached_feature = detached_response
+            .branches
+            .iter()
+            .find(|branch| branch.name == "feature/diverged")
+            .unwrap();
+        assert_eq!(
+            (
+                detached_feature.current_ahead,
+                detached_feature.current_behind
+            ),
+            (2, 1)
+        );
+        assert!(
+            detached_response
+                .branches
+                .iter()
+                .any(|branch| branch.current && branch.detached)
         );
 
         let _ = std::fs::remove_dir_all(root);
@@ -3667,6 +3878,25 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         Ok(())
+    }
+
+    fn commit_file_at(root: &Path, file: &str, content: &str, message: &str, unix_seconds: i64) {
+        std::fs::write(root.join(file), content).unwrap();
+        run_raw(root, &["add", file]).unwrap();
+        let raw_date = format!("{unix_seconds} +0000");
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["commit", "-m", message])
+            .env("GIT_AUTHOR_DATE", &raw_date)
+            .env("GIT_COMMITTER_DATE", &raw_date)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn init_repo_with_commit(root: &Path, file: &str, content: &str, message: &str) {

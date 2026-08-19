@@ -114,6 +114,14 @@ pub struct GitHistoryRequest {
     pub ref_name: Option<String>,
     #[serde(default)]
     pub author: Option<String>,
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Inclusive lower bound for the authored timestamp.
+    #[serde(default)]
+    pub authored_after_ms: Option<i64>,
+    /// Exclusive upper bound for the authored timestamp.
+    #[serde(default)]
+    pub authored_before_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,6 +220,12 @@ pub struct GitBranchSummary {
     pub upstream: Option<String>,
     pub ahead: u32,
     pub behind: u32,
+    /// Commits on the current branch that are absent from this branch.
+    #[serde(default)]
+    pub current_ahead: u32,
+    /// Commits on this branch that are absent from the current branch.
+    #[serde(default)]
+    pub current_behind: u32,
     pub detached: bool,
 }
 
