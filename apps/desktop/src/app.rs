@@ -627,6 +627,12 @@ enum UserMessageInlineSegment {
     Attachment(MessageAttachment),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UserMessageAttachmentAction {
+    PreviewImage(ComposerAttachment),
+    OpenFile(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct VibexMessageClipboard {
@@ -11563,6 +11569,64 @@ impl VibexWorkbench {
         self.code_workbench.update(cx, |workbench, cx| {
             workbench.open_file(path, false, window, cx)
         });
+    }
+
+    fn composer_attachment_workspace_root(&self) -> Option<String> {
+        if self.new_session_open {
+            return self
+                .new_session_workspace
+                .selected_workspace()
+                .map(|workspace| workspace.root_path.clone())
+                .or_else(|| {
+                    let workspace_id = self.new_session_workspace.origin_workspace_id.as_ref()?;
+                    self.workspaces
+                        .iter()
+                        .find(|(_, workspace)| &workspace.id == workspace_id)
+                        .map(|(_, workspace)| workspace.root_path.clone())
+                })
+                .or_else(|| {
+                    (!self.new_session_workspace.project_root.trim().is_empty())
+                        .then(|| self.new_session_workspace.project_root.clone())
+                });
+        }
+        self.selected_session()
+            .map(|session| session.workspace_root.clone())
+    }
+
+    fn composer_attachment_tab_path(&self, attachment: &ComposerAttachment) -> Option<String> {
+        let workspace_root = self.composer_attachment_workspace_root()?;
+        agent_file_operation_preview_path(
+            attachment.path.as_deref()?,
+            Some(workspace_root.as_str()),
+        )
+    }
+
+    fn open_composer_attachment_in_tab(
+        &mut self,
+        attachment: &ComposerAttachment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace_root) = self.composer_attachment_workspace_root() else {
+            return;
+        };
+        let Some(path) = agent_file_operation_preview_path(
+            attachment.path.as_deref().unwrap_or_default(),
+            Some(workspace_root.as_str()),
+        ) else {
+            return;
+        };
+        if let Some(workspace) = self
+            .workspaces
+            .iter()
+            .find(|(_, workspace)| {
+                std::path::Path::new(&workspace.root_path) == std::path::Path::new(&workspace_root)
+            })
+            .map(|(_, workspace)| workspace.clone())
+        {
+            self.activate_workspace(workspace, cx);
+        }
+        self.open_code_file(path, window, cx);
     }
 
     fn open_markdown_resource(
@@ -25072,13 +25136,21 @@ impl VibexWorkbench {
                 let label = attachment.label.clone();
                 let is_image = attachment.is_image();
                 let preview_attachment = attachment.clone();
+                let tab_attachment = attachment.clone();
+                let tab_path = (!is_image)
+                    .then(|| self.composer_attachment_tab_path(&attachment))
+                    .flatten();
                 let preview_source = attachment.path.as_ref().filter(|_| is_image).map(|path| {
                     Arc::<std::path::Path>::from(std::path::PathBuf::from(path).into_boxed_path())
                 });
                 let token_width = f32::from(bounds.size.width).max(24.0);
-                let preview_label = format!(
+                let action_label = format!(
                     "{}: {label}",
-                    locale::text("Preview image", "预览图片", "預覽圖片")
+                    if is_image {
+                        locale::text("Preview image", "预览图片", "預覽圖片")
+                    } else {
+                        locale::text("Open attachment", "打开附件", "開啟附件")
+                    }
                 );
 
                 Some(
@@ -25102,7 +25174,7 @@ impl VibexWorkbench {
                         .font_weight(FontWeight(600.0))
                         .text_color(cx.theme().foreground)
                         .role(Role::Button)
-                        .aria_label(preview_label)
+                        .aria_label(action_label)
                         .hover(|style| {
                             style
                                 .bg(cx.theme().accent)
@@ -25155,6 +25227,17 @@ impl VibexWorkbench {
                                         cx,
                                     )
                                 }))
+                        })
+                        .when_some(tab_path, |this, _| {
+                            this.cursor_pointer().on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.open_composer_attachment_in_tab(
+                                        &tab_attachment,
+                                        window,
+                                        cx,
+                                    )
+                                },
+                            ))
                         })
                         .into_any_element(),
                 )
@@ -28854,18 +28937,30 @@ impl VibexWorkbench {
             .into_any_element();
         }
 
-        let (document, image_attachments) =
-            user_message_inline_document(&text, &attachments, self.resolved_locale());
+        let workspace_root = self
+            .selected_session()
+            .map(|session| session.workspace_root.as_str());
+        let (document, attachment_actions) = user_message_inline_document(
+            &text,
+            &attachments,
+            self.resolved_locale(),
+            workspace_root,
+        );
         let view = cx.entity().downgrade();
         MarkdownView::from_document(format!("user-message-text:{message_id}"), document)
             .presentation(MarkdownPresentation::Agent)
             .search_query(highlight_query.map(Arc::<str>::from))
             .on_open_resource(move |resource, window, cx| {
-                let Some(attachment) = image_attachments.get(&resource.source).cloned() else {
+                let Some(action) = attachment_actions.get(&resource.source).cloned() else {
                     return;
                 };
-                let _ = view.update(cx, |this, cx| {
-                    this.open_attachment_preview(attachment, window, cx);
+                let _ = view.update(cx, |this, cx| match action {
+                    UserMessageAttachmentAction::PreviewImage(attachment) => {
+                        this.open_attachment_preview(attachment, window, cx)
+                    }
+                    UserMessageAttachmentAction::OpenFile(path) => {
+                        this.open_code_file(path, window, cx)
+                    }
                 });
             })
             .w_auto()
@@ -39944,13 +40039,14 @@ fn user_message_inline_document(
     text: &str,
     attachments: &[MessageAttachment],
     locale: locale::ResolvedLocale,
+    workspace_root: Option<&str>,
 ) -> (
     Arc<MarkdownDocument>,
-    Arc<BTreeMap<String, ComposerAttachment>>,
+    Arc<BTreeMap<String, UserMessageAttachmentAction>>,
 ) {
     let mut source = String::with_capacity(text.len());
     let mut inlines = Vec::new();
-    let mut image_attachments = BTreeMap::new();
+    let mut attachment_actions = BTreeMap::new();
     let mut next_node_id = 1;
 
     let segments = user_message_inline_segments(text, attachments);
@@ -40011,10 +40107,20 @@ fn user_message_inline_document(
                     kind: Inline::Mark(vec![text_node]),
                 };
                 next_node_id = next_node_id.saturating_add(1);
-                let kind = if composer_attachment.is_image() {
+                let action = if composer_attachment.is_image() {
+                    Some(UserMessageAttachmentAction::PreviewImage(
+                        composer_attachment.clone(),
+                    ))
+                } else {
+                    composer_attachment.path.as_deref().and_then(|path| {
+                        agent_file_operation_preview_path(path, workspace_root)
+                            .map(UserMessageAttachmentAction::OpenFile)
+                    })
+                };
+                let kind = if let Some(action) = action {
                     let image_key = format!("vibex-attachment:{next_node_id}");
                     let resolved = composer_attachment.path.clone();
-                    image_attachments.insert(image_key.clone(), composer_attachment);
+                    attachment_actions.insert(image_key.clone(), action);
                     Inline::Link {
                         destination: ResolvedResource {
                             role: ResourceRole::Link,
@@ -40077,7 +40183,7 @@ fn user_message_inline_document(
         diagnostics: Arc::default(),
         truncated: false,
     };
-    (Arc::new(document), Arc::new(image_attachments))
+    (Arc::new(document), Arc::new(attachment_actions))
 }
 
 fn render_user_message_bubble(
@@ -42499,6 +42605,9 @@ mod tests {
         assert!(optimistic_remove < repaint);
         assert!(repaint < background_delete);
         assert!(deletion.contains("self.finish_optimistic_session_deletion("));
+        assert!(deletion.contains("self.pending_session_deletion_ids"));
+        assert!(!deletion.contains("self.agent_action_pending = true;"));
+        assert!(!deletion.contains("!self.optimistically_removed_session_ids.is_empty()"));
 
         let optimistic_state = source
             .split_once("    fn optimistically_remove_sessions(")
@@ -42579,11 +42688,6 @@ mod tests {
                 "    fn rename_session(",
                 "\n    fn confirm_delete_session(",
                 "session rename",
-            ),
-            (
-                "    fn finish_optimistic_session_deletion(",
-                "\n    fn finish_session_mutation(",
-                "optimistic session deletion",
             ),
             (
                 "    fn finish_session_mutation(",
@@ -46414,6 +46518,7 @@ mod tests {
             "alpha tail",
             std::slice::from_ref(&attachment),
             locale::ResolvedLocale::En,
+            Some("/tmp"),
         );
 
         assert!(!document.source.contains('\n'));
@@ -46430,6 +46535,49 @@ mod tests {
                 .any(|inline| { matches!(inline.kind, Inline::Link { .. }) })
         );
         assert_eq!(document.plain_text(), "alpha paste tail");
+    }
+
+    #[test]
+    fn user_message_file_attachment_opens_as_a_workspace_tab_target() {
+        let attachment = MessageAttachment {
+            label: "README.md".into(),
+            mime_type: Some("text/markdown".into()),
+            uri: Some("file:///work/vibex/README.md".into()),
+            inline_text_offset: Some(0),
+        };
+        let (document, actions) = user_message_inline_document(
+            "what is this?",
+            std::slice::from_ref(&attachment),
+            locale::ResolvedLocale::En,
+            Some("/work/vibex"),
+        );
+
+        assert_eq!(actions.len(), 1);
+        assert!(actions.values().any(|action| {
+            action == &UserMessageAttachmentAction::OpenFile("README.md".into())
+        }));
+        assert!(document.blocks.iter().any(|block| {
+            match &block.kind {
+                Block::Paragraph(inlines) => inlines
+                    .iter()
+                    .any(|inline| matches!(inline.kind, Inline::Link { .. })),
+                _ => false,
+            }
+        }));
+    }
+
+    #[test]
+    fn inline_composer_file_attachments_use_the_multi_tab_open_path() {
+        let source = include_str!("app.rs");
+        let renderer = source
+            .split_once("    fn render_inline_composer_attachments(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_attachment_image_preview("))
+            .map(|(body, _)| body)
+            .expect("inline attachment renderer should remain inspectable");
+
+        assert!(renderer.contains("self.composer_attachment_tab_path(&attachment)"));
+        assert!(renderer.contains("this.open_composer_attachment_in_tab("));
+        assert!(renderer.contains("this.open_attachment_preview("));
     }
 
     #[test]
