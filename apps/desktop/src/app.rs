@@ -18371,47 +18371,55 @@ impl VibexWorkbench {
                 locale::text("Advanced properties", "高级属性", "進階屬性"),
                 window,
                 cx,
-                move |mut submenu, _, _| {
-                    submenu = submenu.item(PopupMenuItem::label(locale::text(
-                        "Scheduled archive",
-                        "定时归档",
-                        "定時封存",
-                    )));
-                    let off_entity = archive_entity.clone();
-                    let off_folder_id = archive_folder_id.clone();
-                    submenu = submenu.item(
-                        PopupMenuItem::new(locale::text("Off", "关闭", "關閉"))
-                            .checked(auto_archive_after_days.is_none())
-                            .on_click(move |_, _, cx| {
-                                let _ = off_entity.update(cx, |this, cx| {
-                                    this.set_sidebar_folder_auto_archive_after_days(
-                                        &off_folder_id,
-                                        None,
-                                        cx,
-                                    )
-                                });
-                            }),
+                move |mut submenu, window, cx| {
+                    let archive_entity = archive_entity.clone();
+                    let archive_folder_id = archive_folder_id.clone();
+                    submenu = submenu.submenu_with_icon(
+                        None,
+                        locale::text("Scheduled archive", "定时归档", "定時封存"),
+                        window,
+                        cx,
+                        move |mut archive_submenu, _, _| {
+                            let off_entity = archive_entity.clone();
+                            let off_folder_id = archive_folder_id.clone();
+                            archive_submenu = archive_submenu.item(
+                                PopupMenuItem::new(locale::text("Off", "关闭", "關閉"))
+                                    .checked(auto_archive_after_days.is_none())
+                                    .on_click(move |_, _, cx| {
+                                        let _ = off_entity.update(cx, |this, cx| {
+                                            this.set_sidebar_folder_auto_archive_after_days(
+                                                &off_folder_id,
+                                                None,
+                                                cx,
+                                            )
+                                        });
+                                    }),
+                            );
+                            for days in 1..=SIDEBAR_AUTO_ARCHIVE_MAX_DAYS {
+                                let entity = archive_entity.clone();
+                                let folder_id = archive_folder_id.clone();
+                                archive_submenu = archive_submenu.item(
+                                    PopupMenuItem::new(sidebar_auto_archive_days_label(
+                                        days,
+                                        resolved_locale,
+                                    ))
+                                    .checked(auto_archive_after_days == Some(days))
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            let _ = entity.update(cx, |this, cx| {
+                                                this.set_sidebar_folder_auto_archive_after_days(
+                                                    &folder_id,
+                                                    Some(days),
+                                                    cx,
+                                                )
+                                            });
+                                        },
+                                    ),
+                                );
+                            }
+                            archive_submenu
+                        },
                     );
-                    for days in 1..=SIDEBAR_AUTO_ARCHIVE_MAX_DAYS {
-                        let entity = archive_entity.clone();
-                        let folder_id = archive_folder_id.clone();
-                        submenu = submenu.item(
-                            PopupMenuItem::new(sidebar_auto_archive_days_label(
-                                days,
-                                resolved_locale,
-                            ))
-                            .checked(auto_archive_after_days == Some(days))
-                            .on_click(move |_, _, cx| {
-                                let _ = entity.update(cx, |this, cx| {
-                                    this.set_sidebar_folder_auto_archive_after_days(
-                                        &folder_id,
-                                        Some(days),
-                                        cx,
-                                    )
-                                });
-                            }),
-                        );
-                    }
                     submenu
                 },
             );
@@ -43561,6 +43569,7 @@ mod tests {
         assert!(menu.contains("if has_project_scope"));
         assert!(menu.contains("Advanced properties"));
         assert!(menu.contains("Scheduled archive"));
+        assert!(menu.contains("submenu = submenu.submenu_with_icon("));
         assert!(menu.contains("for days in 1..=SIDEBAR_AUTO_ARCHIVE_MAX_DAYS"));
         assert!(folder.contains("folder.auto_archive_after_days"));
         assert!(folder.contains("if auto_archive_after_days.is_some()"));
