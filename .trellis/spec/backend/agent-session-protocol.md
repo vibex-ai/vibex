@@ -3976,6 +3976,11 @@ agent_message_submission_payloads(
   reconstruct that exact range and complete the submission. Preserve any turn
   error in the authoritative Timeline/session state; do not also classify the
   already-observed delivery as ambiguous or surface a message-send failure.
+- Persist the reconstructed or normally returned result range in an immediate
+  SQLite transaction. The transaction must acquire its write reservation before
+  reading the submission and Timeline validation rows so a concurrent usage or
+  session write cannot invalidate a deferred WAL read snapshot and turn an
+  already-completed reply into `AmbiguousPromptDispatch`.
 - Prompt text, attachments, payload references, provider/native ids, tokens,
   workspace paths, and idempotency key values do not appear in Debug, tracing,
   errors, or public submission projections beyond the query contract's key.

@@ -4209,10 +4209,12 @@ impl MessageSubmissionRepository {
                 "message submission result timeline range is invalid",
             ));
         }
-        let tx = conn.transaction().map_err(storage_err(
-            "message_submission_dispatch_transaction_failed",
-            "failed to start message dispatch result transaction",
-        ))?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "message_submission_dispatch_transaction_failed",
+                "failed to start message dispatch result transaction",
+            ))?;
         let submission_session_id = tx
             .query_row(
                 "SELECT session_id FROM agent_message_submissions WHERE submission_id = ?1",
@@ -5780,6 +5782,9 @@ impl AgentSessionRuntimeRepository {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     use vibex_core::{
         AgentMessagePayload, AgentSession, AgentSessionSafety, AgentSessionState, BusyDisposition,
@@ -7810,6 +7815,102 @@ mod tests {
         assert_eq!(unchanged.status, MessageSubmissionStatus::AboutToPrompt);
         assert!(unchanged.result_first_sequence.is_none());
         assert!(unchanged.result_last_sequence.is_none());
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn message_submission_dispatch_result_waits_for_concurrent_writer_before_reading() {
+        let temp = temp_db_path("submission-result-concurrent-writer");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let session_id = seeded_session(&conn, "submission-result-concurrent-writer");
+        let request = message_request(&session_id, "msg-result-concurrent-writer", "durable hello");
+        let submission =
+            MessageSubmissionRepository::enqueue(&mut conn, MessageSubmissionId::new(), &request)
+                .unwrap();
+        MessageSubmissionRepository::advance_status(
+            &conn,
+            &submission.submission_id,
+            MessageSubmissionStatus::AwaitingRuntime,
+            MessageSubmissionStatus::ReadyToDispatch,
+        )
+        .unwrap();
+        MessageSubmissionRepository::mark_about_to_prompt(&conn, &submission.submission_id)
+            .unwrap();
+        let user_item = TimelineRepository::append(
+            &mut conn,
+            &session_id,
+            TimelineSource::User,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: request.text,
+                attachments: request.attachments,
+            }),
+            None,
+            None,
+            TimelineRedactionState::None,
+        )
+        .unwrap();
+        let agent_item = TimelineRepository::append(
+            &mut conn,
+            &session_id,
+            TimelineSource::Agent,
+            TimelinePayload::AgentMessage(AgentMessagePayload {
+                text: "acknowledged".to_string(),
+                is_final: true,
+            }),
+            None,
+            Some("provider-turn-concurrent-writer"),
+            TimelineRedactionState::None,
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut result_conn = open_database(&temp).unwrap();
+        let mut writer_conn = open_database(&temp).unwrap();
+        let writer_session_id = session_id.clone();
+        let (writer_ready_tx, writer_ready_rx) = mpsc::channel();
+        let (release_writer_tx, release_writer_rx) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            let tx = writer_conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            tx.execute(
+                "UPDATE agent_sessions
+                 SET updated_at_ms = updated_at_ms + 1
+                 WHERE session_id = ?1",
+                params![writer_session_id.as_str()],
+            )
+            .unwrap();
+            writer_ready_tx.send(()).unwrap();
+            release_writer_rx.recv().unwrap();
+            tx.commit().unwrap();
+        });
+        writer_ready_rx.recv().unwrap();
+
+        let submission_id = submission.submission_id.clone();
+        let user_item_id = user_item.id.clone();
+        let result = thread::spawn(move || {
+            MessageSubmissionRepository::record_dispatch_result(
+                &mut result_conn,
+                &submission_id,
+                &user_item_id,
+                Some("provider-turn-concurrent-writer"),
+                user_item.sequence,
+                agent_item.sequence,
+            )
+        });
+        thread::sleep(Duration::from_millis(100));
+        release_writer_tx.send(()).unwrap();
+        writer.join().unwrap();
+        result.join().unwrap().unwrap();
+
+        let conn = open_database(&temp).unwrap();
+        let record = MessageSubmissionRepository::get(&conn, &submission.submission_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.status, MessageSubmissionStatus::Dispatched);
+        assert_eq!(record.result_first_sequence, Some(user_item.sequence));
+        assert_eq!(record.result_last_sequence, Some(agent_item.sequence));
         cleanup_db(temp);
     }
 
