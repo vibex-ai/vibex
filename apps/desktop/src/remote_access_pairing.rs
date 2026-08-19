@@ -1591,19 +1591,7 @@ impl RemoteAccessPairing {
                                 cx.theme().muted_foreground
                             })),
                     )
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .gap_1()
-                            .child(div().text_sm().font_semibold().child(label))
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(description),
-                            ),
-                    ),
+                    .child(connection_entry_card_copy(label, description, cx)),
             )
             .child(
                 div()
@@ -3135,6 +3123,25 @@ fn connection_entry_description(entry: RemoteAccessEntry) -> &'static str {
     }
 }
 
+fn connection_entry_card_copy(
+    label: &'static str,
+    description: &'static str,
+    cx: &App,
+) -> gpui::Div {
+    v_flex()
+        .min_w_0()
+        .flex_1()
+        .gap_1()
+        .child(div().text_sm().font_semibold().child(label))
+        .child(
+            div()
+                .min_w_0()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(description),
+        )
+}
+
 fn connection_entry_pairing_description(entry: RemoteAccessEntry) -> &'static str {
     match entry {
         RemoteAccessEntry::LocalNetwork => locale::text(
@@ -3387,8 +3394,12 @@ fn offer_cancel_error_allows_replacement(code: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::Cell, rc::Rc};
+
     use super::*;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use gpui::TestAppContext;
+    use gpui_component::ElementExt as _;
     use vibex_core::{
         DeviceId, RemotePairingCandidate, RemotePairingOffer, RemoteProtocolVersionRange,
         remote_permissions_for_level,
@@ -3436,6 +3447,52 @@ mod tests {
             gateway_running: true,
             gateway_bound_addr: None,
         }
+    }
+
+    struct ConnectionEntryCardCopyLayoutProbe {
+        measured_width: Rc<Cell<f32>>,
+    }
+
+    impl Render for ConnectionEntryCardCopyLayoutProbe {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let measured_width = self.measured_width.clone();
+            h_flex()
+                .w(px(340.0))
+                .gap_2()
+                .child(div().size(px(28.0)).flex_none())
+                .child(
+                    connection_entry_card_copy(
+                        "Tailscale",
+                        "Private access through your Tailnet",
+                        cx,
+                    )
+                    .on_prepaint(move |bounds, _, _| {
+                        measured_width.set(f32::from(bounds.size.width));
+                    }),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn connection_entry_card_copy_fills_space_beside_the_icon(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let measured_width = Rc::new(Cell::new(0.0));
+        let observed_width = measured_width.clone();
+        let (_, cx) =
+            cx.add_window_view(|_, _| ConnectionEntryCardCopyLayoutProbe { measured_width });
+
+        for _ in 0..3 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        }
+
+        assert!(
+            observed_width.get() >= 300.0,
+            "card copy width: {}",
+            observed_width.get()
+        );
     }
 
     #[test]
