@@ -84,6 +84,7 @@ pub fn map_wire_item(item: &serde_json::Value) -> Vec<ProviderEvent> {
                         summary: format!("Codex file change: {status}"),
                         old_text: None,
                         new_text: None,
+                        patch: None,
                         raw_extension: None,
                     }))
                 })

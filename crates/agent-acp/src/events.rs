@@ -439,6 +439,7 @@ fn file_events(input: &AgentEventInput) -> Option<Vec<CanonicalAgentEvent>> {
                     path: public_text(&change.path),
                     old_text: change.old_text,
                     new_text: change.new_text,
+                    patch: None,
                     raw_extension: extension.clone(),
                 })
             })
@@ -925,6 +926,7 @@ mod tests {
                 summary: "edited".to_string(),
                 old_text: None,
                 new_text: None,
+                patch: None,
                 raw_extension: extension.clone(),
             }),
             CanonicalAgentEvent::WebSearch(WebSearchPayload {

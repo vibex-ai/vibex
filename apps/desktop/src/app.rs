@@ -74,13 +74,13 @@ use vibex_core::{
     ContinueAgentTurnRequest, CreateAgentSessionRequest, DetachRuntimeRequest, ElicitationField,
     ElicitationFieldKind, ElicitationRequest, ElicitationResolutionAction,
     ExternalSessionImportCandidateStatus, ExternalSessionImportRequest, FetchTimelineRequest,
-    FileEntryKind, FileOperationKind, FileTreeRequest, ForkAgentSessionRequest,
-    GetMessageSubmissionRequest, GitProjectEligibilityState, GitProjectIneligibleReason,
-    GitStageRequest, GitStatusSummary, GitWorktreeAssistanceSessionRequest,
-    GitWorktreeConflictKind, GitWorktreeOperationRecord, GitWorktreeOperationStatus,
-    MessageAttachment, MessageSubmissionState, MessageSubmissionStatus, OpenWorkspaceRequest,
-    PermissionResolution, PermissionResponseKind, PlanStepStatus, ProjectId, ProjectRecord,
-    PromptId, ProviderBindingMetadata, ProviderKind, ProviderProfileSummary,
+    FileEntryKind, FileOperationKind, FileOperationPatchFormat, FileTreeRequest,
+    ForkAgentSessionRequest, GetMessageSubmissionRequest, GitProjectEligibilityState,
+    GitProjectIneligibleReason, GitStageRequest, GitStatusSummary,
+    GitWorktreeAssistanceSessionRequest, GitWorktreeConflictKind, GitWorktreeOperationRecord,
+    GitWorktreeOperationStatus, MessageAttachment, MessageSubmissionState, MessageSubmissionStatus,
+    OpenWorkspaceRequest, PermissionResolution, PermissionResponseKind, PlanStepStatus, ProjectId,
+    ProjectRecord, PromptId, ProviderBindingMetadata, ProviderKind, ProviderProfileSummary,
     RenameAgentSessionRequest, RequestId, ResolvePermissionRequest, RuntimeAuthSource,
     RuntimeAuthSourceAvailability, RuntimeAuthSourceKind, RuntimeAuthSourceSummary,
     RuntimeClientId, RuntimeLeaseRole, RuntimeModelSelection, RuntimeSelectionInteraction,
@@ -105,9 +105,10 @@ use vibex_desktop_model::{
     SidebarProjectProjection, SidebarState, SidebarWorkspaceProjection, StartupDestination,
     TerminalWorkingDirectory, ThemeMode as ModelThemeMode, ThrottledUiStateWriter,
     TimelineConversationTurn, TimelineFollowState, TimelineModel, TimelineProcessActivityGroup,
-    TimelineRow, TimelineRowKind, UiStateStore, WorkbenchRoute, WorkspaceAgentSummary,
-    WorkspaceContextProjection, WorktreeLifecycleDisplayState, active_collaborations,
-    composer_trigger_at, current_agent_plan, custom_worktree_path_is_absolute,
+    TimelineRow, TimelineRowKind, UiStateStore, UnifiedDiffLineKind, WorkbenchRoute,
+    WorkspaceAgentSummary, WorkspaceContextProjection, WorktreeLifecycleDisplayState,
+    active_collaborations, composer_trigger_at, current_agent_plan,
+    custom_worktree_path_is_absolute, parse_unified_diff,
     sidebar_project_custom_logo_file_is_valid, sidebar_project_projections,
     timeline_agent_message_count_after_sequence, timeline_conversation_turns,
 };
@@ -231,8 +232,8 @@ const NEW_SESSION_COMPACT_SELECTOR_MAX_WIDTH: u32 = 860;
 const AGENT_TIMELINE_FETCH_PAGE_LIMIT: u32 = 500;
 const AGENT_CONTENT_NARROW_MAX_WIDTH: f32 = 768.0;
 const AGENT_CONTENT_STANDARD_MAX_WIDTH: f32 = 1024.0;
-const AGENT_SESSION_VIEW_CACHE_LIMIT: usize = 6;
-const AGENT_SESSION_VIEW_CACHE_BYTES: usize = 32 * 1024 * 1024;
+const AGENT_SESSION_VIEW_CACHE_LIMIT: usize = 12;
+const AGENT_SESSION_VIEW_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const TIMELINE_MARKDOWN_SOURCE_CACHE_LIMIT: usize = 32;
 const TIMELINE_MARKDOWN_SOURCE_CACHE_BYTES: usize = 2 * 1024 * 1024;
 const TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
@@ -2050,6 +2051,7 @@ fn timeline_item_resident_bytes(item: &TimelineItem) -> usize {
             .saturating_add(operation.summary.len())
             .saturating_add(option_len(&operation.old_text))
             .saturating_add(option_len(&operation.new_text))
+            .saturating_add(operation.patch.as_ref().map_or(0, |patch| patch.text.len()))
             .saturating_add(raw_extension_len(&operation.raw_extension)),
         TimelinePayload::WebSearch(search) => search
             .query
@@ -26429,10 +26431,7 @@ impl VibexWorkbench {
         {
             return preview.clone();
         }
-        let preview = Rc::new(agent_file_diff_preview(
-            operation.old_text.as_deref(),
-            operation.new_text.as_deref(),
-        ));
+        let preview = Rc::new(agent_file_operation_diff_preview(operation));
         insert_bounded_timeline_projection(
             &mut self.timeline_file_diff_previews,
             row.id.clone(),
@@ -27666,7 +27665,7 @@ impl VibexWorkbench {
         };
         let preview = self.agent_file_diff_preview_cached(row, &operation);
         let preview_scroll = self.agent_file_diff_scroll_handle(&row.id);
-        let has_diff = operation.old_text.is_some() || operation.new_text.is_some();
+        let has_diff = file_operation_has_diff(&operation);
         let expanded = has_diff
             && self
                 .timeline_command_expansion
@@ -31733,6 +31732,9 @@ struct TurnFileChangeAccumulator {
     old_text: Option<String>,
     new_text: Option<String>,
     has_text_snapshot: bool,
+    patch_added_lines: usize,
+    patch_removed_lines: usize,
+    has_patch_counts: bool,
 }
 
 fn timeline_turn_sequence_range(turn: &TimelineConversationTurn) -> Option<(i64, i64)> {
@@ -31783,6 +31785,7 @@ fn agent_turn_file_changes(
             .as_ref()
             .map(|path| format!("workspace:{path}"))
             .unwrap_or_else(|| format!("external:{display_path}"));
+        let patch_preview = file_operation_patch_preview(operation);
 
         if let Some(index) = indices.get(&key).copied() {
             let file = &mut files[index];
@@ -31797,6 +31800,13 @@ fn agent_turn_file_changes(
                 file.new_text = Some(String::new());
             }
             file.has_text_snapshot |= operation.old_text.is_some() || operation.new_text.is_some();
+            if let Some(preview) = patch_preview {
+                file.patch_added_lines = file.patch_added_lines.saturating_add(preview.added_lines);
+                file.patch_removed_lines = file
+                    .patch_removed_lines
+                    .saturating_add(preview.removed_lines);
+                file.has_patch_counts = true;
+            }
             continue;
         }
 
@@ -31811,6 +31821,13 @@ fn agent_turn_file_changes(
             old_text: operation.old_text.clone(),
             new_text,
             has_text_snapshot: operation.old_text.is_some() || operation.new_text.is_some(),
+            patch_added_lines: patch_preview
+                .as_ref()
+                .map_or(0, |preview| preview.added_lines),
+            patch_removed_lines: patch_preview
+                .as_ref()
+                .map_or(0, |preview| preview.removed_lines),
+            has_patch_counts: patch_preview.is_some(),
         });
     }
 
@@ -31822,6 +31839,8 @@ fn agent_turn_file_changes(
                     let preview =
                         agent_file_diff_preview(file.old_text.as_deref(), file.new_text.as_deref());
                     (preview.added_lines, preview.removed_lines)
+                } else if file.has_patch_counts {
+                    (file.patch_added_lines, file.patch_removed_lines)
                 } else {
                     (0, 0)
                 };
@@ -31832,7 +31851,7 @@ fn agent_turn_file_changes(
                     review_staged: false,
                     added_lines,
                     removed_lines,
-                    has_line_counts: file.has_text_snapshot,
+                    has_line_counts: file.has_text_snapshot || file.has_patch_counts,
                 }
             })
             .collect(),
@@ -31910,6 +31929,75 @@ impl AgentFileDiffPreview {
     }
 }
 
+struct AgentFileDiffPreviewBuilder {
+    head: Vec<AgentFileDiffLine>,
+    tail: VecDeque<AgentFileDiffLine>,
+    head_limit: usize,
+    tail_limit: usize,
+    total_preview_lines: usize,
+    added_lines: usize,
+    removed_lines: usize,
+}
+
+impl AgentFileDiffPreviewBuilder {
+    fn new() -> Self {
+        let head_limit = AGENT_FILE_DIFF_MAX_PREVIEW_LINES / 2;
+        let tail_limit = AGENT_FILE_DIFF_MAX_PREVIEW_LINES.saturating_sub(head_limit);
+        Self {
+            head: Vec::with_capacity(head_limit),
+            tail: VecDeque::with_capacity(tail_limit),
+            head_limit,
+            tail_limit,
+            total_preview_lines: 0,
+            added_lines: 0,
+            removed_lines: 0,
+        }
+    }
+
+    fn push(&mut self, kind: AgentFileDiffLineKind, text: &str) {
+        match kind {
+            AgentFileDiffLineKind::Add => self.added_lines = self.added_lines.saturating_add(1),
+            AgentFileDiffLineKind::Delete => {
+                self.removed_lines = self.removed_lines.saturating_add(1)
+            }
+            AgentFileDiffLineKind::Context | AgentFileDiffLineKind::Omitted => {}
+        }
+        let line = AgentFileDiffLine {
+            kind,
+            text: bounded_agent_diff_line(text),
+        };
+        self.total_preview_lines = self.total_preview_lines.saturating_add(1);
+        if self.head.len() < self.head_limit {
+            self.head.push(line);
+        } else if self.tail_limit > 0 {
+            if self.tail.len() == self.tail_limit {
+                self.tail.pop_front();
+            }
+            self.tail.push_back(line);
+        }
+    }
+
+    fn finish(self) -> AgentFileDiffPreview {
+        let omitted_lines = self
+            .total_preview_lines
+            .saturating_sub(self.head.len().saturating_add(self.tail.len()));
+        let mut lines = self.head;
+        if omitted_lines > 0 {
+            lines.push(AgentFileDiffLine {
+                kind: AgentFileDiffLineKind::Omitted,
+                text: format!("{omitted_lines} diff lines omitted"),
+            });
+        }
+        lines.extend(self.tail);
+        AgentFileDiffPreview {
+            lines,
+            added_lines: self.added_lines,
+            removed_lines: self.removed_lines,
+            omitted_lines,
+        }
+    }
+}
+
 fn render_agent_file_diff_scroll_area(
     rows: Vec<AnyElement>,
     scroll: &gpui::ScrollHandle,
@@ -31947,94 +32035,97 @@ fn agent_file_diff_preview(old_text: Option<&str>, new_text: Option<&str>) -> Ag
     let old_text = old_text.unwrap_or_default();
     let new_text = new_text.unwrap_or_default();
     if old_text == new_text {
-        return AgentFileDiffPreview {
-            lines: Vec::new(),
-            added_lines: 0,
-            removed_lines: 0,
-            omitted_lines: 0,
-        };
+        return AgentFileDiffPreviewBuilder::new().finish();
     }
 
     let diff = TextDiff::configure()
         .timeout(AGENT_FILE_DIFF_TIMEOUT)
         .diff_lines(old_text, new_text);
-    let head_limit = AGENT_FILE_DIFF_MAX_PREVIEW_LINES / 2;
-    let tail_limit = AGENT_FILE_DIFF_MAX_PREVIEW_LINES.saturating_sub(head_limit);
-    let mut head = Vec::with_capacity(head_limit);
-    let mut tail = VecDeque::with_capacity(tail_limit);
-    let mut total_preview_lines = 0_usize;
-    let mut added_lines = 0_usize;
-    let mut removed_lines = 0_usize;
-    {
-        let mut push_line = |kind, text: &str| {
-            let line = AgentFileDiffLine {
-                kind,
-                text: bounded_agent_diff_line(text),
-            };
-            total_preview_lines = total_preview_lines.saturating_add(1);
-            if head.len() < head_limit {
-                head.push(line);
-            } else {
-                if tail.len() == tail_limit {
-                    tail.pop_front();
-                }
-                tail.push_back(line);
+    let mut preview = AgentFileDiffPreviewBuilder::new();
+    let groups = diff.grouped_ops(AGENT_FILE_DIFF_CONTEXT_LINES);
+    let mut previous_group_end = None;
+    for group in groups {
+        if let (Some((previous_old_end, previous_new_end)), Some(first)) =
+            (previous_group_end, group.first())
+        {
+            let skipped = first
+                .old_range()
+                .start
+                .saturating_sub(previous_old_end)
+                .max(first.new_range().start.saturating_sub(previous_new_end));
+            if skipped > 0 {
+                let marker = format!("{skipped} unchanged lines omitted");
+                preview.push(AgentFileDiffLineKind::Omitted, &marker);
             }
-        };
+        }
+        for operation in &group {
+            for change in diff.iter_changes(operation) {
+                let kind = match change.tag() {
+                    ChangeTag::Equal => AgentFileDiffLineKind::Context,
+                    ChangeTag::Insert => AgentFileDiffLineKind::Add,
+                    ChangeTag::Delete => AgentFileDiffLineKind::Delete,
+                };
+                preview.push(kind, agent_diff_line_text(change.value()));
+            }
+        }
+        previous_group_end = group
+            .last()
+            .map(|operation| (operation.old_range().end, operation.new_range().end));
+    }
+    preview.finish()
+}
 
-        let groups = diff.grouped_ops(AGENT_FILE_DIFF_CONTEXT_LINES);
-        let mut previous_group_end = None;
-        for group in groups {
-            if let (Some((previous_old_end, previous_new_end)), Some(first)) =
-                (previous_group_end, group.first())
-            {
-                let skipped = first
-                    .old_range()
-                    .start
-                    .saturating_sub(previous_old_end)
-                    .max(first.new_range().start.saturating_sub(previous_new_end));
-                if skipped > 0 {
-                    let marker = format!("{skipped} unchanged lines omitted");
-                    push_line(AgentFileDiffLineKind::Omitted, &marker);
+fn file_operation_patch_preview(
+    operation: &vibex_core::FileOperationPayload,
+) -> Option<AgentFileDiffPreview> {
+    let patch = operation.patch.as_ref()?;
+    if patch.format != FileOperationPatchFormat::UnifiedDiffV1 {
+        return None;
+    }
+
+    let mut preview = AgentFileDiffPreviewBuilder::new();
+    let mut saw_hunk = false;
+    for file in parse_unified_diff(&patch.text) {
+        for line in file.lines {
+            match line.kind {
+                UnifiedDiffLineKind::Hunk => {
+                    if saw_hunk {
+                        preview.push(AgentFileDiffLineKind::Omitted, "unchanged lines omitted");
+                    }
+                    saw_hunk = true;
                 }
-            }
-            for operation in &group {
-                for change in diff.iter_changes(operation) {
-                    let kind = match change.tag() {
-                        ChangeTag::Equal => AgentFileDiffLineKind::Context,
-                        ChangeTag::Insert => {
-                            added_lines = added_lines.saturating_add(1);
-                            AgentFileDiffLineKind::Add
-                        }
-                        ChangeTag::Delete => {
-                            removed_lines = removed_lines.saturating_add(1);
-                            AgentFileDiffLineKind::Delete
-                        }
-                    };
-                    push_line(kind, agent_diff_line_text(change.value()));
+                UnifiedDiffLineKind::Add => preview.push(AgentFileDiffLineKind::Add, &line.content),
+                UnifiedDiffLineKind::Delete => {
+                    preview.push(AgentFileDiffLineKind::Delete, &line.content)
                 }
+                UnifiedDiffLineKind::Context => {
+                    preview.push(AgentFileDiffLineKind::Context, &line.content)
+                }
+                UnifiedDiffLineKind::Meta => {}
             }
-            previous_group_end = group
-                .last()
-                .map(|operation| (operation.old_range().end, operation.new_range().end));
         }
     }
+    Some(preview.finish())
+}
 
-    let omitted_lines = total_preview_lines.saturating_sub(head.len().saturating_add(tail.len()));
-    let mut lines = head;
-    if omitted_lines > 0 {
-        lines.push(AgentFileDiffLine {
-            kind: AgentFileDiffLineKind::Omitted,
-            text: format!("{omitted_lines} diff lines omitted"),
-        });
+fn agent_file_operation_diff_preview(
+    operation: &vibex_core::FileOperationPayload,
+) -> AgentFileDiffPreview {
+    if operation.old_text.is_some() || operation.new_text.is_some() {
+        agent_file_diff_preview(operation.old_text.as_deref(), operation.new_text.as_deref())
+    } else {
+        file_operation_patch_preview(operation)
+            .unwrap_or_else(|| AgentFileDiffPreviewBuilder::new().finish())
     }
-    lines.extend(tail);
-    AgentFileDiffPreview {
-        lines,
-        added_lines,
-        removed_lines,
-        omitted_lines,
-    }
+}
+
+fn file_operation_has_diff(operation: &vibex_core::FileOperationPayload) -> bool {
+    operation.old_text.is_some()
+        || operation.new_text.is_some()
+        || operation
+            .patch
+            .as_ref()
+            .is_some_and(|patch| patch.format == FileOperationPatchFormat::UnifiedDiffV1)
 }
 
 fn agent_diff_line_text(line: &str) -> &str {
@@ -47659,6 +47750,8 @@ mod tests {
 
     #[test]
     fn opened_session_view_cache_is_bounded_and_refreshes_recency() {
+        assert_eq!(AGENT_SESSION_VIEW_CACHE_LIMIT, 12);
+        assert_eq!(AGENT_SESSION_VIEW_CACHE_BYTES, 256 * 1024 * 1024);
         let mut cache = BTreeMap::new();
         let mut lru = VecDeque::new();
         insert_bounded_session_view(
@@ -47920,6 +48013,7 @@ mod tests {
                 summary: "Read".into(),
                 old_text: None,
                 new_text: None,
+                patch: None,
                 raw_extension: None,
             },
             FileOperationPayload {
@@ -47928,6 +48022,7 @@ mod tests {
                 summary: "First edit".into(),
                 old_text: Some("same\nold\ntail".into()),
                 new_text: Some("same\nintermediate\ntail".into()),
+                patch: None,
                 raw_extension: None,
             },
             FileOperationPayload {
@@ -47936,6 +48031,7 @@ mod tests {
                 summary: "Create file".into(),
                 old_text: None,
                 new_text: Some("first\nsecond".into()),
+                patch: None,
                 raw_extension: None,
             },
             FileOperationPayload {
@@ -47944,6 +48040,7 @@ mod tests {
                 summary: "Second edit".into(),
                 old_text: Some("same\nintermediate\ntail".into()),
                 new_text: Some("same\nnew\nextra\ntail".into()),
+                patch: None,
                 raw_extension: None,
             },
         ]);
@@ -47974,6 +48071,7 @@ mod tests {
                 summary: "Edit".into(),
                 old_text: None,
                 new_text: None,
+                patch: None,
                 raw_extension: None,
             },
             FileOperationPayload {
@@ -47982,6 +48080,7 @@ mod tests {
                 summary: "Outside workspace".into(),
                 old_text: None,
                 new_text: None,
+                patch: None,
                 raw_extension: None,
             },
         ]);
@@ -48005,6 +48104,7 @@ mod tests {
             summary: "Edit".into(),
             old_text: None,
             new_text: None,
+            patch: None,
             raw_extension: None,
         }]);
         let mut summary = agent_turn_file_changes(&turn, &items, Some("/work/vibex"));
@@ -48213,6 +48313,40 @@ mod tests {
         assert!(preview.lines.iter().any(|line| {
             line.kind == AgentFileDiffLineKind::Omitted
                 && line.text.contains("unchanged lines omitted")
+        }));
+    }
+
+    #[test]
+    fn agent_file_diff_preview_renders_patch_only_timeline_records() {
+        let old_text = (0..220)
+            .map(|index| format!("line-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new_text = old_text.replace("line-110", "line-110-edited");
+        let mut operation = FileOperationPayload {
+            operation: FileOperationKind::Edit,
+            path: "src/lib.rs".into(),
+            summary: "Edit".into(),
+            old_text: Some(old_text),
+            new_text: Some(new_text),
+            patch: None,
+            raw_extension: None,
+        };
+        operation.patch = operation.generated_patch();
+        operation.old_text = None;
+        operation.new_text = None;
+
+        assert!(file_operation_has_diff(&operation));
+        let preview = agent_file_operation_diff_preview(&operation);
+        assert_eq!(preview.removed_lines, 1);
+        assert_eq!(preview.added_lines, 1);
+        assert!(
+            preview.lines.iter().any(|line| {
+                line.kind == AgentFileDiffLineKind::Delete && line.text == "line-110"
+            })
+        );
+        assert!(preview.lines.iter().any(|line| {
+            line.kind == AgentFileDiffLineKind::Add && line.text == "line-110-edited"
         }));
     }
 

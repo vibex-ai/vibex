@@ -361,12 +361,13 @@ pub use time::unix_timestamp_ms;
 pub use timeline::{
     AgentEventContentBlock, AgentEventLocation, AgentEventRawExtension, AgentEventRawOutput,
     AgentEventRawOutputMode, AgentMessageDeltaPayload, AgentMessagePayload, AgentMessagePhase,
-    CollaborationPayload, CommandPayload, CommandStatus, FileOperationKind, FileOperationPayload,
-    GitNoticePayload, ImageGenerationPayload, MessageAttachment, PlanPayload, PlanStepPayload,
-    PlanStepStatus, ReasoningPayload, SystemNoticeLevel, SystemNoticePayload, TimelineErrorPayload,
-    TimelineItem, TimelineItemKind, TimelineLiveEvent, TimelinePage, TimelinePayload,
-    TimelineRedactionState, TimelineSource, TodoUpdatePayload, ToolCallPayload, ToolCallStatus,
-    TurnExecutionAttribution, TurnExecutionAttributionView, UserMessagePayload, WebSearchPayload,
+    CollaborationPayload, CommandPayload, CommandStatus, FileOperationKind, FileOperationPatch,
+    FileOperationPatchFormat, FileOperationPayload, GitNoticePayload, ImageGenerationPayload,
+    MessageAttachment, PlanPayload, PlanStepPayload, PlanStepStatus, ReasoningPayload,
+    SystemNoticeLevel, SystemNoticePayload, TimelineErrorPayload, TimelineItem, TimelineItemKind,
+    TimelineLiveEvent, TimelinePage, TimelinePayload, TimelineRedactionState, TimelineSource,
+    TodoUpdatePayload, ToolCallPayload, ToolCallStatus, TurnExecutionAttribution,
+    TurnExecutionAttributionView, UserMessagePayload, WebSearchPayload,
     latest_timeline_turn_ended_normally,
 };
 pub use usage::{

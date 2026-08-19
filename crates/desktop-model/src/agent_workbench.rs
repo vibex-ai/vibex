@@ -1472,6 +1472,7 @@ mod tests {
                 summary: "Edited app.rs".into(),
                 old_text: Some("a".repeat(1_000_000)),
                 new_text: Some("b".repeat(1_000_000)),
+                patch: None,
                 raw_extension: Some(vibex_core::AgentEventRawExtension::new(
                     Vec::new(),
                     Some("raw input that is not rendered".into()),

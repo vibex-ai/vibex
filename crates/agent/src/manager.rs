@@ -5147,6 +5147,7 @@ mod tests {
             summary: "Edited app.rs".into(),
             old_text: Some("before".repeat(1024)),
             new_text: Some("after".repeat(1024)),
+            patch: None,
             raw_extension: None,
         });
         let streamed = TimelineItem {
@@ -5182,6 +5183,7 @@ mod tests {
                 summary: "Edited app.rs again".into(),
                 old_text: None,
                 new_text: None,
+                patch: None,
                 raw_extension: None,
             }),
             ..duplicate

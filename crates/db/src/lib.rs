@@ -17,13 +17,14 @@ use vibex_core::{
     AutomationRunStep, AutomationRunStepCreateRequest, AutomationRunStepId,
     AutomationRunStepListRequest, AutomationRunStepUpdateRequest, AutomationRunUpdateRequest,
     CorrelationId, DeviceId, ElicitationRequest, ElicitationRequestStatus, ElicitationResolution,
-    ElicitationResolutionAction, GitManagedWorktreeRecord, GitManagedWorktreeStatus,
-    GitWorktreeDiagnostic, GitWorktreeOperationCheckpoint, GitWorktreeOperationDetail,
-    GitWorktreeOperationRecord, GitWorktreeOperationStatus, GitWorktreeReadinessRecord,
-    GitWorktreeReconciliationState, Hook, HookCreateRequest, HookId, HookInstallPreview,
-    HookInstallState, McpServer, McpServerAgentMatrix, McpServerCreateRequest, McpServerId,
-    McpServerProviderMatrix, McpServerSecretReference, McpServerStatus, PermissionActionDetail,
-    PermissionRequest, PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
+    ElicitationResolutionAction, FileOperationPatchFormat, FileOperationPayload,
+    GitManagedWorktreeRecord, GitManagedWorktreeStatus, GitWorktreeDiagnostic,
+    GitWorktreeOperationCheckpoint, GitWorktreeOperationDetail, GitWorktreeOperationRecord,
+    GitWorktreeOperationStatus, GitWorktreeReadinessRecord, GitWorktreeReconciliationState, Hook,
+    HookCreateRequest, HookId, HookInstallPreview, HookInstallState, McpServer,
+    McpServerAgentMatrix, McpServerCreateRequest, McpServerId, McpServerProviderMatrix,
+    McpServerSecretReference, McpServerStatus, PermissionActionDetail, PermissionRequest,
+    PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
     PermissionResponseOption, ProjectId, ProjectRecord, Prompt, PromptCreateRequest, PromptId,
     PromptStatus, ProviderCapabilityProbeResult, ProviderHealthProbeResult,
     ProviderInjectionPreview, ProviderInjectionPreviewRequest, ProviderKind,
@@ -7441,7 +7442,7 @@ impl TimelineRepository {
                     session_id.as_str(),
                     item.sequence,
                     item.timestamp_ms,
-                    json_to_db(&item.payload)?,
+                    timeline_payload_json(&item.payload)?,
                     enum_to_db(&item.redaction_state)?
                 ],
             )
@@ -10378,7 +10379,7 @@ fn append_timeline_in_transaction(
             item.timestamp_ms,
             item.correlation_id.as_ref().map(|value| value.as_str()),
             item.provider_correlation_id,
-            json_to_db(&item.payload)?,
+            timeline_payload_json(&item.payload)?,
             enum_to_db(&item.redaction_state)?,
             unix_timestamp_ms(),
             execution_attribution.map(json_to_db).transpose()?
@@ -10445,6 +10446,37 @@ fn json_to_db<T: Serialize + ?Sized>(value: &T) -> VibexResult<String> {
         VibexError::storage("json_encode_failed", "failed to encode JSON payload")
             .with_diagnostic("error", err.to_string())
     })
+}
+
+fn timeline_payload_json(payload: &TimelinePayload) -> VibexResult<String> {
+    match payload {
+        TimelinePayload::FileOperation(operation) => json_to_db(&TimelinePayload::FileOperation(
+            compact_file_operation_for_storage(operation),
+        )),
+        _ => json_to_db(payload),
+    }
+}
+
+fn compact_file_operation_for_storage(operation: &FileOperationPayload) -> FileOperationPayload {
+    let mut compacted = operation.clone();
+    let patch = compacted
+        .patch
+        .clone()
+        .filter(|patch| patch.format == FileOperationPatchFormat::UnifiedDiffV1)
+        .or_else(|| compacted.generated_patch());
+    let snapshot_bytes = compacted
+        .old_text
+        .as_ref()
+        .map_or(0, String::len)
+        .saturating_add(compacted.new_text.as_ref().map_or(0, String::len));
+    if let Some(patch) = patch {
+        if snapshot_bytes == 0 || patch.text.len().saturating_mul(2) < snapshot_bytes {
+            compacted.old_text = None;
+            compacted.new_text = None;
+            compacted.patch = Some(patch);
+        }
+    }
+    compacted
 }
 
 fn json_from_db<T: DeserializeOwned>(value: String) -> VibexResult<T> {
@@ -12261,6 +12293,54 @@ mod tests {
         assert!(result.marker.starts_with("vibex-db-smoke-"));
 
         cleanup_db(temp);
+    }
+
+    #[test]
+    fn timeline_storage_compacts_large_file_snapshots_to_a_versioned_patch() {
+        let old_text = (0..4_000)
+            .map(|index| format!("line-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new_text = old_text.replace("line-2000", "line-2000-edited");
+        let payload = TimelinePayload::FileOperation(FileOperationPayload {
+            operation: vibex_core::FileOperationKind::Edit,
+            path: "apps/desktop/src/app.rs".to_string(),
+            summary: "Edited app.rs".to_string(),
+            old_text: Some(old_text),
+            new_text: Some(new_text),
+            patch: None,
+            raw_extension: None,
+        });
+
+        let encoded = timeline_payload_json(&payload).unwrap();
+        assert!(!encoded.contains("oldText"));
+        assert!(!encoded.contains("newText"));
+        assert!(encoded.contains("unified_diff_v1"));
+        let decoded: TimelinePayload = json_from_db(encoded).unwrap();
+        let TimelinePayload::FileOperation(operation) = decoded else {
+            panic!("expected file operation");
+        };
+        assert_eq!(operation.old_text, None);
+        assert_eq!(operation.new_text, None);
+        assert!(operation.patch.is_some());
+    }
+
+    #[test]
+    fn timeline_storage_keeps_snapshots_when_patch_is_not_smaller() {
+        let payload = TimelinePayload::FileOperation(FileOperationPayload {
+            operation: vibex_core::FileOperationKind::Edit,
+            path: "src/lib.rs".to_string(),
+            summary: "Edited lib.rs".to_string(),
+            old_text: Some("before".to_string()),
+            new_text: Some("after".to_string()),
+            patch: None,
+            raw_extension: None,
+        });
+
+        let encoded = timeline_payload_json(&payload).unwrap();
+        assert!(encoded.contains("oldText"));
+        assert!(encoded.contains("newText"));
+        assert!(!encoded.contains("unified_diff_v1"));
     }
 
     #[test]

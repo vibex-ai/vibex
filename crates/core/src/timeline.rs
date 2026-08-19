@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize};
+use similar::TextDiff;
 
 use crate::agent_config::AgentId;
 use crate::elicitation::{ElicitationRequest, ElicitationResolution};
@@ -313,6 +315,21 @@ pub enum FileOperationKind {
     Move,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileOperationPatchFormat {
+    UnifiedDiffV1,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileOperationPatch {
+    pub format: FileOperationPatchFormat,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileOperationPayload {
@@ -324,7 +341,32 @@ pub struct FileOperationPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch: Option<FileOperationPatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_extension: Option<AgentEventRawExtension>,
+}
+
+impl FileOperationPayload {
+    pub fn generated_patch(&self) -> Option<FileOperationPatch> {
+        let (Some(old_text), Some(new_text)) = (self.old_text.as_deref(), self.new_text.as_deref())
+        else {
+            return None;
+        };
+        if old_text == new_text {
+            return None;
+        }
+        let patch = TextDiff::configure()
+            .timeout(Duration::from_millis(500))
+            .diff_lines(old_text, new_text)
+            .unified_diff()
+            .context_radius(3)
+            .header("old", "new")
+            .to_string();
+        (!patch.is_empty()).then_some(FileOperationPatch {
+            format: FileOperationPatchFormat::UnifiedDiffV1,
+            text: patch,
+        })
+    }
 }
 
 const RAW_EVENT_TEXT_LIMIT: usize = 4_096;
@@ -1224,6 +1266,41 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(legacy.raw_extension, None);
+    }
+
+    #[test]
+    fn file_operation_patch_is_versioned_and_legacy_snapshots_remain_compatible() {
+        let old_text = (0..200)
+            .map(|index| format!("line-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new_text = old_text.replace("line-100", "line-100-edited");
+        let operation = FileOperationPayload {
+            operation: FileOperationKind::Edit,
+            path: "src/lib.rs".to_string(),
+            summary: "Edited src/lib.rs".to_string(),
+            old_text: Some(old_text),
+            new_text: Some(new_text),
+            patch: None,
+            raw_extension: None,
+        };
+        let patch = operation.generated_patch().expect("generated patch");
+        assert_eq!(patch.format, FileOperationPatchFormat::UnifiedDiffV1);
+        assert!(patch.text.contains("@@"));
+        assert!(patch.text.contains("-line-100"));
+        assert!(patch.text.contains("+line-100-edited"));
+
+        let legacy: FileOperationPayload = serde_json::from_value(serde_json::json!({
+            "operation": "edit",
+            "path": "src/lib.rs",
+            "summary": "legacy",
+            "oldText": "before",
+            "newText": "after"
+        }))
+        .unwrap();
+        assert_eq!(legacy.old_text.as_deref(), Some("before"));
+        assert_eq!(legacy.new_text.as_deref(), Some("after"));
+        assert_eq!(legacy.patch, None);
     }
 
     #[test]
