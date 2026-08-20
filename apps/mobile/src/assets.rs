@@ -32,6 +32,11 @@ const ICONS: &[&str] = &[
     "icons/chevron-down.svg",
     "icons/message-square.svg",
     "icons/pin.svg",
+    "icons/crosshair.svg",
+    "icons/log-out.svg",
+    "icons/ellipsis-vertical.svg",
+    "icons/chevrons-right-left.svg",
+    "icons/chevrons-left-right.svg",
     "icons/pencil.svg",
     "icons/file-archive.svg",
     "icons/trash-2.svg",
@@ -77,6 +82,19 @@ impl AssetSource for MobileAssets {
                 Some(include_bytes!("../assets/icons/message-square.svg"))
             }
             "icons/pin.svg" => Some(include_bytes!("../assets/icons/pin.svg")),
+            "icons/crosshair.svg" => Some(include_bytes!("../assets/icons/crosshair.svg")),
+            "icons/log-out.svg" => Some(include_bytes!("../assets/icons/log-out.svg")),
+            "icons/ellipsis-vertical.svg" => {
+                Some(include_bytes!("../assets/icons/ellipsis-vertical.svg"))
+            }
+            // The collapse/expand chevrons are the reviewed desktop marks so the
+            // sessions toolbar reads identically on both shells.
+            "icons/chevrons-right-left.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/chevrons-right-left.svg"
+            )),
+            "icons/chevrons-left-right.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/chevrons-left-right.svg"
+            )),
             "icons/pencil.svg" => Some(include_bytes!("../../desktop/assets/icons/pencil.svg")),
             "icons/file-archive.svg" => Some(include_bytes!(
                 "../../desktop/assets/icons/file-archive.svg"

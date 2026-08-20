@@ -115,6 +115,14 @@ enum SessionActionKind {
     Delete,
 }
 
+/// Touch shells cannot rely on hover, so the sidebar keeps only the most-used
+/// action on the row itself and moves the rest behind this sheet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SidebarRowMenu {
+    session_id: VibexSessionId,
+    title: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionActionPrompt {
     kind: SessionActionKind,
@@ -268,6 +276,7 @@ pub struct MobileApp {
     new_project_busy: bool,
     new_project_error: Option<String>,
     session_action: Option<SessionActionPrompt>,
+    sidebar_row_menu: Option<SidebarRowMenu>,
     session_action_input: Entity<TextInput>,
     session_action_busy: bool,
     runtime_options_open: bool,
@@ -355,6 +364,7 @@ impl MobileApp {
             new_project_busy: false,
             new_project_error: None,
             session_action: None,
+            sidebar_row_menu: None,
             session_action_input: cx.new(|cx| {
                 TextInput::new(locale::text("Session name", "会话名称", "工作階段名稱"), cx)
             }),
@@ -882,6 +892,7 @@ impl MobileApp {
             display_name: candidate.display_name.clone(),
         };
         let display_name = candidate.display_name.clone();
+        let display_name_for_bundle = display_name.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             if candidate.mode != LanDiscoveryMode::ZeroConfig {
                 return Err(BackendError::failed(
@@ -930,7 +941,7 @@ impl MobileApp {
                         verification_code: session.verification_code().to_string(),
                         expires_at_ms: session.expires_at_ms(),
                     };
-                    this.start_lan_pairing_poll(session, cx);
+                    this.start_lan_pairing_poll(session, display_name_for_bundle, cx);
                     cx.notify();
                 }
                 Ok(Err(error)) => {
@@ -963,6 +974,7 @@ impl MobileApp {
     fn start_lan_pairing_poll(
         &mut self,
         mut session: ZeroConfigLanPairingSession,
+        display_name: String,
         cx: &mut Context<Self>,
     ) {
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
@@ -1001,14 +1013,22 @@ impl MobileApp {
                 this.pairing_busy = false;
                 this.lan_pairing_task = None;
                 match outcome {
-                    Ok(Ok(LanPairingOutcome::Bundle(bundle))) => match this.storage.save(&bundle) {
-                        Ok(()) => this.install_bundle(*bundle, cx),
-                        Err(error) => {
-                            this.nearby_pairing_state = NearbyPairingState::Failed {
-                                message: error.message,
+                    Ok(Ok(LanPairingOutcome::Bundle(mut bundle))) => {
+                        // The advertised service name is the only human label
+                        // the desktop publishes, so keep it with the credential.
+                        let display_name = display_name.trim();
+                        if !display_name.is_empty() {
+                            bundle.display_name = Some(display_name.to_string());
+                        }
+                        match this.storage.save(&bundle) {
+                            Ok(()) => this.install_bundle(*bundle, cx),
+                            Err(error) => {
+                                this.nearby_pairing_state = NearbyPairingState::Failed {
+                                    message: error.message,
+                                }
                             }
                         }
-                    },
+                    }
                     Ok(Ok(LanPairingOutcome::Rejected)) => {
                         this.nearby_pairing_state = NearbyPairingState::Rejected;
                     }
@@ -1483,6 +1503,32 @@ impl MobileApp {
     }
 
     fn create_session(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_session_creation(None, window, cx);
+    }
+
+    /// Creates a session inside a specific project, the way the desktop project
+    /// row's "+" does, falling back to the active session's workspace when the
+    /// project has no workspace of its own yet.
+    fn create_session_in_project(
+        &mut self,
+        project_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = self
+            .workspace_summaries
+            .iter()
+            .find(|summary| summary.project.id.as_str() == project_id)
+            .map(|summary| (summary.workspace.root_path.clone(), summary.workspace.mode));
+        self.start_session_creation(workspace, window, cx);
+    }
+
+    fn start_session_creation(
+        &mut self,
+        workspace_override: Option<(String, WorkspaceMode)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.new_session_busy {
             return;
         }
@@ -1507,8 +1553,11 @@ impl MobileApp {
                     .find(|option| option.availability == RuntimeOptionAvailability::Available)
                     .map(|option| option.selection.clone())
             });
-        let workspace = active_session
-            .map(|session| (session.workspace_root.clone(), session.workspace_mode))
+        let workspace = workspace_override
+            .or_else(|| {
+                active_session
+                    .map(|session| (session.workspace_root.clone(), session.workspace_mode))
+            })
             .or_else(|| {
                 self.workspaces
                     .iter()
@@ -1815,6 +1864,46 @@ impl MobileApp {
             self.sidebar_state
                 .collapsed_ids
                 .retain(|project_id| !project_ids.contains(project_id));
+        }
+        cx.notify();
+    }
+
+    /// Mirrors the desktop "locate current session" toolbar action: reveal the
+    /// selected session by expanding its project, then scroll the list to it.
+    fn locate_selected_session(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session_id) = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone())
+        else {
+            return;
+        };
+        let project_id = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.sessions.value.as_deref())
+            .and_then(|sessions| {
+                sessions
+                    .iter()
+                    .find(|session| session.id == session_id)
+                    .map(|session| session.project_id.as_str().to_string())
+            });
+        if let Some(project_id) = project_id {
+            self.sidebar_state.collapsed_ids.remove(&project_id);
+        }
+        let query = self.sidebar_search_input.read(cx).text().to_string();
+        if let Some(index) = self
+            .mobile_sidebar_rows(&query)
+            .iter()
+            .position(|row| row.session_id.as_ref() == Some(&session_id))
+        {
+            self.drawer_scroll
+                .scroll_to_item(index, gpui::ScrollStrategy::Center);
         }
         cx.notify();
     }
@@ -3363,6 +3452,7 @@ impl MobileApp {
         let drawer_page = visible_drawer_page(self.drawer_offset, self.drawer_snap);
         let workbench = self.workbench.clone();
         let session_action = self.session_action.clone();
+        let row_menu = self.sidebar_row_menu.clone();
         let overlay = self.overlay;
         let can_create_session = self.backend.as_ref().is_some_and(|backend| {
             backend
@@ -3545,6 +3635,9 @@ impl MobileApp {
                 };
                 root.child(backdrop).child(drawer)
             })
+            .when_some(row_menu, |root, menu| {
+                root.child(self.render_sidebar_row_menu(&menu, cx))
+            })
             .when_some(session_action, |root, prompt| {
                 root.child(self.render_session_action_prompt(&prompt, cx))
             })
@@ -3554,6 +3647,101 @@ impl MobileApp {
             .when_some(overlay, |root, overlay| {
                 root.child(self.render_mobile_overlay(overlay, cx))
             })
+    }
+
+    fn render_sidebar_row_menu(
+        &self,
+        menu: &SidebarRowMenu,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let entries = [
+            (
+                "mobile-row-menu-rename",
+                SessionActionKind::Rename,
+                locale::common("Rename"),
+                false,
+            ),
+            (
+                "mobile-row-menu-archive",
+                SessionActionKind::Archive,
+                locale::common("Archive"),
+                false,
+            ),
+            (
+                "mobile-row-menu-delete",
+                SessionActionKind::Delete,
+                locale::common("Delete"),
+                true,
+            ),
+        ];
+        let mut sheet = div()
+            .w_full()
+            .max_w(px(360.0))
+            .rounded(px(theme::RADIUS_CARD))
+            .border_1()
+            .border_color(theme::border_default())
+            .bg(theme::bg_card())
+            .p_2()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_size(px(theme::FONT_CAPTION))
+                    .text_color(theme::text_muted())
+                    .child(menu.title.clone()),
+            );
+        for (id, kind, label, destructive) in entries {
+            let session_id = menu.session_id.clone();
+            let title = menu.title.clone();
+            sheet = sheet.child(
+                div()
+                    .id(id)
+                    .h(px(theme::TOUCH_TARGET))
+                    .px_3()
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .text_size(px(theme::FONT_BODY))
+                    .text_color(if destructive {
+                        rgb(theme::ACCENT_RED).into()
+                    } else {
+                        theme::text_primary()
+                    })
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.sidebar_row_menu = None;
+                            this.begin_session_action(kind, session_id.clone(), title.clone(), cx);
+                        }),
+                    )
+                    .child(label),
+            );
+        }
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme::backdrop(0.72))
+            .p_4()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.sidebar_row_menu = None;
+                    cx.notify();
+                }),
+            )
+            .child(sheet)
     }
 
     fn render_session_action_prompt(
@@ -5283,22 +5471,27 @@ impl MobileApp {
     ) -> gpui::AnyElement {
         match row.kind {
             AgentSidebarRowKind::Project => {
+                // The desktop project row carries no expander chevron — the row
+                // itself toggles — and that column is reserved for folders.
                 let project_id = row.project_id.clone();
-                let chevron = if row.collapsed {
-                    "icons/chevron-right.svg"
-                } else {
-                    "icons/chevron-down.svg"
-                };
+                let new_session_project_id = row.project_id.clone();
+                let can_create_session = self.backend.as_ref().is_some_and(|backend| {
+                    backend
+                        .capability_snapshot()
+                        .agent
+                        .supports(BackendOperation::AgentCreateSession)
+                });
                 div()
                     .id(format!("mobile-project-row-{}", row.project_id))
                     .mx(px(theme::SPACING_SM))
                     .h(px(theme::SIDEBAR_ROW_HEIGHT))
                     .min_h(px(theme::SIDEBAR_ROW_HEIGHT))
                     .rounded(px(theme::RADIUS_CONTROL))
-                    .px(px(theme::SPACING_MD))
+                    .pl(px(theme::SPACING_MD))
+                    .pr(px(theme::SPACING_XS))
                     .flex()
                     .items_center()
-                    .gap(px(6.0))
+                    .gap(px(theme::SPACING_SM))
                     .cursor_pointer()
                     .active(|style| style.bg(theme::row_pressed_bg()))
                     .on_mouse_up(
@@ -5309,14 +5502,9 @@ impl MobileApp {
                     )
                     .child(
                         svg()
-                            .path(chevron)
-                            .size(px(12.0))
-                            .text_color(theme::sidebar_text_muted()),
-                    )
-                    .child(
-                        svg()
                             .path("brand/logo.svg")
-                            .size(px(14.0))
+                            .size(px(16.0))
+                            .flex_shrink_0()
                             .text_color(rgb(theme::ACCENT_PURPLE)),
                     )
                     .child(
@@ -5330,6 +5518,41 @@ impl MobileApp {
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::sidebar_text_primary())
                             .child(row.label.clone()),
+                    )
+                    // Always visible: a phone has no hover state to reveal it.
+                    .child(
+                        div()
+                            .id(format!("mobile-project-new-session-{}", row.project_id))
+                            .aria_label(locale::common("New session"))
+                            .size(px(30.0))
+                            .flex_shrink_0()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(can_create_session, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.create_session_in_project(
+                                                new_session_project_id.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        }),
+                                    )
+                            })
+                            .when(!can_create_session, |button| button.opacity(0.38))
+                            .child(
+                                svg()
+                                    .path("icons/plus.svg")
+                                    .size(px(15.0))
+                                    .text_color(theme::sidebar_text_muted()),
+                            ),
                     )
                     .into_any_element()
             }
@@ -5349,7 +5572,15 @@ impl MobileApp {
                     AgentSessionState::Initializing => theme::ACCENT_BLUE,
                     _ => theme::ACCENT_DIM,
                 };
-                let session_id = session.id.clone();
+                let can_manage_session = self.backend.as_ref().is_some_and(|backend| {
+                    backend
+                        .capability_snapshot()
+                        .agent
+                        .supports(BackendOperation::AgentManageSession)
+                });
+                let open_session_id = session.id.clone();
+                let menu_session_id = session.id.clone();
+                let menu_title = session.title.clone();
                 let agent_icon = agent_icon_path(&session.agent_id.to_string());
                 let time = session_sidebar_time_label(session.last_message_at_ms);
                 let row_id = session.id.as_str().to_string();
@@ -5359,7 +5590,8 @@ impl MobileApp {
                     .h(px(theme::SIDEBAR_ROW_HEIGHT))
                     .min_h(px(theme::SIDEBAR_ROW_HEIGHT))
                     .rounded(px(theme::RADIUS_CONTROL))
-                    .px(px(theme::SPACING_SM))
+                    .pl(px(theme::SPACING_SM))
+                    .pr(px(2.0))
                     .flex()
                     .items_center()
                     .gap(px(7.0))
@@ -5369,10 +5601,10 @@ impl MobileApp {
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
-                            this.open_session(session_id.clone(), cx)
+                            this.open_session(open_session_id.clone(), cx)
                         }),
                     )
-                    .child(div().w(px(24.0)).flex_shrink_0())
+                    .child(div().w(px(18.0)).flex_shrink_0())
                     .child(
                         svg()
                             .path(agent_icon)
@@ -5409,7 +5641,7 @@ impl MobileApp {
                     )
                     .child(
                         div()
-                            .w(px(60.0))
+                            .w(px(48.0))
                             .flex_shrink_0()
                             .overflow_hidden()
                             .text_ellipsis()
@@ -5425,6 +5657,42 @@ impl MobileApp {
                             .flex_shrink_0()
                             .rounded_full()
                             .bg(rgb(status)),
+                    )
+                    // Rename/archive/delete are rare, so they live behind the
+                    // overflow sheet rather than on the row.
+                    .child(
+                        div()
+                            .id(format!("mobile-session-menu-{row_id}"))
+                            .aria_label(locale::common("More"))
+                            .size(px(30.0))
+                            .flex_shrink_0()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(can_manage_session, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.sidebar_row_menu = Some(SidebarRowMenu {
+                                                session_id: menu_session_id.clone(),
+                                                title: menu_title.clone(),
+                                            });
+                                            cx.notify();
+                                        }),
+                                    )
+                            })
+                            .when(!can_manage_session, |button| button.opacity(0.38))
+                            .child(
+                                svg()
+                                    .path("icons/ellipsis-vertical.svg")
+                                    .size(px(15.0))
+                                    .text_color(theme::sidebar_text_muted()),
+                            ),
                     )
                     .into_any_element()
             }
@@ -5476,7 +5744,9 @@ impl MobileApp {
             .absolute()
             .top_0()
             .bottom_0()
-            .bg(theme::bg_primary())
+            // The workbench page is the phone's right rail, so it mirrors the
+            // desktop right-rail surfaces rather than the session page.
+            .bg(theme::workbench_bg())
             .border_l_1()
             .border_color(theme::border_default())
             .flex()
@@ -5485,6 +5755,7 @@ impl MobileApp {
                 div()
                     .h(px(theme::HEADER_HEIGHT))
                     .flex_shrink_0()
+                    .bg(theme::workbench_panel_bg())
                     .border_b_1()
                     .border_color(theme::border_subtle())
                     .pl(px(theme::SPACING_LG))
@@ -5841,6 +6112,10 @@ impl MobileApp {
             && project_ids
                 .iter()
                 .all(|project_id| self.sidebar_state.collapsed_ids.contains(*project_id));
+        let can_locate_session = self
+            .controller
+            .as_ref()
+            .is_some_and(|controller| controller.state.selected_session_id.is_some());
         let host_label = self.active_host_label();
         let host_online = self.backend.as_ref().is_some_and(|backend| {
             backend.connection_state().state == RemoteConnectionState::Online
@@ -5863,20 +6138,29 @@ impl MobileApp {
                     .flex()
                     .items_center()
                     .gap(px(theme::SPACING_SM))
-                    .child(
-                        svg()
-                            .path("icons/message-square.svg")
-                            .size(px(theme::ICON_SM))
-                            .text_color(theme::sidebar_text_secondary()),
-                    )
+                    // The sessions page is the phone's home surface, so it wears
+                    // the product wordmark: the brand mark supplies the capital
+                    // "V" and the label completes it.
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
-                            .text_size(px(theme::FONT_HEADING))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::sidebar_text_primary())
-                            .child("Sessions"),
+                            .flex()
+                            .items_center()
+                            .child(
+                                svg()
+                                    .path("brand/logo.svg")
+                                    .size(px(22.0))
+                                    .flex_shrink_0()
+                                    .text_color(theme::sidebar_text_primary()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(17.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::sidebar_text_primary())
+                                    .child("ibex"),
+                            ),
                     )
                     .child(
                         div()
@@ -5923,10 +6207,12 @@ impl MobileApp {
                                     .text_color(theme::sidebar_text_secondary()),
                             ),
                     )
+                    // Leaving the sessions page returns to the conversation, so
+                    // the affordance is an exit arrow rather than a dismissal.
                     .child(
                         div()
                             .id("close-session-drawer")
-                            .aria_label(locale::common("Close"))
+                            .aria_label(locale::text("Back to session", "返回会话", "返回工作階段"))
                             .size(px(36.0))
                             .flex()
                             .items_center()
@@ -5936,7 +6222,7 @@ impl MobileApp {
                             .on_mouse_up(MouseButton::Left, cx.listener(Self::close_drawer))
                             .child(
                                 svg()
-                                    .path("icons/x.svg")
+                                    .path("icons/log-out.svg")
                                     .size(px(17.0))
                                     .text_color(theme::sidebar_text_muted()),
                             ),
@@ -5970,6 +6256,82 @@ impl MobileApp {
                                     .flex()
                                     .items_center()
                                     .gap(px(2.0))
+                                    // Same order and same marks as the desktop
+                                    // sessions toolbar: collapse, locate, new,
+                                    // search. The desktop "more" menu has no
+                                    // mobile counterpart, so it is omitted.
+                                    .child(
+                                        div()
+                                            .id("mobile-drawer-toggle-projects")
+                                            .aria_label(locale::common(if all_projects_collapsed {
+                                                "Expand projects"
+                                            } else {
+                                                "Collapse projects"
+                                            }))
+                                            .size(px(32.0))
+                                            .rounded(px(theme::RADIUS_CONTROL))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .when(!project_ids.is_empty(), |button| {
+                                                button
+                                                    .cursor_pointer()
+                                                    .active(|style| {
+                                                        style.bg(theme::row_pressed_bg())
+                                                    })
+                                                    .on_mouse_up(
+                                                        MouseButton::Left,
+                                                        cx.listener(Self::toggle_all_projects),
+                                                    )
+                                            })
+                                            .when(project_ids.is_empty(), |button| {
+                                                button.opacity(0.38)
+                                            })
+                                            .child(
+                                                svg()
+                                                    .path(if all_projects_collapsed {
+                                                        "icons/chevrons-left-right.svg"
+                                                    } else {
+                                                        "icons/chevrons-right-left.svg"
+                                                    })
+                                                    .size(px(16.0))
+                                                    .text_color(theme::sidebar_text_secondary()),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("mobile-drawer-locate-session")
+                                            .aria_label(locale::text(
+                                                "Locate Current Session",
+                                                "定位当前会话",
+                                                "定位目前工作階段",
+                                            ))
+                                            .size(px(32.0))
+                                            .rounded(px(theme::RADIUS_CONTROL))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .when(can_locate_session, |button| {
+                                                button
+                                                    .cursor_pointer()
+                                                    .active(|style| {
+                                                        style.bg(theme::row_pressed_bg())
+                                                    })
+                                                    .on_mouse_up(
+                                                        MouseButton::Left,
+                                                        cx.listener(Self::locate_selected_session),
+                                                    )
+                                            })
+                                            .when(!can_locate_session, |button| {
+                                                button.opacity(0.38)
+                                            })
+                                            .child(
+                                                svg()
+                                                    .path("icons/crosshair.svg")
+                                                    .size(px(16.0))
+                                                    .text_color(theme::sidebar_text_secondary()),
+                                            ),
+                                    )
                                     .child(
                                         div()
                                             .id("mobile-drawer-new-project")
@@ -5993,44 +6355,7 @@ impl MobileApp {
                                             .when(!can_open_project, |button| button.opacity(0.38))
                                             .child(
                                                 svg()
-                                                    .path("icons/circle-plus.svg")
-                                                    .size(px(16.0))
-                                                    .text_color(theme::sidebar_text_secondary()),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("mobile-drawer-toggle-projects")
-                                            .aria_label(locale::common(if all_projects_collapsed {
-                                                "Expand projects"
-                                            } else {
-                                                "Collapse projects"
-                                            }))
-                                            .size(px(32.0))
-                                            .rounded(px(theme::RADIUS_CONTROL))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .when(all_projects_collapsed, |button| {
-                                                button.bg(theme::sidebar_selected_bg())
-                                            })
-                                            .when(!project_ids.is_empty(), |button| {
-                                                button
-                                                    .cursor_pointer()
-                                                    .active(|style| {
-                                                        style.bg(theme::row_pressed_bg())
-                                                    })
-                                                    .on_mouse_up(
-                                                        MouseButton::Left,
-                                                        cx.listener(Self::toggle_all_projects),
-                                                    )
-                                            })
-                                            .when(project_ids.is_empty(), |button| {
-                                                button.opacity(0.38)
-                                            })
-                                            .child(
-                                                svg()
-                                                    .path("icons/sliders-horizontal.svg")
+                                                    .path("icons/plus.svg")
                                                     .size(px(16.0))
                                                     .text_color(theme::sidebar_text_secondary()),
                                             ),
@@ -7929,35 +8254,35 @@ mod tests {
     #[test]
     fn drawer_snap_uses_forgiving_travel_hysteresis() {
         assert_eq!(
-            drawer_snap_target(DrawerPage::Sessions, 0.26, 0.0, 0.0),
+            drawer_snap_target(DrawerPage::Sessions, 0.13, 0.0, 0.0),
             1.0
         );
         assert_eq!(
-            drawer_snap_target(DrawerPage::Sessions, 0.24, 0.0, 0.0),
+            drawer_snap_target(DrawerPage::Sessions, 0.11, 0.0, 0.0),
             0.0
         );
         assert_eq!(
-            drawer_snap_target(DrawerPage::Sessions, 0.74, 0.0, 1.0),
+            drawer_snap_target(DrawerPage::Sessions, 0.87, 0.0, 1.0),
             0.0
         );
         assert_eq!(
-            drawer_snap_target(DrawerPage::Sessions, 0.76, 0.0, 1.0),
+            drawer_snap_target(DrawerPage::Sessions, 0.89, 0.0, 1.0),
             1.0
         );
         assert_eq!(
-            drawer_snap_target(DrawerPage::Workbench, -0.26, 0.0, 0.0),
+            drawer_snap_target(DrawerPage::Workbench, -0.13, 0.0, 0.0),
             -1.0
         );
         assert_eq!(
-            drawer_snap_target(DrawerPage::Workbench, -0.24, 0.0, 0.0),
+            drawer_snap_target(DrawerPage::Workbench, -0.11, 0.0, 0.0),
             0.0
         );
         assert_eq!(
-            drawer_snap_target(DrawerPage::Workbench, -0.74, 0.0, -1.0),
+            drawer_snap_target(DrawerPage::Workbench, -0.87, 0.0, -1.0),
             0.0
         );
         assert_eq!(
-            drawer_snap_target(DrawerPage::Workbench, -0.76, 0.0, -1.0),
+            drawer_snap_target(DrawerPage::Workbench, -0.89, 0.0, -1.0),
             -1.0
         );
     }
@@ -7970,7 +8295,7 @@ mod tests {
         );
         assert_eq!(drawer_snap_target(DrawerPage::Sessions, 0.1, 5.0, 0.0), 1.0);
         assert_eq!(
-            drawer_snap_target(DrawerPage::Sessions, 0.8, -17.0, 0.0),
+            drawer_snap_target(DrawerPage::Sessions, 0.8, -29.0, 0.0),
             0.0
         );
         assert_eq!(
@@ -7982,7 +8307,7 @@ mod tests {
             -1.0
         );
         assert_eq!(
-            drawer_snap_target(DrawerPage::Workbench, -0.8, 17.0, 0.0),
+            drawer_snap_target(DrawerPage::Workbench, -0.8, 29.0, 0.0),
             0.0
         );
         assert_eq!(
@@ -7991,7 +8316,7 @@ mod tests {
         );
         assert_eq!(drawer_snap_target(DrawerPage::Sessions, 0.4, 9.0, 1.0), 0.0);
         assert_eq!(
-            drawer_snap_target(DrawerPage::Sessions, 0.2, 17.0, 1.0),
+            drawer_snap_target(DrawerPage::Sessions, 0.2, 29.0, 1.0),
             1.0
         );
         assert_eq!(
@@ -8003,7 +8328,7 @@ mod tests {
             0.0
         );
         assert_eq!(
-            drawer_snap_target(DrawerPage::Workbench, -0.2, -17.0, -1.0),
+            drawer_snap_target(DrawerPage::Workbench, -0.2, -29.0, -1.0),
             -1.0
         );
     }

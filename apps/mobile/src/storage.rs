@@ -257,6 +257,7 @@ mod tests {
             expected_server_id: "desktop".to_string(),
             client_type: RemoteClientType::Mobile,
             allow_insecure_local_dev: false,
+            display_name: None,
             route: Some(MobileRemoteRouteBundle {
                 local_network: None,
                 direct_candidates: vec!["https://desktop.example".to_string()],

@@ -10,27 +10,38 @@ use gpui::{Hsla, hsla, rgb};
 // Palette
 // ---------------------------------------------------------------------------
 
-pub const BG_PRIMARY: u32 = 0x0e0c0c;
-pub const BG_CARD: u32 = 0x131313;
+// The values below mirror the shared desktop dark tokens
+// (`crates/vibex-ui/theme/tokens.json`) so the phone reads as the same product
+// as the desktop shell: the session page uses `background`, the sessions page
+// uses `sidebar`, and the workbench page uses the right-rail surfaces.
+pub const BG_PRIMARY: u32 = 0x09090b;
+pub const BG_CARD: u32 = 0x18181b;
 /// Lower-contrast card fill than [`BG_CARD`]; blends into [`BG_PRIMARY`] on dense lists.
-pub const BG_CARD_DIM: u32 = 0x100f0f;
-pub const TEXT_PRIMARY: u32 = 0xffffff;
-pub const TEXT_SECONDARY: u32 = 0xcacaca;
-pub const TEXT_MUTED: u32 = 0x505050;
-pub const BORDER_DEFAULT: u32 = 0x2c2c2c;
-pub const BORDER_SUBTLE: u32 = 0x1a1a1a;
-pub const ACCENT_GREEN: u32 = 0x98c379;
-pub const ACCENT_BLUE: u32 = 0x61afef;
-pub const ACCENT_YELLOW: u32 = 0xe5c07b;
-pub const ACCENT_RED: u32 = 0xe06c75;
-pub const ACCENT_DIM: u32 = 0x505050;
+pub const BG_CARD_DIM: u32 = 0x1c1c1e;
+pub const TEXT_PRIMARY: u32 = 0xfafafa;
+pub const TEXT_SECONDARY: u32 = 0xd4d4d8;
+pub const TEXT_MUTED: u32 = 0x9f9fa9;
+/// Desktop borders are pure white at 10%/6%; these are the flattened values
+/// over [`BG_PRIMARY`] for the places that still need an opaque fill.
+pub const BORDER_DEFAULT: u32 = 0x232326;
+pub const BORDER_SUBTLE: u32 = 0x18181b;
+pub const ACCENT_GREEN: u32 = 0x00c950;
+pub const ACCENT_BLUE: u32 = 0x51a2ff;
+pub const ACCENT_YELLOW: u32 = 0xefb000;
+pub const ACCENT_RED: u32 = 0xff6467;
+pub const ACCENT_DIM: u32 = 0x71717b;
 pub const ACCENT_PURPLE: u32 = 0xc678dd;
 
-pub const SIDEBAR_BG: u32 = 0x161617;
-pub const SIDEBAR_SELECTED_BG: u32 = 0x252527;
-pub const SIDEBAR_TEXT_PRIMARY: u32 = 0xe7e7e7;
-pub const SIDEBAR_TEXT_SECONDARY: u32 = 0xb8b8b8;
-pub const SIDEBAR_TEXT_MUTED: u32 = 0x747474;
+pub const SIDEBAR_BG: u32 = 0x18181b;
+pub const SIDEBAR_SELECTED_BG: u32 = 0x27272a;
+pub const SIDEBAR_TEXT_PRIMARY: u32 = 0xfafafa;
+pub const SIDEBAR_TEXT_SECONDARY: u32 = 0xd4d4d8;
+pub const SIDEBAR_TEXT_MUTED: u32 = 0x9f9fa9;
+
+/// Workbench page surfaces mirror the desktop right rail: the activity bar and
+/// panel body sit on `background`, and the panel chrome uses `sidebar`.
+pub const WORKBENCH_BG: u32 = 0x09090b;
+pub const WORKBENCH_PANEL_BG: u32 = 0x18181b;
 
 // ---------------------------------------------------------------------------
 // Spacing and typography
@@ -77,14 +88,14 @@ pub const DRAWER_ROW_HEIGHT: f32 = 52.0;
 pub const SIDEBAR_ROW_HEIGHT: f32 = 40.0;
 pub const DRAWER_ACTION_HEIGHT: f32 = 40.0;
 pub const DRAWER_SECTION_HEIGHT: f32 = 40.0;
-pub const DRAWER_DRAG_THRESHOLD: f32 = 10.0;
-pub const DRAWER_VERTICAL_CANCEL_RATIO: f32 = 1.25;
+pub const DRAWER_DRAG_THRESHOLD: f32 = 6.0;
+pub const DRAWER_VERTICAL_CANCEL_RATIO: f32 = 2.0;
 /// Fraction of the viewport a page must travel before settling on the next page.
-pub const DRAWER_SNAP_TRAVEL_RATIO: f32 = 0.25;
+pub const DRAWER_SNAP_TRAVEL_RATIO: f32 = 0.12;
 /// Release-adjacent movement in the intended direction commits the transition.
-pub const DRAWER_SNAP_COMMIT_DIRECTION_THRESHOLD: f32 = 4.0;
+pub const DRAWER_SNAP_COMMIT_DIRECTION_THRESHOLD: f32 = 1.5;
 /// Reversing a transition requires a much clearer release-adjacent movement.
-pub const DRAWER_SNAP_REVERSE_DIRECTION_THRESHOLD: f32 = 16.0;
+pub const DRAWER_SNAP_REVERSE_DIRECTION_THRESHOLD: f32 = 28.0;
 pub const DRAWER_BACKDROP_OPACITY: f32 = 0.4;
 pub const DRAWER_OPEN_ANIMATION_MS: u64 = 160;
 pub const DRAWER_CLOSE_ANIMATION_MS: u64 = 100;
@@ -127,6 +138,14 @@ pub fn border_subtle() -> Hsla {
 
 pub fn row_pressed_bg() -> Hsla {
     hsla(0.0, 0.0, 1.0, 0.10)
+}
+
+pub fn workbench_bg() -> Hsla {
+    rgb(WORKBENCH_BG).into()
+}
+
+pub fn workbench_panel_bg() -> Hsla {
+    rgb(WORKBENCH_PANEL_BG).into()
 }
 
 pub fn sidebar_bg() -> Hsla {

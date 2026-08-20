@@ -29,6 +29,11 @@ pub struct MobileCredentialBundle {
     pub client_type: RemoteClientType,
     #[serde(default)]
     pub allow_insecure_local_dev: bool,
+    /// Desktop-advertised service name captured during local-network pairing.
+    /// It is the human name the desktop publishes for itself, so the phone can
+    /// show "dev" instead of a bare address.
+    #[serde(default)]
+    pub display_name: Option<String>,
     #[serde(default)]
     pub route: Option<MobileRemoteRouteBundle>,
 }
@@ -56,6 +61,7 @@ impl fmt::Debug for MobileCredentialBundle {
                 &!self.expected_server_id.is_empty(),
             )
             .field("client_type", &self.client_type)
+            .field("has_display_name", &self.display_name.is_some())
             .field("allow_insecure_local_dev", &self.allow_insecure_local_dev)
             .field("route", &self.route)
             .finish()
@@ -130,6 +136,14 @@ impl MobileCredentialBundle {
     /// Prefer the human-readable route authority for the mobile picker, then
     /// fall back to a bounded server-id label for QR/relay-only credentials.
     pub fn host_label(&self) -> String {
+        if let Some(display_name) = self
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            return display_name.chars().take(48).collect();
+        }
         let route_urls = self.route.as_ref().into_iter().flat_map(|route| {
             route
                 .local_network
@@ -344,6 +358,7 @@ pub async fn claim_pairing_link(link: String) -> BackendResult<MobileCredentialB
         expected_server_id: offer.summary.server_id.clone(),
         client_type: RemoteClientType::Mobile,
         allow_insecure_local_dev: cfg!(debug_assertions),
+        display_name: None,
         route: Some(route_bundle(&offer)),
     };
     bundle.validate()?;
@@ -372,6 +387,7 @@ pub async fn claim_lan_pairing(
         expected_server_id: claim.offer.summary.server_id.clone(),
         client_type: RemoteClientType::Mobile,
         allow_insecure_local_dev: false,
+        display_name: None,
         route: Some(route_bundle(&claim.offer)),
     };
     bundle.validate()?;
@@ -408,6 +424,7 @@ pub async fn claim_zero_config_lan_pairing(
         expected_server_id: claim.offer.summary.server_id.clone(),
         client_type: RemoteClientType::Mobile,
         allow_insecure_local_dev: false,
+        display_name: None,
         route: Some(route),
     };
     bundle.validate()?;
@@ -543,6 +560,7 @@ mod tests {
             expected_server_id: "private-desktop-id".to_string(),
             client_type: RemoteClientType::Mobile,
             allow_insecure_local_dev: false,
+            display_name: None,
             route: Some(MobileRemoteRouteBundle {
                 local_network: None,
                 direct_candidates: vec![private_route.to_string()],
@@ -576,6 +594,7 @@ mod tests {
             expected_server_id: "server-id".to_string(),
             client_type: RemoteClientType::Mobile,
             allow_insecure_local_dev: false,
+            display_name: None,
             route: Some(MobileRemoteRouteBundle {
                 local_network: None,
                 direct_candidates: vec!["https://dev.example:443".to_string()],
@@ -629,6 +648,7 @@ mod tests {
             expected_server_id: "desktop".to_string(),
             client_type: RemoteClientType::Mobile,
             allow_insecure_local_dev: false,
+            display_name: None,
             route: Some(MobileRemoteRouteBundle {
                 local_network: None,
                 direct_candidates: vec!["https://desktop.example?token=leak".to_string()],
