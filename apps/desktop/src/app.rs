@@ -106,9 +106,9 @@ use vibex_desktop_model::{
     SidebarWorkspaceProjection, StartupDestination, TerminalWorkingDirectory,
     ThemeMode as ModelThemeMode, ThrottledUiStateWriter, TimelineConversationTurn,
     TimelineFollowState, TimelineModel, TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
-    UiStateStore, UnifiedDiffLineKind, WorkbenchRoute, WorkspaceAgentSummary,
-    WorkspaceContextProjection, WorktreeLifecycleDisplayState, active_collaborations,
-    composer_trigger_at, current_agent_plan, custom_worktree_path_is_absolute, parse_unified_diff,
+    UiStateStore, UnifiedDiffLineKind, WorkbenchRoute, WorkspaceContextProjection,
+    WorktreeLifecycleDisplayState, active_collaborations, composer_trigger_at, current_agent_plan,
+    custom_worktree_path_is_absolute, parse_unified_diff,
     sidebar_project_custom_logo_file_is_valid, sidebar_project_items,
     sidebar_project_items_for_workspace, sidebar_project_projections, sidebar_root_items,
     timeline_agent_message_count_after_sequence, timeline_conversation_turns,
@@ -20298,7 +20298,6 @@ impl VibexWorkbench {
                         .min_w_0()
                         .gap(px(2.0))
                         .when(!detailed_hierarchy, |this| this.pl_6())
-                        .when(detailed_hierarchy, |this| this.pl_3())
                         .children(session_elements),
                 )
             });
@@ -20327,15 +20326,7 @@ impl VibexWorkbench {
             .branch
             .clone()
             .unwrap_or_else(|| locale::text("No branch", "无分支", "無分支").to_string());
-        let identity = match workspace.mode {
-            WorkspaceMode::CurrentCheckout => {
-                locale::text("Current Checkout", "当前目录", "目前目錄")
-            }
-            WorkspaceMode::VibexWorktree => "Worktree",
-        };
-        let status =
-            sidebar_workspace_agent_summary_label(self.resolved_locale(), projection.agent_summary);
-        let dirty = projection.context.git_dirty;
+        let branch_name = sidebar_workspace_branch_name(&branch).to_string();
         let lifecycle_state = projection.context.worktree_lifecycle_state;
         let collapsed = self
             .ui_state
@@ -20348,7 +20339,13 @@ impl VibexWorkbench {
         let workspace_for_new = workspace.id.clone();
         let workspace_for_folder = workspace.id.clone();
         let project_for_folder = workspace.project_id.clone();
-        let tooltip = format!("{identity} · {branch} · {}", workspace.root_path);
+        let hover_group: SharedString = format!("sidebar-workspace-{workspace_id}").into();
+        let tooltip_branch = branch.clone();
+        let card_background = if selected {
+            cx.theme().sidebar_accent.opacity(0.16)
+        } else {
+            cx.theme().background.opacity(0.22)
+        };
         let lifecycle_error = lifecycle_state.is_some_and(|state| {
             matches!(
                 state,
@@ -20370,28 +20367,20 @@ impl VibexWorkbench {
                     | WorktreeLifecycleDisplayState::Discarding
             )
         });
-        let status_running = projection.agent_summary.running > 0 || lifecycle_running;
-        let status_indicator = if status_running {
+        let status_indicator = if projection.agent_summary.running > 0 || lifecycle_running {
             Spinner::new()
                 .icon(Icon::new(IconName::LoaderCircle))
                 .color(cx.theme().primary)
                 .xsmall()
                 .into_any_element()
         } else if lifecycle_error || projection.agent_summary.failed > 0 {
-            Icon::new(IconName::CircleX)
-                .size(px(14.0))
-                .text_color(cx.theme().danger)
-                .into_any_element()
+            sidebar_status_dot(cx.theme().danger)
+        } else if projection.agent_summary.needs_input > 0 {
+            sidebar_status_dot(cx.theme().warning)
+        } else if projection.agent_summary.total == 0 {
+            sidebar_status_dot(cx.theme().sidebar_foreground.opacity(0.35))
         } else {
-            Icon::new(IconName::CircleCheck)
-                .size(px(14.0))
-                .text_color(cx.theme().success)
-                .into_any_element()
-        };
-        let card_background = if selected {
-            cx.theme().sidebar_accent.opacity(0.16)
-        } else {
-            cx.theme().background.opacity(0.22)
+            sidebar_status_dot(cx.theme().success)
         };
         let workspace_menu_entity = cx.weak_entity();
         let workspace_menu_branch = branch.clone();
@@ -20399,6 +20388,7 @@ impl VibexWorkbench {
         let workspace_menu_workspace_id = workspace_for_folder.clone();
         let row = div()
             .id(format!("sidebar-workspace-row-{workspace_id}"))
+            .group(hover_group.clone())
             .relative()
             .w_full()
             .min_w_0()
@@ -20412,7 +20402,7 @@ impl VibexWorkbench {
                 cx.theme().transparent
             })
             .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.20)))
-            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            .tooltip(move |window, cx| Tooltip::new(tooltip_branch.clone()).build(window, cx))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.activate_and_toggle_sidebar_workspace(workspace_for_click.clone(), cx)
             }))
@@ -20436,19 +20426,13 @@ impl VibexWorkbench {
                     .px_2()
                     .pr(px(34.0))
                     .child(
-                        Icon::new(if collapsed {
-                            IconName::ChevronRight
-                        } else {
-                            IconName::ChevronDown
-                        })
-                        .size(px(12.0))
-                        .text_color(cx.theme().sidebar_foreground.opacity(0.55)),
-                    )
-                    .child(status_indicator)
-                    .child(
-                        sidebar_icon("icons/vibex/git-branch.svg")
-                            .size(px(14.0))
-                            .text_color(cx.theme().sidebar_foreground.opacity(0.58)),
+                        h_flex()
+                            .w(px(26.0))
+                            .h(px(26.0))
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .child(status_indicator),
                     )
                     .child(
                         v_flex()
@@ -20461,57 +20445,52 @@ impl VibexWorkbench {
                                     .truncate()
                                     .text_sm()
                                     .font_semibold()
-                                    .child(branch),
+                                    .child(branch_name),
                             )
                             .child(
-                                h_flex()
+                                div()
                                     .min_w_0()
-                                    .gap(px(5.0))
+                                    .whitespace_normal()
                                     .text_xs()
                                     .text_color(cx.theme().sidebar_foreground.opacity(0.48))
-                                    .child(identity)
-                                    .when(dirty, |this| {
-                                        this.child(locale::text("Dirty", "有更改", "有變更"))
-                                    })
-                                    .when_some(lifecycle_state, |this, state| {
-                                        this.child(
-                                            div()
-                                                .text_color(sidebar_worktree_lifecycle_color(
-                                                    state, cx,
-                                                ))
-                                                .child(sidebar_worktree_lifecycle_label(state)),
-                                        )
-                                    })
-                                    .when_some(status, |this, status| {
-                                        this.child(div().truncate().child(status))
-                                    }),
+                                    .child(branch),
                             ),
                     ),
             )
             .child(
-                Button::new(format!("sidebar-workspace-new-{workspace_id}"))
-                    .xsmall()
-                    .ghost()
-                    .compact()
+                div()
+                    .id(format!("sidebar-workspace-actions-{workspace_id}"))
                     .absolute()
                     .right_1()
                     .top(px(8.0))
-                    .w(px(24.0))
                     .h(px(24.0))
-                    .icon(IconName::Plus)
-                    .tooltip(locale::text(
-                        "New Session in this Workspace",
-                        "在此工作区新建会话",
-                        "在此工作區新增工作階段",
-                    ))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.open_new_session(
-                            Some(NewSessionOpenTarget::Workspace(workspace_for_new.clone())),
-                            window,
-                            cx,
-                        );
-                    })),
+                    .items_center()
+                    .invisible()
+                    .group_hover(&hover_group, |style| style.visible())
+                    .child(
+                        Button::new(format!("sidebar-workspace-new-{workspace_id}"))
+                            .xsmall()
+                            .ghost()
+                            .compact()
+                            .w(px(24.0))
+                            .h(px(24.0))
+                            .icon(IconName::Plus)
+                            .tooltip(locale::text(
+                                "New Session in this Workspace",
+                                "在此工作区新建会话",
+                                "在此工作區新增工作階段",
+                            ))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.open_new_session(
+                                    Some(NewSessionOpenTarget::Workspace(
+                                        workspace_for_new.clone(),
+                                    )),
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    ),
             );
 
         if collapsed {
@@ -20571,6 +20550,10 @@ impl VibexWorkbench {
         let session_id_string = session.id.as_str().to_string();
         let display_state =
             sidebar_session_display_state(session.state, self.session_turn_pending(&session.id));
+        let branch_path = self
+            .workspace_contexts
+            .get(session.workspace_id.as_str())
+            .and_then(|context| context.branch.clone());
         let show_worktree_status = self.ui_state.sidebar.hierarchy_mode
             == SidebarHierarchyMode::Detailed
             && !show_worktree_identity;
@@ -20846,8 +20829,8 @@ impl VibexWorkbench {
             .id(format!("sidebar-session-row-{session_id_string}"))
             .group(hover_group.clone())
             .relative()
-            .h(px(32.0))
-            .min_h(px(32.0))
+            .h(px(44.0))
+            .min_h(px(44.0))
             .w_full()
             .min_w_0()
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
@@ -21102,13 +21085,30 @@ impl VibexWorkbench {
                             })
                             .child(sidebar_agent_logo(sidebar_agent_id.as_str(), selected, cx))
                             .child(
-                                div()
+                                v_flex()
                                     .flex_1()
                                     .min_w_0()
-                                    .truncate()
-                                    .text_sm()
-                                    .when(selected, |this| this.font_medium())
-                                    .child(session.title.clone()),
+                                    .gap(px(1.0))
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_sm()
+                                            .when(selected, |this| this.font_medium())
+                                            .child(session.title.clone()),
+                                    )
+                                    .when_some(branch_path, |this, branch| {
+                                        this.child(
+                                            div()
+                                                .min_w_0()
+                                                .whitespace_normal()
+                                                .text_xs()
+                                                .text_color(
+                                                    cx.theme().sidebar_foreground.opacity(0.48),
+                                                )
+                                                .child(branch),
+                                        )
+                                    }),
                             ),
                     )
                     .child(
@@ -21226,7 +21226,7 @@ impl VibexWorkbench {
                         .id(format!("sidebar-session-actions-{session_id_string}"))
                         .absolute()
                         .right_1()
-                        .top_1()
+                        .top(px(10.0))
                         .h(px(24.0))
                         .w(px(76.0))
                         .items_center()
@@ -21801,7 +21801,7 @@ impl VibexWorkbench {
             .child(
                 h_flex()
                     .flex_none()
-                    .justify_end()
+                    .justify_start()
                     .gap_2()
                     .border_t_1()
                     .border_color(cx.theme().border)
@@ -33843,26 +33843,12 @@ fn sidebar_empty_sessions(strings: Strings, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-fn sidebar_workspace_agent_summary_label(
-    locale: locale::ResolvedLocale,
-    summary: WorkspaceAgentSummary,
-) -> Option<String> {
-    let (count, en, zh_cn, zh_tw) = if summary.failed > 0 {
-        (summary.failed, "failed", "失败", "失敗")
-    } else if summary.needs_input > 0 {
-        (summary.needs_input, "needs input", "等待输入", "等待輸入")
-    } else if summary.running > 0 {
-        (summary.running, "running", "运行中", "執行中")
-    } else if summary.total > 0 {
-        (summary.total, "sessions", "个会话", "個工作階段")
-    } else {
-        return None;
-    };
-    Some(match locale {
-        locale::ResolvedLocale::En => format!("{count} {en}"),
-        locale::ResolvedLocale::ZhCn => format!("{count} {zh_cn}"),
-        locale::ResolvedLocale::ZhTw => format!("{count} {zh_tw}"),
-    })
+fn sidebar_workspace_branch_name(branch: &str) -> &str {
+    branch
+        .rsplit_once('/')
+        .map(|(_, name)| name)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(branch)
 }
 
 fn new_session_worktree_unavailable_reason(
@@ -35684,6 +35670,15 @@ fn sidebar_session_state_label(state: AgentSessionState, strings: Strings) -> Op
     }
 }
 
+fn sidebar_status_dot(color: Hsla) -> AnyElement {
+    div()
+        .size(px(8.0))
+        .flex_none()
+        .rounded_full()
+        .bg(color)
+        .into_any_element()
+}
+
 fn sidebar_session_status_indicator(state: AgentSessionState, cx: &App) -> AnyElement {
     match state {
         AgentSessionState::Running | AgentSessionState::Initializing => Spinner::new()
@@ -35691,22 +35686,12 @@ fn sidebar_session_status_indicator(state: AgentSessionState, cx: &App) -> AnyEl
             .color(cx.theme().primary)
             .xsmall()
             .into_any_element(),
-        AgentSessionState::NeedsInput => Icon::new(IconName::TriangleAlert)
-            .size(px(13.0))
-            .text_color(cx.theme().warning)
-            .into_any_element(),
-        AgentSessionState::Error => Icon::new(IconName::CircleX)
-            .size(px(13.0))
-            .text_color(cx.theme().danger)
-            .into_any_element(),
-        AgentSessionState::Archived | AgentSessionState::Closed => Icon::new(IconName::CircleCheck)
-            .size(px(13.0))
-            .text_color(cx.theme().sidebar_foreground.opacity(0.35))
-            .into_any_element(),
-        AgentSessionState::Idle => Icon::new(IconName::CircleCheck)
-            .size(px(13.0))
-            .text_color(cx.theme().success.opacity(0.78))
-            .into_any_element(),
+        AgentSessionState::NeedsInput => sidebar_status_dot(cx.theme().warning),
+        AgentSessionState::Error => sidebar_status_dot(cx.theme().danger),
+        AgentSessionState::Archived | AgentSessionState::Closed => {
+            sidebar_status_dot(cx.theme().sidebar_foreground.opacity(0.35))
+        }
+        AgentSessionState::Idle => sidebar_status_dot(cx.theme().success.opacity(0.78)),
     }
 }
 
@@ -48157,6 +48142,37 @@ mod tests {
         assert!(workspace.contains(".pl(px(20.0))"));
         assert!(!workspace.contains(".ml(px(18.0))"));
         assert!(!workspace.contains(".border_1()"));
+    }
+
+    #[test]
+    fn sidebar_workspace_branch_name_uses_the_final_path_component() {
+        assert_eq!(sidebar_workspace_branch_name("feature/aaa"), "aaa");
+        assert_eq!(sidebar_workspace_branch_name("aaa"), "aaa");
+        assert_eq!(sidebar_workspace_branch_name("No branch"), "No branch");
+    }
+
+    #[test]
+    fn collapsed_worktree_rows_show_branch_path_without_checkout_identity() {
+        let source = include_str!("app.rs");
+        let workspace = source
+            .split_once("    fn render_sidebar_workspace(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_session("))
+            .map(|(body, _)| body)
+            .expect("sidebar workspace renderer should remain inspectable");
+
+        assert!(workspace.contains("let branch_name = sidebar_workspace_branch_name(&branch)"));
+        assert!(workspace.contains(".child(branch_name)"));
+        assert!(workspace.contains(".child(branch)"));
+        assert!(workspace.contains(".w(px(26.0))"));
+        assert!(!workspace.contains("Current Checkout"));
+        assert!(!workspace.contains("workspace.root_path"));
+
+        let project = source
+            .split_once("    fn render_sidebar_project(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_workspace("))
+            .map(|(body, _)| body)
+            .expect("sidebar project renderer should remain inspectable");
+        assert!(!project.contains(".when(detailed_hierarchy, |this| this.pl_3())"));
     }
 
     #[test]
