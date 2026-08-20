@@ -8,11 +8,11 @@ use std::time::Duration;
 use gpui::{
     AccessibleAction, AnyElement, AnyWindowHandle, App, ClipboardItem, Context, DragMoveEvent,
     Entity, FocusHandle, Hsla, Image, ImageFormat, InteractiveElement as _, IntoElement,
-    KeyDownEvent, ListAlignment, ListHorizontalSizingBehavior, ListOffset, ListState, MouseButton,
-    MouseDownEvent, Orientation, ParentElement as _, PathBuilder, Render, Role, ScrollHandle,
-    ScrollWheelEvent, SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled as _,
-    Subscription, Task, UniformListScrollHandle, WeakEntity, Window, canvas, div, img, list, point,
-    prelude::*, px, relative, uniform_list,
+    KeyDownEvent, Keystroke, ListAlignment, ListHorizontalSizingBehavior, ListOffset, ListState,
+    MouseButton, MouseDownEvent, Orientation, ParentElement as _, PathBuilder, Render, Role,
+    ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _, StyleRefinement,
+    Styled as _, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, canvas, div, img,
+    list, point, prelude::*, px, relative, uniform_list,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath,
@@ -410,19 +410,15 @@ impl Render for PreviewTabDrag {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GitHistoryBranchChoice {
     name: String,
-    current_ahead: u32,
-    current_behind: u32,
+    incoming: u32,
+    outgoing: u32,
 }
 
 impl SearchableListItem for GitHistoryBranchChoice {
     type Value = String;
 
     fn title(&self) -> SharedString {
-        format!(
-            "{}  ↓{} ↑{}",
-            self.name, self.current_ahead, self.current_behind
-        )
-        .into()
+        format!("{}  ↓{} ↑{}", self.name, self.incoming, self.outgoing).into()
     }
 
     fn value(&self) -> &Self::Value {
@@ -444,12 +440,12 @@ impl SearchableListItem for GitHistoryBranchChoice {
                     .child(
                         div()
                             .text_color(cx.theme().info)
-                            .child(format!("↓{}", self.current_ahead)),
+                            .child(format!("↓{}", self.incoming)),
                     )
                     .child(
                         div()
                             .text_color(cx.theme().success)
-                            .child(format!("↑{}", self.current_behind)),
+                            .child(format!("↑{}", self.outgoing)),
                     ),
             )
     }
@@ -2994,6 +2990,9 @@ impl CodeWorkbench {
         self.right_rail_mode = RightRailMode::Git;
         self.git.set_mode(mode);
         if mode == GitWorkbenchMode::History {
+            if self.git.branches.is_none() {
+                self.load_branches(cx);
+            }
             let filter_changed = self.ensure_history_ref_filter();
             if filter_changed || self.git.history.is_empty() {
                 self.load_history(false, cx);
@@ -10198,8 +10197,9 @@ impl CodeRightRail {
                             h_flex()
                                 .h(px(28.0))
                                 .min_w_0()
-                                .flex_1()
-                                .max_w(px(260.0))
+                                .ml_auto()
+                                .flex_none()
+                                .w(px(260.0))
                                 .gap_1()
                                 .rounded(cx.theme().radius)
                                 .border_1()
@@ -11080,22 +11080,26 @@ impl CodeRightRail {
         let graph = git_graph_layout(&history);
         let branch_select = Select::new(&self.history_branch_select)
             .small()
-            .h(px(30.0))
+            .h(px(32.0))
             .w_full()
             .text_xs()
+            .menu_width(px(320.0))
+            .menu_max_h(px(360.0))
             .placeholder(locale::text("Branch", "分支", "分支"))
             .search_placeholder(locale::text("Search branches", "搜索分支", "搜尋分支"));
         let author_select = Select::new(&self.history_author_select)
             .small()
-            .h(px(30.0))
+            .h(px(32.0))
             .w_full()
             .text_xs()
+            .menu_width(px(320.0))
+            .menu_max_h(px(360.0))
             .placeholder(locale::text("All Users", "所有用户", "所有使用者"))
             .search_placeholder(locale::text("Search users", "搜索用户", "搜尋使用者"));
         let date_picker = DatePicker::new(&self.history_date_picker)
             .small()
-            .h(px(30.0))
-            .w(px(180.0))
+            .h(px(32.0))
+            .w(px(220.0))
             .text_xs()
             .cleanable(true)
             .placeholder(locale::text("Any date", "任意日期", "任何日期"));
@@ -11183,9 +11187,14 @@ impl CodeRightRail {
             .child(
                 h_flex()
                     .flex_none()
-                    .h(px(38.0))
+                    .h(px(42.0))
                     .gap_1p5()
                     .px_2()
+                    .capture_any_mouse_down(cx.listener(|_, _, window, cx| {
+                        // Select popovers are deferred overlays. Close the currently focused
+                        // one during capture so the next filter opens on the same click.
+                        let _ = window.dispatch_keystroke(Keystroke::parse("escape").unwrap(), cx);
+                    }))
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .child(div().min_w_0().flex_1().child(branch_select))
@@ -11211,7 +11220,7 @@ impl CodeRightRail {
         let active = self.history_drawer_resize.is_some();
         let increment_target = cx.weak_entity();
         let decrement_target = cx.weak_entity();
-        div()
+        h_flex()
             .id("git-history-drawer-resize")
             .role(Role::Splitter)
             .aria_label(locale::text(
@@ -11354,8 +11363,13 @@ impl CodeRightRail {
                         let bottom = bounds.origin.y + bounds.size.height;
                         let middle = bounds.origin.y + bounds.size.height / 2.0;
                         let lane_x = |lane: usize| {
+                            // Keep the primary lane next to the commit card. Additional
+                            // lanes fan out to the left, which keeps the graph balanced while
+                            // making the main line easy to follow vertically.
+                            let visual_lane =
+                                graph_lane_count.saturating_sub(1).saturating_sub(lane);
                             bounds.origin.x
-                                + px(2.0 + lane as f32 * GIT_HISTORY_GRAPH_LANE_WIDTH)
+                                + px(2.0 + visual_lane as f32 * GIT_HISTORY_GRAPH_LANE_WIDTH)
                                 + px(GIT_HISTORY_GRAPH_LANE_WIDTH / 2.0)
                         };
                         for edge in &graph_row.top_edges {
@@ -12310,8 +12324,19 @@ fn git_history_branch_choices(
         .iter()
         .map(|branch| GitHistoryBranchChoice {
             name: branch.name.clone(),
-            current_ahead: branch.current_ahead,
-            current_behind: branch.current_behind,
+            // Local branches with an upstream already have the exact fetch/push
+            // divergence. Remote or detached refs fall back to their divergence
+            // from the current branch.
+            incoming: if branch.upstream.is_some() || branch.current {
+                branch.behind
+            } else {
+                branch.current_ahead
+            },
+            outgoing: if branch.upstream.is_some() || branch.current {
+                branch.ahead
+            } else {
+                branch.current_behind
+            },
         })
         .collect::<Vec<_>>();
     choices.sort_by(|left, right| {
@@ -14376,6 +14401,38 @@ mod tests {
                     edge.from < GIT_HISTORY_GRAPH_MAX_LANES && edge.to < GIT_HISTORY_GRAPH_MAX_LANES
                 })
         }));
+    }
+
+    #[test]
+    fn git_history_branch_choices_use_upstream_and_current_divergence() {
+        let branch = |name: &str,
+                      current: bool,
+                      upstream: Option<&str>,
+                      ahead: u32,
+                      behind: u32,
+                      current_ahead: u32,
+                      current_behind: u32| GitBranchSummary {
+            name: name.into(),
+            current,
+            upstream: upstream.map(str::to_string),
+            ahead,
+            behind,
+            current_ahead,
+            current_behind,
+            detached: false,
+        };
+        let choices = git_history_branch_choices(
+            &[
+                branch("main", true, Some("origin/main"), 3, 1, 0, 0),
+                branch("feature", false, None, 0, 0, 4, 2),
+            ],
+            &[],
+        );
+
+        assert_eq!(choices[0].name, "main");
+        assert_eq!((choices[0].incoming, choices[0].outgoing), (1, 3));
+        assert_eq!(choices[1].name, "feature");
+        assert_eq!((choices[1].incoming, choices[1].outgoing), (4, 2));
     }
 
     #[test]
