@@ -644,10 +644,14 @@ GET <relay-origin>/api/info -> RelayPublicationInfo
   state, advertisement, and the newly started local listener. Failed disable
   persistence preserves the enabled in-memory intent and listener so restart and
   UI state cannot falsely report a completed disable.
-- One async operation lock serializes enable, disable, repair, startup
-  reconciliation, Gateway configuration, and Relay lifecycle changes. Startup
-  may restore local Gateway/Relay state and inspect external systems, but never
-  creates or removes a Tailscale handler or edits a user reverse proxy.
+- Connectivity mutations use scoped async coordination: startup reconciliation
+  and `disable_all` take an exclusive lifecycle gate; enable/disable/repair for
+  one connectivity method serialize on that method while unrelated methods may
+  probe or transition concurrently. Pairing-window lifecycle has its own
+  pairing gate, and Gateway configuration/publication remains serialized on a
+  shared Gateway gate. Startup may restore local Gateway/Relay state and inspect
+  external systems, but never creates or removes a Tailscale handler or edits a
+  user reverse proxy.
 - Direct and Tailnet always target `http://127.0.0.1:1428`. The Gateway uses a
   validated immutable config snapshot for each listener epoch. Full config
   replacement is stopped-only and serialized with route replacement; changing

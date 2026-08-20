@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::{Mutex as AsyncMutex, broadcast};
+use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock, broadcast};
 use tokio::task::JoinHandle;
 use vibex_core::{
     AgentSessionRuntimeSnapshot, AttachRuntimeRequest, AttachRuntimeResponse, DetachRuntimeRequest,
@@ -154,7 +154,7 @@ struct RuntimeLifecycleInner {
     config: RuntimeLifecycleConfig,
     stream_id: Mutex<RuntimeStreamId>,
     state: Mutex<LifecycleState>,
-    mutation_gate: AsyncMutex<()>,
+    mutation_gate: AsyncRwLock<()>,
     session_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     events: broadcast::Sender<RuntimeSessionEvent>,
     sweep_task: Mutex<Option<JoinHandle<()>>>,
@@ -196,7 +196,7 @@ impl RuntimeLifecycleService {
             config,
             stream_id: Mutex::new(RuntimeStreamId::new()),
             state: Mutex::new(LifecycleState::default()),
-            mutation_gate: AsyncMutex::new(()),
+            mutation_gate: AsyncRwLock::new(()),
             session_locks: Mutex::new(HashMap::new()),
             events,
             sweep_task: Mutex::new(None),
@@ -278,7 +278,7 @@ impl RuntimeLifecycleService {
     }
 
     pub async fn stop(&self) -> VibexResult<()> {
-        let _mutation_guard = self.inner.mutation_gate.lock().await;
+        let _mutation_guard = self.inner.mutation_gate.write().await;
         let task = {
             let mut state = self
                 .inner
@@ -438,7 +438,7 @@ impl RuntimeLifecycleService {
             ));
         }
         let scope = bounded_scope(scope.into())?;
-        let _mutation_guard = self.inner.mutation_gate.lock().await;
+        let _mutation_guard = self.inner.mutation_gate.read().await;
         let session_lock = self.session_lock(&request.session_id)?;
         let _guard = session_lock.lock().await;
         self.ensure_running()?;
@@ -525,7 +525,7 @@ impl RuntimeLifecycleService {
                 "internal materialization requires a backend worker role",
             ));
         }
-        let _mutation_guard = self.inner.mutation_gate.lock().await;
+        let _mutation_guard = self.inner.mutation_gate.read().await;
         let session_lock = self.session_lock(&session_id)?;
         let _guard = session_lock.lock().await;
         self.ensure_running()?;
@@ -551,7 +551,7 @@ impl RuntimeLifecycleService {
         scope: impl Into<String>,
     ) -> VibexResult<DetachRuntimeResponse> {
         let scope = bounded_scope(scope.into())?;
-        let _mutation_guard = self.inner.mutation_gate.lock().await;
+        let _mutation_guard = self.inner.mutation_gate.read().await;
         let session_lock = self.session_lock(&request.session_id)?;
         let _guard = session_lock.lock().await;
         let removed = self.remove_client_leases(&request.session_id, &scope, &request.client_id)?;
@@ -576,7 +576,7 @@ impl RuntimeLifecycleService {
         role: RuntimeLeaseRole,
         holder: impl Into<String>,
     ) -> VibexResult<RuntimeLeaseGuard> {
-        let _mutation_guard = self.inner.mutation_gate.lock().await;
+        let _mutation_guard = self.inner.mutation_gate.read().await;
         self.acquire_internal_locked(session_id, target, role, holder)
     }
 
@@ -624,7 +624,7 @@ impl RuntimeLifecycleService {
     }
 
     pub async fn sweep_once(&self) -> VibexResult<RuntimeSweepReport> {
-        let _mutation_guard = self.inner.mutation_gate.lock().await;
+        let _mutation_guard = self.inner.mutation_gate.write().await;
         self.ensure_running()?;
         let now = self.inner.clock.now_ms();
         let expired = self.expire_client_leases(now)?;
@@ -1117,6 +1117,36 @@ mod tests {
             client_id: RuntimeClientId::new(),
             role,
         }
+    }
+
+    #[tokio::test]
+    async fn session_mutations_share_the_gate_while_maintenance_stays_exclusive() {
+        let session = VibexSessionId::new();
+        let service = RuntimeLifecycleService::new(
+            Arc::new(FakeBackend::new(&session)),
+            RuntimeLifecycleConfig::default(),
+        )
+        .unwrap();
+
+        let first_session = service.inner.mutation_gate.read().await;
+        let second_session =
+            tokio::time::timeout(Duration::from_secs(1), service.inner.mutation_gate.read())
+                .await
+                .expect("independent session operations must share the lifecycle gate");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                service.inner.mutation_gate.write(),
+            )
+            .await
+            .is_err(),
+            "maintenance must wait for active session operations"
+        );
+        drop((first_session, second_session));
+        let _maintenance =
+            tokio::time::timeout(Duration::from_secs(1), service.inner.mutation_gate.write())
+                .await
+                .expect("maintenance must proceed after session operations finish");
     }
 
     #[tokio::test]

@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use vibex_agent::AgentManager;
@@ -51,13 +51,20 @@ pub struct ProviderModelRuntimeOptionProbeResult {
     pub cached_models: Vec<ProviderModelRuntimeOptionKey>,
 }
 
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum RuntimeOptionProbeKey {
+    Agent(AgentId),
+    Profile(ProviderProfileId),
+}
+
 #[derive(Clone)]
 pub struct RuntimeOptionCatalogService {
     manager: Arc<AgentManager>,
     provider_config: ProviderConfigService,
     live_runtime: Option<Arc<AcpRuntimeClient>>,
     auth_contexts: Option<Arc<AgentAuthContextService>>,
-    probe_lock: Arc<tokio::sync::Mutex<()>>,
+    probe_locks:
+        Arc<tokio::sync::Mutex<BTreeMap<RuntimeOptionProbeKey, Weak<tokio::sync::Mutex<()>>>>>,
 }
 
 impl RuntimeOptionCatalogService {
@@ -67,7 +74,7 @@ impl RuntimeOptionCatalogService {
             provider_config,
             live_runtime: None,
             auth_contexts: None,
-            probe_lock: Arc::new(tokio::sync::Mutex::new(())),
+            probe_locks: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -81,7 +88,7 @@ impl RuntimeOptionCatalogService {
             provider_config,
             live_runtime: Some(live_runtime),
             auth_contexts: None,
-            probe_lock: Arc::new(tokio::sync::Mutex::new(())),
+            probe_locks: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -317,7 +324,9 @@ impl RuntimeOptionCatalogService {
         &self,
         provider_profile_id: &ProviderProfileId,
     ) -> Result<ProviderModelRuntimeOptionProbeResult, VibexError> {
-        let _probe_guard = self.probe_lock.lock().await;
+        let _probe_guard = self
+            .acquire_probe(RuntimeOptionProbeKey::Profile(provider_profile_id.clone()))
+            .await;
         let Some(profile) = self.provider_config.get_profile(provider_profile_id)? else {
             self.delete_profile_model_snapshots(provider_profile_id)?;
             return Ok(ProviderModelRuntimeOptionProbeResult::default());
@@ -417,7 +426,9 @@ impl RuntimeOptionCatalogService {
             });
         }
 
-        let _probe_guard = self.probe_lock.lock().await;
+        let _probe_guard = self
+            .acquire_probe(RuntimeOptionProbeKey::Agent(agent_id.clone()))
+            .await;
         // Re-check after waiting for another setup probe to finish.
         if let Some(snapshot) = self.snapshot_map()?.get(agent_id)
             && agent_snapshot_is_reusable(agent_id, snapshot)
@@ -477,6 +488,21 @@ impl RuntimeOptionCatalogService {
         let mut connection = open_database(self.provider_config.database_path())?;
         apply_migrations(&mut connection)?;
         AgentRuntimeOptionSnapshotRepository::delete(&connection, agent_id)
+    }
+
+    async fn acquire_probe(&self, key: RuntimeOptionProbeKey) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.probe_locks.lock().await;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(key, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        lock.lock_owned().await
     }
 
     pub fn delete_profile_model_snapshots(
@@ -1023,6 +1049,39 @@ mod tests {
         let manager = Arc::new(manager);
         let catalog = RuntimeOptionCatalogService::new(manager, provider_config.clone());
         (directory, catalog, provider_config, agent_id, provider)
+    }
+
+    #[tokio::test]
+    async fn probe_locks_are_scoped_to_one_agent_or_profile() {
+        let (_directory, catalog, _provider_config, agent_id, _provider) = catalog_fixture(false);
+        let first_profile = ProviderProfileId::parse("provider_first").unwrap();
+        let second_profile = ProviderProfileId::parse("provider_second").unwrap();
+
+        let first = catalog
+            .acquire_probe(RuntimeOptionProbeKey::Profile(first_profile.clone()))
+            .await;
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            catalog.acquire_probe(RuntimeOptionProbeKey::Profile(second_profile)),
+        )
+        .await
+        .expect("different profiles must not share a probe lock");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                catalog.acquire_probe(RuntimeOptionProbeKey::Profile(first_profile)),
+            )
+            .await
+            .is_err(),
+            "the same profile must serialize probes"
+        );
+        let agent = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            catalog.acquire_probe(RuntimeOptionProbeKey::Agent(agent_id)),
+        )
+        .await
+        .expect("Agent and profile probes must not block each other");
+        drop((first, second, agent));
     }
 
     fn create_profile(

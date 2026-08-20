@@ -36,10 +36,12 @@ type PtyChild = Box<dyn Child + Send + Sync>;
 
 #[derive(Clone)]
 pub struct TerminalManager {
-    sessions: Arc<Mutex<HashMap<TerminalId, TerminalRuntime>>>,
+    sessions: Arc<Mutex<HashMap<TerminalId, TerminalRuntimeHandle>>>,
     ring_capacity: usize,
     raw_observation_capacity: Option<usize>,
 }
+
+type TerminalRuntimeHandle = Arc<Mutex<TerminalRuntime>>;
 
 struct TerminalRuntime {
     session: TerminalSession,
@@ -159,15 +161,16 @@ impl TerminalManager {
     }
 
     pub fn list(&self, workspace_id: &WorkspaceId) -> VibexResult<Vec<TerminalSession>> {
-        let mut sessions = self.lock_sessions()?;
-        for runtime in sessions.values_mut() {
-            refresh_exit_status(runtime)?;
+        let runtimes = self.lock_sessions()?.values().cloned().collect::<Vec<_>>();
+        let mut visible = Vec::new();
+        for handle in runtimes {
+            let mut runtime = lock_runtime(&handle)?;
+            refresh_exit_status(&mut runtime)?;
+            if &runtime.session.workspace_id == workspace_id {
+                visible.push(runtime.session.clone());
+            }
         }
-        Ok(sessions
-            .values()
-            .filter(|runtime| &runtime.session.workspace_id == workspace_id)
-            .map(|runtime| runtime.session.clone())
-            .collect())
+        Ok(visible)
     }
 
     pub fn create(
@@ -267,14 +270,16 @@ impl TerminalManager {
         mut session: TerminalSession,
     ) -> VibexResult<TerminalSession> {
         {
-            let mut sessions = self.lock_sessions()?;
-            if let Some(runtime) = sessions.get_mut(&session.id) {
-                refresh_exit_status(runtime)?;
+            let existing = self.lock_sessions()?.get(&session.id).cloned();
+            if let Some(handle) = existing {
+                let mut runtime = lock_runtime(&handle)?;
+                refresh_exit_status(&mut runtime)?;
                 if runtime.session.status == TerminalStatus::Running {
                     return Ok(runtime.session.clone());
                 }
+                drop(runtime);
+                self.lock_sessions()?.remove(&session.id);
             }
-            sessions.remove(&session.id);
         }
 
         let workspace_root = canonical_workspace_root(workspace_root.as_ref())?;
@@ -380,16 +385,15 @@ impl TerminalManager {
             exit_status: None,
             persist_on_shutdown,
         };
-        self.lock_sessions()?.insert(terminal_id, runtime);
+        self.lock_sessions()?
+            .insert(terminal_id, Arc::new(Mutex::new(runtime)));
         Ok(session)
     }
 
     pub fn snapshot(&self, terminal_id: &TerminalId) -> VibexResult<TerminalSnapshot> {
-        let mut sessions = self.lock_sessions()?;
-        let runtime = sessions.get_mut(terminal_id).ok_or_else(|| {
-            VibexError::validation("terminal_not_found", "terminal session was not found")
-        })?;
-        refresh_exit_status(runtime)?;
+        let handle = self.runtime_handle(terminal_id)?;
+        let mut runtime = lock_runtime(&handle)?;
+        refresh_exit_status(&mut runtime)?;
         let buffer = runtime.buffer.lock().map_err(|_| {
             VibexError::process(
                 "terminal_buffer_poisoned",
@@ -421,11 +425,9 @@ impl TerminalManager {
                 "terminal raw snapshot sequence must be positive",
             ));
         }
-        let mut sessions = self.lock_sessions()?;
-        let runtime = sessions.get_mut(terminal_id).ok_or_else(|| {
-            VibexError::validation("terminal_not_found", "terminal session was not found")
-        })?;
-        refresh_exit_status(runtime)?;
+        let handle = self.runtime_handle(terminal_id)?;
+        let mut runtime = lock_runtime(&handle)?;
+        refresh_exit_status(&mut runtime)?;
         let buffer = runtime.buffer.lock().map_err(|_| {
             VibexError::process(
                 "terminal_buffer_poisoned",
@@ -453,17 +455,17 @@ impl TerminalManager {
     }
 
     pub fn write_bytes(&self, terminal_id: &TerminalId, data: &[u8]) -> VibexResult<()> {
-        let sessions = self.lock_sessions()?;
-        let runtime = sessions.get(terminal_id).ok_or_else(|| {
-            VibexError::validation("terminal_not_found", "terminal session was not found")
-        })?;
+        let handle = self.runtime_handle(terminal_id)?;
+        let runtime = lock_runtime(&handle)?;
         if runtime.session.status != TerminalStatus::Running {
             return Err(VibexError::conflict(
                 "terminal_not_running",
                 "terminal session is not running",
             ));
         }
-        let mut writer = runtime.writer.lock().map_err(|_| {
+        let writer = Arc::clone(&runtime.writer);
+        drop(runtime);
+        let mut writer = writer.lock().map_err(|_| {
             VibexError::process("terminal_writer_poisoned", "terminal writer lock failed")
         })?;
         writer.write_all(data).map_err(|err| {
@@ -478,10 +480,8 @@ impl TerminalManager {
     }
 
     pub fn resize(&self, request: &TerminalResizeRequest) -> VibexResult<TerminalSession> {
-        let mut sessions = self.lock_sessions()?;
-        let runtime = sessions.get_mut(&request.terminal_id).ok_or_else(|| {
-            VibexError::validation("terminal_not_found", "terminal session was not found")
-        })?;
+        let handle = self.runtime_handle(&request.terminal_id)?;
+        let mut runtime = lock_runtime(&handle)?;
         let rows = request.rows.max(1);
         let cols = request.cols.max(1);
         runtime
@@ -514,28 +514,29 @@ impl TerminalManager {
             ));
         }
 
-        let mut runtime = {
+        let handle = {
             let mut sessions = self.lock_sessions()?;
-            if sessions
-                .get(&request.terminal_id)
-                .is_some_and(|runtime| !runtime.persist_on_shutdown)
-            {
+            let handle = sessions.get(&request.terminal_id).cloned().ok_or_else(|| {
+                VibexError::validation("terminal_not_found", "terminal session was not found")
+            })?;
+            if !lock_runtime(&handle)?.persist_on_shutdown {
                 return Err(VibexError::capability(
                     "terminal_shell_switch_unsupported",
                     "explicit command terminals do not support shell switching",
                 ));
             }
-            sessions.remove(&request.terminal_id).ok_or_else(|| {
-                VibexError::validation("terminal_not_found", "terminal session was not found")
-            })?
+            sessions.remove(&request.terminal_id);
+            handle
         };
 
+        let mut runtime = lock_runtime(&handle)?;
         refresh_exit_status(&mut runtime)?;
         if runtime.session.status == TerminalStatus::Running
             && let Err(err) = runtime.child.kill()
         {
+            drop(runtime);
             self.lock_sessions()?
-                .insert(request.terminal_id.clone(), runtime);
+                .insert(request.terminal_id.clone(), handle);
             return Err(VibexError::process(
                 "terminal_shell_switch_kill_failed",
                 "failed to stop existing terminal process",
@@ -557,7 +558,7 @@ impl TerminalManager {
             ));
         }
 
-        let mut session = runtime.session;
+        let mut session = runtime.session.clone();
         session.shell = shell;
         session.status = TerminalStatus::Running;
         session.updated_at_ms = unix_timestamp_ms();
@@ -569,14 +570,16 @@ impl TerminalManager {
         // Remove the runtime before touching the child. Windows ConPTY cleanup
         // can block while the reader thread is unwinding, and the registry
         // lock must remain available to that thread and to UI polling.
-        let mut runtime = self.lock_sessions()?.remove(terminal_id).ok_or_else(|| {
+        let handle = self.lock_sessions()?.remove(terminal_id).ok_or_else(|| {
             VibexError::validation("terminal_not_found", "terminal session was not found")
         })?;
+        let mut runtime = lock_runtime(&handle)?;
         refresh_exit_status(&mut runtime)?;
         if runtime.session.status == TerminalStatus::Running
             && let Err(err) = runtime.child.kill()
         {
-            self.lock_sessions()?.insert(terminal_id.clone(), runtime);
+            drop(runtime);
+            self.lock_sessions()?.insert(terminal_id.clone(), handle);
             return Err(VibexError::process(
                 "terminal_kill_failed",
                 "failed to kill terminal process",
@@ -595,11 +598,9 @@ impl TerminalManager {
         &self,
         terminal_id: &TerminalId,
     ) -> VibexResult<Option<TerminalProcessExitStatus>> {
-        let mut sessions = self.lock_sessions()?;
-        let runtime = sessions.get_mut(terminal_id).ok_or_else(|| {
-            VibexError::validation("terminal_not_found", "terminal session was not found")
-        })?;
-        refresh_exit_status(runtime)?;
+        let handle = self.runtime_handle(terminal_id)?;
+        let mut runtime = lock_runtime(&handle)?;
+        refresh_exit_status(&mut runtime)?;
         Ok(runtime.exit_status.clone())
     }
 
@@ -607,21 +608,25 @@ impl TerminalManager {
     /// children must be killed explicitly so dropping a handle never silently
     /// abandons a process.
     pub fn release(&self, terminal_id: &TerminalId) -> VibexResult<TerminalSession> {
-        let mut sessions = self.lock_sessions()?;
-        let runtime = sessions.get_mut(terminal_id).ok_or_else(|| {
-            VibexError::validation("terminal_not_found", "terminal session was not found")
-        })?;
-        refresh_exit_status(runtime)?;
+        let handle = self.runtime_handle(terminal_id)?;
+        let mut runtime = lock_runtime(&handle)?;
+        refresh_exit_status(&mut runtime)?;
         if runtime.session.status == TerminalStatus::Running {
             return Err(VibexError::conflict(
                 "terminal_release_running",
                 "running terminal process must be stopped before release",
             ));
         }
-        let runtime = sessions
-            .remove(terminal_id)
-            .expect("terminal was validated while holding the session lock");
-        Ok(runtime.session)
+        let session = runtime.session.clone();
+        drop(runtime);
+        let mut sessions = self.lock_sessions()?;
+        if sessions
+            .get(terminal_id)
+            .is_some_and(|candidate| Arc::ptr_eq(candidate, &handle))
+        {
+            sessions.remove(terminal_id);
+        }
+        Ok(session)
     }
 
     /// Stops every owned PTY and returns the final session snapshots for
@@ -633,7 +638,8 @@ impl TerminalManager {
         };
         let mut stopped = Vec::with_capacity(runtimes.len());
         let mut failures = Vec::new();
-        for (terminal_id, mut runtime) in runtimes {
+        for (terminal_id, handle) in runtimes {
+            let mut runtime = lock_runtime(&handle)?;
             if runtime.session.status == TerminalStatus::Running
                 && let Err(error) = runtime.child.kill()
             {
@@ -645,14 +651,15 @@ impl TerminalManager {
                     .with_diagnostic("terminalId", terminal_id.to_string())
                     .with_diagnostic("error", error.to_string()),
                 );
-                self.lock_sessions()?.insert(terminal_id, runtime);
+                drop(runtime);
+                self.lock_sessions()?.insert(terminal_id, handle);
                 continue;
             }
             runtime.session.status = TerminalStatus::Killed;
             runtime.session.updated_at_ms = unix_timestamp_ms();
             runtime.session.closed_at_ms = Some(runtime.session.updated_at_ms);
             if runtime.persist_on_shutdown {
-                stopped.push(runtime.session);
+                stopped.push(runtime.session.clone());
             }
         }
         stopped.sort_by(|left, right| left.id.cmp(&right.id));
@@ -664,11 +671,28 @@ impl TerminalManager {
 
     fn lock_sessions(
         &self,
-    ) -> VibexResult<std::sync::MutexGuard<'_, HashMap<TerminalId, TerminalRuntime>>> {
+    ) -> VibexResult<std::sync::MutexGuard<'_, HashMap<TerminalId, TerminalRuntimeHandle>>> {
         self.sessions.lock().map_err(|_| {
             VibexError::process("terminal_manager_poisoned", "terminal manager lock failed")
         })
     }
+
+    fn runtime_handle(&self, terminal_id: &TerminalId) -> VibexResult<TerminalRuntimeHandle> {
+        self.lock_sessions()?
+            .get(terminal_id)
+            .cloned()
+            .ok_or_else(|| {
+                VibexError::validation("terminal_not_found", "terminal session was not found")
+            })
+    }
+}
+
+fn lock_runtime(
+    handle: &TerminalRuntimeHandle,
+) -> VibexResult<std::sync::MutexGuard<'_, TerminalRuntime>> {
+    handle.lock().map_err(|_| {
+        VibexError::process("terminal_runtime_poisoned", "terminal runtime lock failed")
+    })
 }
 
 fn raw_chunks_from(
@@ -1333,6 +1357,49 @@ mod tests {
         assert_eq!(resized.rows, 30);
         let killed = manager.kill(&session.id).unwrap();
         assert_eq!(killed.status, TerminalStatus::Killed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_terminal_runtime_lock_does_not_block_another_terminal() {
+        let manager = TerminalManager::new();
+        let workspace_id = WorkspaceId::new();
+        let create_terminal = || {
+            manager
+                .create_command(
+                    std::env::temp_dir(),
+                    TerminalCommandRequest {
+                        workspace_id: workspace_id.clone(),
+                        title: None,
+                        command: "sh".to_string(),
+                        args: vec!["-c".to_string(), "sleep 5".to_string()],
+                        cwd: Some(std::env::temp_dir().display().to_string()),
+                        env: Vec::new(),
+                        rows: 24,
+                        cols: 80,
+                    },
+                )
+                .unwrap()
+        };
+        let first = create_terminal();
+        let second = create_terminal();
+        let first_handle = manager.runtime_handle(&first.id).unwrap();
+        let first_runtime = lock_runtime(&first_handle).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let other_manager = manager.clone();
+        let second_id = second.id.clone();
+        let worker = std::thread::spawn(move || {
+            sender.send(other_manager.snapshot(&second_id)).unwrap();
+        });
+
+        receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("a locked terminal must not block another terminal")
+            .unwrap();
+        drop(first_runtime);
+        worker.join().unwrap();
+        manager.kill(&first.id).unwrap();
+        manager.kill(&second.id).unwrap();
     }
 
     #[cfg(target_os = "windows")]

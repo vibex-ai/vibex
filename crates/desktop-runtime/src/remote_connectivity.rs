@@ -2,8 +2,8 @@
 //!
 //! The controller deliberately keeps network publication adapters behind small
 //! traits.  Startup reconciliation can therefore inspect the outside world
-//! without making a mutation, while product actions remain explicit and
-//! serialised.
+//! without making a mutation. Product actions are serialised per connectivity
+//! method, while aggregate lifecycle and Gateway publication stay exclusive.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -22,7 +22,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard, RwLock};
 use tokio::time::timeout;
 use url::{Host, Url};
 use vibex_core::{
@@ -1626,7 +1626,10 @@ struct ControllerInner {
     lan_probe: Arc<dyn DirectPublicationProbe>,
     lan_advertiser: Arc<dyn LanPairingAdvertiser>,
     zero_config_lan_advertiser: Arc<dyn ZeroConfigLanPairingAdvertiser>,
-    operation: Mutex<()>,
+    lifecycle_operation: RwLock<()>,
+    method_operations: BTreeMap<RemoteConnectivityMethod, Mutex<()>>,
+    pairing_operation: Mutex<()>,
+    gateway_operation: Mutex<()>,
     state: Mutex<ControllerState>,
 }
 
@@ -1743,6 +1746,10 @@ impl RemoteConnectivityController {
         for method in RemoteConnectivityMethod::ALL {
             methods.insert(method, MethodRuntime::disabled());
         }
+        let method_operations = RemoteConnectivityMethod::ALL
+            .into_iter()
+            .map(|method| (method, Mutex::new(())))
+            .collect();
         let initial_error = loaded
             .recovered_corrupt_state
             .then_some("remote_connectivity_settings_invalid".to_string());
@@ -1759,7 +1766,10 @@ impl RemoteConnectivityController {
                 lan_probe: adapters.lan_probe,
                 lan_advertiser: adapters.lan_advertiser,
                 zero_config_lan_advertiser: adapters.zero_config_lan_advertiser,
-                operation: Mutex::new(()),
+                lifecycle_operation: RwLock::new(()),
+                method_operations,
+                pairing_operation: Mutex::new(()),
+                gateway_operation: Mutex::new(()),
                 state: Mutex::new(ControllerState {
                     settings: loaded.settings,
                     methods,
@@ -1865,7 +1875,11 @@ impl RemoteConnectivityController {
         permission_level: RemoteDevicePermissionLevel,
         ttl_ms: u32,
     ) -> VibexResult<RemoteLanPairingWindowSnapshot> {
-        let _operation = self.inner.operation.lock().await;
+        let _lifecycle = self.inner.lifecycle_operation.read().await;
+        let _pairing = self.inner.pairing_operation.lock().await;
+        let _direct = self
+            .method_operation(RemoteConnectivityMethod::Direct)
+            .await;
         let direct_origin = {
             let state = self.inner.state.lock().await;
             state
@@ -1900,6 +1914,7 @@ impl RemoteConnectivityController {
             })?;
         self.validate_direct_info(&info)?;
 
+        let _gateway = self.inner.gateway_operation.lock().await;
         let snapshot = self.inner.gateway.start_lan_pairing_window(
             permission_level,
             ttl_ms,
@@ -1947,7 +1962,9 @@ impl RemoteConnectivityController {
         permission_level: RemoteDevicePermissionLevel,
         ttl_ms: u32,
     ) -> VibexResult<RemoteLanPairingWindowSnapshot> {
-        let _operation = self.inner.operation.lock().await;
+        let _lifecycle = self.inner.lifecycle_operation.read().await;
+        let _pairing = self.inner.pairing_operation.lock().await;
+        let _gateway = self.inner.gateway_operation.lock().await;
         let was_local_network_enabled =
             self.inner.state.lock().await.settings.local_network_enabled;
         self.inner
@@ -2065,7 +2082,9 @@ impl RemoteConnectivityController {
     }
 
     pub async fn cancel_zero_config_lan_pairing(&self) -> VibexResult<()> {
-        let _operation = self.inner.operation.lock().await;
+        let _lifecycle = self.inner.lifecycle_operation.read().await;
+        let _pairing = self.inner.pairing_operation.lock().await;
+        let _gateway = self.inner.gateway_operation.lock().await;
         let advertiser = self.inner.zero_config_lan_advertiser.stop();
         let gateway = self.inner.gateway.cancel_zero_config_lan_pairing().await;
         advertiser.and(gateway)
@@ -2117,7 +2136,8 @@ impl RemoteConnectivityController {
             ));
         }
 
-        let _operation = self.inner.operation.lock().await;
+        let _lifecycle = self.inner.lifecycle_operation.read().await;
+        let _pairing = self.inner.pairing_operation.lock().await;
         let mut state = self.inner.state.lock().await;
         if state.settings.last_successful_pairing_entry != Some(method) {
             state.settings.last_successful_pairing_entry = Some(method);
@@ -2130,7 +2150,7 @@ impl RemoteConnectivityController {
     }
 
     pub async fn reconcile_on_startup(&self) -> VibexResult<RemoteConnectivitySnapshot> {
-        let _operation = self.inner.operation.lock().await;
+        let _lifecycle = self.inner.lifecycle_operation.write().await;
         let mut state = self.inner.state.lock().await;
         if !state.settings.desired_enabled {
             for runtime in state.methods.values_mut() {
@@ -2186,7 +2206,10 @@ impl RemoteConnectivityController {
         origin: impl AsRef<str>,
     ) -> VibexResult<RemoteConnectivitySnapshot> {
         let origin = origin.as_ref().to_string();
-        let _operation = self.inner.operation.lock().await;
+        let _lifecycle = self.inner.lifecycle_operation.read().await;
+        let _method = self
+            .method_operation(RemoteConnectivityMethod::Direct)
+            .await;
         self.enable_direct_inner(&origin).await
     }
 
@@ -2269,7 +2292,10 @@ impl RemoteConnectivityController {
         origin: impl AsRef<str>,
     ) -> VibexResult<RemoteConnectivitySnapshot> {
         let origin = origin.as_ref().to_string();
-        let _operation = self.inner.operation.lock().await;
+        let _lifecycle = self.inner.lifecycle_operation.read().await;
+        let _method = self
+            .method_operation(RemoteConnectivityMethod::SelfHostedRelay)
+            .await;
         self.enable_relay_inner(&origin).await
     }
 
@@ -2383,7 +2409,10 @@ impl RemoteConnectivityController {
         &self,
         confirmed_port: Option<u16>,
     ) -> VibexResult<RemoteConnectivitySnapshot> {
-        let _operation = self.inner.operation.lock().await;
+        let _lifecycle = self.inner.lifecycle_operation.read().await;
+        let _method = self
+            .method_operation(RemoteConnectivityMethod::TailscaleServe)
+            .await;
         self.enable_tailscale_inner(confirmed_port).await
     }
 
@@ -2621,7 +2650,8 @@ impl RemoteConnectivityController {
         &self,
         method: RemoteConnectivityMethod,
     ) -> VibexResult<RemoteConnectivitySnapshot> {
-        let _operation = self.inner.operation.lock().await;
+        let _lifecycle = self.inner.lifecycle_operation.read().await;
+        let _method = self.method_operation(method).await;
         self.disable_method_inner(method).await
     }
 
@@ -2629,7 +2659,8 @@ impl RemoteConnectivityController {
         &self,
         method: RemoteConnectivityMethod,
     ) -> VibexResult<RemoteConnectivitySnapshot> {
-        let _operation = self.inner.operation.lock().await;
+        let _lifecycle = self.inner.lifecycle_operation.read().await;
+        let _method = self.method_operation(method).await;
         let settings = self.inner.state.lock().await.settings.clone();
         if !desired_for(&settings, method) {
             return self.disable_method_inner(method).await;
@@ -2742,7 +2773,7 @@ impl RemoteConnectivityController {
     }
 
     pub async fn disable_all(&self) -> VibexResult<RemoteConnectivitySnapshot> {
-        let _operation = self.inner.operation.lock().await;
+        let _lifecycle = self.inner.lifecycle_operation.write().await;
         for method in RemoteConnectivityMethod::ALL {
             if desired_for(&self.inner.state.lock().await.settings, method) {
                 self.disable_method_inner(method).await?;
@@ -2758,14 +2789,27 @@ impl RemoteConnectivityController {
             persist_state(&self.inner.store, &settings)?;
             state.settings = settings;
         }
-        let _ = self.inner.zero_config_lan_advertiser.stop();
-        self.inner.gateway.cancel_zero_config_lan_pairing().await?;
-        self.inner.gateway.stop_local_lan_gateway().await;
+        {
+            let _gateway = self.inner.gateway_operation.lock().await;
+            let _ = self.inner.zero_config_lan_advertiser.stop();
+            self.inner.gateway.cancel_zero_config_lan_pairing().await?;
+            self.inner.gateway.stop_local_lan_gateway().await;
+        }
         Ok(self.snapshot().await)
+    }
+
+    async fn method_operation(&self, method: RemoteConnectivityMethod) -> MutexGuard<'_, ()> {
+        self.inner
+            .method_operations
+            .get(&method)
+            .expect("all method operation locks initialized")
+            .lock()
+            .await
     }
 
     async fn prepare_gateway_for_origin(&self, origin: &str) -> VibexResult<()> {
         let origin = normalize_https_origin(origin)?;
+        let _gateway = self.inner.gateway_operation.lock().await;
         let routes = self.aggregate_routes().await;
         let mut origins = routes
             .direct_candidates
@@ -2773,7 +2817,7 @@ impl RemoteConnectivityController {
             .map(|candidate| candidate.url.clone())
             .collect::<BTreeSet<_>>();
         origins.insert(origin);
-        self.configure_gateway(routes, origins.into_iter().collect(), true)
+        self.configure_gateway_locked(routes, origins.into_iter().collect(), true)
             .await
     }
 
@@ -2804,7 +2848,19 @@ impl RemoteConnectivityController {
         }
     }
 
+    #[cfg(test)]
     async fn configure_gateway(
+        &self,
+        routes: RemoteGatewayPairingRoutes,
+        network_origins: Vec<String>,
+        listener_enabled: bool,
+    ) -> VibexResult<()> {
+        let _gateway = self.inner.gateway_operation.lock().await;
+        self.configure_gateway_locked(routes, network_origins, listener_enabled)
+            .await
+    }
+
+    async fn configure_gateway_locked(
         &self,
         routes: RemoteGatewayPairingRoutes,
         network_origins: Vec<String>,
@@ -3289,16 +3345,19 @@ impl RemoteConnectivityController {
     }
 
     async fn apply_routes(&self) -> VibexResult<()> {
+        let _gateway = self.inner.gateway_operation.lock().await;
         let routes = self.aggregate_routes().await;
         if routes.direct_candidates.is_empty() {
-            return self.configure_gateway(routes, Vec::new(), false).await;
+            return self
+                .configure_gateway_locked(routes, Vec::new(), false)
+                .await;
         }
         let origins = routes
             .direct_candidates
             .iter()
             .map(|candidate| candidate.url.clone())
             .collect();
-        self.configure_gateway(routes, origins, true).await
+        self.configure_gateway_locked(routes, origins, true).await
     }
 }
 
@@ -3771,6 +3830,39 @@ mod tests {
         .unwrap();
         *direct_probe.gateway.lock().unwrap() = Some(gateway.clone());
         (controller, gateway)
+    }
+
+    #[tokio::test]
+    async fn method_operations_are_isolated_by_connectivity_method() {
+        let _guard = CONTROLLER_TEST_LOCK.lock().await;
+        let directory = tempdir().unwrap();
+        let (controller, _gateway) = test_controller(
+            directory.path(),
+            Arc::new(FakeTailscale::default()),
+            Arc::new(FakeDirectProbe::default()),
+            Arc::new(FakeRelayProbe::default()),
+        )
+        .await;
+
+        let direct = controller
+            .method_operation(RemoteConnectivityMethod::Direct)
+            .await;
+        let relay = tokio::time::timeout(
+            Duration::from_secs(1),
+            controller.method_operation(RemoteConnectivityMethod::SelfHostedRelay),
+        )
+        .await
+        .expect("different connectivity methods must not share an operation lock");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                controller.method_operation(RemoteConnectivityMethod::Direct),
+            )
+            .await
+            .is_err(),
+            "the same connectivity method must serialize operations"
+        );
+        drop((direct, relay));
     }
 
     async fn test_controller_with_lan_advertiser(

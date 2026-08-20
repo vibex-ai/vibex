@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Weak};
 
 use vibex_agent::AgentManager;
 use vibex_config_switch::ProviderConfigService;
@@ -12,7 +13,13 @@ use vibex_db::{
 pub struct AgentAuthCatalogService {
     manager: Arc<AgentManager>,
     provider_config: ProviderConfigService,
-    refresh_lock: Arc<tokio::sync::Mutex<()>>,
+    refresh_locks: Arc<tokio::sync::Mutex<BTreeMap<AuthCatalogKey, Weak<tokio::sync::Mutex<()>>>>>,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct AuthCatalogKey {
+    agent_id: AgentId,
+    provider_profile_id: Option<ProviderProfileId>,
 }
 
 impl AgentAuthCatalogService {
@@ -20,7 +27,7 @@ impl AgentAuthCatalogService {
         Self {
             manager,
             provider_config,
-            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+            refresh_locks: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -32,7 +39,9 @@ impl AgentAuthCatalogService {
         if let Some(cached) = self.read_cached(&agent_id, provider_profile_id.as_ref())? {
             return Ok(cached);
         }
-        let _guard = self.refresh_lock.lock().await;
+        let _guard = self
+            .acquire_refresh(agent_id.clone(), provider_profile_id.clone())
+            .await;
         if let Some(cached) = self.read_cached(&agent_id, provider_profile_id.as_ref())? {
             return Ok(cached);
         }
@@ -44,8 +53,33 @@ impl AgentAuthCatalogService {
         agent_id: AgentId,
         provider_profile_id: Option<ProviderProfileId>,
     ) -> VibexResult<AgentAuthCatalog> {
-        let _guard = self.refresh_lock.lock().await;
+        let _guard = self
+            .acquire_refresh(agent_id.clone(), provider_profile_id.clone())
+            .await;
         self.refresh_unlocked(agent_id, provider_profile_id).await
+    }
+
+    async fn acquire_refresh(
+        &self,
+        agent_id: AgentId,
+        provider_profile_id: Option<ProviderProfileId>,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let key = AuthCatalogKey {
+            agent_id,
+            provider_profile_id,
+        };
+        let lock = {
+            let mut locks = self.refresh_locks.lock().await;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(key, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        lock.lock_owned().await
     }
 
     async fn refresh_unlocked(
@@ -109,6 +143,36 @@ mod tests {
 
     struct CountingAuthProvider {
         calls: AtomicUsize,
+    }
+
+    #[tokio::test]
+    async fn refresh_locks_are_scoped_to_one_auth_catalog() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("vibex.db");
+        let service = AgentAuthCatalogService::new(
+            Arc::new(AgentManager::new(&database_path).unwrap()),
+            ProviderConfigService::new(&database_path),
+        );
+        let first_agent = AgentId::parse("opencode").unwrap();
+        let second_agent = AgentId::parse("codex").unwrap();
+
+        let first = service.acquire_refresh(first_agent.clone(), None).await;
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            service.acquire_refresh(second_agent, None),
+        )
+        .await
+        .expect("different auth catalogs must not share a refresh lock");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                service.acquire_refresh(first_agent, None),
+            )
+            .await
+            .is_err(),
+            "the same auth catalog must serialize refreshes"
+        );
+        drop((first, second));
     }
 
     #[async_trait]

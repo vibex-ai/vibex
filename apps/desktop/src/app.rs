@@ -14156,7 +14156,7 @@ impl VibexWorkbench {
                         session_id.as_str(),
                         unix_timestamp_ms()
                     ),
-                    desired_runtime,
+                    desired_runtime: desired_runtime.clone(),
                     text: text.clone(),
                     attachments: attachments.clone(),
                     reasoning_effort,
