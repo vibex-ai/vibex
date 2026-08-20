@@ -2516,6 +2516,14 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
                     AgentAuthManage,
                     has_agent_account_auth && permits(RemoteActionClass::MutateAgentAuthentication),
                 ),
+                (
+                    AgentSidebarOrganizationRead,
+                    permits(RemoteActionClass::ReadAgentSession),
+                ),
+                (
+                    AgentSidebarOrganizationMutate,
+                    permits(RemoteActionClass::MutateAgentSession),
+                ),
             ])
         } else {
             unavailable()

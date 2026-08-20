@@ -170,14 +170,38 @@ impl SidebarOrganizationState {
                 });
             }
         }
-        for (session_id, _) in ordered_session_projects {
+        let mut new_sessions = Vec::new();
+        for (session_id, project_id) in ordered_session_projects {
             let item = SidebarOrganizationItem::Session(session_id.clone());
             if placed.insert(item.clone()) {
-                self.placements.push(SidebarOrganizationPlacement {
+                new_sessions.push((item, project_id.clone()));
+            }
+        }
+        for (item, project_id) in new_sessions {
+            // A newly discovered session is the only item allowed to move when
+            // the authoritative list changes. Insert it before the first root
+            // session in its project instead of appending it to the placement
+            // tail. The subsequent root-session alignment can then update the
+            // session order without shifting existing sessions across folders.
+            let insertion_index = self
+                .placements
+                .iter()
+                .position(|placement| {
+                    placement.parent_folder_id.is_none()
+                        && matches!(
+                            &placement.item,
+                            SidebarOrganizationItem::Session(existing_id)
+                                if session_projects.get(existing_id) == Some(&project_id)
+                        )
+                })
+                .unwrap_or(self.placements.len());
+            self.placements.insert(
+                insertion_index,
+                SidebarOrganizationPlacement {
                     item,
                     parent_folder_id: None,
-                });
-            }
+                },
+            );
         }
         self.enforce_placement_limit();
         self.align_root_session_order(ordered_session_projects);
@@ -1822,6 +1846,64 @@ mod tests {
                 SidebarOrganizationItem::Session("new".into()),
                 SidebarOrganizationItem::Session("second".into()),
                 SidebarOrganizationItem::Session("first".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn reconcile_inserts_new_session_without_shifting_sessions_across_folder() {
+        let mut state = SidebarOrganizationState::default();
+        let sessions = BTreeMap::from([
+            ("first".to_string(), "project".to_string()),
+            ("second".to_string(), "project".to_string()),
+        ]);
+        state.reconcile(
+            &["project".into()],
+            &[
+                ("first".into(), "project".into()),
+                ("second".into(), "project".into()),
+            ],
+        );
+        assert!(state.create_folder("folder", "Folder", Some("project".into()), None,));
+        assert!(state.move_relative(
+            &SidebarOrganizationItem::Folder("folder".into()),
+            &SidebarOrganizationItem::Session("first".into()),
+            true,
+            &sessions,
+        ));
+
+        state.reconcile(
+            &["project".into()],
+            &[
+                ("new".into(), "project".into()),
+                ("first".into(), "project".into()),
+                ("second".into(), "project".into()),
+            ],
+        );
+
+        assert_eq!(
+            state.placements,
+            [
+                SidebarOrganizationPlacement {
+                    item: SidebarOrganizationItem::Project("project".into()),
+                    parent_folder_id: None,
+                },
+                SidebarOrganizationPlacement {
+                    item: SidebarOrganizationItem::Session("new".into()),
+                    parent_folder_id: None,
+                },
+                SidebarOrganizationPlacement {
+                    item: SidebarOrganizationItem::Session("first".into()),
+                    parent_folder_id: None,
+                },
+                SidebarOrganizationPlacement {
+                    item: SidebarOrganizationItem::Folder("folder".into()),
+                    parent_folder_id: None,
+                },
+                SidebarOrganizationPlacement {
+                    item: SidebarOrganizationItem::Session("second".into()),
+                    parent_folder_id: None,
+                },
             ]
         );
     }

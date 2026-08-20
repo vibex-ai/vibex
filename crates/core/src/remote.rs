@@ -413,6 +413,8 @@ pub enum RemoteAgentOperationKind {
     GetRuntimeEvents,
     AttachRuntime,
     DetachRuntime,
+    GetSidebarOrganization,
+    MutateSidebarOrganization,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -887,6 +889,8 @@ pub enum RemoteAgentRequest {
     GetRuntimeEvents(RemoteAgentRuntimeEventsRequest),
     AttachRuntime(RemoteAgentAttachRuntimeRequest),
     DetachRuntime(RemoteAgentDetachRuntimeRequest),
+    GetSidebarOrganization(RemoteSidebarOrganizationRequest),
+    MutateSidebarOrganization(RemoteSidebarOrganizationMutateRequest),
 }
 
 impl RemoteAgentRequest {
@@ -931,6 +935,10 @@ impl RemoteAgentRequest {
             Self::GetRuntimeEvents(_) => RemoteAgentOperationKind::GetRuntimeEvents,
             Self::AttachRuntime(_) => RemoteAgentOperationKind::AttachRuntime,
             Self::DetachRuntime(_) => RemoteAgentOperationKind::DetachRuntime,
+            Self::GetSidebarOrganization(_) => RemoteAgentOperationKind::GetSidebarOrganization,
+            Self::MutateSidebarOrganization(_) => {
+                RemoteAgentOperationKind::MutateSidebarOrganization
+            }
         }
     }
 }
@@ -1811,6 +1819,142 @@ pub struct RemoteCatchUpResponse {
     pub events: Vec<RemoteLiveEventEnvelope>,
     pub next_cursors: Vec<RemoteCatchUpCursor>,
     pub compacted: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Sidebar organization
+// ---------------------------------------------------------------------------
+//
+// The Desktop owns the sidebar tree — folders, nesting, ordering, and the
+// collapsed/pinned flags. These are the wire mirrors of that state so a paired
+// compact client can render the same shape the user arranged on the Desktop,
+// and can move items without inventing a second source of truth.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteSidebarItemKind {
+    Folder,
+    Project,
+    Session,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteSidebarItemRef {
+    pub kind: RemoteSidebarItemKind,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteSidebarFolder {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub auto_archive_after_days: Option<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteSidebarPlacement {
+    pub item: RemoteSidebarItemRef,
+    #[serde(default)]
+    pub parent_folder_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteSidebarOrganizationSnapshot {
+    /// Bumped by the Desktop on every accepted change so a client can tell a
+    /// stale snapshot from a current one without diffing the whole tree.
+    pub revision: u64,
+    pub folders: Vec<RemoteSidebarFolder>,
+    pub placements: Vec<RemoteSidebarPlacement>,
+    #[serde(default)]
+    pub collapsed_folder_ids: Vec<String>,
+    #[serde(default)]
+    pub collapsed_project_ids: Vec<String>,
+    #[serde(default)]
+    pub pinned_session_ids: Vec<String>,
+    #[serde(default)]
+    pub session_order: Vec<String>,
+}
+
+/// Where a move drops its payload relative to an anchor item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteSidebarDropPosition {
+    Before,
+    After,
+    Into,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum RemoteSidebarOrganizationMutation {
+    /// Drag and drop: reparent and/or reorder `items` around `anchor`. A `None`
+    /// anchor appends to the end of the scope root.
+    MoveItems {
+        items: Vec<RemoteSidebarItemRef>,
+        #[serde(default)]
+        anchor: Option<RemoteSidebarItemRef>,
+        position: RemoteSidebarDropPosition,
+        /// Scope the move to a project subtree; `None` is the sidebar root.
+        #[serde(default)]
+        project_id: Option<String>,
+    },
+    CreateFolder {
+        name: String,
+        #[serde(default)]
+        project_id: Option<String>,
+        #[serde(default)]
+        parent_folder_id: Option<String>,
+    },
+    RenameFolder {
+        folder_id: String,
+        name: String,
+    },
+    DeleteFolder {
+        folder_id: String,
+    },
+    SetFolderCollapsed {
+        folder_id: String,
+        collapsed: bool,
+    },
+    SetProjectCollapsed {
+        project_id: String,
+        collapsed: bool,
+    },
+    SetSessionPinned {
+        session_id: String,
+        pinned: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteSidebarOrganizationRequest {
+    pub auth: RemoteAuthProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteSidebarOrganizationMutateRequest {
+    pub auth: RemoteAuthProof,
+    pub mutation: RemoteSidebarOrganizationMutation,
+    /// Snapshot revision the client rendered when the user acted. The Desktop
+    /// rejects the mutation when it no longer matches, so a stale drag cannot
+    /// reorder a tree the user has since changed elsewhere.
+    #[serde(default)]
+    pub expected_revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteSidebarOrganizationResponse {
+    pub snapshot: RemoteSidebarOrganizationSnapshot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -49,6 +49,8 @@ use vibex_core::{
     RemoteProviderProfileListResponse, RemoteProviderRequest,
     RemoteProviderRunHealthProbesResponse, RemoteProviderUsageSummaryListResponse,
     RemoteRequestEnvelope, RemoteResponseEnvelope, RemoteRevokeDeviceRequest, RemoteServiceInfo,
+    RemoteSidebarOrganizationMutation, RemoteSidebarOrganizationResponse,
+    RemoteSidebarOrganizationSnapshot,
     RemoteTerminalCreateResponse, RemoteTerminalKillResponse, RemoteTerminalListResponse,
     RemoteTerminalResizeResponse, RemoteTerminalSnapshotResponse, RemoteTerminalWriteResponse,
     RemoteWorkbenchListWorkspacesResponse, RemoteWorkbenchOpenWorkspaceResponse,
@@ -123,6 +125,7 @@ struct RemoteRouterState {
     runtime_catalog: Option<Arc<dyn RemoteRuntimeOptionCatalogSource>>,
     runtime_probes: Option<Arc<dyn RemoteAgentRuntimeProbeSource>>,
     agent_auth_contexts: Option<Arc<dyn RemoteAgentAuthContextSource>>,
+    sidebar_organization: Option<Arc<dyn RemoteSidebarOrganizationSource>>,
     workbench: Option<RemoteWorkbenchRuntime>,
     provider: Option<RemoteProviderRuntime>,
 }
@@ -130,6 +133,20 @@ struct RemoteRouterState {
 #[async_trait]
 pub trait RemoteRuntimeOptionCatalogSource: Send + Sync {
     async fn list_runtime_options(&self) -> VibexResult<SessionRuntimeOptionCatalog>;
+}
+
+/// The Desktop shell owns the sidebar tree, so the service does not read it
+/// from disk; it asks the running Desktop, which applies compact-client changes
+/// through the same transitions a local drag takes.
+#[async_trait]
+pub trait RemoteSidebarOrganizationSource: Send + Sync {
+    async fn sidebar_organization(&self) -> VibexResult<RemoteSidebarOrganizationSnapshot>;
+
+    async fn mutate_sidebar_organization(
+        &self,
+        mutation: RemoteSidebarOrganizationMutation,
+        expected_revision: Option<u64>,
+    ) -> VibexResult<RemoteSidebarOrganizationSnapshot>;
 }
 
 #[async_trait]
@@ -268,6 +285,7 @@ impl RemoteRouterState {
             runtime_catalog: None,
             runtime_probes: None,
             agent_auth_contexts: None,
+            sidebar_organization: None,
             workbench: None,
             provider: None,
         }
@@ -284,6 +302,7 @@ impl RemoteRouterState {
             runtime_catalog: None,
             runtime_probes: None,
             agent_auth_contexts: None,
+            sidebar_organization: None,
             workbench: None,
             provider: None,
         }
@@ -305,6 +324,7 @@ impl RemoteRouterState {
             runtime_catalog: None,
             runtime_probes: None,
             agent_auth_contexts: None,
+            sidebar_organization: None,
             workbench: Some(workbench),
             provider: Some(provider),
         }
@@ -328,6 +348,7 @@ impl RemoteRouterState {
             runtime_catalog: None,
             runtime_probes: None,
             agent_auth_contexts: None,
+            sidebar_organization: None,
             workbench: Some(workbench),
             provider: Some(provider),
         }
@@ -450,6 +471,14 @@ impl RemoteDispatcher {
         self.state.runtime_catalog = Some(source);
         self.state.capabilities.supports_seamless_runtime_selection =
             self.state.runtime_selection.is_some();
+        self
+    }
+
+    pub fn with_sidebar_organization_source(
+        mut self,
+        source: Arc<dyn RemoteSidebarOrganizationSource>,
+    ) -> Self {
+        self.state.sidebar_organization = Some(source);
         self
     }
 
@@ -2094,6 +2123,34 @@ async fn dispatch_agent_request(
             serde_json::to_value(RemoteAgentDetachRuntimeResponse { response })
                 .map_err(remote_payload_encode_error)
         }
+        RemoteAgentRequest::GetSidebarOrganization(request) => {
+            authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::ReadAgentSession,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let snapshot = remote_sidebar_organization(state)?
+                .sidebar_organization()
+                .await?;
+            serde_json::to_value(RemoteSidebarOrganizationResponse { snapshot })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::MutateSidebarOrganization(request) => {
+            authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentSession,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let snapshot = remote_sidebar_organization(state)?
+                .mutate_sidebar_organization(request.mutation, request.expected_revision)
+                .await?;
+            serde_json::to_value(RemoteSidebarOrganizationResponse { snapshot })
+                .map_err(remote_payload_encode_error)
+        }
         RemoteAgentRequest::GetMessageSubmission(request) => {
             authorize_agent_action(
                 &manager,
@@ -2299,6 +2356,17 @@ fn remote_runtime_catalog(
         VibexError::capability(
             "remote_agent_runtime_catalog_unavailable",
             "remote Agent runtime option catalog is not available on this service",
+        )
+    })
+}
+
+fn remote_sidebar_organization(
+    state: &RemoteRouterState,
+) -> VibexResult<&Arc<dyn RemoteSidebarOrganizationSource>> {
+    state.sidebar_organization.as_ref().ok_or_else(|| {
+        VibexError::capability(
+            "remote_sidebar_organization_unavailable",
+            "the desktop shell is not attached, so its sidebar layout cannot be read",
         )
     })
 }
@@ -4744,6 +4812,7 @@ mod tests {
                 runtime_catalog: None,
                 runtime_probes: None,
                 agent_auth_contexts: None,
+            sidebar_organization: None,
                 workbench: None,
                 provider: None,
             },

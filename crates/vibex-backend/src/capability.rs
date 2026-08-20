@@ -20,6 +20,8 @@ pub enum BackendOperation {
     AgentSwitchRuntime,
     AgentAuthRead,
     AgentAuthManage,
+    AgentSidebarOrganizationRead,
+    AgentSidebarOrganizationMutate,
     WorkspaceList,
     WorkspaceOpen,
     WorkspaceDelete,

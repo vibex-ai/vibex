@@ -11,6 +11,7 @@ mod home_lock;
 mod lan_pairing;
 mod management;
 mod relay;
+mod sidebar_organization;
 mod remote_connectivity;
 mod usage;
 mod workbench;
@@ -78,6 +79,7 @@ pub use events::{
 };
 pub use fixture::FixtureDesktopRuntime;
 pub use home_lock::{DESKTOP_RUNTIME_LOCK_FILE, DesktopHomeLock};
+pub use sidebar_organization::{SidebarOrganizationBridge, SidebarOrganizationRequest};
 pub use lan_pairing::{
     LAN_PAIRING_SERVICE_TYPE, LanPairingAdvertiser, MdnsLanPairingAdvertiser,
     MdnsZeroConfigLanPairingAdvertiser, ZeroConfigLanPairingAdvertiser,
@@ -1017,10 +1019,13 @@ impl DesktopRuntime {
             message_submission.clone(),
             RemoteWorkbenchRuntime::new(db_path.clone(), terminals.clone())
                 .with_worktree_snapshot_source(Arc::new(git.clone())),
-        )
-        .with_runtime_option_catalog_source(runtime_catalog.clone())
-        .with_agent_auth_context_source(auth_contexts.clone())
-        .with_agent_runtime_probe_source(Arc::new(providers.clone()));
+        );
+        let sidebar_organization = SidebarOrganizationBridge::new();
+        let remote_dispatcher = remote_dispatcher
+            .with_runtime_option_catalog_source(runtime_catalog.clone())
+            .with_agent_auth_context_source(auth_contexts.clone())
+            .with_agent_runtime_probe_source(Arc::new(providers.clone()))
+            .with_sidebar_organization_source(sidebar_organization.clone());
         let remote_gateway = RemoteGateway::new(
             config.remote_gateway.clone(),
             remote_dispatcher.clone(),
@@ -1715,6 +1720,12 @@ impl DesktopRuntime {
 
     pub fn config(&self) -> &DesktopRuntimeConfig {
         &self.config
+    }
+
+    /// The Desktop shell claims this to answer compact-client sidebar requests
+    /// from the state it is rendering.
+    pub fn sidebar_organization_bridge(&self) -> Arc<SidebarOrganizationBridge> {
+        self.sidebar_organization.clone()
     }
 
     pub fn app_update(&self) -> AppUpdateService {
