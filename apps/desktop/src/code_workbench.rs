@@ -8332,8 +8332,7 @@ impl CodeRightRail {
             .id(format!("file-name-search-result:{index}:{}", row.path))
             .relative()
             .h(px(FILE_ROW_HEIGHT))
-            .w_full()
-            .min_w_0()
+            .min_w_full()
             .flex_none()
             .items_center()
             .px_1()
@@ -8350,10 +8349,9 @@ impl CodeRightRail {
             .child(file_tree_icon(descriptor.kind, false, cx))
             .child(
                 div()
-                    .min_w_0()
-                    .flex_1()
+                    .flex_none()
                     .ml_1p5()
-                    .truncate()
+                    .whitespace_nowrap()
                     .child(render_file_name_match(
                         &row.name,
                         if row.matched { query } else { "" },
@@ -8395,8 +8393,7 @@ impl CodeRightRail {
         let descriptor = file_icon_descriptor(&result.name, result.kind);
         h_flex()
             .h_8()
-            .w_full()
-            .min_w_0()
+            .min_w_full()
             .flex_none()
             .gap_2()
             .px_2()
@@ -8404,9 +8401,8 @@ impl CodeRightRail {
             .child(file_tree_icon(descriptor.kind, false, cx))
             .child(
                 div()
-                    .min_w_0()
-                    .flex_1()
-                    .truncate()
+                    .flex_none()
+                    .whitespace_nowrap()
                     .text_sm()
                     .font_medium()
                     .child(result.path.clone()),
@@ -8445,8 +8441,7 @@ impl CodeRightRail {
         h_flex()
             .id(format!("file-content-search-result:{index}:{path}:{line}"))
             .min_h(px(30.0))
-            .w_full()
-            .min_w_0()
+            .min_w_full()
             .flex_none()
             .items_start()
             .gap_2()
@@ -8465,7 +8460,7 @@ impl CodeRightRail {
                     .text_color(cx.theme().muted_foreground)
                     .child(line.to_string()),
             )
-            .child(div().min_w_0().flex_1().overflow_hidden().text_xs().child(
+            .child(div().flex_none().whitespace_nowrap().text_xs().child(
                 render_highlighted_text_range(
                     &snippet,
                     snippet_match_range,
@@ -8585,7 +8580,7 @@ impl CodeRightRail {
                 v_flex()
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scrollbar()
+                    .overflow_scrollbar()
                     .px_1()
                     .py_1()
                     .children(rows),
