@@ -1852,6 +1852,10 @@ pub struct RemoteSidebarFolder {
     pub name: String,
     #[serde(default)]
     pub project_id: Option<String>,
+    /// When present, the folder belongs to one workspace/worktree within the
+    /// project. `None` keeps the legacy project-level folder behavior.
+    #[serde(default)]
+    pub workspace_id: Option<String>,
     #[serde(default)]
     pub auto_archive_after_days: Option<u8>,
 }
@@ -1909,6 +1913,8 @@ pub enum RemoteSidebarOrganizationMutation {
         name: String,
         #[serde(default)]
         project_id: Option<String>,
+        #[serde(default)]
+        workspace_id: Option<String>,
         #[serde(default)]
         parent_folder_id: Option<String>,
     },

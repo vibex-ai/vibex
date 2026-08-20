@@ -33,6 +33,10 @@ pub struct SidebarRow {
     /// Scope the row lives in: `None` at the sidebar root, otherwise the
     /// project subtree. A move may not cross scopes.
     pub project_id: Option<String>,
+    /// Worktree owner for detailed-hierarchy folders and sessions. Compact
+    /// clients keep this alongside the project scope so folder creation can
+    /// round-trip without losing its worktree owner.
+    pub workspace_id: Option<String>,
     pub collapsed: bool,
     pub pinned: bool,
     pub selected: bool,
@@ -158,6 +162,7 @@ fn push_root_children(
                     depth,
                     label: label.clone(),
                     project_id: None,
+                    workspace_id: None,
                     collapsed,
                     pinned: false,
                     selected: false,
@@ -189,6 +194,7 @@ fn push_root_children(
                     depth,
                     label: folder.name.clone(),
                     project_id: None,
+                    workspace_id: folder.workspace_id.clone(),
                     collapsed,
                     pinned: false,
                     selected: false,
@@ -259,6 +265,7 @@ fn push_project_children(
                     depth,
                     label: session.title.clone(),
                     project_id: Some(project_id.to_string()),
+                    workspace_id: Some(session.workspace_id.as_str().to_string()),
                     collapsed: false,
                     pinned: input.view.pinned_session_ids.contains(&session_id),
                     selected: input
@@ -279,6 +286,7 @@ fn push_project_children(
                     depth,
                     label: folder.name.clone(),
                     project_id: Some(project_id.to_string()),
+                    workspace_id: folder.workspace_id.clone(),
                     collapsed,
                     pinned: false,
                     selected: false,
@@ -434,6 +442,7 @@ mod tests {
             depth,
             label: id.to_string(),
             project_id: None,
+            workspace_id: None,
             collapsed: false,
             pinned: false,
             selected: false,

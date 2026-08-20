@@ -85,6 +85,7 @@ impl SidebarOrganizationView {
                     id: id.clone(),
                     name: folder.name.clone(),
                     project_id: folder.project_id.clone(),
+                    workspace_id: folder.workspace_id.clone(),
                     auto_archive_after_days: folder.auto_archive_after_days,
                 })
                 .collect(),
@@ -120,6 +121,7 @@ impl SidebarOrganizationView {
                         crate::SidebarFolderUiState {
                             name: folder.name.clone(),
                             project_id: folder.project_id.clone(),
+                            workspace_id: folder.workspace_id.clone(),
                             auto_archive_after_days: folder.auto_archive_after_days,
                         },
                     )
@@ -199,12 +201,14 @@ impl SidebarOrganizationView {
             RemoteSidebarOrganizationMutation::CreateFolder {
                 name,
                 project_id,
+                workspace_id,
                 parent_folder_id,
             } => {
-                if !self.organization.create_folder(
+                if !self.organization.create_folder_with_workspace(
                     new_folder_id,
                     name.trim(),
                     project_id.clone(),
+                    workspace_id.clone(),
                     parent_folder_id.clone(),
                 ) {
                     return Err(SidebarMutationRejection::Rejected);
@@ -312,10 +316,44 @@ pub fn sidebar_project_items(
     pinned_session_ids: &BTreeSet<String>,
     parent_folder_id: Option<&str>,
 ) -> Vec<SidebarOrganizationItem> {
+    sidebar_project_items_for_workspace(
+        organization,
+        project_id,
+        None,
+        true,
+        true,
+        session_ids,
+        pinned_session_ids,
+        parent_folder_id,
+    )
+}
+
+/// Returns children for one workspace in detailed hierarchy mode. Folders
+/// created before workspace ownership existed remain visible through the
+/// legacy `sidebar_project_items` path; detailed mode only pulls folders that
+/// explicitly belong to this workspace. Compact callers may opt into showing
+/// all project folders so older clients do not hide newly scoped folders.
+pub fn sidebar_project_items_for_workspace(
+    organization: &SidebarOrganizationState,
+    project_id: &str,
+    workspace_id: Option<&str>,
+    include_legacy_project_folders: bool,
+    include_all_workspace_folders: bool,
+    session_ids: &[String],
+    pinned_session_ids: &BTreeSet<String>,
+    parent_folder_id: Option<&str>,
+) -> Vec<SidebarOrganizationItem> {
     let mut available = organization
         .folders
         .iter()
-        .filter(|(_, folder)| folder.project_id.as_deref() == Some(project_id))
+        .filter(|(_, folder)| {
+            folder.project_id.as_deref() == Some(project_id)
+                && (folder.workspace_id.as_deref() == workspace_id
+                    || (include_all_workspace_folders && workspace_id.is_none())
+                    || (include_legacy_project_folders
+                        && folder.workspace_id.is_none()
+                        && workspace_id.is_none()))
+        })
         .map(|(id, _)| SidebarOrganizationItem::Folder(id.clone()))
         .collect::<Vec<_>>();
     available.extend(
@@ -389,6 +427,56 @@ mod tests {
             view.organization.placements
         );
         assert_eq!(restored.revision, view.revision);
+    }
+
+    #[test]
+    fn workspace_folder_projection_isolated_from_sibling_worktrees() {
+        let mut view = SidebarOrganizationView::default();
+        assert!(view.organization.create_folder_with_workspace(
+            "folder-a",
+            "A",
+            Some("project-1".into()),
+            Some("workspace-a".into()),
+            None,
+        ));
+        assert!(view.organization.create_folder_with_workspace(
+            "folder-b",
+            "B",
+            Some("project-1".into()),
+            Some("workspace-b".into()),
+            None,
+        ));
+        assert!(view.organization.create_folder(
+            "folder-legacy",
+            "Legacy",
+            Some("project-1".into()),
+            None,
+        ));
+        let sessions = ["session-a".to_string(), "session-b".to_string()];
+        let scoped = sidebar_project_items_for_workspace(
+            &view.organization,
+            "project-1",
+            Some("workspace-a"),
+            false,
+            false,
+            &sessions,
+            &BTreeSet::new(),
+            None,
+        );
+        assert!(scoped.contains(&SidebarOrganizationItem::Folder("folder-a".into())));
+        assert!(!scoped.contains(&SidebarOrganizationItem::Folder("folder-b".into())));
+        assert!(!scoped.contains(&SidebarOrganizationItem::Folder("folder-legacy".into())));
+
+        let compact = sidebar_project_items(
+            &view.organization,
+            "project-1",
+            &sessions,
+            &BTreeSet::new(),
+            None,
+        );
+        assert!(compact.contains(&SidebarOrganizationItem::Folder("folder-a".into())));
+        assert!(compact.contains(&SidebarOrganizationItem::Folder("folder-b".into())));
+        assert!(compact.contains(&SidebarOrganizationItem::Folder("folder-legacy".into())));
     }
 
     #[test]

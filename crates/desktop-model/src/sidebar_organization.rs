@@ -34,6 +34,10 @@ pub struct SidebarFolderUiState {
     pub name: String,
     #[serde(default)]
     pub project_id: Option<String>,
+    /// A detailed-hierarchy folder may be scoped to one workspace/worktree.
+    /// `None` preserves the legacy project-level folder representation.
+    #[serde(default)]
+    pub workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_archive_after_days: Option<u8>,
 }
@@ -79,12 +83,17 @@ impl SidebarOrganizationState {
             let project_id = folder
                 .project_id
                 .and_then(|id| bounded_text(&id, SIDEBAR_ITEM_ID_MAX_CHARS));
+            let workspace_id = folder
+                .workspace_id
+                .and_then(|id| bounded_text(&id, SIDEBAR_ITEM_ID_MAX_CHARS))
+                .filter(|_| project_id.is_some());
             let auto_archive_after_days = folder.auto_archive_after_days.filter(|days| {
                 project_id.is_some() && (1..=SIDEBAR_AUTO_ARCHIVE_MAX_DAYS).contains(days)
             });
             folders.entry(id).or_insert(SidebarFolderUiState {
                 name,
                 project_id,
+                workspace_id,
                 auto_archive_after_days,
             });
         }
@@ -140,10 +149,12 @@ impl SidebarOrganizationState {
                     return false;
                 };
                 match &placement.item {
-                    SidebarOrganizationItem::Folder(folder_id) => self
-                        .folders
-                        .get(folder_id)
-                        .is_some_and(|folder| folder.project_id == parent.project_id),
+                    SidebarOrganizationItem::Folder(folder_id) => {
+                        self.folders.get(folder_id).is_some_and(|folder| {
+                            folder.project_id == parent.project_id
+                                && folder.workspace_id == parent.workspace_id
+                        })
+                    }
                     SidebarOrganizationItem::Project(_) => parent.project_id.is_none(),
                     SidebarOrganizationItem::Session(session_id) => session_projects
                         .get(session_id)
@@ -241,6 +252,19 @@ impl SidebarOrganizationState {
         project_id: Option<String>,
         parent_folder_id: Option<String>,
     ) -> bool {
+        self.create_folder_with_workspace(id, name, project_id, None, parent_folder_id)
+    }
+
+    /// Creates a folder with an optional workspace/worktree owner. The legacy
+    /// `create_folder` entry point remains project-scoped for older clients.
+    pub fn create_folder_with_workspace(
+        &mut self,
+        id: impl Into<String>,
+        name: impl Into<String>,
+        project_id: Option<String>,
+        workspace_id: Option<String>,
+        parent_folder_id: Option<String>,
+    ) -> bool {
         let id = id.into();
         let name = name.into();
         let Some(id) = bounded_text(&id, SIDEBAR_ITEM_ID_MAX_CHARS) else {
@@ -261,6 +285,15 @@ impl SidebarOrganizationState {
             }
             None => None,
         };
+        let workspace_id = match workspace_id {
+            Some(id) => {
+                let Some(id) = bounded_text(&id, SIDEBAR_ITEM_ID_MAX_CHARS) else {
+                    return false;
+                };
+                project_id.is_some().then_some(id)
+            }
+            None => None,
+        };
         let parent_folder_id = match parent_folder_id {
             Some(parent_id) => {
                 let Some(parent_id) = bounded_text(&parent_id, SIDEBAR_ITEM_ID_MAX_CHARS) else {
@@ -270,6 +303,7 @@ impl SidebarOrganizationState {
                     return false;
                 };
                 if parent.project_id != project_id
+                    || parent.workspace_id != workspace_id
                     || self.folder_depth(&parent_id) >= SIDEBAR_FOLDER_DEPTH_LIMIT
                 {
                     return false;
@@ -282,6 +316,7 @@ impl SidebarOrganizationState {
             None,
             &name,
             project_id.as_deref(),
+            workspace_id.as_deref(),
             parent_folder_id.as_deref(),
         ) {
             return false;
@@ -291,6 +326,7 @@ impl SidebarOrganizationState {
             SidebarFolderUiState {
                 name,
                 project_id,
+                workspace_id,
                 auto_archive_after_days: None,
             },
         );
@@ -330,6 +366,7 @@ impl SidebarOrganizationState {
             Some(folder_id),
             &name,
             project_id.as_deref(),
+            folder.workspace_id.as_deref(),
             parent_folder_id.as_deref(),
         ) {
             return false;
@@ -354,6 +391,7 @@ impl SidebarOrganizationState {
             Some(folder_id),
             &name,
             folder.project_id.as_deref(),
+            folder.workspace_id.as_deref(),
             parent_folder_id.as_deref(),
         )
     }
@@ -364,9 +402,30 @@ impl SidebarOrganizationState {
         project_id: Option<&str>,
         parent_folder_id: Option<&str>,
     ) -> Option<String> {
+        self.next_available_folder_name_for_workspace(
+            preferred_name,
+            project_id,
+            None,
+            parent_folder_id,
+        )
+    }
+
+    pub fn next_available_folder_name_for_workspace(
+        &self,
+        preferred_name: &str,
+        project_id: Option<&str>,
+        workspace_id: Option<&str>,
+        parent_folder_id: Option<&str>,
+    ) -> Option<String> {
         let preferred_name = bounded_text(preferred_name, SIDEBAR_FOLDER_NAME_MAX_CHARS)?;
         Some(next_unique_folder_name(&preferred_name, |candidate| {
-            self.folder_name_is_available_at(None, candidate, project_id, parent_folder_id)
+            self.folder_name_is_available_at(
+                None,
+                candidate,
+                project_id,
+                workspace_id,
+                parent_folder_id,
+            )
         }))
     }
 
@@ -1059,6 +1118,7 @@ impl SidebarOrganizationState {
             Some(folder_id),
             &folder.name,
             folder.project_id.as_deref(),
+            folder.workspace_id.as_deref(),
             parent_folder_id,
         )
     }
@@ -1068,12 +1128,14 @@ impl SidebarOrganizationState {
         excluded_folder_id: Option<&str>,
         name: &str,
         project_id: Option<&str>,
+        workspace_id: Option<&str>,
         parent_folder_id: Option<&str>,
     ) -> bool {
         let comparable_name = comparable_folder_name(name);
         !self.folders.iter().any(|(candidate_id, folder)| {
             excluded_folder_id != Some(candidate_id.as_str())
                 && folder.project_id.as_deref() == project_id
+                && folder.workspace_id.as_deref() == workspace_id
                 && self
                     .parent_of(&SidebarOrganizationItem::Folder(candidate_id.clone()))
                     .as_deref()
@@ -1137,7 +1199,12 @@ impl SidebarOrganizationState {
         let folder_scopes = self
             .folders
             .iter()
-            .map(|(id, folder)| (id.clone(), folder.project_id.clone()))
+            .map(|(id, folder)| {
+                (
+                    id.clone(),
+                    (folder.project_id.clone(), folder.workspace_id.clone()),
+                )
+            })
             .collect::<BTreeMap<_, _>>();
         for placement in &mut self.placements {
             let Some(parent_id) = placement.parent_folder_id.as_ref() else {
@@ -1151,8 +1218,10 @@ impl SidebarOrganizationState {
                             folder_id != parent_id
                                 && folder_scopes.get(folder_id) == Some(parent_scope)
                         }
-                        SidebarOrganizationItem::Project(_) => parent_scope.is_none(),
-                        SidebarOrganizationItem::Session(_) => parent_scope.is_some(),
+                        SidebarOrganizationItem::Project(_) => {
+                            parent_scope.0.is_none() && parent_scope.1.is_none()
+                        }
+                        SidebarOrganizationItem::Session(_) => parent_scope.0.is_some(),
                     });
             if !valid {
                 placement.parent_folder_id = None;
@@ -1208,15 +1277,17 @@ impl SidebarOrganizationState {
                 .cloned(),
         );
 
-        let mut used_names = BTreeMap::<(Option<String>, Option<String>), BTreeSet<String>>::new();
+        let mut used_names =
+            BTreeMap::<(Option<String>, Option<String>, Option<String>), BTreeSet<String>>::new();
         for folder_id in folder_ids {
             let Some(folder) = self.folders.get(&folder_id) else {
                 continue;
             };
             let name = folder.name.clone();
             let scope = folder.project_id.clone();
+            let workspace = folder.workspace_id.clone();
             let parent = self.parent_of(&SidebarOrganizationItem::Folder(folder_id.clone()));
-            let names = used_names.entry((scope, parent)).or_default();
+            let names = used_names.entry((scope, workspace, parent)).or_default();
             let unique_name = next_unique_folder_name(&name, |candidate| {
                 !names.contains(&comparable_folder_name(candidate))
             });
@@ -1368,6 +1439,32 @@ mod tests {
     }
 
     #[test]
+    fn workspace_folder_children_must_share_the_workspace_scope() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_folder_with_workspace(
+            "parent",
+            "Parent",
+            Some("project-a".into()),
+            Some("workspace-a".into()),
+            None,
+        ));
+        assert!(!state.create_folder_with_workspace(
+            "wrong-child",
+            "Child",
+            Some("project-a".into()),
+            Some("workspace-b".into()),
+            Some("parent".into()),
+        ));
+        assert!(state.create_folder_with_workspace(
+            "child",
+            "Child",
+            Some("project-a".into()),
+            Some("workspace-a".into()),
+            Some("parent".into()),
+        ));
+    }
+
+    #[test]
     fn new_folders_are_inserted_before_existing_siblings() {
         let mut state = SidebarOrganizationState::default();
         assert!(state.create_folder("older", "Older", None, None));
@@ -1437,6 +1534,7 @@ mod tests {
                     SidebarFolderUiState {
                         name: "Duplicate".into(),
                         project_id: None,
+                        workspace_id: None,
                         auto_archive_after_days: None,
                     },
                 ),
@@ -1445,6 +1543,7 @@ mod tests {
                     SidebarFolderUiState {
                         name: "duplicate".into(),
                         project_id: None,
+                        workspace_id: None,
                         auto_archive_after_days: None,
                     },
                 ),
@@ -1916,6 +2015,7 @@ mod tests {
                 SidebarFolderUiState {
                     name: "Folder".into(),
                     project_id: None,
+                    workspace_id: None,
                     auto_archive_after_days: None,
                 },
             )]),
@@ -1945,6 +2045,7 @@ mod tests {
                     SidebarFolderUiState {
                         name: "A".into(),
                         project_id: None,
+                        workspace_id: None,
                         auto_archive_after_days: None,
                     },
                 ),
@@ -1953,6 +2054,7 @@ mod tests {
                     SidebarFolderUiState {
                         name: "B".into(),
                         project_id: None,
+                        workspace_id: None,
                         auto_archive_after_days: None,
                     },
                 ),

@@ -139,6 +139,7 @@ type SidebarMenuAction = Box<dyn Fn(&mut MobileApp, &mut Window, &mut Context<Mo
 enum SidebarNamePrompt {
     CreateFolder {
         project_id: Option<String>,
+        workspace_id: Option<String>,
         parent_folder_id: Option<String>,
     },
     RenameFolder {
@@ -2132,10 +2133,12 @@ impl MobileApp {
         let mutation = match prompt {
             SidebarNamePrompt::CreateFolder {
                 project_id,
+                workspace_id,
                 parent_folder_id,
             } => RemoteSidebarOrganizationMutation::CreateFolder {
                 name,
                 project_id,
+                workspace_id,
                 parent_folder_id,
             },
             SidebarNamePrompt::RenameFolder { folder_id } => {
@@ -4214,6 +4217,7 @@ impl MobileApp {
                     }),
                 );
                 let nest_project_id = row.project_id.clone();
+                let nest_workspace_id = row.workspace_id.clone();
                 let nest_parent_id = row.id().to_string();
                 sheet = entry(
                     sheet,
@@ -4224,6 +4228,7 @@ impl MobileApp {
                         this.open_folder_name_prompt(
                             SidebarNamePrompt::CreateFolder {
                                 project_id: nest_project_id.clone(),
+                                workspace_id: nest_workspace_id.clone(),
                                 parent_folder_id: Some(nest_parent_id.clone()),
                             },
                             cx,
@@ -4268,6 +4273,7 @@ impl MobileApp {
                         this.open_folder_name_prompt(
                             SidebarNamePrompt::CreateFolder {
                                 project_id: Some(folder_project_id.clone()),
+                                workspace_id: None,
                                 parent_folder_id: None,
                             },
                             cx,
