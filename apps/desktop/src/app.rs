@@ -19808,6 +19808,13 @@ impl VibexWorkbench {
             .sidebar_state
             .collapsed_ids
             .contains(&project_id_string);
+        // Worktree hierarchy is meaningful only for projects with Git-backed
+        // workspaces. A non-Git project keeps the compact project/session tree
+        // even when the global sidebar mode is set to Detailed.
+        let detailed_hierarchy = sidebar_project_uses_detailed_hierarchy(
+            self.ui_state.sidebar.hierarchy_mode,
+            &group.workspaces,
+        );
         let root_folder_drag_active =
             self.sidebar_folder_drag_state
                 .as_ref()
@@ -20151,41 +20158,38 @@ impl VibexWorkbench {
 
         let mut session_elements = Vec::new();
         if !collapsed {
-            match self.ui_state.sidebar.hierarchy_mode {
-                SidebarHierarchyMode::Compact => {
-                    session_elements = self.render_sidebar_project_children(
-                        group,
-                        None,
-                        true,
-                        false,
+            if detailed_hierarchy {
+                session_elements.extend(self.render_sidebar_project_children(
+                    group,
+                    None,
+                    false,
+                    true,
+                    reorder_enabled,
+                    strings,
+                    0,
+                    cx,
+                ));
+                for workspace in &group.workspaces {
+                    session_elements.push(self.render_sidebar_workspace(
+                        workspace,
                         reorder_enabled,
                         strings,
-                        0,
-                        cx,
-                    );
-                    if session_elements.is_empty() {
-                        session_elements.push(sidebar_empty_sessions(strings, cx));
-                    }
-                }
-                SidebarHierarchyMode::Detailed => {
-                    session_elements.extend(self.render_sidebar_project_children(
-                        group,
-                        None,
-                        false,
-                        true,
-                        reorder_enabled,
-                        strings,
-                        0,
                         cx,
                     ));
-                    for workspace in &group.workspaces {
-                        session_elements.push(self.render_sidebar_workspace(
-                            workspace,
-                            reorder_enabled,
-                            strings,
-                            cx,
-                        ));
-                    }
+                }
+            } else {
+                session_elements = self.render_sidebar_project_children(
+                    group,
+                    None,
+                    true,
+                    false,
+                    reorder_enabled,
+                    strings,
+                    0,
+                    cx,
+                );
+                if session_elements.is_empty() {
+                    session_elements.push(sidebar_empty_sessions(strings, cx));
                 }
             }
         }
@@ -20293,14 +20297,8 @@ impl VibexWorkbench {
                         .w_full()
                         .min_w_0()
                         .gap(px(2.0))
-                        .when(
-                            self.ui_state.sidebar.hierarchy_mode == SidebarHierarchyMode::Compact,
-                            |this| this.pl_6(),
-                        )
-                        .when(
-                            self.ui_state.sidebar.hierarchy_mode == SidebarHierarchyMode::Detailed,
-                            |this| this.pl_3(),
-                        )
+                        .when(!detailed_hierarchy, |this| this.pl_6())
+                        .when(detailed_hierarchy, |this| this.pl_3())
                         .children(session_elements),
                 )
             });
@@ -34000,6 +33998,16 @@ fn reveal_sidebar_session(
     let workspace_revealed = hierarchy_mode == SidebarHierarchyMode::Detailed
         && collapsed_workspace_ids.remove(workspace_id);
     project_revealed || workspace_revealed
+}
+
+fn sidebar_project_uses_detailed_hierarchy(
+    hierarchy_mode: SidebarHierarchyMode,
+    workspaces: &[SidebarWorkspaceProjection],
+) -> bool {
+    hierarchy_mode == SidebarHierarchyMode::Detailed
+        && workspaces
+            .iter()
+            .any(|workspace| workspace.context.git_available)
 }
 
 fn sidebar_selected_session_background(accent: Hsla, is_dark: bool) -> Hsla {
@@ -48156,6 +48164,23 @@ mod tests {
         assert!(workspace.contains(".pl(px(20.0))"));
         assert!(!workspace.contains(".ml(px(18.0))"));
         assert!(!workspace.contains(".border_1()"));
+    }
+
+    #[test]
+    fn detailed_sidebar_falls_back_to_compact_for_non_git_projects() {
+        let source = include_str!("app.rs");
+        let project = source
+            .split_once("    fn render_sidebar_project(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_workspace("))
+            .map(|(body, _)| body)
+            .expect("project renderer should remain inspectable");
+
+        assert!(project.contains("sidebar_project_uses_detailed_hierarchy("));
+        assert!(source.contains("workspace.context.git_available"));
+        assert!(project.contains("if detailed_hierarchy {"));
+        assert!(project.contains("!detailed_hierarchy"));
+        assert!(project.contains("self.render_sidebar_project_children("));
+        assert!(!project.contains("match self.ui_state.sidebar.hierarchy_mode"));
     }
 
     #[test]
