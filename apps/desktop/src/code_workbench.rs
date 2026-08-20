@@ -10097,7 +10097,7 @@ impl CodeRightRail {
                                     .h_full()
                                     .w_full()
                                     .font_semibold()
-                                    .label(locale::text("History", "历史", "歷史"))
+                                    .label(locale::text("Commits", "提交", "提交"))
                                     .text_color(if history_active {
                                         cx.theme().sidebar_foreground
                                     } else {
@@ -14167,6 +14167,19 @@ mod tests {
             [RightRailMode::Files, RightRailMode::Git].map(RightRailMode::title),
             ["Files", "Git"]
         );
+    }
+
+    #[test]
+    fn git_history_tab_is_labeled_as_commits() {
+        let source = include_str!("code_workbench.rs");
+        let renderer = source
+            .split_once("Button::new(\"git-mode-history\")")
+            .and_then(|(_, tail)| tail.split_once(".on_click"))
+            .map(|(renderer, _)| renderer)
+            .expect("Git history tab should remain inspectable");
+
+        assert!(renderer.contains("locale::text(\"Commits\", \"提交\", \"提交\")"));
+        assert!(!renderer.contains("locale::text(\"History\", \"历史\", \"歷史\")"));
     }
 
     #[test]

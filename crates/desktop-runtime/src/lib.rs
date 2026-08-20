@@ -11,8 +11,8 @@ mod home_lock;
 mod lan_pairing;
 mod management;
 mod relay;
-mod sidebar_organization;
 mod remote_connectivity;
+mod sidebar_organization;
 mod usage;
 mod workbench;
 mod worktree;
@@ -79,7 +79,6 @@ pub use events::{
 };
 pub use fixture::FixtureDesktopRuntime;
 pub use home_lock::{DESKTOP_RUNTIME_LOCK_FILE, DesktopHomeLock};
-pub use sidebar_organization::{SidebarOrganizationBridge, SidebarOrganizationRequest};
 pub use lan_pairing::{
     LAN_PAIRING_SERVICE_TYPE, LanPairingAdvertiser, MdnsLanPairingAdvertiser,
     MdnsZeroConfigLanPairingAdvertiser, ZeroConfigLanPairingAdvertiser,
@@ -105,6 +104,7 @@ pub use remote_connectivity::{
     TailscaleRoute, TailscaleSettings, TokioProcessRunner, WebPkiDirectPublicationProbe,
     normalize_https_origin, parse_tailscale_inspection,
 };
+pub use sidebar_organization::{SidebarOrganizationBridge, SidebarOrganizationRequest};
 pub use usage::AgentUsageService;
 pub use worktree::{WorktreeCoordinator, WorktreeCreateContext};
 
@@ -875,6 +875,7 @@ pub struct DesktopRuntime {
     remote: RemoteHandle,
     relay: RelayClientRuntime,
     usage: AgentUsageService,
+    sidebar_organization: Arc<SidebarOrganizationBridge>,
     polling: DesktopPollingPolicy,
     events: broadcast::Sender<DesktopEvent>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -1114,6 +1115,7 @@ impl DesktopRuntime {
             remote,
             relay,
             usage,
+            sidebar_organization,
             polling: DesktopPollingPolicy::default(),
             events,
             tasks: Mutex::new(Vec::new()),

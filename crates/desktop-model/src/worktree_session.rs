@@ -425,6 +425,8 @@ pub struct WorkspaceContextProjection {
     pub workspace_root: String,
     pub branch: Option<String>,
     pub managed_worktree_id: Option<String>,
+    #[serde(default)]
+    pub git_available: bool,
     pub git_dirty: bool,
     pub worktree_lifecycle_state: Option<WorktreeLifecycleDisplayState>,
 }
@@ -437,6 +439,7 @@ impl WorkspaceContextProjection {
         lifecycle: Option<&GitWorktreeLifecycleSnapshot>,
         git_branch: Option<&str>,
         git_dirty: bool,
+        git_status_available: bool,
     ) -> Self {
         let managed = lifecycle.and_then(|snapshot| {
             (snapshot.workspace_id == workspace.id)
@@ -461,6 +464,8 @@ impl WorkspaceContextProjection {
                 .or_else(|| eligibility.and_then(|value| value.current_branch.clone()))
                 .or_else(|| git_branch.map(str::to_string)),
             managed_worktree_id: managed.map(|managed| managed.worktree_id.to_string()),
+            git_available: git_status_available
+                || eligibility.is_some_and(GitProjectEligibility::is_eligible),
             git_dirty,
             worktree_lifecycle_state: lifecycle_view.map(|view| view.state),
         }
@@ -844,6 +849,7 @@ pub fn sidebar_project_projections(
                         workspace_root: workspace.root_path.clone(),
                         branch: None,
                         managed_worktree_id: None,
+                        git_available: false,
                         git_dirty: false,
                         worktree_lifecycle_state: None,
                     });
@@ -1308,6 +1314,7 @@ mod tests {
             Some(&snapshot),
             None,
             true,
+            true,
         );
         assert_eq!(context.branch.as_deref(), Some("vibex/feature"));
         assert_eq!(
@@ -1315,6 +1322,7 @@ mod tests {
             Some(managed.worktree_id.as_str())
         );
         assert!(context.git_dirty);
+        assert!(context.git_available);
     }
 
     #[test]

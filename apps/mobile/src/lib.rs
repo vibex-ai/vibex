@@ -14,6 +14,7 @@ mod markdown;
 mod notifications;
 mod pairing;
 mod scanner;
+mod sidebar;
 mod storage;
 mod theme;
 mod workbench;

@@ -100,21 +100,22 @@ use vibex_desktop_model::{
     NewSessionLocation, NewSessionProjectTicket, NewSessionSubmissionStage,
     NewSessionWorkspaceState, RUNTIME_SELECTION_PREFERENCE_LIMIT, RuntimeCascadeChoice,
     RuntimeCascadeProjection, SIDEBAR_AUTO_ARCHIVE_MAX_DAYS, SessionContentWidthMode,
-    SessionUiState, SidebarHierarchyMode, SidebarOrganizationItem, SidebarOrganizationScope,
-    SidebarProjectAppearance, SidebarProjectLogo, SidebarProjectLogoColor,
-    SidebarProjectProjection, SidebarState, SidebarWorkspaceProjection, StartupDestination,
-    TerminalWorkingDirectory, ThemeMode as ModelThemeMode, ThrottledUiStateWriter,
-    TimelineConversationTurn, TimelineFollowState, TimelineModel, TimelineProcessActivityGroup,
-    TimelineRow, TimelineRowKind, UiStateStore, UnifiedDiffLineKind, WorkbenchRoute,
-    WorkspaceAgentSummary, WorkspaceContextProjection, WorktreeLifecycleDisplayState,
-    active_collaborations, composer_trigger_at, current_agent_plan,
-    custom_worktree_path_is_absolute, parse_unified_diff,
-    sidebar_project_custom_logo_file_is_valid, sidebar_project_projections,
-    timeline_agent_message_count_after_sequence, timeline_conversation_turns,
+    SessionUiState, SidebarHierarchyMode, SidebarMutationRejection, SidebarOrganizationItem,
+    SidebarOrganizationScope, SidebarOrganizationView, SidebarProjectAppearance,
+    SidebarProjectLogo, SidebarProjectLogoColor, SidebarProjectProjection, SidebarState,
+    SidebarWorkspaceProjection, StartupDestination, TerminalWorkingDirectory,
+    ThemeMode as ModelThemeMode, ThrottledUiStateWriter, TimelineConversationTurn,
+    TimelineFollowState, TimelineModel, TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
+    UiStateStore, UnifiedDiffLineKind, WorkbenchRoute, WorkspaceAgentSummary,
+    WorkspaceContextProjection, WorktreeLifecycleDisplayState, active_collaborations,
+    composer_trigger_at, current_agent_plan, custom_worktree_path_is_absolute, parse_unified_diff,
+    sidebar_project_custom_logo_file_is_valid, sidebar_project_items, sidebar_project_projections,
+    sidebar_root_items, timeline_agent_message_count_after_sequence, timeline_conversation_turns,
 };
 use vibex_desktop_runtime::{
     DesktopEvent, DesktopRuntime, DesktopRuntimeConfig, DesktopRuntimeFacade, PREVIEW_APP_ID,
-    ProviderConfigChangePhase, RC_APP_ID, STABLE_DESKTOP_APP_ID, validate_external_open_url,
+    ProviderConfigChangePhase, RC_APP_ID, STABLE_DESKTOP_APP_ID, SidebarOrganizationRequest,
+    validate_external_open_url,
 };
 use vibex_markdown::{
     Block, BlockNode, Inline, InlineNode, MarkdownDocument, MarkdownInput, MarkdownLimits,
@@ -1658,6 +1659,25 @@ impl SidebarAnimationState {
             false
         }
     }
+}
+
+/// Content fingerprint of the sidebar tree. Compact clients echo it back with
+/// a drag so a layout that changed on the Desktop in the meantime rejects the
+/// stale move instead of silently reordering something else.
+fn sidebar_organization_revision(view: &SidebarOrganizationView) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut fingerprint = view.clone();
+    fingerprint.revision = 0;
+    serde_json::to_string(&fingerprint.to_remote())
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
+fn sidebar_mutation_error(rejection: SidebarMutationRejection) -> vibex_core::VibexError {
+    vibex_core::VibexError::validation(rejection.stable_code(), rejection.message())
 }
 
 fn sidebar_animation_id(scope: &'static str, state: SidebarAnimationState) -> ElementId {
@@ -3649,6 +3669,7 @@ pub struct VibexWorkbench {
     sidebar_organization_root_drop_target:
         Option<(Vec<SidebarOrganizationItem>, SidebarOrganizationScope)>,
     sidebar_auto_archive_task: Option<Task<()>>,
+    sidebar_organization_task: Option<Task<()>>,
     new_session_agent_drop_target: Option<NewSessionAgentDropTarget>,
     collapsed_project_restore: Option<BTreeSet<String>>,
     selected_session_id: Option<VibexSessionId>,
@@ -4257,6 +4278,7 @@ impl VibexWorkbench {
             sidebar_organization_drop_target: None,
             sidebar_organization_root_drop_target: None,
             sidebar_auto_archive_task: None,
+            sidebar_organization_task: None,
             new_session_agent_drop_target: None,
             collapsed_project_restore: None,
             selected_session_id,
@@ -4587,6 +4609,7 @@ impl VibexWorkbench {
                                 this.persistence_note = Some(note);
                             }
                             this.runtime = Some(runtime.clone());
+                            this.start_sidebar_organization_bridge(&runtime, cx);
                             let facade = Arc::new(NativeBackend::new(runtime.clone())).facade();
                             this.shared_workflow =
                                 Some(AgentFileGitController::from_facade(&facade));
@@ -4698,6 +4721,91 @@ impl VibexWorkbench {
                 });
             },
         ));
+    }
+
+    /// Serves compact clients the sidebar tree from the state this shell is
+    /// rendering. Reading the persisted UI-state file instead would race the
+    /// shell's own throttled writer and lose whichever change landed second.
+    fn start_sidebar_organization_bridge(
+        &mut self,
+        runtime: &DesktopRuntime,
+        cx: &mut Context<Self>,
+    ) {
+        let mut requests = runtime.sidebar_organization_bridge().attach();
+        self.sidebar_organization_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                while let Some(request) = requests.recv().await {
+                    if entity
+                        .update(cx, |this, cx| this.serve_sidebar_organization(request, cx))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            },
+        ));
+    }
+
+    fn sidebar_organization_view(&self) -> SidebarOrganizationView {
+        let mut view = SidebarOrganizationView {
+            revision: 0,
+            organization: self.ui_state.sidebar.organization.clone(),
+            collapsed_project_ids: self.sidebar_state.collapsed_ids.clone(),
+            pinned_session_ids: self.sidebar_state.pinned_ids.clone(),
+            session_order: self.sidebar_state.row_order.clone(),
+        };
+        // The revision is a content fingerprint rather than a counter so that
+        // Desktop-side edits invalidate a client's pending drag too, without
+        // instrumenting every local mutation site.
+        view.revision = sidebar_organization_revision(&view);
+        view
+    }
+
+    fn serve_sidebar_organization(
+        &mut self,
+        request: SidebarOrganizationRequest,
+        cx: &mut Context<Self>,
+    ) {
+        match request {
+            SidebarOrganizationRequest::Snapshot { .. } => {
+                let snapshot = self.sidebar_organization_view().to_remote();
+                request.respond(Ok(snapshot));
+            }
+            SidebarOrganizationRequest::Mutate {
+                ref mutation,
+                expected_revision,
+                ..
+            } => {
+                let mutation = mutation.as_ref().clone();
+                let mut view = self.sidebar_organization_view();
+                if expected_revision.is_some_and(|revision| revision != view.revision) {
+                    request.respond(Err(sidebar_mutation_error(
+                        SidebarMutationRejection::StaleRevision,
+                    )));
+                    return;
+                }
+                let session_projects = self.sidebar_session_projects();
+                let folder_id = RequestId::new().to_string();
+                match view.apply_remote(&mutation, &session_projects, &folder_id) {
+                    Ok(effect) => {
+                        if effect.organization {
+                            self.ui_state.sidebar.organization = view.organization.clone();
+                            self.queue_ui_state();
+                        }
+                        if effect.navigation {
+                            self.sidebar_state.collapsed_ids = view.collapsed_project_ids.clone();
+                            self.sidebar_state.pinned_ids = view.pinned_session_ids.clone();
+                            self.queue_agent_ui_state();
+                        }
+                        self.invalidate_sidebar_projection_cache();
+                        cx.notify();
+                        let snapshot = self.sidebar_organization_view().to_remote();
+                        request.respond(Ok(snapshot));
+                    }
+                    Err(rejection) => request.respond(Err(sidebar_mutation_error(rejection))),
+                }
+            }
+        }
     }
 
     fn start_sidebar_auto_archive_schedule(&mut self, cx: &mut Context<Self>) {
@@ -5358,6 +5466,7 @@ impl VibexWorkbench {
                     lifecycle.as_ref(),
                     status.as_ref().and_then(|status| status.branch.as_deref()),
                     status.as_ref().is_some_and(|status| status.dirty),
+                    status.is_some(),
                 );
                 contexts.insert(summary.workspace.id.as_str().to_string(), context);
             }
@@ -6220,24 +6329,15 @@ impl VibexWorkbench {
         groups: &[SidebarProjectProjection],
         parent_folder_id: Option<&str>,
     ) -> Vec<SidebarOrganizationItem> {
-        let mut available = self
-            .ui_state
-            .sidebar
-            .organization
-            .folders
+        let project_ids = groups
             .iter()
-            .filter(|(_, folder)| folder.project_id.is_none())
-            .map(|(id, _)| SidebarOrganizationItem::Folder(id.clone()))
+            .map(|group| group.project.id.as_str().to_string())
             .collect::<Vec<_>>();
-        available.extend(
-            groups.iter().map(|group| {
-                SidebarOrganizationItem::Project(group.project.id.as_str().to_string())
-            }),
-        );
-        self.ui_state
-            .sidebar
-            .organization
-            .ordered_children(parent_folder_id, &available)
+        sidebar_root_items(
+            &self.ui_state.sidebar.organization,
+            &project_ids,
+            parent_folder_id,
+        )
     }
 
     fn sidebar_project_organization_items(
@@ -6246,29 +6346,17 @@ impl VibexWorkbench {
         sessions: &[AgentSession],
         parent_folder_id: Option<&str>,
     ) -> Vec<SidebarOrganizationItem> {
-        let mut available = self
-            .ui_state
-            .sidebar
-            .organization
-            .folders
+        let session_ids = sessions
             .iter()
-            .filter(|(_, folder)| folder.project_id.as_deref() == Some(project_id))
-            .map(|(id, _)| SidebarOrganizationItem::Folder(id.clone()))
+            .map(|session| session.id.as_str().to_string())
             .collect::<Vec<_>>();
-        available.extend(
-            sessions
-                .iter()
-                .map(|session| SidebarOrganizationItem::Session(session.id.as_str().to_string())),
-        );
-        let ordered = self
-            .ui_state
-            .sidebar
-            .organization
-            .ordered_children(parent_folder_id, &available);
-        let (pinned, rest): (Vec<_>, Vec<_>) = ordered.into_iter().partition(|item| {
-            matches!(item, SidebarOrganizationItem::Session(id) if self.sidebar_state.pinned_ids.contains(id))
-        });
-        pinned.into_iter().chain(rest).collect()
+        sidebar_project_items(
+            &self.ui_state.sidebar.organization,
+            project_id,
+            &session_ids,
+            &self.sidebar_state.pinned_ids,
+            parent_folder_id,
+        )
     }
 
     fn sidebar_session_is_organized(&self, session_id: &VibexSessionId) -> bool {
@@ -16856,6 +16944,9 @@ impl VibexWorkbench {
     }
 
     fn open_right_rail_mode(&mut self, mode: RightRailMode, cx: &mut Context<Self>) {
+        if mode == RightRailMode::Git && !self.selected_session_supports_git() {
+            return;
+        }
         let activity_id = right_rail_activity_id(mode).to_string();
         let mode_changed =
             self.ui_state.right_rail.selected_activity_id.as_ref() != Some(&activity_id);
@@ -16910,11 +17001,20 @@ impl VibexWorkbench {
     }
 
     fn right_rail_panel_open(&self) -> bool {
+        if self.right_rail_mode == RightRailMode::Git && !self.selected_session_supports_git() {
+            return false;
+        }
         if self.last_visibility.right_rail_docked {
             self.ui_state.workbench.right_rail_visible
         } else {
             self.right_rail_overlay_open
         }
+    }
+
+    fn selected_session_supports_git(&self) -> bool {
+        self.selected_session()
+            .and_then(|session| self.workspace_contexts.get(session.workspace_id.as_str()))
+            .is_some_and(|context| context.git_available)
     }
 
     fn render_right_rail_panel(&self) -> AnyElement {
@@ -16925,34 +17025,45 @@ impl VibexWorkbench {
     }
 
     fn render_right_rail_activity_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let git_available = self.selected_session_supports_git();
+        let active_mode = if git_available {
+            self.right_rail_mode
+        } else {
+            RightRailMode::Files
+        };
         let panel_open = self.right_rail_panel_open();
-        let activities = vec![
-            right_rail_activity_button(
-                "activity-files",
-                right_rail_mode_icon(RightRailMode::Files),
-            )
-            .tooltip(locale::text("Files", "文件", "檔案"))
-            .selected(panel_open && self.right_rail_mode == RightRailMode::Files)
-            .on_click(
-                cx.listener(|this, _, _, cx| this.toggle_right_rail_mode(RightRailMode::Files, cx)),
-            )
-            .into_any_element(),
+        let files = right_rail_activity_button(
+            "activity-files",
+            right_rail_mode_icon(RightRailMode::Files),
+        )
+        .tooltip(locale::text("Files", "文件", "檔案"))
+        .selected(panel_open && active_mode == RightRailMode::Files)
+        .on_click(
+            cx.listener(|this, _, _, cx| this.toggle_right_rail_mode(RightRailMode::Files, cx)),
+        )
+        .into_any_element();
+        let git =
             right_rail_activity_button("activity-git", right_rail_mode_icon(RightRailMode::Git))
                 .tooltip("Git")
-                .selected(panel_open && self.right_rail_mode == RightRailMode::Git)
+                .selected(panel_open && active_mode == RightRailMode::Git)
                 .on_click(
                     cx.listener(|this, _, _, cx| {
                         this.toggle_right_rail_mode(RightRailMode::Git, cx)
                     }),
                 )
-                .into_any_element(),
+                .into_any_element();
+        let terminal =
             right_rail_activity_button("activity-terminal", Icon::new(IconName::SquareTerminal))
                 .tooltip(locale::text("New terminal", "新建终端", "新增終端機"))
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.create_preview_terminal(window.window_handle(), None, None, cx)
                 }))
-                .into_any_element(),
-        ];
+                .into_any_element();
+        let activities = if git_available {
+            vec![files, git, terminal]
+        } else {
+            vec![files, terminal]
+        };
 
         v_flex()
             .id("right-rail-activity-bar")
@@ -31488,7 +31599,7 @@ impl VibexWorkbench {
             && !preview_fullscreen
             && !new_session_open;
         let right_rail_docked = visibility.right_rail_docked
-            && self.ui_state.workbench.right_rail_visible
+            && self.right_rail_panel_open()
             && agent_open
             && !preview_fullscreen
             && !new_session_open;
@@ -31599,7 +31710,7 @@ impl VibexWorkbench {
         let floating_right_rail = (agent_open
             && !new_session_open
             && !visibility.right_rail_docked
-            && self.right_rail_overlay_open
+            && self.right_rail_panel_open()
             && !preview_fullscreen)
             .then(|| {
                 let resize_handle = self.render_right_panel_resize_handle(
@@ -42288,6 +42399,20 @@ mod tests {
             route_right_rail_activity_id("git").as_deref(),
             Some("rail_plugin_system_git")
         );
+    }
+
+    #[test]
+    fn git_right_rail_entry_is_gated_by_the_selected_session_workspace() {
+        let source = include_str!("app.rs");
+        let renderer = source
+            .split_once("    fn render_right_rail_activity_bar(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn open_management("))
+            .map(|(renderer, _)| renderer)
+            .expect("right rail activity renderer should remain inspectable");
+
+        assert!(renderer.contains("selected_session_supports_git"));
+        assert!(renderer.contains("if git_available"));
+        assert!(renderer.contains("vec![files, terminal]"));
     }
 
     #[test]

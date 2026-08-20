@@ -149,6 +149,54 @@ impl WebRemoteBackend {
         self.transport.state()
     }
 
+    /// Reads the Desktop's sidebar tree — folders, nesting, ordering, and the
+    /// collapsed/pinned flags — so a compact client renders the layout the user
+    /// arranged there instead of inventing its own.
+    pub async fn sidebar_organization(
+        &self,
+    ) -> BackendResult<vibex_core::RemoteSidebarOrganizationSnapshot> {
+        let payload = RemoteAgentRequest::GetSidebarOrganization(
+            vibex_core::RemoteSidebarOrganizationRequest { auth: self.auth() },
+        );
+        let value = self
+            .rpc(
+                RemoteOperationKind::AgentSession,
+                payload,
+                None,
+                None,
+                vibex_core::RemoteTimeoutClass::Standard,
+            )
+            .await?;
+        Ok(decode::<vibex_core::RemoteSidebarOrganizationResponse>(value)?.snapshot)
+    }
+
+    /// Applies a sidebar change on the Desktop and returns the resulting tree.
+    /// `expected_revision` is the snapshot the client rendered; the Desktop
+    /// refuses the change when its own layout has moved on since.
+    pub async fn mutate_sidebar_organization(
+        &self,
+        mutation: vibex_core::RemoteSidebarOrganizationMutation,
+        expected_revision: Option<u64>,
+    ) -> BackendResult<vibex_core::RemoteSidebarOrganizationSnapshot> {
+        let payload = RemoteAgentRequest::MutateSidebarOrganization(
+            vibex_core::RemoteSidebarOrganizationMutateRequest {
+                auth: self.auth(),
+                mutation,
+                expected_revision,
+            },
+        );
+        let value = self
+            .rpc(
+                RemoteOperationKind::AgentSession,
+                payload,
+                Some(vibex_core::RequestId::new()),
+                None,
+                vibex_core::RemoteTimeoutClass::Standard,
+            )
+            .await?;
+        Ok(decode::<vibex_core::RemoteSidebarOrganizationResponse>(value)?.snapshot)
+    }
+
     pub fn capability_snapshot(&self) -> BackendCapabilitySnapshot {
         if let Some(info) = self.transport.server_info() {
             self.update_capabilities_from_server(&info);

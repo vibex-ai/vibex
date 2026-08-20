@@ -298,14 +298,13 @@ pub use remote::{
     RemoteSidebarDropPosition, RemoteSidebarFolder, RemoteSidebarItemKind, RemoteSidebarItemRef,
     RemoteSidebarOrganizationMutateRequest, RemoteSidebarOrganizationMutation,
     RemoteSidebarOrganizationRequest, RemoteSidebarOrganizationResponse,
-    RemoteSidebarOrganizationSnapshot, RemoteSidebarPlacement,
-    RemoteTerminalCreateRequest, RemoteTerminalCreateResponse, RemoteTerminalKillRequest,
-    RemoteTerminalKillResponse, RemoteTerminalListRequest, RemoteTerminalListResponse,
-    RemoteTerminalResizeRequest, RemoteTerminalResizeResponse, RemoteTerminalSnapshotRequest,
-    RemoteTerminalSnapshotResponse, RemoteTerminalWriteRequest, RemoteTerminalWriteResponse,
-    RemoteWorkbenchListWorkspacesRequest, RemoteWorkbenchListWorkspacesResponse,
-    RemoteWorkbenchOpenWorkspaceRequest, RemoteWorkbenchOpenWorkspaceResponse,
-    RemoteWorkbenchOperationKind, RemoteWorkbenchRequest,
+    RemoteSidebarOrganizationSnapshot, RemoteSidebarPlacement, RemoteTerminalCreateRequest,
+    RemoteTerminalCreateResponse, RemoteTerminalKillRequest, RemoteTerminalKillResponse,
+    RemoteTerminalListRequest, RemoteTerminalListResponse, RemoteTerminalResizeRequest,
+    RemoteTerminalResizeResponse, RemoteTerminalSnapshotRequest, RemoteTerminalSnapshotResponse,
+    RemoteTerminalWriteRequest, RemoteTerminalWriteResponse, RemoteWorkbenchListWorkspacesRequest,
+    RemoteWorkbenchListWorkspacesResponse, RemoteWorkbenchOpenWorkspaceRequest,
+    RemoteWorkbenchOpenWorkspaceResponse, RemoteWorkbenchOperationKind, RemoteWorkbenchRequest,
 };
 pub use remote_v2::*;
 pub use runtime::{

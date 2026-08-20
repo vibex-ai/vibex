@@ -281,6 +281,55 @@ impl SidebarOrganizationView {
     }
 }
 
+/// Root-level children under `parent_folder_id`: root folders and projects, in
+/// the order the user arranged. Both shells build the sidebar from this so the
+/// tree cannot drift between them.
+pub fn sidebar_root_items(
+    organization: &SidebarOrganizationState,
+    project_ids: &[String],
+    parent_folder_id: Option<&str>,
+) -> Vec<SidebarOrganizationItem> {
+    let mut available = organization
+        .folders
+        .iter()
+        .filter(|(_, folder)| folder.project_id.is_none())
+        .map(|(id, _)| SidebarOrganizationItem::Folder(id.clone()))
+        .collect::<Vec<_>>();
+    available.extend(
+        project_ids
+            .iter()
+            .map(|id| SidebarOrganizationItem::Project(id.clone())),
+    );
+    organization.ordered_children(parent_folder_id, &available)
+}
+
+/// Children of a project under `parent_folder_id`: its folders and sessions,
+/// with pinned sessions hoisted to the front the way the Desktop shows them.
+pub fn sidebar_project_items(
+    organization: &SidebarOrganizationState,
+    project_id: &str,
+    session_ids: &[String],
+    pinned_session_ids: &BTreeSet<String>,
+    parent_folder_id: Option<&str>,
+) -> Vec<SidebarOrganizationItem> {
+    let mut available = organization
+        .folders
+        .iter()
+        .filter(|(_, folder)| folder.project_id.as_deref() == Some(project_id))
+        .map(|(id, _)| SidebarOrganizationItem::Folder(id.clone()))
+        .collect::<Vec<_>>();
+    available.extend(
+        session_ids
+            .iter()
+            .map(|id| SidebarOrganizationItem::Session(id.clone())),
+    );
+    let ordered = organization.ordered_children(parent_folder_id, &available);
+    let (pinned, rest): (Vec<_>, Vec<_>) = ordered.into_iter().partition(
+        |item| matches!(item, SidebarOrganizationItem::Session(id) if pinned_session_ids.contains(id)),
+    );
+    pinned.into_iter().chain(rest).collect()
+}
+
 /// Which half of the sidebar view a mutation touched. The Desktop persists the
 /// organization tree and the navigation flags through different paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
