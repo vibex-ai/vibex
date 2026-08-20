@@ -205,12 +205,13 @@ const SIDEBAR_INLINE_TRANSITION_DURATION: Duration = Duration::from_millis(200);
 const SIDEBAR_FLOATING_TRANSITION_DURATION: Duration = Duration::from_millis(200);
 const SIDEBAR_REORDER_TRANSITION_DURATION: Duration = Duration::from_millis(160);
 const SIDEBAR_REORDER_ROW_HEIGHT: f32 = 32.0;
-const SIDEBAR_PROJECT_REORDER_GAP: f32 = 4.0;
+const SIDEBAR_PROJECT_REORDER_GAP: f32 = 8.0;
 const SIDEBAR_SESSION_REORDER_GAP: f32 = 2.0;
 const SIDEBAR_DRAG_PREVIEW_WIDTH: f32 = 280.0;
 const SIDEBAR_DRAG_HORIZONTAL_SLOP: f32 = 16.0;
 const SIDEBAR_ORGANIZATION_INDENT: f32 = 20.0;
 const SIDEBAR_ORGANIZATION_MIN_INDENT: f32 = 4.0;
+const SIDEBAR_WORKSPACE_INDENT: f32 = 12.0;
 const SIDEBAR_FOLDER_DROP_EDGE_HEIGHT: f32 = 8.0;
 const STARTUP_LOADING_INDICATOR_DELAY: Duration = Duration::from_secs(5);
 const STARTUP_LOADING_MIN_DURATION: Duration = Duration::from_secs(1);
@@ -18489,7 +18490,7 @@ impl VibexWorkbench {
                     .id("sidebar-session-list")
                     .flex_1()
                     .min_h_0()
-                    .gap_1()
+                    .gap(px(SIDEBAR_PROJECT_REORDER_GAP))
                     .track_scroll(&self.sidebar_scroll)
                     .overflow_y_scroll()
                     .vertical_scrollbar(&self.sidebar_scroll)
@@ -20229,7 +20230,7 @@ impl VibexWorkbench {
             .relative()
             .w_full()
             .min_w_0()
-            .gap(px(6.0))
+            .gap(px(SIDEBAR_PROJECT_REORDER_GAP))
             .on_hover(cx.listener(|this, hovered, _, cx| {
                 if *hovered {
                     this.clear_sidebar_context_menu_target(cx);
@@ -20298,6 +20299,11 @@ impl VibexWorkbench {
                         .min_w_0()
                         .gap(px(2.0))
                         .when(!detailed_hierarchy, |this| this.pl_6())
+                        .when(detailed_hierarchy, |this| {
+                            this.pl(px(SIDEBAR_WORKSPACE_INDENT))
+                                .border_l_1()
+                                .border_color(cx.theme().sidebar_border.opacity(0.45))
+                        })
                         .children(session_elements),
                 )
             });
@@ -20327,6 +20333,10 @@ impl VibexWorkbench {
             .clone()
             .unwrap_or_else(|| locale::text("No branch", "无分支", "無分支").to_string());
         let branch_name = sidebar_workspace_branch_name(&branch).to_string();
+        let workspace_kind = match workspace.mode {
+            WorkspaceMode::CurrentCheckout => locale::text("Checkout", "当前目录", "目前目錄"),
+            WorkspaceMode::VibexWorktree => locale::text("Worktree", "Worktree", "Worktree"),
+        };
         let lifecycle_state = projection.context.worktree_lifecycle_state;
         let collapsed = self
             .ui_state
@@ -20399,7 +20409,13 @@ impl VibexWorkbench {
             .bg(if selected {
                 cx.theme().sidebar_accent.opacity(0.25)
             } else {
-                cx.theme().transparent
+                cx.theme().background.opacity(0.14)
+            })
+            .border_l_1()
+            .border_color(if selected {
+                cx.theme().sidebar_accent.opacity(0.72)
+            } else {
+                cx.theme().sidebar_border.opacity(0.55)
             })
             .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.20)))
             .tooltip(move |window, cx| Tooltip::new(tooltip_branch.clone()).build(window, cx))
@@ -20427,11 +20443,17 @@ impl VibexWorkbench {
                     .pr(px(34.0))
                     .child(
                         h_flex()
-                            .w(px(26.0))
+                            .w(px(30.0))
                             .h(px(26.0))
                             .flex_none()
                             .items_center()
                             .justify_center()
+                            .gap(px(4.0))
+                            .child(
+                                sidebar_icon("icons/vibex/git-branch.svg")
+                                    .size(px(14.0))
+                                    .text_color(cx.theme().sidebar_foreground.opacity(0.55)),
+                            )
                             .child(status_indicator),
                     )
                     .child(
@@ -20448,12 +20470,19 @@ impl VibexWorkbench {
                                     .child(branch_name),
                             )
                             .child(
-                                div()
+                                h_flex()
                                     .min_w_0()
-                                    .whitespace_normal()
+                                    .gap(px(4.0))
                                     .text_xs()
                                     .text_color(cx.theme().sidebar_foreground.opacity(0.48))
-                                    .child(branch),
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .font_medium()
+                                            .text_color(cx.theme().sidebar_foreground.opacity(0.62))
+                                            .child(workspace_kind),
+                                    )
+                                    .child(div().min_w_0().truncate().child(branch)),
                             ),
                     ),
             )
@@ -48115,7 +48144,7 @@ mod tests {
         assert!(sidebar.contains("sidebar-toolbar-more"));
         assert!(sidebar.contains("Detailed workspace hierarchy"));
         assert!(sidebar.contains("toggle_sidebar_hierarchy_mode"));
-        assert!(sidebar.contains("SidebarHierarchyMode::Compact"));
+        assert!(source.contains("SidebarHierarchyMode::Compact"));
         assert!(sidebar.contains("SidebarHierarchyMode::Detailed"));
         assert!(sidebar.contains("NewSessionOpenTarget::Workspace"));
         assert!(sidebar.contains("icons/vibex/git-branch.svg"));
@@ -48163,7 +48192,7 @@ mod tests {
         assert!(workspace.contains("let branch_name = sidebar_workspace_branch_name(&branch)"));
         assert!(workspace.contains(".child(branch_name)"));
         assert!(workspace.contains(".child(branch)"));
-        assert!(workspace.contains(".w(px(26.0))"));
+        assert!(workspace.contains(".w(px(30.0))"));
         assert!(!workspace.contains("Current Checkout"));
         assert!(!workspace.contains("workspace.root_path"));
 
