@@ -8,11 +8,11 @@ use std::time::Duration;
 use gpui::{
     AccessibleAction, Anchor, AnyElement, AnyWindowHandle, App, ClipboardItem, Context,
     DragMoveEvent, Entity, FocusHandle, Hsla, Image, ImageFormat, InteractiveElement as _,
-    IntoElement, KeyDownEvent, Keystroke, ListAlignment, ListHorizontalSizingBehavior, ListOffset,
-    ListState, MouseButton, MouseDownEvent, Orientation, ParentElement as _, PathBuilder, Render,
-    Role, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _,
-    StyleRefinement, Styled as _, Subscription, Task, UniformListScrollHandle, WeakEntity, Window,
-    canvas, div, img, list, point, prelude::*, px, relative, uniform_list,
+    IntoElement, KeyDownEvent, ListAlignment, ListHorizontalSizingBehavior, ListOffset, ListState,
+    MouseButton, MouseDownEvent, Orientation, ParentElement as _, PathBuilder, Render, Role,
+    ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _, StyleRefinement,
+    Styled as _, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, canvas, deferred,
+    div, img, list, point, prelude::*, px, relative, uniform_list,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath,
@@ -11170,23 +11170,44 @@ impl CodeRightRail {
                     .h(px(42.0))
                     .gap_1p5()
                     .px_2()
-                    .capture_any_mouse_down(|_, window, cx| {
-                        // Select popovers are deferred overlays. Close the currently focused
-                        // one during capture so the next filter opens on the same click. Keep
-                        // this as a plain window callback: wrapping it in `cx.listener` would
-                        // hold a CodeRightRail update while dispatching Escape and re-enter the
-                        // same entity through GPUI's action/focus path.
-                        let _ = window.dispatch_keystroke(Keystroke::parse("escape").unwrap(), cx);
-                        // Action bubbling defaults to stopped. Restore propagation for the
-                        // mouse-down event that is still traversing the filter row, otherwise
-                        // the actual Select/DatePicker trigger never receives this click.
-                        cx.propagate();
-                    })
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .child(div().min_w_0().flex_1().child(branch_select))
-                    .child(div().min_w_0().flex_1().child(author_select))
-                    .child(date_picker),
+                    .child(
+                        div()
+                            .id("git-history-branch-filter")
+                            .cursor_pointer()
+                            .min_w_0()
+                            .flex_1()
+                            .child(branch_select),
+                    )
+                    .child(
+                        div()
+                            .id("git-history-author-filter")
+                            .cursor_pointer()
+                            .min_w_0()
+                            .flex_1()
+                            .child(author_select),
+                    )
+                    .child(
+                        div()
+                            .id("git-history-date-filter")
+                            .cursor_pointer()
+                            .child(date_picker),
+                    )
+                    // Select/DatePicker popovers are deferred overlays. Their outside-click
+                    // handlers close the old popover but intentionally stop propagation. Paint
+                    // this relay after those overlays so the same mouse down can continue to
+                    // the next filter trigger without dispatching a nested Escape action.
+                    .child(
+                        deferred(
+                            div()
+                                .id("git-history-filter-event-relay")
+                                .absolute()
+                                .inset_0()
+                                .capture_any_mouse_down(|_, _, cx| cx.propagate()),
+                        )
+                        .with_priority(3),
+                    ),
             )
             .child(
                 div()
@@ -14573,10 +14594,11 @@ mod tests {
             .map(|(body, _)| body)
             .expect("git history renderer should remain inspectable");
 
-        assert!(history_renderer.contains(".capture_any_mouse_down(|_, window, cx|"));
-        assert!(!history_renderer.contains(".capture_any_mouse_down(cx.listener"));
-        assert!(history_renderer.contains("window.dispatch_keystroke"));
-        assert!(history_renderer.contains("cx.propagate();"));
+        assert!(history_renderer.contains("git-history-filter-event-relay"));
+        assert!(history_renderer.contains("deferred("));
+        assert!(history_renderer.contains(".with_priority(3)"));
+        assert!(history_renderer.contains("capture_any_mouse_down(|_, _, cx| cx.propagate())"));
+        assert!(!history_renderer.contains("dispatch_keystroke"));
     }
 
     #[test]
