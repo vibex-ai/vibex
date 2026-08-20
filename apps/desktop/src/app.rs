@@ -25832,7 +25832,6 @@ impl VibexWorkbench {
                     &turn.id,
                     &agent_progress_label(&pending_label, strings.agent_pending_response),
                     &pending_tooltip,
-                    cx,
                 ));
             }
             content = content.child(response);
@@ -32911,19 +32910,6 @@ fn agent_progress_tooltip(label: &str, fallback: &str) -> String {
     }
 }
 
-fn agent_thinking_scroll_progress(delta: f32) -> f32 {
-    const START_HOLD: f32 = 0.18;
-    const END_HOLD: f32 = 0.18;
-
-    if delta <= START_HOLD {
-        0.0
-    } else if delta >= 1.0 - END_HOLD {
-        1.0
-    } else {
-        (delta - START_HOLD) / (1.0 - START_HOLD - END_HOLD)
-    }
-}
-
 fn shimmer_scan_position(delta: f32, visible_start: f32, visible_span: f32) -> f32 {
     visible_start - visible_span * 0.35 + (delta * SHIMMER_SCAN_PASSES).fract() * visible_span * 1.7
 }
@@ -32945,23 +32931,10 @@ fn shimmer_color(
     }
 }
 
-fn render_agent_thinking_indicator(
-    turn_id: &str,
-    label: &str,
-    tooltip: &str,
-    cx: &App,
-) -> AnyElement {
-    let base = cx.theme().muted_foreground.opacity(0.75);
-    let glow = cx.theme().foreground;
-    let background = cx.theme().background;
+fn render_agent_thinking_indicator(turn_id: &str, label: &str, tooltip: &str) -> AnyElement {
     let label = label.to_string();
-    let character_count = label.chars().count();
     let tooltip = tooltip.to_string();
     let element_id = format!("agent-thinking-{turn_id}");
-    let animation_id = format!("{element_id}-animation");
-    let scroll_id = format!("{element_id}-scroll");
-    let scroll = gpui::ScrollHandle::new();
-    let animation_scroll = scroll.clone();
     h_flex()
         .w_full()
         .min_w_0()
@@ -32970,73 +32943,13 @@ fn render_agent_thinking_indicator(
         .child(
             div()
                 .id(element_id)
-                .relative()
                 .min_w_0()
                 .flex_1()
                 .overflow_hidden()
                 .text_sm()
+                .truncate()
                 .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-                .with_animation(
-                    animation_id,
-                    Animation::new(AGENT_THINKING_SCROLL_DURATION).repeat(),
-                    move |this, delta| {
-                        let progress = agent_thinking_scroll_progress(delta);
-                        let max_offset = animation_scroll.max_offset().x;
-                        animation_scroll.set_offset(point(-max_offset * progress, px(0.0)));
-                        let viewport_width = f32::from(animation_scroll.bounds().size.width);
-                        let content_width = viewport_width + f32::from(max_offset);
-                        let visible_span = if content_width > 0.0 {
-                            (viewport_width / content_width).clamp(0.0, 1.0)
-                        } else {
-                            1.0
-                        };
-                        let visible_start = progress * (1.0 - visible_span);
-                        let scan_position =
-                            shimmer_scan_position(delta, visible_start, visible_span);
-                        let scan_radius = (visible_span * 0.42).max(0.01);
-                        this.child(
-                            div()
-                                .id(scroll_id.clone())
-                                .w_full()
-                                .overflow_x_scroll()
-                                .track_scroll(&animation_scroll)
-                                .child(h_flex().flex_none().whitespace_nowrap().children(
-                                    label.chars().enumerate().map(|(index, character)| {
-                                        let position = if character_count > 1 {
-                                            index as f32 / (character_count - 1) as f32
-                                        } else {
-                                            0.5
-                                        };
-                                        div().flex_none().child(character.to_string()).text_color(
-                                            shimmer_color(
-                                                base,
-                                                glow,
-                                                position,
-                                                scan_position,
-                                                scan_radius,
-                                            ),
-                                        )
-                                    }),
-                                )),
-                        )
-                        .when(
-                            max_offset > px(0.0) && progress < 1.0,
-                            |this| {
-                                this.child(
-                                    div()
-                                        .absolute()
-                                        .top_0()
-                                        .right_0()
-                                        .bottom_0()
-                                        .pl_1()
-                                        .bg(background)
-                                        .text_color(base)
-                                        .child("…"),
-                                )
-                            },
-                        )
-                    },
-                ),
+                .child(label),
         )
         .into_any_element()
 }
@@ -41251,15 +41164,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_thinking_scroll_holds_at_each_end() {
-        assert_eq!(agent_thinking_scroll_progress(0.0), 0.0);
-        assert_eq!(agent_thinking_scroll_progress(0.18), 0.0);
-        assert!((agent_thinking_scroll_progress(0.5) - 0.5).abs() < f32::EPSILON);
-        assert_eq!(agent_thinking_scroll_progress(0.82), 1.0);
-        assert_eq!(agent_thinking_scroll_progress(1.0), 1.0);
-    }
-
-    #[test]
     fn shimmer_scan_reaches_each_glyph_and_falls_back_to_the_base_color() {
         let base = Hsla {
             h: 0.0,
@@ -41280,7 +41184,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_thinking_indicator_scrolls_scans_and_keeps_full_tooltip() {
+    fn agent_thinking_indicator_truncates_and_keeps_full_tooltip() {
         let source = include_str!("app.rs");
         let renderer = source
             .split_once("fn render_agent_thinking_indicator(")
@@ -41288,21 +41192,10 @@ mod tests {
             .map(|(body, _)| body)
             .expect("thinking indicator renderer should remain inspectable");
 
-        assert_eq!(renderer.matches(".with_animation(").count(), 1);
-        assert!(renderer.contains("animation_scroll.max_offset().x"));
-        assert!(renderer.contains("animation_scroll.set_offset"));
-        assert!(renderer.contains(".overflow_x_scroll()"));
-        assert!(renderer.contains(".track_scroll(&animation_scroll)"));
-        assert!(renderer.contains(".whitespace_nowrap()"));
-        assert!(renderer.contains(".child(\"…\")"));
+        assert!(!renderer.contains(".with_animation("));
+        assert!(renderer.contains(".truncate()"));
+        assert!(renderer.contains(".child(label)"));
         assert!(renderer.contains("Tooltip::new(tooltip.clone())"));
-        assert!(renderer.contains("let visible_span"));
-        assert!(renderer.contains("let scan_position"));
-        assert!(renderer.contains(".children("));
-        assert!(renderer.contains("label.chars().enumerate().map("));
-        assert!(renderer.contains(".flex_none()"));
-        assert!(renderer.contains(".text_color("));
-        assert!(renderer.contains("shimmer_color("));
     }
 
     #[test]
