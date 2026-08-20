@@ -6,13 +6,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    AccessibleAction, AnyElement, AnyWindowHandle, App, ClipboardItem, Context, DragMoveEvent,
-    Entity, FocusHandle, Hsla, Image, ImageFormat, InteractiveElement as _, IntoElement,
-    KeyDownEvent, Keystroke, ListAlignment, ListHorizontalSizingBehavior, ListOffset, ListState,
-    MouseButton, MouseDownEvent, Orientation, ParentElement as _, PathBuilder, Render, Role,
-    ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _, StyleRefinement,
-    Styled as _, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, canvas, div, img,
-    list, point, prelude::*, px, relative, uniform_list,
+    AccessibleAction, Anchor, AnyElement, AnyWindowHandle, App, ClipboardItem, Context,
+    DragMoveEvent, Entity, FocusHandle, Hsla, Image, ImageFormat, InteractiveElement as _,
+    IntoElement, KeyDownEvent, Keystroke, ListAlignment, ListHorizontalSizingBehavior, ListOffset,
+    ListState, MouseButton, MouseDownEvent, Orientation, ParentElement as _, PathBuilder, Render,
+    Role, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _,
+    StyleRefinement, Styled as _, Subscription, Task, UniformListScrollHandle, WeakEntity, Window,
+    canvas, div, img, list, point, prelude::*, px, relative, uniform_list,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath,
@@ -10045,6 +10045,7 @@ impl CodeRightRail {
         let deletions = git.deletions;
         let change_count = git.change_count;
         let history_search_input = self.history_search_input.clone();
+        let (pull_count, push_count) = git_sync_counts(&git.branches);
 
         v_flex()
             .size_full()
@@ -10141,40 +10142,58 @@ impl CodeRightRail {
                         cx.theme().border.opacity(0.70)
                     })
                     .child(
-                        Button::new("git-fetch")
-                            .small()
-                            .ghost()
-                            .compact()
-                            .w(px(20.0))
-                            .h(px(20.0))
-                            .p_0()
-                            .icon(Icon::default().path("icons/vibex/download.svg"))
-                            .text_color(cx.theme().sidebar_foreground.opacity(0.48))
-                            .tooltip(locale::text("Fetch", "获取", "擷取"))
-                            .disabled(pending)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.update_workbench(cx, |workbench, cx| {
-                                    workbench.remote_action(GitRemoteActionKind::Fetch, cx)
-                                })
-                            })),
+                        h_flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                Button::new("git-fetch")
+                                    .small()
+                                    .ghost()
+                                    .compact()
+                                    .w(px(20.0))
+                                    .h(px(20.0))
+                                    .p_0()
+                                    .icon(Icon::default().path("icons/vibex/download.svg"))
+                                    .text_color(cx.theme().sidebar_foreground.opacity(0.48))
+                                    .tooltip(locale::text("Fetch", "获取", "擷取"))
+                                    .disabled(pending)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.update_workbench(cx, |workbench, cx| {
+                                            workbench.remote_action(GitRemoteActionKind::Fetch, cx)
+                                        })
+                                    })),
+                            )
+                            .when(pull_count > 0, |this| {
+                                this.child(git_sync_badge(pull_count, "↙", cx.theme().info))
+                            }),
                     )
                     .child(
-                        Button::new("git-push")
-                            .small()
-                            .ghost()
-                            .compact()
-                            .w(px(20.0))
-                            .h(px(20.0))
-                            .p_0()
-                            .icon(Icon::default().path("icons/vibex/upload.svg"))
-                            .text_color(cx.theme().sidebar_foreground.opacity(0.48))
-                            .tooltip(locale::text("Push", "推送", "推送"))
-                            .disabled(pending)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.update_workbench(cx, |workbench, cx| {
-                                    workbench.remote_action(GitRemoteActionKind::Push, cx)
-                                })
-                            })),
+                        h_flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                Button::new("git-push")
+                                    .small()
+                                    .ghost()
+                                    .compact()
+                                    .w(px(20.0))
+                                    .h(px(20.0))
+                                    .p_0()
+                                    .icon(Icon::default().path("icons/vibex/upload.svg"))
+                                    .text_color(cx.theme().sidebar_foreground.opacity(0.48))
+                                    .tooltip(locale::text("Push", "推送", "推送"))
+                                    .disabled(pending)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.update_workbench(cx, |workbench, cx| {
+                                            workbench.remote_action(GitRemoteActionKind::Push, cx)
+                                        })
+                                    })),
+                            )
+                            .when(push_count > 0, |this| {
+                                this.child(git_sync_badge(push_count, "↗", cx.theme().success))
+                            }),
                     )
                     .child(
                         Button::new("refresh-git")
@@ -10273,23 +10292,6 @@ impl CodeRightRail {
                                         window,
                                         cx,
                                     )
-                                })),
-                        )
-                        .child(
-                            Button::new("show-git-history")
-                                .small()
-                                .ghost()
-                                .compact()
-                                .w(px(20.0))
-                                .h(px(20.0))
-                                .p_0()
-                                .icon(IconName::Eye)
-                                .text_color(cx.theme().sidebar_foreground.opacity(0.48))
-                                .tooltip(locale::text("Show history", "显示历史", "顯示歷史"))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.update_workbench(cx, |workbench, cx| {
-                                        workbench.set_git_mode(GitWorkbenchMode::History, cx)
-                                    })
                                 })),
                         )
                         .child(div().flex_1())
@@ -10689,7 +10691,7 @@ impl CodeRightRail {
                                     .bg(cx.theme().background.opacity(0.80))
                                     .child(
                                         Button::new("commit-changes")
-                                            .ghost()
+                                            .outline()
                                             .rounded_none()
                                             .h_full()
                                             .px_3()
@@ -10727,10 +10729,10 @@ impl CodeRightRail {
                                     )
                                     .child(
                                         Button::new("commit-more-actions")
-                                            .ghost()
+                                            .outline()
                                             .rounded_none()
                                             .h_full()
-                                            .w(px(36.0))
+                                            .w(px(40.0))
                                             .p_0()
                                             .icon(IconName::ChevronDown)
                                             .tooltip(locale::text(
@@ -10739,29 +10741,33 @@ impl CodeRightRail {
                                                 "更多提交操作",
                                             ))
                                             .disabled(action_pending || selected_count == 0)
-                                            .dropdown_menu(move |menu, _, _| {
-                                                let workbench = push_workbench.clone();
-                                                menu.item(
-                                                    PopupMenuItem::new(locale::text(
-                                                        "Commit and push",
-                                                        "提交并推送",
-                                                        "提交並推送",
-                                                    ))
-                                                    .on_click(move |_, window, cx| {
-                                                        let window_handle = window.window_handle();
-                                                        let _ = workbench.update(
-                                                            cx,
-                                                            |workbench, cx| {
-                                                                workbench.commit(
-                                                                    true,
-                                                                    window_handle,
-                                                                    cx,
-                                                                )
-                                                            },
-                                                        );
-                                                    }),
-                                                )
-                                            }),
+                                            .dropdown_menu_with_anchor(
+                                                Anchor::BottomRight,
+                                                move |menu, _, _| {
+                                                    let workbench = push_workbench.clone();
+                                                    menu.item(
+                                                        PopupMenuItem::new(locale::text(
+                                                            "Commit and push",
+                                                            "提交并推送",
+                                                            "提交並推送",
+                                                        ))
+                                                        .on_click(move |_, window, cx| {
+                                                            let window_handle =
+                                                                window.window_handle();
+                                                            let _ = workbench.update(
+                                                                cx,
+                                                                |workbench, cx| {
+                                                                    workbench.commit(
+                                                                        true,
+                                                                        window_handle,
+                                                                        cx,
+                                                                    )
+                                                                },
+                                                            );
+                                                        }),
+                                                    )
+                                                },
+                                            ),
                                     ),
                             ),
                     ),
@@ -10810,6 +10816,7 @@ impl CodeRightRail {
                     locale::ResolvedLocale::ZhTw => format!("選擇 {path}"),
                 })
                 .child(git_selection_indicator(state, cx))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let selected = state != GitPathSelectionState::Checked;
                     this.update_workbench(cx, |workbench, cx| {
@@ -10819,7 +10826,8 @@ impl CodeRightRail {
                             workbench.git.select_path(&select_path, selected);
                         }
                         cx.notify();
-                    })
+                    });
+                    cx.stop_propagation();
                 }))
                 .into_any_element()
         });
@@ -11039,7 +11047,8 @@ impl CodeRightRail {
                                     workbench.open_commit_at_path(hash, subject, path, cx)
                                 }
                             }
-                        })
+                        });
+                        cx.stop_propagation();
                     }))
                     .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
                         if event.keystroke.key != "enter" && event.keystroke.key != "space" {
@@ -12241,6 +12250,31 @@ fn file_tree_text_color(row: &FileExplorerRow, cx: &Context<CodeRightRail>) -> H
     }
 }
 
+fn git_sync_counts(branches: &[GitBranchSummary]) -> (u32, u32) {
+    branches
+        .iter()
+        .find(|branch| branch.current && branch.upstream.is_some())
+        .map(|branch| (branch.behind, branch.ahead))
+        .unwrap_or_default()
+}
+
+fn git_sync_badge(count: u32, arrow: &'static str, color: Hsla) -> AnyElement {
+    h_flex()
+        .h(px(18.0))
+        .min_w(px(24.0))
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .gap_1()
+        .rounded(px(3.0))
+        .bg(color.opacity(0.12))
+        .text_color(color)
+        .font_family("monospace")
+        .text_xs()
+        .child(format!("{arrow} {count}"))
+        .into_any_element()
+}
+
 fn git_selection_indicator(
     state: GitPathSelectionState,
     cx: &Context<CodeRightRail>,
@@ -12265,10 +12299,22 @@ fn git_selection_indicator(
         })
         .text_color(cx.theme().accent_foreground.opacity(0.72))
         .when(state == GitPathSelectionState::Checked, |this| {
-            this.child(Icon::new(IconName::Check).size(px(10.0)))
+            this.child(
+                Icon::new(IconName::Check)
+                    .size(px(10.0))
+                    .relative()
+                    .left(px(0.5))
+                    .top(px(0.5)),
+            )
         })
         .when(state == GitPathSelectionState::Indeterminate, |this| {
-            this.child(Icon::new(IconName::Minus).size(px(10.0)))
+            this.child(
+                Icon::new(IconName::Minus)
+                    .size(px(10.0))
+                    .relative()
+                    .left(px(0.5))
+                    .top(px(0.5)),
+            )
         })
         .into_any_element()
 }
@@ -14183,6 +14229,41 @@ mod tests {
     }
 
     #[test]
+    fn git_changes_toolbar_uses_the_commit_action_above_the_trigger() {
+        let source = include_str!("code_workbench.rs");
+        let changes = source
+            .split_once("fn render_git_changes")
+            .and_then(|(_, tail)| tail.split_once("fn render_git_tree_row"))
+            .map(|(body, _)| body)
+            .expect("Git changes toolbar should remain inspectable");
+
+        assert!(!changes.contains("show-git-history"));
+        assert!(changes.contains("Anchor::BottomRight"));
+        assert!(changes.contains("Button::new(\"commit-more-actions\")"));
+        assert!(changes.contains(".w(px(40.0))"));
+        assert!(
+            source.contains(".on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())")
+        );
+    }
+
+    #[test]
+    fn git_sync_counts_use_current_branch_upstream_divergence() {
+        let branch = GitBranchSummary {
+            name: "feature".to_string(),
+            current: true,
+            upstream: Some("origin/feature".to_string()),
+            ahead: 3,
+            behind: 8,
+            current_ahead: 0,
+            current_behind: 0,
+            detached: false,
+        };
+
+        assert_eq!(git_sync_counts(&[branch]), (8, 3));
+        assert_eq!(git_sync_counts(&[]), (0, 0));
+    }
+
+    #[test]
     fn git_selection_indicator_uses_neutral_theme_states_and_a_centered_mixed_glyph() {
         let source = include_str!("code_workbench.rs");
         let indicator = source
@@ -14200,6 +14281,8 @@ mod tests {
             assert!(indicator.contains(theme_style));
         }
         assert!(indicator.contains("IconName::Minus"));
+        assert!(indicator.contains(".left(px(0.5))"));
+        assert!(indicator.contains(".top(px(0.5))"));
         assert!(!indicator.contains("h(px(1.5))"));
         assert!(!indicator.contains("gpui::white()"));
     }
