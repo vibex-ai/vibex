@@ -31,7 +31,7 @@ use vibex_desktop_runtime::{
     RemoteConnectivitySnapshot, RemoteMethodState, RemoteRecoveryAction, normalize_https_origin,
 };
 
-use crate::locale;
+use crate::{locale, theme};
 
 const PAIRING_OFFER_TTL_MS: u32 = 90_000;
 const OFFER_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -66,6 +66,12 @@ enum RemoteAccessEntry {
     LocalNetwork,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteAccessPage {
+    EntryList,
+    EntryDetails,
+}
+
 impl RemoteAccessEntry {
     const ALL: [Self; 4] = [
         Self::TailscaleServe,
@@ -95,6 +101,7 @@ impl RemoteAccessEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RemoteAccessAction {
     Refresh,
+    ShowEntryList,
     SelectMethod(RemoteConnectivityMethod),
     SelectConnectionEntry(RemoteAccessEntry),
     EnableMethod(RemoteConnectivityMethod),
@@ -319,6 +326,7 @@ pub enum RemoteAccessPairingE2eAction {
 
 struct PairingViewState {
     connectivity: Option<RemoteConnectivitySnapshot>,
+    page: RemoteAccessPage,
     selected_method: RemoteConnectivityMethod,
     selected_entry: RemoteAccessEntry,
     permission: RemoteDevicePermissionLevel,
@@ -335,6 +343,7 @@ impl Default for PairingViewState {
     fn default() -> Self {
         Self {
             connectivity: None,
+            page: RemoteAccessPage::EntryList,
             selected_method: RemoteConnectivityMethod::TailscaleServe,
             selected_entry: RemoteAccessEntry::TailscaleServe,
             permission: RemoteDevicePermissionLevel::ReadOnly,
@@ -352,6 +361,20 @@ impl Default for PairingViewState {
 impl PairingViewState {
     fn apply_connectivity(&mut self, snapshot: RemoteConnectivitySnapshot) {
         self.connectivity = Some(snapshot);
+    }
+
+    fn show_entry_list(&mut self) {
+        self.page = RemoteAccessPage::EntryList;
+        self.error_code = None;
+    }
+
+    fn select_connection_entry(&mut self, entry: RemoteAccessEntry) {
+        self.selected_entry = entry;
+        if let Some(method) = entry.remote_method() {
+            self.selected_method = method;
+        }
+        self.page = RemoteAccessPage::EntryDetails;
+        self.error_code = None;
     }
 
     fn preferred_entry(&self) -> Option<RemoteConnectivityMethod> {
@@ -546,18 +569,17 @@ impl RemoteAccessPairing {
     fn dispatch_action(&mut self, action: RemoteAccessAction, cx: &mut Context<Self>) {
         match action {
             RemoteAccessAction::Refresh => self.refresh(cx),
+            RemoteAccessAction::ShowEntryList => {
+                self.state.show_entry_list();
+                cx.notify();
+            }
             RemoteAccessAction::SelectMethod(method) => {
-                self.state.selected_method = method;
-                self.state.selected_entry = RemoteAccessEntry::from_remote_method(method);
-                self.state.error_code = None;
+                self.state
+                    .select_connection_entry(RemoteAccessEntry::from_remote_method(method));
                 cx.notify();
             }
             RemoteAccessAction::SelectConnectionEntry(entry) => {
-                self.state.selected_entry = entry;
-                if let Some(method) = entry.remote_method() {
-                    self.state.selected_method = method;
-                }
-                self.state.error_code = None;
+                self.state.select_connection_entry(entry);
                 cx.notify();
             }
             RemoteAccessAction::EnableMethod(method) => self.enable_method(method, cx),
@@ -1432,7 +1454,6 @@ impl RemoteAccessPairing {
     }
 
     fn render_connection_entry_selector(&self, cx: &mut Context<Self>) -> AnyElement {
-        let disabled = self.has_active_pairing();
         v_flex()
             .w_full()
             .gap_2()
@@ -1441,32 +1462,18 @@ impl RemoteAccessPairing {
                     .w_full()
                     .min_w_0()
                     .gap_2()
-                    .child(self.render_connection_entry_card(
-                        RemoteAccessEntry::TailscaleServe,
-                        disabled,
-                        cx,
-                    ))
-                    .child(self.render_connection_entry_card(
-                        RemoteAccessEntry::Direct,
-                        disabled,
-                        cx,
-                    )),
+                    .child(self.render_connection_entry_card(RemoteAccessEntry::TailscaleServe, cx))
+                    .child(self.render_connection_entry_card(RemoteAccessEntry::Direct, cx)),
             )
             .child(
                 h_flex()
                     .w_full()
                     .min_w_0()
                     .gap_2()
-                    .child(self.render_connection_entry_card(
-                        RemoteAccessEntry::SelfHostedRelay,
-                        disabled,
-                        cx,
-                    ))
-                    .child(self.render_connection_entry_card(
-                        RemoteAccessEntry::LocalNetwork,
-                        disabled,
-                        cx,
-                    )),
+                    .child(
+                        self.render_connection_entry_card(RemoteAccessEntry::SelfHostedRelay, cx),
+                    )
+                    .child(self.render_connection_entry_card(RemoteAccessEntry::LocalNetwork, cx)),
             )
             .into_any_element()
     }
@@ -1474,10 +1481,10 @@ impl RemoteAccessPairing {
     fn render_connection_entry_card(
         &self,
         entry: RemoteAccessEntry,
-        disabled: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let selected = self.state.selected_entry == entry;
+        let disabled = self.has_active_pairing() && !selected;
         let entity = cx.weak_entity();
         let keyboard_entity = entity.clone();
         let action = entry
@@ -1933,16 +1940,6 @@ impl RemoteAccessPairing {
                             .text_color(status_color)
                             .child(status),
                     ),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(locale::text(
-                        "This entry does not require Tailscale, Direct, or Relay.",
-                        "此入口不依赖 Tailscale、Direct 或 Relay。",
-                        "此入口不依賴 Tailscale、Direct 或 Relay。",
-                    )),
             )
             .into_any_element()
     }
@@ -2589,16 +2586,6 @@ impl RemoteAccessPairing {
                         });
                     }),
             )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(locale::text(
-                        "The local entry is independent and does not need another remote route.",
-                        "局域网入口独立工作，不需要先启用其他远程连接。",
-                        "區域網路入口可獨立運作，不需要先啟用其他遠端連線。",
-                    )),
-            )
             .into_any_element()
     }
 }
@@ -2712,17 +2699,118 @@ impl Render for RemoteAccessPairingE2eDriver {
 impl Render for RemoteAccessPairing {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pending = self.state.pending.is_some();
+        let page = self.state.page;
         let selected_entry = self.state.selected_entry;
         let disable_entity = cx.weak_entity();
         let error = self.state.error_code.as_deref().map(remote_error_label);
         let notice = self.state.notice;
         let _safe_snapshot = self.state.safe_snapshot();
+        let is_dark = cx.theme().is_dark();
+        let popover = theme::semantic_color("popover", is_dark);
+        let popover_foreground = theme::semantic_color("popover-foreground", is_dark);
+
+        let page_heading = match page {
+            RemoteAccessPage::EntryList => h_flex()
+                .min_w_0()
+                .items_center()
+                .gap_2()
+                .child(Icon::new(IconName::Network).size(px(18.0)))
+                .child(div().text_sm().font_semibold().child(locale::text(
+                    "Connect a mobile device",
+                    "连接移动设备",
+                    "連接行動裝置",
+                )))
+                .into_any_element(),
+            RemoteAccessPage::EntryDetails => {
+                let back_entity = cx.weak_entity();
+                h_flex()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("remote-access-entry-back")
+                            .small()
+                            .ghost()
+                            .compact()
+                            .size(px(28.0))
+                            .px_0()
+                            .tooltip(locale::text("Back", "返回", "返回"))
+                            .child(Icon::new(IconName::ArrowLeft).size(px(17.0)))
+                            .on_click(move |_, _, cx| {
+                                let _ = back_entity.update(cx, |this, cx| {
+                                    this.dispatch_action(RemoteAccessAction::ShowEntryList, cx)
+                                });
+                            }),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_sm()
+                            .font_semibold()
+                            .child(connection_entry_label(selected_entry)),
+                    )
+                    .into_any_element()
+            }
+        };
+
+        let page_content = match page {
+            RemoteAccessPage::EntryList => v_flex()
+                .w_full()
+                .min_w_0()
+                .gap_3()
+                .child(step_heading(
+                    "1",
+                    locale::text("Connection entry", "连接入口", "連線入口"),
+                    locale::text(
+                        "Choose where the mobile device will connect",
+                        "选择移动设备连接到此电脑的入口",
+                        "選擇行動裝置連線到此電腦的入口",
+                    ),
+                    cx,
+                ))
+                .child(self.render_connection_entry_selector(cx))
+                .into_any_element(),
+            RemoteAccessPage::EntryDetails => v_flex()
+                .w_full()
+                .min_w_0()
+                .gap_4()
+                .child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_3()
+                        .child(step_heading(
+                            "1",
+                            locale::text("Connection settings", "连接设置", "連線設定"),
+                            connection_entry_description(selected_entry),
+                            cx,
+                        ))
+                        .child(self.render_connection_entry_panel(cx)),
+                )
+                .child(div().w_full().border_t_1().border_color(cx.theme().border))
+                .child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_3()
+                        .child(step_heading(
+                            "2",
+                            locale::text("Pair the mobile device", "配对移动设备", "配對行動裝置"),
+                            connection_entry_pairing_description(selected_entry),
+                            cx,
+                        ))
+                        .child(self.render_pairing_section(cx)),
+                )
+                .into_any_element(),
+        };
 
         v_flex()
             .id("remote-access-pairing")
             .size_full()
             .min_h_0()
             .gap_4()
+            .bg(popover)
+            .text_color(popover_foreground)
             .overflow_y_scroll()
             .pr_1()
             .pb_1()
@@ -2733,38 +2821,29 @@ impl Render for RemoteAccessPairing {
                     .items_center()
                     .justify_between()
                     .gap_3()
-                    .child(
-                        h_flex()
-                            .min_w_0()
-                            .items_center()
-                            .gap_2()
-                            .child(Icon::new(IconName::Network).size(px(18.0)))
-                            .child(div().text_sm().font_semibold().child(locale::text(
-                                "Connect a mobile device",
-                                "连接移动设备",
-                                "連接行動裝置",
-                            ))),
-                    )
-                    .child(
-                        Button::new("disable-all-remote-access")
-                            .small()
-                            .outline()
-                            .icon(IconName::Pause)
-                            .label(locale::text("Disable all", "全部停用", "全部停用"))
-                            .disabled(
-                                pending
-                                    || self
-                                        .state
-                                        .connectivity
-                                        .as_ref()
-                                        .is_none_or(|snapshot| !snapshot.desired_enabled),
-                            )
-                            .on_click(move |_, window, cx| {
-                                let _ = disable_entity.update(cx, |this, cx| {
-                                    this.present_disable_all_confirmation(window, cx)
-                                });
-                            }),
-                    ),
+                    .child(page_heading)
+                    .when(page == RemoteAccessPage::EntryDetails, |row| {
+                        row.child(
+                            Button::new("disable-all-remote-access")
+                                .small()
+                                .outline()
+                                .icon(IconName::Pause)
+                                .label(locale::text("Disable all", "全部停用", "全部停用"))
+                                .disabled(
+                                    pending
+                                        || self
+                                            .state
+                                            .connectivity
+                                            .as_ref()
+                                            .is_none_or(|snapshot| !snapshot.desired_enabled),
+                                )
+                                .on_click(move |_, window, cx| {
+                                    let _ = disable_entity.update(cx, |this, cx| {
+                                        this.present_disable_all_confirmation(window, cx)
+                                    });
+                                }),
+                        )
+                    }),
             )
             .when_some(error, |column, error| {
                 column.child(
@@ -2808,38 +2887,7 @@ impl Render for RemoteAccessPairing {
                         .child(div().text_xs().text_color(cx.theme().success).child(notice)),
                 )
             })
-            .child(
-                v_flex()
-                    .w_full()
-                    .min_w_0()
-                    .gap_3()
-                    .child(step_heading(
-                        "1",
-                        locale::text("Connection entry", "连接入口", "連線入口"),
-                        locale::text(
-                            "Choose where the mobile device will connect",
-                            "选择移动设备连接到此电脑的入口",
-                            "選擇行動裝置連線到此電腦的入口",
-                        ),
-                        cx,
-                    ))
-                    .child(self.render_connection_entry_selector(cx))
-                    .child(self.render_connection_entry_panel(cx)),
-            )
-            .child(div().w_full().border_t_1().border_color(cx.theme().border))
-            .child(
-                v_flex()
-                    .w_full()
-                    .min_w_0()
-                    .gap_3()
-                    .child(step_heading(
-                        "2",
-                        locale::text("Pair the mobile device", "配对移动设备", "配對行動裝置"),
-                        connection_entry_pairing_description(selected_entry),
-                        cx,
-                    ))
-                    .child(self.render_pairing_section(cx)),
-            )
+            .child(page_content)
     }
 }
 
@@ -2859,8 +2907,11 @@ pub(crate) fn open_remote_access_pairing(
     let viewport = window.viewport_size();
     let dialog_width = (f32::from(viewport.width) - 32.0).clamp(280.0, DIALOG_MAX_WIDTH);
     let dialog_height = (f32::from(viewport.height) - 32.0).clamp(360.0, DIALOG_MAX_HEIGHT);
-    window.open_dialog(cx, move |dialog, _, _| {
+    window.open_dialog(cx, move |dialog, _, cx| {
         let close_view = close_view.clone();
+        let is_dark = cx.theme().is_dark();
+        let popover = theme::semantic_color("popover", is_dark);
+        let popover_foreground = theme::semantic_color("popover-foreground", is_dark);
         dialog
             .title(locale::text(
                 "Connect a mobile device",
@@ -2870,6 +2921,11 @@ pub(crate) fn open_remote_access_pairing(
             .w(px(dialog_width))
             .max_w(px(dialog_width))
             .h(px(dialog_height))
+            .rounded(px(14.0))
+            .bg(popover)
+            .text_color(popover_foreground)
+            .border_color(popover_foreground.opacity(0.10))
+            .overlay(true)
             .overlay_closable(true)
             .keyboard(true)
             .child(view.clone())
@@ -3764,6 +3820,24 @@ mod tests {
         );
         assert_eq!(connection_entry_index(RemoteAccessEntry::LocalNetwork), 3);
         assert!(RemoteAccessEntry::LocalNetwork.remote_method().is_none());
+    }
+
+    #[test]
+    fn connection_entry_navigation_opens_details_and_returns_to_the_list() {
+        let mut state = PairingViewState::default();
+        assert_eq!(state.page, RemoteAccessPage::EntryList);
+
+        state.select_connection_entry(RemoteAccessEntry::LocalNetwork);
+        assert_eq!(state.page, RemoteAccessPage::EntryDetails);
+        assert_eq!(state.selected_entry, RemoteAccessEntry::LocalNetwork);
+
+        state.show_entry_list();
+        assert_eq!(state.page, RemoteAccessPage::EntryList);
+        assert_eq!(state.selected_entry, RemoteAccessEntry::LocalNetwork);
+
+        state.select_connection_entry(RemoteAccessEntry::Direct);
+        assert_eq!(state.page, RemoteAccessPage::EntryDetails);
+        assert_eq!(state.selected_method, RemoteConnectivityMethod::Direct);
     }
 
     #[test]
