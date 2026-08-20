@@ -38,7 +38,7 @@ const OFFER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const QR_QUIET_ZONE_MODULES: usize = 4;
 const QR_MODULE_SCALE: usize = 4;
 const DIALOG_MAX_WIDTH: f32 = 760.0;
-const DIALOG_MAX_HEIGHT: f32 = 720.0;
+const DIALOG_MAX_HEIGHT: f32 = 400.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteAccessMutation {
@@ -2709,65 +2709,33 @@ impl Render for RemoteAccessPairing {
         let popover = theme::semantic_color("popover", is_dark);
         let popover_foreground = theme::semantic_color("popover-foreground", is_dark);
 
-        let page_heading = match page {
-            RemoteAccessPage::EntryList => h_flex()
-                .min_w_0()
-                .items_center()
-                .gap_2()
-                .child(Icon::new(IconName::Network).size(px(18.0)))
-                .child(div().text_sm().font_semibold().child(locale::text(
-                    "Connect a mobile device",
-                    "连接移动设备",
-                    "連接行動裝置",
-                )))
-                .into_any_element(),
-            RemoteAccessPage::EntryDetails => {
-                let back_entity = cx.weak_entity();
-                h_flex()
-                    .min_w_0()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Button::new("remote-access-entry-back")
-                            .small()
-                            .ghost()
-                            .compact()
-                            .size(px(28.0))
-                            .px_0()
-                            .tooltip(locale::text("Back", "返回", "返回"))
-                            .child(Icon::new(IconName::ArrowLeft).size(px(17.0)))
-                            .on_click(move |_, _, cx| {
-                                let _ = back_entity.update(cx, |this, cx| {
-                                    this.dispatch_action(RemoteAccessAction::ShowEntryList, cx)
-                                });
-                            }),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .text_sm()
-                            .font_semibold()
-                            .child(connection_entry_label(selected_entry)),
-                    )
-                    .into_any_element()
-            }
-        };
+        let back_entity = cx.weak_entity();
 
         let page_content = match page {
             RemoteAccessPage::EntryList => v_flex()
                 .w_full()
                 .min_w_0()
                 .gap_3()
-                .child(step_heading(
-                    "1",
-                    locale::text("Connection entry", "连接入口", "連線入口"),
-                    locale::text(
-                        "Choose where the mobile device will connect",
-                        "选择移动设备连接到此电脑的入口",
-                        "選擇行動裝置連線到此電腦的入口",
-                    ),
-                    cx,
-                ))
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .gap_1()
+                        .child(div().text_sm().font_semibold().child(locale::text(
+                            "Connection entry",
+                            "连接入口",
+                            "連線入口",
+                        )))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(locale::text(
+                                    "Choose where the mobile device will connect",
+                                    "选择移动设备连接到此电脑的入口",
+                                    "選擇行動裝置連線到此電腦的入口",
+                                )),
+                        ),
+                )
                 .child(self.render_connection_entry_selector(cx))
                 .into_any_element(),
             RemoteAccessPage::EntryDetails => v_flex()
@@ -2814,16 +2782,46 @@ impl Render for RemoteAccessPairing {
             .overflow_y_scroll()
             .pr_1()
             .pb_1()
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .child(page_heading)
-                    .when(page == RemoteAccessPage::EntryDetails, |row| {
-                        row.child(
+            .when(page == RemoteAccessPage::EntryDetails, |column| {
+                column.child(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            h_flex()
+                                .min_w_0()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    Button::new("remote-access-entry-back")
+                                        .small()
+                                        .ghost()
+                                        .compact()
+                                        .size(px(28.0))
+                                        .px_0()
+                                        .tooltip(locale::text("Back", "返回", "返回"))
+                                        .child(Icon::new(IconName::ArrowLeft).size(px(17.0)))
+                                        .on_click(move |_, _, cx| {
+                                            let _ = back_entity.update(cx, |this, cx| {
+                                                this.dispatch_action(
+                                                    RemoteAccessAction::ShowEntryList,
+                                                    cx,
+                                                )
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .text_sm()
+                                        .font_semibold()
+                                        .child(connection_entry_label(selected_entry)),
+                                ),
+                        )
+                        .child(
                             Button::new("disable-all-remote-access")
                                 .small()
                                 .outline()
@@ -2842,9 +2840,9 @@ impl Render for RemoteAccessPairing {
                                         this.present_disable_all_confirmation(window, cx)
                                     });
                                 }),
-                        )
-                    }),
-            )
+                        ),
+                )
+            })
             .when_some(error, |column, error| {
                 column.child(
                     h_flex()
@@ -3807,6 +3805,10 @@ mod tests {
         let wide = (1_440.0_f32 - 32.0).clamp(280.0, DIALOG_MAX_WIDTH);
         assert_eq!(narrow, 328.0);
         assert_eq!(wide, DIALOG_MAX_WIDTH);
+        assert_eq!(
+            (900.0_f32 - 32.0).clamp(360.0, DIALOG_MAX_HEIGHT),
+            DIALOG_MAX_HEIGHT
+        );
     }
 
     #[test]
