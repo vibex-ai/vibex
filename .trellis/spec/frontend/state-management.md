@@ -1249,6 +1249,12 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   with a fixed 4 px visual gap. Upward menus may overlay non-trigger Composer
   content; offsetting them beyond the complete Composer surface leaves an
   excessive gap from the control that opened them.
+- GPUI mouse/key callbacks must not synchronously dispatch another action or
+  keystroke through a `cx.listener` for the entity that owns the callback.
+  `cx.listener` holds that entity's update while the dispatch can run focus or
+  action listeners back through the same entity, which violates GPUI's update
+  guard and can panic. Use a plain window callback for an independent target, or
+  defer the dispatch until the active update has unwound.
 - Native Composer cut and paste must use the history-recording InputState edit
   path. Calling a `*_silent` replacement from clipboard actions makes Ctrl+Z
   undo an older IME/text edit and prevents Ctrl+Y/Ctrl+Shift+Z from restoring

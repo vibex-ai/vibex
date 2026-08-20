@@ -11190,11 +11190,14 @@ impl CodeRightRail {
                     .h(px(42.0))
                     .gap_1p5()
                     .px_2()
-                    .capture_any_mouse_down(cx.listener(|_, _, window, cx| {
+                    .capture_any_mouse_down(|_, window, cx| {
                         // Select popovers are deferred overlays. Close the currently focused
-                        // one during capture so the next filter opens on the same click.
+                        // one during capture so the next filter opens on the same click. Keep
+                        // this as a plain window callback: wrapping it in `cx.listener` would
+                        // hold a CodeRightRail update while dispatching Escape and re-enter the
+                        // same entity through GPUI's action/focus path.
                         let _ = window.dispatch_keystroke(Keystroke::parse("escape").unwrap(), cx);
-                    }))
+                    })
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .child(div().min_w_0().flex_1().child(branch_select))
@@ -14433,6 +14436,22 @@ mod tests {
         assert_eq!((choices[0].incoming, choices[0].outgoing), (1, 3));
         assert_eq!(choices[1].name, "feature");
         assert_eq!((choices[1].incoming, choices[1].outgoing), (4, 2));
+    }
+
+    #[test]
+    fn git_history_filter_dismissal_does_not_reenter_the_right_rail() {
+        let source = include_str!("code_workbench.rs");
+        let history_renderer = source
+            .split_once("    fn render_git_history(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn render_git_history_drawer_resize_handle")
+            })
+            .map(|(body, _)| body)
+            .expect("git history renderer should remain inspectable");
+
+        assert!(history_renderer.contains(".capture_any_mouse_down(|_, window, cx|"));
+        assert!(!history_renderer.contains(".capture_any_mouse_down(cx.listener"));
+        assert!(history_renderer.contains("window.dispatch_keystroke"));
     }
 
     #[test]
