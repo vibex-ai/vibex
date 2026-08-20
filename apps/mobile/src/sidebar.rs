@@ -413,7 +413,7 @@ mod tests {
             workspace_mode: WorkspaceMode::CurrentCheckout,
             agent_id: AgentId::parse("claude").expect("valid agent id"),
             state: AgentSessionState::Idle,
-            safety: AgentSessionSafety::default(),
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
             created_at_ms: 0,
             updated_at_ms: 0,
             last_message_at_ms: 0,
@@ -466,7 +466,8 @@ mod tests {
     #[test]
     fn a_collapsed_project_hides_its_sessions_until_a_search_expands_it() {
         let mut view = SidebarOrganizationView::default();
-        view.collapsed_project_ids.insert("project_project".to_string());
+        view.collapsed_project_ids
+            .insert("project_project".to_string());
         let projects = vec![SidebarProject {
             id: "project_project".to_string(),
             label: "vibex".to_string(),
@@ -503,10 +504,20 @@ mod tests {
             session("session-a", "project", "Kept"),
             session("session-b", "project", "Filed"),
         ];
+        let projects = session_projects(&sessions);
+        view.organization.reconcile(
+            &["project_project".to_string()],
+            &projects
+                .iter()
+                .map(|(session_id, project_id)| (session_id.clone(), project_id.clone()))
+                .collect::<Vec<_>>(),
+        );
         assert!(view.organization.move_many_into(
-            &[SidebarOrganizationItem::Session("session_session-b".to_string())],
+            &[SidebarOrganizationItem::Session(
+                "session_session-b".to_string()
+            )],
             "folder",
-            &session_projects(&sessions),
+            &projects,
         ));
         let rows = sidebar_rows(SidebarRowInput {
             view: &view,
@@ -595,6 +606,102 @@ mod tests {
         assert_eq!(
             ancestors_of(&rows, 3),
             BTreeSet::from(["inner".to_string(), "outer".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_root_folder_nests_projects_and_survives_a_missing_folder_record() {
+        let mut view = SidebarOrganizationView::default();
+        assert!(view.organization.create_folder("root", "Work", None, None));
+        let projects = vec![SidebarProject {
+            id: "project_project".to_string(),
+            label: "vibex".to_string(),
+        }];
+        view.organization
+            .reconcile(&["project_project".to_string()], &[]);
+        assert!(view.organization.move_many_into(
+            &[SidebarOrganizationItem::Project(
+                "project_project".to_string()
+            )],
+            "root",
+            &BTreeMap::new(),
+        ));
+        let rows = sidebar_rows(SidebarRowInput {
+            view: &view,
+            projects: &projects,
+            sessions: &[],
+            selected_session_id: None,
+            query: "",
+        });
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.kind, row.depth))
+                .collect::<Vec<_>>(),
+            vec![(SidebarRowKind::Folder, 0), (SidebarRowKind::Project, 1)]
+        );
+
+        // A snapshot can name a folder it no longer carries if the desktop
+        // pruned it mid-flight. Adopting it must return the project to the root
+        // rather than orphan it out of the tree.
+        let mut snapshot = view.to_remote();
+        snapshot.folders.clear();
+        let repaired = SidebarOrganizationView::from_remote(&snapshot);
+        let rows = sidebar_rows(SidebarRowInput {
+            view: &repaired,
+            projects: &projects,
+            sessions: &[],
+            selected_session_id: None,
+            query: "",
+        });
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.kind, row.depth))
+                .collect::<Vec<_>>(),
+            vec![(SidebarRowKind::Project, 0)]
+        );
+    }
+
+    #[test]
+    fn a_collapsed_folder_hides_its_children() {
+        let mut view = SidebarOrganizationView::default();
+        assert!(view.organization.create_folder(
+            "folder",
+            "Archive",
+            Some("project_project".to_string()),
+            None
+        ));
+        let sessions = vec![session("session-a", "project", "Filed")];
+        let projects = session_projects(&sessions);
+        view.organization.reconcile(
+            &["project_project".to_string()],
+            &projects
+                .iter()
+                .map(|(session_id, project_id)| (session_id.clone(), project_id.clone()))
+                .collect::<Vec<_>>(),
+        );
+        assert!(view.organization.move_many_into(
+            &[SidebarOrganizationItem::Session(
+                "session_session-a".to_string()
+            )],
+            "folder",
+            &projects,
+        ));
+        view.organization
+            .collapsed_folder_ids
+            .insert("folder".to_string());
+        let rows = sidebar_rows(SidebarRowInput {
+            view: &view,
+            projects: &[SidebarProject {
+                id: "project_project".to_string(),
+                label: "vibex".to_string(),
+            }],
+            sessions: &sessions,
+            selected_session_id: None,
+            query: "",
+        });
+        assert_eq!(
+            rows.iter().map(|row| row.kind).collect::<Vec<_>>(),
+            vec![SidebarRowKind::Project, SidebarRowKind::Folder]
         );
     }
 

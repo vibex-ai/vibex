@@ -86,6 +86,11 @@ pub const RADIUS_CONTROL: f32 = 6.0;
 
 pub const DRAWER_ROW_HEIGHT: f32 = 52.0;
 pub const SIDEBAR_ROW_HEIGHT: f32 = 40.0;
+/// Indent per tree level, matching the desktop's nested sidebar spacing.
+pub const SIDEBAR_INDENT: f32 = 14.0;
+/// Width of the drag handle column on the right of every sidebar row. A pan
+/// that starts here moves the row; anywhere else it scrolls the list.
+pub const SIDEBAR_GRIP_WIDTH: f32 = 34.0;
 pub const DRAWER_ACTION_HEIGHT: f32 = 40.0;
 pub const DRAWER_SECTION_HEIGHT: f32 = 40.0;
 pub const DRAWER_DRAG_THRESHOLD: f32 = 6.0;
@@ -138,6 +143,10 @@ pub fn border_subtle() -> Hsla {
 
 pub fn row_pressed_bg() -> Hsla {
     hsla(0.0, 0.0, 1.0, 0.10)
+}
+
+pub fn sidebar_drop_bg() -> Hsla {
+    hsla(0.58, 0.9, 0.6, 0.18)
 }
 
 pub fn workbench_bg() -> Hsla {

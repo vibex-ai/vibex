@@ -3540,6 +3540,52 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    use vibex_core::{
+        RemoteSidebarDropPosition, RemoteSidebarItemKind, RemoteSidebarItemRef,
+        RemoteSidebarOrganizationMutateRequest, RemoteSidebarOrganizationRequest,
+    };
+
+    struct TestSidebarOrganizationSource {
+        snapshot: Mutex<RemoteSidebarOrganizationSnapshot>,
+        mutations: Mutex<Vec<RemoteSidebarOrganizationMutation>>,
+    }
+
+    impl TestSidebarOrganizationSource {
+        fn new() -> Self {
+            Self {
+                snapshot: Mutex::new(RemoteSidebarOrganizationSnapshot {
+                    revision: 4,
+                    ..RemoteSidebarOrganizationSnapshot::default()
+                }),
+                mutations: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RemoteSidebarOrganizationSource for TestSidebarOrganizationSource {
+        async fn sidebar_organization(&self) -> VibexResult<RemoteSidebarOrganizationSnapshot> {
+            Ok(self.snapshot.lock().unwrap().clone())
+        }
+
+        async fn mutate_sidebar_organization(
+            &self,
+            mutation: RemoteSidebarOrganizationMutation,
+            expected_revision: Option<u64>,
+        ) -> VibexResult<RemoteSidebarOrganizationSnapshot> {
+            let mut snapshot = self.snapshot.lock().unwrap();
+            if expected_revision.is_some_and(|revision| revision != snapshot.revision) {
+                return Err(VibexError::validation(
+                    "remote_sidebar_organization_stale_revision",
+                    "stale",
+                ));
+            }
+            self.mutations.lock().unwrap().push(mutation);
+            snapshot.revision += 1;
+            Ok(snapshot.clone())
+        }
+    }
+
     struct TestRuntimeProbeSource {
         record: Mutex<vibex_core::AgentRuntimeProbeRecord>,
         start_calls: AtomicUsize,
@@ -4543,6 +4589,86 @@ mod tests {
         assert_eq!(payload.catalog.options[0].agent_label, "Codex");
         assert_eq!(source.calls.load(Ordering::SeqCst), 1);
         assert!(!encoded.contains(&reader.auth_token));
+        cleanup_db(db_path);
+    }
+
+    #[tokio::test]
+    async fn sidebar_organization_reads_are_served_but_moves_need_mutate_permission() {
+        let (db_path, manager) = test_agent_manager("sidebar-organization");
+        let reader = pair_device(&db_path, RemoteDevicePermissionLevel::ReadOnly, "Reader");
+        let controller = pair_device(
+            &db_path,
+            RemoteDevicePermissionLevel::FullControl,
+            "Controller",
+        );
+        let source = Arc::new(TestSidebarOrganizationSource::new());
+        let dispatcher =
+            RemoteDispatcher::with_agent_manager(RemoteServiceConfig::loopback_disabled(), manager)
+                .with_sidebar_organization_source(source.clone());
+        let router = build_router_with_dispatcher(dispatcher);
+
+        let response = post_agent(
+            router.clone(),
+            RemoteAgentRequest::GetSidebarOrganization(RemoteSidebarOrganizationRequest {
+                auth: reader.clone(),
+            }),
+        )
+        .await;
+        let payload: RemoteSidebarOrganizationResponse =
+            serde_json::from_value(response.payload.unwrap()).unwrap();
+        assert_eq!(payload.snapshot.revision, 4);
+
+        let move_items = || RemoteSidebarOrganizationMutation::MoveItems {
+            items: vec![RemoteSidebarItemRef {
+                kind: RemoteSidebarItemKind::Session,
+                id: "session".to_string(),
+            }],
+            anchor: None,
+            position: RemoteSidebarDropPosition::After,
+            project_id: None,
+        };
+
+        // A read-only device may render the tree but not rearrange it.
+        let rejected = post_agent(
+            router.clone(),
+            RemoteAgentRequest::MutateSidebarOrganization(RemoteSidebarOrganizationMutateRequest {
+                auth: reader.clone(),
+                mutation: move_items(),
+                expected_revision: Some(4),
+            }),
+        )
+        .await;
+        assert!(rejected.error.is_some());
+        assert!(source.mutations.lock().unwrap().is_empty());
+
+        // A drag aimed at a layout the desktop has since changed is refused.
+        let stale = post_agent(
+            router.clone(),
+            RemoteAgentRequest::MutateSidebarOrganization(RemoteSidebarOrganizationMutateRequest {
+                auth: controller.clone(),
+                mutation: move_items(),
+                expected_revision: Some(99),
+            }),
+        )
+        .await;
+        assert_eq!(
+            stale.error.map(|error| error.code),
+            Some("remote_sidebar_organization_stale_revision".to_string())
+        );
+
+        let accepted = post_agent(
+            router,
+            RemoteAgentRequest::MutateSidebarOrganization(RemoteSidebarOrganizationMutateRequest {
+                auth: controller,
+                mutation: move_items(),
+                expected_revision: Some(4),
+            }),
+        )
+        .await;
+        let payload: RemoteSidebarOrganizationResponse =
+            serde_json::from_value(accepted.payload.unwrap()).unwrap();
+        assert_eq!(payload.snapshot.revision, 5);
+        assert_eq!(source.mutations.lock().unwrap().len(), 1);
         cleanup_db(db_path);
     }
 
