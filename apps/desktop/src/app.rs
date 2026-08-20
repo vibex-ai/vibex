@@ -15500,6 +15500,10 @@ impl VibexWorkbench {
         self.agent_overview_generation = self.agent_overview_generation.wrapping_add(1);
         self.optimistically_removed_session_ids
             .extend(session_ids.iter().cloned());
+        let deleting_selected_session = self
+            .selected_session_id
+            .as_ref()
+            .is_some_and(|session_id| session_ids.contains(session_id.as_str()));
         self.sessions
             .retain(|session| !session_ids.contains(session.id.as_str()));
         self.agent_session_view_cache
@@ -15520,6 +15524,26 @@ impl VibexWorkbench {
             .is_some_and(|target| session_ids.contains(target.session_id.as_str()))
         {
             self.pending_session_search_jump = None;
+        }
+        if deleting_selected_session {
+            // The sidebar is updated optimistically, so the active workbench
+            // must be invalidated in the same transaction. Otherwise the
+            // removed session's timeline remains rendered until the
+            // authoritative overview refresh completes.
+            self.session_generation = self.session_generation.saturating_add(1);
+            self.selected_session_id = None;
+            self.timeline = TimelineModel::default();
+            self.timeline_scroll = VirtualListScrollHandle::new();
+            self.timeline_row_sizes = Rc::new(Vec::new());
+            self.invalidate_timeline_render_caches();
+            self.runtime_selection = None;
+            self.token_usage = None;
+            self.agent_loading = false;
+            self.agent_turn_pending = false;
+            self.composer_input_session_id = None;
+            self.composer_attachments.clear();
+            self.composer_command_entry = None;
+            self.clear_suggestions();
         }
         self.reconcile_sidebar_state();
     }
@@ -42629,6 +42653,9 @@ mod tests {
         assert!(optimistic_state.contains("self.optimistically_removed_session_ids"));
         assert!(optimistic_state.contains("self.agent_session_view_cache"));
         assert!(optimistic_state.contains("self.agent_session_view_lru"));
+        assert!(optimistic_state.contains("self.selected_session_id = None;"));
+        assert!(optimistic_state.contains("self.timeline = TimelineModel::default();"));
+        assert!(optimistic_state.contains("self.invalidate_timeline_render_caches();"));
         assert!(optimistic_state.contains("self.reconcile_sidebar_state();"));
 
         let completion = source
