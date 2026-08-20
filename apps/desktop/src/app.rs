@@ -20589,6 +20589,9 @@ impl VibexWorkbench {
         let session_id_string = session.id.as_str().to_string();
         let display_state =
             sidebar_session_display_state(session.state, self.session_turn_pending(&session.id));
+        let show_worktree_status = self.ui_state.sidebar.hierarchy_mode
+            == SidebarHierarchyMode::Detailed
+            && !show_worktree_identity;
         let session_item = SidebarOrganizationItem::Session(session_id_string.clone());
         let move_selected = self.sidebar_move_selected_items.contains(&session_item);
         let drag_session_ids = self
@@ -20725,7 +20728,9 @@ impl VibexWorkbench {
                                     ),
                             )
                         })
-                        .child(sidebar_session_status_indicator(display_state, cx))
+                        .when(show_worktree_status, |this| {
+                            this.child(sidebar_session_status_indicator(display_state, cx))
+                        })
                         .child(sidebar_agent_logo(sidebar_agent_id.as_str(), selected, cx))
                         .child(
                             Input::new(&self.sidebar_rename_input)
@@ -21110,7 +21115,9 @@ impl VibexWorkbench {
                                         ),
                                 )
                             })
-                            .child(sidebar_session_status_indicator(display_state, cx))
+                            .when(show_worktree_status, |this| {
+                                this.child(sidebar_session_status_indicator(display_state, cx))
+                            })
                             .child(sidebar_agent_logo(sidebar_agent_id.as_str(), selected, cx))
                             .child(
                                 div()
@@ -44632,6 +44639,10 @@ mod tests {
                 .contains("let session_generating = display_state == AgentSessionState::Running;")
         );
         assert!(sidebar_session.contains("self.session_turn_pending(&session.id)"));
+        assert!(sidebar_session.contains("let show_worktree_status ="));
+        assert!(sidebar_session.contains("self.ui_state.sidebar.hierarchy_mode"));
+        assert!(sidebar_session.contains("SidebarHierarchyMode::Detailed"));
+        assert!(sidebar_session.contains(".when(show_worktree_status, |this|"));
         assert!(!sidebar_session.contains("selected, self.agent_turn_pending"));
         assert!(sidebar_session.contains(".when(session_generating, |this|"));
         assert!(sidebar_session.contains("Spinner::new()"));
