@@ -7343,16 +7343,6 @@ impl VibexWorkbench {
         };
 
         if organization_changed || legacy_order_changed {
-            if organization_changed
-                && target.position == SidebarOrganizationDropPosition::Into
-                && let SidebarOrganizationItem::Folder(folder_id) = &target.target
-            {
-                self.ui_state
-                    .sidebar
-                    .organization
-                    .collapsed_folder_ids
-                    .remove(folder_id);
-            }
             self.queue_ui_state();
             self.invalidate_sidebar_projection_cache();
         }
@@ -20400,13 +20390,6 @@ impl VibexWorkbench {
                 .text_color(cx.theme().success)
                 .into_any_element()
         };
-        let card_border = if selected {
-            cx.theme().sidebar_accent.opacity(0.80)
-        } else if lifecycle_error || projection.agent_summary.failed > 0 {
-            cx.theme().danger.opacity(0.48)
-        } else {
-            cx.theme().sidebar_border.opacity(0.58)
-        };
         let card_background = if selected {
             cx.theme().sidebar_accent.opacity(0.16)
         } else {
@@ -20533,6 +20516,10 @@ impl VibexWorkbench {
                     })),
             );
 
+        if collapsed {
+            return row.into_any_element();
+        }
+
         let mut sessions = self.render_sidebar_workspace_children(
             projection,
             None,
@@ -20549,25 +20536,21 @@ impl VibexWorkbench {
             .w_full()
             .min_w_0()
             .gap(px(5.0))
-            .border_1()
-            .border_color(card_border)
+            .overflow_x_hidden()
             .rounded(px(10.0))
             .bg(card_background)
             .p(px(4.0))
             .child(row)
-            .when(!collapsed, |this| {
-                this.child(
-                    v_flex()
-                        .w_full()
-                        .min_w_0()
-                        .gap(px(2.0))
-                        .ml(px(18.0))
-                        .pl_2()
-                        .border_l_1()
-                        .border_color(cx.theme().sidebar_border.opacity(0.42))
-                        .children(sessions),
-                )
-            })
+            .child(
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap(px(2.0))
+                    .pl(px(20.0))
+                    .border_l_1()
+                    .border_color(cx.theme().sidebar_border.opacity(0.42))
+                    .children(sessions),
+            )
             .into_any_element()
     }
 
@@ -41628,9 +41611,12 @@ mod tests {
             .map(|(body, _)| body)
             .expect("thinking indicator renderer should remain inspectable");
 
-        assert!(!renderer.contains(".with_animation("));
-        assert!(renderer.contains(".truncate()"));
-        assert!(renderer.contains(".child(label)"));
+        assert!(renderer.contains(".with_animation("));
+        assert!(renderer.contains("shimmer_color("));
+        assert!(renderer.contains("truncate_agent_thinking_label(label)"));
+        assert!(!renderer.contains("ScrollHandle"));
+        assert!(!renderer.contains("set_offset"));
+        assert!(!renderer.contains("overflow_x_scroll"));
         assert!(renderer.contains("Tooltip::new(tooltip.clone())"));
     }
 
@@ -44458,6 +44444,19 @@ mod tests {
         assert!(drag.contains(".flat_map(|group| &group.workspaces)"));
         assert!(drop.contains("ordered_sidebar_session_projects()"));
         assert!(drop.contains("if organization_changed || legacy_order_changed"));
+    }
+
+    #[test]
+    fn sidebar_organization_drop_preserves_target_folder_collapsed_state() {
+        let source = include_str!("app.rs");
+        let drop = source
+            .split_once("    fn apply_sidebar_organization_drop(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn sidebar_organization_drop_position("))
+            .map(|(body, _)| body)
+            .expect("organization drop should remain inspectable");
+
+        assert!(drop.contains("SidebarOrganizationDropPosition::Into"));
+        assert!(!drop.contains("collapsed_folder_ids"));
     }
 
     #[test]
@@ -48134,6 +48133,29 @@ mod tests {
         assert!(sidebar.contains("SidebarHierarchyMode::Detailed"));
         assert!(sidebar.contains("NewSessionOpenTarget::Workspace"));
         assert!(sidebar.contains("icons/vibex/git-branch.svg"));
+    }
+
+    #[test]
+    fn detailed_worktree_cards_only_wrap_expanded_workspace_rows() {
+        let source = include_str!("app.rs");
+        let workspace = source
+            .split_once("    fn render_sidebar_workspace(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_session("))
+            .map(|(body, _)| body)
+            .expect("sidebar workspace renderer should remain inspectable");
+        let collapsed_guard = workspace
+            .find("if collapsed {")
+            .expect("collapsed worktree rows should bypass the card wrapper");
+        let session_render = workspace
+            .find("let mut sessions = self.render_sidebar_workspace_children(")
+            .expect("expanded worktrees should render their sessions");
+
+        assert!(collapsed_guard < session_render);
+        assert!(workspace.contains("return row.into_any_element();"));
+        assert!(workspace.contains(".bg(card_background)"));
+        assert!(workspace.contains(".pl(px(20.0))"));
+        assert!(!workspace.contains(".ml(px(18.0))"));
+        assert!(!workspace.contains(".border_1()"));
     }
 
     #[test]
