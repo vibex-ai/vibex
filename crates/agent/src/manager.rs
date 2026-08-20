@@ -2220,6 +2220,21 @@ impl AgentManager {
         let session = SessionRepository::get(&conn, session_id)?.ok_or_else(|| {
             VibexError::validation("session_not_found", "Agent session was not found")
         })?;
+        if !matches!(
+            session.state,
+            AgentSessionState::Running | AgentSessionState::NeedsInput
+        ) {
+            let cancelled = MessageSubmissionRepository::cancel_before_dispatch_for_session(
+                &mut conn,
+                &session.id,
+            )?;
+            if !cancelled.is_empty() {
+                for item in cancelled {
+                    self.publish_timeline_item(item)?;
+                }
+                return Ok(());
+            }
+        }
         let runtime_state = AgentSessionRuntimeRepository::get_runtime_state(&conn, &session.id)?;
         let (selection, binding, _identity, route_key) = match self
             .durable_session_execution(&conn, &session)
@@ -2233,11 +2248,8 @@ impl AgentManager {
                             .as_ref()
                             .is_some_and(|state| state.current_binding_id.is_none())) =>
             {
-                // A deferred first prompt can still be waiting for its initial
-                // runtime switch after a session snapshot has been projected as
-                // Running by the desktop. A missing committed binding proves
-                // that no provider turn can have started, so the durable
-                // submission status is the authoritative cancellation fence.
+                // Close the race with a submission that was persisted after the
+                // first cancellation lookup but before the runtime snapshot.
                 let cancelled = MessageSubmissionRepository::cancel_before_dispatch_for_session(
                     &mut conn,
                     &session.id,
@@ -5491,6 +5503,108 @@ mod tests {
                 ..
             }] if text == "hello"
         ));
+
+        drop(conn);
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn interrupt_cancels_ready_runtime_prompt_before_dispatch() {
+        let db_path = temp_db_path("interrupt-ready-runtime-before-dispatch");
+        let workspace_root = temp_workspace_path("interrupt-ready-runtime-before-dispatch");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let manager = AgentManager::new(&db_path).unwrap();
+        let mut conn = manager.open_migrated().unwrap();
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let agent_id = AgentId::parse("claude").unwrap();
+        let session = insert_session(
+            &conn,
+            "interrupt ready runtime before dispatch",
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            agent_id.clone(),
+            AgentSessionState::Idle,
+        );
+        let selection = SessionRuntimeSelection::provider(
+            agent_id.clone(),
+            ProviderProfileId::parse("provider_acp_claude").unwrap(),
+            "claude-test-model",
+        );
+        let mut runtime_config = SessionRuntimeConfigState {
+            preferred_model: selection.model_id().map(str::to_string),
+            effective_model: selection.model_id().map(str::to_string),
+            ..SessionRuntimeConfigState::default()
+        };
+        runtime_config.mark_generation_if_converged(0);
+        let now = unix_timestamp_ms();
+        let binding = RuntimeBinding {
+            binding_id: RuntimeBindingId::new(),
+            session_id: session.id.clone(),
+            agent_id,
+            transport_kind: TransportKind::Acp,
+            auth_source: selection.auth_source.clone(),
+            auth_source_revision: 1,
+            adapter_id: AcpAdapterId::parse("claude-agent-acp").unwrap(),
+            adapter_version: "1.0.0".to_string(),
+            adapter_compatibility_identity: "claude-agent-acp@1".to_string(),
+            native_session_id: Some("native-ready-before-dispatch".to_string()),
+            native_state_home_id: NativeStateHomeId::new(),
+            provider_resume_identity: None,
+            process_spawn_fingerprint: "ready-before-dispatch".to_string(),
+            session_runtime_config_state: runtime_config,
+            capability_snapshot: None,
+            restore_compatibility_key: None,
+            last_context_sequence: 0,
+            last_summary_sequence: 0,
+            context_bridge_version: 0,
+            activation_generation: 0,
+            binding_state: BindingState::Current,
+            created_by_switch_id: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        AgentSessionRuntimeRepository::initialize_runtime_selection(
+            &mut conn, &binding, &selection,
+        )
+        .unwrap();
+        let submission = MessageSubmissionRepository::enqueue(
+            &mut conn,
+            MessageSubmissionId::new(),
+            &SendAgentMessageRequest {
+                session_id: session.id.clone(),
+                message_idempotency_key: "ready-prompt".to_string(),
+                desired_runtime: selection,
+                text: "hello".to_string(),
+                attachments: Vec::new(),
+                reasoning_effort: None,
+                correlation_id: None,
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        manager.interrupt(&session.id).await.unwrap();
+
+        let conn = manager.open_migrated().unwrap();
+        let cancelled = MessageSubmissionRepository::get(&conn, &submission.submission_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.status, MessageSubmissionStatus::Cancelled);
+        assert_eq!(
+            cancelled.error_code.as_deref(),
+            Some("message_submission_interrupted_before_dispatch")
+        );
+        assert_eq!(
+            AgentSessionRuntimeRepository::get_runtime_state(&conn, &session.id)
+                .unwrap()
+                .unwrap()
+                .effective_runtime_selection,
+            Some(cancelled.desired_runtime_selection)
+        );
 
         drop(conn);
         cleanup_db(&db_path);

@@ -222,8 +222,19 @@ impl MessageSubmissionCoordinator {
 
     pub async fn submit(
         self: &Arc<Self>,
-        mut request: SendAgentMessageRequest,
+        request: SendAgentMessageRequest,
     ) -> VibexResult<Vec<TimelineItem>> {
+        let submission_id = self.prepare_submission(request)?;
+        self.wait_for_submission(&submission_id).await
+    }
+
+    /// Persists a message before its worker is allowed to dispatch it. Callers
+    /// that expose an optimistic turn can use this as the cancellation fence,
+    /// then start the worker with `wait_for_submission`.
+    pub fn prepare_submission(
+        self: &Arc<Self>,
+        mut request: SendAgentMessageRequest,
+    ) -> VibexResult<MessageSubmissionId> {
         request.message_idempotency_key = request.message_idempotency_key.trim().to_string();
         if request.text.trim().is_empty() && request.attachments.is_empty() {
             return Err(VibexError::validation(
@@ -259,8 +270,16 @@ impl MessageSubmissionCoordinator {
                     None,
                 );
         }
-        self.start_session_worker(record.session_id.clone())?;
-        self.wait_for_terminal(&record.submission_id).await
+        Ok(record.submission_id)
+    }
+
+    pub async fn wait_for_submission(
+        self: &Arc<Self>,
+        submission_id: &MessageSubmissionId,
+    ) -> VibexResult<Vec<TimelineItem>> {
+        let record = self.required_submission(submission_id)?;
+        self.start_session_worker(record.session_id)?;
+        self.wait_for_terminal(submission_id).await
     }
 
     pub async fn replace_user_message(
@@ -1742,6 +1761,37 @@ mod tests {
         )
         .unwrap();
         (submission, runtime_switch.switch_id)
+    }
+
+    #[tokio::test]
+    async fn prepared_submission_does_not_dispatch_until_wait_starts() {
+        let db_path = temp_db_path("prepared-cancellation-fence");
+        let initial = selection("gpt-5");
+        let session_id = seed_session(&db_path, "prepared cancellation fence", initial.clone());
+        let (coordinator, _runtime, dispatcher) =
+            harness(&db_path, &session_id, initial.clone(), false);
+
+        let submission_id = coordinator
+            .prepare_submission(request(&session_id, "prepared", initial))
+            .unwrap();
+
+        assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 0);
+        let state = coordinator
+            .get_submission(&GetMessageSubmissionRequest {
+                session_id,
+                message_idempotency_key: "prepared".to_string(),
+            })
+            .unwrap();
+        assert_eq!(state.submission_id, submission_id);
+        assert_eq!(state.status, MessageSubmissionStatus::AwaitingRuntime);
+
+        let items = coordinator
+            .wait_for_submission(&submission_id)
+            .await
+            .unwrap();
+        assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(items.len(), 2);
+        cleanup_db(db_path);
     }
 
     #[tokio::test]

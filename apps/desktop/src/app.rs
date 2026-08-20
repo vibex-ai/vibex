@@ -52,7 +52,7 @@ use gpui_component::{
 };
 use sha2::{Digest as _, Sha256};
 use similar::{ChangeTag, TextDiff};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use vibex_agent::ReplaceUserMessageRequest;
 use vibex_agent_acp::build_runtime_option_catalog_for_agents;
 use vibex_agent_claude::{ClaudeSessionImportPreviewRequest, preview_claude_external_sessions};
@@ -796,6 +796,13 @@ fn initial_message_failure_note(error: &vibex_core::VibexError) -> Option<String
         "Session created; initial message failed: {}: {}",
         error.code, error.message
     ))
+}
+
+fn initial_message_interrupted_error() -> vibex_core::VibexError {
+    vibex_core::VibexError::conflict(
+        "message_submission_interrupted_before_dispatch",
+        "message submission was cancelled before dispatch",
+    )
 }
 
 fn runtime_token_usage_snapshot(
@@ -3646,6 +3653,7 @@ pub struct VibexWorkbench {
     collapsed_project_restore: Option<BTreeSet<String>>,
     selected_session_id: Option<VibexSessionId>,
     pending_new_session: Option<PendingNewSession>,
+    pending_initial_turn_interrupts: BTreeMap<String, watch::Sender<bool>>,
     new_session_open: bool,
     new_session_draft_initialized: bool,
     new_session_project_menu_open: bool,
@@ -4253,6 +4261,7 @@ impl VibexWorkbench {
             collapsed_project_restore: None,
             selected_session_id,
             pending_new_session: None,
+            pending_initial_turn_interrupts: BTreeMap::new(),
             new_session_open: false,
             new_session_draft_initialized: false,
             new_session_project_menu_open: false,
@@ -5739,6 +5748,12 @@ impl VibexWorkbench {
         }
         if self.selected_session_id.as_ref() == Some(session_id) {
             self.agent_turn_pending = pending;
+        }
+    }
+
+    fn release_initial_turn_interrupt_lock(&mut self, interrupted: bool) {
+        if interrupted {
+            self.agent_action_pending = false;
         }
     }
 
@@ -12679,6 +12694,21 @@ impl VibexWorkbench {
             }
             ComposerQueueInterruptBehavior::Pause => {}
         }
+        if let Some(cancel) = self
+            .pending_initial_turn_interrupts
+            .get(session_id.as_str())
+        {
+            if cancel.send(true).is_ok() {
+                // The initial session task owns the durable submission and will
+                // invoke AgentManager::interrupt after that fence exists.
+                self.agent_action_pending = true;
+                self.agent_error = None;
+                cx.notify();
+                return;
+            }
+            self.pending_initial_turn_interrupts
+                .remove(session_id.as_str());
+        }
         self.agent_action_pending = true;
         self.agent_error = None;
         let generation = self.session_generation;
@@ -13332,6 +13362,7 @@ impl VibexWorkbench {
         selection: SessionRuntimeSelection,
         optimistic_message: Option<OptimisticUserMessage>,
         has_initial_message: bool,
+        initial_turn_interrupt: watch::Sender<bool>,
         cx: &mut Context<Self>,
     ) -> u64 {
         let session_id = session.id.clone();
@@ -13344,6 +13375,8 @@ impl VibexWorkbench {
         self.optimistic_runtime_selections
             .insert(session_id.as_str().to_string(), selection);
         if has_initial_message {
+            self.pending_initial_turn_interrupts
+                .insert(session_id.as_str().to_string(), initial_turn_interrupt);
             self.set_session_turn_pending(&session_id, true);
         }
         self.select_session_with_history(session_id, false, cx);
@@ -13403,6 +13436,13 @@ impl VibexWorkbench {
         self.sessions.retain(|session| session.id != *session_id);
         self.optimistic_runtime_selections
             .remove(session_id.as_str());
+        let interrupted = self
+            .pending_initial_turn_interrupts
+            .remove(session_id.as_str())
+            .is_some_and(|interrupt| *interrupt.borrow());
+        if interrupted {
+            self.agent_action_pending = false;
+        }
         self.discard_optimistic_user_message(session_id);
         self.set_session_turn_pending(session_id, false);
         self.agent_session_view_cache.remove(session_id.as_str());
@@ -13988,6 +14028,7 @@ impl VibexWorkbench {
         let deferred_creation = command_invocation.is_none();
         let optimistic_submitted_at_ms = unix_timestamp_ms();
         let optimistic_session_id = VibexSessionId::new();
+        let (initial_turn_interrupt_tx, mut initial_turn_interrupt_rx) = watch::channel(false);
         let optimistic_workspace = selected_workspace
             .as_ref()
             .or(origin_workspace.as_ref())
@@ -14045,6 +14086,7 @@ impl VibexWorkbench {
             selection.clone(),
             optimistic_message,
             has_initial_message,
+            initial_turn_interrupt_tx,
             cx,
         );
         let pending_session_id = optimistic_session_id.clone();
@@ -14098,56 +14140,92 @@ impl VibexWorkbench {
             let workspaces = runtime.workspace().list().ok();
             let session_id = session.id.clone();
             let message_runtime = runtime.clone();
+            let desired_runtime = message_runtime
+                .agent()
+                .runtime_selection()
+                .get_selection_state(&session_id)
+                .map(|state| state.effective)
+                .unwrap_or_else(|_| selection.clone());
+            let prepared_submission = if has_initial_message && command_invocation.is_none() {
+                let coordinator = message_runtime.agent().message_submission();
+                let reasoning_effort = desired_runtime.reasoning_effort.clone();
+                let submission_id = coordinator.prepare_submission(SendAgentMessageRequest {
+                    session_id: session_id.clone(),
+                    message_idempotency_key: format!(
+                        "gpui:new-session:{}:{}",
+                        session_id.as_str(),
+                        unix_timestamp_ms()
+                    ),
+                    desired_runtime,
+                    text: text.clone(),
+                    attachments: attachments.clone(),
+                    reasoning_effort,
+                    correlation_id: None,
+                })?;
+                Some((coordinator, submission_id))
+            } else {
+                None
+            };
             let initial_message = if has_initial_message {
-                let initial_text = text;
                 let initial_attachments = attachments;
-                let initial_selection = selection.clone();
                 Some(async move {
-                    let desired_runtime = message_runtime
-                        .agent()
-                        .runtime_selection()
-                        .get_selection_state(&session_id)
-                        .map(|state| state.effective)
-                        .unwrap_or(initial_selection);
-                    let reasoning_effort = desired_runtime.reasoning_effort.clone();
                     if let Some(invocation) = command_invocation {
-                        message_runtime
-                            .agent()
-                            .manager()
-                            .execute_command(AgentCommandExecuteRequest {
-                                session_id: session_id.clone(),
-                                command_id: invocation.command_id,
-                                trigger: invocation.trigger,
-                                source_kind: invocation.source_kind,
-                                command_text: invocation.command_text,
-                                command_name: invocation.command_name,
-                                arguments: invocation.arguments,
-                                prompt_id: invocation.prompt_id,
-                                attachments: initial_attachments.clone(),
-                                reasoning_effort,
-                                correlation_id: None,
-                            })
-                            .await
-                            .map(|_| ())
+                        if *initial_turn_interrupt_rx.borrow() {
+                            return Err(initial_message_interrupted_error());
+                        }
+                        let manager = message_runtime.agent().manager().clone();
+                        let command = manager.execute_command(AgentCommandExecuteRequest {
+                            session_id: session_id.clone(),
+                            command_id: invocation.command_id,
+                            trigger: invocation.trigger,
+                            source_kind: invocation.source_kind,
+                            command_text: invocation.command_text,
+                            command_name: invocation.command_name,
+                            arguments: invocation.arguments,
+                            prompt_id: invocation.prompt_id,
+                            attachments: initial_attachments.clone(),
+                            reasoning_effort: desired_runtime.reasoning_effort.clone(),
+                            correlation_id: None,
+                        });
+                        tokio::pin!(command);
+                        let mut interrupt_sent = false;
+                        loop {
+                            tokio::select! {
+                                outcome = &mut command => break outcome.map(|_| ()),
+                                changed = initial_turn_interrupt_rx.changed(), if !interrupt_sent => {
+                                    if changed.is_err() || !*initial_turn_interrupt_rx.borrow() {
+                                        interrupt_sent = true;
+                                        continue;
+                                    }
+                                    manager.interrupt(&session_id).await?;
+                                    interrupt_sent = true;
+                                }
+                            }
+                        }
                     } else {
-                        message_runtime
-                            .agent()
-                            .message_submission()
-                            .submit(SendAgentMessageRequest {
-                                session_id: session_id.clone(),
-                                message_idempotency_key: format!(
-                                    "gpui:new-session:{}:{}",
-                                    session_id.as_str(),
-                                    unix_timestamp_ms()
-                                ),
-                                desired_runtime,
-                                text: initial_text,
-                                attachments: initial_attachments,
-                                reasoning_effort,
-                                correlation_id: None,
-                            })
-                            .await
-                            .map(|_| ())
+                        let (coordinator, submission_id) = prepared_submission
+                            .expect("ordinary initial messages must be durably prepared");
+                        let manager = message_runtime.agent().manager().clone();
+                        let mut interrupt_sent = false;
+                        if *initial_turn_interrupt_rx.borrow() {
+                            manager.interrupt(&session_id).await?;
+                            interrupt_sent = true;
+                        }
+                        let submission = coordinator.wait_for_submission(&submission_id);
+                        tokio::pin!(submission);
+                        loop {
+                            tokio::select! {
+                                outcome = &mut submission => break outcome.map(|_| ()),
+                                changed = initial_turn_interrupt_rx.changed(), if !interrupt_sent => {
+                                    if changed.is_err() || !*initial_turn_interrupt_rx.borrow() {
+                                        interrupt_sent = true;
+                                        continue;
+                                    }
+                                    manager.interrupt(&session_id).await?;
+                                    interrupt_sent = true;
+                                }
+                            }
+                        }
                     }
                 })
             } else {
@@ -14268,6 +14346,14 @@ impl VibexWorkbench {
             }
             let outcome = runner.await;
             let _ = entity.update_in(cx, |this, window, cx| {
+                let initial_turn_interrupted = created_session_id
+                    .as_ref()
+                    .and_then(|session_id| {
+                        this.pending_initial_turn_interrupts
+                            .remove(session_id.as_str())
+                    })
+                    .is_some_and(|interrupt| *interrupt.borrow());
+                this.release_initial_turn_interrupt_lock(initial_turn_interrupted);
                 if let Some(session_id) = created_session_id.as_ref() {
                     this.set_session_turn_pending(session_id, false);
                 }
