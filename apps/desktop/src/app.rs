@@ -242,6 +242,7 @@ const TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL: Duration = Duration::from_mi
 const TIMELINE_STREAMING_MARKDOWN_REFRESH_BYTES: usize = 8 * 1024;
 const AGENT_THINKING_SCROLL_DURATION: Duration = Duration::from_secs(12);
 const SHIMMER_SCAN_PASSES: f32 = 10.0;
+const AGENT_THINKING_LABEL_MAX_CHARS: usize = 48;
 const TIMELINE_TOOL_PROJECTION_CACHE_LIMIT: usize = 128;
 const TIMELINE_TOOL_PROJECTION_CACHE_BYTES: usize = 2 * 1024 * 1024;
 const TIMELINE_FILE_DIFF_PREVIEW_CACHE_LIMIT: usize = 64;
@@ -26226,6 +26227,7 @@ impl VibexWorkbench {
                     &turn.id,
                     &agent_progress_label(&pending_label, strings.agent_pending_response),
                     &pending_tooltip,
+                    cx,
                 ));
             }
             content = content.child(response);
@@ -33325,10 +33327,30 @@ fn shimmer_color(
     }
 }
 
-fn render_agent_thinking_indicator(turn_id: &str, label: &str, tooltip: &str) -> AnyElement {
-    let label = label.to_string();
+fn truncate_agent_thinking_label(label: &str) -> String {
+    let characters = label.chars().collect::<Vec<_>>();
+    if characters.len() <= AGENT_THINKING_LABEL_MAX_CHARS {
+        return label.to_string();
+    }
+    characters[..AGENT_THINKING_LABEL_MAX_CHARS - 3]
+        .iter()
+        .collect::<String>()
+        + "..."
+}
+
+fn render_agent_thinking_indicator(
+    turn_id: &str,
+    label: &str,
+    tooltip: &str,
+    cx: &App,
+) -> AnyElement {
+    let base = cx.theme().muted_foreground.opacity(0.75);
+    let glow = cx.theme().foreground;
+    let label = truncate_agent_thinking_label(label);
+    let character_count = label.chars().count();
     let tooltip = tooltip.to_string();
     let element_id = format!("agent-thinking-{turn_id}");
+    let animation_id = format!("{element_id}-animation");
     h_flex()
         .w_full()
         .min_w_0()
@@ -33337,13 +33359,31 @@ fn render_agent_thinking_indicator(turn_id: &str, label: &str, tooltip: &str) ->
         .child(
             div()
                 .id(element_id)
+                .relative()
                 .min_w_0()
                 .flex_1()
                 .overflow_hidden()
                 .text_sm()
-                .truncate()
                 .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-                .child(label),
+                .with_animation(
+                    animation_id,
+                    Animation::new(AGENT_THINKING_SCROLL_DURATION).repeat(),
+                    move |this, delta| {
+                        let scan_position = shimmer_scan_position(delta, 0.0, 1.0);
+                        this.child(h_flex().flex_none().whitespace_nowrap().children(
+                            label.chars().enumerate().map(|(index, character)| {
+                                let position = if character_count > 1 {
+                                    index as f32 / (character_count - 1) as f32
+                                } else {
+                                    0.5
+                                };
+                                div().flex_none().child(character.to_string()).text_color(
+                                    shimmer_color(base, glow, position, scan_position, 0.42),
+                                )
+                            }),
+                        ))
+                    },
+                ),
         )
         .into_any_element()
 }
@@ -41549,6 +41589,17 @@ mod tests {
     }
 
     #[test]
+    fn agent_thinking_label_truncates_with_a_stable_ascii_ellipsis() {
+        let label = truncate_agent_thinking_label(&"字符".repeat(40));
+        assert_eq!(label.chars().count(), AGENT_THINKING_LABEL_MAX_CHARS);
+        assert!(label.ends_with("..."));
+        assert_eq!(
+            truncate_agent_thinking_label("short status"),
+            "short status"
+        );
+    }
+
+    #[test]
     fn shimmer_scan_reaches_each_glyph_and_falls_back_to_the_base_color() {
         let base = Hsla {
             h: 0.0,
@@ -41569,7 +41620,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_thinking_indicator_truncates_and_keeps_full_tooltip() {
+    fn agent_thinking_indicator_shimmers_without_scrolling_and_keeps_full_tooltip() {
         let source = include_str!("app.rs");
         let renderer = source
             .split_once("fn render_agent_thinking_indicator(")
