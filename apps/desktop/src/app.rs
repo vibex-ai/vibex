@@ -23269,21 +23269,14 @@ impl VibexWorkbench {
                     .min_w_0()
                     .flex_wrap()
                     .items_center()
-                    .justify_between()
+                    .justify_start()
                     .gap_2()
                     .px_2()
-                    .child(
-                        h_flex()
-                            .min_w_0()
-                            .flex_1()
-                            .flex_wrap()
-                            .items_center()
-                            .justify_start()
-                            .gap_1()
-                            .child(location_control)
-                            .when(worktree_selected, |this| this.child(base_ref_button)),
-                    )
-                    .child(div().flex_none().child(workspace_button)),
+                    .child(div().flex_none().child(workspace_button))
+                    .child(div().flex_none().child(location_control))
+                    .when(worktree_selected, |this| {
+                        this.child(div().flex_none().child(base_ref_button))
+                    }),
             )
             .when_some(
                 (can_create_worktree && !fixed_workspace && !worktree_ready)
@@ -48118,8 +48111,8 @@ mod tests {
         let branch_control = workspace_toolbar
             .find("base_ref_button")
             .expect("base branch should remain in the workspace toolbar");
+        assert!(project_control < location_control);
         assert!(location_control < branch_control);
-        assert!(branch_control < project_control);
 
         let context_row = panel
             .rfind(".child(workspace_controls)")
