@@ -23168,6 +23168,7 @@ impl VibexWorkbench {
             .disabled(self.agent_action_pending);
         let workspace_button = Popover::new("new-session-project-menu")
             .appearance(false)
+            .anchor(Anchor::BottomLeft)
             .open(self.new_session_project_menu_mounted)
             .on_open_change(cx.listener(|this, open, window, cx| {
                 this.set_new_session_project_menu_open(*open, window, cx)
@@ -23344,6 +23345,7 @@ impl VibexWorkbench {
             );
         let base_ref_button = Popover::new("new-session-base-ref-popover")
             .appearance(false)
+            .anchor(Anchor::BottomLeft)
             .open(self.new_session_base_ref_menu_open)
             .on_open_change(cx.listener(|this, open, window, cx| {
                 this.new_session_base_ref_menu_open = *open;
@@ -23864,7 +23866,7 @@ impl VibexWorkbench {
                                 v_flex()
                                     .items_center()
                                     .text_center()
-                                    .child(vibex_wordmark(48.0, 50.0, 2.0, 0.0, cx))
+                                    .child(startup_loading_wordmark(false, cx))
                                     .child(
                                         div()
                                             .mt_3()
@@ -23881,31 +23883,6 @@ impl VibexWorkbench {
                                             .child(strings.new_session_description),
                                     ),
                             )
-                            .child(
-                                h_flex()
-                                    .id("new-session-agent-tabs")
-                                    .w_full()
-                                    .h(px(49.0))
-                                    .flex_none()
-                                    .min_w_0()
-                                    .gap_1()
-                                    .overflow_x_scroll()
-                                    .rounded(px(28.0))
-                                    .border_1()
-                                    .border_color(cx.theme().border.opacity(0.60))
-                                    .bg(muted_color.opacity(0.70))
-                                    .p(px(6.0))
-                                    .children(agent_tabs),
-                            )
-                            .when(!has_agent_choices, |this| {
-                                this.child(
-                                    div()
-                                        .text_center()
-                                        .text_sm()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(strings.new_session_no_agents),
-                                )
-                            })
                             .child(
                                 v_flex()
                                     .w_full()
@@ -23939,176 +23916,204 @@ impl VibexWorkbench {
                             .min_w_0()
                             .flex_none()
                             .mt_5()
-                            .child(
-                                v_flex()
-                            .items_center()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .rounded(px(20.0))
-                            .border_1()
-                            .border_color(cx.theme().border.opacity(0.72))
-                            .bg(card_color)
-                            .shadow_lg()
-                            .on_prepaint(move |bounds, _, cx| {
-                                let _ = surface_geometry_entity.update(cx, |this, cx| {
-                                    if this.new_session_composer_geometry.surface_bounds
-                                        != Some(bounds)
-                                    {
-                                        this.new_session_composer_geometry.surface_bounds =
-                                            Some(bounds);
-                                        cx.notify();
-                                    }
-                                });
-                            })
-                            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
-                                this.add_composer_paths(paths, window, cx)
-                            }))
+                            .gap_3()
                             .child(
                                 h_flex()
-                                    .min_h(px(112.0))
+                                    .id("new-session-agent-tabs")
+                                    .w_full()
+                                    .h(px(49.0))
+                                    .flex_none()
                                     .min_w_0()
-                                    .items_end()
-                                    .gap_2()
-                                    .p_4()
-                                    .pb_2()
+                                    .gap_1()
+                                    .overflow_x_scroll()
+                                    .rounded(px(28.0))
+                                    .border_1()
+                                    .border_color(cx.theme().border.opacity(0.60))
+                                    .bg(muted_color.opacity(0.70))
+                                    .p(px(6.0))
+                                    .children(agent_tabs),
+                            )
+                            .when(!has_agent_choices, |this| {
+                                this.child(
+                                    div()
+                                        .text_center()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(strings.new_session_no_agents),
+                                )
+                            })
+                            .child(
+                                v_flex()
+                                    .w_full()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .rounded(px(20.0))
+                                    .border_1()
+                                    .border_color(cx.theme().border.opacity(0.72))
+                                    .bg(card_color)
+                                    .shadow_lg()
+                                    .on_prepaint(move |bounds, _, cx| {
+                                        let _ = surface_geometry_entity.update(cx, |this, cx| {
+                                            if this.new_session_composer_geometry.surface_bounds
+                                                != Some(bounds)
+                                            {
+                                                this.new_session_composer_geometry.surface_bounds =
+                                                    Some(bounds);
+                                                cx.notify();
+                                            }
+                                        });
+                                    })
+                                    .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                                        this.add_composer_paths(paths, window, cx)
+                                    }))
                                     .child(
-                                        div()
-                                            .flex_1()
+                                        h_flex()
+                                            .min_h(px(112.0))
                                             .min_w_0()
-                                            .h_full()
-                                            .on_prepaint(move |bounds, _, cx| {
-                                                let _ =
-                                                    input_geometry_entity.update(cx, |this, cx| {
-                                                        if this
-                                                            .new_session_composer_geometry
-                                                            .input_bounds
-                                                            != Some(bounds)
-                                                        {
-                                                            this.new_session_composer_geometry
-                                                                .input_bounds = Some(bounds);
-                                                            cx.notify();
-                                                        }
-                                                    });
-                                            })
-                                            .on_key_up(cx.listener(|this, _, window, cx| {
-                                                this.refresh_suggestions(
-                                                    ComposerTarget::NewSession,
-                                                    window,
-                                                    cx,
-                                                )
-                                            }))
-                                            .on_mouse_up(
-                                                MouseButton::Left,
-                                                cx.listener(|this, _, window, cx| {
-                                                    this.refresh_suggestions(
-                                                        ComposerTarget::NewSession,
-                                                        window,
-                                                        cx,
-                                                    )
-                                                }),
-                                            )
-                                            .capture_action(cx.listener(
-                                                |this, _: &InputBackspace, window, cx| {
-                                                    this.capture_inline_attachment_edit(
-                                                        InlineAttachmentEdit::Backspace,
-                                                        true,
-                                                        window,
-                                                        cx,
-                                                    )
-                                                },
-                                            ))
-                                            .capture_action(cx.listener(
-                                                |this, _: &InputDelete, window, cx| {
-                                                    this.capture_inline_attachment_edit(
-                                                        InlineAttachmentEdit::Delete,
-                                                        true,
-                                                        window,
-                                                        cx,
-                                                    )
-                                                },
-                                            ))
-                                            .capture_action(cx.listener(
-                                                |this, _: &InputMoveLeft, window, cx| {
-                                                    this.capture_inline_attachment_edit(
-                                                        InlineAttachmentEdit::Left,
-                                                        true,
-                                                        window,
-                                                        cx,
-                                                    )
-                                                },
-                                            ))
-                                            .capture_action(cx.listener(
-                                                |this, _: &InputMoveRight, window, cx| {
-                                                    this.capture_inline_attachment_edit(
-                                                        InlineAttachmentEdit::Right,
-                                                        true,
-                                                        window,
-                                                        cx,
-                                                    )
-                                                },
-                                            ))
-                                            .capture_action(cx.listener(
-                                                |this, _: &InputPaste, window, cx| {
-                                                    this.capture_composer_paste(true, window, cx)
-                                                },
-                                            ))
-                                            .capture_action(cx.listener(
-                                                |this, _: &InputMoveUp, window, cx| {
-                                                    this.capture_composer_suggestion_action(
-                                                        ComposerTarget::NewSession,
-                                                        ComposerSuggestionAction::Previous,
-                                                        window,
-                                                        cx,
-                                                    )
-                                                },
-                                            ))
-                                            .capture_action(cx.listener(
-                                                |this, _: &InputMoveDown, window, cx| {
-                                                    this.capture_composer_suggestion_action(
-                                                        ComposerTarget::NewSession,
-                                                        ComposerSuggestionAction::Next,
-                                                        window,
-                                                        cx,
-                                                    )
-                                                },
-                                            ))
-                                            .capture_action(cx.listener(
-                                                |this, _: &InputIndentInline, window, cx| {
-                                                    this.capture_composer_suggestion_action(
-                                                        ComposerTarget::NewSession,
-                                                        ComposerSuggestionAction::Apply,
-                                                        window,
-                                                        cx,
-                                                    )
-                                                },
-                                            ))
-                                            .capture_action(cx.listener(
-                                                |this, _: &InputEnter, window, cx| {
-                                                    this.capture_composer_suggestion_action(
-                                                        ComposerTarget::NewSession,
-                                                        ComposerSuggestionAction::Apply,
-                                                        window,
-                                                        cx,
-                                                    )
-                                                },
-                                            ))
-                                            .capture_action(cx.listener(
-                                                |this, _: &InputEscape, window, cx| {
-                                                    this.capture_composer_suggestion_action(
-                                                        ComposerTarget::NewSession,
-                                                        ComposerSuggestionAction::Dismiss,
-                                                        window,
-                                                        cx,
-                                                    )
-                                                },
-                                            ))
+                                            .items_end()
+                                            .gap_2()
+                                            .p_4()
+                                            .pb_2()
                                             .child(
-                                                Input::new(&self.new_session_input)
-                                                    .appearance(false)
-                                                    .h_full(),
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .h_full()
+                                                    .on_prepaint(move |bounds, _, cx| {
+                                                        let _ = input_geometry_entity.update(
+                                                            cx,
+                                                            |this, cx| {
+                                                                if this
+                                                                    .new_session_composer_geometry
+                                                                    .input_bounds
+                                                                    != Some(bounds)
+                                                                {
+                                                                    this.new_session_composer_geometry
+                                                                        .input_bounds = Some(bounds);
+                                                                    cx.notify();
+                                                                }
+                                                            },
+                                                        );
+                                                    })
+                                                    .on_key_up(cx.listener(|this, _, window, cx| {
+                                                        this.refresh_suggestions(
+                                                            ComposerTarget::NewSession,
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    }))
+                                                    .on_mouse_up(
+                                                        MouseButton::Left,
+                                                        cx.listener(|this, _, window, cx| {
+                                                            this.refresh_suggestions(
+                                                                ComposerTarget::NewSession,
+                                                                window,
+                                                                cx,
+                                                            )
+                                                        }),
+                                                    )
+                                                    .capture_action(cx.listener(
+                                                        |this, _: &InputBackspace, window, cx| {
+                                                            this.capture_inline_attachment_edit(
+                                                                InlineAttachmentEdit::Backspace,
+                                                                true,
+                                                                window,
+                                                                cx,
+                                                            )
+                                                        },
+                                                    ))
+                                                    .capture_action(cx.listener(
+                                                        |this, _: &InputDelete, window, cx| {
+                                                            this.capture_inline_attachment_edit(
+                                                                InlineAttachmentEdit::Delete,
+                                                                true,
+                                                                window,
+                                                                cx,
+                                                            )
+                                                        },
+                                                    ))
+                                                    .capture_action(cx.listener(
+                                                        |this, _: &InputMoveLeft, window, cx| {
+                                                            this.capture_inline_attachment_edit(
+                                                                InlineAttachmentEdit::Left,
+                                                                true,
+                                                                window,
+                                                                cx,
+                                                            )
+                                                        },
+                                                    ))
+                                                    .capture_action(cx.listener(
+                                                        |this, _: &InputMoveRight, window, cx| {
+                                                            this.capture_inline_attachment_edit(
+                                                                InlineAttachmentEdit::Right,
+                                                                true,
+                                                                window,
+                                                                cx,
+                                                            )
+                                                        },
+                                                    ))
+                                                    .capture_action(cx.listener(
+                                                        |this, _: &InputPaste, window, cx| {
+                                                            this.capture_composer_paste(true, window, cx)
+                                                        },
+                                                    ))
+                                                    .capture_action(cx.listener(
+                                                        |this, _: &InputMoveUp, window, cx| {
+                                                            this.capture_composer_suggestion_action(
+                                                                ComposerTarget::NewSession,
+                                                                ComposerSuggestionAction::Previous,
+                                                                window,
+                                                                cx,
+                                                            )
+                                                        },
+                                                    ))
+                                                    .capture_action(cx.listener(
+                                                        |this, _: &InputMoveDown, window, cx| {
+                                                            this.capture_composer_suggestion_action(
+                                                                ComposerTarget::NewSession,
+                                                                ComposerSuggestionAction::Next,
+                                                                window,
+                                                                cx,
+                                                            )
+                                                        },
+                                                    ))
+                                                    .capture_action(cx.listener(
+                                                        |this, _: &InputIndentInline, window, cx| {
+                                                            this.capture_composer_suggestion_action(
+                                                                ComposerTarget::NewSession,
+                                                                ComposerSuggestionAction::Apply,
+                                                                window,
+                                                                cx,
+                                                            )
+                                                        },
+                                                    ))
+                                                    .capture_action(cx.listener(
+                                                        |this, _: &InputEnter, window, cx| {
+                                                            this.capture_composer_suggestion_action(
+                                                                ComposerTarget::NewSession,
+                                                                ComposerSuggestionAction::Apply,
+                                                                window,
+                                                                cx,
+                                                            )
+                                                        },
+                                                    ))
+                                                    .capture_action(cx.listener(
+                                                        |this, _: &InputEscape, window, cx| {
+                                                            this.capture_composer_suggestion_action(
+                                                                ComposerTarget::NewSession,
+                                                                ComposerSuggestionAction::Dismiss,
+                                                                window,
+                                                                cx,
+                                                            )
+                                                        },
+                                                    ))
+                                                    .child(
+                                                        Input::new(&self.new_session_input)
+                                                            .appearance(false)
+                                                            .h_full(),
+                                                    ),
                                             ),
                                     )
-                            )
                             .child(
                                 v_flex()
                                     .min_w_0()
@@ -40510,30 +40515,6 @@ fn shortcut_is_valid(value: &str) -> bool {
         && !value.chars().any(char::is_whitespace)
         && !value.chars().any(char::is_control)
         && Keystroke::parse(value).is_ok()
-}
-
-fn vibex_wordmark(
-    mark_width: f32,
-    mark_height: f32,
-    mark_margin_top: f32,
-    mark_offset_y: f32,
-    cx: &App,
-) -> AnyElement {
-    h_flex()
-        .items_center()
-        .gap(px(1.0))
-        .child(
-            Icon::default()
-                .path("icons/vibex/vibex-mark.svg")
-                .w(px(mark_width))
-                .h(px(mark_height))
-                .mt(px(mark_margin_top))
-                .relative()
-                .top(px(mark_offset_y))
-                .text_color(cx.theme().foreground),
-        )
-        .child("ibex")
-        .into_any_element()
 }
 
 fn startup_loading_wordmark(show_shimmer: bool, cx: &App) -> AnyElement {
