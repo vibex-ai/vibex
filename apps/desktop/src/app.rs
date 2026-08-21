@@ -20337,6 +20337,7 @@ impl VibexWorkbench {
         let project_id = group.project.id.clone();
         let project_id_string = project_id.as_str().to_string();
         let project_name = group.project.name.clone();
+        let worktree_count = group.workspaces.len();
         let Some(current_workspace) = group
             .workspaces
             .iter()
@@ -20454,6 +20455,18 @@ impl VibexWorkbench {
             project_logo_trigger,
             cx,
         );
+        let worktree_count_badge = div()
+            .size(px(20.0))
+            .flex_none()
+            .rounded_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_xs()
+            .font_medium()
+            .bg(cx.theme().muted.opacity(0.55))
+            .text_color(cx.theme().muted_foreground)
+            .child(worktree_count.to_string());
         let context_menu_hover_entity = cx.weak_entity();
         let context_menu_project_id = project_id_string.clone();
         let drag_target_project_id = project_id_string.clone();
@@ -20602,13 +20615,21 @@ impl VibexWorkbench {
                     })
                     .child(project_logo_popover)
                     .child(
-                        div()
+                        h_flex()
                             .flex_1()
                             .min_w_0()
-                            .truncate()
-                            .text_sm()
-                            .font_semibold()
-                            .child(project_name.clone()),
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .child(project_name.clone()),
+                            )
+                            .child(worktree_count_badge),
                     ),
             )
             .when(self.sidebar_batch_mode, |this| {
@@ -43783,6 +43804,9 @@ mod tests {
             .expect("the project action button should expose a menu");
         assert!(project[row_menu..].contains("Self::build_sidebar_project_menu("));
         assert!(project[action_menu..].contains("Self::build_sidebar_project_menu("));
+        assert!(project.contains("let worktree_count = group.workspaces.len();"));
+        assert!(project.contains("let worktree_count_badge = div()"));
+        assert!(project.contains(".rounded_full()"));
     }
 
     #[test]
