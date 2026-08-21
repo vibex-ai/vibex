@@ -182,6 +182,7 @@ const TITLE_BAR_COLLAPSED_SIDEBAR_WIDTH: f32 = 112.0;
 const SIDEBAR_PROJECT_LOGO_DIRECTORY: &str = "project-icons";
 const SIDEBAR_LOGO_DISPLAY_SIZE: f32 = 14.0;
 const SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE: f32 = 18.0;
+const SIDEBAR_WORKSPACE_STATUS_TOP_OFFSET: f32 = 4.0;
 const SIDEBAR_PROJECT_LOGO_IMAGE_SIZE: u32 = 256;
 const SIDEBAR_PROJECT_LOGO_MAX_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 const SIDEBAR_PROJECT_LOGO_MAX_SOURCE_PIXELS: u64 = 40_000_000;
@@ -20918,6 +20919,11 @@ impl VibexWorkbench {
         let project_for_folder = workspace.project_id.clone();
         let hover_group: SharedString = format!("sidebar-workspace-{workspace_id}").into();
         let tooltip_branch = branch.clone();
+        let workspace_title_color = if selected {
+            cx.theme().sidebar_foreground
+        } else {
+            cx.theme().sidebar_foreground.opacity(0.72)
+        };
         let card_background = if selected {
             cx.theme().sidebar_accent.opacity(0.16)
         } else {
@@ -21010,8 +21016,9 @@ impl VibexWorkbench {
                             .w(px(26.0))
                             .h(px(26.0))
                             .flex_none()
-                            .items_center()
+                            .items_start()
                             .justify_center()
+                            .pt(px(SIDEBAR_WORKSPACE_STATUS_TOP_OFFSET))
                             .child(status_indicator),
                     )
                     .child(
@@ -21025,6 +21032,10 @@ impl VibexWorkbench {
                                     .truncate()
                                     .text_sm()
                                     .font_semibold()
+                                    .text_color(workspace_title_color)
+                                    .group_hover(&hover_group, |style| {
+                                        style.text_color(cx.theme().sidebar_foreground)
+                                    })
                                     .child(branch_name),
                             )
                             .child(
@@ -49096,6 +49107,24 @@ mod tests {
         assert!(!workspace.contains(".ml(px(18.0))"));
         assert!(!workspace.contains(".border_1()"));
         assert!(!workspace.contains(".border_l_1()"));
+    }
+
+    #[test]
+    fn worktree_status_and_title_emphasis_follow_the_workspace_row() {
+        let source = include_str!("app.rs");
+        let workspace = source
+            .split_once("    fn render_sidebar_workspace(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_session("))
+            .map(|(body, _)| body)
+            .expect("sidebar workspace renderer should remain inspectable");
+
+        assert!(source.contains("const SIDEBAR_WORKSPACE_STATUS_TOP_OFFSET: f32 = 4.0;"));
+        assert!(workspace.contains(".items_start()\n                            .justify_center()\n                            .pt(px(SIDEBAR_WORKSPACE_STATUS_TOP_OFFSET))"));
+        assert!(workspace.contains("let workspace_title_color = if selected"));
+        assert!(workspace.contains(".text_color(workspace_title_color)"));
+        assert!(workspace.contains(
+            ".group_hover(&hover_group, |style| {\n                                        style.text_color(cx.theme().sidebar_foreground)"
+        ));
     }
 
     #[test]
