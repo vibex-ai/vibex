@@ -16173,6 +16173,12 @@ pub(crate) fn extract_probe_reasoning_efforts(response: &Value) -> Vec<AgentReas
         "thought_level",
         "reasoning_effort",
     ];
+    let is_xai_session_config = response
+        .get("_meta")
+        .and_then(|metadata| metadata.get("x.ai"))
+        .and_then(|xai| xai.get("sessionConfig"))
+        .and_then(|session_config| session_config.get("options"))
+        .is_some();
     let mut efforts: Vec<AgentReasoningEffort> = Vec::new();
     for option in config_options_array(response).map_or(&[][..], Vec::as_slice) {
         let category = option
@@ -16187,7 +16193,8 @@ pub(crate) fn extract_probe_reasoning_efforts(response: &Value) -> Vec<AgentReas
             .and_then(Value::as_str)
             .unwrap_or_default()
             .trim();
-        let is_grok_effort = category == "mode"
+        let is_grok_effort = is_xai_session_config
+            && category == "mode"
             && matches!(
                 normalize_identifier(id).as_str(),
                 "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
