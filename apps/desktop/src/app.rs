@@ -20978,7 +20978,7 @@ impl VibexWorkbench {
                     .min_w_0()
                     .items_center()
                     .gap(px(8.0))
-                    .px_2()
+                    .pl_0()
                     .pr(px(34.0))
                     .child(
                         h_flex()
@@ -21071,14 +21071,16 @@ impl VibexWorkbench {
             .overflow_x_hidden()
             .rounded(px(10.0))
             .bg(card_background)
-            .p(px(4.0))
+            .pt(px(4.0))
+            .pr(px(4.0))
+            .pb(px(4.0))
             .child(row)
             .child(
                 v_flex()
                     .w_full()
                     .min_w_0()
                     .gap(px(2.0))
-                    .pl(px(20.0))
+                    .pl(px(24.0))
                     .children(sessions),
             )
             .into_any_element()
@@ -49040,7 +49042,9 @@ mod tests {
         assert!(workspace.contains("} else if collapsed {\n            cx.theme().transparent"));
         assert!(workspace.contains(".bg(row_background)"));
         assert!(workspace.contains(".bg(card_background)"));
-        assert!(workspace.contains(".pl(px(20.0))"));
+        assert!(workspace.contains(".pl_0()"));
+        assert!(workspace.contains(".pl(px(24.0))"));
+        assert!(workspace.contains(".pt(px(4.0))"));
         assert!(!workspace.contains(".ml(px(18.0))"));
         assert!(!workspace.contains(".border_1()"));
         assert!(!workspace.contains(".border_l_1()"));
