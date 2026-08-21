@@ -183,6 +183,7 @@ const SIDEBAR_PROJECT_LOGO_DIRECTORY: &str = "project-icons";
 const SIDEBAR_LOGO_DISPLAY_SIZE: f32 = 14.0;
 const SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE: f32 = 18.0;
 const SIDEBAR_WORKSPACE_STATUS_TOP_OFFSET: f32 = 4.0;
+const SIDEBAR_ICON_TITLE_GAP: f32 = 4.0;
 const SIDEBAR_PROJECT_LOGO_IMAGE_SIZE: u32 = 256;
 const SIDEBAR_PROJECT_LOGO_MAX_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 const SIDEBAR_PROJECT_LOGO_MAX_SOURCE_PIXELS: u64 = 40_000_000;
@@ -20609,7 +20610,7 @@ impl VibexWorkbench {
                     .size_full()
                     .min_w_0()
                     .items_center()
-                    .gap_2()
+                    .gap(px(SIDEBAR_ICON_TITLE_GAP))
                     .when(self.sidebar_batch_mode, |this| this.pl(px(28.0)).pr_2())
                     .when(!self.sidebar_batch_mode, |this| {
                         this.pl(px(if depth == 0 { 0.0 } else { 8.0 })).pr(px(92.0))
@@ -21008,7 +21009,7 @@ impl VibexWorkbench {
                     .w_full()
                     .min_w_0()
                     .items_center()
-                    .gap(px(8.0))
+                    .gap(px(SIDEBAR_ICON_TITLE_GAP))
                     .pl_0()
                     .pr(px(34.0))
                     .child(
@@ -49119,12 +49120,21 @@ mod tests {
             .expect("sidebar workspace renderer should remain inspectable");
 
         assert!(source.contains("const SIDEBAR_WORKSPACE_STATUS_TOP_OFFSET: f32 = 4.0;"));
+        assert!(source.contains("const SIDEBAR_ICON_TITLE_GAP: f32 = 4.0;"));
         assert!(workspace.contains(".items_start()\n                            .justify_center()\n                            .pt(px(SIDEBAR_WORKSPACE_STATUS_TOP_OFFSET))"));
         assert!(workspace.contains("let workspace_title_color = if selected"));
         assert!(workspace.contains(".text_color(workspace_title_color)"));
         assert!(workspace.contains(
             ".group_hover(&hover_group, |style| {\n                                        style.text_color(cx.theme().sidebar_foreground)"
         ));
+
+        let project = source
+            .split_once("    fn render_sidebar_project(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_workspace("))
+            .map(|(body, _)| body)
+            .expect("sidebar project renderer should remain inspectable");
+        assert!(project.contains(".gap(px(SIDEBAR_ICON_TITLE_GAP))"));
+        assert!(workspace.contains(".gap(px(SIDEBAR_ICON_TITLE_GAP))"));
     }
 
     #[test]
