@@ -181,6 +181,7 @@ const TITLE_BAR_HEIGHT: f32 = 44.0;
 const TITLE_BAR_COLLAPSED_SIDEBAR_WIDTH: f32 = 112.0;
 const SIDEBAR_PROJECT_LOGO_DIRECTORY: &str = "project-icons";
 const SIDEBAR_LOGO_DISPLAY_SIZE: f32 = 14.0;
+const SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE: f32 = 18.0;
 const SIDEBAR_PROJECT_LOGO_IMAGE_SIZE: u32 = 256;
 const SIDEBAR_PROJECT_LOGO_MAX_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 const SIDEBAR_PROJECT_LOGO_MAX_SOURCE_PIXELS: u64 = 40_000_000;
@@ -212,7 +213,7 @@ const SIDEBAR_INLINE_TRANSITION_DURATION: Duration = Duration::from_millis(200);
 const SIDEBAR_FLOATING_TRANSITION_DURATION: Duration = Duration::from_millis(200);
 const SIDEBAR_REORDER_TRANSITION_DURATION: Duration = Duration::from_millis(160);
 const SIDEBAR_REORDER_ROW_HEIGHT: f32 = 32.0;
-const SIDEBAR_PROJECT_REORDER_GAP: f32 = 8.0;
+const SIDEBAR_PROJECT_REORDER_GAP: f32 = 12.0;
 const SIDEBAR_SESSION_REORDER_GAP: f32 = 2.0;
 const SIDEBAR_DRAG_PREVIEW_WIDTH: f32 = 280.0;
 const SIDEBAR_DRAG_HORIZONTAL_SLOP: f32 = 16.0;
@@ -20418,7 +20419,7 @@ impl VibexWorkbench {
         let project_logo = sidebar_project_logo(
             &project_appearance,
             self.config.as_ref().map(|config| config.home_dir.as_path()),
-            px(SIDEBAR_LOGO_DISPLAY_SIZE),
+            px(SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE),
             cx,
         );
         let project_logo_trigger =
@@ -20883,6 +20884,13 @@ impl VibexWorkbench {
         } else {
             cx.theme().background.opacity(0.22)
         };
+        let row_background = if selected {
+            cx.theme().sidebar_accent.opacity(0.25)
+        } else if collapsed {
+            cx.theme().transparent
+        } else {
+            cx.theme().background.opacity(0.14)
+        };
         let lifecycle_error = lifecycle_state.is_some_and(|state| {
             matches!(
                 state,
@@ -20933,11 +20941,7 @@ impl VibexWorkbench {
             .cursor_pointer()
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
             .rounded(px(8.0))
-            .bg(if selected {
-                cx.theme().sidebar_accent.opacity(0.25)
-            } else {
-                cx.theme().background.opacity(0.14)
-            })
+            .bg(row_background)
             .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.20)))
             .tooltip(move |window, cx| Tooltip::new(tooltip_branch.clone()).build(window, cx))
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -45095,7 +45099,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_project_and_session_rows_use_the_same_logo_size() {
+    fn sidebar_project_and_session_rows_use_explicit_logo_sizes() {
         let source = include_str!("app.rs");
         let trigger = source
             .split_once("        let project_logo_trigger =")
@@ -45105,9 +45109,11 @@ mod tests {
         assert!(trigger.contains(".w(px(26.0))"));
         assert!(trigger.contains(".h(px(26.0))"));
         assert!(trigger.contains(".child(project_logo)"));
+        assert!(source.contains("const SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE: f32 = 18.0;"));
         assert!(source.contains("const SIDEBAR_LOGO_DISPLAY_SIZE: f32 = 14.0;"));
+        assert!(source.contains("px(SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE),\n            cx,"));
         assert!(source.contains("px(SIDEBAR_LOGO_DISPLAY_SIZE),\n        Some(if active"));
-        assert!(source.contains("px(SIDEBAR_LOGO_DISPLAY_SIZE),\n            cx,"));
+        assert!(source.contains("const SIDEBAR_PROJECT_REORDER_GAP: f32 = 12.0;"));
     }
 
     #[test]
@@ -49134,6 +49140,8 @@ mod tests {
 
         assert!(collapsed_guard < session_render);
         assert!(workspace.contains("return row.into_any_element();"));
+        assert!(workspace.contains("} else if collapsed {\n            cx.theme().transparent"));
+        assert!(workspace.contains(".bg(row_background)"));
         assert!(workspace.contains(".bg(card_background)"));
         assert!(workspace.contains(".pl(px(20.0))"));
         assert!(!workspace.contains(".ml(px(18.0))"));
