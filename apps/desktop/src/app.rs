@@ -19525,6 +19525,7 @@ impl VibexWorkbench {
                         &group,
                         active,
                         reorder_enabled,
+                        depth,
                         strings,
                         cx,
                     ));
@@ -20014,7 +20015,7 @@ impl VibexWorkbench {
                     .min_w_0()
                     .items_center()
                     .gap(px(6.0))
-                    .pl_2()
+                    .pl(px(if depth == 0 { 0.0 } else { 8.0 }))
                     .pr_1()
                     .text_color(cx.theme().sidebar_foreground.opacity(0.78))
                     .child(
@@ -20329,6 +20330,7 @@ impl VibexWorkbench {
         group: &SidebarProjectProjection,
         active: bool,
         reorder_enabled: bool,
+        depth: usize,
         strings: Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -20590,7 +20592,9 @@ impl VibexWorkbench {
                     .items_center()
                     .gap_2()
                     .when(self.sidebar_batch_mode, |this| this.pl(px(28.0)).pr_2())
-                    .when(!self.sidebar_batch_mode, |this| this.px_2().pr(px(92.0)))
+                    .when(!self.sidebar_batch_mode, |this| {
+                        this.pl(px(if depth == 0 { 0.0 } else { 8.0 })).pr(px(92.0))
+                    })
                     .text_color(if active {
                         cx.theme().sidebar_foreground
                     } else {
