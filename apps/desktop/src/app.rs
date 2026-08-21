@@ -7169,6 +7169,17 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    fn toggle_sidebar_project(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        if !self.sidebar_state.collapsed_ids.remove(project_id) {
+            self.sidebar_state
+                .collapsed_ids
+                .insert(project_id.to_string());
+        }
+        self.collapsed_project_restore = None;
+        self.queue_agent_ui_state();
+        cx.notify();
+    }
+
     fn activate_and_toggle_sidebar_workspace(
         &mut self,
         workspace: WorkspaceRecord,
@@ -19757,8 +19768,6 @@ impl VibexWorkbench {
             .contains(&folder_id);
         let renaming =
             self.sidebar_rename_target == Some(SidebarRenameTarget::Folder(folder_id.clone()));
-        let context_menu_hovered = self.sidebar_context_menu_target
-            == Some(SidebarContextMenuTarget::Folder(folder_id.clone()));
         let hover_group: SharedString = format!("sidebar-folder-{folder_id}").into();
         let click_folder_id = folder_id.clone();
         let context_folder_id = folder_id.clone();
@@ -19825,13 +19834,10 @@ impl VibexWorkbench {
             .bg(
                 if drop_position == Some(SidebarOrganizationDropPosition::Into) {
                     cx.theme().tokens.drop_target.into()
-                } else if context_menu_hovered {
-                    cx.theme().sidebar_accent.opacity(0.45)
                 } else {
                     cx.theme().transparent
                 },
             )
-            .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.45)))
             .on_hover(cx.listener(|this, hovered, _, cx| {
                 if *hovered {
                     this.clear_sidebar_context_menu_target(cx);
@@ -20371,7 +20377,6 @@ impl VibexWorkbench {
             sidebar_selection_state(&project_session_ids, &self.sidebar_state.selected_ids);
         let hover_group: SharedString = format!("sidebar-project-{project_id_string}").into();
         let project_item = SidebarOrganizationItem::Project(project_id_string.clone());
-        let move_selected = self.sidebar_move_selected_items.contains(&project_item);
         let drag_project_ids = self
             .sidebar_drag_items(&project_item)
             .into_iter()
@@ -20415,6 +20420,11 @@ impl VibexWorkbench {
         let locale = self.resolved_locale();
         let project_actions_label = sidebar_project_actions_label(locale, &project_name);
         let new_session_label = sidebar_new_session_for_project_label(locale, &project_name);
+        let project_toggle_label = if project_was_collapsed {
+            locale::text("Expand project", "展开项目", "展開專案")
+        } else {
+            locale::text("Collapse project", "折叠项目", "摺疊專案")
+        };
         let project_appearance = self.sidebar_project_appearance(&project_id_string);
         let project_logo = sidebar_project_logo(
             &project_appearance,
@@ -20442,16 +20452,11 @@ impl VibexWorkbench {
             project_logo_trigger,
             cx,
         );
-        let context_menu_hovered = self.sidebar_context_menu_target
-            == Some(SidebarContextMenuTarget::Project(project_id_string.clone()));
         let context_menu_hover_entity = cx.weak_entity();
         let context_menu_project_id = project_id_string.clone();
         let drag_target_project_id = project_id_string.clone();
         let folder_drag_target_project_id = project_id_string.clone();
         let session_root_target_project_id = project_id_string.clone();
-        let sidebar_accent = cx.theme().sidebar_accent;
-        let sidebar_is_dark = cx.theme().is_dark();
-
         let project_row = div()
             .id(format!("sidebar-project-row-{project_id_string}"))
             .group(hover_group.clone())
@@ -20465,24 +20470,8 @@ impl VibexWorkbench {
             .rounded(px(8.0))
             .bg(if project_scope_drop_active {
                 cx.theme().tokens.drop_target.into()
-            } else if move_selected {
-                sidebar_move_selected_background(cx.theme().sidebar_accent, cx.theme().is_dark())
-            } else if active {
-                cx.theme().sidebar_accent.opacity(0.60)
-            } else if context_menu_hovered {
-                cx.theme().sidebar_accent.opacity(0.45)
             } else {
                 cx.theme().transparent
-            })
-            .hover(move |style| {
-                if move_selected {
-                    style.bg(sidebar_move_selected_background(
-                        sidebar_accent,
-                        sidebar_is_dark,
-                    ))
-                } else {
-                    style.bg(sidebar_accent.opacity(0.45))
-                }
             })
             .on_hover(cx.listener(|this, hovered, _, cx| {
                 if *hovered {
@@ -20601,7 +20590,7 @@ impl VibexWorkbench {
                     .items_center()
                     .gap_2()
                     .when(self.sidebar_batch_mode, |this| this.pl(px(28.0)).pr_2())
-                    .when(!self.sidebar_batch_mode, |this| this.px_2().pr(px(64.0)))
+                    .when(!self.sidebar_batch_mode, |this| this.px_2().pr(px(92.0)))
                     .text_color(if active {
                         cx.theme().sidebar_foreground
                     } else {
@@ -20651,6 +20640,27 @@ impl VibexWorkbench {
                         .invisible()
                         .group_hover(&hover_group, |style| style.visible())
                         .on_click(|_, _, cx| cx.stop_propagation())
+                        .child(
+                            Button::new(format!("sidebar-project-toggle-{project_id_string}"))
+                                .xsmall()
+                                .ghost()
+                                .compact()
+                                .w(px(24.0))
+                                .h(px(24.0))
+                                .icon(if project_was_collapsed {
+                                    IconName::ChevronRight
+                                } else {
+                                    IconName::ChevronDown
+                                })
+                                .tooltip(project_toggle_label)
+                                .on_click(cx.listener({
+                                    let toggle_project_id = project_id_string.clone();
+                                    move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.toggle_sidebar_project(&toggle_project_id, cx);
+                                    }
+                                })),
+                        )
                         .child(
                             Button::new(format!("sidebar-project-menu-{project_id_string}"))
                                 .xsmall()
