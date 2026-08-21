@@ -620,7 +620,13 @@ impl WorkspaceFileService {
             if name == ".git" {
                 continue;
             }
-            let kind = kind_for_path(&path)?;
+            // Search is best-effort over a workspace that can change while it is
+            // being traversed. An entry may disappear (or become inaccessible)
+            // after `read_dir` returns it; skip that entry instead of failing the
+            // entire search with a metadata error.
+            let Ok(kind) = kind_for_path(&path) else {
+                continue;
+            };
             if !include_content && let Some(matched) = matcher.find(&name) {
                 results.push(FileSearchResult {
                     workspace_id: self.workspace_id.clone(),
@@ -638,7 +644,10 @@ impl WorkspaceFileService {
             }
             if kind == FileEntryKind::Directory {
                 self.search_dir(&path, matcher, include_content, limit, results)?;
-            } else if include_content && results.len() < limit {
+            // Never follow symlinks (or inspect special files) for content
+            // search. A dangling link makes `metadata` fail, while a valid link
+            // could otherwise make a workspace search read outside its root.
+            } else if include_content && kind == FileEntryKind::File && results.len() < limit {
                 self.search_file_content(&path, matcher, limit, results)?;
             }
         }
@@ -652,7 +661,15 @@ impl WorkspaceFileService {
         limit: usize,
         results: &mut Vec<FileSearchResult>,
     ) -> VibexResult<()> {
-        let metadata = path_metadata(path)?;
+        // The file may have disappeared or changed type since the directory
+        // entry was read. Search should skip that entry rather than turning a
+        // transient per-file race into a user-visible search failure.
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return Ok(());
+        };
+        if !metadata.file_type().is_file() {
+            return Ok(());
+        }
         if metadata.len() > DEFAULT_MAX_READ_BYTES
             || preview_kind(path) == FilePreviewKind::Image
             || binary_preview_kind(path)
@@ -1798,6 +1815,35 @@ mod tests {
             .map(|result| result.path)
             .collect::<BTreeSet<_>>();
         assert_eq!(content_paths, name_paths);
+        cleanup(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn content_search_skips_dangling_symlinks_without_failing() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root("search-dangling-symlink");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("notes.txt"), "search needle\n").unwrap();
+        symlink("missing.txt", root.join("broken-link.txt")).unwrap();
+        let workspace_id = WorkspaceId::new();
+        let service = WorkspaceFileService::new(&root, workspace_id.clone()).unwrap();
+
+        let hits = service
+            .search(&FileSearchRequest {
+                workspace_id,
+                query: "needle".to_string(),
+                include_content: true,
+                case_sensitive: false,
+                whole_word: false,
+                regex: false,
+                limit: Some(10),
+            })
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "notes.txt");
         cleanup(root);
     }
 
