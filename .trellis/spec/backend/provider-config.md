@@ -2218,6 +2218,51 @@ Ok(runtime)
 The runtime becomes usable first; the owned background task converges managed
 Agent commands only. Agent setup owns the separate one-time option probe.
 
+## Scenario: Managed ACP Companion Compatibility
+
+### 1. Scope / Trigger
+
+- Trigger: a managed ACP Adapter requires a companion npm runtime whose peer
+  range or internal module graph is not aligned with the npm `latest` tag.
+- This contract applies to the verified installation, update-check, cache
+  reuse, and startup-repair paths owned by `AgentInstallService`.
+
+### 2. Contracts
+
+- Managed companion packages are resolved through an Agent-scoped compatibility
+  policy, not by blindly taking npm `latest`.
+- The DeepSeek Harness ACP bridge currently uses the pre-`0.1.1` Harness module
+  graph and must be paired with the exact `@deepseek-ai/dsh@0.1.0-rc.6`
+  runtime. Do not bypass peer conflicts with `legacy-peer-deps` or equivalent
+  flags; the newer runtime also relocates modules that the bridge imports.
+- The installation manifest records the companion `runtime_version`. A
+  DeepSeek installation is usable only when that field equals the compatible
+  runtime version and the managed companion launcher is present.
+- A recorded installation with a mismatched companion remains associated with
+  its installed Adapter version, but update checks report `UpdateAvailable` so
+  the installer can rebuild it. Reinstalling must preserve semver downgrade
+  protection for the Adapter itself.
+- Fixed compatibility versions are used for update probes and fingerprints;
+  other companions may continue to follow their own latest-version policy.
+
+### 3. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| DeepSeek bridge is resolved with `dsh@0.1.1` or another incompatible graph | Do not reuse the installation; report `UpdateAvailable` and rebuild with the compatibility policy. |
+| DeepSeek manifest omits or changes `runtime_version` | Installation is unusable and startup repair is required. |
+| Companion peer dependency cannot be satisfied exactly | Fail the managed install; never retry with a peer-dependency bypass. |
+| Compatible manifest and launcher are present | Reuse the installation without a network latest-version probe. |
+
+### 4. Tests Required
+
+- Installation tests assert the DeepSeek companion policy returns
+  `0.1.0-rc.6` while other Agents retain their normal policy.
+- Manifest usability tests reject a newer/incompatible DeepSeek runtime and
+  accept the exact bridge-compatible version.
+- Update-state tests preserve the recorded Adapter version while surfacing a
+  compatibility mismatch as `UpdateAvailable`.
+
 ## Scenario: Config Center Agent Registry And Selector Gating
 
 ### 1. Scope / Trigger
