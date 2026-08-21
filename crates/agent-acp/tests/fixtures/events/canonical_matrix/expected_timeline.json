@@ -29,7 +29,7 @@
         }
       },
       "providerCorrelationId": "acp_event_5fed9dcd1a9e507a2178a7e887698f32",
-      "redactionState": "contains_redactions"
+      "redactionState": "none"
     },
     {
       "source": "agent",
@@ -59,7 +59,7 @@
         }
       },
       "providerCorrelationId": "acp_event_102ce2056068bf37e8e8352fcf002840",
-      "redactionState": "contains_redactions"
+      "redactionState": "none"
     },
     {
       "source": "agent",
@@ -89,7 +89,7 @@
         }
       },
       "providerCorrelationId": "acp_event_102ce2056068bf37e8e8352fcf002840",
-      "redactionState": "contains_redactions"
+      "redactionState": "none"
     },
     {
       "source": "agent",
@@ -123,7 +123,7 @@
         }
       },
       "providerCorrelationId": "acp_event_b27250d37467b811d01d6091212245f7",
-      "redactionState": "contains_redactions"
+      "redactionState": "none"
     },
     {
       "source": "agent",
@@ -157,7 +157,7 @@
         }
       },
       "providerCorrelationId": "acp_event_08d14563730f5f10eb83fa456ddcc628",
-      "redactionState": "contains_redactions"
+      "redactionState": "none"
     },
     {
       "source": "agent",
@@ -191,7 +191,7 @@
         }
       },
       "providerCorrelationId": "acp_event_ebeadb1de2f59db2000e6b63cf8b7419",
-      "redactionState": "contains_redactions"
+      "redactionState": "none"
     },
     {
       "source": "agent",
@@ -217,7 +217,7 @@
         }
       },
       "providerCorrelationId": "acp_event_b285629ed6ac6cfad3e2c45908f8fb45",
-      "redactionState": "contains_redactions"
+      "redactionState": "none"
     },
     {
       "source": "agent",
@@ -248,7 +248,7 @@
         }
       },
       "providerCorrelationId": "acp_event_cda60d3d54d7003ad9c14c6e0e58dcc2",
-      "redactionState": "contains_redactions"
+      "redactionState": "none"
     },
     {
       "source": "agent",
@@ -263,19 +263,19 @@
           "rawExtension": {
             "schemaVersion": 1,
             "contentBlocks": [],
-            "rawInput": "[redacted]",
+            "rawInput": "{\"agent\":\"reviewer\",\"prompt\":\"Review bounded event fields\"}",
             "rawOutput": {
               "mode": "snapshot",
               "text": "Review complete"
             },
             "locations": [],
             "meta": {},
-            "truncated": true
+            "truncated": false
           }
         }
       },
       "providerCorrelationId": "acp_event_0d452fde5d75785c63ee6dbf432a8244",
-      "redactionState": "contains_redactions"
+      "redactionState": "none"
     },
     {
       "source": "agent",
@@ -304,7 +304,7 @@
         }
       },
       "providerCorrelationId": "acp_event_288f7fd5ccbbc278fc92671f1b754b7c",
-      "redactionState": "contains_redactions"
+      "redactionState": "none"
     },
     {
       "source": "agent",
@@ -330,7 +330,7 @@
         }
       },
       "providerCorrelationId": "acp_event_d4845dcc79f29f546abd00e6ef0bb8b2",
-      "redactionState": "contains_redactions"
+      "redactionState": "none"
     }
   ]
 }
