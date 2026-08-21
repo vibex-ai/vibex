@@ -23351,84 +23351,207 @@ impl VibexWorkbench {
             && worktree_form_valid
             && !self.agent_action_pending
             && !creation_pending;
+        let starter_topics = [
+            (
+                IconName::Bot,
+                locale::text("Make sense of something", "梳理一个问题", "梳理一個問題"),
+                locale::text(
+                    "Help me understand this clearly",
+                    "帮我把这件事梳理清楚",
+                    "幫我把這件事梳理清楚",
+                ),
+                cx.theme().primary,
+            ),
+            (
+                IconName::LayoutDashboard,
+                locale::text("Shape an idea", "完善一个想法", "完善一個想法"),
+                locale::text(
+                    "Turn this rough idea into a plan",
+                    "把这个想法变成可执行的计划",
+                    "把這個想法變成可執行的計畫",
+                ),
+                chart_3,
+            ),
+            (
+                IconName::File,
+                locale::text("Improve what I have", "改进现有内容", "改進現有內容"),
+                locale::text(
+                    "Review and improve my current work",
+                    "帮我检查并改进现有内容",
+                    "幫我檢查並改進現有內容",
+                ),
+                cx.theme().success,
+            ),
+            (
+                IconName::TriangleAlert,
+                locale::text(
+                    "Help me get unstuck",
+                    "帮我解决卡住的问题",
+                    "幫我解決卡住的問題",
+                ),
+                locale::text(
+                    "Find the issue and suggest the next step",
+                    "找出问题并告诉我下一步怎么做",
+                    "找出問題並告訴我下一步怎麼做",
+                ),
+                chart_4,
+            ),
+        ];
+        let starter_topic_cards = starter_topics
+            .into_iter()
+            .enumerate()
+            .map(|(index, (icon, title, prompt, icon_color))| {
+                Button::new(format!("new-session-starter-topic-{index}"))
+                    .ghost()
+                    .flex_1()
+                    .min_w(px(148.0))
+                    .h(px(76.0))
+                    .px_3()
+                    .py_2()
+                    .rounded(px(12.0))
+                    .border_1()
+                    .border_color(border_color.opacity(0.72))
+                    .bg(muted_color.opacity(if is_dark { 0.28 } else { 0.46 }))
+                    .text_color(popover_foreground)
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .items_start()
+                            .gap_1()
+                            .child(Icon::new(icon).size(px(17.0)).text_color(icon_color))
+                            .child(div().text_left().text_sm().font_medium().child(title)),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.new_session_input
+                            .update(cx, |input, cx| input.set_value(prompt, window, cx));
+                        this.new_session_input
+                            .update(cx, |input, cx| input.focus(window, cx));
+                        this.sync_composer_command_entry(ComposerTarget::NewSession, cx);
+                        this.refresh_active_suggestions(ComposerTarget::NewSession, cx);
+                    }))
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let new_session_slogan = format!(
+            "{} Vibex {}",
+            strings.new_session_title_before_brand, strings.new_session_title_after_brand
+        )
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
         let input_geometry_entity = cx.weak_entity();
         let surface_geometry_entity = cx.weak_entity();
-        h_flex()
+        v_flex()
             .id("new-session-home")
             .size_full()
             .min_w_0()
             .min_h_0()
-            .items_start()
-            .justify_center()
+            .items_center()
             .overflow_y_scrollbar()
             .bg(cx.theme().background)
             .px_6()
-            .pt(px(48.0))
-            .pb_6()
+            .pt_6()
+            .pb_4()
             .child(
                 v_flex()
                     .w_full()
                     .max_w(px(768.0))
                     .min_w_0()
+                    .min_h_0()
+                    .flex_1()
+                    .justify_between()
                     .child(
                         v_flex()
+                            .w_full()
+                            .min_w_0()
+                            .min_h_0()
+                            .flex_1()
                             .items_center()
+                            .justify_center()
+                            .gap_5()
                             .text_center()
                             .child(
-                                h_flex()
-                                    .flex_wrap()
+                                v_flex()
                                     .items_center()
-                                    .justify_center()
-                                    .gap_2()
-                                    .text_size(px(32.0))
-                                    .font_semibold()
-                                    .when(
-                                        !strings.new_session_title_before_brand.is_empty(),
-                                        |this| this.child(strings.new_session_title_before_brand),
+                                    .text_center()
+                                    .child(vibex_wordmark(48.0, 50.0, 2.0, 0.0, cx))
+                                    .child(
+                                        div()
+                                            .mt_3()
+                                            .text_size(px(24.0))
+                                            .font_semibold()
+                                            .child(new_session_slogan),
                                     )
-                                    .child(vibex_wordmark(31.0, 33.0, 2.0, 0.0, cx))
-                                    .when(
-                                        !strings.new_session_title_after_brand.is_empty(),
-                                        |this| this.child(strings.new_session_title_after_brand),
+                                    .child(
+                                        div()
+                                            .mt_1()
+                                            .max_w(px(560.0))
+                                            .text_sm()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(strings.new_session_description),
                                     ),
                             )
                             .child(
-                                div()
-                                    .mt_2()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(strings.new_session_description),
+                                h_flex()
+                                    .id("new-session-agent-tabs")
+                                    .w_full()
+                                    .h(px(49.0))
+                                    .flex_none()
+                                    .min_w_0()
+                                    .gap_1()
+                                    .overflow_x_scroll()
+                                    .rounded(px(28.0))
+                                    .border_1()
+                                    .border_color(cx.theme().border.opacity(0.60))
+                                    .bg(muted_color.opacity(0.70))
+                                    .p(px(6.0))
+                                    .children(agent_tabs),
+                            )
+                            .when(!has_agent_choices, |this| {
+                                this.child(
+                                    div()
+                                        .text_center()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(strings.new_session_no_agents),
+                                )
+                            })
+                            .child(
+                                v_flex()
+                                    .w_full()
+                                    .min_w_0()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_left()
+                                            .text_xs()
+                                            .font_medium()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(locale::text(
+                                                "Start with a common task",
+                                                "从常见任务开始",
+                                                "從常見任務開始",
+                                            )),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .w_full()
+                                            .min_w_0()
+                                            .flex_wrap()
+                                            .gap_2()
+                                            .children(starter_topic_cards),
+                                    ),
                             ),
                     )
                     .child(
-                        h_flex()
-                            .id("new-session-agent-tabs")
-                            .mt_6()
-                            .h(px(49.0))
-                            .flex_none()
-                            .min_w_0()
-                            .gap_1()
-                            .overflow_x_scroll()
-                            .rounded(px(28.0))
-                            .border_1()
-                            .border_color(cx.theme().border.opacity(0.60))
-                            .bg(muted_color.opacity(0.70))
-                            .p(px(6.0))
-                            .children(agent_tabs),
-                    )
-                    .when(!has_agent_choices, |this| {
-                        this.child(
-                            div()
-                                .mt_3()
-                                .text_center()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(strings.new_session_no_agents),
-                        )
-                    })
-                    .child(
                         v_flex()
-                            .mt_4()
+                            .w_full()
+                            .min_w_0()
+                            .flex_none()
+                            .mt_5()
+                            .child(
+                                v_flex()
+                            .items_center()
                             .min_w_0()
                             .overflow_hidden()
                             .rounded(px(20.0))
