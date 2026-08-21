@@ -10700,11 +10700,6 @@ impl CodeRightRail {
                                     )
                                     .outline()
                                     .with_size(Size::Size(px(36.0)))
-                                    .tooltip(locale::text(
-                                        "More commit actions",
-                                        "更多提交操作",
-                                        "更多提交操作",
-                                    ))
                                     .loading(pending || lifecycle_pending)
                                     .disabled(action_pending || selected_count == 0)
                                     .dropdown_menu_with_anchor(
@@ -14237,6 +14232,8 @@ mod tests {
         assert!(changes.contains("Anchor::BottomRight"));
         assert!(changes.contains("DropdownButton::new(\"commit-actions\")"));
         assert!(changes.contains(".with_size(Size::Size(px(36.0)))"));
+        assert!(!changes.contains("More commit actions"));
+        assert!(!changes.contains("更多提交操作"));
         assert!(source.contains("toggle-all-git-directories"));
         assert!(source.contains("select-git-tree-row-wrapper:"));
     }
