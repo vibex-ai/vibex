@@ -11077,7 +11077,7 @@ impl CodeRightRail {
             .placeholder(locale::text("All Users", "所有用户", "所有使用者"))
             .search_placeholder(locale::text("Search users", "搜索用户", "搜尋使用者"));
         let date_picker = DatePicker::new(&self.history_date_picker)
-            .small()
+            .with_size(Size::Medium)
             .h(px(32.0))
             .w(px(220.0))
             .text_xs()
@@ -14599,6 +14599,20 @@ mod tests {
         assert!(history_renderer.contains(".with_priority(3)"));
         assert!(history_renderer.contains("capture_any_mouse_down(|_, _, cx| cx.propagate())"));
         assert!(!history_renderer.contains("dispatch_keystroke"));
+    }
+
+    #[test]
+    fn git_history_date_filter_uses_the_same_input_height_as_selectors() {
+        let source = include_str!("code_workbench.rs");
+        let date_filter = source
+            .split_once("let date_picker = DatePicker::new")
+            .and_then(|(_, tail)| tail.split_once("let body_size_target"))
+            .map(|(body, _)| body)
+            .expect("Git history date filter should remain inspectable");
+
+        assert!(date_filter.contains(".with_size(Size::Medium)"));
+        assert!(date_filter.contains(".h(px(32.0))"));
+        assert!(!date_filter.contains(".small()"));
     }
 
     #[test]
