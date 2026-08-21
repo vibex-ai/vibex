@@ -38,7 +38,6 @@ const OFFER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const QR_QUIET_ZONE_MODULES: usize = 4;
 const QR_MODULE_SCALE: usize = 4;
 const DIALOG_MAX_WIDTH: f32 = 760.0;
-const DIALOG_MAX_HEIGHT: f32 = 400.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteAccessMutation {
@@ -2774,12 +2773,13 @@ impl Render for RemoteAccessPairing {
 
         v_flex()
             .id("remote-access-pairing")
-            .size_full()
+            .w_full()
             .min_h_0()
             .gap_4()
             .bg(popover)
             .text_color(popover_foreground)
             .overflow_y_scroll()
+            .pt_2()
             .pr_1()
             .pb_1()
             .when(page == RemoteAccessPage::EntryDetails, |column| {
@@ -2904,7 +2904,7 @@ pub(crate) fn open_remote_access_pairing(
     let close_view = view.clone();
     let viewport = window.viewport_size();
     let dialog_width = (f32::from(viewport.width) - 32.0).clamp(280.0, DIALOG_MAX_WIDTH);
-    let dialog_height = (f32::from(viewport.height) - 32.0).clamp(360.0, DIALOG_MAX_HEIGHT);
+    let dialog_max_height = pairing_dialog_max_height(f32::from(viewport.height));
     window.open_dialog(cx, move |dialog, _, cx| {
         let close_view = close_view.clone();
         let is_dark = cx.theme().is_dark();
@@ -2918,7 +2918,8 @@ pub(crate) fn open_remote_access_pairing(
             ))
             .w(px(dialog_width))
             .max_w(px(dialog_width))
-            .h(px(dialog_height))
+            .h_auto()
+            .max_h(px(dialog_max_height))
             .rounded(px(14.0))
             .bg(popover)
             .text_color(popover_foreground)
@@ -2931,6 +2932,10 @@ pub(crate) fn open_remote_access_pairing(
                 close_view.update(cx, |view, cx| view.dismiss(cx));
             })
     });
+}
+
+fn pairing_dialog_max_height(viewport_height: f32) -> f32 {
+    (viewport_height - 32.0).max(1.0)
 }
 
 fn compose_private_offer(
@@ -3800,15 +3805,13 @@ mod tests {
     }
 
     #[test]
-    fn pairing_dialog_dimensions_fit_narrow_and_wide_windows() {
+    fn pairing_dialog_width_and_adaptive_height_fit_the_viewport() {
         let narrow = (360.0_f32 - 32.0).clamp(280.0, DIALOG_MAX_WIDTH);
         let wide = (1_440.0_f32 - 32.0).clamp(280.0, DIALOG_MAX_WIDTH);
         assert_eq!(narrow, 328.0);
         assert_eq!(wide, DIALOG_MAX_WIDTH);
-        assert_eq!(
-            (900.0_f32 - 32.0).clamp(360.0, DIALOG_MAX_HEIGHT),
-            DIALOG_MAX_HEIGHT
-        );
+        assert_eq!(pairing_dialog_max_height(900.0), 868.0);
+        assert_eq!(pairing_dialog_max_height(24.0), 1.0);
     }
 
     #[test]
