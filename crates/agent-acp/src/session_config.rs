@@ -34,6 +34,9 @@ const MAX_MODEL_ID_LEN: usize = 160;
 const MAX_EFFORT_VALUE_LEN: usize = 64;
 const MAX_CATALOG_LABEL_LEN: usize = 160;
 const RUNTIME_OPTION_CATALOG_DOMAIN: &[u8] = b"vibex/runtime-option-catalog/v2";
+const REASONING_EFFORT_MODE_VALUES: &[&str] = &[
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
 
 /// A normalized semantic option key.  Raw provider ids are never used as
 /// authority without passing through this boundary.
@@ -252,6 +255,7 @@ pub struct SessionConfigPlanner {
     operations: BTreeMap<AcpOperation, SessionConfigOperationEvidence>,
     operation_fallbacks: BTreeMap<AcpOperation, Vec<SessionConfigOperationEvidence>>,
     options: Vec<ProviderSessionConfigOption>,
+    reasoning_effort_mode_bridge: bool,
     extensions: BTreeMap<String, SessionConfigExtension>,
     startup_projections: BTreeSet<String>,
 }
@@ -284,6 +288,7 @@ impl SessionConfigPlanner {
             operations,
             operation_fallbacks: BTreeMap::new(),
             options,
+            reasoning_effort_mode_bridge: false,
             extensions: BTreeMap::new(),
             startup_projections: BTreeSet::new(),
         }
@@ -311,7 +316,54 @@ impl SessionConfigPlanner {
     pub fn with_options(&self, options: Vec<ProviderSessionConfigOption>) -> Self {
         let mut next = self.clone();
         next.options = options;
+        next.add_reasoning_effort_mode_operation();
         next
+    }
+
+    /// Enables the provider-specific bridge used by Grok's xAI session
+    /// metadata, where each reasoning level is a separate `mode` option.
+    pub fn with_reasoning_effort_mode_bridge(mut self) -> Self {
+        self.reasoning_effort_mode_bridge = true;
+        self.add_reasoning_effort_mode_operation();
+        self
+    }
+
+    fn add_reasoning_effort_mode_operation(&mut self) {
+        if !self.reasoning_effort_mode_bridge {
+            return;
+        }
+        add_reasoning_effort_mode_operation(
+            &mut self.operations,
+            &self.compatibility_identity,
+            self.activation_generation,
+            &self.options,
+        );
+    }
+
+    /// Grok exposes reasoning levels as individual xAI `mode` options rather
+    /// than as one selectable `reasoning_effort` option. Those values still
+    /// use ACP's typed `session/set_mode` request on the wire.
+    pub fn reasoning_effort_value_is_advertised(&self, value: &str) -> bool {
+        if self.reasoning_effort_mode_bridge
+            && reasoning_effort_mode_value_is_advertised(&self.options, value)
+        {
+            return true;
+        }
+        let Ok(key) = CanonicalSessionConfigKey::parse(CANONICAL_REASONING_EFFORT) else {
+            return false;
+        };
+        self.option_for_key(&key)
+            .ok()
+            .flatten()
+            .is_some_and(|option| match option.kind {
+                ProviderSessionConfigOptionKind::Boolean => matches!(value, "true" | "false"),
+                ProviderSessionConfigOptionKind::Select => {
+                    option.values.is_empty() || option.values.iter().any(|item| item.value == value)
+                }
+                ProviderSessionConfigOptionKind::String => {
+                    !value.trim().is_empty() && value.len() <= 256
+                }
+            })
     }
 
     /// Adds a lower-priority encoding for an operation.  This is useful when a
@@ -425,6 +477,12 @@ impl SessionConfigPlanner {
                 self.plan_model(&field.key, config_option, config_evidence)
             }
             SessionConfigFieldKind::Mode => self.plan_mode(&field.key),
+            SessionConfigFieldKind::ReasoningEffort
+                if self.reasoning_effort_mode_bridge
+                    && reasoning_effort_mode_value_is_advertised(&self.options, &field.value) =>
+            {
+                self.plan_reasoning_effort_via_mode()
+            }
             SessionConfigFieldKind::ReasoningEffort | SessionConfigFieldKind::Generic => {
                 config_evidence
                     .filter(|_| config_option.is_some())
@@ -452,6 +510,12 @@ impl SessionConfigPlanner {
         let operation = match field.kind {
             SessionConfigFieldKind::Model => Some(AcpOperation::SessionSetModel),
             SessionConfigFieldKind::Mode => Some(AcpOperation::SessionSetMode),
+            SessionConfigFieldKind::ReasoningEffort
+                if self.reasoning_effort_mode_bridge
+                    && reasoning_effort_mode_value_is_advertised(&self.options, &field.value) =>
+            {
+                Some(AcpOperation::SessionSetMode)
+            }
             SessionConfigFieldKind::ReasoningEffort | SessionConfigFieldKind::Generic => {
                 Some(AcpOperation::SessionSetConfigOption)
             }
@@ -523,6 +587,24 @@ impl SessionConfigPlanner {
             .unwrap_or_else(|| self.restart_or_unavailable(key))
     }
 
+    fn plan_reasoning_effort_via_mode(&self) -> SessionConfigPlan {
+        self.supported_operation_candidates(&AcpOperation::SessionSetMode)
+            .into_iter()
+            .find(|evidence| {
+                matches!(
+                    evidence.encoding,
+                    AcpWireEncoding::Typed | AcpWireEncoding::VersionedRaw
+                )
+            })
+            .map(|evidence| SessionConfigPlan::Live {
+                operation: AcpOperation::SessionSetMode,
+                encoding: evidence.encoding,
+                source: evidence.source,
+                option_id: None,
+            })
+            .unwrap_or(SessionConfigPlan::Unavailable)
+    }
+
     fn extension_for(&self, key: &CanonicalSessionConfigKey) -> Option<SessionConfigPlan> {
         self.extensions
             .get(key.as_str())
@@ -575,6 +657,56 @@ impl SessionConfigPlanner {
         });
         fields
     }
+}
+
+fn reasoning_effort_mode_value_is_advertised(
+    options: &[ProviderSessionConfigOption],
+    value: &str,
+) -> bool {
+    let normalized = normalize_identifier(value);
+    if !REASONING_EFFORT_MODE_VALUES.contains(&normalized.as_str()) {
+        return false;
+    }
+    options.iter().any(|option| {
+        normalize_identifier(option.category.as_deref().unwrap_or_default()) == "mode"
+            && normalize_identifier(&option.id) == normalized
+            && option.values.is_empty()
+    }) && reasoning_effort_mode_option_set(options)
+}
+
+fn reasoning_effort_mode_option_set(options: &[ProviderSessionConfigOption]) -> bool {
+    let mode_options = options
+        .iter()
+        .filter(|option| {
+            normalize_identifier(option.category.as_deref().unwrap_or_default()) == "mode"
+        })
+        .collect::<Vec<_>>();
+    mode_options.len() >= 2
+        && mode_options.iter().all(|option| {
+            option.values.is_empty()
+                && REASONING_EFFORT_MODE_VALUES.contains(&normalize_identifier(&option.id).as_str())
+        })
+}
+
+fn add_reasoning_effort_mode_operation(
+    operations: &mut BTreeMap<AcpOperation, SessionConfigOperationEvidence>,
+    compatibility_identity: &str,
+    activation_generation: i64,
+    options: &[ProviderSessionConfigOption],
+) {
+    if !reasoning_effort_mode_option_set(options) {
+        return;
+    }
+    operations
+        .entry(AcpOperation::SessionSetMode)
+        .or_insert(SessionConfigOperationEvidence {
+            support: CapabilitySupport::Supported,
+            source: CapabilitySource::NegotiatedRuntime,
+            encoding: AcpWireEncoding::Typed,
+            stability: AcpOperationStability::CapabilityGated,
+            compatibility_identity: compatibility_identity.to_string(),
+            activation_generation,
+        });
 }
 
 fn operation_candidate_rank(evidence: &SessionConfigOperationEvidence) -> (u8, u8) {
@@ -1867,6 +1999,42 @@ mod tests {
         assert!(matches!(
             planner.option_for_key(&reasoning_key),
             Err(CanonicalKeyError::Ambiguous(_))
+        ));
+    }
+
+    #[test]
+    fn grok_mode_efforts_use_session_set_mode() {
+        let options = ["xhigh", "high", "medium", "low"]
+            .into_iter()
+            .map(|id| {
+                let mut option = option(id, id);
+                option.category = Some("mode".to_string());
+                option.label = id.to_string();
+                option
+            })
+            .collect();
+        let planner = SessionConfigPlanner::new(
+            "adapter=test@1",
+            1,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            options,
+        )
+        .with_reasoning_effort_mode_bridge();
+        let request = SessionConfigFieldRequest {
+            key: CanonicalSessionConfigKey::parse(CANONICAL_REASONING_EFFORT).unwrap(),
+            kind: SessionConfigFieldKind::ReasoningEffort,
+            value: "low".to_string(),
+        };
+
+        assert!(planner.reasoning_effort_value_is_advertised("low"));
+        assert!(matches!(
+            planner.plan(&request).unwrap(),
+            SessionConfigPlan::Live {
+                operation: AcpOperation::SessionSetMode,
+                encoding: AcpWireEncoding::Typed,
+                ..
+            }
         ));
     }
 

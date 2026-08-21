@@ -191,6 +191,7 @@ const ACP_PROCESS_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const ACP_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 const ACP_PERMISSION_CANCELLED_RESPONSE: &str = "cancelled";
 const OPENCODE_AGENT_ID: &str = "opencode";
+const GROK_AGENT_ID: &str = "grok";
 const OPENCODE_DEFAULT_MODEL: &str = "opencode-default";
 const OPENCODE_INLINE_CONFIG_ENV: &str = "OPENCODE_CONFIG_CONTENT";
 const OPENCODE_PROVIDER_API_KEY_ENV: &str = "VIBEX_OPENCODE_PROVIDER_API_KEY";
@@ -12088,6 +12089,9 @@ impl AcpRuntimeClient {
             operations,
             discovery.options.clone(),
         );
+        if process.agent_id.as_str() == GROK_AGENT_ID {
+            planner = planner.with_reasoning_effort_mode_bridge();
+        }
         if config_option_needs_raw_fallback {
             let fallback = SessionConfigOperationEvidence {
                 support: CapabilitySupport::Supported,
@@ -12532,7 +12536,10 @@ fn runtime_config_value_is_advertised(
                 config.modes.is_empty() || config.modes.iter().any(|mode| mode.value == value)
             })
             .unwrap_or(true),
-        SessionConfigFieldKind::ReasoningEffort | SessionConfigFieldKind::Generic => planner
+        SessionConfigFieldKind::ReasoningEffort => {
+            planner.reasoning_effort_value_is_advertised(value)
+        }
+        SessionConfigFieldKind::Generic => planner
             .option_for_key(&field.key)
             .ok()
             .flatten()
