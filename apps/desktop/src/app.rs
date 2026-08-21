@@ -335,11 +335,11 @@ const IMAGE_PREVIEW_MIN_ZOOM: f32 = 0.25;
 const IMAGE_PREVIEW_MAX_ZOOM: f32 = 4.0;
 const IMAGE_PREVIEW_HORIZONTAL_PADDING: f32 = 24.0;
 const IMAGE_PREVIEW_VERTICAL_PADDING: f32 = 64.0;
-const SETTINGS_ROW_INLINE_MIN_VIEWPORT_WIDTH: f32 = 896.0;
+const SETTINGS_ROW_INLINE_MIN_VIEWPORT_WIDTH: f32 = 760.0;
 const SETTINGS_VERTICAL_TABS_MIN_WIDTH: f32 = 768.0;
-const SETTINGS_NAVIGATION_WIDTH: f32 = 196.0;
-const SETTINGS_NAVIGATION_ROW_HEIGHT: f32 = 36.0;
-const SETTINGS_NAVIGATION_SECTION_GAP: f32 = 6.0;
+const SETTINGS_NAVIGATION_WIDTH: f32 = 232.0;
+const SETTINGS_NAVIGATION_ROW_HEIGHT: f32 = 34.0;
+const SETTINGS_NAVIGATION_SECTION_GAP: f32 = 4.0;
 const SETTINGS_DIALOG_MAX_WIDTH: f32 = 960.0;
 const SETTINGS_DIALOG_MAX_HEIGHT: f32 = 720.0;
 
@@ -18353,10 +18353,10 @@ impl VibexWorkbench {
                 .max_w(px(dialog_width))
                 .h(px(dialog_height))
                 .margin_top(px(dialog_margin_top))
-                .rounded(px(14.0))
+                .rounded(px(12.0))
                 .bg(popover)
                 .text_color(popover_foreground)
-                .border_color(popover_foreground.opacity(0.10))
+                .border_color(popover_foreground.opacity(0.16))
                 .overlay(true)
                 .overlay_closable(true)
                 .on_close(move |_, _, cx| {
@@ -37751,12 +37751,12 @@ impl Render for SettingsDialogTitle {
             .items_center()
             .relative()
             .pr(px(40.0))
-            .pb_2()
+            .pb_1()
             .child(
                 v_flex().min_w_0().flex_1().child(
                     div()
-                        .text_sm()
-                        .font_medium()
+                        .text_base()
+                        .font_semibold()
                         .line_height(gpui::relative(1.43))
                         .child(strings.settings),
                 ),
@@ -38872,9 +38872,8 @@ impl FoundationSettings {
         let is_dark = cx.theme().is_dark();
         let foreground = theme::semantic_color("foreground", is_dark);
         let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
-        let muted = theme::semantic_color("muted", is_dark);
         let border = theme::semantic_color("border", is_dark);
-        let active_background = muted.opacity(if is_dark { 0.72 } else { 0.88 });
+        let sidebar_accent = theme::semantic_color("sidebar-accent", is_dark);
         let sections = [
             (
                 SettingsSection::General,
@@ -38922,24 +38921,18 @@ impl FoundationSettings {
             .map(|(section, label, icon)| {
                 let active = self.active_section == section;
                 let icon = Icon::new(icon)
-                    .size(px(24.0))
-                    .p(px(4.0))
+                    .size(px(16.0))
                     .mr(px(2.0))
-                    .rounded(px(6.0))
-                    .bg(if active {
-                        theme::semantic_color("accent", is_dark).opacity(0.24)
-                    } else {
-                        theme::semantic_color("muted", is_dark).opacity(0.55)
-                    });
+                    .text_color(if active { foreground } else { muted_foreground });
                 Button::new(SharedString::from(format!("settings-{section:?}")))
                     .small()
                     .ghost()
                     .h(px(SETTINGS_NAVIGATION_ROW_HEIGHT))
-                    .px_2()
+                    .px_3()
                     .rounded(px(6.0))
                     .selected(active)
                     .text_color(if active { foreground } else { muted_foreground })
-                    .when(active, |this| this.bg(active_background))
+                    .when(active, |this| this.bg(sidebar_accent.opacity(0.34)))
                     .when(wide, |this| this.w_full())
                     .when(!wide, |this| this.min_w(px(112.0)).flex_1())
                     .icon(icon)
@@ -38955,7 +38948,7 @@ impl FoundationSettings {
             .collect::<Vec<_>>();
         let search = Input::new(&self.search)
             .small()
-            .h(px(36.0))
+            .h(px(32.0))
             .w_full()
             .prefix(
                 Icon::new(IconName::Search)
@@ -38988,31 +38981,30 @@ impl FoundationSettings {
             .w(px(SETTINGS_NAVIGATION_WIDTH))
             .h_full()
             .flex_none()
-            .gap_3()
-            .pr_3()
+            .overflow_y_scrollbar()
+            .gap_2()
+            .px_3()
+            .pt_1()
             .border_r_1()
             .border_color(border.opacity(0.72))
+            .bg(theme::semantic_color("sidebar", is_dark))
             .child(search)
             .child(
                 v_flex()
                     .gap(px(SETTINGS_NAVIGATION_SECTION_GAP))
-                    .child(group_label(locale::text(
-                        "Preferences",
-                        "偏好设置",
-                        "偏好設定",
-                    )))
+                    .child(group_label(locale::text("VIBEX", "偏好设置", "偏好設定")))
                     .children(buttons),
             )
             .child(
                 v_flex()
                     .gap(px(SETTINGS_NAVIGATION_SECTION_GAP))
-                    .child(group_label(locale::text("Workflow", "工作流", "工作流程")))
+                    .child(group_label(locale::text("WORKSPACE", "工作流", "工作流程")))
                     .children(workflow),
             )
             .child(
                 v_flex()
                     .gap(px(SETTINGS_NAVIGATION_SECTION_GAP))
-                    .child(group_label(locale::text("Support", "支持", "支援")))
+                    .child(group_label(locale::text("SUPPORT", "支持", "支援")))
                     .children(support),
             )
             .into_any_element()
@@ -40577,7 +40569,7 @@ impl Render for FoundationSettings {
                 this.min_h(px(320.0)).flex_row().items_start()
             })
             .when(!vertical_tabs, |this| this.flex_col().pr_1())
-            .gap_4()
+            .gap_0()
             .child(navigation)
             .child(
                 div()
@@ -40585,6 +40577,7 @@ impl Render for FoundationSettings {
                     .min_w_0()
                     .min_h_0()
                     .flex_1()
+                    .bg(theme::semantic_color("background", cx.theme().is_dark()))
                     .overflow_y_scrollbar()
                     .child(page),
             )
@@ -41118,8 +41111,8 @@ fn settings_page(
     cx: &App,
 ) -> AnyElement {
     let is_dark = cx.theme().is_dark();
-    let card = theme::semantic_color("card", is_dark);
-    let card_foreground = theme::semantic_color("card-foreground", is_dark);
+    let background = theme::semantic_color("background", is_dark);
+    let foreground = theme::semantic_color("foreground", is_dark);
     let border = theme::semantic_color("border", is_dark);
     let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
 
@@ -41127,34 +41120,31 @@ fn settings_page(
         .w_full()
         .min_w_0()
         .overflow_hidden()
-        .gap_4()
-        .rounded(px(10.0))
-        .border_1()
-        .border_color(border.opacity(0.70))
-        .bg(card)
-        .text_color(card_foreground)
-        .py_4()
+        .gap_5()
+        .bg(background)
+        .text_color(foreground)
+        .px_6()
+        .py_5()
         .child(
             v_flex()
-                .gap_1()
-                .px_4()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_medium()
-                        .line_height(gpui::relative(1.43))
-                        .child(title),
-                )
+                .gap_2()
+                .child(div().text_lg().font_semibold().child(title))
                 .child(
                     div()
                         .text_xs()
-                        .line_height(gpui::relative(1.625))
                         .whitespace_normal()
                         .text_color(muted_foreground)
                         .child(description),
                 ),
         )
-        .child(v_flex().gap_4().px_4().children(rows))
+        .child(
+            v_flex()
+                .gap_3()
+                .border_t_1()
+                .border_color(border.opacity(0.65))
+                .pt_5()
+                .children(rows),
+        )
         .into_any_element()
 }
 
@@ -41180,8 +41170,10 @@ fn setting_row(
         .gap_3()
         .rounded(px(8.0))
         .border_1()
-        .border_color(border)
-        .p_3()
+        .border_color(border.opacity(0.82))
+        .bg(theme::semantic_color("card", is_dark).opacity(if is_dark { 0.18 } else { 0.34 }))
+        .px_3()
+        .py_3()
         .child(
             v_flex()
                 .min_w_0()
@@ -48380,10 +48372,10 @@ mod tests {
 
     #[test]
     fn settings_navigation_keeps_grouped_large_targets() {
-        assert_eq!(SETTINGS_NAVIGATION_WIDTH, 196.0);
-        assert_eq!(SETTINGS_NAVIGATION_ROW_HEIGHT, 36.0);
-        assert_eq!(SETTINGS_NAVIGATION_SECTION_GAP, 6.0);
-        assert_eq!(SETTINGS_ROW_INLINE_MIN_VIEWPORT_WIDTH, 896.0);
+        assert_eq!(SETTINGS_NAVIGATION_WIDTH, 232.0);
+        assert_eq!(SETTINGS_NAVIGATION_ROW_HEIGHT, 34.0);
+        assert_eq!(SETTINGS_NAVIGATION_SECTION_GAP, 4.0);
+        assert_eq!(SETTINGS_ROW_INLINE_MIN_VIEWPORT_WIDTH, 760.0);
 
         let source = include_str!("app.rs");
         let navigation = source
