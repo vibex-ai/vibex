@@ -218,7 +218,6 @@ const SIDEBAR_DRAG_PREVIEW_WIDTH: f32 = 280.0;
 const SIDEBAR_DRAG_HORIZONTAL_SLOP: f32 = 16.0;
 const SIDEBAR_ORGANIZATION_INDENT: f32 = 20.0;
 const SIDEBAR_ORGANIZATION_MIN_INDENT: f32 = 4.0;
-const SIDEBAR_WORKSPACE_INDENT: f32 = 12.0;
 const SIDEBAR_FOLDER_DROP_EDGE_HEIGHT: f32 = 8.0;
 const STARTUP_LOADING_INDICATOR_DELAY: Duration = Duration::from_secs(5);
 const STARTUP_LOADING_MIN_DURATION: Duration = Duration::from_secs(1);
@@ -20836,11 +20835,6 @@ impl VibexWorkbench {
                         .min_w_0()
                         .gap(px(2.0))
                         .when(!detailed_hierarchy, |this| this.pl_6())
-                        .when(detailed_hierarchy, |this| {
-                            this.pl(px(SIDEBAR_WORKSPACE_INDENT))
-                                .border_l_1()
-                                .border_color(cx.theme().sidebar_border.opacity(0.45))
-                        })
                         .children(session_elements),
                 )
             });
@@ -20870,10 +20864,6 @@ impl VibexWorkbench {
             .clone()
             .unwrap_or_else(|| locale::text("No branch", "无分支", "無分支").to_string());
         let branch_name = sidebar_workspace_branch_name(&branch).to_string();
-        let workspace_kind = match workspace.mode {
-            WorkspaceMode::CurrentCheckout => locale::text("Checkout", "当前目录", "目前目錄"),
-            WorkspaceMode::VibexWorktree => locale::text("Worktree", "Worktree", "Worktree"),
-        };
         let lifecycle_state = projection.context.worktree_lifecycle_state;
         let collapsed = self
             .ui_state
@@ -20948,12 +20938,6 @@ impl VibexWorkbench {
             } else {
                 cx.theme().background.opacity(0.14)
             })
-            .border_l_1()
-            .border_color(if selected {
-                cx.theme().sidebar_accent.opacity(0.72)
-            } else {
-                cx.theme().sidebar_border.opacity(0.55)
-            })
             .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.20)))
             .tooltip(move |window, cx| Tooltip::new(tooltip_branch.clone()).build(window, cx))
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -20980,17 +20964,11 @@ impl VibexWorkbench {
                     .pr(px(34.0))
                     .child(
                         h_flex()
-                            .w(px(30.0))
+                            .w(px(26.0))
                             .h(px(26.0))
                             .flex_none()
                             .items_center()
                             .justify_center()
-                            .gap(px(4.0))
-                            .child(
-                                sidebar_icon("icons/vibex/git-branch.svg")
-                                    .size(px(14.0))
-                                    .text_color(cx.theme().sidebar_foreground.opacity(0.55)),
-                            )
                             .child(status_indicator),
                     )
                     .child(
@@ -21007,19 +20985,12 @@ impl VibexWorkbench {
                                     .child(branch_name),
                             )
                             .child(
-                                h_flex()
+                                div()
                                     .min_w_0()
-                                    .gap(px(4.0))
                                     .text_xs()
                                     .text_color(cx.theme().sidebar_foreground.opacity(0.48))
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .font_medium()
-                                            .text_color(cx.theme().sidebar_foreground.opacity(0.62))
-                                            .child(workspace_kind),
-                                    )
-                                    .child(div().min_w_0().truncate().child(branch)),
+                                    .truncate()
+                                    .child(branch),
                             ),
                     ),
             )
@@ -21090,8 +21061,6 @@ impl VibexWorkbench {
                     .min_w_0()
                     .gap(px(2.0))
                     .pl(px(20.0))
-                    .border_l_1()
-                    .border_color(cx.theme().sidebar_border.opacity(0.42))
                     .children(sessions),
             )
             .into_any_element()
@@ -49177,6 +49146,7 @@ mod tests {
         assert!(workspace.contains(".pl(px(20.0))"));
         assert!(!workspace.contains(".ml(px(18.0))"));
         assert!(!workspace.contains(".border_1()"));
+        assert!(!workspace.contains(".border_l_1()"));
     }
 
     #[test]
@@ -49194,11 +49164,19 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_session("))
             .map(|(body, _)| body)
             .expect("sidebar workspace renderer should remain inspectable");
+        let row = workspace
+            .split_once("        let row = div()")
+            .and_then(|(_, tail)| tail.split_once("\n        if collapsed {"))
+            .map(|(body, _)| body)
+            .expect("worktree row should remain inspectable");
 
         assert!(workspace.contains("let branch_name = sidebar_workspace_branch_name(&branch)"));
         assert!(workspace.contains(".child(branch_name)"));
         assert!(workspace.contains(".child(branch)"));
-        assert!(workspace.contains(".w(px(30.0))"));
+        assert!(workspace.contains(".w(px(26.0))"));
+        assert!(!row.contains("icons/vibex/git-branch.svg"));
+        assert!(!row.contains(".border_l_1()"));
+        assert!(!workspace.contains("workspace_kind"));
         assert!(!workspace.contains("Current Checkout"));
         assert!(!workspace.contains("workspace.root_path"));
 
@@ -49225,6 +49203,7 @@ mod tests {
         assert!(project.contains("!detailed_hierarchy"));
         assert!(project.contains("self.render_sidebar_project_children("));
         assert!(!project.contains("match self.ui_state.sidebar.hierarchy_mode"));
+        assert!(!project.contains("SIDEBAR_WORKSPACE_INDENT"));
     }
 
     #[test]
