@@ -11650,36 +11650,38 @@ impl VibexWorkbench {
         };
         let image = Arc::new(Image::from_bytes(ImageFormat::Png, bytes));
         let dimensions = buffer.dimensions();
-        let Some(preview) = self.attachment_image_preview.as_mut() else {
-            return false;
+        let (attachment_id, updated_attachment) = {
+            let Some(preview) = self.attachment_image_preview.as_mut() else {
+                return false;
+            };
+            if !preview.editable {
+                return false;
+            }
+            preview.attachment.label = edited_attachment_file_name(&preview.attachment.label);
+            preview.attachment.path = Some(path.to_string_lossy().into_owned());
+            preview.attachment.mime_type = Some("image/png".to_string());
+            preview.image_source = Arc::<Path>::from(path.clone().into_boxed_path());
+            preview.edited_image = Some(image);
+            preview.edit_buffer = Some(buffer);
+            preview.intrinsic_size = Some(dimensions);
+            preview.zoom = 1.0;
+            preview.pan_x = 0.0;
+            preview.pan_y = 0.0;
+            (preview.attachment.id.clone(), preview.attachment.clone())
         };
-        if !preview.editable {
-            return false;
-        }
-        let attachment_id = preview.attachment.id.clone();
-        preview.attachment.label = edited_attachment_file_name(&preview.attachment.label);
-        preview.attachment.path = Some(path.to_string_lossy().into_owned());
-        preview.attachment.mime_type = Some("image/png".to_string());
-        preview.image_source = Arc::<Path>::from(path.clone().into_boxed_path());
-        preview.edited_image = Some(image);
-        preview.edit_buffer = Some(buffer);
-        preview.intrinsic_size = Some(dimensions);
-        preview.zoom = 1.0;
-        preview.pan_x = 0.0;
-        preview.pan_y = 0.0;
         if let Some(attachment) = self
             .composer_attachments
             .iter_mut()
             .find(|attachment| attachment.attachment.id == attachment_id)
         {
-            attachment.attachment = preview.attachment.clone();
+            attachment.attachment = updated_attachment.clone();
         }
         if let Some(attachment) = self
             .new_session_attachments
             .iter_mut()
             .find(|attachment| attachment.attachment.id == attachment_id)
         {
-            attachment.attachment = preview.attachment.clone();
+            attachment.attachment = updated_attachment;
         }
         cx.notify();
         true
@@ -47811,12 +47813,9 @@ mod tests {
             .map(|(body, _)| body)
             .expect("image editor renderer should remain inspectable");
 
+        assert!(editor.contains("format!(\"attachment-edit-tool-{}\", tool.id())"));
         for tool_id in ImageEditTool::ALL.map(ImageEditTool::id) {
-            assert!(
-                editor.contains(&format!("attachment-edit-tool-{}", tool_id))
-                    || editor.contains("attachment-edit-tool-{}"),
-                "image editor should expose {tool_id}"
-            );
+            assert!(!tool_id.is_empty(), "image editor tool id must be stable");
         }
         assert!(editor.contains("ImageEditTool::ALL.into_iter()"));
         assert!(editor.contains("ImageEditTool::Text"));
