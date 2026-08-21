@@ -20619,10 +20619,9 @@ impl VibexWorkbench {
                             .flex_1()
                             .min_w_0()
                             .items_center()
-                            .gap_2()
+                            .gap_1()
                             .child(
                                 div()
-                                    .flex_1()
                                     .min_w_0()
                                     .truncate()
                                     .text_sm()
