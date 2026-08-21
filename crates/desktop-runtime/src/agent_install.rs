@@ -51,6 +51,7 @@ const NODE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const UV_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const MINIMUM_NODE_VERSION: semver::Version = semver::Version::new(22, 0, 0);
 const MINIMUM_UV_VERSION: semver::Version = semver::Version::new(0, 5, 0);
+const DEEPSEEK_HARNESS_MINIMUM_NODE_VERSION: semver::Version = semver::Version::new(22, 15, 0);
 const PI_MINIMUM_NODE_VERSION: semver::Version = semver::Version::new(22, 19, 0);
 const PI_CODING_AGENT_PACKAGE: &str = "@earendil-works/pi-coding-agent";
 const PI_COMMAND_NAME: &str = "pi";
@@ -2862,10 +2863,10 @@ fn require_registry_id(agent_id: &AgentId) -> VibexResult<&'static str> {
 }
 
 fn minimum_node_version(agent_id: &AgentId) -> semver::Version {
-    if agent_id.as_str() == "pi" {
-        PI_MINIMUM_NODE_VERSION
-    } else {
-        MINIMUM_NODE_VERSION
+    match agent_id.as_str() {
+        "deepseek-harness" => DEEPSEEK_HARNESS_MINIMUM_NODE_VERSION,
+        "pi" => PI_MINIMUM_NODE_VERSION,
+        _ => MINIMUM_NODE_VERSION,
     }
 }
 
@@ -5444,6 +5445,42 @@ mod tests {
         assert_eq!(runtime.source, NodeRuntimeSource::System);
         assert_eq!(runtime.node, supported_node);
         assert_eq!(runtime.version, PI_MINIMUM_NODE_VERSION);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deepseek_harness_rejects_node_older_than_bridge_engine() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_node = temp.path().join("old-node");
+        let old_npm = temp.path().join("old-npm");
+        let supported_node = temp.path().join("supported-node");
+        let supported_npm = temp.path().join("supported-npm");
+        write_version_probe(&old_node, "v22.14.0");
+        write_version_probe(&old_npm, "10.9.2");
+        write_version_probe(&supported_node, "v22.15.0");
+        write_version_probe(&supported_npm, "10.9.2");
+
+        let runtime = select_valid_external_node_runtime(
+            vec![
+                NodeRuntimeCandidate {
+                    source: NodeRuntimeSource::Explicit,
+                    node: old_node,
+                    npm: old_npm,
+                },
+                NodeRuntimeCandidate {
+                    source: NodeRuntimeSource::System,
+                    node: supported_node.clone(),
+                    npm: supported_npm,
+                },
+            ],
+            &minimum_node_version(&AgentId::parse("deepseek-harness").unwrap()),
+        )
+        .await
+        .expect("DeepSeek Harness-compatible runtime should be selected");
+
+        assert_eq!(runtime.source, NodeRuntimeSource::System);
+        assert_eq!(runtime.node, supported_node);
+        assert_eq!(runtime.version, DEEPSEEK_HARNESS_MINIMUM_NODE_VERSION);
     }
 
     #[test]
