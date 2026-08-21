@@ -23867,94 +23867,7 @@ impl VibexWorkbench {
             && worktree_form_valid
             && !self.agent_action_pending
             && !creation_pending;
-        let starter_topics = [
-            (
-                IconName::Bot,
-                locale::text("Make sense of something", "梳理一个问题", "梳理一個問題"),
-                locale::text(
-                    "Help me understand this clearly",
-                    "帮我把这件事梳理清楚",
-                    "幫我把這件事梳理清楚",
-                ),
-                cx.theme().primary,
-            ),
-            (
-                IconName::LayoutDashboard,
-                locale::text("Shape an idea", "完善一个想法", "完善一個想法"),
-                locale::text(
-                    "Turn this rough idea into a plan",
-                    "把这个想法变成可执行的计划",
-                    "把這個想法變成可執行的計畫",
-                ),
-                chart_3,
-            ),
-            (
-                IconName::File,
-                locale::text("Improve what I have", "改进现有内容", "改進現有內容"),
-                locale::text(
-                    "Review and improve my current work",
-                    "帮我检查并改进现有内容",
-                    "幫我檢查並改進現有內容",
-                ),
-                cx.theme().success,
-            ),
-            (
-                IconName::TriangleAlert,
-                locale::text(
-                    "Help me get unstuck",
-                    "帮我解决卡住的问题",
-                    "幫我解決卡住的問題",
-                ),
-                locale::text(
-                    "Find the issue and suggest the next step",
-                    "找出问题并告诉我下一步怎么做",
-                    "找出問題並告訴我下一步怎麼做",
-                ),
-                chart_4,
-            ),
-        ];
-        let starter_topic_cards = starter_topics
-            .into_iter()
-            .enumerate()
-            .map(|(index, (icon, title, prompt, icon_color))| {
-                Button::new(format!("new-session-starter-topic-{index}"))
-                    .ghost()
-                    .flex_1()
-                    .min_w(px(148.0))
-                    .h(px(76.0))
-                    .px_3()
-                    .py_2()
-                    .rounded(px(12.0))
-                    .border_1()
-                    .border_color(border_color.opacity(0.72))
-                    .bg(muted_color.opacity(if is_dark { 0.28 } else { 0.46 }))
-                    .text_color(popover_foreground)
-                    .child(
-                        v_flex()
-                            .w_full()
-                            .items_start()
-                            .gap_1()
-                            .child(Icon::new(icon).size(px(17.0)).text_color(icon_color))
-                            .child(div().text_left().text_sm().font_medium().child(title)),
-                    )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.new_session_input
-                            .update(cx, |input, cx| input.set_value(prompt, window, cx));
-                        this.new_session_input
-                            .update(cx, |input, cx| input.focus(window, cx));
-                        this.sync_composer_command_entry(ComposerTarget::NewSession, cx);
-                        this.refresh_active_suggestions(ComposerTarget::NewSession, cx);
-                    }))
-                    .into_any_element()
-            })
-            .collect::<Vec<_>>();
-        let new_session_slogan = format!(
-            "{} Vibex {}",
-            strings.new_session_title_before_brand, strings.new_session_title_after_brand
-        )
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+        let new_session_slogan = strings.new_session_slogan;
         let input_geometry_entity = cx.weak_entity();
         let surface_geometry_entity = cx.weak_entity();
         v_flex()
@@ -23975,16 +23888,13 @@ impl VibexWorkbench {
                     .min_w_0()
                     .min_h_0()
                     .flex_1()
-                    .justify_between()
+                    .justify_center()
+                    .gap_5()
                     .child(
                         v_flex()
                             .w_full()
                             .min_w_0()
-                            .min_h_0()
-                            .flex_1()
                             .items_center()
-                            .justify_center()
-                            .gap_5()
                             .text_center()
                             .child(
                                 v_flex()
@@ -24007,39 +23917,12 @@ impl VibexWorkbench {
                                             .child(strings.new_session_description),
                                     ),
                             )
-                            .child(
-                                v_flex()
-                                    .w_full()
-                                    .min_w_0()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_left()
-                                            .text_xs()
-                                            .font_medium()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(locale::text(
-                                                "Start with a common task",
-                                                "从常见任务开始",
-                                                "從常見任務開始",
-                                            )),
-                                    )
-                                    .child(
-                                        h_flex()
-                                            .w_full()
-                                            .min_w_0()
-                                            .flex_wrap()
-                                            .gap_2()
-                                            .children(starter_topic_cards),
-                                    ),
-                            ),
                     )
                     .child(
                         v_flex()
                             .w_full()
                             .min_w_0()
                             .flex_none()
-                            .mt_5()
                             .gap_3()
                             .child(
                                 h_flex()
