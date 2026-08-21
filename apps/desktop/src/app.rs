@@ -47785,6 +47785,45 @@ mod tests {
     }
 
     #[test]
+    fn image_editor_is_limited_to_unsent_composer_attachments() {
+        let source = include_str!("app.rs");
+        let composer = source
+            .split_once("    fn render_inline_composer_attachments(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_attachment_image_preview("))
+            .map(|(body, _)| body)
+            .expect("composer attachment renderer should remain inspectable");
+        let timeline = source
+            .split_once("UserMessageAttachmentAction::PreviewImage(attachment) =>")
+            .map(|(_, body)| body)
+            .expect("sent attachment preview action should remain inspectable");
+
+        assert!(composer.contains("this.open_attachment_preview("));
+        assert!(composer.contains("true,"));
+        assert!(timeline.contains("this.open_attachment_preview(attachment, false, window, cx)"));
+    }
+
+    #[test]
+    fn image_editor_exposes_every_requested_tool() {
+        let source = include_str!("app.rs");
+        let editor = source
+            .split_once("    fn render_attachment_image_preview(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_timeline_turn("))
+            .map(|(body, _)| body)
+            .expect("image editor renderer should remain inspectable");
+
+        for tool_id in ImageEditTool::ALL.map(ImageEditTool::id) {
+            assert!(
+                editor.contains(&format!("attachment-edit-tool-{}", tool_id))
+                    || editor.contains("attachment-edit-tool-{}"),
+                "image editor should expose {tool_id}"
+            );
+        }
+        assert!(editor.contains("ImageEditTool::ALL.into_iter()"));
+        assert!(editor.contains("ImageEditTool::Text"));
+        assert!(editor.contains("finish-attachment-edit"));
+    }
+
+    #[test]
     fn user_message_segments_preserve_original_whitespace_without_attachments() {
         let text = "first line\n\n  indented text  \nlast line";
 

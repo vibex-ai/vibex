@@ -16187,7 +16187,15 @@ pub(crate) fn extract_probe_reasoning_efforts(response: &Value) -> Vec<AgentReas
             .and_then(Value::as_str)
             .unwrap_or_default()
             .trim();
-        if !EFFORT_OPTION_KEYS.contains(&category) && !EFFORT_OPTION_KEYS.contains(&id) {
+        let is_grok_effort = category == "mode"
+            && matches!(
+                normalize_identifier(id).as_str(),
+                "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+            );
+        if !is_grok_effort
+            && !EFFORT_OPTION_KEYS.contains(&category)
+            && !EFFORT_OPTION_KEYS.contains(&id)
+        {
             continue;
         }
         let Some(values) = option.get("options").or_else(|| option.get("values")) else {
@@ -16257,26 +16265,8 @@ fn extract_initialize_reasoning_efforts(
     target_model: Option<&str>,
 ) -> Vec<AgentReasoningEffort> {
     let mut efforts = Vec::new();
-    let mut collect = |response: &Value| {
-        for effort in extract_probe_reasoning_efforts(response) {
-            if !efforts
-                .iter()
-                .any(|existing: &AgentReasoningEffort| existing.value == effort.value)
-            {
-                efforts.push(effort);
-            }
-        }
-    };
-
-    collect(initialize);
-    for effort in extract_reasoning_effort_metadata(initialize) {
-        if !efforts
-            .iter()
-            .any(|existing| existing.value == effort.value)
-        {
-            efforts.push(effort);
-        }
-    }
+    append_unique_reasoning_efforts(&mut efforts, extract_probe_reasoning_efforts(initialize));
+    append_unique_reasoning_efforts(&mut efforts, extract_reasoning_effort_metadata(initialize));
     if let Some(models) = initialize
         .get("_meta")
         .and_then(|metadata| metadata.get("modelState"))
@@ -16290,17 +16280,19 @@ fn extract_initialize_reasoning_efforts(
                 .map(str::trim)
                 .filter(|value| !value.is_empty());
             if target_model.is_none() || model_id == target_model {
-                collect(model);
+                append_unique_reasoning_efforts(
+                    &mut efforts,
+                    extract_probe_reasoning_efforts(model),
+                );
                 if let Some(model_metadata) = model.get("_meta") {
-                    collect(model_metadata);
-                    for effort in extract_reasoning_effort_metadata(model_metadata) {
-                        if !efforts
-                            .iter()
-                            .any(|existing| existing.value == effort.value)
-                        {
-                            efforts.push(effort);
-                        }
-                    }
+                    append_unique_reasoning_efforts(
+                        &mut efforts,
+                        extract_probe_reasoning_efforts(model_metadata),
+                    );
+                    append_unique_reasoning_efforts(
+                        &mut efforts,
+                        extract_reasoning_effort_metadata(model_metadata),
+                    );
                 }
             }
         }
@@ -16311,11 +16303,32 @@ fn extract_initialize_reasoning_efforts(
                 .get(key)
                 .and_then(|models| models.get(target_model))
             {
-                collect(model);
+                append_unique_reasoning_efforts(
+                    &mut efforts,
+                    extract_probe_reasoning_efforts(model),
+                );
+                append_unique_reasoning_efforts(
+                    &mut efforts,
+                    extract_reasoning_effort_metadata(model),
+                );
             }
         }
     }
     efforts
+}
+
+fn append_unique_reasoning_efforts(
+    efforts: &mut Vec<AgentReasoningEffort>,
+    candidates: impl IntoIterator<Item = AgentReasoningEffort>,
+) {
+    for effort in candidates {
+        if !efforts
+            .iter()
+            .any(|existing| existing.value == effort.value)
+        {
+            efforts.push(effort);
+        }
+    }
 }
 
 pub(crate) fn extract_current_model_id(response: &Value) -> Option<String> {
@@ -16327,6 +16340,13 @@ pub(crate) fn extract_current_model_id(response: &Value) -> Option<String> {
             response
                 .get("models")
                 .and_then(|models| models.get("currentModelId"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            response
+                .get("_meta")
+                .and_then(|metadata| metadata.get("modelState"))
+                .and_then(|model_state| model_state.get("currentModelId"))
                 .and_then(Value::as_str)
         })
         .or_else(|| {
@@ -18828,6 +18848,73 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
             vec!["low", "medium"]
         );
         assert_eq!(efforts[0].description.as_deref(), Some("Low"));
+    }
+
+    #[test]
+    fn extracts_grok_session_config_efforts_from_xai_metadata() {
+        let response = json!({
+            "sessionId": "grok-session",
+            "_meta": {
+                "x.ai": {
+                    "sessionConfig": {
+                        "options": [
+                            { "id": "grok-4.6", "category": "model", "selected": true },
+                            { "id": "xhigh", "category": "mode", "label": "Extra High Effort" },
+                            { "id": "high", "category": "mode", "label": "High Effort", "selected": true },
+                            { "id": "medium", "category": "mode", "label": "Medium Effort" },
+                            { "id": "low", "category": "mode", "label": "Low Effort" }
+                        ]
+                    }
+                }
+            }
+        });
+
+        let efforts = extract_probe_reasoning_efforts(&response);
+        assert_eq!(
+            efforts
+                .iter()
+                .map(|effort| (effort.value.as_str(), effort.description.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("xhigh", Some("Extra High Effort")),
+                ("high", Some("High Effort")),
+                ("medium", Some("Medium Effort")),
+                ("low", Some("Low Effort")),
+            ]
+        );
+        assert!(mode_candidates(&response).is_empty());
+    }
+
+    #[test]
+    fn extracts_grok_initialize_model_state_and_per_model_efforts() {
+        let response = json!({
+            "_meta": {
+                "modelState": {
+                    "currentModelId": "grok-4.6",
+                    "availableModels": [
+                        {
+                            "modelId": "grok-4.6",
+                            "_meta": {
+                                "reasoningEfforts": [
+                                    { "id": "xhigh", "value": "xhigh", "label": "Extra High Effort" },
+                                    { "id": "high", "value": "high", "label": "High Effort" }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+
+        assert_eq!(extract_model_ids(&response), vec!["grok-4.6"]);
+        assert_eq!(
+            extract_initialize_reasoning_efforts(&response, Some("grok-4.6"))
+                .into_iter()
+                .map(|effort| effort.value)
+                .collect::<Vec<_>>(),
+            vec!["xhigh", "high"]
+        );
+        assert!(extract_initialize_reasoning_efforts(&response, Some("other-model")).is_empty());
     }
 
     #[test]

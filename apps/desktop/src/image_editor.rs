@@ -230,12 +230,11 @@ fn rasterize_text_overlay(
     }
     svg.push_str("</svg>");
 
-    let mut options = resvg::usvg::Options {
+    let options = resvg::usvg::Options {
         font_family: "IBM Plex Sans".to_string(),
         fontdb: editor_font_database(),
         ..Default::default()
     };
-    options.fontdb_mut();
     let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &options).ok()?;
     let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
     resvg::render(
@@ -465,5 +464,14 @@ mod tests {
         apply_mosaic(&mut image, (20, 20), (50, 50));
         apply_text(&mut image, (3, 3), "VIBEX 中文 1");
         assert!(image.pixels().any(|pixel| pixel.0 != [0, 0, 0, 255]));
+    }
+
+    #[test]
+    fn text_rasterizer_accepts_unicode_and_escapes_xml() {
+        let mut image = RgbaImage::from_pixel(320, 180, Rgba([0, 0, 0, 255]));
+
+        apply_text(&mut image, (12, 12), "中文 <Vibex> & text");
+
+        assert!(image.pixels().any(|pixel| pixel.0 == MARK_COLOR.0));
     }
 }
