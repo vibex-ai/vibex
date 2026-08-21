@@ -143,8 +143,8 @@ use crate::code_workbench::{
 };
 use crate::gpui_ext::button_with_aria_label;
 use crate::image_editor::{
-    ImageEditTool, apply_arrow, apply_brush, apply_circle, apply_crop, apply_mosaic,
-    apply_rectangle, apply_text,
+    ImageEditSession, ImageEditTool, apply_arrow, apply_brush, apply_circle, apply_crop,
+    apply_mosaic, apply_rectangle, apply_text,
 };
 use crate::locale::{self, Strings};
 use crate::management::{ManagementCenter, ManagementEvent};
@@ -591,8 +591,10 @@ struct ComposerGeometry {
 struct AttachmentImagePreviewState {
     attachment: ComposerAttachment,
     image_source: Arc<std::path::Path>,
+    confirmed_image: Option<Arc<Image>>,
     edited_image: Option<Arc<Image>>,
-    edit_buffer: Option<image::RgbaImage>,
+    edit_buffer: Option<Arc<image::RgbaImage>>,
+    edit_session: Option<Arc<ImageEditSession>>,
     intrinsic_size: Option<(u32, u32)>,
     zoom: f32,
     pan_x: f32,
@@ -602,6 +604,7 @@ struct AttachmentImagePreviewState {
     editing: bool,
     tool: ImageEditTool,
     edit_drag: Option<AttachmentImageEditDragState>,
+    edit_drag_base: Option<Arc<image::RgbaImage>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -11514,17 +11517,28 @@ impl VibexWorkbench {
             return;
         };
         let edit_buffer = editable
-            .then(|| decode_attachment_editor_image(Path::new(&path)).ok())
+            .then(|| {
+                decode_attachment_editor_image(Path::new(&path))
+                    .ok()
+                    .map(Arc::new)
+            })
             .flatten();
         let can_edit = editable && edit_buffer.is_some();
+        let confirmed_image = edit_buffer.as_ref().and_then(|buffer| {
+            encode_editor_image(buffer)
+                .ok()
+                .map(|bytes| Arc::new(Image::from_bytes(ImageFormat::Png, bytes)))
+        });
         let intrinsic_size = image::image_dimensions(&path).ok();
         self.attachment_image_preview = Some(AttachmentImagePreviewState {
             attachment,
             image_source: Arc::<std::path::Path>::from(
                 std::path::PathBuf::from(path).into_boxed_path(),
             ),
+            confirmed_image,
             edited_image: None,
             edit_buffer,
+            edit_session: None,
             intrinsic_size,
             zoom: 1.0,
             pan_x: 0.0,
@@ -11534,40 +11548,163 @@ impl VibexWorkbench {
             editing: false,
             tool: ImageEditTool::Brush,
             edit_drag: None,
+            edit_drag_base: None,
         });
         self.composer_runtime_menu_open = false;
         cx.notify();
     }
 
     fn toggle_attachment_editor(&mut self, cx: &mut Context<Self>) {
-        let Some((editing, buffer)) = self
-            .attachment_image_preview
-            .as_ref()
-            .map(|preview| (preview.editing, preview.edit_buffer.clone()))
-        else {
+        let Some(preview) = self.attachment_image_preview.as_ref() else {
             return;
         };
-        if !self
-            .attachment_image_preview
-            .as_ref()
-            .is_some_and(|preview| preview.editable)
-        {
+        if !preview.editable {
             return;
         }
-        if editing {
-            let Some(buffer) = buffer else {
+        if preview.editing {
+            let Some(session) = preview.edit_session.as_ref() else {
                 return;
             };
+            let changed = preview
+                .edit_buffer
+                .as_deref()
+                .is_none_or(|confirmed| confirmed != session.current());
+            if !changed {
+                if let Some(preview) = self.attachment_image_preview.as_mut() {
+                    preview.edit_session = None;
+                    preview.edited_image = preview.confirmed_image.clone();
+                    preview.editing = false;
+                    preview.edit_drag = None;
+                    preview.edit_drag_base = None;
+                    preview.drag = None;
+                }
+                cx.notify();
+                return;
+            }
+            let buffer = session.current_clone();
             if !self.commit_attachment_editor_buffer(buffer, cx) {
                 return;
             }
-        }
-        if let Some(preview) = self.attachment_image_preview.as_mut() {
-            preview.editing = !preview.editing;
-            preview.edit_drag = None;
-            preview.drag = None;
+        } else {
+            let Some(buffer) = preview.edit_buffer.as_deref().cloned() else {
+                return;
+            };
+            if let Some(preview) = self.attachment_image_preview.as_mut() {
+                preview.edit_session = Some(Arc::new(ImageEditSession::new(buffer)));
+                preview.editing = true;
+                preview.edited_image = preview.confirmed_image.clone();
+                preview.edit_drag = None;
+                preview.edit_drag_base = None;
+                preview.drag = None;
+            }
         }
         cx.notify();
+    }
+
+    fn cancel_attachment_editor(&mut self, cx: &mut Context<Self>) {
+        let viewport_width = self.last_visibility.layout.viewport_width as f32;
+        let viewport_height = self.last_visibility.layout.viewport_height as f32;
+        let Some(preview) = self.attachment_image_preview.as_mut() else {
+            return;
+        };
+        if !preview.editing {
+            return;
+        }
+        preview.edit_session = None;
+        preview.edited_image = preview.confirmed_image.clone();
+        preview.intrinsic_size = preview
+            .edit_buffer
+            .as_deref()
+            .map(|image| image.dimensions());
+        preview.editing = false;
+        preview.edit_drag = None;
+        preview.edit_drag_base = None;
+        preview.drag = None;
+        let layout = attachment_image_preview_layout(
+            preview.intrinsic_size,
+            preview.zoom,
+            viewport_width,
+            viewport_height,
+        );
+        (preview.pan_x, preview.pan_y) = layout.clamp_pan(preview.pan_x, preview.pan_y);
+        cx.notify();
+    }
+
+    fn update_attachment_editor_render(&mut self, cx: &mut Context<Self>) {
+        let Some(buffer) = self.attachment_image_preview.as_ref().and_then(|preview| {
+            preview
+                .edit_session
+                .as_ref()
+                .map(|session| session.current_clone())
+        }) else {
+            return;
+        };
+        let Ok(bytes) = encode_editor_image(&buffer) else {
+            self.agent_error = Some(
+                locale::text(
+                    "Edited image could not be encoded",
+                    "编辑后的图片无法编码",
+                    "編輯後的圖片無法編碼",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        };
+        let image = Arc::new(Image::from_bytes(ImageFormat::Png, bytes));
+        let dimensions = buffer.dimensions();
+        let viewport_width = self.last_visibility.layout.viewport_width as f32;
+        let viewport_height = self.last_visibility.layout.viewport_height as f32;
+        if let Some(preview) = self.attachment_image_preview.as_mut() {
+            preview.edited_image = Some(image);
+            preview.intrinsic_size = Some(dimensions);
+            let layout = attachment_image_preview_layout(
+                preview.intrinsic_size,
+                preview.zoom,
+                viewport_width,
+                viewport_height,
+            );
+            (preview.pan_x, preview.pan_y) = layout.clamp_pan(preview.pan_x, preview.pan_y);
+        }
+        cx.notify();
+    }
+
+    fn undo_attachment_edit(&mut self, cx: &mut Context<Self>) {
+        let changed = self
+            .attachment_image_preview
+            .as_mut()
+            .filter(|preview| preview.editing)
+            .and_then(|preview| {
+                preview.edit_drag = None;
+                preview.edit_drag_base = None;
+                preview
+                    .edit_session
+                    .as_mut()
+                    .map(|session| Arc::make_mut(session).undo())
+            })
+            .unwrap_or(false);
+        if changed {
+            self.update_attachment_editor_render(cx);
+        }
+    }
+
+    fn redo_attachment_edit(&mut self, cx: &mut Context<Self>) {
+        let changed = self
+            .attachment_image_preview
+            .as_mut()
+            .filter(|preview| preview.editing)
+            .and_then(|preview| {
+                preview.edit_drag = None;
+                preview.edit_drag_base = None;
+                preview
+                    .edit_session
+                    .as_mut()
+                    .map(|session| Arc::make_mut(session).redo())
+            })
+            .unwrap_or(false);
+        if changed {
+            self.update_attachment_editor_render(cx);
+        }
     }
 
     fn select_attachment_edit_tool(&mut self, tool: ImageEditTool, cx: &mut Context<Self>) {
@@ -11666,6 +11803,8 @@ impl VibexWorkbench {
         };
         let image = Arc::new(Image::from_bytes(ImageFormat::Png, bytes));
         let dimensions = buffer.dimensions();
+        let viewport_width = self.last_visibility.layout.viewport_width as f32;
+        let viewport_height = self.last_visibility.layout.viewport_height as f32;
         let (attachment_id, updated_attachment) = {
             let Some(preview) = self.attachment_image_preview.as_mut() else {
                 return false;
@@ -11677,12 +11816,22 @@ impl VibexWorkbench {
             preview.attachment.path = Some(path.to_string_lossy().into_owned());
             preview.attachment.mime_type = Some("image/png".to_string());
             preview.image_source = Arc::<Path>::from(path.clone().into_boxed_path());
+            preview.confirmed_image = Some(image.clone());
             preview.edited_image = Some(image);
-            preview.edit_buffer = Some(buffer);
+            preview.edit_buffer = Some(Arc::new(buffer));
+            preview.edit_session = None;
             preview.intrinsic_size = Some(dimensions);
-            preview.zoom = 1.0;
-            preview.pan_x = 0.0;
-            preview.pan_y = 0.0;
+            preview.editing = false;
+            preview.edit_drag = None;
+            preview.edit_drag_base = None;
+            preview.drag = None;
+            let layout = attachment_image_preview_layout(
+                preview.intrinsic_size,
+                preview.zoom,
+                viewport_width,
+                viewport_height,
+            );
+            (preview.pan_x, preview.pan_y) = layout.clamp_pan(preview.pan_x, preview.pan_y);
             (preview.attachment.id.clone(), preview.attachment.clone())
         };
         if let Some(attachment) = self
@@ -11701,34 +11850,6 @@ impl VibexWorkbench {
         }
         cx.notify();
         true
-    }
-
-    fn stage_attachment_editor_buffer(&mut self, buffer: image::RgbaImage, cx: &mut Context<Self>) {
-        let Ok(bytes) = encode_editor_image(&buffer) else {
-            self.agent_error = Some(
-                locale::text(
-                    "Edited image could not be encoded",
-                    "编辑后的图片无法编码",
-                    "編輯後的圖片無法編碼",
-                )
-                .to_string(),
-            );
-            cx.notify();
-            return;
-        };
-        let image = Arc::new(Image::from_bytes(ImageFormat::Png, bytes));
-        let dimensions = buffer.dimensions();
-        if let Some(preview) = self.attachment_image_preview.as_mut() {
-            if preview.editable {
-                preview.edited_image = Some(image);
-                preview.edit_buffer = Some(buffer);
-                preview.intrinsic_size = Some(dimensions);
-                preview.zoom = 1.0;
-                preview.pan_x = 0.0;
-                preview.pan_y = 0.0;
-            }
-        }
-        cx.notify();
     }
 
     fn begin_attachment_edit_gesture(
@@ -11751,11 +11872,20 @@ impl VibexWorkbench {
             if text.trim().is_empty() {
                 return;
             }
-            let Some(mut buffer) = snapshot.edit_buffer else {
+            let Some(session) = snapshot.edit_session else {
                 return;
             };
+            let mut buffer = session.current_clone();
             apply_text(&mut buffer, point, &text);
-            self.commit_attachment_editor_buffer(buffer, cx);
+            if let Some(preview) = self.attachment_image_preview.as_mut() {
+                Arc::make_mut(
+                    preview
+                        .edit_session
+                        .get_or_insert_with(|| Arc::new(ImageEditSession::new(buffer.clone()))),
+                )
+                .commit(buffer);
+            }
+            self.update_attachment_editor_render(cx);
             return;
         }
         if let Some(preview) = self.attachment_image_preview.as_mut() {
@@ -11765,6 +11895,10 @@ impl VibexWorkbench {
                 current_x: point.0,
                 current_y: point.1,
             });
+            preview.edit_drag_base = preview
+                .edit_session
+                .as_ref()
+                .map(|session| Arc::new(session.current_clone()));
             preview.drag = None;
             cx.notify();
         }
@@ -11802,20 +11936,41 @@ impl VibexWorkbench {
                 ..gesture
             });
         }
-        if matches!(snapshot.tool, ImageEditTool::Brush | ImageEditTool::Mosaic) {
-            let Some(mut buffer) = snapshot.edit_buffer else {
-                return;
-            };
-            let from = (gesture.current_x, gesture.current_y);
-            match snapshot.tool {
-                ImageEditTool::Brush => apply_brush(&mut buffer, from, point),
-                ImageEditTool::Mosaic => apply_mosaic(&mut buffer, from, point),
-                _ => {}
-            }
-            self.stage_attachment_editor_buffer(buffer, cx);
+        let Some(base) = snapshot.edit_drag_base else {
+            return;
+        };
+        let Some(session) = snapshot.edit_session else {
+            return;
+        };
+        let mut buffer = if matches!(snapshot.tool, ImageEditTool::Brush | ImageEditTool::Mosaic) {
+            session.current_clone()
         } else {
-            cx.notify();
+            base.as_ref().clone()
+        };
+        match snapshot.tool {
+            ImageEditTool::Brush => {
+                apply_brush(&mut buffer, (gesture.current_x, gesture.current_y), point)
+            }
+            ImageEditTool::Mosaic => {
+                apply_mosaic(&mut buffer, (gesture.current_x, gesture.current_y), point)
+            }
+            ImageEditTool::Rectangle => {
+                apply_rectangle(&mut buffer, (gesture.start_x, gesture.start_y), point)
+            }
+            ImageEditTool::Circle => {
+                apply_circle(&mut buffer, (gesture.start_x, gesture.start_y), point)
+            }
+            ImageEditTool::Arrow => {
+                apply_arrow(&mut buffer, (gesture.start_x, gesture.start_y), point)
+            }
+            ImageEditTool::Crop | ImageEditTool::Text => {}
         }
+        if let Some(preview) = self.attachment_image_preview.as_mut() {
+            if let Some(session) = preview.edit_session.as_mut() {
+                Arc::make_mut(session).preview(buffer);
+            }
+        }
+        self.update_attachment_editor_render(cx);
     }
 
     fn finish_attachment_edit_gesture(&mut self, cx: &mut Context<Self>) {
@@ -11825,44 +11980,39 @@ impl VibexWorkbench {
         let Some(gesture) = snapshot.edit_drag else {
             return;
         };
-        let Some(mut buffer) = snapshot.edit_buffer else {
+        let Some(base) = snapshot.edit_drag_base else {
             return;
         };
-        match snapshot.tool {
-            ImageEditTool::Crop => {
-                let Some(cropped) = apply_crop(
-                    &buffer,
-                    (gesture.start_x, gesture.start_y),
-                    (gesture.current_x, gesture.current_y),
-                ) else {
-                    if let Some(preview) = self.attachment_image_preview.as_mut() {
-                        preview.edit_drag = None;
-                    }
-                    cx.notify();
-                    return;
-                };
-                buffer = cropped;
+        let Some(session) = snapshot.edit_session else {
+            return;
+        };
+        let mut committed = false;
+        if snapshot.tool == ImageEditTool::Crop {
+            if let Some(cropped) = apply_crop(
+                session.current(),
+                (gesture.start_x, gesture.start_y),
+                (gesture.current_x, gesture.current_y),
+            ) {
+                if let Some(preview) = self.attachment_image_preview.as_mut()
+                    && let Some(session) = preview.edit_session.as_mut()
+                {
+                    committed = Arc::make_mut(session).commit(cropped);
+                }
             }
-            ImageEditTool::Rectangle => apply_rectangle(
-                &mut buffer,
-                (gesture.start_x, gesture.start_y),
-                (gesture.current_x, gesture.current_y),
-            ),
-            ImageEditTool::Circle => apply_circle(
-                &mut buffer,
-                (gesture.start_x, gesture.start_y),
-                (gesture.current_x, gesture.current_y),
-            ),
-            ImageEditTool::Arrow => apply_arrow(
-                &mut buffer,
-                (gesture.start_x, gesture.start_y),
-                (gesture.current_x, gesture.current_y),
-            ),
-            ImageEditTool::Brush | ImageEditTool::Mosaic | ImageEditTool::Text => {}
+        } else if let Some(preview) = self.attachment_image_preview.as_mut()
+            && let Some(session) = preview.edit_session.as_mut()
+        {
+            let _ = base;
+            committed = Arc::make_mut(session).commit_gesture(base.as_ref().clone());
         }
-        self.commit_attachment_editor_buffer(buffer, cx);
         if let Some(preview) = self.attachment_image_preview.as_mut() {
             preview.edit_drag = None;
+            preview.edit_drag_base = None;
+        }
+        if committed {
+            self.update_attachment_editor_render(cx);
+        } else {
+            cx.notify();
         }
     }
 
@@ -26346,6 +26496,14 @@ impl VibexWorkbench {
         let editable = preview.editable;
         let editing = preview.editing;
         let selected_tool = preview.tool;
+        let can_undo = preview
+            .edit_session
+            .as_ref()
+            .is_some_and(|session| session.can_undo());
+        let can_redo = preview
+            .edit_session
+            .as_ref()
+            .is_some_and(|session| session.can_redo());
         let text_input = self.image_editor_text_input.clone();
 
         Some(
@@ -26358,7 +26516,17 @@ impl VibexWorkbench {
                 .bg(gpui::black().opacity(0.80))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|this, _, _, cx| this.close_attachment_preview(cx)),
+                    cx.listener(|this, _, _, cx| {
+                        if this
+                            .attachment_image_preview
+                            .as_ref()
+                            .is_some_and(|preview| preview.editing)
+                        {
+                            cx.stop_propagation();
+                        } else {
+                            this.close_attachment_preview(cx);
+                        }
+                    }),
                 )
                 .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                     if event.dragging()
@@ -26548,17 +26716,19 @@ impl VibexWorkbench {
                                                 ImageEditTool::Brush => {
                                                     Icon::default().path("icons/vibex/pencil.svg")
                                                 }
-                                                ImageEditTool::Text => Icon::default()
-                                                    .path("icons/vibex/file-text.svg"),
+                                                ImageEditTool::Text => {
+                                                    Icon::new(IconName::CaseSensitive)
+                                                }
                                                 ImageEditTool::Rectangle => Icon::default()
-                                                    .path("icons/vibex/file-type.svg"),
+                                                    .path("icons/vibex/rectangle-outline.svg"),
                                                 ImageEditTool::Circle => Icon::default()
-                                                    .path("icons/vibex/crosshair.svg"),
+                                                    .path("icons/vibex/circle-outline.svg"),
                                                 ImageEditTool::Arrow => {
                                                     Icon::new(IconName::ArrowUp)
                                                 }
-                                                ImageEditTool::Mosaic => Icon::default()
-                                                    .path("icons/vibex/file-type.svg"),
+                                                ImageEditTool::Mosaic => {
+                                                    Icon::default().path("icons/vibex/mosaic.svg")
+                                                }
                                             })
                                             .tooltip(match tool {
                                                 ImageEditTool::Crop => {
@@ -26601,6 +26771,53 @@ impl VibexWorkbench {
                                                 ),
                                         )
                                     })
+                                    .child(
+                                        Button::new("undo-attachment-edit")
+                                            .ghost()
+                                            .compact()
+                                            .size(px(32.0))
+                                            .icon(IconName::Undo2)
+                                            .disabled(!can_undo)
+                                            .tooltip(locale::text(
+                                                "Undo edit",
+                                                "撤销编辑",
+                                                "復原編輯",
+                                            ))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.undo_attachment_edit(cx)
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("redo-attachment-edit")
+                                            .ghost()
+                                            .compact()
+                                            .size(px(32.0))
+                                            .icon(IconName::Redo2)
+                                            .disabled(!can_redo)
+                                            .tooltip(locale::text(
+                                                "Redo edit",
+                                                "重做编辑",
+                                                "重做編輯",
+                                            ))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.redo_attachment_edit(cx)
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("cancel-attachment-edit")
+                                            .ghost()
+                                            .compact()
+                                            .size(px(32.0))
+                                            .icon(IconName::Close)
+                                            .tooltip(locale::text(
+                                                "Cancel editing",
+                                                "取消编辑",
+                                                "取消編輯",
+                                            ))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.cancel_attachment_editor(cx)
+                                            })),
+                                    )
                                     .child(
                                         Button::new("finish-attachment-edit")
                                             .primary()
@@ -47870,6 +48087,12 @@ mod tests {
         }
         assert!(editor.contains("ImageEditTool::ALL.into_iter()"));
         assert!(editor.contains("ImageEditTool::Text"));
+        assert!(editor.contains("rectangle-outline.svg"));
+        assert!(editor.contains("circle-outline.svg"));
+        assert!(editor.contains("mosaic.svg"));
+        assert!(editor.contains("undo-attachment-edit"));
+        assert!(editor.contains("redo-attachment-edit"));
+        assert!(editor.contains("cancel-attachment-edit"));
         assert!(editor.contains("finish-attachment-edit"));
     }
 

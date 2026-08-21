@@ -5,6 +5,98 @@ use std::{
 
 use image::{Rgba, RgbaImage};
 
+const MAX_EDIT_HISTORY: usize = 64;
+
+/// A bounded, in-memory editing session.
+///
+/// The session deliberately owns only image buffers. Persistence and attachment
+/// metadata updates stay in the desktop view and happen only after confirmation.
+#[derive(Debug, Clone)]
+pub struct ImageEditSession {
+    current: RgbaImage,
+    undo: Vec<RgbaImage>,
+    redo: Vec<RgbaImage>,
+}
+
+impl ImageEditSession {
+    pub fn new(image: RgbaImage) -> Self {
+        Self {
+            current: image,
+            undo: Vec::new(),
+            redo: Vec::new(),
+        }
+    }
+
+    pub fn current(&self) -> &RgbaImage {
+        &self.current
+    }
+
+    pub fn current_clone(&self) -> RgbaImage {
+        self.current.clone()
+    }
+
+    /// Replace the visible working image without creating a history entry.
+    /// This is used for transient previews while a pointer gesture is active.
+    pub fn preview(&mut self, image: RgbaImage) {
+        self.current = image;
+    }
+
+    /// Commit a completed operation as one undoable history entry.
+    pub fn commit(&mut self, image: RgbaImage) -> bool {
+        let previous = self.current.clone();
+        if previous == image {
+            return false;
+        }
+        self.current = image;
+        self.push_undo(previous);
+        self.redo.clear();
+        true
+    }
+
+    /// Commit a gesture whose transient preview started from `base`.
+    pub fn commit_gesture(&mut self, base: RgbaImage) -> bool {
+        if base == self.current {
+            return false;
+        }
+        self.push_undo(base);
+        self.redo.clear();
+        true
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    pub fn undo(&mut self) -> bool {
+        let Some(previous) = self.undo.pop() else {
+            return false;
+        };
+        let current = std::mem::replace(&mut self.current, previous);
+        self.redo.push(current);
+        true
+    }
+
+    pub fn redo(&mut self) -> bool {
+        let Some(next) = self.redo.pop() else {
+            return false;
+        };
+        let current = std::mem::replace(&mut self.current, next);
+        self.push_undo(current);
+        true
+    }
+
+    fn push_undo(&mut self, image: RgbaImage) {
+        if self.undo.len() == MAX_EDIT_HISTORY {
+            self.undo.remove(0);
+        }
+        self.undo.push(image);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageEditTool {
     Crop,
@@ -473,5 +565,54 @@ mod tests {
         apply_text(&mut image, (12, 12), "中文 <Vibex> & text");
 
         assert!(image.pixels().any(|pixel| pixel.0 == MARK_COLOR.0));
+    }
+
+    #[test]
+    fn edit_session_undoes_redoes_and_invalidates_redo_after_new_work() {
+        let original = RgbaImage::from_pixel(8, 8, Rgba([0, 0, 0, 255]));
+        let mut first = original.clone();
+        first.put_pixel(1, 1, MARK_COLOR);
+        let mut second = first.clone();
+        second.put_pixel(2, 2, MARK_COLOR);
+        let mut replacement = first.clone();
+        replacement.put_pixel(3, 3, MARK_COLOR);
+
+        let mut session = ImageEditSession::new(original.clone());
+        assert!(session.commit(first.clone()));
+        assert!(session.commit(second.clone()));
+        assert!(session.can_undo());
+        assert!(!session.can_redo());
+
+        assert!(session.undo());
+        assert_eq!(session.current(), &first);
+        assert!(session.can_redo());
+        assert!(session.redo());
+        assert_eq!(session.current(), &second);
+
+        assert!(session.undo());
+        assert!(session.commit(replacement.clone()));
+        assert_eq!(session.current(), &replacement);
+        assert!(!session.can_redo());
+
+        assert!(session.undo());
+        assert_eq!(session.current(), &first);
+        assert!(session.undo());
+        assert_eq!(session.current(), &original);
+    }
+
+    #[test]
+    fn edit_session_records_a_live_preview_as_one_gesture() {
+        let original = RgbaImage::from_pixel(8, 8, Rgba([0, 0, 0, 255]));
+        let mut preview = original.clone();
+        preview.put_pixel(4, 4, MARK_COLOR);
+
+        let mut session = ImageEditSession::new(original.clone());
+        session.preview(preview.clone());
+        assert!(!session.can_undo());
+        assert!(session.commit_gesture(original.clone()));
+        assert_eq!(session.current(), &preview);
+
+        assert!(session.undo());
+        assert_eq!(session.current(), &original);
     }
 }
