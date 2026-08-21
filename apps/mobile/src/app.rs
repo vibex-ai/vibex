@@ -7177,9 +7177,13 @@ impl Render for MobileApp {
         self.sync_elicitation_form(cx);
         let insets = window.insets().effective();
         let page_width = workspace_page_width(window);
+        let root_background = match visible_drawer_page(self.drawer_offset, self.drawer_snap) {
+            Some(DrawerPage::Sessions) => theme::sidebar_bg(),
+            _ => theme::bg_primary(),
+        };
         div()
             .size_full()
-            .bg(theme::bg_primary())
+            .bg(root_background)
             .font_family("IBM Plex Sans")
             .text_color(theme::text_secondary())
             .pt(insets.top)
