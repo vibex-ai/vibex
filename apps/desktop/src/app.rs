@@ -14612,9 +14612,6 @@ impl VibexWorkbench {
                     ))) => {
                         let initial_message_completed =
                             initial_message_sent && initial_message_error.is_none();
-                        if initial_message_error.is_some() {
-                            this.discard_optimistic_user_message(&session_id);
-                        }
                         if let Some(session) = refreshed_session {
                             this.upsert_session_snapshot(session);
                         }
@@ -45941,6 +45938,10 @@ mod tests {
             .map(|(body, _)| body)
             .expect("initial-message failure handling should remain inspectable");
         assert!(initial_message_failure.contains("this.runtime_note"));
+        assert!(
+            !initial_message_failure.contains("discard_optimistic_user_message"),
+            "a created session must keep the captured user message visible when initialization fails"
+        );
         assert!(!initial_message_failure.contains("composer_input"));
         assert!(!initial_message_failure.contains("draft_raw_text"));
         assert!(!initial_message_failure.contains("draft_attachments"));
