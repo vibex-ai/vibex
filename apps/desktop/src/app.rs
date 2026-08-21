@@ -214,6 +214,7 @@ const SIDEBAR_FLOATING_TRANSITION_DURATION: Duration = Duration::from_millis(200
 const SIDEBAR_REORDER_TRANSITION_DURATION: Duration = Duration::from_millis(160);
 const SIDEBAR_REORDER_ROW_HEIGHT: f32 = 32.0;
 const SIDEBAR_PROJECT_REORDER_GAP: f32 = 12.0;
+const SIDEBAR_PROJECT_CONTENT_GAP: f32 = 4.0;
 const SIDEBAR_SESSION_REORDER_GAP: f32 = 2.0;
 const SIDEBAR_DRAG_PREVIEW_WIDTH: f32 = 280.0;
 const SIDEBAR_DRAG_HORIZONTAL_SLOP: f32 = 16.0;
@@ -20801,7 +20802,7 @@ impl VibexWorkbench {
             .relative()
             .w_full()
             .min_w_0()
-            .gap(px(SIDEBAR_PROJECT_REORDER_GAP))
+            .gap(px(SIDEBAR_PROJECT_CONTENT_GAP))
             .on_hover(cx.listener(|this, hovered, _, cx| {
                 if *hovered {
                     this.clear_sidebar_context_menu_target(cx);
