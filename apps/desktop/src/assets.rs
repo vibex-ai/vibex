@@ -408,6 +408,7 @@ const AGENT_BRAND_ASSETS: &[(&str, &[u8])] = &[
     bundled_icon_asset!("agents/crow-cli.svg"),
     bundled_icon_asset!("agents/cursor.svg"),
     bundled_icon_asset!("agents/deepagents.svg"),
+    bundled_icon_asset!("agents/deepseek-harness.svg"),
     bundled_icon_asset!("agents/devin.svg"),
     bundled_icon_asset!("agents/dimcode.svg"),
     bundled_icon_asset!("agents/dirac.svg"),
@@ -483,6 +484,10 @@ const CATALOG_AGENT_BRANDS: &[(&str, BrandAsset)] = &[
     (
         "deepagents",
         themed_agent_asset("icons/vibex/agents/deepagents.svg"),
+    ),
+    (
+        "deepseek-harness",
+        colored_agent_asset("icons/vibex/agents/deepseek-harness.svg"),
     ),
     ("devin", themed_agent_asset("icons/vibex/agents/devin.svg")),
     (
@@ -770,6 +775,7 @@ fn agent_brand_intrinsic_width(path: &str) -> Option<u16> {
         "icons/vibex/agents/amp-acp.svg" => Some(28),
         "icons/vibex/agents/codebuddy-code.svg" => Some(40),
         "icons/vibex/agents/codewhale.svg" | "icons/vibex/agents/qoder.svg" => Some(180),
+        "icons/vibex/agents/deepseek-harness.svg" => Some(24),
         "icons/vibex/agents/dimcode.svg" => Some(256),
         "icons/vibex/agents/junie.svg" => Some(128),
         "icons/vibex/agents/mistral-vibe.svg" => Some(512),
@@ -881,6 +887,7 @@ mod tests {
             "amp-acp",
             "codebuddy-code",
             "codewhale",
+            "deepseek-harness",
             "dimcode",
             "kimi",
             "kiro",
@@ -983,6 +990,7 @@ mod tests {
             "amp-acp",
             "codebuddy-code",
             "codewhale",
+            "deepseek-harness",
             "crow-cli",
             "dimcode",
             "junie",

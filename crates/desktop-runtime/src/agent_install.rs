@@ -112,6 +112,8 @@ if (process.platform === "win32") {
 "#;
 const AMP_CLI_PACKAGE: &str = "@ampcode/cli";
 const CODEWHALE_CLI_PACKAGE: &str = "codewhale";
+const DEEPSEEK_HARNESS_ACP_PACKAGE: &str = "@openma/deepseek-harness-acp";
+const DEEPSEEK_HARNESS_PACKAGE: &str = "@deepseek-ai/dsh";
 const HERMES_CLI_PACKAGE: &str = "hermes-agent";
 const MINION_ACP_RUNTIME_PACKAGE: &str = "agent-client-protocol";
 const MINION_ACP_RUNTIME_VERSION: &str = "0.8.1";
@@ -789,6 +791,14 @@ impl AgentInstallService {
                     agent.registry_id(),
                     CODEWHALE_CLI_PACKAGE,
                     vec!["serve".to_string(), "--acp".to_string()],
+                )
+                .await?
+            }
+            ManagedCliAgent::DeepSeekHarness => {
+                self.load_latest_npm_entry(
+                    agent.registry_id(),
+                    DEEPSEEK_HARNESS_ACP_PACKAGE,
+                    Vec::new(),
                 )
                 .await?
             }
@@ -2456,6 +2466,7 @@ struct RegistryEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ManagedCliAgent {
     Codewhale,
+    DeepSeekHarness,
     Hermes,
     Kiro,
 }
@@ -2464,6 +2475,7 @@ impl ManagedCliAgent {
     fn for_agent(agent_id: &AgentId) -> Option<Self> {
         match agent_id.as_str() {
             "codewhale" => Some(Self::Codewhale),
+            "deepseek-harness" => Some(Self::DeepSeekHarness),
             "hermes" => Some(Self::Hermes),
             "kiro" => Some(Self::Kiro),
             _ => None,
@@ -2473,6 +2485,7 @@ impl ManagedCliAgent {
     fn registry_id(self) -> &'static str {
         match self {
             Self::Codewhale => "codewhale",
+            Self::DeepSeekHarness => "deepseek-harness-acp",
             Self::Hermes => "hermes",
             Self::Kiro => "kiro",
         }
@@ -2859,6 +2872,7 @@ fn minimum_node_version(agent_id: &AgentId) -> semver::Version {
 fn latest_npm_companion(agent_id: &AgentId) -> Option<&'static str> {
     match agent_id.as_str() {
         "amp-acp" => Some(AMP_CLI_PACKAGE),
+        "deepseek-harness" => Some(DEEPSEEK_HARNESS_PACKAGE),
         "pi" => Some(PI_CODING_AGENT_PACKAGE),
         _ => None,
     }
@@ -2889,6 +2903,7 @@ fn managed_uvx_allows_prereleases(_agent_id: &AgentId) -> bool {
 fn npm_companion_command(agent_id: &AgentId) -> Option<&'static str> {
     match agent_id.as_str() {
         "amp-acp" => Some("amp"),
+        "deepseek-harness" => Some("dsh"),
         "pi" => Some(PI_COMMAND_NAME),
         _ => None,
     }
@@ -2897,6 +2912,7 @@ fn npm_companion_command(agent_id: &AgentId) -> Option<&'static str> {
 fn npm_companion_environment(agent_id: &AgentId) -> Option<&'static str> {
     match agent_id.as_str() {
         "amp-acp" => Some("AMP_CLI_PATH"),
+        "deepseek-harness" => Some("DSH_PATH"),
         "pi" => Some("PI_ACP_PI_COMMAND"),
         _ => None,
     }
@@ -2905,6 +2921,7 @@ fn npm_companion_environment(agent_id: &AgentId) -> Option<&'static str> {
 fn npm_companion_command_for_registry_id(registry_agent_id: &str) -> Option<&'static str> {
     match registry_agent_id {
         "amp-acp" => Some("amp"),
+        "deepseek-harness-acp" => Some("dsh"),
         "pi-acp" => Some(PI_COMMAND_NAME),
         _ => None,
     }
@@ -4149,8 +4166,10 @@ fn load_installed_agent(root: &Path, expected_fingerprint: &str) -> VibexResult<
             "managed Agent cache did not match the requested distribution",
         ));
     }
-    if matches!(manifest.registry_agent_id.as_str(), "amp-acp" | "pi-acp")
-        && manifest.runtime_version.is_none()
+    if matches!(
+        manifest.registry_agent_id.as_str(),
+        "amp-acp" | "deepseek-harness-acp" | "pi-acp"
+    ) && manifest.runtime_version.is_none()
     {
         return Err(VibexError::validation(
             "agent_npm_runtime_version_missing",
@@ -5478,10 +5497,14 @@ mod tests {
             require_registry_id(&AgentId::parse("minion-code").unwrap()).unwrap(),
             "minion-code"
         );
-        for agent_id in ["codewhale", "hermes", "kiro"] {
+        for agent_id in ["codewhale", "deepseek-harness", "hermes", "kiro"] {
             assert_eq!(
                 require_registry_id(&AgentId::parse(agent_id).unwrap()).unwrap(),
-                agent_id
+                if agent_id == "deepseek-harness" {
+                    "deepseek-harness-acp"
+                } else {
+                    agent_id
+                }
             );
         }
     }
@@ -5508,6 +5531,12 @@ mod tests {
     fn latest_npm_companions_are_bound_to_private_adapter_launchers() {
         for (agent, package, command, environment) in [
             ("amp-acp", AMP_CLI_PACKAGE, "amp", "AMP_CLI_PATH"),
+            (
+                "deepseek-harness",
+                DEEPSEEK_HARNESS_PACKAGE,
+                "dsh",
+                "DSH_PATH",
+            ),
             ("pi", PI_CODING_AGENT_PACKAGE, "pi", "PI_ACP_PI_COMMAND"),
         ] {
             let agent_id = AgentId::parse(agent).unwrap();

@@ -1,8 +1,10 @@
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    fs,
     future::Future,
     hash::{Hash as _, Hasher as _},
+    io::Cursor,
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
@@ -50,6 +52,7 @@ use gpui_component::{
     tooltip::Tooltip,
     v_flex, v_virtual_list,
 };
+use image::ImageDecoder as _;
 use sha2::{Digest as _, Sha256};
 use similar::{ChangeTag, TextDiff};
 use tokio::sync::{mpsc, watch};
@@ -139,6 +142,10 @@ use crate::code_workbench::{
     CodeRightRail, CodeWorkbench, CodeWorkbenchEvent, CodeWorkbenchPersistedState, RightRailMode,
 };
 use crate::gpui_ext::button_with_aria_label;
+use crate::image_editor::{
+    ImageEditTool, apply_arrow, apply_brush, apply_circle, apply_crop, apply_mosaic,
+    apply_rectangle, apply_text,
+};
 use crate::locale::{self, Strings};
 use crate::management::{ManagementCenter, ManagementEvent};
 use crate::platform::{
@@ -584,11 +591,17 @@ struct ComposerGeometry {
 struct AttachmentImagePreviewState {
     attachment: ComposerAttachment,
     image_source: Arc<std::path::Path>,
+    edited_image: Option<Arc<Image>>,
+    edit_buffer: Option<image::RgbaImage>,
     intrinsic_size: Option<(u32, u32)>,
     zoom: f32,
     pan_x: f32,
     pan_y: f32,
     drag: Option<AttachmentImagePreviewDragState>,
+    editable: bool,
+    editing: bool,
+    tool: ImageEditTool,
+    edit_drag: Option<AttachmentImageEditDragState>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -597,6 +610,14 @@ struct AttachmentImagePreviewDragState {
     start_pointer_y: f32,
     start_pan_x: f32,
     start_pan_y: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AttachmentImageEditDragState {
+    start_x: u32,
+    start_y: u32,
+    current_x: u32,
+    current_y: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -3640,6 +3661,7 @@ pub struct VibexWorkbench {
     user_message_edit_input: Entity<InputState>,
     composer_queue_edit_input: Entity<InputState>,
     composer_input: Entity<InputState>,
+    image_editor_text_input: Entity<InputState>,
     composer_input_session_id: Option<VibexSessionId>,
     composer_input_syncing: bool,
     composer_session_drafts: BTreeMap<String, ComposerSessionDraft>,
@@ -3919,6 +3941,11 @@ impl VibexWorkbench {
                 .submit_on_enter(true)
                 .placeholder(initial_strings.message_agent)
         });
+        let image_editor_text_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .auto_grow(1, 2)
+                .placeholder(locale::text("Text", "文字", "文字"))
+        });
         let new_session_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .auto_grow(3, 8)
@@ -4040,6 +4067,9 @@ impl VibexWorkbench {
                     InputEvent::PressEnter { shift: false, .. } => {}
                 },
             ),
+            cx.subscribe(&image_editor_text_input, |_, _, _: &InputEvent, cx| {
+                cx.notify()
+            }),
             cx.subscribe_in(
                 &new_session_input,
                 window,
@@ -4250,6 +4280,7 @@ impl VibexWorkbench {
             user_message_edit_input,
             composer_queue_edit_input,
             composer_input,
+            image_editor_text_input,
             composer_input_session_id: selected_session_id.clone(),
             composer_input_syncing: false,
             composer_session_drafts: BTreeMap::new(),
@@ -11454,26 +11485,367 @@ impl VibexWorkbench {
     fn open_attachment_preview(
         &mut self,
         attachment: ComposerAttachment,
+        editable: bool,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(path) = attachment.path.clone().filter(|_| attachment.is_image()) else {
             return;
         };
+        let Some(_format) =
+            attachment_preview_image_format(Path::new(&path), attachment.mime_type.as_deref())
+        else {
+            return;
+        };
+        let edit_buffer = editable
+            .then(|| decode_attachment_editor_image(Path::new(&path)).ok())
+            .flatten();
+        let can_edit = editable && edit_buffer.is_some();
         let intrinsic_size = image::image_dimensions(&path).ok();
         self.attachment_image_preview = Some(AttachmentImagePreviewState {
             attachment,
             image_source: Arc::<std::path::Path>::from(
                 std::path::PathBuf::from(path).into_boxed_path(),
             ),
+            edited_image: None,
+            edit_buffer,
             intrinsic_size,
             zoom: 1.0,
             pan_x: 0.0,
             pan_y: 0.0,
             drag: None,
+            editable: can_edit,
+            editing: false,
+            tool: ImageEditTool::Brush,
+            edit_drag: None,
         });
         self.composer_runtime_menu_open = false;
         cx.notify();
+    }
+
+    fn toggle_attachment_editor(&mut self, cx: &mut Context<Self>) {
+        let Some((editing, buffer)) = self
+            .attachment_image_preview
+            .as_ref()
+            .map(|preview| (preview.editing, preview.edit_buffer.clone()))
+        else {
+            return;
+        };
+        if !self
+            .attachment_image_preview
+            .as_ref()
+            .is_some_and(|preview| preview.editable)
+        {
+            return;
+        }
+        if editing {
+            let Some(buffer) = buffer else {
+                return;
+            };
+            if !self.commit_attachment_editor_buffer(buffer, cx) {
+                return;
+            }
+        }
+        if let Some(preview) = self.attachment_image_preview.as_mut() {
+            preview.editing = !preview.editing;
+            preview.edit_drag = None;
+            preview.drag = None;
+        }
+        cx.notify();
+    }
+
+    fn select_attachment_edit_tool(&mut self, tool: ImageEditTool, cx: &mut Context<Self>) {
+        let Some(preview) = self.attachment_image_preview.as_mut() else {
+            return;
+        };
+        if preview.editable && preview.editing {
+            preview.tool = tool;
+            preview.edit_drag = None;
+            cx.notify();
+        }
+    }
+
+    fn attachment_preview_point(
+        &self,
+        preview: &AttachmentImagePreviewState,
+        pointer_x: f32,
+        pointer_y: f32,
+    ) -> Option<(u32, u32)> {
+        let (source_width, source_height) = preview.intrinsic_size?;
+        let layout = attachment_image_preview_layout(
+            preview.intrinsic_size,
+            preview.zoom,
+            self.last_visibility.layout.viewport_width as f32,
+            self.last_visibility.layout.viewport_height as f32,
+        );
+        if layout.image_width <= 0.0 || layout.image_height <= 0.0 {
+            return None;
+        }
+        // The centered image lives inside the padded viewport child. Pointer
+        // events are reported in overlay coordinates, so include that inset
+        // before converting back to source pixels.
+        let origin_x = IMAGE_PREVIEW_HORIZONTAL_PADDING
+            + (layout.viewport_width - layout.image_width) / 2.0
+            + preview.pan_x;
+        let origin_y = IMAGE_PREVIEW_VERTICAL_PADDING
+            + (layout.viewport_height - layout.image_height) / 2.0
+            + preview.pan_y;
+        let x = ((pointer_x - origin_x) / layout.image_width * source_width as f32).round();
+        let y = ((pointer_y - origin_y) / layout.image_height * source_height as f32).round();
+        if x < 0.0 || y < 0.0 || x >= source_width as f32 || y >= source_height as f32 {
+            return None;
+        }
+        Some((x as u32, y as u32))
+    }
+
+    fn persist_attachment_editor_buffer(&self, bytes: &[u8]) -> std::io::Result<PathBuf> {
+        let Some(config) = self.config.as_ref() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "isolated desktop home is unavailable",
+            ));
+        };
+        let root = config.home_dir.join("composer-edits");
+        fs::create_dir_all(&root)?;
+        let digest = Sha256::digest(bytes);
+        let digest = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let destination = root.join(format!("{digest}.png"));
+        if !destination.exists() {
+            fs::write(&destination, bytes)?;
+        }
+        Ok(destination)
+    }
+
+    fn commit_attachment_editor_buffer(
+        &mut self,
+        buffer: image::RgbaImage,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Ok(bytes) = encode_editor_image(&buffer) else {
+            self.agent_error = Some(
+                locale::text(
+                    "Edited image could not be encoded",
+                    "编辑后的图片无法编码",
+                    "編輯後的圖片無法編碼",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return false;
+        };
+        let Ok(path) = self.persist_attachment_editor_buffer(&bytes) else {
+            self.agent_error = Some(
+                locale::text(
+                    "Edited image could not be saved",
+                    "编辑后的图片无法保存",
+                    "編輯後的圖片無法儲存",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return false;
+        };
+        let image = Arc::new(Image::from_bytes(ImageFormat::Png, bytes));
+        let dimensions = buffer.dimensions();
+        let Some(preview) = self.attachment_image_preview.as_mut() else {
+            return false;
+        };
+        if !preview.editable {
+            return false;
+        }
+        let attachment_id = preview.attachment.id.clone();
+        preview.attachment.label = edited_attachment_file_name(&preview.attachment.label);
+        preview.attachment.path = Some(path.to_string_lossy().into_owned());
+        preview.attachment.mime_type = Some("image/png".to_string());
+        preview.image_source = Arc::<Path>::from(path.clone().into_boxed_path());
+        preview.edited_image = Some(image);
+        preview.edit_buffer = Some(buffer);
+        preview.intrinsic_size = Some(dimensions);
+        preview.zoom = 1.0;
+        preview.pan_x = 0.0;
+        preview.pan_y = 0.0;
+        if let Some(attachment) = self
+            .composer_attachments
+            .iter_mut()
+            .find(|attachment| attachment.attachment.id == attachment_id)
+        {
+            attachment.attachment = preview.attachment.clone();
+        }
+        if let Some(attachment) = self
+            .new_session_attachments
+            .iter_mut()
+            .find(|attachment| attachment.attachment.id == attachment_id)
+        {
+            attachment.attachment = preview.attachment.clone();
+        }
+        cx.notify();
+        true
+    }
+
+    fn stage_attachment_editor_buffer(&mut self, buffer: image::RgbaImage, cx: &mut Context<Self>) {
+        let Ok(bytes) = encode_editor_image(&buffer) else {
+            self.agent_error = Some(
+                locale::text(
+                    "Edited image could not be encoded",
+                    "编辑后的图片无法编码",
+                    "編輯後的圖片無法編碼",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        };
+        let image = Arc::new(Image::from_bytes(ImageFormat::Png, bytes));
+        let dimensions = buffer.dimensions();
+        if let Some(preview) = self.attachment_image_preview.as_mut() {
+            if preview.editable {
+                preview.edited_image = Some(image);
+                preview.edit_buffer = Some(buffer);
+                preview.intrinsic_size = Some(dimensions);
+                preview.zoom = 1.0;
+                preview.pan_x = 0.0;
+                preview.pan_y = 0.0;
+            }
+        }
+        cx.notify();
+    }
+
+    fn begin_attachment_edit_gesture(
+        &mut self,
+        pointer_x: f32,
+        pointer_y: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(snapshot) = self.attachment_image_preview.clone() else {
+            return;
+        };
+        if !snapshot.editable || !snapshot.editing {
+            return;
+        }
+        let Some(point) = self.attachment_preview_point(&snapshot, pointer_x, pointer_y) else {
+            return;
+        };
+        if snapshot.tool == ImageEditTool::Text {
+            let text = self.image_editor_text_input.read(cx).value().to_string();
+            if text.trim().is_empty() {
+                return;
+            }
+            let Some(mut buffer) = snapshot.edit_buffer else {
+                return;
+            };
+            apply_text(&mut buffer, point, &text);
+            self.commit_attachment_editor_buffer(buffer, cx);
+            return;
+        }
+        if let Some(preview) = self.attachment_image_preview.as_mut() {
+            preview.edit_drag = Some(AttachmentImageEditDragState {
+                start_x: point.0,
+                start_y: point.1,
+                current_x: point.0,
+                current_y: point.1,
+            });
+            preview.drag = None;
+            cx.notify();
+        }
+    }
+
+    fn update_attachment_edit_gesture(
+        &mut self,
+        pointer_x: f32,
+        pointer_y: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(snapshot) = self.attachment_image_preview.clone() else {
+            return;
+        };
+        let Some(mut point) = self.attachment_preview_point(&snapshot, pointer_x, pointer_y) else {
+            return;
+        };
+        let Some(gesture) = snapshot.edit_drag else {
+            return;
+        };
+        point.0 = point.0.min(
+            snapshot
+                .intrinsic_size
+                .map_or(point.0, |size| size.0.saturating_sub(1)),
+        );
+        point.1 = point.1.min(
+            snapshot
+                .intrinsic_size
+                .map_or(point.1, |size| size.1.saturating_sub(1)),
+        );
+        if let Some(preview) = self.attachment_image_preview.as_mut() {
+            preview.edit_drag = Some(AttachmentImageEditDragState {
+                current_x: point.0,
+                current_y: point.1,
+                ..gesture
+            });
+        }
+        if matches!(snapshot.tool, ImageEditTool::Brush | ImageEditTool::Mosaic) {
+            let Some(mut buffer) = snapshot.edit_buffer else {
+                return;
+            };
+            let from = (gesture.current_x, gesture.current_y);
+            match snapshot.tool {
+                ImageEditTool::Brush => apply_brush(&mut buffer, from, point),
+                ImageEditTool::Mosaic => apply_mosaic(&mut buffer, from, point),
+                _ => {}
+            }
+            self.stage_attachment_editor_buffer(buffer, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn finish_attachment_edit_gesture(&mut self, cx: &mut Context<Self>) {
+        let Some(snapshot) = self.attachment_image_preview.clone() else {
+            return;
+        };
+        let Some(gesture) = snapshot.edit_drag else {
+            return;
+        };
+        let Some(mut buffer) = snapshot.edit_buffer else {
+            return;
+        };
+        match snapshot.tool {
+            ImageEditTool::Crop => {
+                let Some(cropped) = apply_crop(
+                    &buffer,
+                    (gesture.start_x, gesture.start_y),
+                    (gesture.current_x, gesture.current_y),
+                ) else {
+                    if let Some(preview) = self.attachment_image_preview.as_mut() {
+                        preview.edit_drag = None;
+                    }
+                    cx.notify();
+                    return;
+                };
+                buffer = cropped;
+            }
+            ImageEditTool::Rectangle => apply_rectangle(
+                &mut buffer,
+                (gesture.start_x, gesture.start_y),
+                (gesture.current_x, gesture.current_y),
+            ),
+            ImageEditTool::Circle => apply_circle(
+                &mut buffer,
+                (gesture.start_x, gesture.start_y),
+                (gesture.current_x, gesture.current_y),
+            ),
+            ImageEditTool::Arrow => apply_arrow(
+                &mut buffer,
+                (gesture.start_x, gesture.start_y),
+                (gesture.current_x, gesture.current_y),
+            ),
+            ImageEditTool::Brush | ImageEditTool::Mosaic | ImageEditTool::Text => {}
+        }
+        self.commit_attachment_editor_buffer(buffer, cx);
+        if let Some(preview) = self.attachment_image_preview.as_mut() {
+            preview.edit_drag = None;
+        }
     }
 
     fn close_attachment_preview(&mut self, cx: &mut Context<Self>) {
@@ -23802,6 +24174,7 @@ impl VibexWorkbench {
                     )
                     .child(workspace_controls),
             )
+            )
             .into_any_element()
     }
 
@@ -25887,6 +26260,7 @@ impl VibexWorkbench {
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.open_attachment_preview(
                                         preview_attachment.clone(),
+                                        true,
                                         window,
                                         cx,
                                     )
@@ -25931,6 +26305,24 @@ impl VibexWorkbench {
         let copy_mime_type = preview.attachment.mime_type.clone();
         let copy_entity = cx.weak_entity();
         let image_source = preview.image_source;
+        let rendered_image = preview.edited_image;
+        let image_element = rendered_image
+            .map(|image| {
+                img(image)
+                    .size_full()
+                    .object_fit(ObjectFit::Contain)
+                    .into_any_element()
+            })
+            .unwrap_or_else(|| {
+                img(image_source)
+                    .size_full()
+                    .object_fit(ObjectFit::Contain)
+                    .into_any_element()
+            });
+        let editable = preview.editable;
+        let editing = preview.editing;
+        let selected_tool = preview.tool;
+        let text_input = self.image_editor_text_input.clone();
 
         Some(
             div()
@@ -25949,6 +26341,19 @@ impl VibexWorkbench {
                         && this
                             .attachment_image_preview
                             .as_ref()
+                            .is_some_and(|preview| preview.editing && preview.edit_drag.is_some())
+                    {
+                        this.update_attachment_edit_gesture(
+                            f32::from(event.position.x),
+                            f32::from(event.position.y),
+                            cx,
+                        );
+                        window.prevent_default();
+                        cx.stop_propagation();
+                    } else if event.dragging()
+                        && this
+                            .attachment_image_preview
+                            .as_ref()
                             .is_some_and(|preview| preview.drag.is_some())
                     {
                         this.update_attachment_preview_drag(
@@ -25962,11 +26367,31 @@ impl VibexWorkbench {
                 }))
                 .on_mouse_up(
                     MouseButton::Left,
-                    cx.listener(|this, _, _, cx| this.finish_attachment_preview_drag(cx)),
+                    cx.listener(|this, _, _, cx| {
+                        if this
+                            .attachment_image_preview
+                            .as_ref()
+                            .is_some_and(|preview| preview.edit_drag.is_some())
+                        {
+                            this.finish_attachment_edit_gesture(cx);
+                        } else {
+                            this.finish_attachment_preview_drag(cx);
+                        }
+                    }),
                 )
                 .on_mouse_up_out(
                     MouseButton::Left,
-                    cx.listener(|this, _, _, cx| this.finish_attachment_preview_drag(cx)),
+                    cx.listener(|this, _, _, cx| {
+                        if this
+                            .attachment_image_preview
+                            .as_ref()
+                            .is_some_and(|preview| preview.edit_drag.is_some())
+                        {
+                            this.finish_attachment_edit_gesture(cx);
+                        } else {
+                            this.finish_attachment_preview_drag(cx);
+                        }
+                    }),
                 )
                 .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
                     let y = match event.delta {
@@ -25997,12 +26422,25 @@ impl VibexWorkbench {
                                 .relative()
                                 .left(px(pan_x))
                                 .top(px(pan_y))
-                                .when(can_pan && !dragging, |this| this.cursor_grab())
-                                .when(can_pan && dragging, |this| this.cursor_grabbing())
+                                .when(editing, |this| this.cursor_crosshair())
+                                .when(can_pan && !editing && !dragging, |this| this.cursor_grab())
+                                .when(can_pan && !editing && dragging, |this| {
+                                    this.cursor_grabbing()
+                                })
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                        if can_pan {
+                                        if this
+                                            .attachment_image_preview
+                                            .as_ref()
+                                            .is_some_and(|preview| preview.editing)
+                                        {
+                                            this.begin_attachment_edit_gesture(
+                                                f32::from(event.position.x),
+                                                f32::from(event.position.y),
+                                                cx,
+                                            );
+                                        } else if can_pan {
                                             this.begin_attachment_preview_drag(
                                                 f32::from(event.position.x),
                                                 f32::from(event.position.y),
@@ -26037,9 +26475,7 @@ impl VibexWorkbench {
                                         ),
                                     )
                                 })
-                                .child(
-                                    img(image_source).size_full().object_fit(ObjectFit::Contain),
-                                ),
+                                .child(image_element),
                         ),
                 )
                 .child(
@@ -26050,6 +26486,114 @@ impl VibexWorkbench {
                         .items_center()
                         .gap_2()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .when(editable && !editing, |this| {
+                            this.child(
+                                Button::new("edit-attachment-preview")
+                                    .ghost()
+                                    .compact()
+                                    .size(px(40.0))
+                                    .rounded(gpui_component::button::ButtonRounded::Size(px(999.0)))
+                                    .bg(cx.theme().foreground.opacity(0.12))
+                                    .text_color(cx.theme().foreground)
+                                    .icon(Icon::default().path("icons/vibex/pencil.svg"))
+                                    .tooltip(locale::text("Edit image", "编辑图片", "編輯圖片"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toggle_attachment_editor(cx)
+                                    })),
+                            )
+                        })
+                        .when(editing, |this| {
+                            this.child(
+                                h_flex()
+                                    .items_center()
+                                    .gap(px(2.0))
+                                    .rounded(px(10.0))
+                                    .bg(cx.theme().foreground.opacity(0.12))
+                                    .p(px(3.0))
+                                    .children(ImageEditTool::ALL.into_iter().map(|tool| {
+                                        let selected = selected_tool == tool;
+                                        Button::new(format!("attachment-edit-tool-{}", tool.id()))
+                                            .ghost()
+                                            .compact()
+                                            .size(px(32.0))
+                                            .when(selected, |button| button.primary())
+                                            .icon(match tool {
+                                                ImageEditTool::Crop => {
+                                                    Icon::default().path("icons/vibex/scissors.svg")
+                                                }
+                                                ImageEditTool::Brush => {
+                                                    Icon::default().path("icons/vibex/pencil.svg")
+                                                }
+                                                ImageEditTool::Text => Icon::default()
+                                                    .path("icons/vibex/file-text.svg"),
+                                                ImageEditTool::Rectangle => Icon::default()
+                                                    .path("icons/vibex/file-type.svg"),
+                                                ImageEditTool::Circle => Icon::default()
+                                                    .path("icons/vibex/crosshair.svg"),
+                                                ImageEditTool::Arrow => {
+                                                    Icon::new(IconName::ArrowUp)
+                                                }
+                                                ImageEditTool::Mosaic => Icon::default()
+                                                    .path("icons/vibex/file-type.svg"),
+                                            })
+                                            .tooltip(match tool {
+                                                ImageEditTool::Crop => {
+                                                    locale::text("Crop", "裁剪", "裁剪")
+                                                }
+                                                ImageEditTool::Brush => {
+                                                    locale::text("Brush", "笔画", "筆畫")
+                                                }
+                                                ImageEditTool::Text => {
+                                                    locale::text("Text", "文字", "文字")
+                                                }
+                                                ImageEditTool::Rectangle => {
+                                                    locale::text("Rectangle", "矩形框", "矩形框")
+                                                }
+                                                ImageEditTool::Circle => {
+                                                    locale::text("Circle", "圆形框", "圓形框")
+                                                }
+                                                ImageEditTool::Arrow => {
+                                                    locale::text("Arrow", "箭头", "箭頭")
+                                                }
+                                                ImageEditTool::Mosaic => {
+                                                    locale::text("Mosaic", "马赛克", "馬賽克")
+                                                }
+                                            })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.select_attachment_edit_tool(tool, cx)
+                                            }))
+                                    }))
+                                    .when(selected_tool == ImageEditTool::Text, |this| {
+                                        this.child(
+                                            div()
+                                                .w(px(120.0))
+                                                .h(px(30.0))
+                                                .rounded(px(6.0))
+                                                .bg(cx.theme().background)
+                                                .child(
+                                                    Input::new(&text_input)
+                                                        .appearance(false)
+                                                        .size_full(),
+                                                ),
+                                        )
+                                    })
+                                    .child(
+                                        Button::new("finish-attachment-edit")
+                                            .primary()
+                                            .compact()
+                                            .size(px(32.0))
+                                            .icon(IconName::Check)
+                                            .tooltip(locale::text(
+                                                "Finish editing",
+                                                "完成编辑",
+                                                "完成編輯",
+                                            ))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.toggle_attachment_editor(cx)
+                                            })),
+                                    ),
+                            )
+                        })
                         .child(
                             Button::new("save-attachment-preview")
                                 .ghost()
@@ -29620,7 +30164,7 @@ impl VibexWorkbench {
                 };
                 let _ = view.update(cx, |this, cx| match action {
                     UserMessageAttachmentAction::PreviewImage(attachment) => {
-                        this.open_attachment_preview(attachment, window, cx)
+                        this.open_attachment_preview(attachment, false, window, cx)
                     }
                     UserMessageAttachmentAction::OpenFile(path) => {
                         this.open_code_file(path, window, cx)
@@ -35004,6 +35548,16 @@ fn safe_attachment_file_name(label: &str, source: &str) -> String {
     name
 }
 
+fn edited_attachment_file_name(label: &str) -> String {
+    let label = label.trim();
+    let stem = Path::new(label)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("image");
+    format!("{stem}.png")
+}
+
 fn attachment_preview_image_format(
     path: &std::path::Path,
     mime_type: Option<&str>,
@@ -35023,6 +35577,22 @@ fn attachment_preview_image_format(
             _ => None,
         }
     })
+}
+
+fn encode_editor_image(image: &image::RgbaImage) -> image::ImageResult<Vec<u8>> {
+    let mut bytes = Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image.clone()).write_to(&mut bytes, image::ImageFormat::Png)?;
+    Ok(bytes.into_inner())
+}
+
+fn decode_attachment_editor_image(path: &Path) -> image::ImageResult<image::RgbaImage> {
+    let mut decoder = image::ImageReader::open(path)?
+        .with_guessed_format()?
+        .into_decoder()?;
+    let orientation = decoder.orientation()?;
+    let mut image = image::DynamicImage::from_decoder(decoder)?;
+    image.apply_orientation(orientation);
+    Ok(image.to_rgba8())
 }
 
 fn fitted_attachment_preview_size(

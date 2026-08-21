@@ -3,9 +3,9 @@
   "status": "passed",
   "claimScope": "manifest_and_contract",
   "realRuntimeVerification": "blocked",
-  "capturedAt": "2026-08-11T06:39:55.903Z",
+  "capturedAt": "2026-08-21T06:32:39.518Z",
   "source": {
-    "captureParentCommit": "9b059f48a71c48f0859239f765bfcd92646873f4",
+    "captureParentCommit": "1ea4cc1f0a0d3c6259efc45deeabff9acb996cf6",
     "rustToolchain": "rustc-1.97.0",
     "sourceInputRoots": [
       "crates/core/src/acp_catalog.rs",
@@ -53,27 +53,27 @@
       "crates/vibex-ui/Cargo.toml",
       "apps/desktop/Cargo.toml"
     ],
-    "sourceInputTreeSha256": "83842fd6775df2ccd18a1e40386b3def3632cbfafb776c43b523fd518d1b55a8",
+    "sourceInputTreeSha256": "b7d7e0eaf22d94098bd36c5dc681d94f3c60147f688ccadeab22611041176e72",
     "bindings": {
-      "catalog": "bdc87ebdab402b8cc7f34192da8bd0e7db914c30672064412920d520af2e207a",
-      "manifest": "0f67c6211fb00c7dfe4f82400fda7f7095993c19c35dafc3ab9a8e4febbab847",
-      "probe": "230f0152e8677893f5f518a87887319e24350286c57c37bd197375fe6841b738",
-      "database": "f08e74e841050d51e4587167a48f3e3268c3132261a04d07f13aa179f17c2ec9",
-      "remote": "a058842c99911355e411e3e18aa5ff8b72cd40c6b21029d2819e1431c168e929",
-      "ui": "f0b069eddde413a8f7061158ce5809bc4d1be4377f619d088a7a59aba6addb37",
-      "switch": "d758f60e370cd99701faff26ca254abf4bee36b8b583c6bfd28c6285f78f5a19",
-      "scripts": "4593dcd79a383f4875b98ecbd5db6e457cd725e44537d0f716f1f3e832e4cdd8",
-      "packageMetadata": "0975d1120f3880725f4862f7717cbd80d4e517072611782c12fa0afa1d549e91"
+      "catalog": "0383e76913841b1405ba3fb57ffc71c9d3016fb19af54427271d92dc8f36b879",
+      "manifest": "2b0c18700a02679ea659ae551a4c2867ebec5cd2fb9ceeb8c550225532dba0ac",
+      "probe": "7edeae9a6aaafde18b9bccabd2b61d92a95eae572d02634610244a74944cfadc",
+      "database": "0ace5cfc6f53906288aabc098d21459b8019c9c97d5e5fb0cd4a3950cab5189c",
+      "remote": "341d02a6ccf83c94d56f4d170e4d1da7a0912b11c5384cbad4119a9a007d21c0",
+      "ui": "e068ca537dcfc5855d5410fc955163e5fb6ee4f30787544d26cd041e86981a87",
+      "switch": "a3490a3b058ef2498685a5df82eedc6c3ddc56def0731ff309303e31285c53bf",
+      "scripts": "bf41a9b102d7a1589794a4524435b959eb46e3078169fcc5fc0b6b27f0afe6f4",
+      "packageMetadata": "cefacf2b461aca71e531a5f7548e2d89dd63e9518e54c08ce822cc61b71efc0e"
     },
-    "cargoLockSha256": "8d8bd3b75f3d71566b925df34c84893e5e6c6a6a021c825696565047cc6c5598",
-    "packageJsonSha256": "4e1c85256422478413b0e9c5f0e046295bbe260944dd7d93a59b1c190ed7d739",
-    "rolloutManifestSha256": "9b8cb4e4abac655a6e906a28ac020660a0ed2322cce49f6827e5d071423a4f05"
+    "cargoLockSha256": "b333a7de10311d5da23d658ce99e33fdb754a82c2e933476a59a5800afdfbdc4",
+    "packageJsonSha256": "3bf13132c815037285846cd90920224559d666d9c18e15db3c1d694e7a783dfa",
+    "rolloutManifestSha256": "9378f5875a8b6ac2d713506fa0fe9c82c57cfbe95d9b446477361a514de6210a"
   },
   "manifest": {
     "schemaVersion": "agent-provider-runtime-manifest.v1",
-    "totalAgents": 34,
+    "totalAgents": 35,
     "builtinCount": 3,
-    "catalogCount": 31,
+    "catalogCount": 32,
     "entries": [
       {
         "agentId": "claude",
@@ -366,6 +366,25 @@
         "sourceEvidenceReference": "research/acp-agent/deepagents@0.1.15",
         "smokeId": "agent-provider-deepagents",
         "capabilityDiagnosticCode": "agent_projection_environment_contract_not_runtime_verified"
+      },
+      {
+        "agentId": "deepseek-harness",
+        "catalogVersion": "0.4.15",
+        "adapterId": "deepseek-harness-acp",
+        "descriptorId": "projection_deepseek_harness_runtime_v1",
+        "descriptorVersion": "1",
+        "versionPolicy": {
+          "kind": "exact"
+        },
+        "capabilityMode": "replaceable_provider",
+        "runtimeHomeStrategy": "none",
+        "switchBehavior": "unverified",
+        "credentialKinds": [],
+        "modelInterfaces": [],
+        "evidenceState": "unverified",
+        "sourceEvidenceReference": "research/acp-agent/deepseek-harness@0.4.15",
+        "smokeId": "agent-provider-deepseek-harness",
+        "capabilityDiagnosticCode": "agent_projection_auth_boundary_not_runtime_verified"
       },
       {
         "agentId": "devin",
@@ -1503,6 +1522,41 @@
       "recordedAt": null
     },
     {
+      "agentId": "deepseek-harness",
+      "smokeId": "agent-provider-deepseek-harness",
+      "catalogVersion": "0.4.15",
+      "descriptorId": "projection_deepseek_harness_runtime_v1",
+      "descriptorVersion": "1",
+      "versionPolicy": "exact",
+      "capabilityMode": "replaceable_provider",
+      "switchBehavior": "unverified",
+      "status": "blocked",
+      "execution": "not_run",
+      "diagnosticCode": "agent_projection_auth_boundary_not_runtime_verified",
+      "detectedIdentity": null,
+      "descriptorMatch": "not_checked",
+      "projectionFingerprint": null,
+      "facts": {
+        "binaryIdentity": "blocked",
+        "acpHandshake": "blocked",
+        "authentication": "blocked",
+        "session": "blocked",
+        "modelCatalog": "blocked",
+        "modelSelection": "blocked",
+        "providerProjection": "blocked",
+        "sessionResume": "blocked",
+        "switchCompatibility": "blocked",
+        "redaction": "blocked"
+      },
+      "redactionPassed": false,
+      "sourceSurvivedPrepareFailure": false,
+      "providerVerified": false,
+      "liveSwitchVerified": false,
+      "binaryOnlyVerified": false,
+      "sourceEvidenceReference": "research/acp-agent/deepseek-harness@0.4.15",
+      "recordedAt": null
+    },
+    {
       "agentId": "devin",
       "smokeId": "agent-provider-devin",
       "catalogVersion": "manual",
@@ -2332,8 +2386,8 @@
     "absolutePathPersisted": false
   },
   "summary": {
-    "totalAgents": 34,
-    "blockedRealSmokes": 34,
+    "totalAgents": 35,
+    "blockedRealSmokes": 35,
     "passedRealSmokes": 0,
     "providerVerifiedAgents": 0,
     "liveSwitchVerifiedAgents": 0,

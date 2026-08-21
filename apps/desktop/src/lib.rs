@@ -5,6 +5,7 @@ pub mod app;
 pub mod assets;
 pub mod code_workbench;
 pub mod gpui_ext;
+pub mod image_editor;
 pub mod locale;
 pub mod management;
 pub mod office_surface;

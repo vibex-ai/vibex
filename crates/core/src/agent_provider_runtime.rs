@@ -625,7 +625,7 @@ fn catalog_interface(
 
 fn conservative_replaceable_shape(agent_id: &str) -> VibexResult<CatalogProjectionShape> {
     let diagnostic = match agent_id {
-        "cline" | "dimcode" | "minion-code" | "nova" => {
+        "cline" | "deepseek-harness" | "dimcode" | "minion-code" | "nova" => {
             "agent_projection_auth_boundary_not_runtime_verified"
         }
         "deepagents" => "agent_projection_environment_contract_not_runtime_verified",
@@ -1281,7 +1281,7 @@ mod tests {
     fn manifest_has_exact_catalog_coverage_and_unique_routes() {
         let manifest = agent_provider_rollout_manifest().unwrap();
         validate_rollout_manifest(&manifest).unwrap();
-        assert_eq!(manifest.len(), 34);
+        assert_eq!(manifest.len(), 35);
         assert!(manifest.iter().any(|entry| entry.agent_id.as_str() == "pi"));
         assert!(
             manifest
@@ -1580,9 +1580,16 @@ mod tests {
             "stakpak",
             "vtcode",
         ];
-        let blocked_projectors = ["cline", "deepagents", "dimcode", "minion-code", "nova"];
+        let blocked_projectors = [
+            "cline",
+            "deepagents",
+            "deepseek-harness",
+            "dimcode",
+            "minion-code",
+            "nova",
+        ];
         assert_eq!(typed_projectors.len(), 17);
-        assert_eq!(blocked_projectors.len(), 5);
+        assert_eq!(blocked_projectors.len(), 6);
 
         for descriptor in descriptors
             .iter()

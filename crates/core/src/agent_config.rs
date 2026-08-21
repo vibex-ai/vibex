@@ -442,6 +442,7 @@ pub fn acp_registry_agent_id(agent_id: &AgentId) -> Option<&'static str> {
     match agent_id.as_str() {
         "claude" => return Some("claude-acp"),
         "codex" => return Some("codex-acp"),
+        "deepseek-harness" => return Some("deepseek-harness-acp"),
         "copilot" => return Some("github-copilot-cli"),
         "grok" => return Some("grok-build"),
         "opencode" => return Some("opencode"),
@@ -690,6 +691,7 @@ mod tests {
             "crow-cli",
             "cursor",
             "deepagents",
+            "deepseek-harness",
             "devin",
             "dimcode",
             "dirac",
@@ -788,10 +790,14 @@ mod tests {
                 "{managed} must use its Registry binary distribution"
             );
         }
-        for latest_managed in ["codewhale", "hermes", "kiro"] {
+        for latest_managed in ["codewhale", "deepseek-harness", "hermes", "kiro"] {
             assert_eq!(
                 acp_registry_agent_id(&AgentId::parse(latest_managed).unwrap()),
-                Some(latest_managed),
+                Some(if latest_managed == "deepseek-harness" {
+                    "deepseek-harness-acp"
+                } else {
+                    latest_managed
+                }),
                 "{latest_managed} must use its Vibex-managed latest CLI distribution"
             );
         }

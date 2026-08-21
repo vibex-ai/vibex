@@ -426,6 +426,33 @@ enum ManagementMutation {
     BackupRestore,
 }
 
+struct ManagementTaskSuccess {
+    message: String,
+    agent_install_state: Option<(AgentId, vibex_core::AgentManagedInstallState)>,
+}
+
+impl ManagementTaskSuccess {
+    fn with_agent_install_state(
+        message: String,
+        agent_id: AgentId,
+        state: vibex_core::AgentManagedInstallState,
+    ) -> Self {
+        Self {
+            message,
+            agent_install_state: Some((agent_id, state)),
+        }
+    }
+}
+
+impl From<String> for ManagementTaskSuccess {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            agent_install_state: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentAuthTerminalState {
     Running,
@@ -4642,15 +4669,15 @@ impl ManagementCenter {
             return;
         };
         let active_locale = locale::current_locale();
-        self.begin_simple_task(
+        self.begin_task_with_success(
             ManagementMutation::AgentUpdateCheck(agent_id),
             cx,
             async move {
                 let state = runtime
                     .agent()
-                    .check_managed_agent_update(parsed_agent_id)
+                    .check_managed_agent_update(parsed_agent_id.clone())
                     .await?;
-                Ok(
+                let message =
                     if state.status == vibex_core::AgentManagedInstallStatus::UpdateAvailable {
                         management_locale_text_for(
                             active_locale,
@@ -4667,8 +4694,12 @@ impl ManagementCenter {
                             "Agent 已是最新版本",
                         )
                         .to_string()
-                    },
-                )
+                    };
+                Ok(ManagementTaskSuccess::with_agent_install_state(
+                    message,
+                    parsed_agent_id,
+                    state,
+                ))
             },
         );
     }
@@ -5133,6 +5164,19 @@ impl ManagementCenter {
     ) where
         F: std::future::Future<Output = VibexResult<String>> + Send + 'static,
     {
+        self.begin_task_with_success(mutation, cx, async move {
+            work.await.map(ManagementTaskSuccess::from)
+        });
+    }
+
+    fn begin_task_with_success<F>(
+        &mut self,
+        mutation: ManagementMutation,
+        cx: &mut Context<Self>,
+        work: F,
+    ) where
+        F: std::future::Future<Output = VibexResult<ManagementTaskSuccess>> + Send + 'static,
+    {
         let concurrent_agent_id = mutation.concurrent_agent_id().map(str::to_string);
         if let Some(agent_id) = concurrent_agent_id.as_deref() {
             if self.agent_mutations.contains_key(agent_id) {
@@ -5189,7 +5233,7 @@ impl ManagementCenter {
                         ManagementMutation::ProviderDisplayOrder(_)
                     );
                 match outcome {
-                    Ok(Ok(message)) => {
+                    Ok(Ok(success)) => {
                         match &completed_mutation {
                             ManagementMutation::PromptAction(action)
                             | ManagementMutation::HookAction(action)
@@ -5227,8 +5271,21 @@ impl ManagementCenter {
                             }
                             _ => {}
                         }
-                        this.notice = Some(message);
-                        this.refresh(cx);
+                        if let Some((agent_id, state)) = success.agent_install_state {
+                            if let Some(agent) = this
+                                .snapshot
+                                .agents
+                                .iter_mut()
+                                .find(|agent| agent.id == agent_id)
+                            {
+                                agent.apply_managed_install_state(state);
+                            }
+                        }
+                        this.notice = Some(success.message);
+                        cx.notify();
+                        if !matches!(&completed_mutation, ManagementMutation::AgentUpdateCheck(_)) {
+                            this.refresh(cx);
+                        }
                         if agent_registry_changed {
                             cx.emit(ManagementEvent::AgentRegistryChanged);
                         }
@@ -8523,7 +8580,7 @@ impl ManagementCenter {
                                 Button::new("agent-auth-verify")
                                     .small()
                                     .outline()
-                                    .icon(IconName::Check)
+                                    .icon(Icon::default().path("icons/vibex/file-key.svg"))
                                     .loading(verify_loading)
                                     .disabled(pending)
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -8537,7 +8594,7 @@ impl ManagementCenter {
                                 Button::new("agent-auth-refresh-models")
                                     .small()
                                     .outline()
-                                    .icon(Icon::default().path("icons/vibex/rotate-ccw.svg"))
+                                    .icon(Icon::default().path("icons/vibex/brain.svg"))
                                     .loading(models_loading)
                                     .disabled(pending)
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -8555,7 +8612,7 @@ impl ManagementCenter {
                                 Button::new("agent-auth-reauthenticate")
                                     .small()
                                     .outline()
-                                    .icon(Icon::default().path("icons/vibex/rotate-ccw.svg"))
+                                    .icon(Icon::default().path("icons/vibex/pencil.svg"))
                                     .disabled(pending)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.begin_agent_reauthentication(cx)
@@ -8885,9 +8942,15 @@ impl ManagementCenter {
                         }
                     };
                     let action_icon = match method.kind {
-                        AgentAuthMethodKind::Agent => Icon::new(IconName::ArrowRight),
-                        AgentAuthMethodKind::Environment => Icon::new(IconName::Check),
-                        AgentAuthMethodKind::Terminal => Icon::new(IconName::ArrowRight),
+                        AgentAuthMethodKind::Agent => {
+                            Icon::default().path("icons/vibex/file-key.svg")
+                        }
+                        AgentAuthMethodKind::Environment => {
+                            Icon::default().path("icons/vibex/file-lock.svg")
+                        }
+                        AgentAuthMethodKind::Terminal => {
+                            Icon::default().path("icons/vibex/file-terminal.svg")
+                        }
                     };
                     (
                         Button::new(action_button_id)
@@ -17191,10 +17254,20 @@ mod tests {
         assert_eq!(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE, 40.0);
         assert!(render.contains(".icon(IconName::Plus)"));
         assert!(render.contains("icons/vibex/trash-2.svg"));
-        assert!(
-            authentication
-                .contains("AgentAuthMethodKind::Terminal => Icon::new(IconName::ArrowRight)")
-        );
+        for semantic_icon in [
+            ".icon(Icon::default().path(\"icons/vibex/file-key.svg\"))",
+            ".icon(Icon::default().path(\"icons/vibex/brain.svg\"))",
+            ".icon(Icon::default().path(\"icons/vibex/pencil.svg\"))",
+            ".icon(IconName::ExternalLink)",
+            "icons/vibex/file-key.svg",
+            "icons/vibex/file-lock.svg",
+            "icons/vibex/file-terminal.svg",
+        ] {
+            assert!(
+                authentication.contains(semantic_icon),
+                "authentication action should retain semantic icon {semantic_icon}"
+            );
+        }
         assert!(action_helper.contains(".size(px(MANAGEMENT_DETAIL_ACTION_HEIGHT))"));
         assert!(action_helper.contains(".tooltip(label.clone())"));
         assert!(action_helper.contains("button_with_aria_label("));

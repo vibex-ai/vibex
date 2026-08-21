@@ -129,6 +129,18 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         &["npx", "-y", "deepagents-acp@0.1.15"],
     ),
     AcpAgentCatalogEntry::new(
+        "deepseek-harness",
+        "DeepSeek Harness",
+        "DeepSeek Harness coding agent connected through the deepseek-harness-acp bridge.",
+        "0.4.15",
+        "https://github.com/vibex-ai/deepseek-harness-acp",
+        &[
+            "npx",
+            "-y",
+            "@openma/deepseek-harness-acp@0.4.15",
+        ],
+    ),
+    AcpAgentCatalogEntry::new(
         "devin",
         "Devin CLI",
         "Cognition's Devin for Terminal via Agent Client Protocol",
@@ -345,7 +357,7 @@ mod tests {
     #[test]
     fn catalog_ids_and_presets_are_unique_and_commands_are_complete() {
         let entries = acp_agent_catalog_entries();
-        assert_eq!(entries.len(), 31);
+        assert_eq!(entries.len(), 32);
 
         let ids = entries
             .iter()
@@ -369,6 +381,15 @@ mod tests {
         let pi = entries.iter().find(|entry| entry.id == "pi").unwrap();
         assert_eq!(pi.version, "0.0.33");
         assert_eq!(pi.command, &["npx", "-y", "pi-acp@0.0.33"]);
+        let deepseek = entries
+            .iter()
+            .find(|entry| entry.id == "deepseek-harness")
+            .unwrap();
+        assert_eq!(deepseek.version, "0.4.15");
+        assert_eq!(
+            deepseek.command,
+            &["npx", "-y", "@openma/deepseek-harness-acp@0.4.15"]
+        );
         assert!(!entries.iter().any(|entry| entry.id == "corust-agent"));
     }
 }

@@ -14027,15 +14027,21 @@ async fn probe_runtime_session_configs_with_config(
                 ACP_PROBE_TIMEOUT,
             )
             .await?;
-        let initial = runtime_session_probe_from_response(&process, &session, None).await?;
+        let initial =
+            runtime_session_probe_from_response(&process, &initialize, &session, None).await?;
         let target_models = match targets {
             RuntimeSessionProbeTargets::Explicit(models) => models.to_vec(),
             RuntimeSessionProbeTargets::Discovered => initial.models.clone(),
         };
         let mut model_results = Vec::with_capacity(target_models.len());
         for model_id in target_models {
-            let result =
-                runtime_session_probe_from_response(&process, &session, Some(&model_id)).await;
+            let result = runtime_session_probe_from_response(
+                &process,
+                &initialize,
+                &session,
+                Some(&model_id),
+            )
+            .await;
             model_results.push((model_id, result));
         }
         Ok::<AcpRuntimeSessionProbeBatch, VibexError>(AcpRuntimeSessionProbeBatch {
@@ -14051,6 +14057,7 @@ async fn probe_runtime_session_configs_with_config(
 
 async fn runtime_session_probe_from_response(
     process: &Arc<AcpProcess>,
+    initialize: &Value,
     session: &Value,
     target_model: Option<&str>,
 ) -> VibexResult<AcpRuntimeSessionProbe> {
@@ -14140,11 +14147,14 @@ async fn runtime_session_probe_from_response(
         })
         .map(|response| extract_config_values(mode_candidates(response)))
         .unwrap_or_else(|| extract_config_values(mode_candidates(session)));
-    let reasoning_efforts = model_response_ref
+    let mut reasoning_efforts = model_response_ref
         .filter(|response| response_has_config_options(response))
         .or(model_config_update.as_ref())
         .map(extract_probe_reasoning_efforts)
         .unwrap_or_else(|| extract_probe_reasoning_efforts(session));
+    if reasoning_efforts.is_empty() {
+        reasoning_efforts = extract_initialize_reasoning_efforts(initialize, target_model);
+    }
     let options = model_response_ref
         .filter(|response| response_has_config_options(response))
         .or(model_config_update.as_ref())
@@ -14153,7 +14163,14 @@ async fn runtime_session_probe_from_response(
     Ok(AcpRuntimeSessionProbe {
         models: target_model
             .map(|model| vec![model.to_string()])
-            .unwrap_or_else(|| extract_model_ids(session)),
+            .unwrap_or_else(|| {
+                let models = extract_model_ids(session);
+                if models.is_empty() {
+                    extract_model_ids(initialize)
+                } else {
+                    models
+                }
+            }),
         modes,
         reasoning_efforts,
         options,
@@ -16118,6 +16135,10 @@ pub(crate) fn extract_model_ids(response: &Value) -> Vec<String> {
         response
             .get("models")
             .and_then(|models| models.get("availableModels")),
+        response
+            .get("_meta")
+            .and_then(|metadata| metadata.get("modelState"))
+            .and_then(|model_state| model_state.get("availableModels")),
     ];
     for candidate in candidates.into_iter().flatten() {
         if let Some(models) = candidate.as_array() {
@@ -16127,7 +16148,11 @@ pub(crate) fn extract_model_ids(response: &Value) -> Vec<String> {
         }
     }
     for option in model_config_options(response) {
-        if let Some(options) = option.get("options").and_then(Value::as_array) {
+        if let Some(options) = option
+            .get("options")
+            .or_else(|| option.get("values"))
+            .and_then(Value::as_array)
+        {
             for model in options {
                 push_model(model);
             }
@@ -16166,6 +16191,21 @@ pub(crate) fn extract_probe_reasoning_efforts(response: &Value) -> Vec<AgentReas
             continue;
         }
         let Some(values) = option.get("options").or_else(|| option.get("values")) else {
+            if option
+                .get("category")
+                .and_then(Value::as_str)
+                .is_some_and(|category| normalize_identifier(category) == "mode")
+            {
+                if let Some(value) = config_value_from_json(option)
+                    && value.value != "default"
+                    && !efforts.iter().any(|existing| existing.value == value.value)
+                {
+                    efforts.push(AgentReasoningEffort {
+                        value: value.value,
+                        description: value.label,
+                    });
+                }
+            }
             continue;
         };
         for value in extract_config_values(vec![values]) {
@@ -16178,6 +16218,101 @@ pub(crate) fn extract_probe_reasoning_efforts(response: &Value) -> Vec<AgentReas
                 value: value.value,
                 description: value.label,
             });
+        }
+    }
+    efforts
+}
+
+fn extract_reasoning_effort_metadata(response: &Value) -> Vec<AgentReasoningEffort> {
+    response
+        .get("reasoningEfforts")
+        .or_else(|| response.get("reasoning_efforts"))
+        .and_then(Value::as_array)
+        .map(|efforts| {
+            efforts
+                .iter()
+                .filter_map(|effort| {
+                    let value = effort
+                        .get("value")
+                        .or_else(|| effort.get("id"))
+                        .and_then(Value::as_str)
+                        .and_then(sanitize_config_string)?;
+                    if value.eq_ignore_ascii_case("default") {
+                        return None;
+                    }
+                    let description = effort
+                        .get("description")
+                        .or_else(|| effort.get("label"))
+                        .and_then(Value::as_str)
+                        .and_then(sanitize_config_string);
+                    Some(AgentReasoningEffort { value, description })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn extract_initialize_reasoning_efforts(
+    initialize: &Value,
+    target_model: Option<&str>,
+) -> Vec<AgentReasoningEffort> {
+    let mut efforts = Vec::new();
+    let mut collect = |response: &Value| {
+        for effort in extract_probe_reasoning_efforts(response) {
+            if !efforts
+                .iter()
+                .any(|existing: &AgentReasoningEffort| existing.value == effort.value)
+            {
+                efforts.push(effort);
+            }
+        }
+    };
+
+    collect(initialize);
+    for effort in extract_reasoning_effort_metadata(initialize) {
+        if !efforts
+            .iter()
+            .any(|existing| existing.value == effort.value)
+        {
+            efforts.push(effort);
+        }
+    }
+    if let Some(models) = initialize
+        .get("_meta")
+        .and_then(|metadata| metadata.get("modelState"))
+        .and_then(|model_state| model_state.get("availableModels"))
+        .and_then(Value::as_array)
+    {
+        for model in models {
+            let model_id = model
+                .get("modelId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if target_model.is_none() || model_id == target_model {
+                collect(model);
+                if let Some(model_metadata) = model.get("_meta") {
+                    collect(model_metadata);
+                    for effort in extract_reasoning_effort_metadata(model_metadata) {
+                        if !efforts
+                            .iter()
+                            .any(|existing| existing.value == effort.value)
+                        {
+                            efforts.push(effort);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(target_model) = target_model {
+        for key in ["models", "availableModels", "modelCatalog"] {
+            if let Some(model) = initialize
+                .get(key)
+                .and_then(|models| models.get(target_model))
+            {
+                collect(model);
+            }
         }
     }
     efforts
@@ -16350,13 +16485,18 @@ fn config_options_array(response: &Value) -> Option<&Vec<Value>> {
         .get("configOptions")
         .or_else(|| response.get("config_options"))
         .and_then(Value::as_array)
+        .or_else(|| {
+            response
+                .get("_meta")
+                .and_then(|metadata| metadata.get("x.ai"))
+                .and_then(|xai| xai.get("sessionConfig"))
+                .and_then(|session_config| session_config.get("options"))
+                .and_then(Value::as_array)
+        })
 }
 
 fn response_has_config_options(response: &Value) -> bool {
-    response
-        .get("configOptions")
-        .or_else(|| response.get("config_options"))
-        .is_some()
+    config_options_array(response).is_some()
 }
 
 fn response_has_mode_evidence(response: &Value) -> bool {
