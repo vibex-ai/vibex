@@ -213,6 +213,7 @@ const SIDEBAR_INLINE_TRANSITION_DURATION: Duration = Duration::from_millis(200);
 const SIDEBAR_FLOATING_TRANSITION_DURATION: Duration = Duration::from_millis(200);
 const SIDEBAR_REORDER_TRANSITION_DURATION: Duration = Duration::from_millis(160);
 const SIDEBAR_REORDER_ROW_HEIGHT: f32 = 32.0;
+const SIDEBAR_PROJECT_GROUP_GAP: f32 = 12.0;
 const SIDEBAR_PROJECT_REORDER_GAP: f32 = 12.0;
 const SIDEBAR_PROJECT_CONTENT_GAP: f32 = 4.0;
 const SIDEBAR_SESSION_REORDER_GAP: f32 = 2.0;
@@ -19039,7 +19040,10 @@ impl VibexWorkbench {
                     .id("sidebar-session-list")
                     .flex_1()
                     .min_h_0()
-                    .gap(px(SIDEBAR_PROJECT_REORDER_GAP))
+                    // Keep the boundary from the previous project's last
+                    // worktree/session row to the next project row distinct
+                    // from the tighter spacing inside one project.
+                    .gap(px(SIDEBAR_PROJECT_GROUP_GAP))
                     .track_scroll(&self.sidebar_scroll)
                     .overflow_y_scroll()
                     .vertical_scrollbar(&self.sidebar_scroll)
@@ -45037,6 +45041,26 @@ mod tests {
         assert!(source.contains("px(SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE),\n            cx,"));
         assert!(source.contains("px(SIDEBAR_LOGO_DISPLAY_SIZE),\n        Some(if active"));
         assert!(source.contains("const SIDEBAR_PROJECT_REORDER_GAP: f32 = 12.0;"));
+    }
+
+    #[test]
+    fn sidebar_keeps_project_boundaries_wider_than_project_contents() {
+        let source = include_str!("app.rs");
+        let sidebar = source
+            .split_once("    fn render_agent_sidebar(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_root_children("))
+            .map(|(body, _)| body)
+            .expect("agent sidebar renderer should remain inspectable");
+        assert!(source.contains("const SIDEBAR_PROJECT_GROUP_GAP: f32 = 12.0;"));
+        assert!(source.contains("const SIDEBAR_PROJECT_CONTENT_GAP: f32 = 4.0;"));
+        assert!(sidebar.contains(".gap(px(SIDEBAR_PROJECT_GROUP_GAP))"));
+
+        let project = source
+            .split_once("    fn render_sidebar_project(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_workspace("))
+            .map(|(body, _)| body)
+            .expect("project renderer should remain inspectable");
+        assert!(project.contains(".gap(px(SIDEBAR_PROJECT_CONTENT_GAP))"));
     }
 
     #[test]
