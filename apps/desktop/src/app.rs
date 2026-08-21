@@ -23668,6 +23668,7 @@ impl VibexWorkbench {
             .disabled(self.agent_action_pending || fixed_workspace);
         let location_control = Popover::new("new-session-workspace-mode-menu")
             .appearance(false)
+            .anchor(Anchor::BottomLeft)
             .open(self.new_session_workspace_mode_menu_open)
             .on_open_change(cx.listener(|this, open, _, cx| {
                 this.new_session_workspace_mode_menu_open = *open;
