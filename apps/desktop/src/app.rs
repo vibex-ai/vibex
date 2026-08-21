@@ -5411,13 +5411,29 @@ impl VibexWorkbench {
                             }
                             if !this.initial_new_session_panel_handled {
                                 this.initial_new_session_panel_handled = true;
-                                this.new_session_open = sessions_empty
-                                    || this.ui_state.desktop_behavior.startup_destination
-                                        == StartupDestination::NewSession;
+                                this.new_session_open = resolve_initial_new_session_open(
+                                    this.new_session_open,
+                                    sessions_empty,
+                                    this.ui_state.desktop_behavior.startup_destination,
+                                );
                                 this.initial_new_session_setup_pending =
                                     this.new_session_open && !this.new_session_draft_initialized;
                             }
-                            if let Some(session_id) = preferred {
+                            if this.new_session_open {
+                                // The overview may finish after the user has opened the
+                                // New Session home. Reconcile its data, but never let the
+                                // background refresh navigate away from that explicit view.
+                                if preferred.is_none() {
+                                    this.selected_session_id = None;
+                                    this.timeline = TimelineModel::default();
+                                    this.timeline_row_sizes = Rc::new(Vec::new());
+                                    this.invalidate_timeline_render_caches();
+                                    this.runtime_selection = None;
+                                    this.token_usage = None;
+                                }
+                                this.agent_loading = false;
+                                this.finish_startup_loading(cx);
+                            } else if let Some(session_id) = preferred {
                                 this.select_session_with_history(session_id, false, cx);
                             } else {
                                 this.selected_session_id = None;
@@ -40480,6 +40496,14 @@ fn selected_shell_index(choices: &[ShellChoice], selected: &Option<String>) -> O
         .map(|row| IndexPath::default().row(row))
 }
 
+fn resolve_initial_new_session_open(
+    currently_open: bool,
+    sessions_empty: bool,
+    startup_destination: StartupDestination,
+) -> bool {
+    currently_open || sessions_empty || startup_destination == StartupDestination::NewSession
+}
+
 fn shortcut_is_valid(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 80
@@ -46913,6 +46937,51 @@ mod tests {
             .find("this.open_new_session(None, window, cx);")
             .expect("startup should reuse the normal New Session flow");
         assert!(pending < open);
+    }
+
+    #[test]
+    fn overview_refresh_preserves_an_explicit_new_session_navigation() {
+        assert!(resolve_initial_new_session_open(
+            true,
+            false,
+            StartupDestination::RestoreWorkbench,
+        ));
+        assert!(resolve_initial_new_session_open(
+            false,
+            true,
+            StartupDestination::RestoreWorkbench,
+        ));
+        assert!(resolve_initial_new_session_open(
+            false,
+            false,
+            StartupDestination::NewSession,
+        ));
+        assert!(!resolve_initial_new_session_open(
+            false,
+            false,
+            StartupDestination::RestoreWorkbench,
+        ));
+
+        let source = include_str!("app.rs");
+        let overview = source
+            .split_once("    fn load_agent_overview(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    pub(crate) fn refresh_workspace_contexts(")
+            })
+            .map(|(body, _)| body)
+            .expect("agent overview should remain inspectable");
+        let initial_state = overview
+            .find("this.new_session_open = resolve_initial_new_session_open(")
+            .expect("initial new-session state should preserve explicit navigation");
+        let guarded_selection = overview
+            .find("if this.new_session_open {")
+            .expect("overview selection should be fenced by the new-session home");
+        let session_selection = overview
+            .find("this.select_session_with_history(session_id, false, cx);")
+            .expect("overview should still select a session when the home is closed");
+        assert!(initial_state < guarded_selection);
+        assert!(guarded_selection < session_selection);
+        assert!(overview.contains("this.finish_startup_loading(cx);"));
     }
 
     #[test]
