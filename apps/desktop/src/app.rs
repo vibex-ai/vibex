@@ -41101,6 +41101,7 @@ impl FoundationSettings {
                     .text_color(muted_foreground),
             );
         let search_results = self.render_search_results(strings, cx);
+        let has_search_results = search_results.is_some();
 
         if !wide {
             return v_flex()
@@ -41108,7 +41109,9 @@ impl FoundationSettings {
                 .gap_2()
                 .child(search)
                 .when_some(search_results, |this, results| this.child(results))
-                .child(div().flex().flex_wrap().gap_1().children(buttons))
+                .when(!has_search_results, |this| {
+                    this.child(div().flex().flex_wrap().gap_1().children(buttons))
+                })
                 .into_any_element();
         }
 
@@ -41123,20 +41126,8 @@ impl FoundationSettings {
                 .text_color(muted_foreground.opacity(0.72))
                 .child(label)
         };
-
-        v_flex()
-            .w(px(SETTINGS_NAVIGATION_WIDTH))
-            .h_full()
-            .flex_none()
-            .overflow_y_scrollbar()
+        let navigation_groups = v_flex()
             .gap_2()
-            .px_4()
-            .pt_3()
-            .border_r_1()
-            .border_color(border.opacity(0.72))
-            .bg(theme::semantic_color("sidebar", is_dark))
-            .child(search)
-            .when_some(search_results, |this, results| this.child(results))
             .child(
                 v_flex()
                     .gap(px(SETTINGS_NAVIGATION_SECTION_GAP))
@@ -41154,7 +41145,22 @@ impl FoundationSettings {
                     .gap(px(SETTINGS_NAVIGATION_SECTION_GAP))
                     .child(group_label(locale::text("SUPPORT", "支持", "支援")))
                     .children(support),
-            )
+            );
+
+        v_flex()
+            .w(px(SETTINGS_NAVIGATION_WIDTH))
+            .h_full()
+            .flex_none()
+            .overflow_y_scrollbar()
+            .gap_2()
+            .px_4()
+            .pt_3()
+            .border_r_1()
+            .border_color(border.opacity(0.72))
+            .bg(theme::semantic_color("sidebar", is_dark))
+            .child(search)
+            .when_some(search_results, |this, results| this.child(results))
+            .when(!has_search_results, |this| this.child(navigation_groups))
             .into_any_element()
     }
 
@@ -51120,6 +51126,9 @@ mod tests {
         assert!(navigation.contains("IconName::Palette"));
         assert!(navigation.contains("IconName::SquareTerminal"));
         assert!(navigation.contains("IconName::HardDrive"));
+        assert!(navigation.contains("let has_search_results = search_results.is_some()"));
+        assert!(navigation.contains("let navigation_groups = v_flex()"));
+        assert!(navigation.contains(".when(!has_search_results"));
         assert!(navigation.contains("\"偏好设置\""));
         assert!(navigation.contains("\"工作流\""));
         assert!(navigation.contains("\"支持\""));
