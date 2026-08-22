@@ -2235,7 +2235,7 @@ impl CodeWorkbench {
         self.git
             .branches
             .as_ref()
-            .map(|branches| git_sync_counts(branches).1)
+            .map(|branches| git_sync_counts(&branches.branches).1)
             .unwrap_or_default()
     }
 
