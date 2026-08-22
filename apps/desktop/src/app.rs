@@ -7202,11 +7202,6 @@ impl VibexWorkbench {
             .contains(&workspace_id);
         self.activate_workspace(workspace, cx);
         if was_collapsed {
-            self.ui_state
-                .sidebar
-                .collapsed_workspace_ids
-                .remove(&workspace_id);
-        } else {
             for (_, candidate) in &self.workspaces {
                 if candidate.project_id == project_id {
                     self.ui_state
@@ -7219,6 +7214,11 @@ impl VibexWorkbench {
                 .sidebar
                 .collapsed_workspace_ids
                 .remove(&workspace_id);
+        } else {
+            self.ui_state
+                .sidebar
+                .collapsed_workspace_ids
+                .insert(workspace_id);
         }
         self.queue_ui_state();
         cx.notify();
@@ -21019,6 +21019,9 @@ impl VibexWorkbench {
             .cursor_pointer()
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
             .rounded(px(8.0))
+            .when(collapsed, |this| {
+                this.border_1().border_color(cx.theme().transparent)
+            })
             .tooltip(move |window, cx| Tooltip::new(tooltip_branch.clone()).build(window, cx))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.activate_and_toggle_sidebar_workspace(workspace_for_click.clone(), cx)
@@ -21142,7 +21145,6 @@ impl VibexWorkbench {
             .bg(card_background)
             .border_1()
             .border_color(card_border_color)
-            .pt(px(4.0))
             .pr(px(4.0))
             .pb(px(4.0))
             .child(row)
@@ -45552,6 +45554,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("workspace toggle should remain inspectable");
         assert!(workspace_toggle.contains("let was_collapsed = self"));
+        assert!(workspace_toggle.contains("if was_collapsed {"));
         assert!(workspace_toggle.contains("for (_, candidate) in &self.workspaces"));
         assert!(workspace_toggle.contains("candidate.project_id == project_id"));
         assert!(
@@ -49147,7 +49150,9 @@ mod tests {
         assert!(workspace.contains(".h(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))"));
         assert!(workspace.contains(".pl_0()"));
         assert!(workspace.contains(".pl(px(SIDEBAR_WORKSPACE_SESSION_INDENT))"));
-        assert!(workspace.contains(".pt(px(4.0))"));
+        assert!(workspace.contains(".when(collapsed, |this|"));
+        assert!(workspace.contains("this.border_1().border_color(cx.theme().transparent)"));
+        assert!(!workspace.contains(".pt(px(4.0))"));
         assert!(!workspace.contains(".ml(px(18.0))"));
         assert!(!workspace.contains(".border_l_1()"));
 
