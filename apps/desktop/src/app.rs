@@ -16801,6 +16801,25 @@ impl VibexWorkbench {
         });
     }
 
+    fn archive_session(&mut self, session_id: VibexSessionId, cx: &mut Context<Self>) {
+        if self.agent_action_pending
+            || self
+                .pending_session_deletion_ids
+                .contains(session_id.as_str())
+        {
+            return;
+        }
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        self.agent_action_pending = true;
+        let generation = self.session_generation;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            runtime.agent().manager().archive_session(&session_id).await
+        });
+        self.finish_session_mutation(generation, runner, cx);
+    }
+
     fn delete_session(&mut self, session_id: VibexSessionId, cx: &mut Context<Self>) {
         if self
             .pending_session_deletion_ids
@@ -19485,35 +19504,96 @@ impl VibexWorkbench {
 
     fn render_title_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let strings = self.strings();
-        let selected_context = self.selected_session().and_then(|session| {
+        let selected_session = self.selected_session().cloned();
+        let selected_context = selected_session.as_ref().and_then(|session| {
             self.workspace_contexts
                 .get(session.workspace_id.as_str())
                 .cloned()
         });
-        let workspace_tooltip = selected_context
+        let session_title = selected_session
             .as_ref()
-            .map(|context| context.workspace_root.clone());
-        let workspace_label = selected_context
-            .as_ref()
-            .map(|context| {
+            .map(|session| session.title.clone())
+            .unwrap_or_else(|| strings.agent_select_session.to_string());
+        let (workspace_project_label, workspace_branch_label, workspace_tooltip) =
+            if let Some(context) = selected_context.as_ref() {
                 let branch = context
                     .branch
                     .as_deref()
-                    .unwrap_or_else(|| locale::text("No branch", "无分支", "無分支"));
-                let identity = match context.workspace_mode {
+                    .map(sidebar_workspace_branch_name)
+                    .unwrap_or_else(|| locale::text("No branch", "无分支", "無分支"))
+                    .to_string();
+                let workspace_name = if context.workspace_mode == WorkspaceMode::VibexWorktree {
+                    self.ui_state
+                        .sidebar
+                        .worktree_titles
+                        .get(context.workspace_id.as_str())
+                        .cloned()
+                        .unwrap_or_else(|| branch.clone())
+                } else {
+                    branch.clone()
+                };
+                let mode = match context.workspace_mode {
                     WorkspaceMode::CurrentCheckout => {
                         locale::text("Current Checkout", "当前目录", "目前目錄")
                     }
                     WorkspaceMode::VibexWorktree => "Worktree",
                 };
-                format!("{} · {branch} · {identity}", context.project_name)
-            })
-            .or_else(|| {
-                self.selected_session()
-                    .map(|session| workspace_display_name(&session.workspace_root))
-            })
-            .unwrap_or_else(|| strings.no_workspace.to_string());
-        let workspace_tooltip = workspace_tooltip.unwrap_or_else(|| workspace_label.clone());
+                (
+                    context.project_name.clone(),
+                    Some(workspace_name.clone()),
+                    format!(
+                        "{} · {mode} · {}",
+                        context.workspace_root, context.project_name
+                    ),
+                )
+            } else if let Some(session) = selected_session.as_ref() {
+                let workspace_name = workspace_display_name(&session.workspace_root);
+                (workspace_name.clone(), None, session.workspace_root.clone())
+            } else {
+                (
+                    strings.no_workspace.to_string(),
+                    None,
+                    strings.no_workspace.to_string(),
+                )
+            };
+        let title_session_menu = selected_session.as_ref().map(|session| {
+            let entity = cx.weak_entity();
+            let session_id = session.id.clone();
+            let session_title = session.title.clone();
+            let pinned = self.sidebar_state.pinned_ids.contains(session.id.as_str());
+            let archived = session.archived_at_ms.is_some();
+            let deletion_pending = self
+                .pending_session_deletion_ids
+                .contains(session.id.as_str());
+            div()
+                .id("title-session-actions")
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    Button::new("title-session-menu")
+                        .small()
+                        .ghost()
+                        .compact()
+                        .size(px(24.0))
+                        .px_0()
+                        .tooltip(locale::text("Session actions", "会话操作", "會話操作"))
+                        .icon(IconName::Ellipsis)
+                        .dropdown_menu(move |menu, _, menu_cx| {
+                            Self::build_title_session_menu(
+                                menu,
+                                session_id.clone(),
+                                session_title.clone(),
+                                pinned,
+                                archived,
+                                deletion_pending,
+                                strings,
+                                entity.clone(),
+                                menu_cx,
+                            )
+                        })
+                        .anchor(Anchor::TopRight),
+                )
+                .into_any_element()
+        });
         let sidebar_selected = if self.last_visibility.sidebar_docked {
             self.ui_state.workbench.sidebar_visible
         } else {
@@ -19533,7 +19613,7 @@ impl VibexWorkbench {
         } else {
             strings.expand_sidebar
         };
-        let sidebar_icon = if sidebar_selected {
+        let sidebar_toggle_icon = if sidebar_selected {
             IconName::PanelLeftClose
         } else {
             IconName::PanelLeftOpen
@@ -19569,8 +19649,8 @@ impl VibexWorkbench {
             .overflow_hidden()
             .border_b_1()
             .border_color(cx.theme().border)
-            .bg(cx.theme().sidebar)
-            .text_color(cx.theme().sidebar_foreground)
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
             .when(is_linux, |this| {
                 this.on_double_click(|_, window, _| window.zoom_window())
             })
@@ -19645,7 +19725,10 @@ impl VibexWorkbench {
                                                     .size(px(32.0))
                                                     .px_0()
                                                     .tooltip(sidebar_tooltip)
-                                                    .child(Icon::new(sidebar_icon).size(px(18.0)))
+                                                    .child(
+                                                        Icon::new(sidebar_toggle_icon)
+                                                            .size(px(18.0)),
+                                                    )
                                                     .on_click(cx.listener(|this, _, _, cx| {
                                                         this.toggle_sidebar(cx)
                                                     })),
@@ -19680,26 +19763,59 @@ impl VibexWorkbench {
                                             })),
                                     ),
                             )
-                            .child(div().h_full().min_w_0().flex_1()),
-                    )
-                    .child(
-                        h_flex()
-                            .h_full()
-                            .min_w_0()
-                            .flex_1()
-                            .items_center()
-                            .px_4()
                             .child(
-                                div()
-                                    .id("title-workspace-context")
+                                v_flex()
+                                    .h_full()
                                     .min_w_0()
-                                    .truncate()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .tooltip(move |window, cx| {
-                                        Tooltip::new(workspace_tooltip.clone()).build(window, cx)
-                                    })
-                                    .child(workspace_label),
+                                    .flex_1()
+                                    .justify_center()
+                                    .gap(px(1.0))
+                                    .px_3()
+                                    .child(
+                                        h_flex()
+                                            .min_w_0()
+                                            .items_center()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .id("title-session-title")
+                                                    .min_w_0()
+                                                    .flex_1()
+                                                    .truncate()
+                                                    .text_sm()
+                                                    .font_medium()
+                                                    .child(session_title),
+                                            )
+                                            .when_some(title_session_menu, |this, menu| {
+                                                this.child(menu)
+                                            }),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .id("title-workspace-context")
+                                            .min_w_0()
+                                            .items_center()
+                                            .gap_1()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(
+                                                div()
+                                                    .min_w_0()
+                                                    .truncate()
+                                                    .child(workspace_project_label),
+                                            )
+                                            .when_some(workspace_branch_label, |this, branch| {
+                                                this.child(
+                                                    sidebar_icon("icons/vibex/git-branch.svg")
+                                                        .size(px(12.0)),
+                                                )
+                                                .child(div().min_w_0().truncate().child(branch))
+                                            })
+                                            .tooltip(move |window, cx| {
+                                                Tooltip::new(workspace_tooltip.clone())
+                                                    .build(window, cx)
+                                            }),
+                                    ),
                             ),
                     )
                     .child(
@@ -19795,6 +19911,85 @@ impl VibexWorkbench {
                 this.child(workbench_window_controls(wide_window_controls, cx))
             })
             .into_any_element()
+    }
+
+    fn build_title_session_menu(
+        menu: PopupMenu,
+        session_id: VibexSessionId,
+        session_title: String,
+        pinned: bool,
+        archived: bool,
+        deletion_pending: bool,
+        strings: Strings,
+        entity: WeakEntity<Self>,
+        _cx: &mut Context<PopupMenu>,
+    ) -> PopupMenu {
+        let rename_entity = entity.clone();
+        let copy_session_id = session_id.as_str().to_string();
+        let pin_entity = entity.clone();
+        let archive_entity = entity.clone();
+        let delete_entity = entity;
+        let rename_id = session_id.clone();
+        let pin_id = session_id.clone();
+        let archive_id = session_id.clone();
+        let delete_id = session_id;
+        let delete_label = strings.sidebar_delete;
+        let pin_label = if pinned {
+            strings.sidebar_unpin
+        } else {
+            strings.sidebar_pin
+        };
+
+        menu.item(PopupMenuItem::label(session_title))
+            .separator()
+            .item(
+                PopupMenuItem::new(strings.sidebar_rename)
+                    .icon(sidebar_icon("icons/vibex/pencil.svg"))
+                    .on_click(move |_, window, cx| {
+                        let _ = rename_entity.update(cx, |this, cx| {
+                            this.begin_sidebar_rename(rename_id.clone(), window, cx)
+                        });
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(locale::text(
+                    "Copy Session ID",
+                    "复制会话 ID",
+                    "複製會話 ID",
+                ))
+                .icon(IconName::Copy)
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy_session_id.clone()));
+                }),
+            )
+            .item(
+                PopupMenuItem::new(pin_label)
+                    .icon(sidebar_icon("icons/vibex/pin.svg"))
+                    .on_click(move |_, _, cx| {
+                        let _ =
+                            pin_entity.update(cx, |this, cx| this.toggle_session_pin(&pin_id, cx));
+                    }),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new(locale::text("Archive", "归档", "封存"))
+                    .icon(sidebar_icon("icons/vibex/file-archive.svg"))
+                    .disabled(archived)
+                    .on_click(move |_, _, cx| {
+                        let _ = archive_entity
+                            .update(cx, |this, cx| this.archive_session(archive_id.clone(), cx));
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(delete_label)
+                    .icon(sidebar_icon("icons/vibex/trash-2.svg"))
+                    .disabled(deletion_pending)
+                    .on_click(move |_, window, cx| {
+                        let _ = delete_entity.update(cx, |this, cx| {
+                            this.confirm_delete_session(delete_id.clone(), window, cx)
+                        });
+                    }),
+            )
     }
 
     fn render_agent_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -38364,7 +38559,7 @@ fn workbench_window_controls(wide: bool, cx: &App) -> AnyElement {
     } else {
         TITLE_BAR_NARROW_WINDOW_CONTROL_WIDTH
     };
-    let foreground = cx.theme().sidebar_foreground.opacity(0.7);
+    let foreground = cx.theme().foreground.opacity(0.7);
     let hover_background = cx.theme().sidebar_accent;
     let hover_foreground = cx.theme().sidebar_accent_foreground;
     let active_background = cx.theme().sidebar_accent.opacity(0.8);
@@ -38378,7 +38573,7 @@ fn workbench_window_controls(wide: bool, cx: &App) -> AnyElement {
         .items_stretch()
         .border_l_1()
         .border_color(cx.theme().border)
-        .bg(cx.theme().sidebar)
+        .bg(cx.theme().background)
         .child(
             div()
                 .id("window-minimize")
@@ -52001,6 +52196,31 @@ mod tests {
 
         assert!(content < drag);
         assert!(drag < controls);
+    }
+
+    #[test]
+    fn title_bar_presents_session_context_and_actions() {
+        let source = include_str!("app.rs");
+        let title_bar = source
+            .split_once("    fn render_title_bar(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn build_title_session_menu("))
+            .map(|(body, _)| body)
+            .expect("title bar should remain inspectable");
+        assert!(title_bar.contains(".bg(cx.theme().background)"));
+        assert!(title_bar.contains("title-session-title"));
+        assert!(title_bar.contains("title-session-menu"));
+        assert!(title_bar.contains("title-workspace-context"));
+        assert!(title_bar.contains("worktree_titles"));
+        assert!(title_bar.contains("icons/vibex/git-branch.svg"));
+
+        let menu = source
+            .split_once("    fn build_title_session_menu(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_agent_sidebar("))
+            .map(|(body, _)| body)
+            .expect("title session menu should remain inspectable");
+        assert!(menu.contains("Copy Session ID"));
+        assert!(menu.contains("this.archive_session"));
+        assert!(menu.contains("this.confirm_delete_session"));
     }
 
     #[test]
