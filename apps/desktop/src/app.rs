@@ -325,7 +325,8 @@ const COMPOSER_PLAN_TOOLTIP_MAX_HEIGHT: f32 = 420.0;
 const COMPOSER_PLAN_EXPANDED_MAX_HEIGHT: f32 = 320.0;
 const COMPOSER_PLAN_TOOLTIP_DELAY: Duration = Duration::from_secs(2);
 const COMPOSER_SURFACE_MIN_HEIGHT: f32 = 112.0;
-const ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT: f32 = 64.0;
+const ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT: f32 = COMPOSER_SURFACE_MIN_HEIGHT + 24.0;
+const ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT: f32 = 80.0;
 const COMPOSER_SURFACE_RADIUS: f32 = 20.0;
 const COMPOSER_RUNTIME_MENU_WIDTH: f32 = 320.0;
 const COMPOSER_RUNTIME_MENU_MAX_HEIGHT: f32 = 448.0;
@@ -33018,7 +33019,7 @@ impl VibexWorkbench {
                         v_flex()
                             .w_full()
                             .min_w_0()
-                            .min_h(px(COMPOSER_SURFACE_MIN_HEIGHT))
+                            .min_h(px(ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT))
                             .when(self.composer_expanded, |this| {
                                 this.flex_1().min_h(px(240.0))
                             })
@@ -48911,7 +48912,8 @@ mod tests {
             728.0
         );
         assert_eq!(COMPOSER_SURFACE_MIN_HEIGHT, 112.0);
-        assert_eq!(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT, 64.0);
+        assert_eq!(ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT, 136.0);
+        assert_eq!(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT, 80.0);
         assert_eq!(COMPOSER_QUEUE_HEADER_HEIGHT, 36.0);
         assert_eq!(COMPOSER_QUEUE_ROW_HEIGHT, 28.0);
         assert_eq!(COMPOSER_SURFACE_RADIUS, 20.0);
@@ -48936,6 +48938,7 @@ mod tests {
         assert!(composer.contains("toggle-composer-expanded"));
         assert!(composer.contains("this.flex_1().min_h(px(240.0))"));
         assert!(composer.contains("this.flex_1().min_h_0()"));
+        assert!(composer.contains("ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT"));
         assert!(composer.contains("ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT"));
         assert!(composer.contains(".h(px(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT))"));
         assert!(composer.contains(".when(self.composer_expanded, |this| this.pt_4())"));
