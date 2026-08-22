@@ -1538,7 +1538,7 @@ fn right_rail_activity_button(id: impl Into<ElementId>, icon: Icon) -> Button {
 }
 
 fn git_pending_commit_count(status: Option<&GitStatusSummary>) -> u32 {
-    status.map_or(0, |status| status.staged_count)
+    status.map_or(0, |status| status.changes.len() as u32)
 }
 
 fn git_activity_badge(count: u32, cx: &Context<VibexWorkbench>) -> AnyElement {
