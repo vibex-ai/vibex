@@ -20961,7 +20961,7 @@ impl VibexWorkbench {
         let card_background = if !collapsed {
             cx.theme()
                 .sidebar_accent
-                .opacity(if selected { 0.22 } else { 0.14 })
+                .opacity(if selected { 0.30 } else { 0.18 })
         } else {
             cx.theme().transparent
         };
@@ -49129,7 +49129,7 @@ mod tests {
         assert!(collapsed_guard < session_render);
         assert!(workspace.contains("return row.into_any_element();"));
         assert!(workspace.contains("let card_background = if !collapsed"));
-        assert!(workspace.contains(".opacity(if selected { 0.22 } else { 0.14 })"));
+        assert!(workspace.contains(".opacity(if selected { 0.30 } else { 0.18 })"));
         assert!(workspace.contains("let row_background = if collapsed && selected"));
         assert!(workspace.contains(".bg(row_background)"));
         assert!(workspace.contains(".bg(card_background)"));
