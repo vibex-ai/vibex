@@ -19205,6 +19205,15 @@ impl VibexWorkbench {
         let hierarchy_entity = entity.clone();
         let batch_entity = entity.clone();
         let import_entity = entity;
+        let hierarchy_label = if state.hierarchy_mode == SidebarHierarchyMode::Detailed {
+            locale::text("Switch to session view", "切换为会话视图", "切換為會話視圖")
+        } else {
+            locale::text(
+                "Switch to workspace view",
+                "切换为工作区视图",
+                "切換為工作區視圖",
+            )
+        };
 
         menu.item(
             PopupMenuItem::new(locale::text("New Folder", "新建文件夹", "新建資料夾"))
@@ -19217,17 +19226,12 @@ impl VibexWorkbench {
                 }),
         )
         .item(
-            PopupMenuItem::new(locale::text(
-                "Detailed workspace hierarchy",
-                "详细工作区层级",
-                "詳細工作區層級",
-            ))
-            .icon(IconName::Folder)
-            .checked(state.hierarchy_mode == SidebarHierarchyMode::Detailed)
-            .on_click(move |_, _, cx| {
-                let _ =
-                    hierarchy_entity.update(cx, |this, cx| this.toggle_sidebar_hierarchy_mode(cx));
-            }),
+            PopupMenuItem::new(hierarchy_label)
+                .icon(IconName::Folder)
+                .on_click(move |_, _, cx| {
+                    let _ = hierarchy_entity
+                        .update(cx, |this, cx| this.toggle_sidebar_hierarchy_mode(cx));
+                }),
         )
         .item(
             PopupMenuItem::new(if state.batch_mode {
@@ -48514,7 +48518,8 @@ mod tests {
             .map(|(body, _)| body)
             .expect("sidebar toolbar more menu should remain inspectable");
         assert!(more_menu.contains("New Folder"));
-        assert!(more_menu.contains("Detailed workspace hierarchy"));
+        assert!(more_menu.contains("Switch to workspace view"));
+        assert!(more_menu.contains("Switch to session view"));
         assert!(more_menu.contains("state.strings.sidebar_batch"));
         assert!(more_menu.contains("state.strings.sidebar_import_sessions"));
 
@@ -49361,7 +49366,13 @@ mod tests {
             .map(|(body, _)| body)
             .expect("sidebar hierarchy should remain inspectable");
         assert!(sidebar.contains("sidebar-toolbar-more"));
-        assert!(sidebar.contains("Detailed workspace hierarchy"));
+        let toolbar_menu = source
+            .split_once("    fn build_sidebar_toolbar_more_menu(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn build_sidebar_project_menu("))
+            .map(|(body, _)| body)
+            .expect("sidebar toolbar menu should remain inspectable");
+        assert!(toolbar_menu.contains("Switch to workspace view"));
+        assert!(toolbar_menu.contains("Switch to session view"));
         assert!(sidebar.contains("toggle_sidebar_hierarchy_mode"));
         assert!(source.contains("SidebarHierarchyMode::Compact"));
         assert!(sidebar.contains("SidebarHierarchyMode::Detailed"));
