@@ -994,6 +994,16 @@ const ERROR_MESSAGES: &[MessageTranslation] = &[
         zh_tw: "請檢查所選 Agent 設定和模型，然後重試。",
     },
     MessageTranslation {
+        en: "Vibex could not reserve local runtime state because the database stayed busy.",
+        zh_cn: "Vibex 无法锁定本地运行时状态，因为数据库持续繁忙。",
+        zh_tw: "Vibex 無法鎖定本機執行環境狀態，因為資料庫持續忙碌。",
+    },
+    MessageTranslation {
+        en: "Retry initialization shortly; no Agent work was started.",
+        zh_cn: "请稍后重试初始化；Agent 尚未开始工作。",
+        zh_tw: "請稍後重試初始化；Agent 尚未開始工作。",
+    },
+    MessageTranslation {
         en: "The selected Agent runtime could not be activated; the previous runtime remains available.",
         zh_cn: "无法激活所选 Agent 运行时；之前的运行时仍可使用。",
         zh_tw: "無法啟用所選 Agent 執行環境；先前的執行環境仍可使用。",

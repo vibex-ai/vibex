@@ -829,6 +829,10 @@ fn actionable_error_for_code(code: &str) -> VibexResult<RuntimeSelectionActionab
             "The selected Agent runtime configuration is unavailable.",
             "Review the selected Agent profile and model, then retry.",
         ),
+        "runtime_switch_claim_retry_exhausted" => (
+            "Vibex could not reserve local runtime state because the database stayed busy.",
+            "Retry initialization shortly; no Agent work was started.",
+        ),
         _ => (
             "The selected Agent runtime could not be activated; the previous runtime remains available.",
             "Review the selected runtime configuration and retry.",
@@ -1477,6 +1481,18 @@ mod tests {
         assert!(error.message.contains("did not finish"));
         assert!(env.gate.cancel_calls().is_empty());
         assert_eq!(env.gate.prompt_gate_events().last(), Some(&false));
+    }
+
+    #[test]
+    fn busy_claim_failure_has_a_storage_recovery_message() {
+        let error = actionable_error_for_code("runtime_switch_claim_retry_exhausted").unwrap();
+        assert!(error.message.contains("database stayed busy"));
+        assert!(
+            error
+                .recovery_hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("no Agent work was started"))
+        );
     }
 
     #[tokio::test]

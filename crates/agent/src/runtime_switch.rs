@@ -524,6 +524,8 @@ const ACTIVE_WORK_KINDS: [ActiveWorkKind; 4] = [
     ActiveWorkKind::BackgroundWork,
 ];
 
+const REQUESTED_CLAIM_RETRY_LIMIT: usize = 4;
+
 impl RuntimeSwitchCoordinator {
     pub fn new(
         db_path: impl Into<PathBuf>,
@@ -959,10 +961,7 @@ impl RuntimeSwitchCoordinator {
             let intent = SwitchIntent::from_record(&record)?;
             match record.status {
                 RuntimeSwitchStatus::Requested => {
-                    let outcome = {
-                        let mut conn = self.open_connection()?;
-                        RuntimeSwitchRepository::claim_requested(&mut conn, switch_id)?
-                    };
+                    let outcome = self.claim_requested_with_retry(switch_id).await?;
                     match outcome {
                         RequestedSwitchClaimOutcome::Claimed => {}
                         RequestedSwitchClaimOutcome::WaitingForPending => {
@@ -1001,6 +1000,40 @@ impl RuntimeSwitchCoordinator {
                 | RuntimeSwitchStatus::Cancelled
                 | RuntimeSwitchStatus::Superseded
                 | RuntimeSwitchStatus::AmbiguousExternalEffect => unreachable!(),
+            }
+        }
+    }
+
+    async fn claim_requested_with_retry(
+        &self,
+        switch_id: &RuntimeSwitchId,
+    ) -> VibexResult<RequestedSwitchClaimOutcome> {
+        let mut retries = 0;
+        loop {
+            let result = {
+                let mut conn = self.open_connection()?;
+                RuntimeSwitchRepository::claim_requested(&mut conn, switch_id)
+            };
+            match result {
+                Ok(outcome) => return Ok(outcome),
+                Err(error)
+                    if is_retryable_requested_claim_error(&error)
+                        && retries < REQUESTED_CLAIM_RETRY_LIMIT =>
+                {
+                    retries += 1;
+                    sleep(self.inner.config.idle_poll_interval).await;
+                }
+                Err(error) if is_retryable_requested_claim_error(&error) => {
+                    let last_error_code = error.code.clone();
+                    return Err(VibexError::storage(
+                        "runtime_switch_claim_retry_exhausted",
+                        "local runtime state remained busy while initializing the Agent",
+                    )
+                    .with_recovery_hint("Retry initialization shortly.")
+                    .with_diagnostic("lastErrorCode", last_error_code)
+                    .with_diagnostic("retryCount", retries.to_string()));
+                }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -2266,6 +2299,24 @@ fn busy_error_code(kind: ActiveWorkKind) -> &'static str {
         ActiveWorkKind::ActiveTerminal => "runtime_switch_busy_active_terminal",
         ActiveWorkKind::BackgroundWork => "runtime_switch_busy_background_work",
     }
+}
+
+fn is_retryable_requested_claim_error(error: &VibexError) -> bool {
+    if !matches!(
+        error.code.as_str(),
+        "runtime_switch_requested_claim_failed"
+            | "runtime_switch_requested_claim_transaction_failed"
+    ) {
+        return false;
+    }
+    error.diagnostics.iter().any(|diagnostic| {
+        let value = diagnostic.value.to_ascii_lowercase();
+        value.contains("database is locked")
+            || value.contains("database table is locked")
+            || value.contains("database schema is locked")
+            || value.contains("database busy")
+            || value.contains("sqlite_busy")
+    })
 }
 
 fn cancel_operation_kind(kind: ActiveWorkKind) -> &'static str {
@@ -4328,5 +4379,28 @@ mod tests {
             0
         );
         assert!(!calls.iter().any(|call| call == "cleanup_source"));
+    }
+
+    #[test]
+    fn only_transient_sqlite_claim_errors_are_retryable() {
+        let locked = VibexError::storage(
+            "runtime_switch_requested_claim_failed",
+            "failed to claim session pending slot",
+        )
+        .with_diagnostic("error", "database is locked");
+        assert!(is_retryable_requested_claim_error(&locked));
+
+        let schema_error = VibexError::storage(
+            "runtime_switch_requested_claim_failed",
+            "failed to claim session pending slot",
+        )
+        .with_diagnostic("error", "no such column: pending_switch_id");
+        assert!(!is_retryable_requested_claim_error(&schema_error));
+
+        let conflict = VibexError::conflict(
+            "runtime_switch_requested_claim_conflict",
+            "requested runtime switch changed while claiming",
+        );
+        assert!(!is_retryable_requested_claim_error(&conflict));
     }
 }

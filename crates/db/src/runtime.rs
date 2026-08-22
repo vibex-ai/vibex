@@ -1975,10 +1975,15 @@ impl RuntimeSwitchRepository {
         conn: &mut Connection,
         switch_id: &RuntimeSwitchId,
     ) -> VibexResult<RequestedSwitchClaimOutcome> {
-        let tx = conn.transaction().map_err(storage_err(
-            "runtime_switch_requested_claim_transaction_failed",
-            "failed to start requested runtime switch claim transaction",
-        ))?;
+        // Claiming updates both the session slot and switch row. Acquire the
+        // write lock before reading so a WAL snapshot cannot become stale
+        // while this deferred transaction is upgraded to a writer.
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "runtime_switch_requested_claim_transaction_failed",
+                "failed to start requested runtime switch claim transaction",
+            ))?;
         let record = Self::get(&tx, switch_id)?.ok_or_else(|| {
             VibexError::validation("runtime_switch_not_found", "runtime switch was not found")
         })?;
