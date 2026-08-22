@@ -181,10 +181,10 @@ const TITLE_BAR_HEIGHT: f32 = 44.0;
 const TITLE_BAR_COLLAPSED_SIDEBAR_WIDTH: f32 = 112.0;
 const SIDEBAR_PROJECT_LOGO_DIRECTORY: &str = "project-icons";
 const SIDEBAR_LOGO_DISPLAY_SIZE: f32 = 14.0;
-const SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE: f32 = 20.0;
+const SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE: f32 = 24.0;
 const SIDEBAR_WORKSPACE_STATUS_TOP_OFFSET: f32 = 4.0;
 const SIDEBAR_ICON_TITLE_GAP: f32 = 4.0;
-const SIDEBAR_TOP_LEVEL_PROJECT_OFFSET: f32 = -4.0;
+const SIDEBAR_TOP_LEVEL_PROJECT_OFFSET: f32 = -12.0;
 const SIDEBAR_PROJECT_LOGO_IMAGE_SIZE: u32 = 256;
 const SIDEBAR_PROJECT_LOGO_MAX_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 const SIDEBAR_PROJECT_LOGO_MAX_SOURCE_PIXELS: u64 = 40_000_000;
@@ -45052,7 +45052,7 @@ mod tests {
         assert!(trigger.contains(".w(px(26.0))"));
         assert!(trigger.contains(".h(px(26.0))"));
         assert!(trigger.contains(".child(project_logo)"));
-        assert!(source.contains("const SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE: f32 = 20.0;"));
+        assert!(source.contains("const SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE: f32 = 24.0;"));
         assert!(source.contains("const SIDEBAR_LOGO_DISPLAY_SIZE: f32 = 14.0;"));
         assert!(source.contains("px(SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE),\n            cx,"));
         assert!(source.contains("px(SIDEBAR_LOGO_DISPLAY_SIZE),\n        Some(if active"));
@@ -45063,7 +45063,7 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n        let mut session_elements"))
             .map(|(body, _)| body)
             .expect("project row should remain inspectable");
-        assert!(source.contains("const SIDEBAR_TOP_LEVEL_PROJECT_OFFSET: f32 = -4.0;"));
+        assert!(source.contains("const SIDEBAR_TOP_LEVEL_PROJECT_OFFSET: f32 = -12.0;"));
         assert!(project_row.contains(
             ".when(depth == 0, |this| {\n                this.left(px(SIDEBAR_TOP_LEVEL_PROJECT_OFFSET))"
         ));
