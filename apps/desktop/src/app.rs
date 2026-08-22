@@ -23334,7 +23334,7 @@ impl VibexWorkbench {
             .disabled(self.agent_action_pending);
         let workspace_button = Popover::new("new-session-project-menu")
             .appearance(false)
-            .anchor(Anchor::BottomLeft)
+            .anchor(Anchor::TopLeft)
             .open(self.new_session_project_menu_mounted)
             .on_open_change(cx.listener(|this, open, window, cx| {
                 this.set_new_session_project_menu_open(*open, window, cx)
@@ -23511,7 +23511,7 @@ impl VibexWorkbench {
             );
         let base_ref_button = Popover::new("new-session-base-ref-popover")
             .appearance(false)
-            .anchor(Anchor::BottomLeft)
+            .anchor(Anchor::TopLeft)
             .open(self.new_session_base_ref_menu_open)
             .on_open_change(cx.listener(|this, open, window, cx| {
                 this.new_session_base_ref_menu_open = *open;
@@ -23834,7 +23834,7 @@ impl VibexWorkbench {
             .disabled(self.agent_action_pending || fixed_workspace);
         let location_control = Popover::new("new-session-workspace-mode-menu")
             .appearance(false)
-            .anchor(Anchor::BottomLeft)
+            .anchor(Anchor::TopLeft)
             .open(self.new_session_workspace_mode_menu_open)
             .on_open_change(cx.listener(|this, open, _, cx| {
                 this.new_session_workspace_mode_menu_open = *open;
