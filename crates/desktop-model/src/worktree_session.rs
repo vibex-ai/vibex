@@ -208,6 +208,16 @@ impl NewSessionWorkspaceState {
         true
     }
 
+    pub fn select_new_worktree(&mut self) -> bool {
+        if !self.worktree_available() {
+            return false;
+        }
+        self.fixed_workspace = None;
+        self.location = NewSessionLocation::NewWorktree;
+        self.location_touched = true;
+        true
+    }
+
     pub fn set_base_ref(&mut self, base_ref: impl Into<String>) -> bool {
         let base_ref = base_ref.into();
         if !self
@@ -1047,6 +1057,32 @@ mod tests {
         assert_eq!(state.location, NewSessionLocation::NewWorktree);
         assert!(state.set_location(NewSessionLocation::CurrentCheckout));
         assert_eq!(state.preference, NewSessionLocation::NewWorktree);
+    }
+
+    #[test]
+    fn selecting_new_worktree_releases_an_existing_workspace_selection() {
+        let project = project();
+        let checkout = workspace(&project, WorkspaceMode::CurrentCheckout, "/repo");
+        let managed = workspace(
+            &project,
+            WorkspaceMode::VibexWorktree,
+            "/repo/.worktrees/one",
+        );
+        let mut state = NewSessionWorkspaceState::default();
+        let ticket = state.select_existing_workspace(
+            &project,
+            &checkout,
+            &managed,
+            "nonce-existing",
+            "/home/vibex",
+            Some("Existing workspace"),
+        );
+        assert!(state.apply_eligibility(&ticket, eligibility(&project, "/repo", "r1")));
+        assert_eq!(state.selected_workspace(), Some(&managed));
+
+        assert!(state.select_new_worktree());
+        assert!(state.fixed_workspace.is_none());
+        assert_eq!(state.location, NewSessionLocation::NewWorktree);
     }
 
     #[test]

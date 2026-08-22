@@ -14564,13 +14564,8 @@ impl VibexWorkbench {
         self.sync_new_session_worktree_inputs(window, cx);
     }
 
-    fn set_new_session_location(
-        &mut self,
-        location: NewSessionLocation,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.new_session_workspace.set_location(location) {
+    fn select_new_session_worktree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.new_session_workspace.select_new_worktree() {
             self.new_session_error = None;
             self.sync_new_session_worktree_inputs(window, cx);
             cx.notify();
@@ -23411,23 +23406,83 @@ impl VibexWorkbench {
                 .git
                 .supports(BackendOperation::GitWorktreeCreate)
         });
-        let fixed_workspace = self.new_session_workspace.fixed_workspace.is_some();
+        let fixed_workspace_id = self
+            .new_session_workspace
+            .fixed_workspace
+            .as_ref()
+            .map(|workspace| workspace.id.clone());
         let worktree_selected = self.new_session_workspace.location
             == NewSessionLocation::NewWorktree
-            && !fixed_workspace;
+            && fixed_workspace_id.is_none();
         let worktree_ready = can_create_worktree && self.new_session_workspace.worktree_available();
+        let git_worktree_options_visible = worktree_ready;
+        let new_worktree_label = locale::text("New Worktree", "新建 Worktree", "新增 Worktree");
+        let local_location_label = locale::text("Local", "本地", "本機").to_string();
+        let active_project_workspaces = active_project_id
+            .as_ref()
+            .map(|project_id| {
+                self.workspaces
+                    .iter()
+                    .filter(|(project, _)| project.id == *project_id)
+                    .map(|(_, workspace)| workspace.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let has_managed_workspaces = active_project_workspaces
+            .iter()
+            .any(|workspace| workspace.mode == WorkspaceMode::VibexWorktree);
+        let show_location_control = git_worktree_options_visible || has_managed_workspaces;
+        let selected_workspace_id = fixed_workspace_id.clone().or_else(|| {
+            (self.new_session_workspace.location == NewSessionLocation::CurrentCheckout)
+                .then(|| self.new_session_workspace.origin_workspace_id.clone())
+                .flatten()
+        });
+        let mut workspace_options = active_project_workspaces
+            .into_iter()
+            .filter(|workspace| {
+                workspace.mode == WorkspaceMode::VibexWorktree || git_worktree_options_visible
+            })
+            .map(|workspace| {
+                let workspace_id = workspace.id.as_str().to_string();
+                let label = if workspace.mode == WorkspaceMode::CurrentCheckout {
+                    local_location_label.clone()
+                } else {
+                    self.ui_state
+                        .sidebar
+                        .worktree_titles
+                        .get(&workspace_id)
+                        .cloned()
+                        .or_else(|| {
+                            self.workspace_contexts
+                                .get(&workspace_id)
+                                .and_then(|context| context.branch.as_deref())
+                                .map(sidebar_workspace_branch_name)
+                                .map(str::to_string)
+                        })
+                        .or_else(|| {
+                            Path::new(&workspace.root_path)
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .filter(|name| !name.is_empty())
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_else(|| workspace.root_path.clone())
+                };
+                (workspace, workspace_id, label)
+            })
+            .collect::<Vec<_>>();
+        workspace_options.sort_by_key(|(workspace, _, label)| {
+            (
+                workspace.mode != WorkspaceMode::CurrentCheckout,
+                label.to_lowercase(),
+            )
+        });
         let worktree_reason = new_session_worktree_unavailable_reason(
             self.resolved_locale(),
             &self.new_session_workspace,
             self.new_session_eligibility_error.as_deref(),
             can_create_worktree,
         );
-        let local_location_label = if fixed_workspace {
-            locale::text("This Workspace", "此工作区", "此工作區")
-        } else {
-            locale::text("Local", "本地", "本機")
-        };
-        let new_worktree_label = locale::text("New Worktree", "新建 Worktree", "新增 Worktree");
 
         let selected_base_ref = self.new_session_workspace.base_ref.clone();
         let base_ref_options = self
@@ -23765,42 +23820,58 @@ impl VibexWorkbench {
                             })),
                     ),
             );
-        let local_location_entity = cx.weak_entity();
-        let local_location_button = Button::new("new-session-location-current")
-            .small()
-            .ghost()
-            .w_full()
-            .h(px(32.0))
-            .px_2()
-            .selected(!worktree_selected)
-            .rounded(gpui_component::button::ButtonRounded::Size(px(7.0)))
-            .text_color(popover_foreground)
-            .child(
-                h_flex()
-                    .w_full()
-                    .justify_between()
-                    .gap_2()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(Icon::new(IconName::Folder).size(px(14.0)))
-                            .child(local_location_label),
-                    )
-                    .when(!worktree_selected, |this| {
-                        this.child(Icon::new(IconName::Check).size(px(14.0)))
-                    }),
-            )
-            .disabled(self.agent_action_pending || fixed_workspace)
-            .on_click(move |_, window, cx| {
-                let _ = local_location_entity.update(cx, |this, cx| {
-                    this.set_new_session_location(NewSessionLocation::CurrentCheckout, window, cx);
-                    this.new_session_workspace_mode_menu_open = false;
-                    this.new_session_input
-                        .update(cx, |input, cx| input.focus(window, cx));
-                });
-            });
-        let worktree_location_entity = cx.weak_entity();
-        let worktree_location_button = Button::new("new-session-location-worktree")
+        let workspace_rows =
+            workspace_options
+                .iter()
+                .map(|(workspace, workspace_id, workspace_label)| {
+                    let selected = selected_workspace_id
+                        .as_ref()
+                        .is_some_and(|id| id.as_str() == workspace_id);
+                    let workspace_id_for_click = workspace.id.clone();
+                    let icon = if workspace.mode == WorkspaceMode::VibexWorktree {
+                        sidebar_icon("icons/vibex/git-branch.svg")
+                            .size(px(14.0))
+                            .into_any_element()
+                    } else {
+                        Icon::new(IconName::Folder)
+                            .size(px(14.0))
+                            .into_any_element()
+                    };
+                    Button::new(format!("new-session-workspace-{workspace_id}"))
+                        .small()
+                        .ghost()
+                        .w_full()
+                        .h(px(32.0))
+                        .px_2()
+                        .selected(selected)
+                        .rounded(gpui_component::button::ButtonRounded::Size(px(7.0)))
+                        .text_color(popover_foreground)
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .justify_between()
+                                .gap_2()
+                                .child(h_flex().min_w_0().gap_2().child(icon).child(
+                                    div().min_w_0().truncate().child(workspace_label.clone()),
+                                ))
+                                .when(selected, |this| {
+                                    this.child(Icon::new(IconName::Check).size(px(14.0)))
+                                }),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.select_new_session_target(
+                                NewSessionOpenTarget::Workspace(workspace_id_for_click.clone()),
+                                window,
+                                cx,
+                            );
+                            this.new_session_workspace_mode_menu_open = false;
+                            this.new_session_input
+                                .update(cx, |input, cx| input.focus(window, cx));
+                        }))
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>();
+        let new_worktree_button = Button::new("new-session-location-worktree")
             .small()
             .ghost()
             .w_full()
@@ -23833,11 +23904,12 @@ impl VibexWorkbench {
                 .to_string()
             }))
             .disabled(self.agent_action_pending || !worktree_ready)
-            .on_click(move |_, window, cx| {
-                let _ = worktree_location_entity.update(cx, |this, cx| {
-                    this.set_new_session_location(NewSessionLocation::NewWorktree, window, cx)
-                });
-            });
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.select_new_session_worktree(window, cx);
+                this.new_session_workspace_mode_menu_open = false;
+                this.new_session_input
+                    .update(cx, |input, cx| input.focus(window, cx));
+            }));
         let mode_panel = v_flex()
             .w(px(settings_panel_width))
             .min_w_0()
@@ -23850,9 +23922,16 @@ impl VibexWorkbench {
             .p_2()
             .text_color(popover_foreground)
             .shadow_lg()
-            .child(local_location_button)
-            .when(!fixed_workspace, |this| {
-                this.child(worktree_location_button)
+            .children(workspace_rows)
+            .when(git_worktree_options_visible, |this| {
+                this.child(
+                    div()
+                        .mx(px(-2.0))
+                        .my_1()
+                        .h(px(1.0))
+                        .bg(border_color.opacity(0.60)),
+                )
+                .child(new_worktree_button)
             })
             .when(worktree_selected, |this| {
                 this.child(
@@ -23864,16 +23943,34 @@ impl VibexWorkbench {
                 )
                 .child(settings_panel)
             });
-        let mode_trigger_icon = if worktree_selected {
-            sidebar_icon("icons/vibex/git-branch.svg")
-                .size(px(14.0))
-                .text_color(muted_foreground)
-                .into_any_element()
+        let selected_workspace_mode = selected_workspace_id.as_ref().and_then(|id| {
+            workspace_options
+                .iter()
+                .find(|(_, workspace_id, _)| id.as_str() == workspace_id)
+                .map(|(workspace, _, _)| workspace.mode)
+        });
+        let mode_trigger_icon =
+            if worktree_selected || selected_workspace_mode == Some(WorkspaceMode::VibexWorktree) {
+                sidebar_icon("icons/vibex/git-branch.svg")
+                    .size(px(14.0))
+                    .text_color(muted_foreground)
+                    .into_any_element()
+            } else {
+                Icon::new(IconName::Folder)
+                    .size(px(14.0))
+                    .text_color(muted_foreground)
+                    .into_any_element()
+            };
+        let mode_trigger_label = if worktree_selected {
+            new_worktree_label.to_string()
+        } else if let Some(selected_workspace_id) = selected_workspace_id.as_ref() {
+            workspace_options
+                .iter()
+                .find(|(_, workspace_id, _)| selected_workspace_id.as_str() == workspace_id)
+                .map(|(_, _, label)| label.clone())
+                .unwrap_or(local_location_label.clone())
         } else {
-            Icon::new(IconName::Folder)
-                .size(px(14.0))
-                .text_color(muted_foreground)
-                .into_any_element()
+            local_location_label.clone()
         };
         let mode_trigger = Button::new("new-session-workspace-mode")
             .xsmall()
@@ -23886,14 +23983,10 @@ impl VibexWorkbench {
                 h_flex()
                     .gap(px(6.0))
                     .child(mode_trigger_icon)
-                    .child(if worktree_selected {
-                        new_worktree_label
-                    } else {
-                        local_location_label
-                    })
+                    .child(mode_trigger_label)
                     .child(Icon::new(IconName::ChevronDown).size(px(13.0))),
             )
-            .disabled(self.agent_action_pending || fixed_workspace);
+            .disabled(self.agent_action_pending);
         let location_control = Popover::new("new-session-workspace-mode-menu")
             .appearance(false)
             .anchor(Anchor::TopLeft)
@@ -23920,13 +24013,15 @@ impl VibexWorkbench {
                     .gap_2()
                     .px_2()
                     .child(div().flex_none().child(workspace_button))
-                    .child(div().flex_none().child(location_control))
+                    .when(show_location_control, |this| {
+                        this.child(div().flex_none().child(location_control))
+                    })
                     .when(worktree_selected, |this| {
                         this.child(div().flex_none().child(base_ref_button))
                     }),
             )
             .when_some(
-                (can_create_worktree && !fixed_workspace && !worktree_ready)
+                (can_create_worktree && fixed_workspace_id.is_none() && !worktree_ready)
                     .then_some(worktree_reason)
                     .flatten(),
                 |this, reason| {
@@ -34824,18 +34919,10 @@ fn new_session_worktree_unavailable_reason(
         ));
     }
     let Some(eligibility) = state.eligibility.as_ref() else {
-        return Some(localized(
-            "Checking Git status...",
-            "正在检查 Git 状态...",
-            "正在檢查 Git 狀態...",
-        ));
+        return None;
     };
     match eligibility.state {
-        GitProjectEligibilityState::Probing => Some(localized(
-            "Checking Git status...",
-            "正在检查 Git 状态...",
-            "正在檢查 Git 狀態...",
-        )),
+        GitProjectEligibilityState::Probing => None,
         GitProjectEligibilityState::Eligible if eligibility.is_eligible() => None,
         GitProjectEligibilityState::Eligible => Some(localized(
             "No valid base branch is available",
@@ -49373,8 +49460,11 @@ mod tests {
             .map(|(body, _)| body)
             .expect("new-session panel should remain inspectable");
         assert!(panel.contains("new-session-project-menu"));
-        assert!(panel.contains("new-session-location-current"));
+        assert!(panel.contains("new-session-workspace-{workspace_id}"));
         assert!(panel.contains("new-session-location-worktree"));
+        assert!(panel.contains("git_worktree_options_visible"));
+        assert!(panel.contains("show_location_control"));
+        assert!(!panel.contains("Checking Git status"));
         assert!(panel.contains("new-session-base-ref"));
         assert!(panel.contains("new-session-base-ref-popover"));
         assert!(panel.contains("new_session_base_ref_search"));
@@ -49386,6 +49476,13 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("        let mode_trigger_icon ="))
             .map(|(body, _)| body)
             .expect("workspace mode menu should remain inspectable");
+        let workspace_rows = mode_panel
+            .find(".children(workspace_rows)")
+            .expect("existing workspaces should populate the menu");
+        let new_worktree = mode_panel
+            .find(".child(new_worktree_button)")
+            .expect("new Worktree should remain a menu item");
+        assert!(workspace_rows < new_worktree);
         assert!(mode_panel.contains(".child(settings_panel)"));
 
         let workspace_toolbar = panel
@@ -49641,6 +49738,17 @@ mod tests {
             )
             .as_deref(),
             Some("此客户端不支持创建 Worktree")
+        );
+        let mut probing_state = state.clone();
+        probing_state.project_id = Some(ProjectId::new());
+        assert_eq!(
+            new_session_worktree_unavailable_reason(
+                locale::ResolvedLocale::En,
+                &probing_state,
+                None,
+                true,
+            ),
+            None
         );
     }
 
