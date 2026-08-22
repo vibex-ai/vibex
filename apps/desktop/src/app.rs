@@ -23801,17 +23801,6 @@ impl VibexWorkbench {
             cx,
         );
         let mut runtime_controls_other = Vec::new();
-        if let Some(selection) = selection.as_ref() {
-            for feature in features {
-                runtime_controls_other.push(self.render_runtime_feature(
-                    RuntimeFeatureTarget::NewSession,
-                    feature,
-                    selection.clone(),
-                    compact_runtime_controls,
-                    cx,
-                ));
-            }
-        }
         if !reasoning_efforts.is_empty() {
             runtime_controls_other.push(self.render_new_session_runtime_choice(
                 "effort".into(),
@@ -23838,6 +23827,17 @@ impl VibexWorkbench {
                     cx,
                 ),
             );
+        }
+        if let Some(selection) = selection.as_ref() {
+            for feature in features {
+                runtime_controls_other.push(self.render_runtime_feature(
+                    RuntimeFeatureTarget::NewSession,
+                    feature,
+                    selection.clone(),
+                    compact_runtime_controls,
+                    cx,
+                ));
+            }
         }
         let selected_agent_id = self.new_session_agent_id.clone();
         let has_agent_choices = !agent_choices.is_empty();
@@ -32467,15 +32467,6 @@ impl VibexWorkbench {
                     cx,
                 );
                 let mut other = Vec::new();
-                for feature in projection.features {
-                    other.push(self.render_runtime_feature(
-                        RuntimeFeatureTarget::ActiveSession,
-                        feature,
-                        desired.clone(),
-                        compact_runtime_controls,
-                        cx,
-                    ));
-                }
                 if !projection.reasoning_efforts.is_empty() {
                     other.push(self.render_composer_runtime_choice(
                         "effort".into(),
@@ -32500,6 +32491,15 @@ impl VibexWorkbench {
                         ),
                         projection.modes,
                         desired.mode_id.clone().unwrap_or_default(),
+                        compact_runtime_controls,
+                        cx,
+                    ));
+                }
+                for feature in projection.features {
+                    other.push(self.render_runtime_feature(
+                        RuntimeFeatureTarget::ActiveSession,
+                        feature,
+                        desired.clone(),
                         compact_runtime_controls,
                         cx,
                     ));
@@ -47884,6 +47884,17 @@ mod tests {
         assert!(attachment < other_runtime_controls);
         assert!(other_runtime_controls < cascade_runtime_controls);
         assert!(cascade_runtime_controls < submit);
+        let new_session_effort = new_session
+            .find("strings.reasoning_depth")
+            .expect("new-session reasoning control should be rendered");
+        let new_session_mode = new_session
+            .find("strings.conversation_mode")
+            .expect("new-session mode control should be rendered");
+        let new_session_feature = new_session
+            .find("render_runtime_feature(")
+            .expect("new-session feature controls should be rendered");
+        assert!(new_session_effort < new_session_mode);
+        assert!(new_session_mode < new_session_feature);
 
         let composer = source
             .split_once("    fn render_composer(")
@@ -47910,6 +47921,17 @@ mod tests {
         assert!(attachment < other_runtime_controls);
         assert!(other_runtime_controls < cascade_runtime_controls);
         assert!(cascade_runtime_controls < submit);
+        let composer_effort = composer
+            .find("Thinking depth")
+            .expect("composer reasoning control should be rendered");
+        let composer_mode = composer
+            .find("Conversation mode")
+            .expect("composer mode control should be rendered");
+        let composer_feature = composer
+            .find("render_runtime_feature(")
+            .expect("composer feature controls should be rendered");
+        assert!(composer_effort < composer_mode);
+        assert!(composer_mode < composer_feature);
     }
 
     #[gpui::test]
