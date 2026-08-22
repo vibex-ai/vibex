@@ -35991,7 +35991,7 @@ fn sidebar_project_logo(
             .into_any_element();
     }
     sidebar_project_logo_icon(appearance.logo)
-        .size(size)
+        .with_size(size)
         .text_color(sidebar_project_logo_color(appearance.color, cx))
         .into_any_element()
 }
@@ -45068,6 +45068,15 @@ mod tests {
         assert!(trigger.contains(".child(project_logo)"));
         assert!(source.contains("const SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE: f32 = 28.0;"));
         assert!(source.contains("const SIDEBAR_PROJECT_ICON_SLOT_SIZE: f32 = 30.0;"));
+        let logo_renderer = source
+            .split_once("fn sidebar_project_logo(")
+            .and_then(|(_, tail)| tail.split_once("\nfn sidebar_project_logo_path("))
+            .map(|(body, _)| body)
+            .expect("project logo renderer should remain inspectable");
+        assert!(
+            logo_renderer
+                .contains("sidebar_project_logo_icon(appearance.logo)\n        .with_size(size)")
+        );
         assert!(source.contains("const SIDEBAR_LOGO_DISPLAY_SIZE: f32 = 14.0;"));
         assert!(source.contains("px(SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE),\n            cx,"));
         assert!(source.contains("px(SIDEBAR_LOGO_DISPLAY_SIZE),\n        Some(if active"));
