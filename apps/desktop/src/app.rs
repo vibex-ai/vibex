@@ -21711,7 +21711,10 @@ impl VibexWorkbench {
                                 )
                             })
                             .when(
-                                !pinned && !session_needs_approval && !has_unread_completion,
+                                !pinned
+                                    && !session_needs_approval
+                                    && !has_unread_completion
+                                    && display_state != AgentSessionState::Idle,
                                 |this| {
                                     this.child(sidebar_session_status_indicator(display_state, cx))
                                 },
@@ -45584,7 +45587,9 @@ mod tests {
                 .contains("let session_generating = display_state == AgentSessionState::Running")
         );
         assert!(sidebar_session.contains("sidebar_session_status_indicator(display_state, cx)"));
-        assert!(sidebar_session.contains("!session_needs_approval && !has_unread_completion"));
+        assert!(sidebar_session.contains("!session_needs_approval"));
+        assert!(sidebar_session.contains("!has_unread_completion"));
+        assert!(sidebar_session.contains("display_state != AgentSessionState::Idle"));
         assert!(sidebar_session.contains("!session_needs_approval && !session_generating"));
         assert!(sidebar_session.contains(".when(pinned, |this|"));
         assert!(sidebar_session.contains("icons/vibex/pin.svg"));
