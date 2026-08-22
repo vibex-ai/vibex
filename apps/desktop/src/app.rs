@@ -23786,14 +23786,26 @@ impl VibexWorkbench {
             .as_ref()
             .map(|projection| projection.features.clone())
             .unwrap_or_default();
-        let mut runtime_controls_side = vec![self.render_new_session_runtime_cascade(
+        let runtime_controls_cascade = self.render_new_session_runtime_cascade(
             selection.clone(),
             self.runtime_catalog.clone(),
             compact_runtime_controls,
             cx,
-        )];
+        );
+        let mut runtime_controls_other = Vec::new();
+        if let Some(selection) = selection.as_ref() {
+            for feature in features {
+                runtime_controls_other.push(self.render_runtime_feature(
+                    RuntimeFeatureTarget::NewSession,
+                    feature,
+                    selection.clone(),
+                    compact_runtime_controls,
+                    cx,
+                ));
+            }
+        }
         if !reasoning_efforts.is_empty() {
-            runtime_controls_side.push(self.render_new_session_runtime_choice(
+            runtime_controls_other.push(self.render_new_session_runtime_choice(
                 "effort".into(),
                 strings.reasoning_depth.into(),
                 new_session_selector_icon("icons/vibex/brain.svg", chart_3),
@@ -23804,7 +23816,7 @@ impl VibexWorkbench {
             ));
         }
         if !modes.is_empty() {
-            runtime_controls_side.push(
+            runtime_controls_other.push(
                 self.render_new_session_runtime_choice(
                     "mode".into(),
                     strings.conversation_mode.into(),
@@ -23819,19 +23831,6 @@ impl VibexWorkbench {
                 ),
             );
         }
-        let mut runtime_controls_bottom = Vec::new();
-        if let Some(selection) = selection.as_ref() {
-            for feature in features {
-                runtime_controls_bottom.push(self.render_runtime_feature(
-                    RuntimeFeatureTarget::NewSession,
-                    feature,
-                    selection.clone(),
-                    compact_runtime_controls,
-                    cx,
-                ));
-            }
-        }
-
         let selected_agent_id = self.new_session_agent_id.clone();
         let has_agent_choices = !agent_choices.is_empty();
         let creation_pending = self.pending_new_session.is_some();
@@ -25187,18 +25186,15 @@ impl VibexWorkbench {
                                                                 },
                                                             )),
                                                         )
-                                                        .children(runtime_controls_bottom),
+                                                        .children(runtime_controls_other),
                                                 )
                                                 .child(
                                                     h_flex()
-                                                        .id("new-session-runtime-controls-side")
-                                                        .min_w_0()
-                                                        .flex_1()
-                                                        .max_w(px(360.0))
+                                                        .id("new-session-runtime-controls-cascade")
+                                                        .flex_none()
                                                         .items_center()
                                                         .gap_1()
-                                                        .overflow_x_scroll()
-                                                        .children(runtime_controls_side),
+                                                        .child(runtime_controls_cascade),
                                                 )
                                                 .child(
                                                     h_flex()
@@ -32454,16 +32450,26 @@ impl VibexWorkbench {
         let composer_queue_visible = composer_queue.is_some();
         let input_geometry_entity = cx.weak_entity();
         let surface_geometry_entity = cx.weak_entity();
-        let (runtime_controls_side, runtime_controls_bottom) =
+        let (runtime_controls_cascade, runtime_controls_other) =
             if let Some((desired, catalog, projection)) = runtime_projection {
-                let mut side = vec![self.render_composer_runtime_cascade(
+                let cascade = self.render_composer_runtime_cascade(
                     desired.clone(),
                     catalog,
                     compact_runtime_controls,
                     cx,
-                )];
+                );
+                let mut other = Vec::new();
+                for feature in projection.features {
+                    other.push(self.render_runtime_feature(
+                        RuntimeFeatureTarget::ActiveSession,
+                        feature,
+                        desired.clone(),
+                        compact_runtime_controls,
+                        cx,
+                    ));
+                }
                 if !projection.reasoning_efforts.is_empty() {
-                    side.push(self.render_composer_runtime_choice(
+                    other.push(self.render_composer_runtime_choice(
                         "effort".into(),
                         locale::text("Thinking depth", "思考深度", "思考深度").into(),
                         new_session_selector_icon(
@@ -32477,7 +32483,7 @@ impl VibexWorkbench {
                     ));
                 }
                 if !projection.modes.is_empty() {
-                    side.push(self.render_composer_runtime_choice(
+                    other.push(self.render_composer_runtime_choice(
                         "mode".into(),
                         locale::text("Conversation mode", "对话模式", "對話模式").into(),
                         new_session_selector_icon(
@@ -32490,19 +32496,9 @@ impl VibexWorkbench {
                         cx,
                     ));
                 }
-                let mut bottom = Vec::new();
-                for feature in projection.features {
-                    bottom.push(self.render_runtime_feature(
-                        RuntimeFeatureTarget::ActiveSession,
-                        feature,
-                        desired.clone(),
-                        compact_runtime_controls,
-                        cx,
-                    ));
-                }
-                (side, bottom)
+                (cascade, other)
             } else {
-                (Vec::new(), Vec::new())
+                (Empty.into_any_element(), Vec::new())
             };
         let primary_action = if session_running {
             Button::new("interrupt-agent")
@@ -33010,18 +33006,15 @@ impl VibexWorkbench {
                                                         },
                                                     )),
                                             )
-                                            .children(runtime_controls_bottom)
+                                            .children(runtime_controls_other)
                                     )
                                     .child(
                                         h_flex()
-                                            .id("composer-runtime-controls-side")
-                                            .min_w_0()
-                                            .flex_1()
-                                            .max_w(px(360.0))
+                                            .id("composer-runtime-controls-cascade")
+                                            .flex_none()
                                             .items_center()
                                             .gap_1()
-                                            .overflow_x_scroll()
-                                            .children(runtime_controls_side),
+                                            .child(runtime_controls_cascade),
                                     )
                                     .child(
                                         h_flex()
@@ -47871,18 +47864,18 @@ mod tests {
         let attachment = new_session
             .find("new-session-choose-attachments")
             .expect("new-session attachment control should be present");
-        let bottom_runtime_controls = new_session
-            .find("children(runtime_controls_bottom)")
-            .expect("new-session feature controls should stay in the bottom toolbar");
-        let side_runtime_controls = new_session
-            .find("new-session-runtime-controls-side")
-            .expect("new-session primary runtime controls should stay in the bottom toolbar");
+        let other_runtime_controls = new_session
+            .find("children(runtime_controls_other)")
+            .expect("new-session secondary runtime controls should stay beside attachments");
+        let cascade_runtime_controls = new_session
+            .find("new-session-runtime-controls-cascade")
+            .expect("new-session cascade should stay beside the submit control");
         let submit = new_session
             .find("new-session-submit")
             .expect("new-session submit control should be present");
-        assert!(attachment < bottom_runtime_controls);
-        assert!(bottom_runtime_controls < side_runtime_controls);
-        assert!(side_runtime_controls < submit);
+        assert!(attachment < other_runtime_controls);
+        assert!(other_runtime_controls < cascade_runtime_controls);
+        assert!(cascade_runtime_controls < submit);
 
         let composer = source
             .split_once("    fn render_composer(")
@@ -47891,24 +47884,24 @@ mod tests {
             .expect("session composer should remain inspectable");
         assert_eq!(composer.matches("choose-composer-attachments").count(), 1);
         assert!(!composer.contains("choose-composer-images"));
-        assert!(composer.contains("composer-runtime-controls-side"));
-        assert!(composer.contains("children(runtime_controls_side)"));
-        assert!(composer.contains("children(runtime_controls_bottom)"));
+        assert!(composer.contains("composer-runtime-controls-cascade"));
+        assert!(composer.contains(".child(runtime_controls_cascade)"));
+        assert!(composer.contains("children(runtime_controls_other)"));
         let attachment = composer
             .find("choose-composer-attachments")
             .expect("composer attachment control should be present");
-        let bottom_runtime_controls = composer
-            .find("children(runtime_controls_bottom)")
-            .expect("composer feature controls should stay beside attachments");
-        let side_runtime_controls = composer
-            .find("composer-runtime-controls-side")
-            .expect("composer primary runtime controls should stay in the bottom toolbar");
+        let other_runtime_controls = composer
+            .find("children(runtime_controls_other)")
+            .expect("composer secondary runtime controls should stay beside attachments");
+        let cascade_runtime_controls = composer
+            .find("composer-runtime-controls-cascade")
+            .expect("composer cascade should stay beside the submit control");
         let submit = composer
             .find(".child(primary_action)")
             .expect("composer submit control should remain present");
-        assert!(attachment < bottom_runtime_controls);
-        assert!(bottom_runtime_controls < side_runtime_controls);
-        assert!(side_runtime_controls < submit);
+        assert!(attachment < other_runtime_controls);
+        assert!(other_runtime_controls < cascade_runtime_controls);
+        assert!(cascade_runtime_controls < submit);
     }
 
     #[gpui::test]
