@@ -21044,7 +21044,7 @@ impl VibexWorkbench {
                         v_flex()
                             .flex_1()
                             .min_w_0()
-                            .gap(px(1.0))
+                            .gap(px(0.0))
                             .child(
                                 div()
                                     .min_w_0()
@@ -49149,6 +49149,7 @@ mod tests {
         assert!(workspace.contains("} else if collapsed {\n            cx.theme().transparent"));
         assert!(workspace.contains(".bg(row_background)"));
         assert!(workspace.contains(".bg(card_background)"));
+        assert!(workspace.contains(".gap(px(0.0))"));
         assert!(workspace.contains("cx.theme().sidebar_foreground.opacity(0.28)"));
         assert!(workspace.contains(".w(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))"));
         assert!(workspace.contains(".h(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))"));
