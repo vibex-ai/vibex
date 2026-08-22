@@ -92,6 +92,7 @@ const GIT_HISTORY_DRAWER_MIN_HEIGHT: f32 = 52.0;
 const GIT_HISTORY_DRAWER_CLOSE_THRESHOLD: f32 = 92.0;
 const GIT_HISTORY_DRAWER_DEFAULT_HEIGHT: f32 = 260.0;
 const GIT_HISTORY_DRAWER_KEYBOARD_STEP: f32 = 24.0;
+const GIT_HISTORY_LOAD_MORE_THRESHOLD_PX: f32 = 192.0;
 const GIT_COMMIT_MESSAGE_HEIGHT: f32 = 80.0;
 const GIT_COMMIT_TYPES: [&str; 11] = [
     "feat", "fix", "refactor", "test", "docs", "style", "perf", "chore", "build", "ci", "revert",
@@ -621,6 +622,7 @@ struct CodeRightRailGitProjection {
     deletions: u32,
     change_rows: Arc<Vec<CodeRightRailGitTreeRow>>,
     history: Arc<Vec<GitCommitSummary>>,
+    history_has_more: bool,
     branches: Arc<Vec<GitBranchSummary>>,
     remotes: Arc<Vec<GitRemoteSummary>>,
     authors: Arc<Vec<GitHistoryAuthor>>,
@@ -759,6 +761,7 @@ fn right_rail_git_projection(
         deletions,
         change_rows: Arc::new(change_rows),
         history: Arc::new(git.history.clone()),
+        history_has_more: git.history_has_more,
         branches: Arc::new(branches),
         remotes: Arc::new(remotes),
         authors: Arc::new(git.history_authors.clone()),
@@ -3138,6 +3141,13 @@ impl CodeWorkbench {
                 cx.notify();
             });
         }));
+    }
+
+    pub(crate) fn load_more_history(&mut self, cx: &mut Context<Self>) {
+        if self.history_loading || !self.git.history_has_more {
+            return;
+        }
+        self.load_history(true, cx);
     }
 
     fn load_branches(&mut self, cx: &mut Context<Self>) {
@@ -11058,6 +11068,8 @@ impl CodeRightRail {
         let history = git.history.clone();
         let history_row_count = history.len();
         let loading = git.history_loading;
+        let history_has_more = git.history_has_more;
+        let history_scroll = git.scroll.clone();
         let selected_hash = git.selected_hash.clone();
         let selected_hash_for_rows = selected_hash.clone();
         let scroll_handle = git.scroll.clone();
@@ -11104,6 +11116,16 @@ impl CodeRightRail {
             }
         } else {
             div()
+                .on_scroll_wheel(cx.listener(move |this, _, _, cx| {
+                    if history_has_more
+                        && git_history_is_near_bottom(
+                            &history_scroll,
+                            GIT_HISTORY_LOAD_MORE_THRESHOLD_PX,
+                        )
+                    {
+                        this.update_workbench(cx, |workbench, cx| workbench.load_more_history(cx));
+                    }
+                }))
                 .relative()
                 .size_full()
                 .min_h_0()
@@ -14096,6 +14118,16 @@ fn bounded_uniform_range(
     let start = range.start.min(total);
     let end = range.end.min(total).min(start.saturating_add(limit.max(1)));
     start..end
+}
+
+fn git_history_is_near_bottom(scroll: &UniformListScrollHandle, threshold_px: f32) -> bool {
+    let state = scroll.0.borrow();
+    let max_offset = state.base_handle.max_offset().y;
+    if max_offset <= px(0.0) {
+        return false;
+    }
+    let distance = f32::from(max_offset + state.base_handle.offset().y).max(0.0);
+    distance <= threshold_px.max(0.0)
 }
 
 fn pane_tab_ids(node: &PreviewSplitNode, pane_id: &str) -> Option<Vec<String>> {
