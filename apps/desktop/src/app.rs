@@ -223,6 +223,7 @@ const SIDEBAR_PROJECT_GROUP_GAP: f32 = 16.0;
 const SIDEBAR_PROJECT_REORDER_GAP: f32 = 12.0;
 const SIDEBAR_PROJECT_CONTENT_GAP: f32 = 4.0;
 const SIDEBAR_SESSION_REORDER_GAP: f32 = 2.0;
+const SIDEBAR_SESSION_ROW_HEIGHT: f32 = 40.0;
 const SIDEBAR_DRAG_PREVIEW_WIDTH: f32 = 280.0;
 const SIDEBAR_DRAG_HORIZONTAL_SLOP: f32 = 16.0;
 const SIDEBAR_ORGANIZATION_INDENT: f32 = 20.0;
@@ -20657,7 +20658,7 @@ impl VibexWorkbench {
                                 div()
                                     .min_w_0()
                                     .truncate()
-                                    .text_sm()
+                                    .text_base()
                                     .font_semibold()
                                     .child(project_name.clone()),
                             )
@@ -21064,7 +21065,7 @@ impl VibexWorkbench {
                                 div()
                                     .min_w_0()
                                     .truncate()
-                                    .text_sm()
+                                    .text_base()
                                     .font_semibold()
                                     .text_color(workspace_title_color)
                                     .group_hover(&hover_group, |style| {
@@ -21445,8 +21446,8 @@ impl VibexWorkbench {
             .id(format!("sidebar-session-row-{session_id_string}"))
             .group(hover_group.clone())
             .relative()
-            .h(px(44.0))
-            .min_h(px(44.0))
+            .h(px(SIDEBAR_SESSION_ROW_HEIGHT))
+            .min_h(px(SIDEBAR_SESSION_ROW_HEIGHT))
             .w_full()
             .min_w_0()
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
@@ -21779,7 +21780,7 @@ impl VibexWorkbench {
                         .id(format!("sidebar-session-error-{session_id_string}"))
                         .absolute()
                         .left(px(-24.0))
-                        .top(px(9.0))
+                        .top(px(7.0))
                         .size(px(14.0))
                         .child(
                             Icon::new(IconName::TriangleAlert)
@@ -21794,7 +21795,7 @@ impl VibexWorkbench {
                         .id(format!("sidebar-session-check-{session_id_string}"))
                         .absolute()
                         .left_2()
-                        .top(px(9.0))
+                        .top(px(7.0))
                         .child(sidebar_selection_indicator(selection_indicator_state, cx)),
                 )
             })
@@ -21804,7 +21805,7 @@ impl VibexWorkbench {
                         .id(format!("sidebar-session-actions-{session_id_string}"))
                         .absolute()
                         .right_1()
-                        .top(px(10.0))
+                        .top(px(8.0))
                         .h(px(24.0))
                         .w(px(76.0))
                         .items_center()
@@ -45055,6 +45056,7 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n        let mut session_elements"))
             .map(|(body, _)| body)
             .expect("project row should remain inspectable");
+        assert!(project_row.contains(".text_base()"));
         assert!(source.contains("const SIDEBAR_TOP_LEVEL_PROJECT_OFFSET: f32 = -8.0;"));
         assert!(source.contains("const SIDEBAR_NESTED_PROJECT_INDENT: f32 = 8.0;"));
         assert!(project_row.contains(
@@ -45568,6 +45570,10 @@ mod tests {
             .expect("sidebar session renderer should remain inspectable");
 
         assert!(sidebar_session.contains("self.session_turn_pending(&session.id)"));
+        assert!(source.contains("const SIDEBAR_SESSION_ROW_HEIGHT: f32 = 40.0;"));
+        assert!(sidebar_session.contains(".h(px(SIDEBAR_SESSION_ROW_HEIGHT))"));
+        assert!(sidebar_session.contains(".min_h(px(SIDEBAR_SESSION_ROW_HEIGHT))"));
+        assert!(sidebar_session.contains(".top(px(8.0))"));
         assert!(sidebar_session.contains("let show_worktree_status ="));
         assert!(sidebar_session.contains("self.ui_state.sidebar.hierarchy_mode"));
         assert!(sidebar_session.contains("SidebarHierarchyMode::Detailed"));
@@ -49181,6 +49187,7 @@ mod tests {
         assert!(workspace.contains(".items_start()\n                            .justify_center()\n                            .pt(px(SIDEBAR_WORKSPACE_STATUS_TOP_OFFSET))"));
         assert!(workspace.contains("let workspace_title_color = if selected"));
         assert!(workspace.contains(".text_color(workspace_title_color)"));
+        assert!(workspace.contains(".text_base()"));
         assert!(workspace.contains(
             ".group_hover(&hover_group, |style| {\n                                        style.text_color(cx.theme().sidebar_foreground)"
         ));
