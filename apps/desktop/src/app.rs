@@ -181,9 +181,10 @@ const TITLE_BAR_HEIGHT: f32 = 44.0;
 const TITLE_BAR_COLLAPSED_SIDEBAR_WIDTH: f32 = 112.0;
 const SIDEBAR_PROJECT_LOGO_DIRECTORY: &str = "project-icons";
 const SIDEBAR_LOGO_DISPLAY_SIZE: f32 = 14.0;
-const SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE: f32 = 24.0;
+const SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE: f32 = 28.0;
 const SIDEBAR_WORKSPACE_STATUS_TOP_OFFSET: f32 = 4.0;
 const SIDEBAR_ICON_TITLE_GAP: f32 = 4.0;
+const SIDEBAR_PROJECT_ICON_SLOT_SIZE: f32 = 30.0;
 const SIDEBAR_TOP_LEVEL_PROJECT_OFFSET: f32 = -8.0;
 const SIDEBAR_NESTED_PROJECT_INDENT: f32 = 8.0;
 const SIDEBAR_PROJECT_LOGO_IMAGE_SIZE: u32 = 256;
@@ -217,7 +218,7 @@ const SIDEBAR_INLINE_TRANSITION_DURATION: Duration = Duration::from_millis(200);
 const SIDEBAR_FLOATING_TRANSITION_DURATION: Duration = Duration::from_millis(200);
 const SIDEBAR_REORDER_TRANSITION_DURATION: Duration = Duration::from_millis(160);
 const SIDEBAR_REORDER_ROW_HEIGHT: f32 = 32.0;
-const SIDEBAR_PROJECT_GROUP_GAP: f32 = 12.0;
+const SIDEBAR_PROJECT_GROUP_GAP: f32 = 16.0;
 const SIDEBAR_PROJECT_REORDER_GAP: f32 = 12.0;
 const SIDEBAR_PROJECT_CONTENT_GAP: f32 = 4.0;
 const SIDEBAR_SESSION_REORDER_GAP: f32 = 2.0;
@@ -20449,8 +20450,8 @@ impl VibexWorkbench {
                 .xsmall()
                 .ghost()
                 .compact()
-                .w(px(26.0))
-                .h(px(26.0))
+                .w(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))
+                .h(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))
                 .child(project_logo)
                 .tooltip(locale::text(
                     "Customize project logo",
@@ -20981,7 +20982,7 @@ impl VibexWorkbench {
         } else if projection.agent_summary.needs_input > 0 {
             sidebar_status_dot(cx.theme().warning)
         } else if projection.agent_summary.total == 0 {
-            sidebar_status_dot(cx.theme().sidebar_foreground.opacity(0.35))
+            sidebar_status_dot(cx.theme().sidebar_foreground.opacity(0.28))
         } else {
             sidebar_status_dot(cx.theme().success)
         };
@@ -21031,8 +21032,8 @@ impl VibexWorkbench {
                     .pr(px(34.0))
                     .child(
                         h_flex()
-                            .w(px(26.0))
-                            .h(px(26.0))
+                            .w(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))
+                            .h(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))
                             .flex_none()
                             .items_start()
                             .justify_center()
@@ -45062,10 +45063,11 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("        let project_logo_popover ="))
             .map(|(body, _)| body)
             .expect("project logo trigger should remain inspectable");
-        assert!(trigger.contains(".w(px(26.0))"));
-        assert!(trigger.contains(".h(px(26.0))"));
+        assert!(trigger.contains(".w(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))"));
+        assert!(trigger.contains(".h(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))"));
         assert!(trigger.contains(".child(project_logo)"));
-        assert!(source.contains("const SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE: f32 = 24.0;"));
+        assert!(source.contains("const SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE: f32 = 28.0;"));
+        assert!(source.contains("const SIDEBAR_PROJECT_ICON_SLOT_SIZE: f32 = 30.0;"));
         assert!(source.contains("const SIDEBAR_LOGO_DISPLAY_SIZE: f32 = 14.0;"));
         assert!(source.contains("px(SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE),\n            cx,"));
         assert!(source.contains("px(SIDEBAR_LOGO_DISPLAY_SIZE),\n        Some(if active"));
@@ -45099,7 +45101,7 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_root_children("))
             .map(|(body, _)| body)
             .expect("agent sidebar renderer should remain inspectable");
-        assert!(source.contains("const SIDEBAR_PROJECT_GROUP_GAP: f32 = 12.0;"));
+        assert!(source.contains("const SIDEBAR_PROJECT_GROUP_GAP: f32 = 16.0;"));
         assert!(source.contains("const SIDEBAR_PROJECT_CONTENT_GAP: f32 = 4.0;"));
         assert!(sidebar.contains(".gap(px(SIDEBAR_PROJECT_GROUP_GAP))"));
 
@@ -49138,6 +49140,9 @@ mod tests {
         assert!(workspace.contains("} else if collapsed {\n            cx.theme().transparent"));
         assert!(workspace.contains(".bg(row_background)"));
         assert!(workspace.contains(".bg(card_background)"));
+        assert!(workspace.contains("cx.theme().sidebar_foreground.opacity(0.28)"));
+        assert!(workspace.contains(".w(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))"));
+        assert!(workspace.contains(".h(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))"));
         assert!(workspace.contains(".pl_0()"));
         assert!(workspace.contains(".pl(px(24.0))"));
         assert!(workspace.contains(".pt(px(4.0))"));
