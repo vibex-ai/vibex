@@ -12002,16 +12002,18 @@ impl Render for CodeRightRail {
                         .child(locale::localize_error_message(&error)),
                 )
             })
-            .when_some(note, |this, note| {
-                this.child(
-                    div()
-                        .flex_none()
-                        .px_3()
-                        .py_1()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(locale::localize_ui_message(&note)),
-                )
+            .when(mode != RightRailMode::Git, |this| {
+                this.when_some(note, |this, note| {
+                    this.child(
+                        div()
+                            .flex_none()
+                            .px_3()
+                            .py_1()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(locale::localize_ui_message(&note)),
+                    )
+                })
             })
             .child(match mode {
                 RightRailMode::Files => self.render_files(cx),
