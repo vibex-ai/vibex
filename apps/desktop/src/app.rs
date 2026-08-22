@@ -21177,10 +21177,6 @@ impl VibexWorkbench {
         let session_id_string = session.id.as_str().to_string();
         let display_state =
             sidebar_session_display_state(session.state, self.session_turn_pending(&session.id));
-        let branch_path = self
-            .workspace_contexts
-            .get(session.workspace_id.as_str())
-            .and_then(|context| context.branch.clone());
         let show_worktree_status = self.ui_state.sidebar.hierarchy_mode
             == SidebarHierarchyMode::Detailed
             && !show_worktree_identity;
@@ -21263,7 +21259,7 @@ impl VibexWorkbench {
                 .bg(row_background)
                 .py_1()
                 .when(self.sidebar_batch_mode, |this| this.pl(px(28.0)).pr_2())
-                .when(!self.sidebar_batch_mode, |this| this.px_2())
+                .when(!self.sidebar_batch_mode, |this| this.pl_0().pr_2())
                 .on_key_down(cx.listener(Self::on_sidebar_rename_key_down))
                 .when(self.sidebar_batch_mode, |this| {
                     this.child(
@@ -21665,7 +21661,7 @@ impl VibexWorkbench {
                         )
                     })
                     .when(self.sidebar_batch_mode, |this| this.pl(px(28.0)).pr_2())
-                    .when(!self.sidebar_batch_mode, |this| this.px_2())
+                    .when(!self.sidebar_batch_mode, |this| this.pl_0().pr_2())
                     .text_color(row_foreground)
                     .child(
                         h_flex()
@@ -21697,30 +21693,14 @@ impl VibexWorkbench {
                             })
                             .child(sidebar_agent_logo(sidebar_agent_id.as_str(), selected, cx))
                             .child(
-                                v_flex()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .gap(px(1.0))
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .truncate()
-                                            .text_sm()
-                                            .when(selected, |this| this.font_medium())
-                                            .child(session.title.clone()),
-                                    )
-                                    .when_some(branch_path, |this, branch| {
-                                        this.child(
-                                            div()
-                                                .min_w_0()
-                                                .whitespace_normal()
-                                                .text_xs()
-                                                .text_color(
-                                                    cx.theme().sidebar_foreground.opacity(0.48),
-                                                )
-                                                .child(branch),
-                                        )
-                                    }),
+                                v_flex().flex_1().min_w_0().child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_sm()
+                                        .when(selected, |this| this.font_medium())
+                                        .child(session.title.clone()),
+                                ),
                             ),
                     )
                     .child(
@@ -45592,6 +45572,11 @@ mod tests {
         assert!(sidebar_session.contains(".when(show_worktree_status, |this|"));
         assert!(!sidebar_session.contains("selected, self.agent_turn_pending"));
         assert!(sidebar_session.contains(".when(show_worktree_status, |this|"));
+        assert!(
+            sidebar_session.contains(".when(!self.sidebar_batch_mode, |this| this.pl_0().pr_2())")
+        );
+        assert!(!sidebar_session.contains("let branch_path ="));
+        assert!(!sidebar_session.contains(".when_some(branch_path"));
         assert!(!sidebar_session.contains(".when(session_generating, |this|"));
         assert!(sidebar_session.contains(".when(pinned, |this|"));
         assert!(sidebar_session.contains("icons/vibex/pin.svg"));
@@ -49161,6 +49146,16 @@ mod tests {
         assert!(!workspace.contains(".ml(px(18.0))"));
         assert!(!workspace.contains(".border_1()"));
         assert!(!workspace.contains(".border_l_1()"));
+
+        let folder = source
+            .split_once("    fn render_sidebar_folder(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_project("))
+            .map(|(body, _)| body)
+            .expect("sidebar folder renderer should remain inspectable");
+        assert!(folder.contains(".gap(px(6.0))"));
+        assert!(folder.contains(".size(px(12.0))"));
+        assert!(folder.contains(".size(px(14.0))"));
+        assert!(folder.contains(".pl(px(if depth == 0 { 0.0 } else { 8.0 }))"));
     }
 
     #[test]
