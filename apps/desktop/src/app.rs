@@ -185,6 +185,7 @@ const SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE: f32 = 18.0;
 const SIDEBAR_WORKSPACE_STATUS_TOP_OFFSET: f32 = 4.0;
 const SIDEBAR_ICON_TITLE_GAP: f32 = 4.0;
 const SIDEBAR_PROJECT_ICON_SLOT_SIZE: f32 = 30.0;
+const SIDEBAR_WORKSPACE_SESSION_INDENT: f32 = 34.0;
 const SIDEBAR_TOP_LEVEL_PROJECT_OFFSET: f32 = -8.0;
 const SIDEBAR_NESTED_PROJECT_INDENT: f32 = 8.0;
 const SIDEBAR_PROJECT_LOGO_IMAGE_SIZE: u32 = 256;
@@ -7193,17 +7194,31 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) {
         let workspace_id = workspace.id.as_str().to_string();
-        self.activate_workspace(workspace, cx);
-        if !self
+        let project_id = workspace.project_id.clone();
+        let was_collapsed = self
             .ui_state
             .sidebar
             .collapsed_workspace_ids
-            .remove(&workspace_id)
-        {
+            .contains(&workspace_id);
+        self.activate_workspace(workspace, cx);
+        if was_collapsed {
             self.ui_state
                 .sidebar
                 .collapsed_workspace_ids
-                .insert(workspace_id);
+                .remove(&workspace_id);
+        } else {
+            for (_, candidate) in &self.workspaces {
+                if candidate.project_id == project_id {
+                    self.ui_state
+                        .sidebar
+                        .collapsed_workspace_ids
+                        .insert(candidate.id.as_str().to_string());
+                }
+            }
+            self.ui_state
+                .sidebar
+                .collapsed_workspace_ids
+                .remove(&workspace_id);
         }
         self.queue_ui_state();
         cx.notify();
@@ -20933,6 +20948,11 @@ impl VibexWorkbench {
         let project_for_folder = workspace.project_id.clone();
         let hover_group: SharedString = format!("sidebar-workspace-{workspace_id}").into();
         let tooltip_branch = branch.clone();
+        let workspace_offset = if depth == 0 {
+            SIDEBAR_TOP_LEVEL_PROJECT_OFFSET
+        } else {
+            SIDEBAR_NESTED_PROJECT_INDENT
+        };
         let workspace_title_color = if selected {
             cx.theme().sidebar_foreground
         } else {
@@ -20941,11 +20961,11 @@ impl VibexWorkbench {
         let card_background = if selected {
             cx.theme().sidebar_accent.opacity(0.16)
         } else {
-            cx.theme().background.opacity(0.22)
+            cx.theme().transparent
         };
         let row_background = if selected {
             cx.theme().sidebar_accent.opacity(0.25)
-        } else if collapsed {
+        } else if collapsed || !selected {
             cx.theme().transparent
         } else {
             cx.theme().background.opacity(0.14)
@@ -20994,11 +21014,6 @@ impl VibexWorkbench {
             .id(format!("sidebar-workspace-row-{workspace_id}"))
             .group(hover_group.clone())
             .relative()
-            .left(px(if depth == 0 {
-                SIDEBAR_TOP_LEVEL_PROJECT_OFFSET
-            } else {
-                SIDEBAR_NESTED_PROJECT_INDENT
-            }))
             .w_full()
             .min_w_0()
             .min_h(px(44.0))
@@ -21104,7 +21119,7 @@ impl VibexWorkbench {
             );
 
         if collapsed {
-            return row.into_any_element();
+            return row.left(px(workspace_offset)).into_any_element();
         }
 
         let mut sessions = self.render_sidebar_workspace_children(
@@ -21120,6 +21135,8 @@ impl VibexWorkbench {
         }
         v_flex()
             .id(format!("sidebar-workspace-{workspace_id}"))
+            .relative()
+            .left(px(workspace_offset))
             .w_full()
             .min_w_0()
             .gap(px(5.0))
@@ -21135,7 +21152,7 @@ impl VibexWorkbench {
                     .w_full()
                     .min_w_0()
                     .gap(px(2.0))
-                    .pl(px(24.0))
+                    .pl(px(SIDEBAR_WORKSPACE_SESSION_INDENT))
                     .children(sessions),
             )
             .into_any_element()
@@ -21275,13 +21292,6 @@ impl VibexWorkbench {
                         .min_w_0()
                         .items_center()
                         .gap_2()
-                        .when(pinned, |this| {
-                            this.child(
-                                sidebar_icon("icons/vibex/pin.svg")
-                                    .size(px(12.0))
-                                    .text_color(cx.theme().warning),
-                            )
-                        })
                         .when_some(worktree_tooltip.clone(), |this, (tooltip, state)| {
                             this.child(
                                 div()
@@ -21355,7 +21365,6 @@ impl VibexWorkbench {
         } else {
             strings.sidebar_pin
         };
-        let session_generating = display_state == AgentSessionState::Running;
         let session_needs_approval = display_state == AgentSessionState::NeedsInput;
         let has_unread_completion = !selected
             && self
@@ -21664,13 +21673,6 @@ impl VibexWorkbench {
                             .min_w_0()
                             .items_center()
                             .gap_2()
-                            .when(pinned, |this| {
-                                this.child(
-                                    sidebar_icon("icons/vibex/pin.svg")
-                                        .size(px(12.0))
-                                        .text_color(cx.theme().warning),
-                                )
-                            })
                             .when_some(worktree_tooltip, |this, (tooltip, state)| {
                                 this.child(
                                     div()
@@ -21730,30 +21732,17 @@ impl VibexWorkbench {
                             .gap(px(6.0))
                             .text_sm()
                             .text_color(cx.theme().sidebar_foreground.opacity(0.48))
-                            .when(!self.sidebar_batch_mode, |this| {
+                            .when(!self.sidebar_batch_mode && !pinned, |this| {
                                 this.group_hover(&hover_group, |style| style.invisible())
                             })
-                            .when(session_generating, |this| {
+                            .when(pinned, |this| {
                                 this.child(
-                                    div()
-                                        .size(px(16.0))
-                                        .flex()
-                                        .flex_none()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(
-                                            Spinner::new()
-                                                .icon(Icon::new(IconName::LoaderCircle))
-                                                .color(if auto_continue_enabled {
-                                                    cx.theme().success
-                                                } else {
-                                                    cx.theme().sidebar_foreground.opacity(0.58)
-                                                })
-                                                .xsmall(),
-                                        ),
+                                    sidebar_icon("icons/vibex/pin.svg")
+                                        .size(px(14.0))
+                                        .text_color(cx.theme().warning),
                                 )
                             })
-                            .when(session_needs_approval, |this| {
+                            .when(!pinned && session_needs_approval, |this| {
                                 this.child(
                                     div()
                                         .id(format!("sidebar-session-approval-{session_id_string}"))
@@ -21773,24 +21762,22 @@ impl VibexWorkbench {
                                         ),
                                 )
                             })
-                            .when(!session_generating, |this| {
-                                this.when(!session_needs_approval, |this| {
-                                    this.when_some(state_label, |this, label| {
-                                        this.child(
-                                            div()
-                                                .h(px(16.0))
-                                                .flex_none()
-                                                .rounded(px(4.0))
-                                                .px(px(6.0))
-                                                .text_xs()
-                                                .bg(cx.theme().secondary)
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(label),
-                                        )
-                                    })
-                                    .when(state_label.is_none() && !has_unread_completion, |this| {
-                                        this.child(time_label)
-                                    })
+                            .when(!pinned && !session_needs_approval, |this| {
+                                this.when_some(state_label, |this, label| {
+                                    this.child(
+                                        div()
+                                            .h(px(16.0))
+                                            .flex_none()
+                                            .rounded(px(4.0))
+                                            .px(px(6.0))
+                                            .text_xs()
+                                            .bg(cx.theme().secondary)
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(label),
+                                    )
+                                })
+                                .when(state_label.is_none() && !has_unread_completion, |this| {
+                                    this.child(time_label)
                                 })
                             })
                             .when(has_unread_completion, |this| {
@@ -45097,9 +45084,8 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_session("))
             .map(|(body, _)| body)
             .expect("workspace renderer should remain inspectable");
-        assert!(workspace.contains(
-            ".left(px(if depth == 0 {\n                SIDEBAR_TOP_LEVEL_PROJECT_OFFSET\n            } else {\n                SIDEBAR_NESTED_PROJECT_INDENT"
-        ));
+        assert!(workspace.contains("let workspace_offset = if depth == 0"));
+        assert!(workspace.contains(".left(px(workspace_offset))"));
     }
 
     #[test]
@@ -45581,25 +45567,36 @@ mod tests {
     #[test]
     fn sidebar_session_status_uses_left_error_and_hoverable_loading_metadata() {
         let source = include_str!("app.rs");
+        let workspace_toggle = source
+            .split_once("    fn activate_and_toggle_sidebar_workspace(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn set_sidebar_organization_drop_target("))
+            .map(|(body, _)| body)
+            .expect("workspace toggle should remain inspectable");
+        assert!(workspace_toggle.contains("let was_collapsed = self"));
+        assert!(workspace_toggle.contains("for (_, candidate) in &self.workspaces"));
+        assert!(workspace_toggle.contains("candidate.project_id == project_id"));
+        assert!(
+            workspace_toggle.contains("collapsed_workspace_ids\n                        .insert")
+        );
+
         let sidebar_session = source
             .split_once("    fn render_sidebar_session(")
             .and_then(|(_, tail)| tail.split_once("\n    fn render_new_session_runtime_choice("))
             .map(|(body, _)| body)
             .expect("sidebar session renderer should remain inspectable");
 
-        assert!(
-            sidebar_session
-                .contains("let session_generating = display_state == AgentSessionState::Running;")
-        );
         assert!(sidebar_session.contains("self.session_turn_pending(&session.id)"));
         assert!(sidebar_session.contains("let show_worktree_status ="));
         assert!(sidebar_session.contains("self.ui_state.sidebar.hierarchy_mode"));
         assert!(sidebar_session.contains("SidebarHierarchyMode::Detailed"));
         assert!(sidebar_session.contains(".when(show_worktree_status, |this|"));
         assert!(!sidebar_session.contains("selected, self.agent_turn_pending"));
-        assert!(sidebar_session.contains(".when(session_generating, |this|"));
-        assert!(sidebar_session.contains("Spinner::new()"));
-        assert!(sidebar_session.contains("IconName::LoaderCircle"));
+        assert!(sidebar_session.contains(".when(show_worktree_status, |this|"));
+        assert!(!sidebar_session.contains(".when(session_generating, |this|"));
+        assert!(sidebar_session.contains(".when(pinned, |this|"));
+        assert!(sidebar_session.contains("icons/vibex/pin.svg"));
+        assert!(sidebar_session.contains(".when(!self.sidebar_batch_mode && !pinned, |this|"));
+        assert!(sidebar_session.contains(".when(!pinned && !session_needs_approval, |this|"));
         assert!(
             sidebar_session.contains(".when(display_state == AgentSessionState::Error, |this|")
         );
@@ -49146,15 +49143,20 @@ mod tests {
 
         assert!(collapsed_guard < session_render);
         assert!(workspace.contains("return row.into_any_element();"));
-        assert!(workspace.contains("} else if collapsed {\n            cx.theme().transparent"));
+        assert!(
+            workspace
+                .contains("} else if collapsed || !selected {\n            cx.theme().transparent")
+        );
         assert!(workspace.contains(".bg(row_background)"));
         assert!(workspace.contains(".bg(card_background)"));
+        assert!(workspace.contains(".left(px(workspace_offset))"));
+        assert!(workspace.contains(".pl(px(SIDEBAR_WORKSPACE_SESSION_INDENT))"));
         assert!(workspace.contains(".gap(px(0.0))"));
         assert!(workspace.contains("cx.theme().sidebar_foreground.opacity(0.28)"));
         assert!(workspace.contains(".w(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))"));
         assert!(workspace.contains(".h(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))"));
         assert!(workspace.contains(".pl_0()"));
-        assert!(workspace.contains(".pl(px(24.0))"));
+        assert!(workspace.contains(".pl(px(SIDEBAR_WORKSPACE_SESSION_INDENT))"));
         assert!(workspace.contains(".pt(px(4.0))"));
         assert!(!workspace.contains(".ml(px(18.0))"));
         assert!(!workspace.contains(".border_1()"));
