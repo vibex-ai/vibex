@@ -35,7 +35,7 @@ use gpui_component::{
     dialog::{DialogAction, DialogClose, DialogFooter},
     h_flex,
     input::{
-        Backspace as InputBackspace, Delete as InputDelete, Enter as InputEnter,
+        Backspace as InputBackspace, Copy as InputCopy, Delete as InputDelete, Enter as InputEnter,
         Escape as InputEscape, IndentInline as InputIndentInline, Input, InputEvent, InputState,
         MoveDown as InputMoveDown, MoveLeft as InputMoveLeft, MoveRight as InputMoveRight,
         MoveUp as InputMoveUp, Paste as InputPaste,
@@ -382,6 +382,17 @@ impl InlineComposerAttachment {
         text.find(&self.marker)
             .map(|start| start..start + self.marker.len())
     }
+}
+
+fn inline_composer_attachments_in_text(
+    text: &str,
+    attachments: &[InlineComposerAttachment],
+) -> Vec<InlineComposerAttachment> {
+    attachments
+        .iter()
+        .filter(|attachment| attachment.range_in(text).is_some())
+        .cloned()
+        .collect()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -8051,9 +8062,10 @@ impl VibexWorkbench {
             self.composer_session_drafts.remove(session_id.as_str());
             return;
         }
+        let text = self.composer_input.read(cx).value().to_string();
         let draft = ComposerSessionDraft {
-            text: self.composer_input.read(cx).value().to_string(),
-            attachments: self.composer_attachments.clone(),
+            attachments: inline_composer_attachments_in_text(&text, &self.composer_attachments),
+            text,
             command_entry: self.composer_command_entry.clone(),
         };
         store_composer_session_draft(&mut self.composer_session_drafts, session_id, draft);
@@ -10203,12 +10215,8 @@ impl VibexWorkbench {
                 input.focus(window, cx);
             });
         }
-        let attachments = if new_session {
-            &mut self.new_session_attachments
-        } else {
-            &mut self.composer_attachments
-        };
-        attachments.retain(|item| item.attachment.id != attachment_id);
+        // Keep the metadata in memory so InputState undo can restore the marker
+        // and its image overlay after this explicit deletion.
         cx.notify();
     }
 
@@ -10331,6 +10339,28 @@ impl VibexWorkbench {
         if captured {
             cx.stop_propagation();
         }
+    }
+
+    fn capture_composer_copy(&mut self, new_session: bool, cx: &mut Context<Self>) {
+        let input = if new_session {
+            self.new_session_input.clone()
+        } else {
+            self.composer_input.clone()
+        };
+        let (text, selection) = {
+            let input = input.read(cx);
+            (input.value().to_string(), input.selected_range())
+        };
+        let attachments = if new_session {
+            &self.new_session_attachments
+        } else {
+            &self.composer_attachments
+        };
+        let Some(clipboard) = inline_composer_clipboard_item(&text, attachments, selection) else {
+            return;
+        };
+        cx.write_to_clipboard(clipboard);
+        cx.stop_propagation();
     }
 
     fn handle_composer_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -11216,18 +11246,10 @@ impl VibexWorkbench {
     }
 
     fn sync_inline_composer_attachments(&mut self, new_session: bool, cx: &App) {
-        let input = if new_session {
-            &self.new_session_input
-        } else {
-            &self.composer_input
-        };
-        let text = input.read(cx).value().to_string();
-        let attachments = if new_session {
-            &mut self.new_session_attachments
-        } else {
-            &mut self.composer_attachments
-        };
-        attachments.retain(|attachment| attachment.range_in(&text).is_some());
+        // InputState owns undo/redo history for the marker text. Keep attachment
+        // metadata while editing so undoing a deletion can restore its overlay;
+        // submission and draft persistence filter metadata against current text.
+        let _ = (new_session, cx);
     }
 
     fn add_composer_path(
@@ -24098,6 +24120,11 @@ impl VibexWorkbench {
                                                         },
                                                     ))
                                                     .capture_action(cx.listener(
+                                                        |this, _: &InputCopy, _, cx| {
+                                                            this.capture_composer_copy(true, cx)
+                                                        },
+                                                    ))
+                                                    .capture_action(cx.listener(
                                                         |this, _: &InputPaste, window, cx| {
                                                             this.capture_composer_paste(true, window, cx)
                                                         },
@@ -24157,7 +24184,18 @@ impl VibexWorkbench {
                                                             .appearance(false)
                                                             .h_full(),
                                                     ),
-                                            ),
+                                            )
+                                    .child(
+                                        h_flex()
+                                            .id("new-session-runtime-controls-side")
+                                            .min_w_0()
+                                            .flex_1()
+                                            .max_w(px(360.0))
+                                            .items_center()
+                                            .gap_1()
+                                            .overflow_x_scroll()
+                                            .children(runtime_controls),
+                                    ),
                                     )
                             .child(
                                 v_flex()
@@ -24169,7 +24207,6 @@ impl VibexWorkbench {
                                         this.child(
                                             h_flex()
                                                 .min_w_0()
-                                                .flex_wrap()
                                                 .items_center()
                                                 .justify_between()
                                                 .gap_2()
@@ -24177,7 +24214,7 @@ impl VibexWorkbench {
                                                     h_flex()
                                                         .flex_1()
                                                         .min_w_0()
-                                                        .flex_wrap()
+                                                        .items_center()
                                                         .gap_1()
                                                         .child(
                                                             Button::new(
@@ -24200,8 +24237,7 @@ impl VibexWorkbench {
                                                                     )
                                                                 },
                                                             )),
-                                                        )
-                                                        .children(runtime_controls),
+                                                        ),
                                                 )
                                                 .child(
                                                     h_flex()
@@ -24751,7 +24787,8 @@ impl VibexWorkbench {
             .bg(cx.theme().background)
             .child(
                 v_flex()
-                    .flex_1()
+                    .when(!self.composer_expanded, |this| this.flex_1())
+                    .when(self.composer_expanded, |this| this.h_0().flex_none())
                     .min_h_0()
                     .min_w_0()
                     .overflow_hidden()
@@ -24815,7 +24852,7 @@ impl VibexWorkbench {
                     })
                     .child(timeline_surface),
             )
-            .when(timeline_bottom_control_mounted, |this| {
+            .when(timeline_bottom_control_mounted && !self.composer_expanded, |this| {
                 let button = Button::new("follow-agent-bottom").small().primary();
                 let button = if self.timeline_follow.unread_count > 0 {
                     button.label(match self.resolved_locale() {
@@ -31481,6 +31518,7 @@ impl VibexWorkbench {
             .w_full()
             .min_w_0()
             .flex_none()
+            .when(self.composer_expanded, |this| this.flex_1().min_h_0())
             .gap_2()
             .items_center()
             .px_4()
@@ -31648,6 +31686,7 @@ impl VibexWorkbench {
                         this.max_w(px(max_width))
                     })
                     .min_w_0()
+                    .when(self.composer_expanded, |this| this.flex_1().min_h_0())
                     .when_some(composer_collaboration, |this, collaboration| {
                         this.child(
                             div()
@@ -31682,7 +31721,9 @@ impl VibexWorkbench {
                             .w_full()
                             .min_w_0()
                             .min_h(px(COMPOSER_SURFACE_MIN_HEIGHT))
-                            .when(self.composer_expanded, |this| this.min_h(px(240.0)))
+                            .when(self.composer_expanded, |this| {
+                                this.flex_1().min_h(px(240.0))
+                            })
                             .rounded(px(COMPOSER_SURFACE_RADIUS))
                             .border_1()
                             .border_color(cx.theme().border)
@@ -31803,6 +31844,11 @@ impl VibexWorkbench {
                                                 },
                                             ))
                                             .capture_action(cx.listener(
+                                                |this, _: &InputCopy, _, cx| {
+                                                    this.capture_composer_copy(false, cx)
+                                                },
+                                            ))
+                                            .capture_action(cx.listener(
                                                 |this, _: &InputPaste, window, cx| {
                                                     this.capture_composer_paste(false, window, cx)
                                                 },
@@ -31864,33 +31910,52 @@ impl VibexWorkbench {
                                             ),
                                     )
                                     .child(
-                                        Button::new("toggle-composer-expanded")
-                                            .xsmall()
-                                            .ghost()
-                                            .compact()
-                                            .size(px(30.0))
-                                            .icon(if self.composer_expanded {
-                                                IconName::Minimize
-                                            } else {
-                                                IconName::Maximize
-                                            })
-                                            .tooltip(if self.composer_expanded {
-                                                locale::text(
-                                                    "Collapse input",
-                                                    "收起输入框",
-                                                    "收合輸入框",
-                                                )
-                                            } else {
-                                                locale::text(
-                                                    "Expand input",
-                                                    "展开输入框",
-                                                    "展開輸入框",
-                                                )
-                                            })
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.composer_expanded = !this.composer_expanded;
-                                                cx.notify();
-                                            })),
+                                        h_flex()
+                                            .id("composer-runtime-controls-side")
+                                            .min_w_0()
+                                            .flex_1()
+                                            .max_w(px(360.0))
+                                            .items_center()
+                                            .gap_1()
+                                            .overflow_x_scroll()
+                                            .children(runtime_controls),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .flex_none()
+                                            .items_center()
+                                            .gap_1()
+                                            .child(
+                                                Button::new("toggle-composer-expanded")
+                                                    .xsmall()
+                                                    .ghost()
+                                                    .compact()
+                                                    .size(px(30.0))
+                                                    .icon(if self.composer_expanded {
+                                                        IconName::Minimize
+                                                    } else {
+                                                        IconName::Maximize
+                                                    })
+                                                    .tooltip(if self.composer_expanded {
+                                                        locale::text(
+                                                            "Collapse input",
+                                                            "收起输入框",
+                                                            "收合輸入框",
+                                                        )
+                                                    } else {
+                                                        locale::text(
+                                                            "Expand input",
+                                                            "展开输入框",
+                                                            "展開輸入框",
+                                                        )
+                                                    })
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.composer_expanded =
+                                                            !this.composer_expanded;
+                                                        cx.notify();
+                                                    })),
+                                            )
+                                            .child(self.render_composer_terminal_menu(cx)),
                                     ),
                             )
                             .child(
@@ -31930,14 +31995,12 @@ impl VibexWorkbench {
                                                         },
                                                     )),
                                             )
-                                            .children(runtime_controls),
                                     )
                                     .child(
                                         h_flex()
                                             .flex_none()
                                             .items_center()
                                             .gap_1()
-                                            .child(self.render_composer_terminal_menu(cx))
                                             .child(button_with_aria_label(
                                                 Button::new("open-session-usage")
                                                     .ghost()
@@ -35597,6 +35660,39 @@ fn user_message_clipboard_item(text: &str, attachments: &[MessageAttachment]) ->
         plain_text,
         VibexMessageClipboard::new(text.to_string(), image_attachments),
     )
+}
+
+fn inline_composer_clipboard_item(
+    raw_text: &str,
+    inline_attachments: &[InlineComposerAttachment],
+    selection: Range<usize>,
+) -> Option<ClipboardItem> {
+    let selected_text = raw_text.get(selection.clone())?;
+    let selected_attachments = inline_attachments
+        .iter()
+        .filter_map(|attachment| {
+            let range = attachment.range_in(raw_text)?;
+            (range.start >= selection.start && range.end <= selection.end).then_some(attachment)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if selected_attachments.is_empty()
+        || selected_attachments.len() > VIBEX_MESSAGE_CLIPBOARD_MAX_ATTACHMENTS
+        || selected_attachments.iter().any(|attachment| {
+            !attachment.attachment.is_image() || attachment.attachment.path.is_none()
+        })
+    {
+        return None;
+    }
+
+    let (text, attachments) = composer_submission_payload(selected_text, &selected_attachments);
+    (!attachments.is_empty()).then(|| {
+        let plain_text = user_message_clipboard_plain_text(&text, &attachments);
+        ClipboardItem::new_string_with_json_metadata(
+            plain_text,
+            VibexMessageClipboard::new(text, attachments),
+        )
+    })
 }
 
 fn vibex_message_composer_insertion(
@@ -43745,7 +43841,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_terminal_toggle_sits_left_of_token_usage() {
+    fn composer_terminal_toggle_sits_below_fullscreen_control() {
         let source = include_str!("app.rs");
         let composer = source
             .split_once("    fn render_composer(&mut self, cx: &mut Context<Self>)")
@@ -43755,6 +43851,9 @@ mod tests {
         let usage = composer
             .find("Button::new(\"open-session-usage\")")
             .expect("token usage action should exist");
+        let fullscreen = composer
+            .find("Button::new(\"toggle-composer-expanded\")")
+            .expect("composer fullscreen action should exist");
         let terminal = composer
             .find("self.render_composer_terminal_menu(cx)")
             .expect("terminal mode action should exist");
@@ -43762,6 +43861,7 @@ mod tests {
             .find(".child(primary_action)")
             .expect("send or stop action should exist");
 
+        assert!(fullscreen < terminal);
         assert!(terminal < usage);
         assert!(usage < primary_action);
     }
@@ -46551,7 +46651,15 @@ mod tests {
         assert!(composer.contains("session_content_max_width"));
         assert!(!composer.contains("COMPOSER_MAX_WIDTH"));
         assert!(composer.contains("toggle-composer-expanded"));
-        assert!(composer.contains("this.min_h(px(240.0))"));
+        assert!(composer.contains("this.flex_1().min_h(px(240.0))"));
+        assert!(composer.contains("this.flex_1().min_h_0()"));
+        let fullscreen_button = composer
+            .find("toggle-composer-expanded")
+            .expect("composer fullscreen control should remain present");
+        let terminal_button = composer
+            .find("self.render_composer_terminal_menu(cx)")
+            .expect("composer terminal control should remain present");
+        assert!(fullscreen_button < terminal_button);
         assert!(composer.contains(".pb_1()"));
         assert!(composer.contains(".when(composer_queue_visible, |this|"));
         assert!(composer.contains("px(-2.0)"));
@@ -46671,9 +46779,9 @@ mod tests {
             .find("new-session-choose-attachments")
             .expect("new-session attachment control should be present");
         let runtime_controls = new_session
-            .find(".children(runtime_controls)")
-            .expect("new-session runtime controls should be present");
-        assert!(attachment < runtime_controls);
+            .find("new-session-runtime-controls-side")
+            .expect("new-session runtime controls should stay beside the input");
+        assert!(runtime_controls < attachment);
 
         let composer = source
             .split_once("    fn render_composer(")
@@ -46682,6 +46790,7 @@ mod tests {
             .expect("session composer should remain inspectable");
         assert_eq!(composer.matches("choose-composer-attachments").count(), 1);
         assert!(!composer.contains("choose-composer-images"));
+        assert!(composer.contains("composer-runtime-controls-side"));
     }
 
     #[gpui::test]
@@ -47801,6 +47910,71 @@ mod tests {
         assert_eq!(text, "\u{1f642}\u{4e2d} tail");
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0].inline_text_offset, Some(3));
+    }
+
+    #[test]
+    fn copying_inline_composer_images_keeps_vibex_attachment_metadata() {
+        let attachment = inline_composer_attachment(1, "diagram");
+        let raw_text = format!(
+            "before{}after",
+            inline_composer_attachment_insertion(&attachment.marker)
+        );
+        let clipboard = inline_composer_clipboard_item(
+            &raw_text,
+            std::slice::from_ref(&attachment),
+            0..raw_text.len(),
+        )
+        .expect("a selection containing an image should use the Vibex clipboard format");
+
+        assert_eq!(clipboard.text().as_deref(), Some("before image after"));
+        let ClipboardEntry::String(string) = &clipboard.entries()[0] else {
+            panic!("inline image copy should expose a string entry");
+        };
+        let metadata = string
+            .metadata_json::<VibexMessageClipboard>()
+            .expect("inline image copy should include Vibex metadata");
+        assert_eq!(metadata.text, "before after");
+        assert_eq!(metadata.attachments.len(), 1);
+        assert_eq!(metadata.attachments[0].label, "diagram");
+
+        let (insertion, inline_attachments, _) =
+            vibex_message_composer_insertion(&metadata.text, &metadata.attachments, 1)
+                .expect("copied image metadata should paste back into the composer");
+        assert_eq!(
+            composer_submission_payload(&insertion, &inline_attachments).0,
+            metadata.text
+        );
+    }
+
+    #[test]
+    fn inline_composer_attachment_metadata_survives_marker_undo_until_draft_save() {
+        let attachment = inline_composer_attachment(1, "diagram");
+        let text_with_marker = format!("before{}after", attachment.marker);
+        let text_without_marker = "beforeafter";
+
+        assert!(
+            inline_composer_clipboard_item(
+                &text_with_marker,
+                std::slice::from_ref(&attachment),
+                0..text_with_marker.len(),
+            )
+            .is_some()
+        );
+        assert!(
+            inline_composer_attachments_in_text(
+                text_without_marker,
+                std::slice::from_ref(&attachment),
+            )
+            .is_empty()
+        );
+        let source = include_str!("app.rs");
+        let sync = source
+            .split_once("    fn sync_inline_composer_attachments(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn add_composer_path("))
+            .map(|(body, _)| body)
+            .expect("composer attachment sync should remain inspectable");
+        assert!(sync.contains("undo/redo"));
+        assert!(!sync.contains(".retain("));
     }
 
     #[test]
