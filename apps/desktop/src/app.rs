@@ -22929,14 +22929,14 @@ impl VibexWorkbench {
             .as_ref()
             .map(|projection| projection.features.clone())
             .unwrap_or_default();
-        let mut runtime_controls = vec![self.render_new_session_runtime_cascade(
+        let mut runtime_controls_side = vec![self.render_new_session_runtime_cascade(
             selection.clone(),
             self.runtime_catalog.clone(),
             compact_runtime_controls,
             cx,
         )];
         if !reasoning_efforts.is_empty() {
-            runtime_controls.push(self.render_new_session_runtime_choice(
+            runtime_controls_side.push(self.render_new_session_runtime_choice(
                 "effort".into(),
                 strings.reasoning_depth.into(),
                 new_session_selector_icon("icons/vibex/brain.svg", chart_3),
@@ -22947,7 +22947,7 @@ impl VibexWorkbench {
             ));
         }
         if !modes.is_empty() {
-            runtime_controls.push(
+            runtime_controls_side.push(
                 self.render_new_session_runtime_choice(
                     "mode".into(),
                     strings.conversation_mode.into(),
@@ -22962,9 +22962,10 @@ impl VibexWorkbench {
                 ),
             );
         }
+        let mut runtime_controls_bottom = Vec::new();
         if let Some(selection) = selection.as_ref() {
             for feature in features {
-                runtime_controls.push(self.render_runtime_feature(
+                runtime_controls_bottom.push(self.render_runtime_feature(
                     RuntimeFeatureTarget::NewSession,
                     feature,
                     selection.clone(),
@@ -24194,7 +24195,7 @@ impl VibexWorkbench {
                                             .items_center()
                                             .gap_1()
                                             .overflow_x_scroll()
-                                            .children(runtime_controls),
+                                            .children(runtime_controls_side),
                                     ),
                                     )
                             .child(
@@ -24239,6 +24240,7 @@ impl VibexWorkbench {
                                                             )),
                                                         ),
                                                 )
+                                                .children(runtime_controls_bottom)
                                                 .child(
                                                     h_flex()
                                                         .flex_none()
@@ -31431,54 +31433,56 @@ impl VibexWorkbench {
         let composer_queue_visible = composer_queue.is_some();
         let input_geometry_entity = cx.weak_entity();
         let surface_geometry_entity = cx.weak_entity();
-        let runtime_controls = if let Some((desired, catalog, projection)) = runtime_projection {
-            let mut controls = vec![self.render_composer_runtime_cascade(
-                desired.clone(),
-                catalog,
-                compact_runtime_controls,
-                cx,
-            )];
-            if !projection.reasoning_efforts.is_empty() {
-                controls.push(self.render_composer_runtime_choice(
-                    "effort".into(),
-                    locale::text("Thinking depth", "思考深度", "思考深度").into(),
-                    new_session_selector_icon(
-                        "icons/vibex/brain.svg",
-                        theme::semantic_color("chart-3", is_dark),
-                    ),
-                    projection.reasoning_efforts,
-                    runtime_reasoning_effort_value(Some(&desired)),
-                    compact_runtime_controls,
-                    cx,
-                ));
-            }
-            if !projection.modes.is_empty() {
-                controls.push(self.render_composer_runtime_choice(
-                    "mode".into(),
-                    locale::text("Conversation mode", "对话模式", "對話模式").into(),
-                    new_session_selector_icon(
-                        "icons/vibex/shield-alert.svg",
-                        theme::semantic_color("chart-4", is_dark),
-                    ),
-                    projection.modes,
-                    desired.mode_id.clone().unwrap_or_default(),
-                    compact_runtime_controls,
-                    cx,
-                ));
-            }
-            for feature in projection.features {
-                controls.push(self.render_runtime_feature(
-                    RuntimeFeatureTarget::ActiveSession,
-                    feature,
+        let (runtime_controls_side, runtime_controls_bottom) =
+            if let Some((desired, catalog, projection)) = runtime_projection {
+                let mut side = vec![self.render_composer_runtime_cascade(
                     desired.clone(),
+                    catalog,
                     compact_runtime_controls,
                     cx,
-                ));
-            }
-            controls
-        } else {
-            Vec::new()
-        };
+                )];
+                if !projection.reasoning_efforts.is_empty() {
+                    side.push(self.render_composer_runtime_choice(
+                        "effort".into(),
+                        locale::text("Thinking depth", "思考深度", "思考深度").into(),
+                        new_session_selector_icon(
+                            "icons/vibex/brain.svg",
+                            theme::semantic_color("chart-3", is_dark),
+                        ),
+                        projection.reasoning_efforts,
+                        runtime_reasoning_effort_value(Some(&desired)),
+                        compact_runtime_controls,
+                        cx,
+                    ));
+                }
+                if !projection.modes.is_empty() {
+                    side.push(self.render_composer_runtime_choice(
+                        "mode".into(),
+                        locale::text("Conversation mode", "对话模式", "對話模式").into(),
+                        new_session_selector_icon(
+                            "icons/vibex/shield-alert.svg",
+                            theme::semantic_color("chart-4", is_dark),
+                        ),
+                        projection.modes,
+                        desired.mode_id.clone().unwrap_or_default(),
+                        compact_runtime_controls,
+                        cx,
+                    ));
+                }
+                let mut bottom = Vec::new();
+                for feature in projection.features {
+                    bottom.push(self.render_runtime_feature(
+                        RuntimeFeatureTarget::ActiveSession,
+                        feature,
+                        desired.clone(),
+                        compact_runtime_controls,
+                        cx,
+                    ));
+                }
+                (side, bottom)
+            } else {
+                (Vec::new(), Vec::new())
+            };
         let primary_action = if session_running {
             Button::new("interrupt-agent")
                 .danger()
@@ -31918,7 +31922,7 @@ impl VibexWorkbench {
                                             .items_center()
                                             .gap_1()
                                             .overflow_x_scroll()
-                                            .children(runtime_controls),
+                                            .children(runtime_controls_side),
                                     )
                                     .child(
                                         v_flex()
@@ -31995,6 +31999,7 @@ impl VibexWorkbench {
                                                         },
                                                     )),
                                             )
+                                            .children(runtime_controls_bottom)
                                     )
                                     .child(
                                         h_flex()
@@ -46782,6 +46787,10 @@ mod tests {
             .find("new-session-runtime-controls-side")
             .expect("new-session runtime controls should stay beside the input");
         assert!(runtime_controls < attachment);
+        let bottom_runtime_controls = new_session
+            .find("children(runtime_controls_bottom)")
+            .expect("new-session feature controls should stay in the bottom toolbar");
+        assert!(attachment < bottom_runtime_controls);
 
         let composer = source
             .split_once("    fn render_composer(")
@@ -46791,6 +46800,8 @@ mod tests {
         assert_eq!(composer.matches("choose-composer-attachments").count(), 1);
         assert!(!composer.contains("choose-composer-images"));
         assert!(composer.contains("composer-runtime-controls-side"));
+        assert!(composer.contains("children(runtime_controls_side)"));
+        assert!(composer.contains("children(runtime_controls_bottom)"));
     }
 
     #[gpui::test]
