@@ -39705,7 +39705,7 @@ impl FoundationSettings {
                     .small()
                     .outline()
                     .selected(hierarchy == SidebarHierarchyMode::Compact)
-                    .label(locale::text("Compact", "紧凑", "精簡"))
+                    .label(locale::text("Session view", "会话视图", "會話視圖"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.set_sidebar_hierarchy(SidebarHierarchyMode::Compact, cx)
                     })),
@@ -39715,7 +39715,7 @@ impl FoundationSettings {
                     .small()
                     .outline()
                     .selected(hierarchy == SidebarHierarchyMode::Detailed)
-                    .label(locale::text("Detailed", "详细", "詳細"))
+                    .label(locale::text("Workspace view", "工作区视图", "工作區視圖"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.set_sidebar_hierarchy(SidebarHierarchyMode::Detailed, cx)
                     })),
@@ -39752,8 +39752,8 @@ impl FoundationSettings {
                     locale::text("Sidebar hierarchy", "侧栏层级", "側欄層級"),
                     locale::text(
                         "Choose compact project groups or detailed workspace nesting.",
-                        "选择紧凑项目分组或详细工作区嵌套。",
-                        "選擇精簡專案分組或詳細工作區巢狀結構。",
+                        "选择会话视图或工作区视图。",
+                        "選擇會話視圖或工作區視圖。",
                     ),
                     hierarchy_control,
                     stacked,
@@ -49141,6 +49141,14 @@ mod tests {
         assert!(sidebar.contains("SidebarHierarchyMode::Detailed"));
         assert!(sidebar.contains("NewSessionOpenTarget::Workspace"));
         assert!(sidebar.contains("icons/vibex/git-branch.svg"));
+        assert!(
+            source.contains(".label(locale::text(\"Session view\", \"会话视图\", \"會話視圖\"))")
+        );
+        assert!(
+            source.contains(
+                ".label(locale::text(\"Workspace view\", \"工作区视图\", \"工作區視圖\"))"
+            )
+        );
     }
 
     #[test]
