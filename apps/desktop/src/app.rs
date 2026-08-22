@@ -190,6 +190,7 @@ const SIDEBAR_WORKSPACE_SESSION_INDENT: f32 = 28.0;
 const SIDEBAR_WORKSPACE_SESSION_CARD_OVERHANG: f32 = 8.0;
 const SIDEBAR_TOP_LEVEL_PROJECT_OFFSET: f32 = -8.0;
 const SIDEBAR_NESTED_PROJECT_INDENT: f32 = 8.0;
+const SIDEBAR_ROOT_FOLDER_CONTENT_GAP: f32 = 12.0;
 const SIDEBAR_PROJECT_LOGO_IMAGE_SIZE: u32 = 256;
 const SIDEBAR_PROJECT_LOGO_MAX_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 const SIDEBAR_PROJECT_LOGO_MAX_SOURCE_PIXELS: u64 = 40_000_000;
@@ -20734,6 +20735,7 @@ impl VibexWorkbench {
         let context_hover_entity = cx.weak_entity();
         let menu_folder_id = folder_id.clone();
         let menu_folder_name = folder_name.clone();
+        let root_level_folder = project_id.is_none() && depth == 0;
         let menu_project_id = project_id;
         let menu_workspace_id = context_workspace_id.clone();
         let menu_entity = cx.weak_entity();
@@ -20770,6 +20772,9 @@ impl VibexWorkbench {
             .id(format!("sidebar-folder-row-{folder_id}"))
             .group(hover_group.clone())
             .relative()
+            .when(root_level_folder, |this| {
+                this.left(px(SIDEBAR_TOP_LEVEL_PROJECT_OFFSET))
+            })
             .h(px(32.0))
             .min_h(px(32.0))
             .w_full()
@@ -20964,7 +20969,11 @@ impl VibexWorkbench {
                     .size_full()
                     .min_w_0()
                     .items_center()
-                    .gap_2()
+                    .gap(px(if root_level_folder {
+                        SIDEBAR_ROOT_FOLDER_CONTENT_GAP
+                    } else {
+                        8.0
+                    }))
                     .pl(px(SIDEBAR_WORKSPACE_SESSION_CARD_OVERHANG))
                     .pr_1()
                     .text_color(cx.theme().sidebar_foreground.opacity(0.78))
@@ -46599,9 +46608,20 @@ mod tests {
         assert!(project_row.contains(".text_base()"));
         assert!(source.contains("const SIDEBAR_TOP_LEVEL_PROJECT_OFFSET: f32 = -8.0;"));
         assert!(source.contains("const SIDEBAR_NESTED_PROJECT_INDENT: f32 = 8.0;"));
+        assert!(source.contains("const SIDEBAR_ROOT_FOLDER_CONTENT_GAP: f32 = 12.0;"));
         assert!(project_row.contains(
             ".when(depth == 0, |this| {\n                this.left(px(SIDEBAR_TOP_LEVEL_PROJECT_OFFSET))"
         ));
+        let folder = source
+            .split_once("    fn render_sidebar_folder(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_project("))
+            .map(|(body, _)| body)
+            .expect("folder renderer should remain inspectable");
+        assert!(folder.contains("let root_level_folder = project_id.is_none() && depth == 0;"));
+        assert!(folder.contains(
+            ".when(root_level_folder, |this| {\n                this.left(px(SIDEBAR_TOP_LEVEL_PROJECT_OFFSET))"
+        ));
+        assert!(folder.contains("SIDEBAR_ROOT_FOLDER_CONTENT_GAP"));
         let workspace = source
             .split_once("    fn render_sidebar_workspace(")
             .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_session("))
