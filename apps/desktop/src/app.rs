@@ -356,6 +356,8 @@ const SETTINGS_VERTICAL_TABS_MIN_WIDTH: f32 = 768.0;
 const SETTINGS_NAVIGATION_WIDTH: f32 = 256.0;
 const SETTINGS_NAVIGATION_ROW_HEIGHT: f32 = 34.0;
 const SETTINGS_NAVIGATION_SECTION_GAP: f32 = 4.0;
+const SETTINGS_SEARCH_RESULT_LIMIT: usize = 32;
+const SETTINGS_SEARCH_RESULT_MAX_HEIGHT: f32 = 480.0;
 const SETTINGS_DIALOG_MAX_WIDTH: f32 = 1160.0;
 const SETTINGS_DIALOG_MAX_HEIGHT: f32 = 900.0;
 
@@ -19418,6 +19420,10 @@ impl VibexWorkbench {
         self.settings_snapshot = Some(self.ui_state.clone());
         self.settings_view.update(cx, |settings, cx| {
             settings.active_section = SettingsSection::General;
+            settings.search_selected_index = 0;
+            settings
+                .search
+                .update(cx, |input, cx| input.set_value("", window, cx));
             settings
                 .settings_render_context
                 .target_title
@@ -40382,8 +40388,34 @@ fn settings_search_candidates_for_query(
                     term.contains(&query) || query.contains(&term)
                 })
         })
-        .take(8)
+        .take(SETTINGS_SEARCH_RESULT_LIMIT)
         .collect()
+}
+
+fn wrap_settings_search_selection(index: usize, delta: isize, count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    if delta < 0 {
+        let steps = delta.unsigned_abs() % count;
+        (index + count - steps) % count
+    } else {
+        index.saturating_add(delta as usize) % count
+    }
+}
+
+fn settings_search_result_scroll_index(
+    candidates: &[SettingsSearchCandidate],
+    selected_index: usize,
+) -> usize {
+    if candidates.is_empty() {
+        return 0;
+    }
+    let selected_index = selected_index.min(candidates.len() - 1);
+    let section_heading_count = (0..=selected_index)
+        .filter(|&index| index == 0 || candidates[index].section != candidates[index - 1].section)
+        .count();
+    selected_index + section_heading_count
 }
 
 fn settings_row_id(title: &str) -> String {
@@ -40502,6 +40534,8 @@ struct FoundationSettings {
     session_content_widths: Entity<SelectState<Vec<SessionContentWidthChoice>>>,
     terminal_shells: Entity<SelectState<Vec<ShellChoice>>>,
     search: Entity<InputState>,
+    search_selected_index: usize,
+    search_scroll: ScrollHandle,
     settings_render_context: SettingsRenderContext,
     storage_usage_state: SettingsStorageUsageState,
     storage_usage_task: Option<Task<()>>,
@@ -40571,15 +40605,7 @@ impl FoundationSettings {
                 &search,
                 |this: &mut FoundationSettings, _, event: &InputEvent, cx| match event {
                     InputEvent::Change => {
-                        let query = this.search.read(cx).value().trim().to_lowercase();
-                        if let Some(section) = settings_section_for_query(&query) {
-                            this.activate_settings_section(section, cx);
-                        } else {
-                            this.settings_render_context
-                                .target_title
-                                .borrow_mut()
-                                .take();
-                        }
+                        this.preview_settings_search_selection(0, locale::current_strings(), cx);
                         cx.notify();
                     }
                     InputEvent::PressEnter { .. } | InputEvent::Focus | InputEvent::Blur => {}
@@ -40659,6 +40685,8 @@ impl FoundationSettings {
                 session_content_widths,
                 terminal_shells,
                 search,
+                search_selected_index: 0,
+                search_scroll: ScrollHandle::new(),
                 settings_render_context,
                 storage_usage_state: SettingsStorageUsageState::Unloaded,
                 storage_usage_task: None,
@@ -40711,20 +40739,101 @@ impl FoundationSettings {
         }));
     }
 
-    fn select_settings_search_candidate(
+    fn preview_settings_search_selection(
         &mut self,
-        candidate: SettingsSearchCandidate,
-        window: &mut Window,
+        index: usize,
+        strings: Strings,
         cx: &mut Context<Self>,
     ) {
+        let query = self.search.read(cx).value().trim().to_lowercase();
+        let candidates = settings_search_candidates_for_query(&query, strings);
+        let Some(candidate) = candidates
+            .get(index.min(candidates.len().saturating_sub(1)))
+            .copied()
+        else {
+            self.search_selected_index = 0;
+            self.search_scroll.scroll_to_item(0);
+            if let Some(section) = settings_section_for_query(&query) {
+                self.activate_settings_section(section, cx);
+            } else {
+                self.settings_render_context
+                    .target_title
+                    .borrow_mut()
+                    .take();
+            }
+            return;
+        };
+        self.search_selected_index = index.min(candidates.len() - 1);
+        self.search_scroll
+            .scroll_to_item(settings_search_result_scroll_index(
+                &candidates,
+                self.search_selected_index,
+            ));
         self.activate_settings_section(candidate.section, cx);
-        self.search
-            .update(cx, |input, cx| input.set_value("", window, cx));
         self.settings_render_context
             .target_title
             .borrow_mut()
             .replace(candidate.title.to_string());
+    }
+
+    fn select_settings_search_candidate(
+        &mut self,
+        index: usize,
+        candidate: SettingsSearchCandidate,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.search_selected_index = index;
+        self.activate_settings_section(candidate.section, cx);
+        self.settings_render_context
+            .target_title
+            .borrow_mut()
+            .replace(candidate.title.to_string());
+        let candidates = settings_search_candidates_for_query(
+            self.search.read(cx).value().as_ref(),
+            locale::current_strings(),
+        );
+        self.search_scroll
+            .scroll_to_item(settings_search_result_scroll_index(&candidates, index));
+        self.search.update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
+    }
+
+    fn move_settings_search_selection(
+        &mut self,
+        delta: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let candidates = settings_search_candidates_for_query(
+            self.search.read(cx).value().as_ref(),
+            locale::current_strings(),
+        );
+        if candidates.is_empty() {
+            return;
+        }
+        let index =
+            wrap_settings_search_selection(self.search_selected_index, delta, candidates.len());
+        self.preview_settings_search_selection(index, locale::current_strings(), cx);
+        self.search.update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    fn on_settings_search_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.search.read(cx).focus_handle(cx).is_focused(window) {
+            return;
+        }
+        match event.keystroke.key.as_str() {
+            "up" => self.move_settings_search_selection(-1, window, cx),
+            "down" => self.move_settings_search_selection(1, window, cx),
+            _ => return,
+        }
+        cx.stop_propagation();
     }
 
     fn render_search_results(
@@ -40739,83 +40848,99 @@ impl FoundationSettings {
         }
 
         let is_dark = cx.theme().is_dark();
-        let border = theme::semantic_color("border", is_dark);
-        let popover = theme::semantic_color("popover", is_dark);
-        let foreground = theme::semantic_color("popover-foreground", is_dark);
+        let foreground = theme::semantic_color("foreground", is_dark);
         let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
-        let hover_background = theme::semantic_color("accent", is_dark);
+        let hover_background = theme::semantic_color("muted", is_dark);
+        let selected_background = theme::semantic_color("sidebar-accent", is_dark);
+        let selected_index = self.search_selected_index.min(candidates.len() - 1);
+        let mut last_section = None;
+        let mut rendered = Vec::new();
+        for (index, candidate) in candidates.into_iter().enumerate() {
+            if last_section != Some(candidate.section) {
+                last_section = Some(candidate.section);
+                rendered.push(
+                    div()
+                        .w_full()
+                        .px_2()
+                        .pt_2()
+                        .pb_1()
+                        .text_xs()
+                        .font_medium()
+                        .text_color(muted_foreground.opacity(0.78))
+                        .child(settings_section_label(candidate.section))
+                        .into_any_element(),
+                );
+            }
+            let selected = index == selected_index;
+            let title = candidate.title;
+            let description = candidate.description;
+            rendered.push(
+                div()
+                    .id(format!("settings-search-result-{index}"))
+                    .role(Role::Button)
+                    .focusable()
+                    .tab_index(0)
+                    .cursor_pointer()
+                    .w_full()
+                    .aria_label(format!("{title}: {description}"))
+                    .px_2()
+                    .py_1()
+                    .rounded(px(6.0))
+                    .when(selected, |this| this.bg(selected_background.opacity(0.62)))
+                    .when(!selected, |this| {
+                        this.hover(|style| style.bg(hover_background.opacity(0.44)))
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.select_settings_search_candidate(index, candidate, window, cx);
+                    }))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                        match event.keystroke.key.as_str() {
+                            "up" => this.move_settings_search_selection(-1, window, cx),
+                            "down" => this.move_settings_search_selection(1, window, cx),
+                            "enter" | "space" => {
+                                this.select_settings_search_candidate(index, candidate, window, cx)
+                            }
+                            _ => return,
+                        }
+                        cx.stop_propagation();
+                    }))
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .min_w_0()
+                            .items_start()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .text_sm()
+                                    .text_color(foreground)
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .text_xs()
+                                    .whitespace_normal()
+                                    .text_color(muted_foreground)
+                                    .child(description),
+                            ),
+                    )
+                    .into_any_element(),
+            );
+        }
         Some(
             v_flex()
                 .id("settings-search-results")
                 .w_full()
-                .max_h(px(280.0))
-                .gap(px(2.0))
-                .overflow_y_scroll()
-                .rounded(px(8.0))
-                .border_1()
-                .border_color(border.opacity(0.72))
-                .bg(popover)
-                .p_1()
-                .children(
-                    candidates
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, candidate)| {
-                            let title = candidate.title;
-                            let description = candidate.description;
-                            let section = settings_section_label(candidate.section);
-                            div()
-                                .id(format!("settings-search-result-{index}"))
-                                .role(Role::Button)
-                                .focusable()
-                                .tab_index(0)
-                                .cursor_pointer()
-                                .w_full()
-                                .aria_label(title)
-                                .px_2()
-                                .py_1()
-                                .rounded(px(6.0))
-                                .hover(|style| style.bg(hover_background.opacity(0.50)))
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.select_settings_search_candidate(candidate, window, cx);
-                                }))
-                                .on_key_down(cx.listener(
-                                    move |this, event: &KeyDownEvent, window, cx| {
-                                        if matches!(event.keystroke.key.as_str(), "enter" | "space")
-                                        {
-                                            this.select_settings_search_candidate(
-                                                candidate, window, cx,
-                                            );
-                                            cx.stop_propagation();
-                                        }
-                                    },
-                                ))
-                                .child(
-                                    v_flex()
-                                        .w_full()
-                                        .min_w_0()
-                                        .items_start()
-                                        .gap(px(1.0))
-                                        .child(
-                                            div()
-                                                .w_full()
-                                                .truncate()
-                                                .text_sm()
-                                                .text_color(foreground)
-                                                .child(title),
-                                        )
-                                        .child(
-                                            div()
-                                                .w_full()
-                                                .truncate()
-                                                .text_xs()
-                                                .text_color(muted_foreground)
-                                                .child(format!("{section} · {description}")),
-                                        ),
-                                )
-                                .into_any_element()
-                        }),
-                )
+                .max_h(px(SETTINGS_SEARCH_RESULT_MAX_HEIGHT))
+                .track_scroll(&self.search_scroll)
+                .overflow_y_scrollbar()
+                .gap_0()
+                .py_1()
+                .children(rendered)
                 .into_any_element(),
         )
     }
@@ -41492,16 +41617,21 @@ impl FoundationSettings {
                     .into_any_element()
             })
             .collect::<Vec<_>>();
-        let search = Input::new(&self.search)
-            .small()
-            .h(px(34.0))
+        let search = div()
             .w_full()
             .mt_1()
             .mb_1()
-            .prefix(
-                Icon::new(IconName::Search)
+            .capture_key_down(cx.listener(Self::on_settings_search_key_down))
+            .child(
+                Input::new(&self.search)
                     .small()
-                    .text_color(muted_foreground),
+                    .h(px(34.0))
+                    .w_full()
+                    .prefix(
+                        Icon::new(IconName::Search)
+                            .small()
+                            .text_color(muted_foreground),
+                    ),
             );
         let search_results = self.render_search_results(strings, cx);
         let has_search_results = search_results.is_some();
@@ -51502,6 +51632,40 @@ mod tests {
             candidate.section == SettingsSection::General && candidate.keywords.contains(&"通知")
         }));
         assert!(settings_search_candidates_for_query("", english).is_empty());
+    }
+
+    #[test]
+    fn settings_search_selection_wraps_and_previews_each_candidate() {
+        assert_eq!(wrap_settings_search_selection(0, -1, 4), 3);
+        assert_eq!(wrap_settings_search_selection(3, 1, 4), 0);
+        assert_eq!(wrap_settings_search_selection(2, 1, 4), 3);
+        assert_eq!(wrap_settings_search_selection(0, 1, 0), 0);
+
+        let candidates = vec![
+            settings_search_candidate(SettingsSection::General, "A", "", &[]),
+            settings_search_candidate(SettingsSection::General, "B", "", &[]),
+            settings_search_candidate(SettingsSection::Appearance, "C", "", &[]),
+        ];
+        assert_eq!(settings_search_result_scroll_index(&candidates, 0), 1);
+        assert_eq!(settings_search_result_scroll_index(&candidates, 1), 2);
+        assert_eq!(settings_search_result_scroll_index(&candidates, 2), 4);
+
+        let source = include_str!("app.rs");
+        let settings = source
+            .split_once("impl FoundationSettings {")
+            .and_then(|(_, tail)| tail.split_once("    fn appearance("))
+            .map(|(body, _)| body)
+            .expect("settings search behavior should remain inspectable");
+        assert!(settings.contains("search_selected_index"));
+        assert!(settings.contains("search_scroll"));
+        assert!(settings.contains("settings_search_result_scroll_index"));
+        assert!(settings.contains("move_settings_search_selection"));
+        assert!(settings.contains("settings_section_label(candidate.section)"));
+        assert!(settings.contains(".when(selected"));
+        assert!(settings.contains(".whitespace_normal()"));
+        assert!(
+            source.contains(".capture_key_down(cx.listener(Self::on_settings_search_key_down))")
+        );
     }
 
     #[test]
