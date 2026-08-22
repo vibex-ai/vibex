@@ -7729,7 +7729,16 @@ impl VibexWorkbench {
             let ids = groups
                 .iter()
                 .flat_map(|group| &group.workspaces)
-                .find(|workspace| workspace.workspace.id.as_str() == drag.workspace_id)
+                // A projection may merge workspace aliases that share the same
+                // checkout. The session's persisted workspace id can therefore
+                // differ from the canonical row id used by the projection.
+                .find(|workspace| {
+                    workspace.workspace.id.as_str() == drag.workspace_id
+                        || workspace
+                            .sessions
+                            .iter()
+                            .any(|session| session.id == drag.session_id)
+                })
                 .map(|workspace| {
                     workspace
                         .sessions
@@ -45113,6 +45122,19 @@ mod tests {
         let mut committed = ids.clone();
         assert!(move_strings_relative(&mut committed, &moving, "c", true));
         assert_eq!(committed, preview);
+    }
+
+    #[test]
+    fn sidebar_session_drag_resolves_projection_aliases_by_session_id() {
+        let source = include_str!("app.rs");
+        let drag = source
+            .split_once("    fn start_sidebar_session_drag(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn preview_sidebar_session_reorder("))
+            .map(|(body, _)| body)
+            .expect("session drag setup should remain inspectable");
+
+        assert!(drag.contains("workspace.workspace.id.as_str() == drag.workspace_id"));
+        assert!(drag.contains(".any(|session| session.id == drag.session_id)"));
     }
 
     #[test]
