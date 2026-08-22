@@ -30463,7 +30463,9 @@ impl VibexWorkbench {
                             .size(px(14.0))
                             .flex_none(),
                     )
-                    .child(div().min_w_0().flex_1().truncate().child(highlighted_title))
+                    // Keep the disclosure control beside the activity label. The label is
+                    // still shrinkable, so long tool summaries truncate before the icon.
+                    .child(div().min_w_0().truncate().child(highlighted_title))
                     .child(
                         Icon::new(if expanded {
                             IconName::ChevronDown
@@ -30690,23 +30692,12 @@ impl VibexWorkbench {
                     .child(
                         div()
                             .min_w_0()
-                            .flex_1()
                             .truncate()
                             .font_family(cx.theme().mono_font_family.clone())
                             .text_size(cx.theme().mono_font_size)
                             .font_weight(code_font_weight(cx))
                             .child(command_title),
                     )
-                    .child(Self::render_process_status_badge(
-                        if waiting_for_confirmation {
-                            self.strings().agent_waiting_confirmation.to_string()
-                        } else {
-                            command_status_label(command.status).to_string()
-                        },
-                        failed,
-                        in_progress || waiting_for_confirmation,
-                        cx,
-                    ))
                     .when(has_details, |this| {
                         this.child(
                             Icon::new(if expanded {
@@ -30718,7 +30709,17 @@ impl VibexWorkbench {
                             .flex_none()
                             .text_color(cx.theme().muted_foreground),
                         )
-                    }),
+                    })
+                    .child(Self::render_process_status_badge(
+                        if waiting_for_confirmation {
+                            self.strings().agent_waiting_confirmation.to_string()
+                        } else {
+                            command_status_label(command.status).to_string()
+                        },
+                        failed,
+                        in_progress || waiting_for_confirmation,
+                        cx,
+                    )),
             )
             .when(expanded, |this| {
                 this.child(
@@ -30862,14 +30863,19 @@ impl VibexWorkbench {
                             .flex_none()
                             .text_color(cx.theme().muted_foreground),
                     )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .truncate()
-                            .font_medium()
-                            .child(title),
-                    )
+                    .child(div().min_w_0().truncate().font_medium().child(title))
+                    .when(has_diff, |this| {
+                        this.child(
+                            Icon::new(if expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .size(px(14.0))
+                            .flex_none()
+                            .text_color(cx.theme().muted_foreground),
+                        )
+                    })
                     .when(preview.removed_lines > 0, |this| {
                         this.child(
                             div()
@@ -30909,18 +30915,6 @@ impl VibexWorkbench {
                                     cx.stop_propagation();
                                     this.open_code_file(open_path.clone(), window, cx)
                                 })),
-                        )
-                    })
-                    .when(has_diff, |this| {
-                        this.child(
-                            Icon::new(if expanded {
-                                IconName::ChevronDown
-                            } else {
-                                IconName::ChevronRight
-                            })
-                            .size(px(14.0))
-                            .flex_none()
-                            .text_color(cx.theme().muted_foreground),
                         )
                     }),
             )
@@ -31091,17 +31085,10 @@ impl VibexWorkbench {
                     .child(
                         div()
                             .min_w_0()
-                            .flex_1()
                             .truncate()
                             .font_medium()
                             .child(summary.clone()),
                     )
-                    .child(Self::render_process_status_badge(
-                        agent_activity_status_label(image.status).to_string(),
-                        failed,
-                        in_progress,
-                        cx,
-                    ))
                     .when(has_details, |this| {
                         this.child(
                             Icon::new(if expanded {
@@ -31113,7 +31100,13 @@ impl VibexWorkbench {
                             .flex_none()
                             .text_color(cx.theme().muted_foreground),
                         )
-                    }),
+                    })
+                    .child(Self::render_process_status_badge(
+                        agent_activity_status_label(image.status).to_string(),
+                        failed,
+                        in_progress,
+                        cx,
+                    )),
             )
             .when(expanded, |this| {
                 this.child(
