@@ -20958,15 +20958,9 @@ impl VibexWorkbench {
         } else {
             cx.theme().sidebar_foreground.opacity(0.72)
         };
-        let card_background = if !collapsed {
-            cx.theme()
-                .sidebar_accent
-                .opacity(if selected { 0.30 } else { 0.18 })
-        } else {
-            cx.theme().transparent
-        };
-        let row_background = if collapsed && selected {
-            cx.theme().sidebar_accent.opacity(0.25)
+        let card_focused = !collapsed && selected;
+        let card_background = if card_focused {
+            cx.theme().sidebar_accent.opacity(0.36)
         } else {
             cx.theme().transparent
         };
@@ -21020,8 +21014,6 @@ impl VibexWorkbench {
             .cursor_pointer()
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
             .rounded(px(8.0))
-            .bg(row_background)
-            .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.20)))
             .tooltip(move |window, cx| Tooltip::new(tooltip_branch.clone()).build(window, cx))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.activate_and_toggle_sidebar_workspace(workspace_for_click.clone(), cx)
@@ -21143,6 +21135,10 @@ impl VibexWorkbench {
             .overflow_x_hidden()
             .rounded(px(10.0))
             .bg(card_background)
+            .when(card_focused, |this| {
+                this.border_1()
+                    .border_color(cx.theme().sidebar_accent.opacity(0.72))
+            })
             .pt(px(4.0))
             .pr(px(4.0))
             .pb(px(4.0))
@@ -49128,11 +49124,17 @@ mod tests {
 
         assert!(collapsed_guard < session_render);
         assert!(workspace.contains("return row.into_any_element();"));
-        assert!(workspace.contains("let card_background = if !collapsed"));
-        assert!(workspace.contains(".opacity(if selected { 0.30 } else { 0.18 })"));
-        assert!(workspace.contains("let row_background = if collapsed && selected"));
-        assert!(workspace.contains(".bg(row_background)"));
+        assert!(workspace.contains("let card_focused = !collapsed && selected"));
+        assert!(workspace.contains("let card_background = if card_focused"));
+        assert!(workspace.contains(".sidebar_accent.opacity(0.36)"));
+        assert!(workspace.contains(".when(card_focused, |this|"));
+        assert!(workspace.contains(".border_color(cx.theme().sidebar_accent.opacity(0.72))"));
         assert!(workspace.contains(".bg(card_background)"));
+        assert!(!workspace.contains(".bg(row_background)"));
+        assert!(
+            !workspace
+                .contains(".hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.20)))")
+        );
         assert!(workspace.contains(".left(px(workspace_offset))"));
         assert!(workspace.contains(".pl(px(SIDEBAR_WORKSPACE_SESSION_INDENT))"));
         assert!(workspace.contains(".gap(px(0.0))"));
@@ -49143,7 +49145,6 @@ mod tests {
         assert!(workspace.contains(".pl(px(SIDEBAR_WORKSPACE_SESSION_INDENT))"));
         assert!(workspace.contains(".pt(px(4.0))"));
         assert!(!workspace.contains(".ml(px(18.0))"));
-        assert!(!workspace.contains(".border_1()"));
         assert!(!workspace.contains(".border_l_1()"));
 
         let folder = source
