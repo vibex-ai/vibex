@@ -34806,9 +34806,10 @@ fn sidebar_project_uses_detailed_hierarchy(
     workspaces: &[SidebarWorkspaceProjection],
 ) -> bool {
     hierarchy_mode == SidebarHierarchyMode::Detailed
-        && workspaces
-            .iter()
-            .any(|workspace| workspace.context.git_available)
+        && workspaces.iter().any(|workspace| {
+            workspace.context.git_available
+                || workspace.workspace.mode == WorkspaceMode::VibexWorktree
+        })
 }
 
 fn sidebar_selected_session_background(accent: Hsla, is_dark: bool) -> Hsla {
@@ -49271,11 +49272,51 @@ mod tests {
 
         assert!(project.contains("sidebar_project_uses_detailed_hierarchy("));
         assert!(source.contains("workspace.context.git_available"));
+        assert!(source.contains("workspace.workspace.mode == WorkspaceMode::VibexWorktree"));
         assert!(project.contains("if detailed_hierarchy {"));
         assert!(project.contains("!detailed_hierarchy"));
         assert!(project.contains("self.render_sidebar_project_children("));
         assert!(!project.contains("match self.ui_state.sidebar.hierarchy_mode"));
         assert!(!project.contains("SIDEBAR_WORKSPACE_INDENT"));
+    }
+
+    #[test]
+    fn detailed_sidebar_shows_authoritative_worktrees_before_git_context_loads() {
+        let project = ProjectRecord {
+            id: ProjectId::new(),
+            name: "Vibex".into(),
+            root_path: "/repo".into(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        let worktree = WorkspaceRecord {
+            id: WorkspaceId::new(),
+            project_id: project.id.clone(),
+            root_path: "/repo/.worktrees/feature".into(),
+            mode: WorkspaceMode::VibexWorktree,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        let projects = sidebar_project_projections(
+            &[(project, worktree)],
+            &[],
+            &BTreeMap::new(),
+            &[],
+            &[],
+            &BTreeSet::new(),
+            "",
+        );
+        let workspaces = &projects[0].workspaces;
+
+        assert!(!workspaces[0].context.git_available);
+        assert!(sidebar_project_uses_detailed_hierarchy(
+            SidebarHierarchyMode::Detailed,
+            workspaces,
+        ));
+        assert!(!sidebar_project_uses_detailed_hierarchy(
+            SidebarHierarchyMode::Compact,
+            workspaces,
+        ));
     }
 
     #[test]
