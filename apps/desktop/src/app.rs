@@ -21952,20 +21952,34 @@ impl VibexWorkbench {
                     | WorktreeLifecycleDisplayState::Discarding
             )
         });
-        let status_indicator = if projection.agent_summary.running > 0 || lifecycle_running {
-            Spinner::new()
+        let has_unread_completion = self.sessions.iter().any(|session| {
+            session.deleted_at_ms.is_none()
+                && self
+                    .unread_agent_completion_session_ids
+                    .contains(session.id.as_str())
+                && (session.workspace_id == workspace.id
+                    || (session.project_id == workspace.project_id
+                        && session.workspace_root == workspace.root_path
+                        && session.workspace_mode == workspace.mode))
+        });
+        let workspace_status = sidebar_workspace_status(
+            projection.agent_summary,
+            lifecycle_running,
+            lifecycle_error,
+            has_unread_completion,
+        );
+        let status_indicator = match workspace_status {
+            SidebarWorkspaceStatus::Running => Spinner::new()
                 .icon(Icon::new(IconName::LoaderCircle))
                 .color(cx.theme().primary)
                 .xsmall()
-                .into_any_element()
-        } else if lifecycle_error || projection.agent_summary.failed > 0 {
-            sidebar_status_dot(cx.theme().danger)
-        } else if projection.agent_summary.needs_input > 0 {
-            sidebar_status_dot(cx.theme().warning)
-        } else if projection.agent_summary.total == 0 {
-            sidebar_status_dot(cx.theme().sidebar_foreground.opacity(0.28))
-        } else {
-            sidebar_status_dot(cx.theme().success)
+                .into_any_element(),
+            SidebarWorkspaceStatus::Error => sidebar_status_dot(cx.theme().danger),
+            SidebarWorkspaceStatus::NeedsInput => sidebar_status_dot(cx.theme().warning),
+            SidebarWorkspaceStatus::UnreadCompletion => sidebar_status_dot(cx.theme().success),
+            SidebarWorkspaceStatus::Complete => {
+                sidebar_status_dot(cx.theme().sidebar_foreground.opacity(0.28))
+            }
         };
         let workspace_menu_entity = cx.weak_entity();
         let workspace_menu_branch = branch.clone();
@@ -37993,6 +38007,34 @@ fn sidebar_status_dot(color: Hsla) -> AnyElement {
         .into_any_element()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarWorkspaceStatus {
+    Running,
+    Error,
+    NeedsInput,
+    UnreadCompletion,
+    Complete,
+}
+
+fn sidebar_workspace_status(
+    summary: vibex_desktop_model::WorkspaceAgentSummary,
+    lifecycle_running: bool,
+    lifecycle_error: bool,
+    has_unread_completion: bool,
+) -> SidebarWorkspaceStatus {
+    if summary.running > 0 || lifecycle_running {
+        SidebarWorkspaceStatus::Running
+    } else if lifecycle_error || summary.failed > 0 {
+        SidebarWorkspaceStatus::Error
+    } else if summary.needs_input > 0 {
+        SidebarWorkspaceStatus::NeedsInput
+    } else if has_unread_completion {
+        SidebarWorkspaceStatus::UnreadCompletion
+    } else {
+        SidebarWorkspaceStatus::Complete
+    }
+}
+
 fn sidebar_session_status_indicator(state: AgentSessionState, cx: &App) -> AnyElement {
     match state {
         AgentSessionState::Running | AgentSessionState::Initializing => Spinner::new()
@@ -43384,6 +43426,59 @@ mod tests {
             }]
         ));
         assert!(unread.is_empty());
+    }
+
+    #[test]
+    fn workspace_status_prioritizes_running_errors_and_unread_completions() {
+        let complete = vibex_desktop_model::WorkspaceAgentSummary::default();
+        assert_eq!(
+            sidebar_workspace_status(complete, false, false, false),
+            SidebarWorkspaceStatus::Complete
+        );
+        assert_eq!(
+            sidebar_workspace_status(complete, false, false, true),
+            SidebarWorkspaceStatus::UnreadCompletion
+        );
+        assert_eq!(
+            sidebar_workspace_status(
+                vibex_desktop_model::WorkspaceAgentSummary {
+                    needs_input: 1,
+                    ..complete
+                },
+                false,
+                false,
+                true,
+            ),
+            SidebarWorkspaceStatus::NeedsInput
+        );
+        assert_eq!(
+            sidebar_workspace_status(
+                vibex_desktop_model::WorkspaceAgentSummary {
+                    failed: 1,
+                    ..complete
+                },
+                false,
+                false,
+                true,
+            ),
+            SidebarWorkspaceStatus::Error
+        );
+        assert_eq!(
+            sidebar_workspace_status(
+                vibex_desktop_model::WorkspaceAgentSummary {
+                    running: 1,
+                    ..complete
+                },
+                false,
+                true,
+                true,
+            ),
+            SidebarWorkspaceStatus::Running
+        );
+        assert_eq!(
+            sidebar_workspace_status(complete, true, true, true),
+            SidebarWorkspaceStatus::Running
+        );
     }
 
     #[test]
