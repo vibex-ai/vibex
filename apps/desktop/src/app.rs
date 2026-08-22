@@ -184,7 +184,8 @@ const SIDEBAR_LOGO_DISPLAY_SIZE: f32 = 14.0;
 const SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE: f32 = 24.0;
 const SIDEBAR_WORKSPACE_STATUS_TOP_OFFSET: f32 = 4.0;
 const SIDEBAR_ICON_TITLE_GAP: f32 = 4.0;
-const SIDEBAR_TOP_LEVEL_PROJECT_OFFSET: f32 = -12.0;
+const SIDEBAR_TOP_LEVEL_PROJECT_OFFSET: f32 = -8.0;
+const SIDEBAR_NESTED_PROJECT_INDENT: f32 = 8.0;
 const SIDEBAR_PROJECT_LOGO_IMAGE_SIZE: u32 = 256;
 const SIDEBAR_PROJECT_LOGO_MAX_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 const SIDEBAR_PROJECT_LOGO_MAX_SOURCE_PIXELS: u64 = 40_000_000;
@@ -20617,7 +20618,12 @@ impl VibexWorkbench {
                     .gap(px(SIDEBAR_ICON_TITLE_GAP))
                     .when(self.sidebar_batch_mode, |this| this.pl(px(28.0)).pr_2())
                     .when(!self.sidebar_batch_mode, |this| {
-                        this.pl(px(if depth == 0 { 0.0 } else { 8.0 })).pr(px(92.0))
+                        this.pl(px(if depth == 0 {
+                            0.0
+                        } else {
+                            SIDEBAR_NESTED_PROJECT_INDENT
+                        }))
+                        .pr(px(92.0))
                     })
                     .text_color(if active {
                         cx.theme().sidebar_foreground
@@ -20757,6 +20763,7 @@ impl VibexWorkbench {
                         workspace,
                         reorder_enabled,
                         strings,
+                        depth,
                         cx,
                     ));
                 }
@@ -20900,6 +20907,7 @@ impl VibexWorkbench {
         projection: &SidebarWorkspaceProjection,
         reorder_enabled: bool,
         strings: Strings,
+        depth: usize,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let workspace = projection.workspace.clone();
@@ -20985,6 +20993,11 @@ impl VibexWorkbench {
             .id(format!("sidebar-workspace-row-{workspace_id}"))
             .group(hover_group.clone())
             .relative()
+            .left(px(if depth == 0 {
+                SIDEBAR_TOP_LEVEL_PROJECT_OFFSET
+            } else {
+                SIDEBAR_NESTED_PROJECT_INDENT
+            }))
             .w_full()
             .min_w_0()
             .min_h(px(44.0))
@@ -45063,9 +45076,18 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n        let mut session_elements"))
             .map(|(body, _)| body)
             .expect("project row should remain inspectable");
-        assert!(source.contains("const SIDEBAR_TOP_LEVEL_PROJECT_OFFSET: f32 = -12.0;"));
+        assert!(source.contains("const SIDEBAR_TOP_LEVEL_PROJECT_OFFSET: f32 = -8.0;"));
+        assert!(source.contains("const SIDEBAR_NESTED_PROJECT_INDENT: f32 = 8.0;"));
         assert!(project_row.contains(
             ".when(depth == 0, |this| {\n                this.left(px(SIDEBAR_TOP_LEVEL_PROJECT_OFFSET))"
+        ));
+        let workspace = source
+            .split_once("    fn render_sidebar_workspace(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_session("))
+            .map(|(body, _)| body)
+            .expect("workspace renderer should remain inspectable");
+        assert!(workspace.contains(
+            ".left(px(if depth == 0 {\n                SIDEBAR_TOP_LEVEL_PROJECT_OFFSET\n            } else {\n                SIDEBAR_NESTED_PROJECT_INDENT"
         ));
     }
 
