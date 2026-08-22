@@ -1537,6 +1537,31 @@ fn right_rail_activity_button(id: impl Into<ElementId>, icon: Icon) -> Button {
         .icon(icon)
 }
 
+fn git_pending_commit_count(status: Option<&GitStatusSummary>) -> u32 {
+    status.map_or(0, |status| status.staged_count)
+}
+
+fn git_activity_badge(count: u32, cx: &Context<VibexWorkbench>) -> AnyElement {
+    div()
+        .absolute()
+        .top(px(-4.0))
+        .right(px(-4.0))
+        .min_w(px(16.0))
+        .h(px(16.0))
+        .px_1()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .bg(cx.theme().success)
+        .text_color(cx.theme().background)
+        .font_family("monospace")
+        .text_xs()
+        .font_semibold()
+        .child(count.to_string())
+        .into_any_element()
+}
+
 fn toggled_sidebar_display(
     docked: bool,
     requested_open: bool,
@@ -17801,16 +17826,22 @@ impl VibexWorkbench {
             cx.listener(|this, _, _, cx| this.toggle_right_rail_mode(RightRailMode::Files, cx)),
         )
         .into_any_element();
+        let pending_commit_count =
+            git_pending_commit_count(self.code_workbench.read(cx).git_status());
         let git =
             right_rail_activity_button("activity-git", right_rail_mode_icon(RightRailMode::Git))
                 .tooltip("Git")
                 .selected(panel_open && active_mode == RightRailMode::Git)
-                .on_click(
-                    cx.listener(|this, _, _, cx| {
-                        this.toggle_right_rail_mode(RightRailMode::Git, cx)
-                    }),
-                )
-                .into_any_element();
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.toggle_right_rail_mode(RightRailMode::Git, cx)
+                }));
+        let git = div()
+            .relative()
+            .child(git)
+            .when(pending_commit_count > 0, |this| {
+                this.child(git_activity_badge(pending_commit_count, cx))
+            })
+            .into_any_element();
         let terminal =
             right_rail_activity_button("activity-terminal", Icon::new(IconName::SquareTerminal))
                 .tooltip(locale::text("New terminal", "新建终端", "新增終端機"))
