@@ -1562,8 +1562,8 @@ fn git_activity_badge(count: u32, cx: &Context<VibexWorkbench>) -> AnyElement {
         .items_center()
         .justify_center()
         .rounded_full()
-        .bg(cx.theme().success)
-        .text_color(cx.theme().background)
+        .bg(cx.theme().success.opacity(0.18))
+        .text_color(cx.theme().success)
         .font_family("monospace")
         .text_xs()
         .font_semibold()
@@ -45932,6 +45932,19 @@ mod tests {
         assert!(renderer.contains("activity-git"));
         assert!(renderer.contains("activity-terminal"));
         assert!(!renderer.contains("activity-preview"));
+    }
+
+    #[test]
+    fn git_activity_badge_uses_translucent_success_surface_and_opaque_text() {
+        let source = include_str!("app.rs");
+        let badge = source
+            .split_once("fn git_activity_badge(")
+            .and_then(|(_, tail)| tail.split_once("fn toggled_sidebar_display"))
+            .map(|(body, _)| body)
+            .expect("Git activity badge should remain inspectable");
+
+        assert!(badge.contains(".bg(cx.theme().success.opacity(0.18))"));
+        assert!(badge.contains(".text_color(cx.theme().success)"));
     }
 
     #[test]
