@@ -1236,6 +1236,47 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_projection_respects_workspace_order_per_project() {
+        let project = project();
+        let checkout = workspace(&project, WorkspaceMode::CurrentCheckout, "/repo");
+        let first = workspace(&project, WorkspaceMode::VibexWorktree, "/wt-first");
+        let second = workspace(&project, WorkspaceMode::VibexWorktree, "/wt-second");
+        let mut workspace_order = BTreeMap::new();
+        workspace_order.insert(
+            project.id.as_str().to_string(),
+            vec![
+                second.id.as_str().to_string(),
+                checkout.id.as_str().to_string(),
+            ],
+        );
+
+        let projects = sidebar_project_projections_with_workspace_order(
+            &[
+                (project.clone(), checkout.clone()),
+                (project.clone(), first.clone()),
+                (project, second.clone()),
+            ],
+            &[],
+            &BTreeMap::new(),
+            &[],
+            &[],
+            &workspace_order,
+            &BTreeSet::new(),
+            "",
+        );
+
+        let ids = projects[0]
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.workspace.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![second.id.as_str(), checkout.id.as_str(), first.id.as_str()]
+        );
+    }
+
+    #[test]
     fn sidebar_projection_places_new_sessions_before_persisted_manual_order() {
         let project = project();
         let checkout = workspace(&project, WorkspaceMode::CurrentCheckout, "/repo");

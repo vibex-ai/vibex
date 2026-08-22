@@ -3359,7 +3359,15 @@ impl Render for SidebarWorkspaceDrag {
             .shadow_lg()
             .opacity(0.94)
             .child(sidebar_icon("icons/vibex/git-branch.svg").size(px(14.0)))
-            .child(div().min_w_0().flex_1().truncate().text_sm().font_medium().child(self.label.clone()))
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .truncate()
+                    .text_sm()
+                    .font_medium()
+                    .child(self.label.clone()),
+            )
     }
 }
 
@@ -7628,16 +7636,57 @@ impl VibexWorkbench {
             .is_some_and(|(_, target_scope)| target_scope == scope)
     }
 
-    fn start_sidebar_workspace_drag(&mut self, drag: &SidebarWorkspaceDrag, offset: f32, cx: &mut Context<Self>) {
+    fn start_sidebar_workspace_drag(
+        &mut self,
+        drag: &SidebarWorkspaceDrag,
+        cursor_offset_y: f32,
+        cx: &mut Context<Self>,
+    ) {
         let groups = self.sidebar_workspace_groups("");
-        let Some(group) = groups.iter().find(|group| group.project.id.as_str() == drag.project_id) else { return; };
-        let original_ids = group.workspaces.iter().map(|workspace| workspace.workspace.id.as_str().to_string()).collect::<Vec<_>>();
-        if !original_ids.iter().any(|id| id == &drag.workspace_id) { return; }
-        let target = reorder_target_from_cursor_offset(&original_ids, &drag.workspace_id, offset, SIDEBAR_WORKSPACE_ROW_HEIGHT, SIDEBAR_WORKSPACE_REORDER_GAP)
-            .filter(|(id, _)| id != &drag.workspace_id);
-        let preview_ids = target.as_ref().map(|(id, after)| reordered_string_ids_many(&original_ids, &[drag.workspace_id.clone()], id, *after)).unwrap_or_else(|| original_ids.clone());
-        self.sidebar_workspace_drag_state = Some(SidebarWorkspaceDragState { workspace_id: drag.workspace_id.clone(), project_id: drag.project_id.clone(), original_ids, preview_ids });
-        self.sidebar_workspace_drop_target = target.map(|(workspace_id, after)| SidebarWorkspaceDropTarget { workspace_id, after });
+        let Some(group) = groups
+            .iter()
+            .find(|group| group.project.id.as_str() == drag.project_id)
+        else {
+            return;
+        };
+        let original_ids = group
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.workspace.id.as_str().to_string())
+            .collect::<Vec<_>>();
+        if !original_ids.iter().any(|id| id == &drag.workspace_id) {
+            return;
+        }
+        let initial_target = reorder_target_from_cursor_offset(
+            &original_ids,
+            &drag.workspace_id,
+            cursor_offset_y,
+            SIDEBAR_WORKSPACE_ROW_HEIGHT,
+            SIDEBAR_WORKSPACE_REORDER_GAP,
+        )
+        .filter(|(target_id, _)| target_id != &drag.workspace_id);
+        let preview_ids = initial_target
+            .as_ref()
+            .map(|(target_id, after)| {
+                reordered_string_ids_many(
+                    &original_ids,
+                    &[drag.workspace_id.clone()],
+                    target_id,
+                    *after,
+                )
+            })
+            .unwrap_or_else(|| original_ids.clone());
+        self.sidebar_workspace_drag_state = Some(SidebarWorkspaceDragState {
+            workspace_id: drag.workspace_id.clone(),
+            project_id: drag.project_id.clone(),
+            original_ids,
+            preview_ids,
+        });
+        self.sidebar_workspace_drop_target =
+            initial_target.map(|(workspace_id, after)| SidebarWorkspaceDropTarget {
+                workspace_id,
+                after,
+            });
         self.sidebar_project_drop_target = None;
         self.sidebar_session_drop_target = None;
         self.sidebar_organization_drop_target = None;
@@ -7645,28 +7694,99 @@ impl VibexWorkbench {
         cx.notify();
     }
 
-    fn preview_sidebar_workspace_reorder(&mut self, drag: &SidebarWorkspaceDrag, target_id: &str, after: bool, cx: &mut Context<Self>) {
-        let Some(state) = self.sidebar_workspace_drag_state.as_mut().filter(|state| state.workspace_id == drag.workspace_id && state.project_id == drag.project_id) else { return; };
-        state.preview_ids = reordered_string_ids_many(&state.original_ids, std::slice::from_ref(&drag.workspace_id), target_id, after);
-        let target = SidebarWorkspaceDropTarget { workspace_id: target_id.to_string(), after };
-        if self.sidebar_workspace_drop_target.as_ref() != Some(&target) {
-            self.sidebar_workspace_drop_target = Some(target);
+    fn preview_sidebar_workspace_reorder(
+        &mut self,
+        drag: &SidebarWorkspaceDrag,
+        target_id: &str,
+        after: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.sidebar_workspace_drag_state.as_mut().filter(|state| {
+            state.workspace_id == drag.workspace_id && state.project_id == drag.project_id
+        }) else {
+            return;
+        };
+        state.preview_ids = reordered_string_ids_many(
+            &state.original_ids,
+            std::slice::from_ref(&drag.workspace_id),
+            target_id,
+            after,
+        );
+        let next_target = SidebarWorkspaceDropTarget {
+            workspace_id: target_id.to_string(),
+            after,
+        };
+        if self.sidebar_workspace_drop_target.as_ref() != Some(&next_target) {
+            self.sidebar_workspace_drop_target = Some(next_target);
             cx.notify();
         }
     }
 
-    fn finish_sidebar_workspace_drag(&mut self, project_id: &str, workspace_id: &str, cx: &mut Context<Self>) {
-        let Some(state) = self.sidebar_workspace_drag_state.take().filter(|state| state.project_id == project_id && state.workspace_id == workspace_id) else { return; };
-        let target = self.sidebar_workspace_drop_target.take().map(|target| (target.workspace_id, target.after)).or_else(|| reorder_target_from_preview_many(&state.original_ids, &state.preview_ids, std::slice::from_ref(&state.workspace_id)));
-        if let Some((target_id, after)) = target {
-            self.move_workspace_order_relative(project_id, &state.workspace_id, &target_id, after, cx);
-        } else { cx.notify(); }
+    fn finish_sidebar_workspace_drag(
+        &mut self,
+        project_id: &str,
+        workspace_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self
+            .sidebar_workspace_drag_state
+            .take()
+            .filter(|state| state.project_id == project_id && state.workspace_id == workspace_id)
+        else {
+            return;
+        };
+        let direct_target = self.sidebar_workspace_drop_target.take();
+        let fallback_target = direct_target
+            .map(|target| (target.workspace_id, target.after))
+            .or_else(|| {
+                reorder_target_from_preview_many(
+                    &state.original_ids,
+                    &state.preview_ids,
+                    std::slice::from_ref(&state.workspace_id),
+                )
+            });
+        if let Some((target_id, after)) = fallback_target {
+            self.move_workspace_order_relative(
+                project_id,
+                &state.workspace_id,
+                &target_id,
+                after,
+                cx,
+            );
+        } else {
+            cx.notify();
+        }
     }
 
-    fn move_workspace_order_relative(&mut self, project_id: &str, moving_id: &str, target_id: &str, after: bool, cx: &mut Context<Self>) {
-        let ids = self.sidebar_workspace_groups("").iter().find(|group| group.project.id.as_str() == project_id).map(|group| group.workspaces.iter().map(|workspace| workspace.workspace.id.as_str().to_string()).collect::<Vec<_>>()).unwrap_or_default();
-        if ids.is_empty() { return; }
-        let order = self.ui_state.sidebar.workspace_order.entry(project_id.to_string()).or_default();
+    fn move_workspace_order_relative(
+        &mut self,
+        project_id: &str,
+        moving_id: &str,
+        target_id: &str,
+        after: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let ids = self
+            .sidebar_workspace_groups("")
+            .iter()
+            .find(|group| group.project.id.as_str() == project_id)
+            .map(|group| {
+                group
+                    .workspaces
+                    .iter()
+                    .map(|workspace| workspace.workspace.id.as_str().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if ids.is_empty() {
+            return;
+        }
+        let order = self
+            .ui_state
+            .sidebar
+            .workspace_order
+            .entry(project_id.to_string())
+            .or_default();
         complete_string_order(order, ids);
         if move_string_relative(order, moving_id, target_id, after) {
             self.queue_ui_state();
@@ -7768,7 +7888,6 @@ impl VibexWorkbench {
         });
         self.sidebar_project_drop_target = initial_target
             .map(|(project_id, after)| SidebarProjectDropTarget { project_id, after });
-        self.sidebar_workspace_drop_target = None;
         self.sidebar_organization_drop_target = None;
         self.sidebar_organization_root_drop_target = None;
         if let Some(target) = self.sidebar_project_drop_target.clone() {
@@ -7996,7 +8115,6 @@ impl VibexWorkbench {
                 .ok()
                 .map(|session_id| SidebarSessionDropTarget { session_id, after })
         });
-        self.sidebar_workspace_drop_target = None;
         self.sidebar_organization_drop_target = None;
         self.sidebar_organization_root_drop_target = None;
         if let Some(target) = self.sidebar_session_drop_target.clone() {
@@ -11571,7 +11689,12 @@ impl VibexWorkbench {
             .map(|option| {
                 format!(
                     "{} / {} / {}",
-                    option.agent_label, option.auth_source_label, option.model_label
+                    option.agent_label,
+                    runtime_auth_source_selection_label(
+                        &selection.auth_source,
+                        &option.auth_source_label,
+                    ),
+                    option.model_label
                 )
             })
             .unwrap_or_else(|| {
@@ -20011,7 +20134,11 @@ impl VibexWorkbench {
                         cx.stop_propagation();
                     }))
                     .on_drop(cx.listener(|this, drag: &SidebarWorkspaceDrag, _, cx| {
-                        this.finish_sidebar_workspace_drag(&drag.project_id, &drag.workspace_id, cx);
+                        this.finish_sidebar_workspace_drag(
+                            &drag.project_id,
+                            &drag.workspace_id,
+                            cx,
+                        );
                         cx.stop_propagation();
                     }))
                     .px_4()
@@ -22000,23 +22127,49 @@ impl VibexWorkbench {
         let workspace_menu_branch = branch.clone();
         let workspace_menu_project_id = project_for_folder.clone();
         let workspace_menu_workspace_id = workspace_for_folder.clone();
-        let active_workspace_drag = self.sidebar_workspace_drag_state.clone().filter(|drag| cx.has_active_drag() && drag.project_id == project_id);
-        let workspace_drop_after = self.sidebar_workspace_drop_target.as_ref().filter(|target| target.workspace_id == workspace_id).map(|target| target.after);
-        let workspace_drag_payload = SidebarWorkspaceDrag { workspace_id: workspace_id.clone(), project_id: project_id.clone(), label: workspace_title.clone().into() };
+        let active_workspace_drag = self
+            .sidebar_workspace_drag_state
+            .clone()
+            .filter(|drag| cx.has_active_drag() && drag.project_id == project_id);
+        let workspace_drop_after = self
+            .sidebar_workspace_drop_target
+            .as_ref()
+            .filter(|target| target.workspace_id == workspace_id)
+            .map(|target| target.after);
+        let workspace_drag_payload = SidebarWorkspaceDrag {
+            workspace_id: workspace_id.clone(),
+            project_id: project_id.clone(),
+            label: workspace_title.clone().into(),
+        };
         let workspace_drag_entity = cx.weak_entity();
-        let drag_target_workspace_id = workspace_id.clone();
-        let drag_target_project_id = project_id.clone();
+        let workspace_drag_target_id = workspace_id.clone();
+        let workspace_drag_target_project_id = project_id.clone();
         let release_workspace_id = workspace_id.clone();
-        let release_project_id = project_id.clone();
+        let release_workspace_project_id = project_id.clone();
         let release_out_workspace_id = workspace_id.clone();
-        let release_out_project_id = project_id.clone();
-        let workspace_reorder_offset = active_workspace_drag.as_ref().and_then(|drag| sidebar_reorder_row_offset(&drag.original_ids, &drag.preview_ids, &workspace_id)).map(|rows| px(rows as f32 * (SIDEBAR_WORKSPACE_ROW_HEIGHT + SIDEBAR_WORKSPACE_REORDER_GAP)));
-        let workspace_reorder_animation_id = active_workspace_drag.as_ref().zip(self.sidebar_workspace_drop_target.as_ref()).map(|(drag, target)| format!("sidebar-workspace-reorder-{}-{}-{}-{}", drag.project_id, drag.workspace_id, target.after, workspace_id));
+        let release_out_workspace_project_id = project_id.clone();
         let workspace_edit_id = workspace.id.clone();
         let workspace_edit_title = workspace_title.clone();
         let workspace_edit_branch = branch.clone();
         let workspace_delete = workspace.clone();
         let workspace_delete_title = workspace_title.clone();
+        let workspace_reorder_offset = active_workspace_drag
+            .as_ref()
+            .and_then(|drag| {
+                sidebar_reorder_row_offset(&drag.original_ids, &drag.preview_ids, &workspace_id)
+            })
+            .map(|rows| {
+                px(rows as f32 * (SIDEBAR_WORKSPACE_ROW_HEIGHT + SIDEBAR_WORKSPACE_REORDER_GAP))
+            });
+        let workspace_reorder_animation_id = active_workspace_drag
+            .as_ref()
+            .zip(self.sidebar_workspace_drop_target.as_ref())
+            .map(|(drag, target)| {
+                format!(
+                    "sidebar-workspace-reorder-{}-{}-{}-{}",
+                    drag.project_id, drag.workspace_id, target.after, workspace_id
+                )
+            });
         let row = div()
             .id(format!("sidebar-workspace-row-{workspace_id}"))
             .group(hover_group.clone())
@@ -22034,29 +22187,73 @@ impl VibexWorkbench {
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.activate_and_toggle_sidebar_workspace(workspace_for_click.clone(), cx)
             }))
-            .when_some(workspace_drop_after, |this, after| this.child(div().absolute().left_0().right_0().h(px(2.0)).bg(cx.theme().drag_border).map(|line| if after { line.bottom_0() } else { line.top_0() })))
+            .when_some(workspace_drop_after, |this, after| {
+                this.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .h(px(2.0))
+                        .bg(cx.theme().drag_border)
+                        .map(|line| if after { line.bottom_0() } else { line.top_0() }),
+                )
+            })
             .when(reorder_enabled, |this| {
-                this.on_mouse_up(MouseButton::Left, cx.listener(move |this, _, _, cx| this.finish_sidebar_workspace_drag(&release_project_id, &release_workspace_id, cx)))
-                    .on_mouse_up_out(MouseButton::Left, cx.listener(move |this, _, _, cx| this.finish_sidebar_workspace_drag(&release_out_project_id, &release_out_workspace_id, cx)))
-                    .on_drag(workspace_drag_payload, move |drag, cursor_offset, _, cx| {
-                        cx.stop_propagation();
-                        let _ = workspace_drag_entity.update(cx, |this, cx| this.start_sidebar_workspace_drag(drag, f32::from(cursor_offset.y), cx));
-                        cx.new(|_| drag.clone())
-                    })
-                    .on_drag_move(cx.listener(move |this, event: &DragMoveEvent<SidebarWorkspaceDrag>, _, cx| {
+                this.on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.finish_sidebar_workspace_drag(
+                            &release_out_workspace_project_id,
+                            &release_out_workspace_id,
+                            cx,
+                        );
+                    }),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.finish_sidebar_workspace_drag(
+                            &release_workspace_project_id,
+                            &release_workspace_id,
+                            cx,
+                        );
+                    }),
+                )
+                .on_drag(workspace_drag_payload, move |drag, cursor_offset, _, cx| {
+                    cx.stop_propagation();
+                    let _ = workspace_drag_entity.update(cx, |this, cx| {
+                        this.start_sidebar_workspace_drag(drag, f32::from(cursor_offset.y), cx);
+                    });
+                    cx.new(|_| drag.clone())
+                })
+                .on_drag_move(cx.listener(
+                    move |this, event: &DragMoveEvent<SidebarWorkspaceDrag>, _, cx| {
                         let position = event.event.position;
-                        let inside = position.x >= event.bounds.left() - px(SIDEBAR_DRAG_HORIZONTAL_SLOP)
-                            && position.x <= event.bounds.right() + px(SIDEBAR_DRAG_HORIZONTAL_SLOP)
-                            && position.y >= event.bounds.top() - px(SIDEBAR_WORKSPACE_REORDER_GAP / 2.0)
-                            && position.y <= event.bounds.bottom() + px(SIDEBAR_WORKSPACE_REORDER_GAP / 2.0);
-                        if inside {
-                            let drag = event.drag(cx).clone();
-                            if drag.project_id == drag_target_project_id && drag.workspace_id != drag_target_workspace_id {
-                                cx.stop_propagation();
-                                this.preview_sidebar_workspace_reorder(&drag, &drag_target_workspace_id, position.y >= event.bounds.center().y, cx);
-                            }
+                        let inside_target = position.x
+                            >= event.bounds.left() - px(SIDEBAR_DRAG_HORIZONTAL_SLOP)
+                            && position.x
+                                <= event.bounds.right() + px(SIDEBAR_DRAG_HORIZONTAL_SLOP)
+                            && position.y
+                                >= event.bounds.top() - px(SIDEBAR_WORKSPACE_REORDER_GAP / 2.0)
+                            && position.y
+                                <= event.bounds.bottom() + px(SIDEBAR_WORKSPACE_REORDER_GAP / 2.0);
+                        if !inside_target {
+                            return;
                         }
-                    }))
+                        let drag = event.drag(cx).clone();
+                        if drag.project_id == workspace_drag_target_project_id
+                            && drag.workspace_id != workspace_drag_target_id
+                        {
+                            cx.stop_propagation();
+                            this.preview_sidebar_workspace_reorder(
+                                &drag,
+                                &workspace_drag_target_id,
+                                position.y >= event.bounds.center().y,
+                                cx,
+                            );
+                        }
+                    },
+                ))
             })
             .on_drop(cx.listener(|this, drag: &SidebarWorkspaceDrag, _, cx| {
                 this.finish_sidebar_workspace_drag(&drag.project_id, &drag.workspace_id, cx);
@@ -22208,7 +22405,17 @@ impl VibexWorkbench {
                 return row.left(px(workspace_offset)).into_any_element();
             }
             let workspace = row.left(px(workspace_offset));
-            return Transition::new(SIDEBAR_REORDER_TRANSITION_DURATION).ease(ease_out_cubic).slide_y(workspace_reorder_offset.unwrap(), px(0.0)).apply(workspace, workspace_reorder_animation_id.unwrap()).into_any_element();
+            return if let (Some(offset), Some(animation_id)) =
+                (workspace_reorder_offset, workspace_reorder_animation_id)
+            {
+                Transition::new(SIDEBAR_REORDER_TRANSITION_DURATION)
+                    .ease(ease_out_cubic)
+                    .slide_y(offset, px(0.0))
+                    .apply(workspace, animation_id)
+                    .into_any_element()
+            } else {
+                workspace.into_any_element()
+            };
         }
 
         let mut sessions = self.render_sidebar_workspace_children(
@@ -22245,10 +22452,15 @@ impl VibexWorkbench {
                         SIDEBAR_WORKSPACE_SESSION_INDENT - SIDEBAR_WORKSPACE_SESSION_CARD_OVERHANG
                     ))
                     .children(sessions),
-            )
-            ;
-        if let (Some(offset), Some(animation_id)) = (workspace_reorder_offset, workspace_reorder_animation_id) {
-            Transition::new(SIDEBAR_REORDER_TRANSITION_DURATION).ease(ease_out_cubic).slide_y(offset, px(0.0)).apply(workspace, animation_id).into_any_element()
+            );
+        if let (Some(offset), Some(animation_id)) =
+            (workspace_reorder_offset, workspace_reorder_animation_id)
+        {
+            Transition::new(SIDEBAR_REORDER_TRANSITION_DURATION)
+                .ease(ease_out_cubic)
+                .slide_y(offset, px(0.0))
+                .apply(workspace, animation_id)
+                .into_any_element()
         } else {
             workspace.into_any_element()
         }
@@ -25071,28 +25283,23 @@ impl VibexWorkbench {
             .trigger(mode_trigger)
             .child(mode_panel)
             .into_any_element();
-        let workspace_controls = v_flex()
-            .w_full()
-            .min_w_0()
-            .mt_2()
-            .gap(px(6.0))
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_start()
-                    .gap_2()
-                    .px_2()
-                    .child(div().flex_none().child(workspace_button))
-                    .when(show_location_control, |this| {
-                        this.child(div().flex_none().child(location_control))
-                    })
-                    .when(worktree_selected, |this| {
-                        this.child(div().flex_none().child(base_ref_button))
-                    }),
-            );
+        let workspace_controls = v_flex().w_full().min_w_0().mt_2().gap(px(6.0)).child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .flex_wrap()
+                .items_center()
+                .justify_start()
+                .gap_2()
+                .px_2()
+                .child(div().flex_none().child(workspace_button))
+                .when(show_location_control, |this| {
+                    this.child(div().flex_none().child(location_control))
+                })
+                .when(worktree_selected, |this| {
+                    this.child(div().flex_none().child(base_ref_button))
+                }),
+        );
 
         let worktree_form_valid = !worktree_selected
             || (worktree_ready
@@ -50174,10 +50381,21 @@ mod tests {
         assert!(menu_view.contains("Authentication"));
         for cascade in [new_session, current_session] {
             assert!(cascade.contains("RuntimeAuthSourceKind::AgentAccount"));
+            assert!(cascade.contains("auth_source_choices"));
+            assert!(cascade.contains("sort_by_key"));
+            assert!(
+                cascade.contains("!matches!(source.kind, RuntimeAuthSourceKind::AgentAccount)")
+            );
             assert!(cascade.contains("RuntimeAuthSourceAvailability::Verifying"));
             assert!(cascade.contains("RuntimeAuthSourceAvailability::DiscoveringModels"));
             assert!(cascade.contains("ComposerRuntimeMenuView::Authentication"));
             assert!(cascade.contains("load_runtime_authentication_menu("));
+            assert!(cascade.contains("edit-agent-config"));
+            assert!(cascade.contains("open_agent_auth_management"));
+            let footer = cascade
+                .find("edit-agent-config")
+                .expect("agent configuration footer should be rendered");
+            assert!(cascade[..footer].rfind("children(rows)").is_some());
         }
         assert!(operations.contains("list_agent_auth_contexts()"));
         assert!(operations.contains("list_agent_auth_methods("));
@@ -52100,7 +52318,7 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
         };
-        let projects = sidebar_project_projections(
+        let projects = vibex_desktop_model::sidebar_project_projections(
             &[(project, worktree)],
             &[],
             &BTreeMap::new(),
