@@ -23238,7 +23238,11 @@ impl VibexWorkbench {
                                     && !has_unread_completion
                                     && display_state != AgentSessionState::Idle,
                                 |this| {
-                                    this.child(sidebar_session_status_indicator(display_state, cx))
+                                    this.child(sidebar_session_status_indicator(
+                                        display_state,
+                                        auto_continue_enabled,
+                                        cx,
+                                    ))
                                 },
                             )
                             .when(!pinned && session_needs_approval, |this| {
@@ -38459,11 +38463,19 @@ fn sidebar_workspace_status(
     }
 }
 
-fn sidebar_session_status_indicator(state: AgentSessionState, cx: &App) -> AnyElement {
+fn sidebar_session_status_indicator(
+    state: AgentSessionState,
+    auto_continue_enabled: bool,
+    cx: &App,
+) -> AnyElement {
     match state {
         AgentSessionState::Running | AgentSessionState::Initializing => Spinner::new()
             .icon(Icon::new(IconName::LoaderCircle))
-            .color(cx.theme().primary)
+            .color(if auto_continue_enabled {
+                cx.theme().success
+            } else {
+                cx.theme().primary
+            })
             .xsmall()
             .into_any_element(),
         AgentSessionState::NeedsInput => sidebar_status_dot(cx.theme().warning),
@@ -48575,7 +48587,9 @@ mod tests {
             sidebar_session
                 .contains("let session_generating = display_state == AgentSessionState::Running")
         );
-        assert!(sidebar_session.contains("sidebar_session_status_indicator(display_state, cx)"));
+        assert!(sidebar_session.contains("sidebar_session_status_indicator(\n                                        display_state,\n                                        auto_continue_enabled,\n                                        cx,\n                                    )"));
+        assert!(source.contains(".color(if auto_continue_enabled {"));
+        assert!(source.contains("cx.theme().success"));
         assert!(sidebar_session.contains("!session_needs_approval"));
         assert!(sidebar_session.contains("!has_unread_completion"));
         assert!(sidebar_session.contains("display_state != AgentSessionState::Idle"));
