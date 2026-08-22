@@ -743,6 +743,28 @@ pub fn sidebar_project_projections(
     pinned_session_ids: &BTreeSet<String>,
     query: &str,
 ) -> Vec<SidebarProjectProjection> {
+    sidebar_project_projections_with_workspace_order(
+        workspaces,
+        sessions,
+        contexts,
+        project_order,
+        session_order,
+        &BTreeMap::new(),
+        pinned_session_ids,
+        query,
+    )
+}
+
+pub fn sidebar_project_projections_with_workspace_order(
+    workspaces: &[(ProjectRecord, WorkspaceRecord)],
+    sessions: &[AgentSession],
+    contexts: &BTreeMap<String, WorkspaceContextProjection>,
+    project_order: &[String],
+    session_order: &[String],
+    workspace_order: &BTreeMap<String, Vec<String>>,
+    pinned_session_ids: &BTreeSet<String>,
+    query: &str,
+) -> Vec<SidebarProjectProjection> {
     let query = query.trim().to_lowercase();
     let project_positions = project_order
         .iter()
@@ -817,8 +839,22 @@ pub fn sidebar_project_projections(
     grouped
         .into_iter()
         .filter_map(|(project, mut project_workspaces)| {
+            let workspace_positions = workspace_order.get(project.id.as_str()).map(|ids| {
+                ids.iter()
+                    .enumerate()
+                    .map(|(index, id)| (id.as_str(), index))
+                    .collect::<BTreeMap<_, _>>()
+            });
             project_workspaces.sort_by_key(|workspace| {
                 (
+                    workspace_positions
+                        .as_ref()
+                        .and_then(|positions| positions.get(workspace.id.as_str()).copied())
+                        .is_none(),
+                    workspace_positions
+                        .as_ref()
+                        .and_then(|positions| positions.get(workspace.id.as_str()).copied())
+                        .unwrap_or(usize::MAX),
                     workspace.mode != WorkspaceMode::CurrentCheckout,
                     workspace.created_at_ms,
                     workspace.id.as_str().to_string(),

@@ -309,6 +309,8 @@ const fn default_remember_layout() -> bool {
 pub struct SidebarUiState {
     pub project_order: Vec<String>,
     pub session_order: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub workspace_order: BTreeMap<String, Vec<String>>,
     pub pinned_session_ids: BTreeSet<String>,
     pub collapsed_project_ids: BTreeSet<String>,
     #[serde(default)]
@@ -584,6 +586,15 @@ impl DesktopUiStateV1 {
 
         normalize_ids(&mut self.sidebar.project_order, 1_000);
         normalize_ids(&mut self.sidebar.session_order, 2_000);
+        self.sidebar.workspace_order = std::mem::take(&mut self.sidebar.workspace_order)
+            .into_iter()
+            .filter_map(|(project_id, mut workspace_ids)| {
+                let project_id = bounded_required(&project_id, 256)?;
+                normalize_ids(&mut workspace_ids, 2_000);
+                (!workspace_ids.is_empty()).then_some((project_id, workspace_ids))
+            })
+            .take(1_000)
+            .collect();
         normalize_set(&mut self.sidebar.pinned_session_ids, 2_000);
         normalize_set(&mut self.sidebar.collapsed_project_ids, 1_000);
         normalize_set(&mut self.sidebar.collapsed_workspace_ids, 2_000);
@@ -724,6 +735,15 @@ impl DesktopUiStateV1 {
         self.sidebar
             .project_location_preferences
             .retain(|id, _| references.project_ids.contains(id));
+        self.sidebar
+            .workspace_order
+            .retain(|project_id, workspace_ids| {
+                if !references.project_ids.contains(project_id) {
+                    return false;
+                }
+                workspace_ids.retain(|id| references.workspace_ids.contains(id));
+                !workspace_ids.is_empty()
+            });
         self.sidebar
             .project_appearances
             .retain(|id, _| references.project_ids.contains(id));

@@ -113,7 +113,8 @@ use vibex_desktop_model::{
     WorktreeLifecycleDisplayState, active_collaborations, composer_trigger_at, current_agent_plan,
     custom_worktree_path_is_absolute, parse_unified_diff,
     sidebar_project_custom_logo_file_is_valid, sidebar_project_items,
-    sidebar_project_items_for_workspace, sidebar_project_projections, sidebar_root_items,
+    sidebar_project_items_for_workspace, sidebar_project_projections,
+    sidebar_project_projections_with_workspace_order, sidebar_root_items,
     timeline_agent_message_count_after_sequence, timeline_conversation_turns,
 };
 use vibex_desktop_runtime::{
@@ -224,6 +225,8 @@ const SIDEBAR_PROJECT_GROUP_GAP: f32 = 16.0;
 const SIDEBAR_PROJECT_REORDER_GAP: f32 = 12.0;
 const SIDEBAR_PROJECT_CONTENT_GAP: f32 = 4.0;
 const SIDEBAR_SESSION_REORDER_GAP: f32 = 2.0;
+const SIDEBAR_WORKSPACE_REORDER_GAP: f32 = 5.0;
+const SIDEBAR_WORKSPACE_ROW_HEIGHT: f32 = 44.0;
 const SIDEBAR_SESSION_ROW_HEIGHT: f32 = 40.0;
 const SIDEBAR_DRAG_PREVIEW_WIDTH: f32 = 280.0;
 const SIDEBAR_DRAG_HORIZONTAL_SLOP: f32 = 16.0;
@@ -3332,6 +3335,47 @@ struct SidebarSessionDragState {
 }
 
 #[derive(Clone)]
+struct SidebarWorkspaceDrag {
+    workspace_id: String,
+    project_id: String,
+    label: SharedString,
+}
+
+impl Render for SidebarWorkspaceDrag {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .w(px(SIDEBAR_DRAG_PREVIEW_WIDTH))
+            .h(px(SIDEBAR_WORKSPACE_ROW_HEIGHT))
+            .min_w_0()
+            .gap_2()
+            .px_2()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(cx.theme().drag_border)
+            .bg(cx.theme().sidebar)
+            .text_color(cx.theme().sidebar_foreground)
+            .shadow_lg()
+            .opacity(0.94)
+            .child(sidebar_icon("icons/vibex/git-branch.svg").size(px(14.0)))
+            .child(div().min_w_0().flex_1().truncate().text_sm().font_medium().child(self.label.clone()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SidebarWorkspaceDropTarget {
+    workspace_id: String,
+    after: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SidebarWorkspaceDragState {
+    workspace_id: String,
+    project_id: String,
+    original_ids: Vec<String>,
+    preview_ids: Vec<String>,
+}
+
+#[derive(Clone)]
 struct SidebarProjectDrag {
     project_id: String,
     project_ids: Vec<String>,
@@ -3756,8 +3800,10 @@ pub struct VibexWorkbench {
     sidebar_rename_error: Option<String>,
     sidebar_project_drag_state: Option<SidebarProjectDragState>,
     sidebar_session_drag_state: Option<SidebarSessionDragState>,
+    sidebar_workspace_drag_state: Option<SidebarWorkspaceDragState>,
     sidebar_project_drop_target: Option<SidebarProjectDropTarget>,
     sidebar_session_drop_target: Option<SidebarSessionDropTarget>,
+    sidebar_workspace_drop_target: Option<SidebarWorkspaceDropTarget>,
     sidebar_folder_drag_state: Option<SidebarFolderDragState>,
     sidebar_organization_drop_target: Option<SidebarOrganizationDropTarget>,
     sidebar_organization_root_drop_target:
@@ -4393,8 +4439,10 @@ impl VibexWorkbench {
             sidebar_rename_error: None,
             sidebar_project_drag_state: None,
             sidebar_session_drag_state: None,
+            sidebar_workspace_drag_state: None,
             sidebar_project_drop_target: None,
             sidebar_session_drop_target: None,
+            sidebar_workspace_drop_target: None,
             sidebar_folder_drag_state: None,
             sidebar_organization_drop_target: None,
             sidebar_organization_root_drop_target: None,
@@ -5882,6 +5930,16 @@ impl VibexWorkbench {
             .sidebar
             .collapsed_workspace_ids
             .retain(|id| valid_workspace_ids.contains(id));
+        self.ui_state
+            .sidebar
+            .workspace_order
+            .retain(|project_id, ids| {
+                if !valid_project_ids.contains(project_id) {
+                    return false;
+                }
+                ids.retain(|id| valid_workspace_ids.contains(id));
+                !ids.is_empty()
+            });
         let mut ordered_project_ids = self.ui_state.sidebar.project_order.clone();
         ordered_project_ids.extend(
             self.workspaces
@@ -6417,12 +6475,13 @@ impl VibexWorkbench {
             return cache.groups.clone();
         }
 
-        let groups = Rc::new(sidebar_project_projections(
+        let groups = Rc::new(sidebar_project_projections_with_workspace_order(
             &self.workspaces,
             &self.sessions,
             &self.workspace_contexts,
             &self.ui_state.sidebar.project_order,
             &self.sidebar_state.row_order,
+            &self.ui_state.sidebar.workspace_order,
             &self.sidebar_state.pinned_ids,
             &normalized_query,
         ));
@@ -6572,12 +6631,13 @@ impl VibexWorkbench {
     }
 
     fn ordered_sidebar_session_projects(&self) -> Vec<(String, String)> {
-        let projected = sidebar_project_projections(
+        let projected = sidebar_project_projections_with_workspace_order(
             &self.workspaces,
             &self.sessions,
             &self.workspace_contexts,
             &self.ui_state.sidebar.project_order,
             &self.sidebar_state.row_order,
+            &self.ui_state.sidebar.workspace_order,
             &self.sidebar_state.pinned_ids,
             "",
         );
@@ -6621,12 +6681,13 @@ impl VibexWorkbench {
 
     fn sidebar_session_project_scopes(&self) -> BTreeMap<String, String> {
         let mut projects = BTreeMap::new();
-        for group in sidebar_project_projections(
+        for group in sidebar_project_projections_with_workspace_order(
             &self.workspaces,
             &self.sessions,
             &self.workspace_contexts,
             &self.ui_state.sidebar.project_order,
             &self.sidebar_state.row_order,
+            &self.ui_state.sidebar.workspace_order,
             &self.sidebar_state.pinned_ids,
             "",
         ) {
@@ -6792,12 +6853,13 @@ impl VibexWorkbench {
     ) -> Vec<SidebarOrganizationItem> {
         let (kind, available) = match target {
             SidebarOrganizationItem::Project(_) => {
-                let groups = sidebar_project_projections(
+                let groups = sidebar_project_projections_with_workspace_order(
                     &self.workspaces,
                     &self.sessions,
                     &self.workspace_contexts,
                     &self.ui_state.sidebar.project_order,
                     &self.sidebar_state.row_order,
+                    &self.ui_state.sidebar.workspace_order,
                     &self.sidebar_state.pinned_ids,
                     "",
                 );
@@ -6828,12 +6890,13 @@ impl VibexWorkbench {
                     .get(session_id)
                     .map(String::as_str)
                     .unwrap_or(session.project_id.as_str());
-                let groups = sidebar_project_projections(
+                let groups = sidebar_project_projections_with_workspace_order(
                     &self.workspaces,
                     &self.sessions,
                     &self.workspace_contexts,
                     &self.ui_state.sidebar.project_order,
                     &self.sidebar_state.row_order,
+                    &self.ui_state.sidebar.workspace_order,
                     &self.sidebar_state.pinned_ids,
                     "",
                 );
@@ -7566,6 +7629,53 @@ impl VibexWorkbench {
             .is_some_and(|(_, target_scope)| target_scope == scope)
     }
 
+    fn start_sidebar_workspace_drag(&mut self, drag: &SidebarWorkspaceDrag, offset: f32, cx: &mut Context<Self>) {
+        let groups = self.sidebar_workspace_groups("");
+        let Some(group) = groups.iter().find(|group| group.project.id.as_str() == drag.project_id) else { return; };
+        let original_ids = group.workspaces.iter().map(|workspace| workspace.workspace.id.as_str().to_string()).collect::<Vec<_>>();
+        if !original_ids.iter().any(|id| id == &drag.workspace_id) { return; }
+        let target = reorder_target_from_cursor_offset(&original_ids, &drag.workspace_id, offset, SIDEBAR_WORKSPACE_ROW_HEIGHT, SIDEBAR_WORKSPACE_REORDER_GAP)
+            .filter(|(id, _)| id != &drag.workspace_id);
+        let preview_ids = target.as_ref().map(|(id, after)| reordered_string_ids_many(&original_ids, &[drag.workspace_id.clone()], id, *after)).unwrap_or_else(|| original_ids.clone());
+        self.sidebar_workspace_drag_state = Some(SidebarWorkspaceDragState { workspace_id: drag.workspace_id.clone(), project_id: drag.project_id.clone(), original_ids, preview_ids });
+        self.sidebar_workspace_drop_target = target.map(|(workspace_id, after)| SidebarWorkspaceDropTarget { workspace_id, after });
+        self.sidebar_project_drop_target = None;
+        self.sidebar_session_drop_target = None;
+        self.sidebar_organization_drop_target = None;
+        self.sidebar_organization_root_drop_target = None;
+        cx.notify();
+    }
+
+    fn preview_sidebar_workspace_reorder(&mut self, drag: &SidebarWorkspaceDrag, target_id: &str, after: bool, cx: &mut Context<Self>) {
+        let Some(state) = self.sidebar_workspace_drag_state.as_mut().filter(|state| state.workspace_id == drag.workspace_id && state.project_id == drag.project_id) else { return; };
+        state.preview_ids = reordered_string_ids_many(&state.original_ids, std::slice::from_ref(&drag.workspace_id), target_id, after);
+        let target = SidebarWorkspaceDropTarget { workspace_id: target_id.to_string(), after };
+        if self.sidebar_workspace_drop_target.as_ref() != Some(&target) {
+            self.sidebar_workspace_drop_target = Some(target);
+            cx.notify();
+        }
+    }
+
+    fn finish_sidebar_workspace_drag(&mut self, project_id: &str, workspace_id: &str, cx: &mut Context<Self>) {
+        let Some(state) = self.sidebar_workspace_drag_state.take().filter(|state| state.project_id == project_id && state.workspace_id == workspace_id) else { return; };
+        let target = self.sidebar_workspace_drop_target.take().map(|target| (target.workspace_id, target.after)).or_else(|| reorder_target_from_preview_many(&state.original_ids, &state.preview_ids, std::slice::from_ref(&state.workspace_id)));
+        if let Some((target_id, after)) = target {
+            self.move_workspace_order_relative(project_id, &state.workspace_id, &target_id, after, cx);
+        } else { cx.notify(); }
+    }
+
+    fn move_workspace_order_relative(&mut self, project_id: &str, moving_id: &str, target_id: &str, after: bool, cx: &mut Context<Self>) {
+        let ids = self.sidebar_workspace_groups("").iter().find(|group| group.project.id.as_str() == project_id).map(|group| group.workspaces.iter().map(|workspace| workspace.workspace.id.as_str().to_string()).collect::<Vec<_>>()).unwrap_or_default();
+        if ids.is_empty() { return; }
+        let order = self.ui_state.sidebar.workspace_order.entry(project_id.to_string()).or_default();
+        complete_string_order(order, ids);
+        if move_string_relative(order, moving_id, target_id, after) {
+            self.queue_ui_state();
+            self.invalidate_sidebar_projection_cache();
+            cx.notify();
+        }
+    }
+
     fn start_sidebar_project_drag(
         &mut self,
         drag: &SidebarProjectDrag,
@@ -7659,6 +7769,7 @@ impl VibexWorkbench {
         });
         self.sidebar_project_drop_target = initial_target
             .map(|(project_id, after)| SidebarProjectDropTarget { project_id, after });
+        self.sidebar_workspace_drop_target = None;
         self.sidebar_organization_drop_target = None;
         self.sidebar_organization_root_drop_target = None;
         if let Some(target) = self.sidebar_project_drop_target.clone() {
@@ -7886,6 +7997,7 @@ impl VibexWorkbench {
                 .ok()
                 .map(|session_id| SidebarSessionDropTarget { session_id, after })
         });
+        self.sidebar_workspace_drop_target = None;
         self.sidebar_organization_drop_target = None;
         self.sidebar_organization_root_drop_target = None;
         if let Some(target) = self.sidebar_session_drop_target.clone() {
@@ -14852,14 +14964,6 @@ impl VibexWorkbench {
         ));
     }
 
-    fn retry_new_session_eligibility(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ticket) = self.new_session_workspace.ticket() {
-            self.new_session_workspace.eligibility = None;
-            self.probe_new_session_eligibility(ticket, window, cx);
-            cx.notify();
-        }
-    }
-
     fn sync_new_session_worktree_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name = self.new_session_workspace.worktree_name.clone();
         let path = self.new_session_workspace.worktree_path.clone();
@@ -19894,6 +19998,10 @@ impl VibexWorkbench {
                         this.finish_sidebar_session_drag(&drag.workspace_id, &drag.session_id, cx);
                         cx.stop_propagation();
                     }))
+                    .on_drop(cx.listener(|this, drag: &SidebarWorkspaceDrag, _, cx| {
+                        this.finish_sidebar_workspace_drag(&drag.project_id, &drag.workspace_id, cx);
+                        cx.stop_propagation();
+                    }))
                     .px_4()
                     .py_3()
                     .when(group_elements.is_empty(), |this| {
@@ -20855,96 +20963,112 @@ impl VibexWorkbench {
                     .size_full()
                     .min_w_0()
                     .items_center()
-                    .gap(px(6.0))
-                    .pl(px(if depth == 0 { 0.0 } else { 8.0 }))
+                    .gap_2()
+                    .pl(px(SIDEBAR_WORKSPACE_SESSION_CARD_OVERHANG))
                     .pr_1()
                     .text_color(cx.theme().sidebar_foreground.opacity(0.78))
                     .child(
-                        Icon::new(if collapsed {
-                            IconName::ChevronRight
-                        } else {
-                            IconName::ChevronDown
-                        })
-                        .size(px(12.0))
-                        .flex_none(),
+                        div()
+                            .size(px(SIDEBAR_LOGO_DISPLAY_SIZE))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                Icon::new(if collapsed {
+                                    IconName::ChevronRight
+                                } else {
+                                    IconName::ChevronDown
+                                })
+                                .size(px(12.0)),
+                            ),
                     )
                     .child(
-                        Icon::new(if collapsed {
-                            IconName::Folder
-                        } else {
-                            IconName::FolderOpen
-                        })
-                        .size(px(14.0))
-                        .flex_none()
-                        .text_color(
-                            if auto_archive_after_days.is_some() {
-                                cx.theme().success
-                            } else {
-                                cx.theme().sidebar_foreground.opacity(0.72)
-                            },
-                        ),
-                    )
-                    .when(!renaming, |this| {
-                        this.child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_sm()
-                                .font_medium()
-                                .child(folder_name.clone()),
-                        )
-                    })
-                    .when(renaming, |this| {
-                        this.child(
-                            Input::new(&self.sidebar_rename_input)
-                                .small()
-                                .h(px(24.0))
-                                .flex_1()
-                                .min_w_0(),
-                        )
-                    })
-                    .when(!renaming && reorder_enabled, |this| {
-                        this.child(
-                            div()
-                                .id(format!("sidebar-folder-actions-{folder_id}"))
+                        h_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                Icon::new(if collapsed {
+                                    IconName::Folder
+                                } else {
+                                    IconName::FolderOpen
+                                })
+                                .size(px(14.0))
                                 .flex_none()
-                                .size(px(24.0))
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .on_click(|_, _, cx| cx.stop_propagation())
-                                .child(
-                                    Button::new(format!("sidebar-folder-menu-{folder_id}"))
-                                        .xsmall()
-                                        .ghost()
-                                        .compact()
-                                        .size(px(24.0))
-                                        .icon(IconName::Ellipsis)
-                                        .tooltip(locale::text(
-                                            "Folder Actions",
-                                            "文件夹操作",
-                                            "資料夾操作",
-                                        ))
-                                        .dropdown_menu(move |menu, window, cx| {
-                                            Self::build_sidebar_folder_menu(
-                                                menu,
-                                                SidebarFolderMenuTarget {
-                                                    folder_id: menu_folder_id.clone(),
-                                                    folder_name: menu_folder_name.clone(),
-                                                    project_id: menu_project_id.clone(),
-                                                    workspace_id: menu_workspace_id.clone(),
-                                                    auto_archive_after_days,
-                                                },
-                                                menu_entity.clone(),
-                                                window,
-                                                cx,
-                                            )
-                                        })
-                                        .anchor(gpui::Anchor::TopRight),
+                                .text_color(
+                                    if auto_archive_after_days.is_some() {
+                                        cx.theme().success
+                                    } else {
+                                        cx.theme().sidebar_foreground.opacity(0.72)
+                                    },
+                                ),
+                            )
+                            .when(!renaming, |this| {
+                                this.child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_sm()
+                                        .font_medium()
+                                        .child(folder_name.clone()),
                                 )
-                                .invisible()
-                                .group_hover(&hover_group, |style| style.visible()),
-                        )
-                    }),
+                            })
+                            .when(renaming, |this| {
+                                this.child(
+                                    Input::new(&self.sidebar_rename_input)
+                                        .small()
+                                        .h(px(24.0))
+                                        .flex_1()
+                                        .min_w_0(),
+                                )
+                            })
+                            .when(!renaming && reorder_enabled, |this| {
+                                this.child(
+                                    div()
+                                        .id(format!("sidebar-folder-actions-{folder_id}"))
+                                        .flex_none()
+                                        .size(px(24.0))
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation()
+                                        })
+                                        .on_click(|_, _, cx| cx.stop_propagation())
+                                        .child(
+                                            Button::new(format!("sidebar-folder-menu-{folder_id}"))
+                                                .xsmall()
+                                                .ghost()
+                                                .compact()
+                                                .size(px(24.0))
+                                                .icon(IconName::Ellipsis)
+                                                .tooltip(locale::text(
+                                                    "Folder Actions",
+                                                    "文件夹操作",
+                                                    "資料夾操作",
+                                                ))
+                                                .dropdown_menu(move |menu, window, cx| {
+                                                    Self::build_sidebar_folder_menu(
+                                                        menu,
+                                                        SidebarFolderMenuTarget {
+                                                            folder_id: menu_folder_id.clone(),
+                                                            folder_name: menu_folder_name.clone(),
+                                                            project_id: menu_project_id.clone(),
+                                                            workspace_id: menu_workspace_id.clone(),
+                                                            auto_archive_after_days,
+                                                        },
+                                                        menu_entity.clone(),
+                                                        window,
+                                                        cx,
+                                                    )
+                                                })
+                                                .anchor(gpui::Anchor::TopRight),
+                                        )
+                                        .invisible()
+                                        .group_hover(&hover_group, |style| style.visible()),
+                                )
+                            }),
+                    ),
             );
 
         v_flex()
@@ -21712,6 +21836,10 @@ impl VibexWorkbench {
                 this.finish_sidebar_folder_drag(&drag.folder_id, cx);
                 cx.stop_propagation();
             }))
+            .on_drop(cx.listener(|this, drag: &SidebarWorkspaceDrag, _, cx| {
+                this.finish_sidebar_workspace_drag(&drag.project_id, &drag.workspace_id, cx);
+                cx.stop_propagation();
+            }))
             .when(
                 active_project_drag
                     .as_ref()
@@ -21750,6 +21878,7 @@ impl VibexWorkbench {
     ) -> AnyElement {
         let workspace = projection.workspace.clone();
         let workspace_id = workspace.id.as_str().to_string();
+        let project_id = workspace.project_id.as_str().to_string();
         let branch = projection
             .context
             .branch
@@ -21837,6 +21966,18 @@ impl VibexWorkbench {
         let workspace_menu_branch = branch.clone();
         let workspace_menu_project_id = project_for_folder.clone();
         let workspace_menu_workspace_id = workspace_for_folder.clone();
+        let active_workspace_drag = self.sidebar_workspace_drag_state.clone().filter(|drag| cx.has_active_drag() && drag.project_id == project_id);
+        let workspace_drop_after = self.sidebar_workspace_drop_target.as_ref().filter(|target| target.workspace_id == workspace_id).map(|target| target.after);
+        let workspace_drag_payload = SidebarWorkspaceDrag { workspace_id: workspace_id.clone(), project_id: project_id.clone(), label: workspace_title.clone().into() };
+        let workspace_drag_entity = cx.weak_entity();
+        let drag_target_workspace_id = workspace_id.clone();
+        let drag_target_project_id = project_id.clone();
+        let release_workspace_id = workspace_id.clone();
+        let release_project_id = project_id.clone();
+        let release_out_workspace_id = workspace_id.clone();
+        let release_out_project_id = project_id.clone();
+        let workspace_reorder_offset = active_workspace_drag.as_ref().and_then(|drag| sidebar_reorder_row_offset(&drag.original_ids, &drag.preview_ids, &workspace_id)).map(|rows| px(rows as f32 * (SIDEBAR_WORKSPACE_ROW_HEIGHT + SIDEBAR_WORKSPACE_REORDER_GAP)));
+        let workspace_reorder_animation_id = active_workspace_drag.as_ref().zip(self.sidebar_workspace_drop_target.as_ref()).map(|(drag, target)| format!("sidebar-workspace-reorder-{}-{}-{}-{}", drag.project_id, drag.workspace_id, target.after, workspace_id));
         let workspace_edit_id = workspace.id.clone();
         let workspace_edit_title = workspace_title.clone();
         let workspace_edit_branch = branch.clone();
@@ -21858,6 +21999,34 @@ impl VibexWorkbench {
             .tooltip(move |window, cx| Tooltip::new(tooltip_branch.clone()).build(window, cx))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.activate_and_toggle_sidebar_workspace(workspace_for_click.clone(), cx)
+            }))
+            .when_some(workspace_drop_after, |this, after| this.child(div().absolute().left_0().right_0().h(px(2.0)).bg(cx.theme().drag_border).map(|line| if after { line.bottom_0() } else { line.top_0() })))
+            .when(reorder_enabled, |this| {
+                this.on_mouse_up(MouseButton::Left, cx.listener(move |this, _, _, cx| this.finish_sidebar_workspace_drag(&release_project_id, &release_workspace_id, cx)))
+                    .on_mouse_up_out(MouseButton::Left, cx.listener(move |this, _, _, cx| this.finish_sidebar_workspace_drag(&release_out_project_id, &release_out_workspace_id, cx)))
+                    .on_drag(workspace_drag_payload, move |drag, cursor_offset, _, cx| {
+                        cx.stop_propagation();
+                        let _ = workspace_drag_entity.update(cx, |this, cx| this.start_sidebar_workspace_drag(drag, f32::from(cursor_offset.y), cx));
+                        cx.new(|_| drag.clone())
+                    })
+                    .on_drag_move(cx.listener(move |this, event: &DragMoveEvent<SidebarWorkspaceDrag>, _, cx| {
+                        let position = event.event.position;
+                        let inside = position.x >= event.bounds.left() - px(SIDEBAR_DRAG_HORIZONTAL_SLOP)
+                            && position.x <= event.bounds.right() + px(SIDEBAR_DRAG_HORIZONTAL_SLOP)
+                            && position.y >= event.bounds.top() - px(SIDEBAR_WORKSPACE_REORDER_GAP / 2.0)
+                            && position.y <= event.bounds.bottom() + px(SIDEBAR_WORKSPACE_REORDER_GAP / 2.0);
+                        if inside {
+                            let drag = event.drag(cx).clone();
+                            if drag.project_id == drag_target_project_id && drag.workspace_id != drag_target_workspace_id {
+                                cx.stop_propagation();
+                                this.preview_sidebar_workspace_reorder(&drag, &drag_target_workspace_id, position.y >= event.bounds.center().y, cx);
+                            }
+                        }
+                    }))
+            })
+            .on_drop(cx.listener(|this, drag: &SidebarWorkspaceDrag, _, cx| {
+                this.finish_sidebar_workspace_drag(&drag.project_id, &drag.workspace_id, cx);
+                cx.stop_propagation();
             }))
             .context_menu(move |menu, _, cx| {
                 Self::build_sidebar_workspace_menu(
@@ -22001,7 +22170,11 @@ impl VibexWorkbench {
             );
 
         if collapsed {
-            return row.left(px(workspace_offset)).into_any_element();
+            if workspace_reorder_offset.is_none() || workspace_reorder_animation_id.is_none() {
+                return row.left(px(workspace_offset)).into_any_element();
+            }
+            let workspace = row.left(px(workspace_offset));
+            return Transition::new(SIDEBAR_REORDER_TRANSITION_DURATION).ease(ease_out_cubic).slide_y(workspace_reorder_offset.unwrap(), px(0.0)).apply(workspace, workspace_reorder_animation_id.unwrap()).into_any_element();
         }
 
         let mut sessions = self.render_sidebar_workspace_children(
@@ -22015,7 +22188,7 @@ impl VibexWorkbench {
         if sessions.is_empty() {
             sessions.push(sidebar_empty_sessions(strings, cx));
         }
-        v_flex()
+        let workspace = v_flex()
             .id(format!("sidebar-workspace-{workspace_id}"))
             .relative()
             .left(px(workspace_offset))
@@ -22039,7 +22212,12 @@ impl VibexWorkbench {
                     ))
                     .children(sessions),
             )
-            .into_any_element()
+            ;
+        if let (Some(offset), Some(animation_id)) = (workspace_reorder_offset, workspace_reorder_animation_id) {
+            Transition::new(SIDEBAR_REORDER_TRANSITION_DURATION).ease(ease_out_cubic).slide_y(offset, px(0.0)).apply(workspace, animation_id).into_any_element()
+        } else {
+            workspace.into_any_element()
+        }
     }
 
     fn render_sidebar_session(
@@ -23343,7 +23521,7 @@ impl VibexWorkbench {
         let content =
             runtime_selector_dropdown_content(model_icon, selected_runtime_label, compact, cx);
         let agent_id = self.new_session_agent_id.clone();
-        let auth_source_choices = agent_id
+        let mut auth_source_choices = agent_id
             .as_ref()
             .and_then(|agent_id| {
                 catalog
@@ -23351,6 +23529,8 @@ impl VibexWorkbench {
                     .map(|catalog| runtime_auth_sources_for_agent(catalog, agent_id))
             })
             .unwrap_or_default();
+        auth_source_choices
+            .sort_by_key(|source| !matches!(source.kind, RuntimeAuthSourceKind::AgentAccount));
         let menu_auth_source = self
             .new_session_runtime_menu_auth_source
             .clone()
@@ -23551,6 +23731,12 @@ impl VibexWorkbench {
                         })
                     })
                     .collect::<Vec<_>>();
+                let edit_agent_id = agent_id.clone();
+                let edit_label = match self.resolved_locale() {
+                    locale::ResolvedLocale::En => format!("Edit {agent_label} configuration"),
+                    locale::ResolvedLocale::ZhCn => format!("编辑 {agent_label} 配置"),
+                    locale::ResolvedLocale::ZhTw => format!("編輯 {agent_label} 設定"),
+                };
                 v_flex()
                     .h_full()
                     .min_h_0()
@@ -23576,6 +23762,23 @@ impl VibexWorkbench {
                                 this.child(runtime_menu_empty_state(cx))
                             })
                             .children(rows),
+                    )
+                    .child(separator())
+                    .child(
+                        h_flex().w_full().flex_none().p_1().child(
+                            Button::new("new-session-runtime-edit-agent-config")
+                                .small()
+                                .ghost()
+                                .w_full()
+                                .justify_start()
+                                .icon(IconName::Settings)
+                                .label(edit_label)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(agent_id) = edit_agent_id.clone() {
+                                        this.open_agent_auth_management(agent_id, cx);
+                                    }
+                                })),
+                        ),
                     )
                     .into_any_element()
             }
@@ -24844,41 +25047,6 @@ impl VibexWorkbench {
                     .when(worktree_selected, |this| {
                         this.child(div().flex_none().child(base_ref_button))
                     }),
-            )
-            .when_some(
-                (can_create_worktree && fixed_workspace_id.is_none() && !worktree_ready)
-                    .then_some(worktree_reason)
-                    .flatten(),
-                |this, reason| {
-                    this.child(
-                        h_flex()
-                            .min_w_0()
-                            .gap_1()
-                            .px_2()
-                            .text_xs()
-                            .text_color(muted_foreground)
-                            .child(div().min_w_0().flex_1().child(reason))
-                            .when(self.new_session_eligibility_error.is_some(), |this| {
-                                this.child(
-                                    Button::new("new-session-retry-worktree-probe")
-                                        .xsmall()
-                                        .ghost()
-                                        .compact()
-                                        .w(px(24.0))
-                                        .h(px(24.0))
-                                        .icon(IconName::Undo)
-                                        .tooltip(locale::text(
-                                            "Retry Git check",
-                                            "重试 Git 检查",
-                                            "重試 Git 檢查",
-                                        ))
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.retry_new_session_eligibility(window, cx)
-                                        })),
-                                )
-                            }),
-                    )
-                },
             );
 
         let worktree_form_valid = !worktree_selected
@@ -26176,7 +26344,9 @@ impl VibexWorkbench {
             .clone()
             .unwrap_or_else(|| desired.auth_source.clone());
         let agent_choices = runtime_menu_agents(&self.agent_snapshots);
-        let auth_source_choices = runtime_auth_sources_for_agent(&catalog, &menu_agent_id);
+        let mut auth_source_choices = runtime_auth_sources_for_agent(&catalog, &menu_agent_id);
+        auth_source_choices
+            .sort_by_key(|source| !matches!(source.kind, RuntimeAuthSourceKind::AgentAccount));
         let preferred_model_selection = if desired.agent_id == menu_agent_id {
             Some(&desired)
         } else {
@@ -26410,6 +26580,12 @@ impl VibexWorkbench {
                         })
                     })
                     .collect::<Vec<_>>();
+                let edit_agent_id = menu_agent_id.clone();
+                let edit_label = match self.resolved_locale() {
+                    locale::ResolvedLocale::En => format!("Edit {agent_label} configuration"),
+                    locale::ResolvedLocale::ZhCn => format!("编辑 {agent_label} 配置"),
+                    locale::ResolvedLocale::ZhTw => format!("編輯 {agent_label} 設定"),
+                };
                 v_flex()
                     .h_full()
                     .min_h_0()
@@ -26444,6 +26620,21 @@ impl VibexWorkbench {
                                 this.child(runtime_menu_empty_state(cx))
                             })
                             .children(rows),
+                    )
+                    .child(separator())
+                    .child(
+                        h_flex().w_full().flex_none().p_1().child(
+                            Button::new("composer-runtime-edit-agent-config")
+                                .small()
+                                .ghost()
+                                .w_full()
+                                .justify_start()
+                                .icon(IconName::Settings)
+                                .label(edit_label)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_agent_auth_management(edit_agent_id.clone(), cx)
+                                })),
+                        ),
                     )
                     .into_any_element()
             }
@@ -44248,7 +44439,7 @@ mod tests {
                                         .child(
                                             h_flex()
                                                 .w_full()
-                                                .min_h(px(COMPOSER_TEXT_AREA_MIN_HEIGHT))
+                                                .min_h(px(52.0))
                                                 .flex_1()
                                                 .items_start()
                                                 .gap_2()
@@ -50547,6 +50738,7 @@ mod tests {
         assert!(panel.contains("git_worktree_options_visible"));
         assert!(panel.contains("show_location_control"));
         assert!(!panel.contains("Checking Git status"));
+        assert!(!panel.contains("项目不是 Git 工作目录"));
         assert!(panel.contains("new-session-base-ref"));
         assert!(panel.contains("new-session-base-ref-popover"));
         assert!(panel.contains("new_session_base_ref_search"));
@@ -50669,10 +50861,12 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_project("))
             .map(|(body, _)| body)
             .expect("sidebar folder renderer should remain inspectable");
-        assert!(folder.contains(".gap(px(6.0))"));
+        assert!(folder.contains(".gap_2()"));
         assert!(folder.contains(".size(px(12.0))"));
         assert!(folder.contains(".size(px(14.0))"));
-        assert!(folder.contains(".pl(px(if depth == 0 { 0.0 } else { 8.0 }))"));
+        assert!(folder.contains(".size(px(SIDEBAR_LOGO_DISPLAY_SIZE))"));
+        assert!(folder.contains(".pl(px(SIDEBAR_WORKSPACE_SESSION_CARD_OVERHANG))"));
+        assert!(folder.contains(".child(\n                        h_flex()"));
     }
 
     #[test]
