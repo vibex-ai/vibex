@@ -18698,9 +18698,10 @@ impl VibexWorkbench {
         let git = div()
             .relative()
             .child(git)
-            .when(pending_commit_count > 0, |this| {
-                this.child(git_activity_badge(pending_commit_count, cx))
-            })
+            .when(
+                self.ui_state.workbench.show_git_change_count && pending_commit_count > 0,
+                |this| this.child(git_activity_badge(pending_commit_count, cx)),
+            )
             .into_any_element();
         let terminal =
             right_rail_activity_button("activity-terminal", Icon::new(IconName::SquareTerminal))
@@ -39795,6 +39796,15 @@ impl FoundationSettings {
         cx.notify();
     }
 
+    fn set_show_git_change_count(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.ui_state.workbench.show_git_change_count = enabled;
+            this.queue_ui_state();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
     fn set_default_new_session_location(
         &mut self,
         location: NewSessionLocation,
@@ -41157,6 +41167,26 @@ impl FoundationSettings {
                         .checked(workbench.remember_layout)
                         .on_click(cx.listener(|this, enabled, _, cx| {
                             this.set_workbench_remember_layout(*enabled, cx)
+                        })),
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text(
+                        "Show Git change count",
+                        "显示 Git 变更数量",
+                        "顯示 Git 變更數量",
+                    ),
+                    locale::text(
+                        "Show the number of pending changes on the Git activity button.",
+                        "在 Git 活动按钮上显示待处理变更数量。",
+                        "在 Git 活動按鈕上顯示待處理變更數量。",
+                    ),
+                    Switch::new("show-git-change-count")
+                        .small()
+                        .checked(workbench.show_git_change_count)
+                        .on_click(cx.listener(|this, enabled, _, cx| {
+                            this.set_show_git_change_count(*enabled, cx)
                         })),
                     stacked,
                     cx,

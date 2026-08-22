@@ -276,6 +276,8 @@ pub struct WorkbenchUiState {
     pub right_rail_width: f32,
     #[serde(default = "default_remember_layout")]
     pub remember_layout: bool,
+    #[serde(default = "default_show_git_change_count")]
+    pub show_git_change_count: bool,
     #[serde(default)]
     pub default_new_session_location: NewSessionLocation,
 }
@@ -295,12 +297,17 @@ impl Default for WorkbenchUiState {
             preview_width: 520.0,
             right_rail_width: 336.0,
             remember_layout: default_remember_layout(),
+            show_git_change_count: default_show_git_change_count(),
             default_new_session_location: NewSessionLocation::CurrentCheckout,
         }
     }
 }
 
 const fn default_remember_layout() -> bool {
+    true
+}
+
+const fn default_show_git_change_count() -> bool {
     true
 }
 
@@ -1503,6 +1510,7 @@ mod tests {
             .and_then(serde_json::Value::as_object_mut)
             .unwrap();
         workbench.remove("rememberLayout");
+        workbench.remove("showGitChangeCount");
         workbench.remove("defaultNewSessionLocation");
         let composer = legacy
             .get_mut("composer")
@@ -1526,6 +1534,7 @@ mod tests {
 
         let decoded = decode_and_migrate(&serde_json::to_vec(&legacy).unwrap()).unwrap();
         assert!(decoded.workbench.remember_layout);
+        assert!(decoded.workbench.show_git_change_count);
         assert_eq!(
             decoded.workbench.default_new_session_location,
             NewSessionLocation::CurrentCheckout
@@ -1551,6 +1560,7 @@ mod tests {
 
         let mut state = decoded;
         state.workbench.remember_layout = false;
+        state.workbench.show_git_change_count = false;
         state.workbench.default_new_session_location = NewSessionLocation::NewWorktree;
         state.desktop_behavior.startup_destination = StartupDestination::NewSession;
         state.desktop_behavior.launch_at_login = true;
@@ -1569,6 +1579,7 @@ mod tests {
         state.normalize().unwrap();
         let round_trip = decode_and_migrate(&serde_json::to_vec(&state).unwrap()).unwrap();
         assert!(!round_trip.workbench.remember_layout);
+        assert!(!round_trip.workbench.show_git_change_count);
         assert_eq!(
             round_trip.workbench.default_new_session_location,
             NewSessionLocation::NewWorktree
