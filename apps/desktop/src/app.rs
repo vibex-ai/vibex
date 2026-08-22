@@ -3691,6 +3691,7 @@ pub struct VibexWorkbench {
     code_files_surface_visible: bool,
     code_git_surface_visible: bool,
     right_rail_mode: RightRailMode,
+    git_pending_change_count: u32,
     code_right_rail: Entity<CodeRightRail>,
     management_view: Entity<ManagementCenter>,
     usage_view: Entity<UsageView>,
@@ -4219,6 +4220,18 @@ impl VibexWorkbench {
         let code_right_rail = cx.new(|cx| CodeRightRail::new(code_workbench.clone(), window, cx));
         let management_view = cx.new(|cx| ManagementCenter::new(window, cx));
         let usage_view = cx.new(|_| UsageView::new());
+        agent_subscriptions.push(cx.observe_in(
+            &code_workbench,
+            window,
+            |this, workbench, _, cx| {
+                let next_count = git_pending_commit_count(workbench.read(cx).git_status());
+                if this.git_pending_change_count == next_count {
+                    return;
+                }
+                this.git_pending_change_count = next_count;
+                cx.notify();
+            },
+        ));
         agent_subscriptions.push(cx.subscribe(
             &code_workbench,
             |this, _, event: &CodeWorkbenchEvent, cx| match event {
@@ -4310,6 +4323,7 @@ impl VibexWorkbench {
             code_files_surface_visible: false,
             code_git_surface_visible: false,
             right_rail_mode: restored_right_rail_mode,
+            git_pending_change_count: 0,
             code_right_rail,
             management_view,
             usage_view,
@@ -17830,8 +17844,7 @@ impl VibexWorkbench {
             cx.listener(|this, _, _, cx| this.toggle_right_rail_mode(RightRailMode::Files, cx)),
         )
         .into_any_element();
-        let pending_commit_count =
-            git_pending_commit_count(self.code_workbench.read(cx).git_status());
+        let pending_commit_count = self.git_pending_change_count;
         let git =
             right_rail_activity_button("activity-git", right_rail_mode_icon(RightRailMode::Git))
                 .tooltip("Git")
@@ -24325,17 +24338,6 @@ impl VibexWorkbench {
                                                             .h_full(),
                                                     ),
                                             )
-                                    .child(
-                                        h_flex()
-                                            .id("new-session-runtime-controls-side")
-                                            .min_w_0()
-                                            .flex_1()
-                                            .max_w(px(360.0))
-                                            .items_center()
-                                            .gap_1()
-                                            .overflow_x_scroll()
-                                            .children(runtime_controls_side),
-                                    ),
                                     )
                             .child(
                                 v_flex()
@@ -24352,10 +24354,12 @@ impl VibexWorkbench {
                                                 .gap_2()
                                                 .child(
                                                     h_flex()
+                                                        .id("new-session-runtime-controls-scroll")
                                                         .flex_1()
                                                         .min_w_0()
                                                         .items_center()
                                                         .gap_1()
+                                                        .overflow_x_scroll()
                                                         .child(
                                                             Button::new(
                                                                 "new-session-choose-attachments",
@@ -24377,9 +24381,20 @@ impl VibexWorkbench {
                                                                     )
                                                                 },
                                                             )),
-                                                        ),
+                                                        )
+                                                        .children(runtime_controls_bottom),
                                                 )
-                                                .children(runtime_controls_bottom)
+                                                .child(
+                                                    h_flex()
+                                                        .id("new-session-runtime-controls-side")
+                                                        .min_w_0()
+                                                        .flex_1()
+                                                        .max_w(px(360.0))
+                                                        .items_center()
+                                                        .gap_1()
+                                                        .overflow_x_scroll()
+                                                        .children(runtime_controls_side),
+                                                )
                                                 .child(
                                                     h_flex()
                                                         .flex_none()
@@ -32053,17 +32068,6 @@ impl VibexWorkbench {
                                             ),
                                     )
                                     .child(
-                                        h_flex()
-                                            .id("composer-runtime-controls-side")
-                                            .min_w_0()
-                                            .flex_1()
-                                            .max_w(px(360.0))
-                                            .items_center()
-                                            .gap_1()
-                                            .overflow_x_scroll()
-                                            .children(runtime_controls_side),
-                                    )
-                                    .child(
                                         v_flex()
                                             .flex_none()
                                             .items_center()
@@ -32139,6 +32143,17 @@ impl VibexWorkbench {
                                                     )),
                                             )
                                             .children(runtime_controls_bottom)
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .id("composer-runtime-controls-side")
+                                            .min_w_0()
+                                            .flex_1()
+                                            .max_w(px(360.0))
+                                            .items_center()
+                                            .gap_1()
+                                            .overflow_x_scroll()
+                                            .children(runtime_controls_side),
                                     )
                                     .child(
                                         h_flex()
@@ -46927,14 +46942,18 @@ mod tests {
         let attachment = new_session
             .find("new-session-choose-attachments")
             .expect("new-session attachment control should be present");
-        let runtime_controls = new_session
-            .find("new-session-runtime-controls-side")
-            .expect("new-session runtime controls should stay beside the input");
-        assert!(runtime_controls < attachment);
         let bottom_runtime_controls = new_session
             .find("children(runtime_controls_bottom)")
             .expect("new-session feature controls should stay in the bottom toolbar");
+        let side_runtime_controls = new_session
+            .find("new-session-runtime-controls-side")
+            .expect("new-session primary runtime controls should stay in the bottom toolbar");
+        let submit = new_session
+            .find("new-session-submit")
+            .expect("new-session submit control should be present");
         assert!(attachment < bottom_runtime_controls);
+        assert!(bottom_runtime_controls < side_runtime_controls);
+        assert!(side_runtime_controls < submit);
 
         let composer = source
             .split_once("    fn render_composer(")
@@ -46946,6 +46965,21 @@ mod tests {
         assert!(composer.contains("composer-runtime-controls-side"));
         assert!(composer.contains("children(runtime_controls_side)"));
         assert!(composer.contains("children(runtime_controls_bottom)"));
+        let attachment = composer
+            .find("choose-composer-attachments")
+            .expect("composer attachment control should be present");
+        let bottom_runtime_controls = composer
+            .find("children(runtime_controls_bottom)")
+            .expect("composer feature controls should stay beside attachments");
+        let side_runtime_controls = composer
+            .find("composer-runtime-controls-side")
+            .expect("composer primary runtime controls should stay in the bottom toolbar");
+        let submit = composer
+            .find(".child(primary_action)")
+            .expect("composer submit control should remain present");
+        assert!(attachment < bottom_runtime_controls);
+        assert!(bottom_runtime_controls < side_runtime_controls);
+        assert!(side_runtime_controls < submit);
     }
 
     #[gpui::test]
