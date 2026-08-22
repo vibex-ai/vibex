@@ -21239,7 +21239,7 @@ impl VibexWorkbench {
         let row_foreground = if selected || move_selected {
             cx.theme().sidebar_foreground
         } else {
-            cx.theme().sidebar_foreground.opacity(0.72)
+            cx.theme().sidebar_foreground.opacity(0.56)
         };
         let row_hover_background = if selected || move_selected {
             row_background
@@ -21709,7 +21709,7 @@ impl VibexWorkbench {
                                         .min_w_0()
                                         .truncate()
                                         .text_sm()
-                                        .when(selected, |this| this.font_medium())
+                                        .when(selected, |this| this.font_semibold())
                                         .child(session.title.clone()),
                                 ),
                             ),
@@ -45617,6 +45617,8 @@ mod tests {
         assert!(sidebar_session.contains(".min_h(px(SIDEBAR_SESSION_ROW_HEIGHT))"));
         assert!(sidebar_session.contains(".top(px(8.0))"));
         assert!(sidebar_session.contains("let show_worktree_status ="));
+        assert!(sidebar_session.contains("cx.theme().sidebar_foreground.opacity(0.56)"));
+        assert!(sidebar_session.contains(".when(selected, |this| this.font_semibold())"));
         assert!(sidebar_session.contains("self.ui_state.sidebar.hierarchy_mode"));
         assert!(sidebar_session.contains("SidebarHierarchyMode::Detailed"));
         assert!(sidebar_session.contains(".when(show_worktree_status, |this|"));
