@@ -150,7 +150,7 @@ use crate::image_editor::{
 use crate::locale::{self, Strings};
 use crate::management::{ManagementCenter, ManagementEvent};
 use crate::platform::{
-    launch_at_login_enabled, open_external_url, reveal_path_in_file_manager,
+    StorageUsage, launch_at_login_enabled, open_external_url, reveal_path_in_file_manager,
     send_system_notification, set_launch_at_login, storage_usage, ui_state_path,
 };
 use crate::remote_access_pairing::open_remote_access_pairing;
@@ -39201,6 +39201,14 @@ impl SettingsRenderContext {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsStorageUsageState {
+    Unloaded,
+    Loading,
+    Ready(StorageUsage),
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NotificationKind {
     Completed,
     NeedsInput,
@@ -40092,6 +40100,8 @@ struct FoundationSettings {
     terminal_shells: Entity<SelectState<Vec<ShellChoice>>>,
     search: Entity<InputState>,
     settings_render_context: SettingsRenderContext,
+    storage_usage_state: SettingsStorageUsageState,
+    storage_usage_task: Option<Task<()>>,
     active_section: SettingsSection,
 }
 
@@ -40160,12 +40170,13 @@ impl FoundationSettings {
                     InputEvent::Change => {
                         let query = this.search.read(cx).value().trim().to_lowercase();
                         if let Some(section) = settings_section_for_query(&query) {
-                            this.active_section = section;
+                            this.activate_settings_section(section, cx);
+                        } else {
+                            this.settings_render_context
+                                .target_title
+                                .borrow_mut()
+                                .take();
                         }
-                        this.settings_render_context
-                            .target_title
-                            .borrow_mut()
-                            .take();
                         cx.notify();
                     }
                     InputEvent::PressEnter { .. } | InputEvent::Focus | InputEvent::Blur => {}
@@ -40246,9 +40257,55 @@ impl FoundationSettings {
                 terminal_shells,
                 search,
                 settings_render_context,
+                storage_usage_state: SettingsStorageUsageState::Unloaded,
+                storage_usage_task: None,
                 active_section: SettingsSection::General,
             }
         })
+    }
+
+    fn activate_settings_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+        self.active_section = section;
+        self.settings_render_context
+            .target_title
+            .borrow_mut()
+            .take();
+        if section == SettingsSection::Data {
+            self.start_storage_usage_probe(cx);
+        }
+    }
+
+    fn start_storage_usage_probe(&mut self, cx: &mut Context<Self>) {
+        if matches!(
+            self.storage_usage_state,
+            SettingsStorageUsageState::Loading | SettingsStorageUsageState::Ready(_)
+        ) {
+            return;
+        }
+        let Some(home) = self
+            .workbench
+            .read_with(cx, |this, _| {
+                this.config.as_ref().map(|config| config.home_dir.clone())
+            })
+            .ok()
+            .flatten()
+        else {
+            self.storage_usage_state = SettingsStorageUsageState::Unavailable;
+            return;
+        };
+
+        self.storage_usage_state = SettingsStorageUsageState::Loading;
+        let probe = cx.background_spawn(async move { storage_usage(&home).ok() });
+        self.storage_usage_task = Some(cx.spawn(async move |entity, cx| {
+            let usage = probe.await;
+            let _ = entity.update(cx, |this, cx| {
+                this.storage_usage_task = None;
+                this.storage_usage_state = usage
+                    .map(SettingsStorageUsageState::Ready)
+                    .unwrap_or(SettingsStorageUsageState::Unavailable);
+                cx.notify();
+            });
+        }));
     }
 
     fn select_settings_search_candidate(
@@ -40257,7 +40314,7 @@ impl FoundationSettings {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.active_section = candidate.section;
+        self.activate_settings_section(candidate.section, cx);
         self.search
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.settings_render_context
@@ -41026,11 +41083,7 @@ impl FoundationSettings {
                     .child(div().flex_1())
                     .tooltip(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.active_section = section;
-                        this.settings_render_context
-                            .target_title
-                            .borrow_mut()
-                            .take();
+                        this.activate_settings_section(section, cx);
                         cx.notify();
                     }))
                     .into_any_element()
@@ -42198,9 +42251,12 @@ impl FoundationSettings {
             })
             .ok()
             .flatten();
-        let usage = home.as_deref().and_then(|home| storage_usage(home).ok());
-        let storage_label = usage
-            .map(|usage| {
+        let storage_pending = matches!(
+            self.storage_usage_state,
+            SettingsStorageUsageState::Unloaded | SettingsStorageUsageState::Loading
+        );
+        let storage_label = match self.storage_usage_state {
+            SettingsStorageUsageState::Ready(usage) => {
                 format!(
                     "{} {} · DB {} · {} {} · {} {} · {} {} · {} {}",
                     locale::text("Total", "总计", "總計"),
@@ -42215,8 +42271,19 @@ impl FoundationSettings {
                     locale::text("Diagnostics", "诊断", "診斷"),
                     format_bytes(usage.diagnostic_bytes),
                 )
-            })
-            .unwrap_or_else(|| locale::text("Unavailable", "不可用", "無法使用").to_string());
+            }
+            SettingsStorageUsageState::Unavailable => {
+                locale::text("Unavailable", "不可用", "無法使用").to_string()
+            }
+            SettingsStorageUsageState::Unloaded | SettingsStorageUsageState::Loading => {
+                locale::text("Loading...", "正在加载...", "正在載入...").to_string()
+            }
+        };
+        let storage_control = h_flex()
+            .items_center()
+            .gap_1()
+            .when(storage_pending, |this| this.child(Spinner::new().xsmall()))
+            .child(div().text_xs().font_medium().child(storage_label));
         let open_home = home.clone();
         settings_page(
             locale::text("Data & Diagnostics", "数据与诊断", "資料與診斷"),
@@ -42233,7 +42300,7 @@ impl FoundationSettings {
                         "数据库、会话、终端记录、附件和诊断文件。",
                         "資料庫、會話、終端機記錄、附件與診斷檔案。",
                     ),
-                    div().text_xs().font_medium().child(storage_label),
+                    storage_control,
                     stacked,
                     cx,
                 ),
@@ -51007,6 +51074,30 @@ mod tests {
         assert!(settings.contains("_: &InputEnter"));
         assert!(settings.contains("this.search.read(cx).focus_handle(cx).is_focused(window)"));
         assert!(settings.contains("cx.stop_propagation()"));
+    }
+
+    #[test]
+    fn data_settings_probe_runs_off_the_render_path_with_loading_state() {
+        let source = include_str!("app.rs");
+        let data_page = source
+            .split_once("    fn render_data_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_about_page("))
+            .map(|(body, _)| body)
+            .expect("data settings page should remain inspectable");
+        assert!(!data_page.contains("storage_usage("));
+        assert!(data_page.contains("SettingsStorageUsageState::Loading"));
+        assert!(data_page.contains("storage_pending"));
+
+        let probe = source
+            .split_once("    fn start_storage_usage_probe(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn select_settings_search_candidate("))
+            .map(|(body, _)| body)
+            .expect("storage usage probe should remain inspectable");
+        assert!(probe.contains("cx.background_spawn"));
+        assert!(probe.contains("storage_usage(&home).ok()"));
+        assert!(probe.contains("SettingsStorageUsageState::Loading"));
+        assert!(probe.contains("SettingsStorageUsageState::Ready"));
+        assert!(probe.contains("cx.notify()"));
     }
 
     #[test]
