@@ -41093,6 +41093,8 @@ impl FoundationSettings {
             .small()
             .h(px(34.0))
             .w_full()
+            .mt_1()
+            .mb_1()
             .prefix(
                 Icon::new(IconName::Search)
                     .small()
@@ -51124,6 +51126,8 @@ mod tests {
         assert!(navigation.contains(".px_2()"));
         assert!(navigation.contains(".text_color(muted_foreground.opacity(0.72))"));
         assert!(navigation.contains(".gap(px(SETTINGS_NAVIGATION_SECTION_GAP))"));
+        assert!(navigation.contains(".mt_1()"));
+        assert!(navigation.contains(".mb_1()"));
         assert!(navigation.contains("let icon = Icon::new(icon)"));
         assert!(navigation.contains(".mr(px(2.0))"));
         assert!(navigation.contains(".child(div().flex_1())"));
