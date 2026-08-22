@@ -185,7 +185,8 @@ const SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE: f32 = 18.0;
 const SIDEBAR_WORKSPACE_STATUS_TOP_OFFSET: f32 = 4.0;
 const SIDEBAR_ICON_TITLE_GAP: f32 = 4.0;
 const SIDEBAR_PROJECT_ICON_SLOT_SIZE: f32 = 30.0;
-const SIDEBAR_WORKSPACE_SESSION_INDENT: f32 = 34.0;
+const SIDEBAR_WORKSPACE_SESSION_INDENT: f32 = 28.0;
+const SIDEBAR_WORKSPACE_SESSION_CONTENT_INSET: f32 = 6.0;
 const SIDEBAR_TOP_LEVEL_PROJECT_OFFSET: f32 = -8.0;
 const SIDEBAR_NESTED_PROJECT_INDENT: f32 = 8.0;
 const SIDEBAR_PROJECT_LOGO_IMAGE_SIZE: u32 = 256;
@@ -20961,12 +20962,12 @@ impl VibexWorkbench {
         };
         let card_focused = !collapsed && selected;
         let card_background = if card_focused {
-            cx.theme().sidebar_accent.opacity(0.36)
+            cx.theme().sidebar_accent.opacity(0.44)
         } else {
             cx.theme().transparent
         };
         let card_border_color = if card_focused {
-            cx.theme().sidebar_accent.opacity(0.72)
+            cx.theme().sidebar_accent.opacity(0.88)
         } else {
             cx.theme().transparent
         };
@@ -21261,7 +21262,11 @@ impl VibexWorkbench {
                 .bg(row_background)
                 .py_1()
                 .when(self.sidebar_batch_mode, |this| this.pl(px(28.0)).pr_2())
-                .when(!self.sidebar_batch_mode, |this| this.pl_0().pr_2())
+                .when(!self.sidebar_batch_mode, |this| {
+                    this.pr_2().when(show_worktree_status, |this| {
+                        this.pl(px(SIDEBAR_WORKSPACE_SESSION_CONTENT_INSET))
+                    })
+                })
                 .on_key_down(cx.listener(Self::on_sidebar_rename_key_down))
                 .when(self.sidebar_batch_mode, |this| {
                     this.child(
@@ -21663,7 +21668,11 @@ impl VibexWorkbench {
                         )
                     })
                     .when(self.sidebar_batch_mode, |this| this.pl(px(28.0)).pr_2())
-                    .when(!self.sidebar_batch_mode, |this| this.pl_0().pr_2())
+                    .when(!self.sidebar_batch_mode, |this| {
+                        this.pr_2().when(show_worktree_status, |this| {
+                            this.pl(px(SIDEBAR_WORKSPACE_SESSION_CONTENT_INSET))
+                        })
+                    })
                     .text_color(row_foreground)
                     .child(
                         h_flex()
@@ -45580,9 +45589,8 @@ mod tests {
         assert!(sidebar_session.contains(".when(show_worktree_status, |this|"));
         assert!(!sidebar_session.contains("selected, self.agent_turn_pending"));
         assert!(sidebar_session.contains(".when(show_worktree_status, |this|"));
-        assert!(
-            sidebar_session.contains(".when(!self.sidebar_batch_mode, |this| this.pl_0().pr_2())")
-        );
+        assert!(sidebar_session.contains("SIDEBAR_WORKSPACE_SESSION_CONTENT_INSET"));
+        assert!(sidebar_session.contains("this.pr_2().when(show_worktree_status"));
         assert!(!sidebar_session.contains("let branch_path ="));
         assert!(!sidebar_session.contains(".when_some(branch_path"));
         assert!(!sidebar_session.contains(".when(session_generating, |this|"));
@@ -49138,7 +49146,8 @@ mod tests {
         assert!(workspace.contains("return row.into_any_element();"));
         assert!(workspace.contains("let card_focused = !collapsed && selected"));
         assert!(workspace.contains("let card_background = if card_focused"));
-        assert!(workspace.contains(".sidebar_accent.opacity(0.36)"));
+        assert!(workspace.contains(".sidebar_accent.opacity(0.44)"));
+        assert!(workspace.contains(".sidebar_accent.opacity(0.88)"));
         assert!(workspace.contains("let card_border_color = if card_focused"));
         assert!(workspace.contains(".border_1()"));
         assert!(workspace.contains(".border_color(card_border_color)"));
@@ -49150,6 +49159,7 @@ mod tests {
         );
         assert!(workspace.contains(".left(px(workspace_offset))"));
         assert!(workspace.contains(".pl(px(SIDEBAR_WORKSPACE_SESSION_INDENT))"));
+        assert!(source.contains("const SIDEBAR_WORKSPACE_SESSION_CONTENT_INSET: f32 = 6.0;"));
         assert!(workspace.contains(".gap(px(0.0))"));
         assert!(workspace.contains("cx.theme().sidebar_foreground.opacity(0.28)"));
         assert!(workspace.contains(".w(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))"));
