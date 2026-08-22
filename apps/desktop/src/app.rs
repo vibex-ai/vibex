@@ -186,7 +186,6 @@ const SIDEBAR_WORKSPACE_STATUS_TOP_OFFSET: f32 = 4.0;
 const SIDEBAR_ICON_TITLE_GAP: f32 = 4.0;
 const SIDEBAR_PROJECT_ICON_SLOT_SIZE: f32 = 30.0;
 const SIDEBAR_WORKSPACE_SESSION_INDENT: f32 = 28.0;
-const SIDEBAR_WORKSPACE_SESSION_CONTENT_INSET: f32 = 6.0;
 const SIDEBAR_TOP_LEVEL_PROJECT_OFFSET: f32 = -8.0;
 const SIDEBAR_NESTED_PROJECT_INDENT: f32 = 8.0;
 const SIDEBAR_PROJECT_LOGO_IMAGE_SIZE: u32 = 256;
@@ -21174,9 +21173,6 @@ impl VibexWorkbench {
         let session_id_string = session.id.as_str().to_string();
         let display_state =
             sidebar_session_display_state(session.state, self.session_turn_pending(&session.id));
-        let show_worktree_status = self.ui_state.sidebar.hierarchy_mode
-            == SidebarHierarchyMode::Detailed
-            && !show_worktree_identity;
         let session_item = SidebarOrganizationItem::Session(session_id_string.clone());
         let move_selected = self.sidebar_move_selected_items.contains(&session_item);
         let drag_session_ids = self
@@ -21256,11 +21252,7 @@ impl VibexWorkbench {
                 .bg(row_background)
                 .py_1()
                 .when(self.sidebar_batch_mode, |this| this.pl(px(28.0)).pr_2())
-                .when(!self.sidebar_batch_mode, |this| {
-                    this.pr_2().when(show_worktree_status, |this| {
-                        this.pl(px(SIDEBAR_WORKSPACE_SESSION_CONTENT_INSET))
-                    })
-                })
+                .when(!self.sidebar_batch_mode, |this| this.pr_2())
                 .on_key_down(cx.listener(Self::on_sidebar_rename_key_down))
                 .when(self.sidebar_batch_mode, |this| {
                     this.child(
@@ -21309,9 +21301,6 @@ impl VibexWorkbench {
                                             ),
                                     ),
                             )
-                        })
-                        .when(show_worktree_status, |this| {
-                            this.child(sidebar_session_status_indicator(display_state, cx))
                         })
                         .child(sidebar_agent_logo(sidebar_agent_id.as_str(), selected, cx))
                         .child(
@@ -21362,6 +21351,7 @@ impl VibexWorkbench {
         } else {
             strings.sidebar_pin
         };
+        let session_generating = display_state == AgentSessionState::Running;
         let session_needs_approval = display_state == AgentSessionState::NeedsInput;
         let has_unread_completion = !selected
             && self
@@ -21662,11 +21652,7 @@ impl VibexWorkbench {
                         )
                     })
                     .when(self.sidebar_batch_mode, |this| this.pl(px(28.0)).pr_2())
-                    .when(!self.sidebar_batch_mode, |this| {
-                        this.pr_2().when(show_worktree_status, |this| {
-                            this.pl(px(SIDEBAR_WORKSPACE_SESSION_CONTENT_INSET))
-                        })
-                    })
+                    .when(!self.sidebar_batch_mode, |this| this.pr_2())
                     .text_color(row_foreground)
                     .child(
                         h_flex()
@@ -21692,9 +21678,6 @@ impl VibexWorkbench {
                                                 )),
                                         ),
                                 )
-                            })
-                            .when(show_worktree_status, |this| {
-                                this.child(sidebar_session_status_indicator(display_state, cx))
                             })
                             .child(sidebar_agent_logo(sidebar_agent_id.as_str(), selected, cx))
                             .child(
@@ -21727,6 +21710,12 @@ impl VibexWorkbench {
                                         .text_color(cx.theme().warning),
                                 )
                             })
+                            .when(
+                                !pinned && !session_needs_approval && !has_unread_completion,
+                                |this| {
+                                    this.child(sidebar_session_status_indicator(display_state, cx))
+                                },
+                            )
                             .when(!pinned && session_needs_approval, |this| {
                                 this.child(
                                     div()
@@ -21747,24 +21736,27 @@ impl VibexWorkbench {
                                         ),
                                 )
                             })
-                            .when(!pinned && !session_needs_approval, |this| {
-                                this.when_some(state_label, |this, label| {
-                                    this.child(
-                                        div()
-                                            .h(px(16.0))
-                                            .flex_none()
-                                            .rounded(px(4.0))
-                                            .px(px(6.0))
-                                            .text_xs()
-                                            .bg(cx.theme().secondary)
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(label),
-                                    )
-                                })
-                                .when(state_label.is_none() && !has_unread_completion, |this| {
-                                    this.child(time_label)
-                                })
-                            })
+                            .when(
+                                !pinned && !session_needs_approval && !session_generating,
+                                |this| {
+                                    this.when_some(state_label, |this, label| {
+                                        this.child(
+                                            div()
+                                                .h(px(16.0))
+                                                .flex_none()
+                                                .rounded(px(4.0))
+                                                .px(px(6.0))
+                                                .text_xs()
+                                                .bg(cx.theme().secondary)
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(label),
+                                        )
+                                    })
+                                    .when(state_label.is_none() && !has_unread_completion, |this| {
+                                        this.child(time_label)
+                                    })
+                                },
+                            )
                             .when(has_unread_completion, |this| {
                                 this.child(
                                     div()
@@ -21777,21 +21769,6 @@ impl VibexWorkbench {
                             }),
                     ),
             )
-            .when(display_state == AgentSessionState::Error, |this| {
-                this.child(
-                    div()
-                        .id(format!("sidebar-session-error-{session_id_string}"))
-                        .absolute()
-                        .left(px(-24.0))
-                        .top(px(7.0))
-                        .size(px(14.0))
-                        .child(
-                            Icon::new(IconName::TriangleAlert)
-                                .size(px(14.0))
-                                .text_color(cx.theme().danger),
-                        ),
-                )
-            })
             .when(self.sidebar_batch_mode, |this| {
                 this.child(
                     div()
@@ -45571,7 +45548,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_session_status_uses_left_error_and_hoverable_loading_metadata() {
+    fn sidebar_session_status_is_rendered_on_the_right_for_all_views() {
         let source = include_str!("app.rs");
         let workspace_toggle = source
             .split_once("    fn activate_and_toggle_sidebar_workspace(")
@@ -45597,29 +45574,23 @@ mod tests {
         assert!(sidebar_session.contains(".h(px(SIDEBAR_SESSION_ROW_HEIGHT))"));
         assert!(sidebar_session.contains(".min_h(px(SIDEBAR_SESSION_ROW_HEIGHT))"));
         assert!(sidebar_session.contains(".top(px(8.0))"));
-        assert!(sidebar_session.contains("let show_worktree_status ="));
         assert!(sidebar_session.contains("cx.theme().sidebar_foreground.opacity(0.56)"));
         assert!(sidebar_session.contains(".when(selected, |this| this.font_semibold())"));
-        assert!(sidebar_session.contains("self.ui_state.sidebar.hierarchy_mode"));
-        assert!(sidebar_session.contains("SidebarHierarchyMode::Detailed"));
-        assert!(sidebar_session.contains(".when(show_worktree_status, |this|"));
         assert!(!sidebar_session.contains("selected, self.agent_turn_pending"));
-        assert!(sidebar_session.contains(".when(show_worktree_status, |this|"));
-        assert!(sidebar_session.contains("SIDEBAR_WORKSPACE_SESSION_CONTENT_INSET"));
-        assert!(sidebar_session.contains("this.pr_2().when(show_worktree_status"));
         assert!(!sidebar_session.contains("let branch_path ="));
         assert!(!sidebar_session.contains(".when_some(branch_path"));
-        assert!(!sidebar_session.contains(".when(session_generating, |this|"));
+        assert!(
+            sidebar_session
+                .contains("let session_generating = display_state == AgentSessionState::Running")
+        );
+        assert!(sidebar_session.contains("sidebar_session_status_indicator(display_state, cx)"));
+        assert!(sidebar_session.contains("!session_needs_approval && !has_unread_completion"));
+        assert!(sidebar_session.contains("!session_needs_approval && !session_generating"));
         assert!(sidebar_session.contains(".when(pinned, |this|"));
         assert!(sidebar_session.contains("icons/vibex/pin.svg"));
         assert!(sidebar_session.contains(".when(!self.sidebar_batch_mode && !pinned, |this|"));
-        assert!(sidebar_session.contains(".when(!pinned && !session_needs_approval, |this|"));
-        assert!(
-            sidebar_session.contains(".when(display_state == AgentSessionState::Error, |this|")
-        );
         assert!(sidebar_session.contains("Icon::new(IconName::TriangleAlert)"));
-        assert!(sidebar_session.contains(".left(px(-24.0))"));
-        assert!(sidebar_session.contains(".text_color(cx.theme().danger)"));
+        assert!(!sidebar_session.contains("sidebar-session-error-{session_id_string}"));
         assert!(!sidebar_session.contains(".child(strings.sidebar_state_error)"));
         assert!(
             sidebar_session.contains("this.group_hover(&hover_group, |style| style.invisible())")
@@ -49181,7 +49152,6 @@ mod tests {
         );
         assert!(workspace.contains(".left(px(workspace_offset))"));
         assert!(workspace.contains(".pl(px(SIDEBAR_WORKSPACE_SESSION_INDENT))"));
-        assert!(source.contains("const SIDEBAR_WORKSPACE_SESSION_CONTENT_INSET: f32 = 6.0;"));
         assert!(workspace.contains(".gap(px(0.0))"));
         assert!(workspace.contains("cx.theme().sidebar_foreground.opacity(0.28)"));
         assert!(workspace.contains(".w(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))"));
