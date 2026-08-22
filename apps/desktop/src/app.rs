@@ -19702,12 +19702,15 @@ impl VibexWorkbench {
                     })
                     .child(
                         h_flex()
+                            .id("title-bar-sidebar")
                             .h_full()
                             .w(px(sidebar_width))
                             .flex_none()
                             .items_center()
                             .border_r_1()
                             .border_color(cx.theme().border)
+                            .bg(cx.theme().sidebar)
+                            .text_color(cx.theme().sidebar_foreground)
                             .px_2()
                             .when(cfg!(target_os = "macos"), |this| this.pl(px(80.0)))
                             .child(
@@ -19768,60 +19771,57 @@ impl VibexWorkbench {
                                                 this.navigate_forward(window, cx);
                                             })),
                                     ),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .id("title-bar-main")
+                            .h_full()
+                            .min_w_0()
+                            .flex_1()
+                            .justify_center()
+                            .gap(px(1.0))
+                            .px_3()
+                            .bg(cx.theme().background)
+                            .text_color(cx.theme().foreground)
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .id("title-session-title")
+                                            .min_w_0()
+                                            .flex_1()
+                                            .truncate()
+                                            .text_sm()
+                                            .font_medium()
+                                            .child(session_title),
+                                    )
+                                    .when_some(title_session_menu, |this, menu| this.child(menu)),
                             )
                             .child(
-                                v_flex()
-                                    .h_full()
+                                h_flex()
+                                    .id("title-workspace-context")
                                     .min_w_0()
-                                    .flex_1()
-                                    .justify_center()
-                                    .gap(px(1.0))
-                                    .px_3()
+                                    .items_center()
+                                    .gap_1()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
                                     .child(
-                                        h_flex()
-                                            .min_w_0()
-                                            .items_center()
-                                            .gap_1()
-                                            .child(
-                                                div()
-                                                    .id("title-session-title")
-                                                    .min_w_0()
-                                                    .flex_1()
-                                                    .truncate()
-                                                    .text_sm()
-                                                    .font_medium()
-                                                    .child(session_title),
-                                            )
-                                            .when_some(title_session_menu, |this, menu| {
-                                                this.child(menu)
-                                            }),
+                                        div().min_w_0().truncate().child(workspace_project_label),
                                     )
-                                    .child(
-                                        h_flex()
-                                            .id("title-workspace-context")
-                                            .min_w_0()
-                                            .items_center()
-                                            .gap_1()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(
-                                                div()
-                                                    .min_w_0()
-                                                    .truncate()
-                                                    .child(workspace_project_label),
-                                            )
-                                            .when_some(workspace_branch_label, |this, branch| {
-                                                this.child(
-                                                    sidebar_icon("icons/vibex/git-branch.svg")
-                                                        .size(px(12.0)),
-                                                )
-                                                .child(div().min_w_0().truncate().child(branch))
-                                            })
-                                            .tooltip(move |window, cx| {
-                                                Tooltip::new(workspace_tooltip.clone())
-                                                    .build(window, cx)
-                                            }),
-                                    ),
+                                    .when_some(workspace_branch_label, |this, branch| {
+                                        this.child(
+                                            sidebar_icon("icons/vibex/git-branch.svg")
+                                                .size(px(12.0)),
+                                        )
+                                        .child(div().min_w_0().truncate().child(branch))
+                                    })
+                                    .tooltip(move |window, cx| {
+                                        Tooltip::new(workspace_tooltip.clone()).build(window, cx)
+                                    }),
                             ),
                     )
                     .child(
@@ -52377,12 +52377,43 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn build_title_session_menu("))
             .map(|(body, _)| body)
             .expect("title bar should remain inspectable");
-        assert!(title_bar.contains(".bg(cx.theme().background)"));
-        assert!(title_bar.contains("title-session-title"));
-        assert!(title_bar.contains("title-session-menu"));
-        assert!(title_bar.contains("title-workspace-context"));
+        let sidebar_start = title_bar
+            .find(".id(\"title-bar-sidebar\")")
+            .expect("sidebar title-bar segment should exist");
+        let main_start = title_bar
+            .find(".id(\"title-bar-main\")")
+            .expect("main title-bar segment should exist");
+        let session_title = title_bar
+            .find(".id(\"title-session-title\")")
+            .expect("session title should exist");
+        let session_menu = title_bar[main_start..]
+            .find(".when_some(title_session_menu")
+            .map(|offset| main_start + offset)
+            .expect("session actions menu should be mounted in the main segment");
+        let workspace_context = title_bar
+            .find(".id(\"title-workspace-context\")")
+            .expect("workspace context should exist");
+
+        assert!(sidebar_start < main_start);
+        assert!(main_start < session_title);
+        assert!(session_title < session_menu);
+        assert!(session_menu < workspace_context);
+
+        let sidebar = &title_bar[sidebar_start..main_start];
+        assert!(sidebar.contains(".bg(cx.theme().sidebar)"));
+        assert!(sidebar.contains(".text_color(cx.theme().sidebar_foreground)"));
+        assert!(!sidebar.contains("title-session-title"));
+        assert!(!sidebar.contains("title-workspace-context"));
+
+        let main = &title_bar[main_start..];
+        assert!(main.contains(".bg(cx.theme().background)"));
+        assert!(main.contains(".text_color(cx.theme().foreground)"));
+        assert!(main.contains("title-session-title"));
+        assert!(main.contains("title_session_menu"));
+        assert!(main.contains("title-workspace-context"));
+        assert!(main.contains("icons/vibex/git-branch.svg"));
         assert!(title_bar.contains("worktree_titles"));
-        assert!(title_bar.contains("icons/vibex/git-branch.svg"));
+        assert!(title_bar.contains("title-session-menu"));
 
         let menu = source
             .split_once("    fn build_title_session_menu(")
