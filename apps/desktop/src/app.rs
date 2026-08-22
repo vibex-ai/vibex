@@ -20964,6 +20964,11 @@ impl VibexWorkbench {
         } else {
             cx.theme().transparent
         };
+        let card_border_color = if card_focused {
+            cx.theme().sidebar_accent.opacity(0.72)
+        } else {
+            cx.theme().transparent
+        };
         let lifecycle_error = lifecycle_state.is_some_and(|state| {
             matches!(
                 state,
@@ -21135,10 +21140,8 @@ impl VibexWorkbench {
             .overflow_x_hidden()
             .rounded(px(10.0))
             .bg(card_background)
-            .when(card_focused, |this| {
-                this.border_1()
-                    .border_color(cx.theme().sidebar_accent.opacity(0.72))
-            })
+            .border_1()
+            .border_color(card_border_color)
             .pt(px(4.0))
             .pr(px(4.0))
             .pb(px(4.0))
@@ -49127,8 +49130,9 @@ mod tests {
         assert!(workspace.contains("let card_focused = !collapsed && selected"));
         assert!(workspace.contains("let card_background = if card_focused"));
         assert!(workspace.contains(".sidebar_accent.opacity(0.36)"));
-        assert!(workspace.contains(".when(card_focused, |this|"));
-        assert!(workspace.contains(".border_color(cx.theme().sidebar_accent.opacity(0.72))"));
+        assert!(workspace.contains("let card_border_color = if card_focused"));
+        assert!(workspace.contains(".border_1()"));
+        assert!(workspace.contains(".border_color(card_border_color)"));
         assert!(workspace.contains(".bg(card_background)"));
         assert!(!workspace.contains(".bg(row_background)"));
         assert!(
