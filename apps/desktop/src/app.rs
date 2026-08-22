@@ -1562,7 +1562,7 @@ fn git_activity_badge(count: u32, cx: &Context<VibexWorkbench>) -> AnyElement {
         .items_center()
         .justify_center()
         .rounded_full()
-        .bg(cx.theme().success.opacity(0.18))
+        .bg(cx.theme().success.opacity(0.10))
         .text_color(cx.theme().success)
         .font_family("monospace")
         .text_xs()
@@ -45943,7 +45943,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("Git activity badge should remain inspectable");
 
-        assert!(badge.contains(".bg(cx.theme().success.opacity(0.18))"));
+        assert!(badge.contains(".bg(cx.theme().success.opacity(0.10))"));
         assert!(badge.contains(".text_color(cx.theme().success)"));
     }
 
