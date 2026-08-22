@@ -9,10 +9,10 @@ use gpui::{
     AccessibleAction, Anchor, AnyElement, AnyWindowHandle, App, ClipboardItem, Context,
     DragMoveEvent, Entity, FocusHandle, Hsla, Image, ImageFormat, InteractiveElement as _,
     IntoElement, KeyDownEvent, ListAlignment, ListHorizontalSizingBehavior, ListOffset, ListState,
-    MouseButton, MouseDownEvent, Orientation, ParentElement as _, PathBuilder, Render, Role,
-    ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _, StyleRefinement,
-    Styled as _, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, canvas, deferred,
-    div, img, list, point, prelude::*, px, relative, uniform_list,
+    MouseButton, MouseDownEvent, Orientation, ParentElement as _, PathBuilder, Render, RenderImage,
+    Role, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _,
+    StyleRefinement, Styled as _, Subscription, Task, UniformListScrollHandle, WeakEntity, Window,
+    canvas, deferred, div, img, list, point, prelude::*, px, relative, uniform_list,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath,
@@ -309,7 +309,7 @@ enum FilePresentation {
         images: Arc<BTreeMap<String, Arc<Image>>>,
     },
     Image {
-        image: Arc<Image>,
+        image: Arc<RenderImage>,
         cache_key: ImageCacheKey,
     },
     MediaExternalOnly,
@@ -3842,9 +3842,17 @@ impl CodeWorkbench {
         else {
             return;
         };
+        let Some(format) = image_format_for_path(&path) else {
+            self.presentations.insert(
+                path,
+                FilePresentation::Unsupported("Unsupported image format".into()),
+            );
+            return;
+        };
         self.presentations
             .insert(path.clone(), FilePresentation::Loading);
         let workspace_id = workspace.id.clone();
+        let svg_renderer = cx.svg_renderer();
         let request = FileReadRequest {
             workspace_id: workspace_id.clone(),
             path: path.clone(),
@@ -3855,12 +3863,16 @@ impl CodeWorkbench {
             let files = runtime.files();
             let metadata = files.read(&request)?;
             let bytes = files.read_bytes(&workspace_id, &byte_path, IMAGE_SOURCE_MAX_BYTES)?;
-            Ok::<_, VibexError>((metadata, bytes))
+            let image = Image::from_bytes(format, bytes);
+            let rendered = image.to_image_data(svg_renderer).map_err(|error| {
+                VibexError::validation("image_decode_failed", error.to_string())
+            })?;
+            Ok::<_, VibexError>((metadata, rendered))
         });
         let task_path = path.clone();
         let task = cx.spawn_in(window, async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
-            let _ = entity.update_in(cx, |this, window, cx| {
+            let _ = entity.update_in(cx, |this, _window, cx| {
                 this.file_tasks.remove(&task_path);
                 if this.workspace.as_ref().map(|current| current.generation)
                     != Some(workspace.generation)
@@ -3868,25 +3880,7 @@ impl CodeWorkbench {
                     return;
                 }
                 match outcome {
-                    Ok(Ok((metadata, bytes))) => {
-                        let Some(format) = image_format_for_path(&task_path) else {
-                            this.presentations.insert(
-                                task_path.clone(),
-                                FilePresentation::Unsupported("Unsupported image format".into()),
-                            );
-                            return;
-                        };
-                        let image = Arc::new(Image::from_bytes(format, bytes));
-                        let Some(rendered) = image.clone().get_render_image(window, cx) else {
-                            this.presentations.insert(
-                                task_path.clone(),
-                                FilePresentation::Error {
-                                    code: "image_decode_failed".into(),
-                                    message: "The image could not be decoded".into(),
-                                },
-                            );
-                            return;
-                        };
+                    Ok(Ok((metadata, rendered))) => {
                         let size = rendered.size(0);
                         let width = u32::try_from(size.width.0).unwrap_or(u32::MAX);
                         let height = u32::try_from(size.height.0).unwrap_or(u32::MAX);
@@ -3902,31 +3896,18 @@ impl CodeWorkbench {
                             decoded_bytes,
                         ) {
                             Ok(evicted) => {
-                                let evicted_images = this
-                                    .presentations
-                                    .values()
-                                    .filter_map(|presentation| match presentation {
-                                        FilePresentation::Image { image, cache_key }
-                                            if evicted.contains(cache_key) =>
-                                        {
-                                            Some(image.clone())
-                                        }
-                                        _ => None,
-                                    })
-                                    .collect::<Vec<_>>();
-                                for evicted_image in evicted_images {
-                                    evicted_image.remove_asset(cx);
-                                }
                                 this.presentations.retain(|_, presentation| {
                                     !matches!(presentation, FilePresentation::Image { cache_key, .. } if evicted.contains(cache_key))
                                 });
                                 this.presentations.insert(
                                     task_path.clone(),
-                                    FilePresentation::Image { image, cache_key },
+                                    FilePresentation::Image {
+                                        image: rendered,
+                                        cache_key,
+                                    },
                                 );
                             }
                             Err(_) => {
-                                image.remove_asset(cx);
                                 this.presentations.insert(
                                     task_path.clone(),
                                     FilePresentation::Error {
@@ -14160,6 +14141,24 @@ mod tests {
             }),
             ContentSurfaceKind::GitDiff
         );
+    }
+
+    #[test]
+    fn svg_preview_bytes_decode_into_a_renderable_frame() {
+        let image = Image::from_bytes(
+            ImageFormat::Svg,
+            br##"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1">
+<rect width="1" height="1" fill="#38BDF8"/>
+</svg>"##
+                .to_vec(),
+        );
+        let rendered = image
+            .to_image_data(gpui::SvgRenderer::new(Arc::new(())))
+            .expect("valid SVG should decode through the native renderer");
+
+        assert_eq!(rendered.frame_count(), 1);
+        assert_eq!(rendered.size(0).width.0, 2);
+        assert_eq!(rendered.size(0).height.0, 2);
     }
 
     #[test]
