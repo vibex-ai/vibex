@@ -388,6 +388,46 @@ pub fn branch_checkout(
     status(workspace_id, root)
 }
 
+/// Rename a local branch while holding the repository mutation guard. A
+/// managed Worktree keeps its durable identity separate from this Git ref, so
+/// callers are responsible for updating that record after this command
+/// succeeds.
+pub fn branch_rename(
+    repo_path: impl AsRef<Path>,
+    old_name: &str,
+    new_name: &str,
+) -> VibexResult<()> {
+    let root = repo_root(repo_path.as_ref())?;
+    let _mutation = GitMutationGuard::claim(&root)?;
+    validate_branch_name(&root, old_name)?;
+    validate_branch_name(&root, new_name)?;
+    if old_name == new_name {
+        return Ok(());
+    }
+    run_git_owned(
+        &root,
+        &[
+            "branch".to_string(),
+            "-m".to_string(),
+            old_name.to_string(),
+            new_name.to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn branch_delete(repo_path: impl AsRef<Path>, name: &str, force: bool) -> VibexResult<()> {
+    let root = repo_root(repo_path.as_ref())?;
+    let _mutation = GitMutationGuard::claim(&root)?;
+    validate_branch_name(&root, name)?;
+    let flag = if force { "-D" } else { "-d" };
+    run_git_owned(
+        &root,
+        &["branch".to_string(), flag.to_string(), name.to_string()],
+    )?;
+    Ok(())
+}
+
 pub fn remote_action(
     workspace_id: WorkspaceId,
     repo_path: impl AsRef<Path>,
@@ -3353,12 +3393,64 @@ mod tests {
                 workspace_id,
                 worktree_path: worktree_path.to_string_lossy().to_string(),
                 force: false,
+                delete_branch: false,
                 expected_head: created.head,
                 preflight_revision: None,
             },
         )
         .unwrap();
         assert!(removed.is_empty() || removed.contains("Preparing"));
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(worktree_path);
+    }
+
+    #[test]
+    fn branch_rename_and_delete_worktree_branch() {
+        let root = temp_repo("worktree-branch-lifecycle-main");
+        std::fs::create_dir_all(&root).unwrap();
+        init_repo_with_commit(&root, "README.md", "hello\n", "initial");
+        let worktree_path = temp_repo("worktree-branch-lifecycle-feature");
+        let workspace_id = WorkspaceId::new();
+        let request = GitWorktreeCreateRequest {
+            workspace_id: workspace_id.clone(),
+            branch_name: "feature/old-name".to_string(),
+            base_ref: Some("HEAD".to_string()),
+            name: None,
+            worktree_path: None,
+            target_workspace_id: None,
+            target_branch: None,
+        };
+        let created = worktree_add(&root, &worktree_path, &request).unwrap();
+
+        branch_rename(&root, "feature/old-name", "feature/new-name").unwrap();
+        let listed = worktree_list(workspace_id.clone(), &root).unwrap();
+        let renamed = listed
+            .worktrees
+            .iter()
+            .find(|worktree| same_path_identity(&worktree.path, &worktree_path))
+            .expect("renamed worktree should remain registered");
+        assert_eq!(renamed.branch.as_deref(), Some("feature/new-name"));
+
+        worktree_remove(
+            &root,
+            &GitWorktreeDiscardRequest {
+                workspace_id,
+                worktree_path: worktree_path.to_string_lossy().to_string(),
+                force: true,
+                delete_branch: true,
+                expected_head: created.head,
+                preflight_revision: None,
+            },
+        )
+        .unwrap();
+        branch_delete(&root, "feature/new-name", true).unwrap();
+        assert!(!worktree_path.exists());
+        assert!(
+            local_branch_head(&root, "feature/new-name")
+                .unwrap()
+                .is_none()
+        );
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(worktree_path);
@@ -3441,6 +3533,7 @@ mod tests {
                 workspace_id,
                 worktree_path: worktree_path.to_string_lossy().to_string(),
                 force: false,
+                delete_branch: false,
                 expected_head: Some(source_head),
                 preflight_revision: None,
             },
@@ -3787,6 +3880,7 @@ mod tests {
                 workspace_id,
                 worktree_path: path.to_string_lossy().into_owned(),
                 force: false,
+                delete_branch: false,
                 expected_head: Some(expected_head.clone()),
                 preflight_revision: None,
             },

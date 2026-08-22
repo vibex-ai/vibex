@@ -1253,6 +1253,13 @@ impl WorkspaceBackend for WebRemoteBackend {
         })
     }
 
+    fn delete_workspace(&self, _request: MutationRequest<WorkspaceId>) -> BackendFuture<'_, ()> {
+        self.unsupported(
+            "remote_workspace_delete_unavailable",
+            "remote worktree deletion is not exposed by this Gateway",
+        )
+    }
+
     fn delete_project(&self, _request: MutationRequest<ProjectId>) -> BackendFuture<'_, ()> {
         self.unsupported(
             "remote_workspace_delete_unavailable",

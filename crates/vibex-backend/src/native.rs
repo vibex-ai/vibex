@@ -592,6 +592,18 @@ impl WorkspaceBackend for NativeBackend {
         })
     }
 
+    fn delete_workspace(&self, request: MutationRequest<WorkspaceId>) -> BackendFuture<'_, ()> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .workspace()
+                .delete_workspace(&request.payload)
+                .map_err(Into::into)
+        })
+    }
+
     fn delete_project(&self, request: MutationRequest<ProjectId>) -> BackendFuture<'_, ()> {
         let runtime = self.runtime.clone();
         Box::pin(async move {

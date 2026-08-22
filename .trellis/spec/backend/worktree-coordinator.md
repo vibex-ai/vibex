@@ -53,7 +53,7 @@ GitWorktreeMergeRequest {
 GitWorktreeMergeStrategy { no_ff_merge, rebase_and_merge, unknown }
 
 GitWorktreeDiscardRequest {
-  workspaceId, worktreePath, force, expectedHead?, preflightRevision?
+  workspaceId, worktreePath, force, deleteBranch?, expectedHead?, preflightRevision?
 }
 
 GitWorktreeDestructivePreflight {
@@ -145,6 +145,11 @@ but an unexpired `Running` lease returns busy.
   example, `worktreePath = None` uses `skip_serializing_if`); a present value
   participates in the fingerprint. Do not turn a legacy retry into an
   idempotency conflict by serializing a newly added `null` field.
+- Discarding a managed Worktree may explicitly request `deleteBranch`. The
+  coordinator removes the registered Worktree with the requested force mode
+  first, then deletes its local branch while holding the same Git mutation
+  guard. The default `false` value is omitted from serialized requests so old
+  clients retain their request shape and branch deletion remains opt-in.
 - Acquire all repository/path/workspace-index keys atomically after sorting by
   `(kind, key)`. Never hold a partial multi-key claim while waiting.
 - If a merge/discard intent is reserved but the in-process lifecycle lock is

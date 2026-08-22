@@ -66,6 +66,28 @@ impl WorktreeCoordinator {
         }
     }
 
+    pub fn rename_branch(&self, workspace_id: &WorkspaceId, new_branch: &str) -> VibexResult<()> {
+        let connection = open_database(&self.db_path)?;
+        let (_, workspace) = workspace_record(&connection, workspace_id)?;
+        if workspace.mode != WorkspaceMode::VibexWorktree {
+            return Err(VibexError::validation(
+                "worktree_rename_requires_managed_workspace",
+                "only a managed Worktree branch can be renamed here",
+            ));
+        }
+        let managed = managed_for_path(&connection, &workspace.root_path)?.ok_or_else(|| {
+            VibexError::validation("worktree_not_managed", "worktree is not managed by Vibex")
+        })?;
+        let old_branch = managed.branch.clone().ok_or_else(|| {
+            VibexError::validation(
+                "worktree_branch_missing",
+                "managed worktree has no local branch",
+            )
+        })?;
+        vibex_git::branch_rename(&managed.repo_root, &old_branch, new_branch)?;
+        ManagedWorktreeRepository::update_branch(&connection, &managed.worktree_id, new_branch)
+    }
+
     pub fn project_git_eligibility(
         &self,
         workspace_id: &WorkspaceId,
@@ -1434,6 +1456,7 @@ impl WorktreeCoordinator {
             workspace_id: request.workspace_id.clone(),
             worktree_path: current.managed.worktree_path.clone(),
             force: false,
+            delete_branch: false,
             expected_head: Some(source_head.to_string()),
             preflight_revision: request.preflight_revision.clone(),
         };
@@ -1648,11 +1671,20 @@ impl WorktreeCoordinator {
             workspace_id: request.workspace_id.clone(),
             worktree_path: current.managed.worktree_path.clone(),
             force: request.force,
+            delete_branch: request.delete_branch,
             expected_head: request.expected_head.clone(),
             preflight_revision: request.preflight_revision.clone(),
         };
         match vibex_git::worktree_remove(&current.managed.repo_root, &exact_request) {
             Ok(_) => {
+                if request.delete_branch
+                    && let Some(branch) = current.managed.branch.as_deref()
+                    && let Err(error) =
+                        vibex_git::branch_delete(&current.managed.repo_root, branch, true)
+                {
+                    mark_lifecycle_failure(&connection, &claimed, &error, false)?;
+                    return Err(error);
+                }
                 ManagedWorktreeRepository::update_status(
                     &connection,
                     &current.managed.worktree_path,
@@ -3432,6 +3464,14 @@ impl WorktreeCoordinator {
 }
 
 impl GitHandle {
+    pub fn worktree_rename_branch(
+        &self,
+        workspace_id: &WorkspaceId,
+        new_branch: &str,
+    ) -> VibexResult<()> {
+        self.worktrees.rename_branch(workspace_id, new_branch)
+    }
+
     pub fn project_git_eligibility(
         &self,
         workspace_id: &WorkspaceId,
@@ -5185,6 +5225,7 @@ mod tests {
             workspace_id: first.workspace.id.clone(),
             worktree_path: first.worktree.path.clone(),
             force: false,
+            delete_branch: false,
             expected_head: None,
             preflight_revision: None,
         };
@@ -6655,6 +6696,7 @@ mod tests {
             workspace_id: created.workspace.id.clone(),
             worktree_path: created.worktree.path.clone(),
             force: false,
+            delete_branch: false,
             expected_head: None,
             preflight_revision: None,
         };

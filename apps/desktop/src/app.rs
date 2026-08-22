@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fs,
     future::Future,
@@ -80,21 +80,21 @@ use vibex_core::{
     FileEntryKind, FileOperationKind, FileOperationPatchFormat, FileTreeRequest,
     ForkAgentSessionRequest, GetMessageSubmissionRequest, GitProjectEligibilityState,
     GitProjectIneligibleReason, GitStageRequest, GitStatusSummary,
-    GitWorktreeAssistanceSessionRequest, GitWorktreeConflictKind, GitWorktreeOperationRecord,
-    GitWorktreeOperationStatus, MessageAttachment, MessageSubmissionState, MessageSubmissionStatus,
-    OpenWorkspaceRequest, PermissionResolution, PermissionResponseKind, PlanStepStatus, ProjectId,
-    ProjectRecord, PromptId, ProviderBindingMetadata, ProviderKind, ProviderProfileSummary,
-    RenameAgentSessionRequest, RequestId, ResolvePermissionRequest, RuntimeAuthSource,
-    RuntimeAuthSourceAvailability, RuntimeAuthSourceKind, RuntimeAuthSourceSummary,
-    RuntimeClientId, RuntimeLeaseRole, RuntimeModelSelection, RuntimeSelectionInteraction,
-    SendAgentMessageRequest, SessionRuntimeFeature, SessionRuntimeFeatureKind,
-    SessionRuntimeOption, SessionRuntimeOptionCatalog, SessionRuntimeSelection,
-    SessionRuntimeSelectionStatus, SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest,
-    TerminalId, TerminalSession, TerminalStatus, TerminalSwitchShellRequest, TimelineItem,
-    TimelineItemId, TimelineLiveEvent, TimelinePage, TimelinePayload, TimelineRedactionState,
-    TimelineSource, UserMessagePayload, VibexSessionId, WorkspaceMode, WorkspaceRecord,
-    agent_session_turn_requires_continuation, latest_timeline_turn_ended_normally,
-    unix_timestamp_ms,
+    GitWorktreeAssistanceSessionRequest, GitWorktreeConflictKind, GitWorktreeDiscardRequest,
+    GitWorktreeOperationRecord, GitWorktreeOperationStatus, MessageAttachment,
+    MessageSubmissionState, MessageSubmissionStatus, OpenWorkspaceRequest, PermissionResolution,
+    PermissionResponseKind, PlanStepStatus, ProjectId, ProjectRecord, PromptId,
+    ProviderBindingMetadata, ProviderKind, ProviderProfileSummary, RenameAgentSessionRequest,
+    RequestId, ResolvePermissionRequest, RuntimeAuthSource, RuntimeAuthSourceAvailability,
+    RuntimeAuthSourceKind, RuntimeAuthSourceSummary, RuntimeClientId, RuntimeLeaseRole,
+    RuntimeModelSelection, RuntimeSelectionInteraction, SendAgentMessageRequest,
+    SessionRuntimeFeature, SessionRuntimeFeatureKind, SessionRuntimeOption,
+    SessionRuntimeOptionCatalog, SessionRuntimeSelection, SessionRuntimeSelectionStatus,
+    SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest, TerminalId, TerminalSession,
+    TerminalStatus, TerminalSwitchShellRequest, TimelineItem, TimelineItemId, TimelineLiveEvent,
+    TimelinePage, TimelinePayload, TimelineRedactionState, TimelineSource, UserMessagePayload,
+    VibexSessionId, WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation,
+    latest_timeline_turn_ended_normally, managed_worktree_name_slug, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     AgentPlanProjection, AppearanceUiState, ComposerAttachment, ComposerQueueSendMode,
@@ -186,6 +186,7 @@ const SIDEBAR_WORKSPACE_STATUS_TOP_OFFSET: f32 = 4.0;
 const SIDEBAR_ICON_TITLE_GAP: f32 = 4.0;
 const SIDEBAR_PROJECT_ICON_SLOT_SIZE: f32 = 30.0;
 const SIDEBAR_WORKSPACE_SESSION_INDENT: f32 = 28.0;
+const SIDEBAR_WORKSPACE_SESSION_CARD_OVERHANG: f32 = 8.0;
 const SIDEBAR_TOP_LEVEL_PROJECT_OFFSET: f32 = -8.0;
 const SIDEBAR_NESTED_PROJECT_INDENT: f32 = 8.0;
 const SIDEBAR_PROJECT_LOGO_IMAGE_SIZE: u32 = 256;
@@ -319,7 +320,7 @@ const COMPOSER_PLAN_TOOLTIP_WIDTH: f32 = 360.0;
 const COMPOSER_PLAN_TOOLTIP_MAX_HEIGHT: f32 = 420.0;
 const COMPOSER_PLAN_EXPANDED_MAX_HEIGHT: f32 = 320.0;
 const COMPOSER_PLAN_TOOLTIP_DELAY: Duration = Duration::from_secs(2);
-const COMPOSER_SURFACE_MIN_HEIGHT: f32 = 96.0;
+const COMPOSER_SURFACE_MIN_HEIGHT: f32 = 112.0;
 const COMPOSER_TEXT_AREA_MIN_HEIGHT: f32 = 52.0;
 const COMPOSER_SURFACE_RADIUS: f32 = 20.0;
 const COMPOSER_RUNTIME_MENU_WIDTH: f32 = 320.0;
@@ -426,6 +427,13 @@ enum InlineAttachmentEdit {
     Delete,
     Left,
     Right,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InlineAttachmentKeyAction {
+    None,
+    Handled,
+    Remove(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1537,24 +1545,12 @@ fn right_rail_activity_button(id: impl Into<ElementId>, icon: Icon) -> Button {
         .icon(icon)
 }
 
-fn git_pending_commit_count(status: Option<&GitStatusSummary>) -> u32 {
-    status.map_or(0, |status| status.changes.len() as u32)
-}
-
 fn git_activity_badge(count: u32, cx: &Context<VibexWorkbench>) -> AnyElement {
     div()
         .absolute()
-        .top(px(-4.0))
-        .right(px(-4.0))
-        .min_w(px(16.0))
-        .h(px(16.0))
-        .px_1()
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded_full()
-        .bg(cx.theme().success)
-        .text_color(cx.theme().background)
+        .top(px(-2.0))
+        .right(px(1.0))
+        .text_color(cx.theme().success)
         .font_family("monospace")
         .text_xs()
         .font_semibold()
@@ -3216,6 +3212,19 @@ fn composer_queue_session_blocks_dispatch(
     local_turn_pending || session_blocks
 }
 
+fn composer_queue_waits_for_continuation(
+    behavior: ComposerQueueDispatchBehavior,
+    session_state: Option<AgentSessionState>,
+    latest_turn_ended_normally: Option<bool>,
+) -> bool {
+    matches!(
+        behavior,
+        ComposerQueueDispatchBehavior::Automatic | ComposerQueueDispatchBehavior::AfterCompletion
+    ) && session_state.is_some_and(|state| {
+        agent_session_turn_requires_continuation(state, latest_turn_ended_normally)
+    })
+}
+
 fn auto_continue_should_start(
     enabled: bool,
     session_state: AgentSessionState,
@@ -3691,7 +3700,7 @@ pub struct VibexWorkbench {
     code_files_surface_visible: bool,
     code_git_surface_visible: bool,
     right_rail_mode: RightRailMode,
-    git_pending_change_count: u32,
+    git_pending_commit_count: u32,
     code_right_rail: Entity<CodeRightRail>,
     management_view: Entity<ManagementCenter>,
     usage_view: Entity<UsageView>,
@@ -3724,6 +3733,8 @@ pub struct VibexWorkbench {
     sessions: Vec<AgentSession>,
     optimistically_removed_session_ids: BTreeSet<String>,
     pending_session_deletion_ids: BTreeSet<String>,
+    pending_worktree_rename_ids: BTreeSet<String>,
+    pending_worktree_deletion_ids: BTreeSet<String>,
     optimistic_session_deletion_reconciliation_pending: bool,
     sidebar_state: SidebarState,
     sidebar_projection_revision: u64,
@@ -3836,9 +3847,12 @@ pub struct VibexWorkbench {
     composer_queue_serial: u64,
     composer_queue_manual_session_ids: BTreeSet<String>,
     composer_queue_paused_session_ids: BTreeSet<String>,
+    composer_queue_ready_after_continuation_session_ids: BTreeSet<String>,
     composer_queue_interrupted_session_ids: BTreeSet<String>,
     composer_queue_steering_session_ids: BTreeSet<String>,
     composer_queue_editing_id: Option<u64>,
+    composer_queue_edit_attachments: Vec<InlineComposerAttachment>,
+    composer_queue_edit_geometry: ComposerGeometry,
     composer_queue_drop_target: Option<ComposerQueueDropTarget>,
     composer_plan_expanded: Option<ComposerPlanIdentity>,
     dismissed_composer_plans: BTreeSet<ComposerPlanIdentity>,
@@ -4224,11 +4238,11 @@ impl VibexWorkbench {
             &code_workbench,
             window,
             |this, workbench, _, cx| {
-                let next_count = git_pending_commit_count(workbench.read(cx).git_status());
-                if this.git_pending_change_count == next_count {
+                let next_count = workbench.read(cx).git_pending_commit_count();
+                if this.git_pending_commit_count == next_count {
                     return;
                 }
-                this.git_pending_change_count = next_count;
+                this.git_pending_commit_count = next_count;
                 cx.notify();
             },
         ));
@@ -4323,7 +4337,7 @@ impl VibexWorkbench {
             code_files_surface_visible: false,
             code_git_surface_visible: false,
             right_rail_mode: restored_right_rail_mode,
-            git_pending_change_count: 0,
+            git_pending_commit_count: 0,
             code_right_rail,
             management_view,
             usage_view,
@@ -4356,6 +4370,8 @@ impl VibexWorkbench {
             sessions: Vec::new(),
             optimistically_removed_session_ids: BTreeSet::new(),
             pending_session_deletion_ids: BTreeSet::new(),
+            pending_worktree_rename_ids: BTreeSet::new(),
+            pending_worktree_deletion_ids: BTreeSet::new(),
             optimistic_session_deletion_reconciliation_pending: false,
             sidebar_state,
             sidebar_projection_revision: 0,
@@ -4467,9 +4483,12 @@ impl VibexWorkbench {
             composer_queue_serial: 0,
             composer_queue_manual_session_ids: BTreeSet::new(),
             composer_queue_paused_session_ids: BTreeSet::new(),
+            composer_queue_ready_after_continuation_session_ids: BTreeSet::new(),
             composer_queue_interrupted_session_ids: BTreeSet::new(),
             composer_queue_steering_session_ids: BTreeSet::new(),
             composer_queue_editing_id: None,
+            composer_queue_edit_attachments: Vec::new(),
+            composer_queue_edit_geometry: ComposerGeometry::default(),
             composer_queue_drop_target: None,
             composer_plan_expanded: None,
             dismissed_composer_plans: BTreeSet::new(),
@@ -5789,6 +5808,8 @@ impl VibexWorkbench {
             .retain(|id| valid_session_ids.contains(id));
         self.composer_queue_paused_session_ids
             .retain(|id| valid_session_ids.contains(id));
+        self.composer_queue_ready_after_continuation_session_ids
+            .retain(|id| valid_session_ids.contains(id));
         self.composer_queue_interrupted_session_ids
             .retain(|id| valid_session_ids.contains(id));
         self.composer_queue_steering_session_ids
@@ -5800,6 +5821,8 @@ impl VibexWorkbench {
                 .any(|message| message.id == editing_id)
         }) {
             self.composer_queue_editing_id = None;
+            self.composer_queue_edit_attachments.clear();
+            self.composer_queue_edit_geometry.input_bounds = None;
         }
         self.auto_continue_session_ids
             .retain(|id| valid_session_ids.contains(id));
@@ -6541,8 +6564,7 @@ impl VibexWorkbench {
     }
 
     fn ordered_sidebar_session_projects(&self) -> Vec<(String, String)> {
-        let mut seen = BTreeSet::new();
-        let mut ordered = sidebar_project_projections(
+        let projected = sidebar_project_projections(
             &self.workspaces,
             &self.sessions,
             &self.workspace_contexts,
@@ -6550,33 +6572,64 @@ impl VibexWorkbench {
             &self.sidebar_state.row_order,
             &self.sidebar_state.pinned_ids,
             "",
-        )
-        .into_iter()
-        .flat_map(|group| group.compact_sessions)
-        .filter_map(|session| {
-            let session_id = session.id.as_str().to_string();
-            seen.insert(session_id.clone())
-                .then(|| (session_id, session.project_id.as_str().to_string()))
-        })
-        .collect::<Vec<_>>();
+        );
+        let mut projected_scopes = BTreeMap::new();
+        let mut seen = BTreeSet::new();
+        let mut ordered = Vec::new();
+        for group in projected {
+            let project_id = group.project.id.as_str().to_string();
+            for session in group.compact_sessions {
+                let session_id = session.id.as_str().to_string();
+                projected_scopes
+                    .entry(session_id.clone())
+                    .or_insert_with(|| project_id.clone());
+                if seen.insert(session_id.clone()) {
+                    ordered.push((session_id, project_id.clone()));
+                }
+            }
+        }
         ordered.extend(self.sessions.iter().filter_map(|session| {
             let session_id = session.id.as_str().to_string();
-            seen.insert(session_id.clone())
-                .then(|| (session_id, session.project_id.as_str().to_string()))
+            seen.insert(session_id.clone()).then(|| {
+                let project_id = projected_scopes
+                    .get(&session_id)
+                    .cloned()
+                    .unwrap_or_else(|| session.project_id.as_str().to_string());
+                (session_id, project_id)
+            })
         }));
         ordered
     }
 
     fn sidebar_session_projects(&self) -> BTreeMap<String, String> {
-        self.sessions
-            .iter()
-            .map(|session| {
-                (
-                    session.id.as_str().to_string(),
-                    session.project_id.as_str().to_string(),
-                )
-            })
-            .collect()
+        let mut projects = self.sidebar_session_project_scopes();
+        for session in &self.sessions {
+            projects
+                .entry(session.id.as_str().to_string())
+                .or_insert_with(|| session.project_id.as_str().to_string());
+        }
+        projects
+    }
+
+    fn sidebar_session_project_scopes(&self) -> BTreeMap<String, String> {
+        let mut projects = BTreeMap::new();
+        for group in sidebar_project_projections(
+            &self.workspaces,
+            &self.sessions,
+            &self.workspace_contexts,
+            &self.ui_state.sidebar.project_order,
+            &self.sidebar_state.row_order,
+            &self.sidebar_state.pinned_ids,
+            "",
+        ) {
+            let project_id = group.project.id.as_str().to_string();
+            for session in group.compact_sessions {
+                projects
+                    .entry(session.id.as_str().to_string())
+                    .or_insert_with(|| project_id.clone());
+            }
+        }
+        projects
     }
 
     fn sidebar_root_organization_items(
@@ -6657,6 +6710,7 @@ impl VibexWorkbench {
                 SidebarOrganizationItem::Session(left_id),
                 SidebarOrganizationItem::Session(right_id),
             ) => {
+                let project_scopes = self.sidebar_session_project_scopes();
                 let left = self
                     .sessions
                     .iter()
@@ -6666,7 +6720,7 @@ impl VibexWorkbench {
                     .iter()
                     .find(|session| session.id.as_str() == right_id);
                 left.zip(right).is_some_and(|(left, right)| {
-                    left.project_id == right.project_id
+                    project_scopes.get(left_id) == project_scopes.get(right_id)
                         && self.sidebar_state.pinned_ids.contains(left.id.as_str())
                             == self.sidebar_state.pinned_ids.contains(right.id.as_str())
                 })
@@ -6761,6 +6815,11 @@ impl VibexWorkbench {
                 else {
                     return vec![target.clone()];
                 };
+                let project_scopes = self.sidebar_session_project_scopes();
+                let project_id = project_scopes
+                    .get(session_id)
+                    .map(String::as_str)
+                    .unwrap_or(session.project_id.as_str());
                 let groups = sidebar_project_projections(
                     &self.workspaces,
                     &self.sessions,
@@ -6772,7 +6831,7 @@ impl VibexWorkbench {
                 );
                 let Some(group) = groups
                     .iter()
-                    .find(|group| group.project.id == session.project_id)
+                    .find(|group| group.project.id.as_str() == project_id)
                 else {
                     return vec![target.clone()];
                 };
@@ -6782,9 +6841,7 @@ impl VibexWorkbench {
                     .organization
                     .folders
                     .iter()
-                    .filter(|(_, folder)| {
-                        folder.project_id.as_deref() == Some(session.project_id.as_str())
-                    })
+                    .filter(|(_, folder)| folder.project_id.as_deref() == Some(project_id))
                     .map(|(id, _)| SidebarOrganizationItem::Folder(id.clone()))
                     .collect::<Vec<_>>();
                 available.extend(group.compact_sessions.iter().map(|session| {
@@ -10268,25 +10325,41 @@ impl VibexWorkbench {
         cx.notify();
     }
 
-    fn handle_inline_attachment_key(
+    fn remove_queue_inline_composer_attachment(
         &mut self,
-        edit: InlineAttachmentEdit,
-        new_session: bool,
+        attachment_id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> bool {
-        let input = if new_session {
-            self.new_session_input.clone()
-        } else {
-            self.composer_input.clone()
+    ) {
+        let Some(marker) = self
+            .composer_queue_edit_attachments
+            .iter()
+            .find(|item| item.attachment.id == attachment_id)
+            .map(|item| item.marker.clone())
+        else {
+            return;
         };
-        let attachments = if new_session {
-            self.new_session_attachments.clone()
-        } else {
-            self.composer_attachments.clone()
-        };
+        let text = self.composer_queue_edit_input.read(cx).value().to_string();
+        if let Some(start) = text.find(&marker) {
+            let range = inline_composer_attachment_padded_range(&text, start..start + marker.len());
+            self.composer_queue_edit_input.update(cx, |input, cx| {
+                input.set_selected_range(range, cx);
+                input.replace("", window, cx);
+                input.focus(window, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    fn inline_attachment_key_action(
+        &self,
+        edit: InlineAttachmentEdit,
+        input: &Entity<InputState>,
+        attachments: &[InlineComposerAttachment],
+        cx: &mut Context<Self>,
+    ) -> InlineAttachmentKeyAction {
         if attachments.is_empty() {
-            return false;
+            return InlineAttachmentKeyAction::None;
         }
         let text = input.read(cx).value().to_string();
         let selection = input.read(cx).selected_range();
@@ -10313,7 +10386,7 @@ impl VibexWorkbench {
             if expanded != selection {
                 input.update(cx, |input, cx| input.set_selected_range(expanded, cx));
             }
-            return false;
+            return InlineAttachmentKeyAction::None;
         }
 
         let cursor = selection.end;
@@ -10321,35 +10394,60 @@ impl VibexWorkbench {
             let inside = cursor > range.start && cursor < range.end;
             match edit {
                 InlineAttachmentEdit::Backspace if inside || cursor == range.end => {
-                    self.remove_inline_composer_attachment(&attachment_id, new_session, window, cx);
-                    return true;
+                    return InlineAttachmentKeyAction::Remove(attachment_id);
                 }
                 InlineAttachmentEdit::Delete if inside || cursor == range.start => {
-                    self.remove_inline_composer_attachment(&attachment_id, new_session, window, cx);
-                    return true;
+                    return InlineAttachmentKeyAction::Remove(attachment_id);
                 }
                 InlineAttachmentEdit::Left if inside || cursor == range.end => {
                     input.update(cx, |input, cx| {
                         input.set_selected_range(range.start..range.start, cx)
                     });
-                    return true;
+                    return InlineAttachmentKeyAction::Handled;
                 }
                 InlineAttachmentEdit::Right if inside || cursor == range.start => {
                     input.update(cx, |input, cx| {
                         input.set_selected_range(range.end..range.end, cx)
                     });
-                    return true;
+                    return InlineAttachmentKeyAction::Handled;
                 }
                 _ if inside => {
                     input.update(cx, |input, cx| {
                         input.set_selected_range(range.end..range.end, cx)
                     });
-                    return false;
+                    return InlineAttachmentKeyAction::None;
                 }
                 _ => {}
             }
         }
-        false
+        InlineAttachmentKeyAction::None
+    }
+
+    fn handle_inline_attachment_key(
+        &mut self,
+        edit: InlineAttachmentEdit,
+        new_session: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let input = if new_session {
+            self.new_session_input.clone()
+        } else {
+            self.composer_input.clone()
+        };
+        let attachments = if new_session {
+            self.new_session_attachments.clone()
+        } else {
+            self.composer_attachments.clone()
+        };
+        match self.inline_attachment_key_action(edit, &input, &attachments, cx) {
+            InlineAttachmentKeyAction::Remove(attachment_id) => {
+                self.remove_inline_composer_attachment(&attachment_id, new_session, window, cx);
+                true
+            }
+            InlineAttachmentKeyAction::Handled => true,
+            InlineAttachmentKeyAction::None => false,
+        }
     }
 
     fn capture_inline_attachment_edit(
@@ -10361,6 +10459,24 @@ impl VibexWorkbench {
     ) {
         if self.handle_inline_attachment_key(edit, new_session, window, cx) {
             cx.stop_propagation();
+        }
+    }
+
+    fn capture_queue_inline_attachment_edit(
+        &mut self,
+        edit: InlineAttachmentEdit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = self.composer_queue_edit_input.clone();
+        let attachments = self.composer_queue_edit_attachments.clone();
+        match self.inline_attachment_key_action(edit, &input, &attachments, cx) {
+            InlineAttachmentKeyAction::Remove(attachment_id) => {
+                self.remove_queue_inline_composer_attachment(&attachment_id, window, cx);
+                cx.stop_propagation();
+            }
+            InlineAttachmentKeyAction::Handled => cx.stop_propagation(),
+            InlineAttachmentKeyAction::None => {}
         }
     }
 
@@ -10544,22 +10660,37 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) {
         let session_id = message.session_id.clone();
-        let session_state = self
+        let session = self
             .sessions
             .iter()
-            .find(|session| session.id == session_id)
-            .map(|session| session.state);
+            .find(|session| session.id == session_id);
+        let session_state = session.map(|session| session.state);
+        let latest_turn_ended_normally = session
+            .and_then(|session| {
+                self.cached_auto_continue_turn_status(&session_id, session.updated_at_ms)
+            })
+            .and_then(|status| status.ended_normally);
+        let waits_for_continuation = composer_queue_waits_for_continuation(
+            behavior,
+            session_state,
+            latest_turn_ended_normally,
+        );
         if composer_queue_session_blocks_dispatch(
             behavior,
             self.session_turn_pending(&session_id),
             session_state,
-        ) {
+        ) || waits_for_continuation
+        {
             let insert_at = self
                 .composer_queue
                 .iter()
                 .position(|queued| queued.session_id == session_id)
                 .unwrap_or(self.composer_queue.len());
             self.composer_queue.insert(insert_at, message);
+            if waits_for_continuation {
+                self.composer_queue_paused_session_ids
+                    .insert(session_id.as_str().to_string());
+            }
             cx.notify();
             return;
         }
@@ -10766,6 +10897,21 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let session = self
+            .sessions
+            .iter()
+            .find(|session| &session.id == session_id);
+        let session_state = session.map(|session| session.state);
+        let latest_turn_ended_normally = session
+            .and_then(|session| {
+                self.cached_auto_continue_turn_status(session_id, session.updated_at_ms)
+            })
+            .and_then(|status| status.ended_normally);
+        let waits_for_continuation = composer_queue_waits_for_continuation(
+            behavior,
+            session_state,
+            latest_turn_ended_normally,
+        );
         if !composer_queue_dispatch_enabled(
             &self.composer_queue_manual_session_ids,
             session_id,
@@ -10774,15 +10920,17 @@ impl VibexWorkbench {
             || composer_queue_session_blocks_dispatch(
                 behavior,
                 self.session_turn_pending(session_id),
-                self.sessions
-                    .iter()
-                    .find(|session| &session.id == session_id)
-                    .map(|session| session.state),
+                session_state,
             )
+            || waits_for_continuation
             || self
                 .composer_queue_paused_session_ids
                 .contains(session_id.as_str())
         {
+            if waits_for_continuation {
+                self.composer_queue_paused_session_ids
+                    .insert(session_id.as_str().to_string());
+            }
             return;
         }
         let Some(index) = self
@@ -10796,21 +10944,58 @@ impl VibexWorkbench {
         self.dispatch_composer_message(message, behavior, window, cx);
     }
 
+    fn flush_composer_queue_dispatches_after_continuation(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let session_ids =
+            std::mem::take(&mut self.composer_queue_ready_after_continuation_session_ids);
+        for session_id in session_ids {
+            let Ok(session_id) = VibexSessionId::parse(&session_id) else {
+                continue;
+            };
+            if !self
+                .composer_queue
+                .iter()
+                .any(|message| message.session_id == session_id)
+            {
+                continue;
+            }
+            self.composer_queue_paused_session_ids
+                .remove(session_id.as_str());
+            self.maybe_dispatch_next_composer_queue_message(
+                &session_id,
+                ComposerQueueDispatchBehavior::AfterCompletion,
+                window,
+                cx,
+            );
+        }
+    }
+
     fn begin_composer_queue_edit(
         &mut self,
         message_id: u64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(text) = self
+        let Some(message) = self
             .composer_queue
             .iter()
             .find(|message| message.id == message_id)
-            .map(|message| message.text.clone())
+            .cloned()
         else {
             return;
         };
+        let (text, attachments, serial) = composer_queue_edit_insertion(
+            &message.text,
+            &message.attachments,
+            self.composer_attachment_serial,
+        );
+        self.composer_attachment_serial = serial;
         self.composer_queue_editing_id = Some(message_id);
+        self.composer_queue_edit_attachments = attachments;
+        self.composer_queue_edit_geometry.input_bounds = None;
         self.composer_queue_edit_input.update(cx, |input, cx| {
             input.set_value(text, window, cx);
             input.focus(window, cx);
@@ -10822,36 +11007,127 @@ impl VibexWorkbench {
         let Some(message_id) = self.composer_queue_editing_id else {
             return;
         };
-        let text = self
-            .composer_queue_edit_input
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
+        let raw_text = self.composer_queue_edit_input.read(cx).value().to_string();
+        let (text, attachments) =
+            composer_submission_payload(&raw_text, &self.composer_queue_edit_attachments);
         let Some(message) = self
             .composer_queue
             .iter_mut()
             .find(|message| message.id == message_id)
         else {
             self.composer_queue_editing_id = None;
+            self.composer_queue_edit_attachments.clear();
+            self.composer_queue_edit_geometry.input_bounds = None;
             cx.notify();
             return;
         };
-        if text.is_empty() && message.attachments.is_empty() {
+        if text.trim().is_empty() && attachments.is_empty() {
             return;
         }
         message.text = text;
-        for attachment in &mut message.attachments {
-            attachment.inline_text_offset = None;
-        }
+        message.attachments = attachments;
         message.command_invocation = None;
         self.composer_queue_editing_id = None;
+        self.composer_queue_edit_attachments.clear();
+        self.composer_queue_edit_geometry.input_bounds = None;
         cx.notify();
     }
 
     fn cancel_composer_queue_edit(&mut self, cx: &mut Context<Self>) {
         self.composer_queue_editing_id = None;
+        self.composer_queue_edit_attachments.clear();
+        self.composer_queue_edit_geometry.input_bounds = None;
         cx.notify();
+    }
+
+    fn render_composer_queue_attachment_chip(
+        &self,
+        message_id: u64,
+        attachment_index: usize,
+        attachment: &MessageAttachment,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let composer_attachment = composer_attachment_from_message(
+            attachment,
+            format!("queue-attachment:{message_id}:{attachment_index}"),
+        );
+        let is_image = composer_attachment.is_image();
+        let label = if attachment.label.trim().is_empty() {
+            locale::text_for(self.resolved_locale(), "Image", "图片", "圖片").to_string()
+        } else {
+            attachment.label.clone()
+        };
+        let tooltip = if is_image {
+            locale::text("Preview image", "预览图片", "預覽圖片")
+        } else {
+            locale::text("Open attachment", "打开附件", "開啟附件")
+        };
+        let preview_attachment = composer_attachment.clone();
+        let tab_path = (!is_image)
+            .then(|| self.composer_attachment_tab_path(&composer_attachment))
+            .flatten();
+        let chip = h_flex()
+            .id(format!(
+                "composer-queue-attachment-{message_id}-{attachment_index}"
+            ))
+            .flex_none()
+            .min_w_0()
+            .max_w(px(180.0))
+            .h(px(24.0))
+            .items_center()
+            .gap(px(5.5))
+            .overflow_hidden()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().muted)
+            .px(px(7.0))
+            .text_xs()
+            .font_weight(FontWeight(600.0))
+            .text_color(cx.theme().foreground)
+            .aria_label(tooltip)
+            .child(
+                if is_image {
+                    Icon::default().path("icons/vibex/image.svg")
+                } else {
+                    Icon::new(IconName::File)
+                }
+                .size(px(13.0))
+                .text_color(cx.theme().foreground.opacity(0.80)),
+            )
+            .child(div().min_w_0().flex_1().truncate().child(label));
+        if is_image {
+            chip.cursor_pointer()
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_attachment_preview(preview_attachment.clone(), true, window, cx)
+                }))
+                .into_any_element()
+        } else if tab_path.is_some() {
+            let tab_attachment = composer_attachment.clone();
+            chip.cursor_pointer()
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_composer_attachment_in_tab(&tab_attachment, window, cx)
+                }))
+                .into_any_element()
+        } else {
+            chip.into_any_element()
+        }
+    }
+
+    fn render_composer_queue_attachment_content(
+        &self,
+        message_id: u64,
+        attachments: &[MessageAttachment],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .min_w_0()
+            .flex_wrap()
+            .gap_1()
+            .children(attachments.iter().enumerate().map(|(index, attachment)| {
+                self.render_composer_queue_attachment_chip(message_id, index, attachment, cx)
+            }))
+            .into_any_element()
     }
 
     fn delete_composer_queue_message(
@@ -10871,6 +11147,8 @@ impl VibexWorkbench {
         self.composer_queue.remove(index);
         if self.composer_queue_editing_id == Some(message_id) {
             self.composer_queue_editing_id = None;
+            self.composer_queue_edit_attachments.clear();
+            self.composer_queue_edit_geometry.input_bounds = None;
         }
         if !self
             .composer_queue
@@ -10878,6 +11156,8 @@ impl VibexWorkbench {
             .any(|message| message.session_id == session_id)
         {
             self.composer_queue_paused_session_ids
+                .remove(session_id.as_str());
+            self.composer_queue_ready_after_continuation_session_ids
                 .remove(session_id.as_str());
         } else {
             self.maybe_dispatch_next_composer_queue_message(
@@ -10987,9 +11267,13 @@ impl VibexWorkbench {
                 .any(|message| message.id == message_id)
         }) {
             self.composer_queue_editing_id = None;
+            self.composer_queue_edit_attachments.clear();
+            self.composer_queue_edit_geometry.input_bounds = None;
         }
         self.composer_queue_drop_target = None;
         self.composer_queue_paused_session_ids
+            .remove(session_id.as_str());
+        self.composer_queue_ready_after_continuation_session_ids
             .remove(session_id.as_str());
         self.composer_queue_interrupted_session_ids
             .remove(session_id.as_str());
@@ -13747,6 +14031,18 @@ impl VibexWorkbench {
                     }
                     this.set_session_turn_pending(&continued_session_id, false);
                     this.sync_auto_continue_for_session(&continued_session_id, cx);
+                    if matches!(&outcome, Ok((Ok(_), _)))
+                        && this
+                            .composer_queue
+                            .iter()
+                            .any(|message| message.session_id == continued_session_id)
+                    {
+                        // The queue was fenced while the previous turn needed
+                        // continuation. Let the next frame dispatch it only
+                        // after the continuation has completed successfully.
+                        this.composer_queue_ready_after_continuation_session_ids
+                            .insert(continued_session_id.as_str().to_string());
+                    }
                     if !agent_turn_completion_is_active(
                         this.session_generation,
                         generation,
@@ -16479,6 +16775,441 @@ impl VibexWorkbench {
         });
     }
 
+    fn confirm_rename_sidebar_worktree(
+        &mut self,
+        workspace_id: vibex_core::WorkspaceId,
+        current_title: String,
+        current_branch: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window.has_active_dialog(cx)
+            || self
+                .pending_worktree_rename_ids
+                .contains(workspace_id.as_str())
+            || self
+                .pending_worktree_deletion_ids
+                .contains(workspace_id.as_str())
+        {
+            return;
+        }
+        let sync_git_name = Rc::new(Cell::new(false));
+        let sync_git_name_for_switch = sync_git_name.clone();
+        let entity = cx.weak_entity();
+        let title = locale::text("Rename Worktree", "重命名 Worktree", "重新命名 Worktree");
+        let input_placeholder = locale::text("Worktree title", "Worktree 标题", "Worktree 標題");
+        let sync_label = locale::text(
+            "Also rename the Git Worktree branch",
+            "同时修改 Git Worktree 分支名称",
+            "同時修改 Git Worktree 分支名稱",
+        );
+        let input_label = locale::text("Title", "标题", "標題");
+        let cancel = locale::text("Cancel", "取消", "取消");
+        let save = locale::text("Save", "保存", "儲存");
+        // Keep the input entity outside the dialog builder. Dialog builders are
+        // evaluated again when the overlay repaints, so creating the input in
+        // the builder would replace its focus handle while the user types.
+        let input = cx.new(|cx| {
+            gpui_component::input::InputState::new(window, cx)
+                .default_value(current_title.clone())
+                .placeholder(input_placeholder)
+        });
+        let input_for_focus = input.clone();
+        let input_selection_end = current_title.len();
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let input_for_submit = input.clone();
+            let workspace_id = workspace_id.clone();
+            let current_branch = current_branch.clone();
+            let sync_git_name_for_submit = sync_git_name.clone();
+            let sync_git_name_for_switch = sync_git_name_for_switch.clone();
+            let entity_for_submit = entity.clone();
+            dialog
+                .title(title)
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(input_label),
+                        )
+                        .child(Input::new(&input).w_full())
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_3()
+                                .child(div().min_w_0().text_xs().child(sync_label))
+                                .child(
+                                    Switch::new("sidebar-worktree-sync-git-name")
+                                        .small()
+                                        .checked(false)
+                                        .on_click(move |enabled, _, _| {
+                                            sync_git_name_for_switch.set(*enabled);
+                                        }),
+                                ),
+                        ),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            DialogClose::new().child(
+                                Button::new("cancel-sidebar-worktree-rename")
+                                    .outline()
+                                    .label(cancel),
+                            ),
+                        )
+                        .child(
+                            DialogAction::new().child(
+                                Button::new("save-sidebar-worktree-rename")
+                                    .primary()
+                                    .label(save),
+                            ),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    let value = input_for_submit.read(cx).value().trim().to_string();
+                    if !value.is_empty() {
+                        let _ = entity_for_submit.update(cx, |this, cx| {
+                            this.rename_sidebar_worktree(
+                                workspace_id.clone(),
+                                current_branch.clone(),
+                                value,
+                                sync_git_name_for_submit.get(),
+                                cx,
+                            )
+                        });
+                    }
+                    true
+                })
+        });
+        // The dialog's focus trap claims focus while it mounts. Request input
+        // focus after that first frame so keyboard events reach the text field.
+        window.on_next_frame(move |window, cx| {
+            input_for_focus.update(cx, |input, cx| {
+                input.set_selected_range(0..input_selection_end, cx);
+                input.focus(window, cx);
+            });
+        });
+    }
+
+    fn rename_sidebar_worktree(
+        &mut self,
+        workspace_id: vibex_core::WorkspaceId,
+        current_branch: String,
+        title: String,
+        sync_git_name: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let title = title.trim().to_string();
+        if title.is_empty() || title.len() > 160 || title.chars().any(char::is_control) {
+            self.agent_error = Some(
+                locale::text(
+                    "Worktree title must be non-empty and bounded",
+                    "Worktree 标题不能为空且长度必须受限",
+                    "Worktree 標題不能為空且長度必須受限",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let workspace_key = workspace_id.as_str().to_string();
+        let new_branch = sidebar_worktree_branch_for_title(&current_branch, &title);
+        if !sync_git_name || new_branch == current_branch {
+            self.ui_state
+                .sidebar
+                .worktree_titles
+                .insert(workspace_key, title);
+            self.queue_ui_state();
+            cx.notify();
+            return;
+        }
+        if self
+            .pending_worktree_rename_ids
+            .contains(workspace_id.as_str())
+            || self
+                .pending_worktree_deletion_ids
+                .contains(workspace_id.as_str())
+        {
+            return;
+        }
+        let Some(runtime) = self.runtime.clone() else {
+            self.agent_error = Some(
+                locale::text(
+                    "Git Worktree rename is unavailable",
+                    "当前无法重命名 Git Worktree",
+                    "目前無法重新命名 Git Worktree",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        };
+        self.pending_worktree_rename_ids
+            .insert(workspace_id.as_str().to_string());
+        let workspace_id_for_runner = workspace_id.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            runtime
+                .git()
+                .worktree_rename_branch(&workspace_id_for_runner, &new_branch)
+        });
+        cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.pending_worktree_rename_ids
+                        .remove(workspace_id.as_str());
+                    match outcome {
+                        Ok(Ok(())) => {
+                            this.ui_state
+                                .sidebar
+                                .worktree_titles
+                                .insert(workspace_id.as_str().to_string(), title);
+                            this.queue_ui_state();
+                            this.refresh_workspace_contexts(cx);
+                        }
+                        Ok(Err(error)) => {
+                            this.agent_error = Some(format!("{}: {}", error.code, error.message));
+                        }
+                        Err(error) => {
+                            this.agent_error = Some(format!("worktree rename failed: {error}"));
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        )
+        .detach();
+    }
+
+    fn confirm_delete_sidebar_worktree(
+        &mut self,
+        workspace: WorkspaceRecord,
+        title: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window.has_active_dialog(cx)
+            || self
+                .pending_worktree_rename_ids
+                .contains(workspace.id.as_str())
+            || self
+                .pending_worktree_deletion_ids
+                .contains(workspace.id.as_str())
+        {
+            return;
+        }
+        let remove_git = Rc::new(Cell::new(false));
+        let remove_git_for_switch = remove_git.clone();
+        let entity = cx.weak_entity();
+        let dialog_title = locale::text("Delete Worktree", "删除 Worktree", "刪除 Worktree");
+        let description = locale::text(
+            "All sessions and sidebar folders under this Worktree will be removed.",
+            "此 Worktree 下的所有会话和侧栏文件夹都会被移除。",
+            "此 Worktree 下的所有會話和側欄資料夾都會被移除。",
+        );
+        let git_label = locale::text(
+            "Also delete the Git branch and Worktree directory",
+            "同时删除 Git 分支和 Worktree 文件目录",
+            "同時刪除 Git 分支和 Worktree 檔案目錄",
+        );
+        let cancel = locale::text("Cancel", "取消", "取消");
+        let delete = locale::text("Delete", "删除", "刪除");
+        window.open_dialog(cx, move |dialog, _, _cx| {
+            let workspace_for_submit = workspace.clone();
+            let entity = entity.clone();
+            let remove_git_for_submit = remove_git.clone();
+            let remove_git_for_switch = remove_git_for_switch.clone();
+            dialog
+                .title(dialog_title)
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(div().text_sm().child(description))
+                        .child(div().text_sm().font_semibold().child(title.clone()))
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_3()
+                                .child(div().min_w_0().text_xs().child(git_label))
+                                .child(
+                                    Switch::new("sidebar-worktree-delete-git")
+                                        .small()
+                                        .checked(false)
+                                        .on_click(move |enabled, _, _| {
+                                            remove_git_for_switch.set(*enabled);
+                                        }),
+                                ),
+                        ),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            DialogClose::new().child(
+                                Button::new("cancel-sidebar-worktree-delete")
+                                    .outline()
+                                    .label(cancel),
+                            ),
+                        )
+                        .child(
+                            DialogAction::new().child(
+                                Button::new("confirm-sidebar-worktree-delete")
+                                    .danger()
+                                    .label(delete),
+                            ),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    let workspace = workspace_for_submit.clone();
+                    let remove_git = remove_git_for_submit.get();
+                    let _ = entity.update(cx, |this, cx| {
+                        this.delete_sidebar_worktree(workspace, remove_git, cx)
+                    });
+                    true
+                })
+        });
+    }
+
+    fn delete_sidebar_worktree(
+        &mut self,
+        workspace: WorkspaceRecord,
+        remove_git: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace_key = workspace.id.as_str().to_string();
+        if self.pending_worktree_rename_ids.contains(&workspace_key) {
+            return;
+        }
+        if !self
+            .pending_worktree_deletion_ids
+            .insert(workspace_key.clone())
+        {
+            return;
+        }
+        let session_ids = self
+            .sessions
+            .iter()
+            .filter(|session| session.workspace_id == workspace.id)
+            .map(|session| session.id.clone())
+            .collect::<Vec<_>>();
+        let session_id_set = session_ids
+            .iter()
+            .map(|session_id| session_id.as_str().to_string())
+            .collect::<BTreeSet<_>>();
+        if !session_id_set.is_empty() {
+            self.optimistically_remove_sessions(&session_id_set);
+        }
+        let folder_ids = self
+            .ui_state
+            .sidebar
+            .organization
+            .folders
+            .iter()
+            .filter(|(_, folder)| folder.workspace_id.as_deref() == Some(workspace.id.as_str()))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for folder_id in folder_ids {
+            self.ui_state.sidebar.organization.delete_folder(&folder_id);
+        }
+        self.workspaces
+            .retain(|(_, candidate)| candidate.id != workspace.id);
+        self.workspace_contexts.remove(workspace.id.as_str());
+        self.ui_state
+            .sidebar
+            .collapsed_workspace_ids
+            .remove(workspace.id.as_str());
+        if self.ui_state.workbench.selected_workspace_id.as_deref() == Some(workspace.id.as_str()) {
+            self.ui_state.workbench.selected_workspace_id = None;
+        }
+        self.queue_ui_state();
+        self.reconcile_sidebar_state();
+        let Some(backend) = self.backend.clone() else {
+            self.pending_worktree_deletion_ids.remove(&workspace_key);
+            cx.notify();
+            return;
+        };
+        let workspace_id = workspace.id.clone();
+        let workspace_id_for_title = workspace_id.clone();
+        let worktree_path = workspace.root_path.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            for session_id in session_ids {
+                backend
+                    .agent()
+                    .delete_session(MutationRequest::new(session_id))
+                    .await?;
+            }
+            if remove_git {
+                let draft = GitWorktreeDiscardRequest {
+                    workspace_id: workspace_id.clone(),
+                    worktree_path,
+                    force: true,
+                    delete_branch: true,
+                    expected_head: None,
+                    preflight_revision: None,
+                };
+                let preflight = backend
+                    .git()
+                    .git_worktree_discard_preflight(draft.clone())
+                    .await?;
+                if !preflight.allowed {
+                    return Err(BackendError::conflict(
+                        "worktree_preflight_blocked",
+                        "Git Worktree deletion is blocked by its current lifecycle state",
+                    ));
+                }
+                let mut confirmed = draft;
+                confirmed.expected_head = preflight.source_head;
+                confirmed.preflight_revision = Some(preflight.revision);
+                backend
+                    .git()
+                    .git_worktree_discard(MutationRequest::new(confirmed))
+                    .await?;
+            }
+            backend
+                .workspace()
+                .delete_workspace(MutationRequest::new(workspace_id))
+                .await
+        });
+        cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.pending_worktree_deletion_ids.remove(&workspace_key);
+                    match outcome {
+                        Ok(Ok(())) => {
+                            this.ui_state
+                                .sidebar
+                                .worktree_titles
+                                .remove(workspace_id_for_title.as_str());
+                            this.queue_ui_state();
+                            this.optimistic_session_deletion_reconciliation_pending = true;
+                            this.load_agent_overview(cx);
+                            this.refresh_workspace_contexts(cx);
+                        }
+                        Ok(Err(error)) => {
+                            this.agent_error = Some(format!("{}: {}", error.code, error.message));
+                            this.optimistic_session_deletion_reconciliation_pending = true;
+                            this.load_agent_overview(cx);
+                            this.refresh_workspace_contexts(cx);
+                        }
+                        Err(error) => {
+                            this.agent_error = Some(format!("worktree deletion failed: {error}"));
+                            this.optimistic_session_deletion_reconciliation_pending = true;
+                            this.load_agent_overview(cx);
+                            this.refresh_workspace_contexts(cx);
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        )
+        .detach();
+        cx.notify();
+    }
+
     fn delete_project(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
         if self.agent_action_pending {
             return;
@@ -17844,7 +18575,7 @@ impl VibexWorkbench {
             cx.listener(|this, _, _, cx| this.toggle_right_rail_mode(RightRailMode::Files, cx)),
         )
         .into_any_element();
-        let pending_commit_count = self.git_pending_change_count;
+        let pending_commit_count = self.git_pending_commit_count;
         let git =
             right_rail_activity_button("activity-git", right_rail_mode_icon(RightRailMode::Git))
                 .tooltip("Git")
@@ -19748,6 +20479,7 @@ impl VibexWorkbench {
                     {
                         elements.push(self.render_sidebar_session(
                             &session,
+                            &project_id,
                             reorder_enabled,
                             true,
                             strings,
@@ -19830,6 +20562,7 @@ impl VibexWorkbench {
                     {
                         elements.push(self.render_sidebar_session(
                             &session,
+                            &project_id,
                             reorder_enabled,
                             false,
                             strings,
@@ -21015,6 +21748,17 @@ impl VibexWorkbench {
             .clone()
             .unwrap_or_else(|| locale::text("No branch", "无分支", "無分支").to_string());
         let branch_name = sidebar_workspace_branch_name(&branch).to_string();
+        let workspace_title = if workspace.mode == WorkspaceMode::VibexWorktree {
+            self.ui_state
+                .sidebar
+                .worktree_titles
+                .get(&workspace_id)
+                .cloned()
+                .unwrap_or_else(|| branch_name.clone())
+        } else {
+            branch_name.clone()
+        };
+        let managed_worktree = workspace.mode == WorkspaceMode::VibexWorktree;
         let lifecycle_state = projection.context.worktree_lifecycle_state;
         let collapsed = self
             .ui_state
@@ -21085,6 +21829,11 @@ impl VibexWorkbench {
         let workspace_menu_branch = branch.clone();
         let workspace_menu_project_id = project_for_folder.clone();
         let workspace_menu_workspace_id = workspace_for_folder.clone();
+        let workspace_edit_id = workspace.id.clone();
+        let workspace_edit_title = workspace_title.clone();
+        let workspace_edit_branch = branch.clone();
+        let workspace_delete = workspace.clone();
+        let workspace_delete_title = workspace_title.clone();
         let row = div()
             .id(format!("sidebar-workspace-row-{workspace_id}"))
             .group(hover_group.clone())
@@ -21120,7 +21869,7 @@ impl VibexWorkbench {
                     .items_center()
                     .gap(px(SIDEBAR_ICON_TITLE_GAP))
                     .pl_0()
-                    .pr(px(34.0))
+                    .pr(px(if managed_worktree { 106.0 } else { 34.0 }))
                     .child(
                         h_flex()
                             .w(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))
@@ -21146,7 +21895,7 @@ impl VibexWorkbench {
                                     .group_hover(&hover_group, |style| {
                                         style.text_color(cx.theme().sidebar_foreground)
                                     })
-                                    .child(branch_name),
+                                    .child(workspace_title),
                             )
                             .child(
                                 div()
@@ -21159,7 +21908,7 @@ impl VibexWorkbench {
                     ),
             )
             .child(
-                div()
+                h_flex()
                     .id(format!("sidebar-workspace-actions-{workspace_id}"))
                     .absolute()
                     .right_1()
@@ -21191,7 +21940,56 @@ impl VibexWorkbench {
                                     cx,
                                 );
                             })),
-                    ),
+                    )
+                    .when(managed_worktree, |this| {
+                        this.child(
+                            Button::new(format!("sidebar-workspace-edit-{workspace_id}"))
+                                .xsmall()
+                                .ghost()
+                                .compact()
+                                .w(px(24.0))
+                                .h(px(24.0))
+                                .icon(sidebar_icon("icons/vibex/pencil.svg"))
+                                .tooltip(locale::text(
+                                    "Rename Worktree",
+                                    "重命名 Worktree",
+                                    "重新命名 Worktree",
+                                ))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.confirm_rename_sidebar_worktree(
+                                        workspace_edit_id.clone(),
+                                        workspace_edit_title.clone(),
+                                        workspace_edit_branch.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        )
+                        .child(
+                            Button::new(format!("sidebar-workspace-delete-{workspace_id}"))
+                                .xsmall()
+                                .ghost()
+                                .compact()
+                                .w(px(24.0))
+                                .h(px(24.0))
+                                .icon(sidebar_icon("icons/vibex/trash-2.svg"))
+                                .tooltip(locale::text(
+                                    "Delete Worktree",
+                                    "删除 Worktree",
+                                    "刪除 Worktree",
+                                ))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.confirm_delete_sidebar_worktree(
+                                        workspace_delete.clone(),
+                                        workspace_delete_title.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        )
+                    }),
             );
 
         if collapsed {
@@ -21228,7 +22026,9 @@ impl VibexWorkbench {
                     .w_full()
                     .min_w_0()
                     .gap(px(2.0))
-                    .pl(px(SIDEBAR_WORKSPACE_SESSION_INDENT))
+                    .pl(px(
+                        SIDEBAR_WORKSPACE_SESSION_INDENT - SIDEBAR_WORKSPACE_SESSION_CARD_OVERHANG
+                    ))
                     .children(sessions),
             )
             .into_any_element()
@@ -21237,11 +22037,13 @@ impl VibexWorkbench {
     fn render_sidebar_session(
         &mut self,
         session: &AgentSession,
+        project_scope_id: &str,
         reorder_enabled: bool,
         show_worktree_identity: bool,
         strings: Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let project_scope_id = project_scope_id.to_string();
         let selected = self.selected_session_id.as_ref() == Some(&session.id);
         let pinned = self.sidebar_state.pinned_ids.contains(session.id.as_str());
         let batch_selected = self
@@ -21361,6 +22163,7 @@ impl VibexWorkbench {
                         .min_w_0()
                         .items_center()
                         .gap_2()
+                        .pl(px(SIDEBAR_WORKSPACE_SESSION_CARD_OVERHANG))
                         .when_some(worktree_tooltip.clone(), |this, (tooltip, state)| {
                             this.child(
                                 div()
@@ -21445,9 +22248,10 @@ impl VibexWorkbench {
             self.resolved_locale(),
             strings,
         );
-        let active_session_drag = self.sidebar_session_drag_state.clone().filter(|state| {
-            cx.has_active_drag() && state.project_id == session.project_id.as_str()
-        });
+        let active_session_drag = self
+            .sidebar_session_drag_state
+            .clone()
+            .filter(|state| cx.has_active_drag() && state.project_id == project_scope_id);
         let organization_drop_position = self.sidebar_organization_drop_position(&session_item);
         let active_drop_after = organization_drop_position
             .and_then(|position| match position {
@@ -21467,7 +22271,7 @@ impl VibexWorkbench {
             session_id: session.id.clone(),
             session_ids: drag_session_ids,
             workspace_id: session.workspace_id.as_str().to_string(),
-            project_id: session.project_id.as_str().to_string(),
+            project_id: project_scope_id.clone(),
             label: session.title.clone().into(),
             agent_id: sidebar_agent_id.as_str().to_string(),
             pinned,
@@ -21499,7 +22303,7 @@ impl VibexWorkbench {
             });
         let drag_entity = cx.weak_entity();
         let drag_target_session_id = session.id.clone();
-        let drag_target_project_id = session.project_id.as_str().to_string();
+        let drag_target_project_id = project_scope_id;
         let folder_drag_target_session_id = session.id.as_str().to_string();
         let release_session_id = session.id.clone();
         let release_workspace_id = session.workspace_id.as_str().to_string();
@@ -21740,6 +22544,7 @@ impl VibexWorkbench {
                             .min_w_0()
                             .items_center()
                             .gap_2()
+                            .pl(px(SIDEBAR_WORKSPACE_SESSION_CARD_OVERHANG))
                             .when_some(worktree_tooltip, |this, (tooltip, state)| {
                                 this.child(
                                     div()
@@ -26383,7 +27188,13 @@ impl VibexWorkbench {
         ) {
             return Vec::new();
         }
-        let (input, attachments, input_bounds) = if self.new_session_open {
+        let (input, attachments, input_bounds) = if self.composer_queue_editing_id.is_some() {
+            (
+                self.composer_queue_edit_input.clone(),
+                self.composer_queue_edit_attachments.clone(),
+                self.composer_queue_edit_geometry.input_bounds,
+            )
+        } else if self.new_session_open {
             (
                 self.new_session_input.clone(),
                 self.new_session_attachments.clone(),
@@ -31307,6 +32118,7 @@ impl VibexWorkbench {
             let drag_entity = cx.weak_entity();
             let drag_target_session_id = session_id.clone();
             let drop_target_session_id = session_id.clone();
+            let queue_edit_geometry_entity = cx.weak_entity();
             let editing = editing_id == Some(message_id);
             let can_save_edit = editing
                 && (!self
@@ -31316,6 +32128,9 @@ impl VibexWorkbench {
                     .trim()
                     .is_empty()
                     || attachment_count > 0);
+            let attachment_content = (!message.attachments.is_empty()).then(|| {
+                self.render_composer_queue_attachment_content(message_id, &message.attachments, cx)
+            });
             let content = if editing {
                 h_flex()
                     .min_w_0()
@@ -31323,10 +32138,60 @@ impl VibexWorkbench {
                     .items_center()
                     .gap_1()
                     .child(
-                        div().min_w_0().flex_1().child(
-                            Input::new(&self.composer_queue_edit_input)
-                                .appearance(false)
-                                .w_full(),
+                        v_flex().min_w_0().flex_1().gap_1().child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .on_prepaint(move |bounds, _, cx| {
+                                    let _ = queue_edit_geometry_entity.update(cx, |this, cx| {
+                                        if this.composer_queue_edit_geometry.input_bounds
+                                            != Some(bounds)
+                                        {
+                                            this.composer_queue_edit_geometry.input_bounds =
+                                                Some(bounds);
+                                            cx.notify();
+                                        }
+                                    });
+                                })
+                                .capture_action(cx.listener(
+                                    |this, _: &InputBackspace, window, cx| {
+                                        this.capture_queue_inline_attachment_edit(
+                                            InlineAttachmentEdit::Backspace,
+                                            window,
+                                            cx,
+                                        )
+                                    },
+                                ))
+                                .capture_action(cx.listener(|this, _: &InputDelete, window, cx| {
+                                    this.capture_queue_inline_attachment_edit(
+                                        InlineAttachmentEdit::Delete,
+                                        window,
+                                        cx,
+                                    )
+                                }))
+                                .capture_action(cx.listener(
+                                    |this, _: &InputMoveLeft, window, cx| {
+                                        this.capture_queue_inline_attachment_edit(
+                                            InlineAttachmentEdit::Left,
+                                            window,
+                                            cx,
+                                        )
+                                    },
+                                ))
+                                .capture_action(cx.listener(
+                                    |this, _: &InputMoveRight, window, cx| {
+                                        this.capture_queue_inline_attachment_edit(
+                                            InlineAttachmentEdit::Right,
+                                            window,
+                                            cx,
+                                        )
+                                    },
+                                ))
+                                .child(
+                                    Input::new(&self.composer_queue_edit_input)
+                                        .appearance(false)
+                                        .w_full(),
+                                ),
                         ),
                     )
                     .child(
@@ -31362,12 +32227,14 @@ impl VibexWorkbench {
                     .items_center()
                     .gap_2()
                     .child(
-                        div()
+                        v_flex()
                             .min_w_0()
                             .flex_1()
-                            .truncate()
-                            .text_sm()
-                            .child(display_text),
+                            .gap_1()
+                            .child(div().min_w_0().truncate().text_sm().child(display_text))
+                            .when_some(attachment_content, |this, attachments| {
+                                this.child(attachments)
+                            }),
                     )
                     .when(attachment_count > 0, |this| {
                         this.child(
@@ -31681,6 +32548,7 @@ impl VibexWorkbench {
             .items_center()
             .px_4()
             .py_2()
+            .when(self.composer_expanded, |this| this.pt_4())
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 this.add_composer_paths(paths, window, cx)
             }))
@@ -34901,6 +35769,14 @@ fn sidebar_workspace_branch_name(branch: &str) -> &str {
         .unwrap_or(branch)
 }
 
+fn sidebar_worktree_branch_for_title(current_branch: &str, title: &str) -> String {
+    let slug = managed_worktree_name_slug(title.trim());
+    current_branch
+        .rsplit_once('/')
+        .map(|(prefix, _)| format!("{prefix}/{slug}"))
+        .unwrap_or(slug)
+}
+
 fn new_session_worktree_unavailable_reason(
     locale: locale::ResolvedLocale,
     state: &NewSessionWorkspaceState,
@@ -35844,6 +36720,34 @@ fn inline_composer_clipboard_item(
             VibexMessageClipboard::new(text, attachments),
         )
     })
+}
+
+fn composer_queue_edit_insertion(
+    text: &str,
+    attachments: &[MessageAttachment],
+    mut serial: u64,
+) -> (String, Vec<InlineComposerAttachment>, u64) {
+    let segments = user_message_inline_segments(text, attachments);
+    let mut insertion = String::with_capacity(text.len());
+    let mut inline_attachments = Vec::with_capacity(attachments.len());
+    for segment in segments {
+        match segment {
+            UserMessageInlineSegment::Text(value) => insertion.push_str(&value),
+            UserMessageInlineSegment::Attachment(attachment) => {
+                serial = serial.saturating_add(1);
+                let marker = inline_composer_attachment_marker(serial);
+                let mut composer_attachment =
+                    composer_attachment_from_message(&attachment, format!("attachment:{serial}"));
+                composer_attachment.id = format!("attachment:{serial}");
+                insertion.push_str(&inline_composer_attachment_insertion(&marker));
+                inline_attachments.push(InlineComposerAttachment {
+                    attachment: composer_attachment,
+                    marker,
+                });
+            }
+        }
+    }
+    (insertion, inline_attachments, serial)
 }
 
 fn vibex_message_composer_insertion(
@@ -41002,6 +41906,7 @@ impl Render for VibexWorkbench {
                 let _ = workbench.update(cx, |this, cx| this.open_settings(window, cx));
             });
         }
+        self.flush_composer_queue_dispatches_after_continuation(window, cx);
         let viewport = window.viewport_size();
         let mut visibility = WorkbenchVisibility::resolve(
             f32::from(viewport.width).round() as u32,
@@ -45240,6 +46145,20 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_session_drag_uses_canonical_project_scope() {
+        let source = include_str!("app.rs");
+        let session = source
+            .split_once("    fn render_sidebar_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_choice_popover("))
+            .map(|(body, _)| body)
+            .expect("session renderer should remain inspectable");
+        assert!(session.contains("project_scope_id: &str"));
+        assert!(session.contains("project_id: project_scope_id.clone()"));
+        assert!(source.contains("fn sidebar_session_project_scopes(&self)"));
+        assert!(source.contains("project_scopes.get(left_id) == project_scopes.get(right_id)"));
+    }
+
+    #[test]
     fn sidebar_organization_drag_preview_requires_flat_siblings() {
         let mixed_items = vec![
             SidebarOrganizationItem::Folder("folder-a".into()),
@@ -45901,6 +46820,13 @@ mod tests {
         assert!(source.contains("const SIDEBAR_SESSION_ROW_HEIGHT: f32 = 40.0;"));
         assert!(sidebar_session.contains(".h(px(SIDEBAR_SESSION_ROW_HEIGHT))"));
         assert!(sidebar_session.contains(".min_h(px(SIDEBAR_SESSION_ROW_HEIGHT))"));
+        assert_eq!(
+            sidebar_session
+                .matches(".pl(px(SIDEBAR_WORKSPACE_SESSION_CARD_OVERHANG))")
+                .count(),
+            2,
+            "normal and inline-rename rows should preserve the logo inset"
+        );
         assert!(sidebar_session.contains(".top(px(8.0))"));
         assert!(sidebar_session.contains("cx.theme().sidebar_foreground.opacity(0.56)"));
         assert!(sidebar_session.contains(".when(selected, |this| this.font_semibold())"));
@@ -46366,6 +47292,8 @@ mod tests {
             .find("if !agent_turn_completion_is_active(")
             .expect("continuation completion should remain session-fenced");
         assert!(clear < completion_fence);
+        assert!(continuation.contains("composer_queue_ready_after_continuation_session_ids"));
+        assert!(source.contains("flush_composer_queue_dispatches_after_continuation"));
     }
 
     #[test]
@@ -46792,7 +47720,7 @@ mod tests {
             AGENT_CONTENT_NARROW_MAX_WIDTH - COMPOSER_QUEUE_HORIZONTAL_INSET * 2.0,
             728.0
         );
-        assert_eq!(COMPOSER_SURFACE_MIN_HEIGHT, 96.0);
+        assert_eq!(COMPOSER_SURFACE_MIN_HEIGHT, 112.0);
         assert_eq!(COMPOSER_QUEUE_HEADER_HEIGHT, 36.0);
         assert_eq!(COMPOSER_QUEUE_ROW_HEIGHT, 28.0);
         assert_eq!(COMPOSER_SURFACE_RADIUS, 20.0);
@@ -46817,6 +47745,7 @@ mod tests {
         assert!(composer.contains("toggle-composer-expanded"));
         assert!(composer.contains("this.flex_1().min_h(px(240.0))"));
         assert!(composer.contains("this.flex_1().min_h_0()"));
+        assert!(composer.contains(".when(self.composer_expanded, |this| this.pt_4())"));
         let fullscreen_button = composer
             .find("toggle-composer-expanded")
             .expect("composer fullscreen control should remain present");
@@ -47112,6 +48041,30 @@ mod tests {
             ComposerQueueDispatchBehavior::Automatic,
             false,
             Some(AgentSessionState::Idle),
+        ));
+    }
+
+    #[test]
+    fn automatic_composer_queue_waits_for_an_incomplete_turn_continuation() {
+        assert!(composer_queue_waits_for_continuation(
+            ComposerQueueDispatchBehavior::Automatic,
+            Some(AgentSessionState::Error),
+            None,
+        ));
+        assert!(composer_queue_waits_for_continuation(
+            ComposerQueueDispatchBehavior::Automatic,
+            Some(AgentSessionState::Idle),
+            Some(false),
+        ));
+        assert!(!composer_queue_waits_for_continuation(
+            ComposerQueueDispatchBehavior::Automatic,
+            Some(AgentSessionState::Error),
+            Some(true),
+        ));
+        assert!(!composer_queue_waits_for_continuation(
+            ComposerQueueDispatchBehavior::ForceNext,
+            Some(AgentSessionState::Error),
+            None,
         ));
     }
 
@@ -47588,6 +48541,9 @@ mod tests {
         assert!(!queue.contains("Turn off queueing"));
         assert!(!queue.contains("More actions"));
         assert!(queue.contains("ComposerQueueDrag"));
+        assert!(queue.contains("render_composer_queue_attachment_content"));
+        assert!(source.contains("composer-queue-attachment-"));
+        assert!(queue.contains("let attachment_content = (!message.attachments.is_empty())"));
 
         let header = queue
             .find("composer-queue-header")
@@ -48278,6 +49234,65 @@ mod tests {
 
         assert_eq!(text, "before after");
         assert_eq!(attachments[0].inline_text_offset, Some(6));
+    }
+
+    #[test]
+    fn composer_queue_edit_insertion_round_trips_attachment_positions() {
+        let first = message_attachment("first", Some(5));
+        let second = message_attachment("second", Some(10));
+        let text = "alpha beta omega";
+
+        let (raw_text, inline_attachments, serial) =
+            composer_queue_edit_insertion(text, &[second, first], 40);
+
+        assert_eq!(serial, 42);
+        assert_eq!(
+            inline_attachments
+                .iter()
+                .map(|attachment| attachment.attachment.label.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert!(raw_text.contains(COMPOSER_INLINE_ATTACHMENT_PREFIX));
+
+        let (round_trip_text, round_trip_attachments) =
+            composer_submission_payload(&raw_text, &inline_attachments);
+        assert_eq!(round_trip_text, text);
+        assert_eq!(
+            round_trip_attachments
+                .iter()
+                .map(|attachment| attachment.label.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert_eq!(
+            round_trip_attachments
+                .iter()
+                .map(|attachment| attachment.inline_text_offset)
+                .collect::<Vec<_>>(),
+            [Some(5), Some(10)]
+        );
+    }
+
+    #[test]
+    fn composer_queue_edit_uses_the_inline_attachment_overlay() {
+        let source = include_str!("app.rs");
+        let queue = source
+            .split_once("    fn render_composer_queue(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer("))
+            .map(|(body, _)| body)
+            .expect("composer queue renderer should remain inspectable");
+        assert!(source.contains("composer_queue_edit_attachments"));
+        assert!(queue.contains("composer_queue_edit_geometry.input_bounds"));
+        assert!(queue.contains("capture_queue_inline_attachment_edit"));
+
+        let overlay = source
+            .split_once("    fn render_inline_composer_attachments(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_attachment_image_preview("))
+            .map(|(body, _)| body)
+            .expect("inline attachment overlay should remain inspectable");
+        assert!(overlay.contains("self.composer_queue_editing_id.is_some()"));
+        assert!(overlay.contains("self.composer_queue_edit_attachments.clone()"));
     }
 
     #[test]
@@ -49588,7 +50603,7 @@ mod tests {
             .expect("expanded worktrees should render their sessions");
 
         assert!(collapsed_guard < session_render);
-        assert!(workspace.contains("return row.into_any_element();"));
+        assert!(workspace.contains("return row.left(px(workspace_offset)).into_any_element();"));
         assert!(workspace.contains("let card_focused = !collapsed && selected"));
         assert!(workspace.contains("sidebar_workspace_focus_border("));
         assert!(workspace.contains("let card_border_color = if card_focused"));
@@ -49601,13 +50616,15 @@ mod tests {
                 .contains(".hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.20)))")
         );
         assert!(workspace.contains(".left(px(workspace_offset))"));
-        assert!(workspace.contains(".pl(px(SIDEBAR_WORKSPACE_SESSION_INDENT))"));
+        assert!(source.contains("const SIDEBAR_WORKSPACE_SESSION_CARD_OVERHANG: f32 = 8.0;"));
+        assert!(workspace.contains(
+            "SIDEBAR_WORKSPACE_SESSION_INDENT - SIDEBAR_WORKSPACE_SESSION_CARD_OVERHANG"
+        ));
         assert!(workspace.contains(".gap(px(0.0))"));
         assert!(workspace.contains("cx.theme().sidebar_foreground.opacity(0.28)"));
         assert!(workspace.contains(".w(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))"));
         assert!(workspace.contains(".h(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))"));
         assert!(workspace.contains(".pl_0()"));
-        assert!(workspace.contains(".pl(px(SIDEBAR_WORKSPACE_SESSION_INDENT))"));
         assert!(workspace.contains(".when(collapsed, |this|"));
         assert!(workspace.contains("this.border_1().border_color(cx.theme().transparent)"));
         assert!(!workspace.contains(".pt(px(4.0))"));
@@ -49654,10 +50671,50 @@ mod tests {
     }
 
     #[test]
+    fn worktree_actions_are_horizontal_and_rename_input_keeps_focus() {
+        let source = include_str!("app.rs");
+        let workspace = source
+            .split_once("    fn render_sidebar_workspace(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_session("))
+            .map(|(body, _)| body)
+            .expect("sidebar workspace renderer should remain inspectable");
+        assert!(workspace.contains(
+            "h_flex()\n                    .id(format!(\"sidebar-workspace-actions-{workspace_id}\"))"
+        ));
+
+        let rename = source
+            .split_once("    fn confirm_rename_sidebar_worktree(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn rename_sidebar_worktree("))
+            .map(|(body, _)| body)
+            .expect("worktree rename dialog should remain inspectable");
+        let input_creation = rename
+            .find("let input = cx.new(")
+            .expect("rename input should be created once before opening the dialog");
+        let dialog_open = rename
+            .find("window.open_dialog(cx")
+            .expect("rename dialog should open after input creation");
+        assert!(input_creation < dialog_open);
+        assert!(rename.contains("window.on_next_frame(move |window, cx|"));
+        assert!(rename.contains("input_for_focus.update(cx"));
+    }
+
+    #[test]
     fn sidebar_workspace_branch_name_uses_the_final_path_component() {
         assert_eq!(sidebar_workspace_branch_name("feature/aaa"), "aaa");
         assert_eq!(sidebar_workspace_branch_name("aaa"), "aaa");
         assert_eq!(sidebar_workspace_branch_name("No branch"), "No branch");
+    }
+
+    #[test]
+    fn worktree_title_branch_mapping_preserves_branch_prefix() {
+        assert_eq!(
+            sidebar_worktree_branch_for_title("feature/old-name", "New title"),
+            "feature/New-title"
+        );
+        assert_eq!(
+            sidebar_worktree_branch_for_title("worktree", "中文 task"),
+            "task"
+        );
     }
 
     #[test]
@@ -49675,9 +50732,9 @@ mod tests {
             .expect("worktree row should remain inspectable");
 
         assert!(workspace.contains("let branch_name = sidebar_workspace_branch_name(&branch)"));
-        assert!(workspace.contains(".child(branch_name)"));
+        assert!(workspace.contains(".child(workspace_title)"));
         assert!(workspace.contains(".child(branch)"));
-        assert!(workspace.contains(".w(px(26.0))"));
+        assert!(workspace.contains(".w(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))"));
         assert!(!row.contains("icons/vibex/git-branch.svg"));
         assert!(!row.contains(".border_l_1()"));
         assert!(!workspace.contains("workspace_kind"));

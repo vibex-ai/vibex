@@ -2231,6 +2231,14 @@ impl CodeWorkbench {
         self.git.status.as_ref()
     }
 
+    pub(crate) fn git_pending_commit_count(&self) -> u32 {
+        self.git
+            .branches
+            .as_ref()
+            .map(|branches| git_sync_counts(branches).1)
+            .unwrap_or_default()
+    }
+
     pub(crate) fn workspace_is_active(&self, workspace_id: &WorkspaceId) -> bool {
         self.workspace
             .as_ref()
@@ -2723,6 +2731,7 @@ impl CodeWorkbench {
             workspace_id: view.workspace_id,
             worktree_path: managed.worktree_path,
             force,
+            delete_branch: false,
             expected_head: None,
             preflight_revision: None,
         };

@@ -20,5 +20,7 @@ pub trait WorkspaceBackend: BackendBound {
 
     fn get_workspace(&self, workspace_id: WorkspaceId) -> BackendFuture<'_, WorkspaceSummary>;
 
+    fn delete_workspace(&self, request: MutationRequest<WorkspaceId>) -> BackendFuture<'_, ()>;
+
     fn delete_project(&self, request: MutationRequest<ProjectId>) -> BackendFuture<'_, ()>;
 }

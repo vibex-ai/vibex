@@ -2302,6 +2302,50 @@ impl WorkspaceRepository {
         ))
     }
 
+    pub fn delete_workspace(conn: &mut Connection, workspace_id: &WorkspaceId) -> VibexResult<()> {
+        let now = unix_timestamp_ms();
+        let tx = conn.transaction().map_err(storage_err(
+            "workspace_delete_transaction_failed",
+            "failed to start workspace delete transaction",
+        ))?;
+        let changed = tx
+            .execute(
+                "
+                UPDATE workspaces
+                SET deleted_at_ms = COALESCE(deleted_at_ms, ?2), updated_at_ms = ?2
+                WHERE workspace_id = ?1
+                ",
+                params![workspace_id.as_str(), now],
+            )
+            .map_err(storage_err(
+                "workspace_delete_failed",
+                "failed to delete workspace",
+            ))?;
+        if changed == 0 {
+            return Err(VibexError::validation(
+                "workspace_not_found",
+                "workspace was not found",
+            ));
+        }
+        tx.execute(
+            "
+            UPDATE agent_sessions
+            SET deleted_at_ms = COALESCE(deleted_at_ms, ?2), updated_at_ms = ?2
+            WHERE workspace_id = ?1
+            ",
+            params![workspace_id.as_str(), now],
+        )
+        .map_err(storage_err(
+            "workspace_session_delete_failed",
+            "failed to delete workspace sessions",
+        ))?;
+        tx.commit().map_err(storage_err(
+            "workspace_delete_commit_failed",
+            "failed to commit workspace delete",
+        ))?;
+        Ok(())
+    }
+
     fn find_project_by_root(
         conn: &Connection,
         root_path: &str,
@@ -8352,6 +8396,33 @@ impl ManagedWorktreeRepository {
         Ok(())
     }
 
+    pub fn update_branch(
+        conn: &Connection,
+        worktree_id: &RequestId,
+        branch: &str,
+    ) -> VibexResult<()> {
+        let changed = conn
+            .execute(
+                "
+                UPDATE git_managed_worktrees
+                SET branch = ?2, updated_at_ms = ?3
+                WHERE worktree_id = ?1
+                ",
+                params![worktree_id.as_str(), branch, unix_timestamp_ms()],
+            )
+            .map_err(storage_err(
+                "managed_worktree_branch_update_failed",
+                "failed to update managed worktree branch",
+            ))?;
+        if changed == 0 {
+            return Err(VibexError::storage(
+                "managed_worktree_not_found",
+                "managed worktree was not found",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn update_reconciliation(
         conn: &Connection,
         worktree_id: &RequestId,
@@ -13572,6 +13643,51 @@ mod tests {
 
         cleanup_db(temp);
         fs::remove_dir_all(project_dir).unwrap();
+    }
+
+    #[test]
+    fn workspace_delete_soft_deletes_workspace_and_sessions_without_touching_files() {
+        let temp = temp_db_path("workspace-delete-worktree");
+        let worktree_dir = std::env::temp_dir().join(format!(
+            "vibex-worktree-delete-{}",
+            RequestId::new().as_str()
+        ));
+        fs::create_dir_all(&worktree_dir).unwrap();
+        let sentinel_path = worktree_dir.join("keep.txt");
+        fs::write(&sentinel_path, "do not delete").unwrap();
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &worktree_dir, WorkspaceMode::VibexWorktree)
+                .unwrap();
+        let now = unix_timestamp_ms();
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: "Worktree session".to_string(),
+            project_id: project.id,
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path.clone(),
+            workspace_mode: workspace.mode,
+            agent_id: AgentId::parse("codex").unwrap(),
+            state: AgentSessionState::Idle,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_message_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        SessionRepository::insert(&conn, &session).unwrap();
+
+        WorkspaceRepository::delete_workspace(&mut conn, &workspace.id).unwrap();
+
+        assert!(sentinel_path.exists());
+        assert!(WorkspaceRepository::list(&conn).unwrap().is_empty());
+        assert!(SessionRepository::list(&conn, false).unwrap().is_empty());
+
+        cleanup_db(temp);
+        fs::remove_dir_all(worktree_dir).unwrap();
     }
 
     #[test]

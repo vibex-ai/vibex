@@ -820,10 +820,18 @@ pub struct GitWorktreeDiscardRequest {
     pub workspace_id: WorkspaceId,
     pub worktree_path: String,
     pub force: bool,
+    /// Remove the local branch after the worktree registration and directory
+    /// are removed. This is explicit because branch deletion is destructive.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub delete_branch: bool,
     #[serde(default)]
     pub expected_head: Option<String>,
     #[serde(default)]
     pub preflight_revision: Option<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -991,6 +999,31 @@ mod worktree_contract_tests {
         request.worktree_path = Some("/tmp/worktree".to_string());
         let encoded = serde_json::to_value(&request).unwrap();
         assert_eq!(encoded["worktreePath"], "/tmp/worktree");
+    }
+
+    #[test]
+    fn unchecked_worktree_branch_deletion_preserves_legacy_discard_shape() {
+        let request = GitWorktreeDiscardRequest {
+            workspace_id: WorkspaceId::new(),
+            worktree_path: "/tmp/worktree".to_string(),
+            force: true,
+            delete_branch: false,
+            expected_head: None,
+            preflight_revision: None,
+        };
+        let encoded = serde_json::to_value(request).unwrap();
+        assert!(encoded.get("deleteBranch").is_none());
+
+        let request = GitWorktreeDiscardRequest {
+            workspace_id: WorkspaceId::new(),
+            worktree_path: "/tmp/worktree".to_string(),
+            force: true,
+            delete_branch: true,
+            expected_head: None,
+            preflight_revision: None,
+        };
+        let encoded = serde_json::to_value(request).unwrap();
+        assert_eq!(encoded["deleteBranch"], true);
     }
 
     #[test]

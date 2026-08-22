@@ -319,6 +319,11 @@ pub struct SidebarUiState {
     pub project_location_preferences: BTreeMap<String, NewSessionLocation>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub project_appearances: BTreeMap<String, SidebarProjectAppearance>,
+    /// Desktop-only display overrides for managed Worktree rows. The Git
+    /// branch/path remains authoritative; this map only stores the sidebar
+    /// title chosen by the user.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub worktree_titles: BTreeMap<String, String>,
     #[serde(default)]
     pub organization: SidebarOrganizationState,
 }
@@ -601,6 +606,15 @@ impl DesktopUiStateV1 {
             })
             .take(1_000)
             .collect();
+        self.sidebar.worktree_titles = std::mem::take(&mut self.sidebar.worktree_titles)
+            .into_iter()
+            .filter_map(|(workspace_id, title)| {
+                let workspace_id = bounded_required(&workspace_id, 256)?;
+                let title = bounded_required(&title, 160)?;
+                Some((workspace_id, title))
+            })
+            .take(2_000)
+            .collect();
         self.sidebar.organization.normalize();
         normalize_ids(&mut self.preview.pinned_tab_ids, 500);
         self.preview.focused_pane_id = bounded_optional(self.preview.focused_pane_id.take(), 256);
@@ -716,6 +730,9 @@ impl DesktopUiStateV1 {
         self.sidebar
             .collapsed_workspace_ids
             .retain(|id| references.workspace_ids.contains(id));
+        self.sidebar
+            .worktree_titles
+            .retain(|id, _| references.workspace_ids.contains(id));
         self.sidebar
             .session_order
             .retain(|id| references.session_ids.contains(id));
@@ -1346,6 +1363,10 @@ mod tests {
             .sidebar
             .project_location_preferences
             .insert(" project-1 ".into(), NewSessionLocation::NewWorktree);
+        state
+            .sidebar
+            .worktree_titles
+            .insert(" workspace-1 ".into(), " Feature title ".into());
         state.sidebar.project_appearances.insert(
             " project-1 ".into(),
             SidebarProjectAppearance {
@@ -1359,6 +1380,10 @@ mod tests {
         assert_eq!(
             state.sidebar.project_location_preferences.get("project-1"),
             Some(&NewSessionLocation::NewWorktree)
+        );
+        assert_eq!(
+            state.sidebar.worktree_titles.get("workspace-1"),
+            Some(&"Feature title".to_string())
         );
         assert_eq!(
             state.sidebar.project_appearances.get("project-1"),

@@ -180,6 +180,10 @@ impl WorkspaceBackend for DisconnectedBackend {
         disconnected_future!()
     }
 
+    fn delete_workspace(&self, _request: MutationRequest<WorkspaceId>) -> BackendFuture<'_, ()> {
+        disconnected_future!()
+    }
+
     fn delete_project(&self, _request: MutationRequest<ProjectId>) -> BackendFuture<'_, ()> {
         disconnected_future!()
     }

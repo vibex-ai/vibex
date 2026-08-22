@@ -622,6 +622,11 @@ impl WorkspaceHandle {
             .ok_or_else(|| VibexError::validation("workspace_not_found", "workspace was not found"))
     }
 
+    pub fn delete_workspace(&self, workspace_id: &WorkspaceId) -> VibexResult<()> {
+        let mut connection = open_database(&self.db_path)?;
+        WorkspaceRepository::delete_workspace(&mut connection, workspace_id)
+    }
+
     pub fn delete_project(&self, project_id: &ProjectId) -> VibexResult<()> {
         let mut connection = open_database(&self.db_path)?;
         WorkspaceRepository::delete_project(&mut connection, project_id)
