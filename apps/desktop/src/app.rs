@@ -20961,11 +20961,6 @@ impl VibexWorkbench {
             cx.theme().sidebar_foreground.opacity(0.72)
         };
         let card_focused = !collapsed && selected;
-        let card_background = if card_focused {
-            sidebar_workspace_focus_background(cx.theme().sidebar_accent, cx.theme().is_dark())
-        } else {
-            cx.theme().transparent
-        };
         let card_border_color = if card_focused {
             sidebar_workspace_focus_border(cx.theme().sidebar_accent, cx.theme().is_dark())
         } else {
@@ -21144,7 +21139,6 @@ impl VibexWorkbench {
             .gap(px(5.0))
             .overflow_x_hidden()
             .rounded(px(10.0))
-            .bg(card_background)
             .border_1()
             .border_color(card_border_color)
             .pr(px(4.0))
@@ -34844,14 +34838,6 @@ fn sidebar_move_selected_background(accent: Hsla, is_dark: bool) -> Hsla {
     }
 }
 
-fn sidebar_workspace_focus_background(accent: Hsla, is_dark: bool) -> Hsla {
-    if is_dark {
-        accent.lighten(0.34)
-    } else {
-        accent.darken(0.04)
-    }
-}
-
 fn sidebar_workspace_focus_border(accent: Hsla, is_dark: bool) -> Hsla {
     if is_dark {
         accent.lighten(0.46)
@@ -43803,20 +43789,15 @@ mod tests {
     }
 
     #[test]
-    fn workspace_focus_background_and_border_increase_contrast_in_both_themes() {
+    fn workspace_focus_border_increases_contrast_in_both_themes() {
         let light_accent = theme::semantic_color("sidebar-accent", false);
-        let light_background = sidebar_workspace_focus_background(light_accent, false);
         let light_border = sidebar_workspace_focus_border(light_accent, false);
-        assert!(light_background.l < light_accent.l);
-        assert!(light_border.l < light_background.l);
-        assert!(light_background.l > light_accent.l - 0.06);
+        assert!(light_border.l < light_accent.l);
         assert!(light_border.l > light_accent.l - 0.18);
 
         let dark_accent = theme::semantic_color("sidebar-accent", true);
-        let dark_background = sidebar_workspace_focus_background(dark_accent, true);
         let dark_border = sidebar_workspace_focus_border(dark_accent, true);
-        assert!(dark_background.l > dark_accent.l);
-        assert!(dark_border.l > dark_background.l);
+        assert!(dark_border.l > dark_accent.l);
     }
 
     #[test]
@@ -49180,13 +49161,11 @@ mod tests {
         assert!(collapsed_guard < session_render);
         assert!(workspace.contains("return row.into_any_element();"));
         assert!(workspace.contains("let card_focused = !collapsed && selected"));
-        assert!(workspace.contains("let card_background = if card_focused"));
-        assert!(workspace.contains("sidebar_workspace_focus_background("));
         assert!(workspace.contains("sidebar_workspace_focus_border("));
         assert!(workspace.contains("let card_border_color = if card_focused"));
         assert!(workspace.contains(".border_1()"));
         assert!(workspace.contains(".border_color(card_border_color)"));
-        assert!(workspace.contains(".bg(card_background)"));
+        assert!(!workspace.contains("card_background"));
         assert!(!workspace.contains(".bg(row_background)"));
         assert!(
             !workspace
