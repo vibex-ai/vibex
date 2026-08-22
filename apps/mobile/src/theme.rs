@@ -85,7 +85,7 @@ pub const RADIUS_CARD: f32 = 8.0;
 pub const RADIUS_CONTROL: f32 = 6.0;
 
 pub const DRAWER_ROW_HEIGHT: f32 = 52.0;
-pub const SIDEBAR_ROW_HEIGHT: f32 = 40.0;
+pub const SIDEBAR_ROW_HEIGHT: f32 = 44.0;
 /// Indent per tree level, matching the desktop's nested sidebar spacing.
 pub const SIDEBAR_INDENT: f32 = 14.0;
 /// Width of the drag handle column on the right of every sidebar row. A pan

@@ -50,7 +50,8 @@ use crate::lifecycle::MobileLifecycleEvent;
 use crate::pairing::{MobileCredentialBundle, claim_pairing_link, claim_zero_config_lan_pairing};
 use crate::sidebar::{
     SidebarDropPosition, SidebarDropTarget, SidebarProject, SidebarRow, SidebarRowInput,
-    SidebarRowKind, ancestors_of, drop_target, press_is_on_grip, row_at_position, sidebar_rows,
+    SidebarRowKind, SidebarWorkspace, ancestors_of, drop_target, press_is_on_grip, row_at_position,
+    sidebar_rows,
 };
 use crate::storage::CredentialStorage;
 use crate::workbench::{MobileWorkbench, WorkbenchSurface};
@@ -317,6 +318,7 @@ pub struct MobileApp {
     /// The Desktop's sidebar tree, mirrored so the phone renders the layout the
     /// user arranged there rather than a second, divergent ordering.
     sidebar_view: SidebarOrganizationView,
+    collapsed_workspace_ids: BTreeSet<String>,
     sidebar_sync_busy: bool,
     sidebar_drag: Option<SidebarDrag>,
     /// Top edge and right edge of the row list in window space, recorded during
@@ -415,6 +417,7 @@ impl MobileApp {
                 TextInput::new(locale::text("Folder name", "文件夹名称", "資料夾名稱"), cx)
             }),
             sidebar_view: SidebarOrganizationView::default(),
+            collapsed_workspace_ids: BTreeSet::new(),
             sidebar_sync_busy: false,
             sidebar_drag: None,
             sidebar_list_frame: Rc::new(Cell::new((0.0, 0.0))),
@@ -1492,6 +1495,13 @@ impl MobileApp {
                             .into_iter()
                             .map(|summary| summary.workspace)
                             .collect();
+                        let workspace_ids = this
+                            .workspaces
+                            .iter()
+                            .map(|workspace| workspace.id.as_str().to_string())
+                            .collect::<BTreeSet<_>>();
+                        this.collapsed_workspace_ids
+                            .retain(|workspace_id| workspace_ids.contains(workspace_id));
                         let active_workspace = this
                             .controller
                             .as_ref()
@@ -1574,6 +1584,20 @@ impl MobileApp {
             .iter()
             .find(|summary| summary.project.id.as_str() == project_id)
             .map(|summary| (summary.workspace.root_path.clone(), summary.workspace.mode));
+        self.start_session_creation(workspace, window, cx);
+    }
+
+    fn create_session_in_workspace(
+        &mut self,
+        workspace_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id.as_str() == workspace_id)
+            .map(|workspace| (workspace.root_path.clone(), workspace.mode));
         self.start_session_creation(workspace, window, cx);
     }
 
@@ -1957,6 +1981,23 @@ impl MobileApp {
         projects
     }
 
+    fn sidebar_workspaces(&self) -> Vec<SidebarWorkspace> {
+        self.workspace_summaries
+            .iter()
+            .map(|summary| {
+                let workspace_id = summary.workspace.id.as_str().to_string();
+                SidebarWorkspace {
+                    id: workspace_id.clone(),
+                    project_id: summary.project.id.as_str().to_string(),
+                    label: workspace_label(&summary.workspace.root_path).to_string(),
+                    detail: summary.workspace.root_path.clone(),
+                    mode: summary.workspace.mode,
+                    collapsed: self.collapsed_workspace_ids.contains(&workspace_id),
+                }
+            })
+            .collect()
+    }
+
     fn sessions(&self) -> &[vibex_core::AgentSession] {
         self.controller
             .as_ref()
@@ -1966,9 +2007,11 @@ impl MobileApp {
 
     fn mobile_sidebar_rows(&self, query: &str) -> Vec<SidebarRow> {
         let projects = self.sidebar_projects();
+        let workspaces = self.sidebar_workspaces();
         sidebar_rows(SidebarRowInput {
             view: &self.sidebar_view,
             projects: &projects,
+            workspaces: &workspaces,
             sessions: self.sessions(),
             selected_session_id: self
                 .controller
@@ -1976,6 +2019,13 @@ impl MobileApp {
                 .and_then(|controller| controller.state.selected_session_id.as_ref()),
             query,
         })
+    }
+
+    fn toggle_workspace(&mut self, workspace_id: String, cx: &mut Context<Self>) {
+        if !self.collapsed_workspace_ids.remove(&workspace_id) {
+            self.collapsed_workspace_ids.insert(workspace_id);
+        }
+        cx.notify();
     }
 
     fn toggle_folder(&mut self, folder_id: String, cx: &mut Context<Self>) {
@@ -2037,6 +2087,9 @@ impl MobileApp {
         let Some(row) = rows.get(index).cloned() else {
             return false;
         };
+        if row.kind == SidebarRowKind::Workspace {
+            return false;
+        }
         self.sidebar_drag = Some(SidebarDrag {
             index,
             row,
@@ -2058,6 +2111,12 @@ impl MobileApp {
         let pointer_y = f32::from(event.position.y);
         let position = row_at_position(pointer_y, list_top, offset_y, theme::SIDEBAR_ROW_HEIGHT);
         let mut target = drop_target(&rows, index, position);
+        if target
+            .as_ref()
+            .is_some_and(|candidate| rows[candidate.index].kind == SidebarRowKind::Workspace)
+        {
+            target = None;
+        }
         // A folder cannot be filed inside itself or its own descendants.
         if let Some(candidate) = target.as_ref()
             && rows[index].kind == SidebarRowKind::Folder
@@ -2077,6 +2136,9 @@ impl MobileApp {
         let Some(drag) = self.sidebar_drag.take() else {
             return;
         };
+        if drag.row.kind == SidebarRowKind::Workspace {
+            return;
+        }
         cx.notify();
         let Some(target) = drag.target.filter(|_| !cancelled) else {
             return;
@@ -2085,6 +2147,9 @@ impl MobileApp {
         let Some(anchor) = rows.get(target.index) else {
             return;
         };
+        if anchor.kind == SidebarRowKind::Workspace {
+            return;
+        }
         // Scopes never mix: a root item stays at the root and a project item
         // stays inside its project, exactly as the Desktop enforces.
         if anchor.project_id != drag.row.project_id {
@@ -2186,6 +2251,7 @@ impl MobileApp {
         // The tree belongs to whichever desktop is paired, so switching hosts
         // must not leave the previous desktop's folders on screen.
         self.sidebar_view = SidebarOrganizationView::default();
+        self.collapsed_workspace_ids.clear();
         self.sidebar_drag = None;
         self.sidebar_row_menu = None;
         self.sidebar_name_prompt = None;
@@ -2278,6 +2344,12 @@ impl MobileApp {
                     .find(|session| session.id == session_id)
                     .map(|session| session.project_id.as_str().to_string())
             });
+        let workspace_id = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.sessions.value.as_deref())
+            .and_then(|sessions| sessions.iter().find(|session| session.id == session_id))
+            .map(|session| session.workspace_id.as_str().to_string());
         if let Some(project_id) = project_id
             && self
                 .sidebar_view
@@ -2285,6 +2357,11 @@ impl MobileApp {
                 .contains(&project_id)
         {
             self.toggle_project(project_id, cx);
+        }
+        if let Some(workspace_id) = workspace_id
+            && self.collapsed_workspace_ids.contains(&workspace_id)
+        {
+            self.toggle_workspace(workspace_id, cx);
         }
         let query = self.sidebar_search_input.read(cx).text().to_string();
         if let Some(index) = self
@@ -4281,6 +4358,7 @@ impl MobileApp {
                     }),
                 );
             }
+            SidebarRowKind::Workspace => {}
         }
 
         div()
@@ -6070,6 +6148,7 @@ impl MobileApp {
         let body = match row.kind {
             SidebarRowKind::Folder => self.render_sidebar_folder_row(row, indent, cx),
             SidebarRowKind::Project => self.render_sidebar_project_row(row, indent, cx),
+            SidebarRowKind::Workspace => self.render_sidebar_workspace_row(row, indent, cx),
             SidebarRowKind::Session => self.render_sidebar_session_row(row, indent, cx),
         };
         div()
@@ -6102,6 +6181,9 @@ impl MobileApp {
     /// The grip is the only place a pan means "move this row"; everywhere else
     /// a finger scrolls the list.
     fn render_sidebar_grip(&self, row: &SidebarRow, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if row.kind == SidebarRowKind::Workspace {
+            return div().into_any_element();
+        }
         let can_move = self.backend.as_ref().is_some_and(|backend| {
             backend
                 .capability_snapshot()
@@ -6161,7 +6243,7 @@ impl MobileApp {
             .rounded(px(theme::RADIUS_CONTROL))
             .flex()
             .items_center()
-            .gap(px(theme::SPACING_SM))
+            .gap(px(theme::SPACING_XS))
             .cursor_pointer()
             .active(|style| style.bg(theme::row_pressed_bg()))
             .on_mouse_up(
@@ -6226,6 +6308,9 @@ impl MobileApp {
             .flex()
             .items_center()
             .gap(px(theme::SPACING_SM))
+            .when(row.selected, |project| {
+                project.bg(theme::sidebar_selected_bg())
+            })
             .cursor_pointer()
             .active(|style| style.bg(theme::row_pressed_bg()))
             .on_mouse_up(
@@ -6234,10 +6319,29 @@ impl MobileApp {
             )
             .child(
                 svg()
-                    .path("brand/logo.svg")
-                    .size(px(16.0))
+                    .path(if row.collapsed {
+                        "icons/chevron-right.svg"
+                    } else {
+                        "icons/chevron-down.svg"
+                    })
+                    .size(px(12.0))
                     .flex_shrink_0()
-                    .text_color(rgb(theme::ACCENT_PURPLE)),
+                    .text_color(theme::sidebar_text_muted()),
+            )
+            .child(
+                div()
+                    .w(px(30.0))
+                    .h(px(30.0))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        svg()
+                            .path("icons/boxes.svg")
+                            .size(px(18.0))
+                            .text_color(rgb(theme::ACCENT_PURPLE)),
+                    ),
             )
             .child(
                 div()
@@ -6251,6 +6355,21 @@ impl MobileApp {
                     .text_color(theme::sidebar_text_primary())
                     .child(row.label.clone()),
             )
+            .when(row.child_count > 0, |project| {
+                project.child(
+                    div()
+                        .size(px(20.0))
+                        .flex_shrink_0()
+                        .rounded_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(theme::FONT_MICRO))
+                        .text_color(theme::sidebar_text_muted())
+                        .bg(theme::bg_card_dim())
+                        .child(row.child_count.to_string()),
+                )
+            })
             // Always visible: a phone has no hover state to reveal it.
             .child(
                 div()
@@ -6289,6 +6408,156 @@ impl MobileApp {
             .into_any_element()
     }
 
+    fn render_sidebar_workspace_row(
+        &self,
+        row: &SidebarRow,
+        indent: f32,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(workspace_id) = row.workspace_id.clone() else {
+            return div().into_any_element();
+        };
+        let workspace_mode = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id.as_str() == workspace_id)
+            .map(|workspace| workspace.mode)
+            .unwrap_or(WorkspaceMode::CurrentCheckout);
+        let toggle_id = workspace_id.clone();
+        let new_session_id = workspace_id.clone();
+        let can_create_session = self.backend.as_ref().is_some_and(|backend| {
+            backend
+                .capability_snapshot()
+                .agent
+                .supports(BackendOperation::AgentCreateSession)
+        });
+        let status_color = sidebar_workspace_status_color(row.state);
+        let detail = row
+            .detail
+            .as_deref()
+            .map(|detail| format!("{} · {detail}", workspace_mode_label(workspace_mode)))
+            .unwrap_or_else(|| workspace_mode_label(workspace_mode).to_string());
+        div()
+            .id(format!("mobile-workspace-row-{workspace_id}"))
+            .h_full()
+            .mx(px(theme::SPACING_SM))
+            .pl(px(indent))
+            .pr(px(theme::SIDEBAR_GRIP_WIDTH))
+            .rounded(px(theme::RADIUS_CONTROL))
+            .flex()
+            .items_center()
+            .gap(px(theme::SPACING_XS))
+            .when(row.selected, |workspace| {
+                workspace.bg(theme::sidebar_selected_bg())
+            })
+            .cursor_pointer()
+            .active(|style| style.bg(theme::row_pressed_bg()))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| this.toggle_workspace(toggle_id.clone(), cx)),
+            )
+            .child(
+                svg()
+                    .path(if row.collapsed {
+                        "icons/chevron-right.svg"
+                    } else {
+                        "icons/chevron-down.svg"
+                    })
+                    .size(px(12.0))
+                    .flex_shrink_0()
+                    .text_color(theme::sidebar_text_muted()),
+            )
+            .child(
+                div()
+                    .w(px(30.0))
+                    .h(px(30.0))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .size(px(theme::ICON_STATUS))
+                            .rounded_full()
+                            .bg(rgb(status_color)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(px(theme::FONT_BODY))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::sidebar_text_primary())
+                            .child(row.label.clone()),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(px(theme::FONT_MICRO))
+                            .text_color(theme::sidebar_text_muted())
+                            .child(detail),
+                    ),
+            )
+            .when(row.child_count > 0, |workspace| {
+                workspace.child(
+                    div()
+                        .size(px(20.0))
+                        .flex_shrink_0()
+                        .rounded_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(theme::FONT_MICRO))
+                        .text_color(theme::sidebar_text_muted())
+                        .bg(theme::bg_card_dim())
+                        .child(row.child_count.to_string()),
+                )
+            })
+            .child(
+                div()
+                    .id(format!("mobile-workspace-new-session-{workspace_id}"))
+                    .size(px(30.0))
+                    .flex_shrink_0()
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .when(!can_create_session, |button| button.opacity(0.38))
+                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            if !can_create_session {
+                                return;
+                            }
+                            cx.stop_propagation();
+                            this.create_session_in_workspace(new_session_id.clone(), window, cx);
+                        }),
+                    )
+                    .child(
+                        svg()
+                            .path("icons/plus.svg")
+                            .size(px(15.0))
+                            .text_color(theme::sidebar_text_muted()),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_sidebar_session_row(
         &self,
         row: &SidebarRow,
@@ -6307,7 +6576,8 @@ impl MobileApp {
             AgentSessionState::NeedsInput => theme::ACCENT_YELLOW,
             AgentSessionState::Error => theme::ACCENT_RED,
             AgentSessionState::Initializing => theme::ACCENT_BLUE,
-            _ => theme::ACCENT_DIM,
+            AgentSessionState::Idle => theme::ACCENT_GREEN,
+            AgentSessionState::Archived | AgentSessionState::Closed => theme::ACCENT_DIM,
         };
         let is_selected = row.selected;
         let open_session_id = session_id.clone();
@@ -6331,7 +6601,7 @@ impl MobileApp {
             .child(
                 svg()
                     .path(agent_icon_path(&session.agent_id.to_string()))
-                    .size(px(14.0))
+                    .size(px(16.0))
                     .flex_shrink_0()
                     .text_color(if is_selected {
                         theme::text_primary()
@@ -6365,7 +6635,7 @@ impl MobileApp {
             )
             .child(
                 div()
-                    .w(px(44.0))
+                    .w(px(52.0))
                     .flex_shrink_0()
                     .overflow_hidden()
                     .text_ellipsis()
@@ -8198,6 +8468,27 @@ fn workspace_label(root: &str) -> &str {
     root.rsplit(['/', '\\'])
         .find(|segment| !segment.is_empty())
         .unwrap_or(root)
+}
+
+fn workspace_mode_label(mode: WorkspaceMode) -> &'static str {
+    match mode {
+        WorkspaceMode::CurrentCheckout => {
+            locale::text("Current checkout", "当前工作区", "目前簽出")
+        }
+        WorkspaceMode::VibexWorktree => {
+            locale::text("Vibex worktree", "Vibex 工作树", "Vibex 工作樹")
+        }
+    }
+}
+
+fn sidebar_workspace_status_color(state: Option<AgentSessionState>) -> u32 {
+    match state {
+        Some(AgentSessionState::Running | AgentSessionState::Initializing) => theme::ACCENT_BLUE,
+        Some(AgentSessionState::NeedsInput) => theme::ACCENT_YELLOW,
+        Some(AgentSessionState::Error) => theme::ACCENT_RED,
+        Some(AgentSessionState::Idle) => theme::ACCENT_GREEN,
+        Some(AgentSessionState::Archived | AgentSessionState::Closed) | None => theme::ACCENT_DIM,
+    }
 }
 
 fn agent_icon_path(agent_id: &str) -> &'static str {

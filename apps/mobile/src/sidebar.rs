@@ -8,9 +8,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use vibex_core::{AgentSession, AgentSessionState, VibexSessionId};
+use vibex_core::{AgentSession, AgentSessionState, VibexSessionId, WorkspaceMode};
 use vibex_desktop_model::{
-    SidebarOrganizationItem, SidebarOrganizationView, sidebar_project_items, sidebar_root_items,
+    SidebarOrganizationItem, SidebarOrganizationView, sidebar_project_items_for_workspace,
+    sidebar_root_items,
 };
 
 /// Folders may nest, but a runaway parent chain must not build an unbounded
@@ -21,6 +22,7 @@ const MAX_FOLDER_DEPTH: usize = 32;
 pub enum SidebarRowKind {
     Folder,
     Project,
+    Workspace,
     Session,
 }
 
@@ -37,6 +39,11 @@ pub struct SidebarRow {
     /// clients keep this alongside the project scope so folder creation can
     /// round-trip without losing its worktree owner.
     pub workspace_id: Option<String>,
+    /// Secondary line for a workspace row (usually its branch or compact path).
+    pub detail: Option<String>,
+    /// Number of direct children represented by the row. Projects use this for
+    /// the workspace count badge; workspace rows use it for their session count.
+    pub child_count: usize,
     pub collapsed: bool,
     pub pinned: bool,
     pub selected: bool,
@@ -46,7 +53,11 @@ pub struct SidebarRow {
 
 impl SidebarRow {
     pub fn id(&self) -> &str {
-        self.item.id()
+        if self.kind == SidebarRowKind::Workspace {
+            self.workspace_id.as_deref().unwrap_or_default()
+        } else {
+            self.item.id()
+        }
     }
 }
 
@@ -57,9 +68,23 @@ pub struct SidebarProject {
     pub label: String,
 }
 
+/// A workspace displayed beneath a project in the desktop's detailed sidebar.
+/// Workspace rows are presentation-only on mobile: their sessions and folders
+/// still use the existing project-scoped organization protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarWorkspace {
+    pub id: String,
+    pub project_id: String,
+    pub label: String,
+    pub detail: String,
+    pub mode: WorkspaceMode,
+    pub collapsed: bool,
+}
+
 pub struct SidebarRowInput<'a> {
     pub view: &'a SidebarOrganizationView,
     pub projects: &'a [SidebarProject],
+    pub workspaces: &'a [SidebarWorkspace],
     pub sessions: &'a [AgentSession],
     pub selected_session_id: Option<&'a VibexSessionId>,
     pub query: &'a str,
@@ -90,6 +115,48 @@ pub fn sidebar_rows(input: SidebarRowInput<'_>) -> Vec<SidebarRow> {
             .push(session);
     }
 
+    let mut workspaces_by_project = BTreeMap::<String, Vec<&SidebarWorkspace>>::new();
+    for workspace in input.workspaces {
+        workspaces_by_project
+            .entry(workspace.project_id.clone())
+            .or_default()
+            .push(workspace);
+    }
+    let workspace_ids = input
+        .workspaces
+        .iter()
+        .map(|workspace| workspace.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut sessions_by_workspace = BTreeMap::<String, Vec<&AgentSession>>::new();
+    for session in input
+        .sessions
+        .iter()
+        .filter(|session| session.deleted_at_ms.is_none())
+    {
+        // The workspace id is authoritative, but older sessions can carry an
+        // id from a previous desktop snapshot. Match the same project/root
+        // identity fallback used by the desktop projection.
+        let workspace_id = if workspace_ids.contains(session.workspace_id.as_str()) {
+            Some(session.workspace_id.as_str().to_string())
+        } else {
+            input
+                .workspaces
+                .iter()
+                .find(|workspace| {
+                    workspace.project_id == session.project_id.as_str()
+                        && workspace.detail == session.workspace_root
+                        && workspace.mode == session.workspace_mode
+                })
+                .map(|workspace| workspace.id.clone())
+        };
+        if let Some(workspace_id) = workspace_id {
+            sessions_by_workspace
+                .entry(workspace_id)
+                .or_default()
+                .push(session);
+        }
+    }
+
     let visible_projects = input
         .projects
         .iter()
@@ -98,6 +165,17 @@ pub fn sidebar_rows(input: SidebarRowInput<'_>) -> Vec<SidebarRow> {
                 return true;
             }
             if project.label.to_lowercase().contains(&query) {
+                return true;
+            }
+            if workspaces_by_project
+                .get(&project.id)
+                .is_some_and(|workspaces| {
+                    workspaces.iter().any(|workspace| {
+                        workspace.label.to_lowercase().contains(&query)
+                            || workspace.detail.to_lowercase().contains(&query)
+                    })
+                })
+            {
                 return true;
             }
             sessions_by_project
@@ -126,7 +204,9 @@ pub fn sidebar_rows(input: SidebarRowInput<'_>) -> Vec<SidebarRow> {
         organization,
         &project_ids,
         &project_labels,
+        &workspaces_by_project,
         &sessions_by_project,
+        &sessions_by_workspace,
         &query,
         None,
         0,
@@ -141,7 +221,9 @@ fn push_root_children(
     organization: &vibex_desktop_model::SidebarOrganizationState,
     project_ids: &[String],
     project_labels: &BTreeMap<String, String>,
+    workspaces_by_project: &BTreeMap<String, Vec<&SidebarWorkspace>>,
     sessions_by_project: &BTreeMap<String, Vec<&AgentSession>>,
+    sessions_by_workspace: &BTreeMap<String, Vec<&AgentSession>>,
     query: &str,
     parent_folder_id: Option<&str>,
     depth: usize,
@@ -156,6 +238,13 @@ fn push_root_children(
                     continue;
                 };
                 let collapsed = input.view.collapsed_project_ids.contains(&project_id);
+                let selected = input.selected_session_id.is_some_and(|selected| {
+                    sessions_by_project
+                        .get(&project_id)
+                        .is_some_and(|sessions| {
+                            sessions.iter().any(|session| session.id == *selected)
+                        })
+                });
                 rows.push(SidebarRow {
                     item: SidebarOrganizationItem::Project(project_id.clone()),
                     kind: SidebarRowKind::Project,
@@ -163,9 +252,11 @@ fn push_root_children(
                     label: label.clone(),
                     project_id: None,
                     workspace_id: None,
+                    detail: None,
+                    child_count: workspaces_by_project.get(&project_id).map_or(0, Vec::len),
                     collapsed,
                     pinned: false,
-                    selected: false,
+                    selected,
                     state: None,
                     session_id: None,
                 });
@@ -177,7 +268,9 @@ fn push_root_children(
                     input,
                     organization,
                     &project_id,
+                    workspaces_by_project,
                     sessions_by_project,
+                    sessions_by_workspace,
                     query,
                     None,
                     depth + 1,
@@ -195,6 +288,8 @@ fn push_root_children(
                     label: folder.name.clone(),
                     project_id: None,
                     workspace_id: folder.workspace_id.clone(),
+                    detail: None,
+                    child_count: 0,
                     collapsed,
                     pinned: false,
                     selected: false,
@@ -210,7 +305,9 @@ fn push_root_children(
                     organization,
                     project_ids,
                     project_labels,
+                    workspaces_by_project,
                     sessions_by_project,
+                    sessions_by_workspace,
                     query,
                     Some(&folder_id),
                     depth + 1,
@@ -227,7 +324,9 @@ fn push_project_children(
     input: &SidebarRowInput<'_>,
     organization: &vibex_desktop_model::SidebarOrganizationState,
     project_id: &str,
+    workspaces_by_project: &BTreeMap<String, Vec<&SidebarWorkspace>>,
     sessions_by_project: &BTreeMap<String, Vec<&AgentSession>>,
+    sessions_by_workspace: &BTreeMap<String, Vec<&AgentSession>>,
     query: &str,
     parent_folder_id: Option<&str>,
     depth: usize,
@@ -239,41 +338,39 @@ fn push_project_children(
         .get(project_id)
         .cloned()
         .unwrap_or_default();
-    let session_ids = project_sessions
+    let legacy_sessions = project_sessions
+        .iter()
+        .filter(|session| {
+            !sessions_by_workspace
+                .values()
+                .any(|sessions| sessions.iter().any(|candidate| candidate.id == session.id))
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    let session_ids = legacy_sessions
         .iter()
         .filter(|session| session_matches(session, query))
         .map(|session| session.id.as_str().to_string())
         .collect::<Vec<_>>();
-    for item in sidebar_project_items(
+    for item in sidebar_project_items_for_workspace(
         organization,
         project_id,
+        None,
+        true,
+        false,
         &session_ids,
         &input.view.pinned_session_ids,
         parent_folder_id,
     ) {
         match item {
             SidebarOrganizationItem::Session(session_id) => {
-                let Some(session) = project_sessions
+                let Some(session) = legacy_sessions
                     .iter()
                     .find(|session| session.id.as_str() == session_id)
                 else {
                     continue;
                 };
-                rows.push(SidebarRow {
-                    item: SidebarOrganizationItem::Session(session_id.clone()),
-                    kind: SidebarRowKind::Session,
-                    depth,
-                    label: session.title.clone(),
-                    project_id: Some(project_id.to_string()),
-                    workspace_id: Some(session.workspace_id.as_str().to_string()),
-                    collapsed: false,
-                    pinned: input.view.pinned_session_ids.contains(&session_id),
-                    selected: input
-                        .selected_session_id
-                        .is_some_and(|selected| selected.as_str() == session_id),
-                    state: Some(session.state),
-                    session_id: Some(session.id.clone()),
-                });
+                rows.push(session_row(input, project_id, session, depth));
             }
             SidebarOrganizationItem::Folder(folder_id) => {
                 let Some(folder) = organization.folder(&folder_id) else {
@@ -287,6 +384,8 @@ fn push_project_children(
                     label: folder.name.clone(),
                     project_id: Some(project_id.to_string()),
                     workspace_id: folder.workspace_id.clone(),
+                    detail: None,
+                    child_count: 0,
                     collapsed,
                     pinned: false,
                     selected: false,
@@ -301,7 +400,9 @@ fn push_project_children(
                     input,
                     organization,
                     project_id,
+                    workspaces_by_project,
                     sessions_by_project,
+                    sessions_by_workspace,
                     query,
                     Some(&folder_id),
                     depth + 1,
@@ -309,6 +410,186 @@ fn push_project_children(
             }
             SidebarOrganizationItem::Project(_) => {}
         }
+    }
+
+    if parent_folder_id.is_some() {
+        return;
+    }
+    for workspace in workspaces_by_project
+        .get(project_id)
+        .into_iter()
+        .flatten()
+        .filter(|workspace| {
+            query.is_empty()
+                || workspace.label.to_lowercase().contains(query)
+                || workspace.detail.to_lowercase().contains(query)
+                || sessions_by_workspace
+                    .get(&workspace.id)
+                    .is_some_and(|sessions| {
+                        sessions
+                            .iter()
+                            .any(|session| session_matches(session, query))
+                    })
+        })
+    {
+        let workspace_sessions = sessions_by_workspace
+            .get(&workspace.id)
+            .cloned()
+            .unwrap_or_default();
+        let session_ids = workspace_sessions
+            .iter()
+            .filter(|session| session_matches(session, query))
+            .map(|session| session.id.as_str().to_string())
+            .collect::<Vec<_>>();
+        rows.push(SidebarRow {
+            // The shared organization protocol intentionally has no workspace
+            // item. This placeholder is never sent as a mutation.
+            item: SidebarOrganizationItem::Project(workspace.id.clone()),
+            kind: SidebarRowKind::Workspace,
+            depth,
+            label: workspace.label.clone(),
+            project_id: Some(project_id.to_string()),
+            workspace_id: Some(workspace.id.clone()),
+            detail: Some(workspace.detail.clone()),
+            child_count: workspace_sessions.len(),
+            collapsed: workspace.collapsed,
+            pinned: false,
+            selected: input.selected_session_id.is_some_and(|selected| {
+                workspace_sessions
+                    .iter()
+                    .any(|session| session.id == *selected)
+            }),
+            state: workspace_sessions
+                .iter()
+                .find(|session| {
+                    matches!(
+                        session.state,
+                        AgentSessionState::Running
+                            | AgentSessionState::NeedsInput
+                            | AgentSessionState::Error
+                    )
+                })
+                .map(|session| session.state),
+            session_id: None,
+        });
+        if workspace.collapsed && query.is_empty() {
+            continue;
+        }
+        push_workspace_children(
+            rows,
+            input,
+            organization,
+            project_id,
+            &workspace.id,
+            &workspace_sessions,
+            &session_ids,
+            query,
+            None,
+            depth + 1,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_workspace_children(
+    rows: &mut Vec<SidebarRow>,
+    input: &SidebarRowInput<'_>,
+    organization: &vibex_desktop_model::SidebarOrganizationState,
+    project_id: &str,
+    workspace_id: &str,
+    workspace_sessions: &[&AgentSession],
+    session_ids: &[String],
+    query: &str,
+    parent_folder_id: Option<&str>,
+    depth: usize,
+) {
+    if depth > MAX_FOLDER_DEPTH {
+        return;
+    }
+    for item in sidebar_project_items_for_workspace(
+        organization,
+        project_id,
+        Some(workspace_id),
+        false,
+        false,
+        session_ids,
+        &input.view.pinned_session_ids,
+        parent_folder_id,
+    ) {
+        match item {
+            SidebarOrganizationItem::Session(session_id) => {
+                let Some(session) = workspace_sessions
+                    .iter()
+                    .find(|session| session.id.as_str() == session_id)
+                else {
+                    continue;
+                };
+                rows.push(session_row(input, project_id, session, depth));
+            }
+            SidebarOrganizationItem::Folder(folder_id) => {
+                let Some(folder) = organization.folder(&folder_id) else {
+                    continue;
+                };
+                let collapsed = organization.collapsed_folder_ids.contains(&folder_id);
+                rows.push(SidebarRow {
+                    item: SidebarOrganizationItem::Folder(folder_id.clone()),
+                    kind: SidebarRowKind::Folder,
+                    depth,
+                    label: folder.name.clone(),
+                    project_id: Some(project_id.to_string()),
+                    workspace_id: Some(workspace_id.to_string()),
+                    detail: None,
+                    child_count: 0,
+                    collapsed,
+                    pinned: false,
+                    selected: false,
+                    state: None,
+                    session_id: None,
+                });
+                if collapsed && query.is_empty() {
+                    continue;
+                }
+                push_workspace_children(
+                    rows,
+                    input,
+                    organization,
+                    project_id,
+                    workspace_id,
+                    workspace_sessions,
+                    session_ids,
+                    query,
+                    Some(&folder_id),
+                    depth + 1,
+                );
+            }
+            SidebarOrganizationItem::Project(_) => {}
+        }
+    }
+}
+
+fn session_row(
+    input: &SidebarRowInput<'_>,
+    project_id: &str,
+    session: &AgentSession,
+    depth: usize,
+) -> SidebarRow {
+    let session_id = session.id.as_str().to_string();
+    SidebarRow {
+        item: SidebarOrganizationItem::Session(session_id.clone()),
+        kind: SidebarRowKind::Session,
+        depth,
+        label: session.title.clone(),
+        project_id: Some(project_id.to_string()),
+        workspace_id: Some(session.workspace_id.as_str().to_string()),
+        detail: None,
+        child_count: 0,
+        collapsed: false,
+        pinned: input.view.pinned_session_ids.contains(&session_id),
+        selected: input
+            .selected_session_id
+            .is_some_and(|selected| selected.as_str() == session_id),
+        state: Some(session.state),
+        session_id: Some(session.id.clone()),
     }
 }
 
@@ -434,6 +715,7 @@ mod tests {
         let item = match kind {
             SidebarRowKind::Folder => SidebarOrganizationItem::Folder(id.to_string()),
             SidebarRowKind::Project => SidebarOrganizationItem::Project(id.to_string()),
+            SidebarRowKind::Workspace => SidebarOrganizationItem::Project(id.to_string()),
             SidebarRowKind::Session => SidebarOrganizationItem::Session(id.to_string()),
         };
         SidebarRow {
@@ -443,6 +725,8 @@ mod tests {
             label: id.to_string(),
             project_id: None,
             workspace_id: None,
+            detail: None,
+            child_count: 0,
             collapsed: false,
             pinned: false,
             selected: false,
@@ -462,6 +746,7 @@ mod tests {
         let rows = sidebar_rows(SidebarRowInput {
             view: &view,
             projects: &projects,
+            workspaces: &[],
             sessions: &sessions,
             selected_session_id: None,
             query: "",
@@ -485,6 +770,7 @@ mod tests {
         let collapsed = sidebar_rows(SidebarRowInput {
             view: &view,
             projects: &projects,
+            workspaces: &[],
             sessions: &sessions,
             selected_session_id: None,
             query: "",
@@ -493,11 +779,45 @@ mod tests {
         let searched = sidebar_rows(SidebarRowInput {
             view: &view,
             projects: &projects,
+            workspaces: &[],
             sessions: &sessions,
             selected_session_id: None,
             query: "hello",
         });
         assert_eq!(searched.len(), 2);
+    }
+
+    #[test]
+    fn detailed_rows_group_sessions_under_their_workspace() {
+        let view = SidebarOrganizationView::default();
+        let projects = vec![SidebarProject {
+            id: "project_project".to_string(),
+            label: "vibex".to_string(),
+        }];
+        let workspaces = vec![SidebarWorkspace {
+            id: "workspace_project".to_string(),
+            project_id: "project_project".to_string(),
+            label: "project".to_string(),
+            detail: "/tmp/project".to_string(),
+            mode: WorkspaceMode::CurrentCheckout,
+            collapsed: false,
+        }];
+        let sessions = vec![session("session-a", "project", "Hello")];
+        let rows = sidebar_rows(SidebarRowInput {
+            view: &view,
+            projects: &projects,
+            workspaces: &workspaces,
+            sessions: &sessions,
+            selected_session_id: None,
+            query: "",
+        });
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].child_count, 1);
+        assert_eq!(rows[1].kind, SidebarRowKind::Workspace);
+        assert_eq!(rows[1].id(), "workspace_project");
+        assert_eq!(rows[1].child_count, 1);
+        assert_eq!(rows[2].kind, SidebarRowKind::Session);
+        assert_eq!(rows[2].depth, 2);
     }
 
     #[test]
@@ -534,6 +854,7 @@ mod tests {
                 id: "project_project".to_string(),
                 label: "vibex".to_string(),
             }],
+            workspaces: &[],
             sessions: &sessions,
             selected_session_id: None,
             query: "",
@@ -638,6 +959,7 @@ mod tests {
         let rows = sidebar_rows(SidebarRowInput {
             view: &view,
             projects: &projects,
+            workspaces: &[],
             sessions: &[],
             selected_session_id: None,
             query: "",
@@ -658,6 +980,7 @@ mod tests {
         let rows = sidebar_rows(SidebarRowInput {
             view: &repaired,
             projects: &projects,
+            workspaces: &[],
             sessions: &[],
             selected_session_id: None,
             query: "",
@@ -704,6 +1027,7 @@ mod tests {
                 id: "project_project".to_string(),
                 label: "vibex".to_string(),
             }],
+            workspaces: &[],
             sessions: &sessions,
             selected_session_id: None,
             query: "",
