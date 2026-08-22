@@ -21705,9 +21705,13 @@ impl VibexWorkbench {
                             })
                             .when(pinned, |this| {
                                 this.child(
-                                    sidebar_icon("icons/vibex/pin.svg")
-                                        .size(px(14.0))
-                                        .text_color(cx.theme().warning),
+                                    div()
+                                        .group_hover(&hover_group, |style| style.invisible())
+                                        .child(
+                                            sidebar_icon("icons/vibex/pin.svg")
+                                                .size(px(14.0))
+                                                .text_color(cx.theme().warning),
+                                        ),
                                 )
                             })
                             .when(
@@ -21804,7 +21808,12 @@ impl VibexWorkbench {
                                 .compact()
                                 .w(px(24.0))
                                 .h(px(24.0))
-                                .icon(sidebar_icon("icons/vibex/pin.svg"))
+                                .icon(if pinned {
+                                    sidebar_icon("icons/vibex/pin.svg")
+                                        .text_color(cx.theme().warning)
+                                } else {
+                                    sidebar_icon("icons/vibex/pin.svg")
+                                })
                                 .tooltip(pin_label)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.toggle_session_pin(&pin_session_id, cx)
@@ -45593,6 +45602,10 @@ mod tests {
         assert!(sidebar_session.contains("!session_needs_approval && !session_generating"));
         assert!(sidebar_session.contains(".when(pinned, |this|"));
         assert!(sidebar_session.contains("icons/vibex/pin.svg"));
+        assert!(sidebar_session.contains(".icon(if pinned {"));
+        assert!(sidebar_session.contains(
+            "div()\n                                        .group_hover(&hover_group, |style| style.invisible())"
+        ));
         assert!(sidebar_session.contains(".when(!self.sidebar_batch_mode && !pinned, |this|"));
         assert!(sidebar_session.contains("Icon::new(IconName::TriangleAlert)"));
         assert!(!sidebar_session.contains("sidebar-session-error-{session_id_string}"));
