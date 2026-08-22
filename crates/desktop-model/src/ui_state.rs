@@ -108,10 +108,26 @@ pub enum SidebarProjectLogo {
     Hash,
     Book,
     Sparkles,
+    Folder,
+    Briefcase,
+    Box,
+    Globe,
+    Server,
+    Cpu,
+    Layers,
+    Braces,
+    Rocket,
+    Wrench,
+    Gift,
+    Chart,
+    Palette,
+    Gauge,
+    Workflow,
+    Package,
 }
 
 impl SidebarProjectLogo {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 24] = [
         Self::Boxes,
         Self::Code,
         Self::Terminal,
@@ -120,6 +136,22 @@ impl SidebarProjectLogo {
         Self::Hash,
         Self::Book,
         Self::Sparkles,
+        Self::Folder,
+        Self::Briefcase,
+        Self::Box,
+        Self::Globe,
+        Self::Server,
+        Self::Cpu,
+        Self::Layers,
+        Self::Braces,
+        Self::Rocket,
+        Self::Wrench,
+        Self::Gift,
+        Self::Chart,
+        Self::Palette,
+        Self::Gauge,
+        Self::Workflow,
+        Self::Package,
     ];
 }
 

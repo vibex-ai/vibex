@@ -20313,7 +20313,13 @@ impl VibexWorkbench {
                             .text_color(cx.theme().muted_foreground)
                             .child(locale::text("Logo", "图标", "圖示")),
                     )
-                    .child(h_flex().gap_1().children(logo_buttons)),
+                    .child(
+                        h_flex()
+                            .w(px(240.0))
+                            .flex_wrap()
+                            .gap_1()
+                            .children(logo_buttons),
+                    ),
             )
             .child(
                 h_flex()
@@ -35937,6 +35943,22 @@ fn sidebar_project_logo_icon(logo: SidebarProjectLogo) -> Icon {
         SidebarProjectLogo::Hash => "icons/vibex/hash.svg",
         SidebarProjectLogo::Book => "icons/vibex/book-open-text.svg",
         SidebarProjectLogo::Sparkles => "icons/vibex/sparkles.svg",
+        SidebarProjectLogo::Folder => "icons/vibex/folder.svg",
+        SidebarProjectLogo::Briefcase => "icons/vibex/briefcase.svg",
+        SidebarProjectLogo::Box => "icons/vibex/box.svg",
+        SidebarProjectLogo::Globe => "icons/vibex/globe.svg",
+        SidebarProjectLogo::Server => "icons/vibex/server.svg",
+        SidebarProjectLogo::Cpu => "icons/vibex/cpu.svg",
+        SidebarProjectLogo::Layers => "icons/vibex/layers.svg",
+        SidebarProjectLogo::Braces => "icons/vibex/braces.svg",
+        SidebarProjectLogo::Rocket => "icons/vibex/rocket.svg",
+        SidebarProjectLogo::Wrench => "icons/vibex/wrench.svg",
+        SidebarProjectLogo::Gift => "icons/vibex/gift.svg",
+        SidebarProjectLogo::Chart => "icons/vibex/chart-column.svg",
+        SidebarProjectLogo::Palette => "icons/vibex/palette.svg",
+        SidebarProjectLogo::Gauge => "icons/vibex/gauge.svg",
+        SidebarProjectLogo::Workflow => "icons/vibex/workflow.svg",
+        SidebarProjectLogo::Package => "icons/vibex/package.svg",
     })
 }
 
@@ -36102,6 +36124,22 @@ fn sidebar_project_logo_label(logo: SidebarProjectLogo) -> &'static str {
         SidebarProjectLogo::Hash => locale::text("Hash", "井号", "井號"),
         SidebarProjectLogo::Book => locale::text("Book", "文档", "文件"),
         SidebarProjectLogo::Sparkles => locale::text("Sparkles", "闪光", "閃光"),
+        SidebarProjectLogo::Folder => locale::text("Folder", "文件夹", "資料夾"),
+        SidebarProjectLogo::Briefcase => locale::text("Briefcase", "公文包", "公事包"),
+        SidebarProjectLogo::Box => locale::text("Box", "盒子", "盒子"),
+        SidebarProjectLogo::Globe => locale::text("Globe", "地球", "地球"),
+        SidebarProjectLogo::Server => locale::text("Server", "服务器", "伺服器"),
+        SidebarProjectLogo::Cpu => locale::text("CPU", "处理器", "處理器"),
+        SidebarProjectLogo::Layers => locale::text("Layers", "图层", "圖層"),
+        SidebarProjectLogo::Braces => locale::text("Braces", "代码括号", "程式括號"),
+        SidebarProjectLogo::Rocket => locale::text("Rocket", "火箭", "火箭"),
+        SidebarProjectLogo::Wrench => locale::text("Wrench", "工具", "工具"),
+        SidebarProjectLogo::Gift => locale::text("Gift", "礼物", "禮物"),
+        SidebarProjectLogo::Chart => locale::text("Chart", "图表", "圖表"),
+        SidebarProjectLogo::Palette => locale::text("Palette", "调色板", "調色盤"),
+        SidebarProjectLogo::Gauge => locale::text("Gauge", "仪表盘", "儀表板"),
+        SidebarProjectLogo::Workflow => locale::text("Workflow", "工作流", "工作流程"),
+        SidebarProjectLogo::Package => locale::text("Package", "软件包", "套件"),
     }
 }
 
@@ -43847,6 +43885,7 @@ mod tests {
         assert!(picker.contains("Popover::new(format!(\"sidebar-project-logo-popover-"));
         assert!(picker.contains(".anchor(Anchor::TopLeft)"));
         assert!(picker.contains("for logo in SidebarProjectLogo::ALL"));
+        assert!(picker.contains(".flex_wrap()"));
         assert!(picker.contains("for color in SidebarProjectLogoColor::ALL"));
         assert!(picker.contains("this.set_sidebar_project_logo("));
         assert!(picker.contains("this.set_sidebar_project_logo_color("));
@@ -43865,6 +43904,18 @@ mod tests {
         assert!(project.contains("render_sidebar_project_appearance_popover("));
         assert!(menu.contains("Customize Logo"));
         assert!(menu.contains("set_sidebar_project_appearance_popover("));
+    }
+
+    #[test]
+    fn sidebar_project_logo_catalog_includes_the_extended_builtin_set() {
+        assert_eq!(SidebarProjectLogo::ALL.len(), 24);
+        for logo in SidebarProjectLogo::ALL {
+            assert!(!sidebar_project_logo_label(logo).is_empty());
+            let _ = sidebar_project_logo_icon(logo);
+        }
+        assert!(SidebarProjectLogo::ALL.contains(&SidebarProjectLogo::Folder));
+        assert!(SidebarProjectLogo::ALL.contains(&SidebarProjectLogo::Workflow));
+        assert!(SidebarProjectLogo::ALL.contains(&SidebarProjectLogo::Package));
     }
 
     #[test]

@@ -368,6 +368,25 @@ macro_rules! bundled_icon_asset {
     };
 }
 
+const PROJECT_LOGO_ASSETS: &[(&str, &[u8])] = &[
+    bundled_icon_asset!("folder.svg"),
+    bundled_icon_asset!("briefcase.svg"),
+    bundled_icon_asset!("box.svg"),
+    bundled_icon_asset!("globe.svg"),
+    bundled_icon_asset!("server.svg"),
+    bundled_icon_asset!("cpu.svg"),
+    bundled_icon_asset!("layers.svg"),
+    bundled_icon_asset!("braces.svg"),
+    bundled_icon_asset!("rocket.svg"),
+    bundled_icon_asset!("wrench.svg"),
+    bundled_icon_asset!("gift.svg"),
+    bundled_icon_asset!("chart-column.svg"),
+    bundled_icon_asset!("palette.svg"),
+    bundled_icon_asset!("gauge.svg"),
+    bundled_icon_asset!("workflow.svg"),
+    bundled_icon_asset!("package.svg"),
+];
+
 const FILE_INTEGRATION_ASSETS: &[(&str, &[u8])] = &[
     bundled_icon_asset!("audio-lines.svg"),
     bundled_icon_asset!("clipboard-paste.svg"),
@@ -807,6 +826,7 @@ impl AssetSource for VibexAssets {
     fn load(&self, path: &str) -> GpuiResult<Option<Cow<'static, [u8]>>> {
         if let Some((_, bytes)) = VIBEX_ASSETS
             .iter()
+            .chain(PROJECT_LOGO_ASSETS.iter())
             .chain(FILE_INTEGRATION_ASSETS.iter())
             .chain(AGENT_BRAND_ASSETS.iter())
             .find(|(asset_path, _)| *asset_path == path)
@@ -821,6 +841,7 @@ impl AssetSource for VibexAssets {
         assets.extend(
             VIBEX_ASSETS
                 .iter()
+                .chain(PROJECT_LOGO_ASSETS.iter())
                 .chain(FILE_INTEGRATION_ASSETS.iter())
                 .chain(AGENT_BRAND_ASSETS.iter())
                 .filter(|(asset_path, _)| asset_path.starts_with(path))
@@ -980,6 +1001,15 @@ mod tests {
                     entry.id
                 );
             }
+        }
+    }
+
+    #[test]
+    fn every_builtin_project_logo_asset_is_embedded() {
+        let assets = VibexAssets;
+        for (path, bytes) in PROJECT_LOGO_ASSETS {
+            assert!(assets.load(path).unwrap().is_some(), "{path}");
+            assert!(bytes.starts_with(b"<svg"), "{path} should be an SVG");
         }
     }
 
