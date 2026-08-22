@@ -10578,41 +10578,43 @@ impl CodeRightRail {
                                     .h(px(32.0))
                                     .label(commit_type)
                                     .dropdown_caret(true)
-                                    .dropdown_menu(move |mut menu, _, _| {
-                                        for candidate in GIT_COMMIT_TYPES {
-                                            let workbench = type_workbench.clone();
-                                            let value = candidate.to_string();
-                                            let checked = active_type == candidate;
-                                            menu = menu.item(
-                                                PopupMenuItem::new(candidate)
-                                                    .checked(checked)
-                                                    .on_click(move |_, window, cx| {
-                                                        let value = value.clone();
-                                                        let placeholder =
-                                                            git_commit_placeholder(&value);
-                                                        let _ = workbench.update(
-                                                            cx,
-                                                            |workbench, cx| {
-                                                                workbench.commit_type =
-                                                                    value.clone();
-                                                                workbench.commit_message.update(
-                                                                    cx,
-                                                                    |input, cx| {
-                                                                        input.set_placeholder(
-                                                                            placeholder,
-                                                                            window,
-                                                                            cx,
-                                                                        )
-                                                                    },
-                                                                );
-                                                                cx.notify();
-                                                            },
-                                                        );
-                                                    }),
-                                            );
-                                        }
-                                        menu
-                                    }),
+                                    .dropdown_menu_with_anchor(
+                                        Anchor::BottomLeft,
+                                        move |mut menu, _, _| {
+                                            for candidate in GIT_COMMIT_TYPES {
+                                                let workbench = type_workbench.clone();
+                                                let value = candidate.to_string();
+                                                let checked = active_type == candidate;
+                                                menu = menu.item(
+                                                    PopupMenuItem::new(candidate)
+                                                        .checked(checked)
+                                                        .on_click(move |_, window, cx| {
+                                                            let value = value.clone();
+                                                            let placeholder =
+                                                                git_commit_placeholder(&value);
+                                                            let _ = workbench.update(
+                                                                cx,
+                                                                |workbench, cx| {
+                                                                    workbench.commit_type =
+                                                                        value.clone();
+                                                                    workbench
+                                                                        .commit_message
+                                                                        .update(cx, |input, cx| {
+                                                                            input.set_placeholder(
+                                                                                placeholder,
+                                                                                window,
+                                                                                cx,
+                                                                            )
+                                                                        });
+                                                                    cx.notify();
+                                                                },
+                                                            );
+                                                        }),
+                                                );
+                                            }
+                                            menu
+                                        },
+                                    ),
                             )
                             .child(
                                 Button::new("toggle-amend")
@@ -14270,6 +14272,7 @@ mod tests {
             .expect("Git changes toolbar should remain inspectable");
 
         assert!(!changes.contains("show-git-history"));
+        assert!(changes.contains(".dropdown_menu_with_anchor(\n                                        Anchor::BottomLeft,"));
         assert!(changes.contains("Anchor::BottomRight"));
         assert!(changes.contains("DropdownButton::new(\"commit-actions\")"));
         assert!(changes.contains(".with_size(Size::Size(px(36.0)))"));
