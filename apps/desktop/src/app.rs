@@ -20958,17 +20958,17 @@ impl VibexWorkbench {
         } else {
             cx.theme().sidebar_foreground.opacity(0.72)
         };
-        let card_background = if selected {
-            cx.theme().sidebar_accent.opacity(0.16)
+        let card_background = if !collapsed {
+            cx.theme()
+                .sidebar_accent
+                .opacity(if selected { 0.22 } else { 0.14 })
         } else {
             cx.theme().transparent
         };
-        let row_background = if selected {
+        let row_background = if collapsed && selected {
             cx.theme().sidebar_accent.opacity(0.25)
-        } else if collapsed || !selected {
-            cx.theme().transparent
         } else {
-            cx.theme().background.opacity(0.14)
+            cx.theme().transparent
         };
         let lifecycle_error = lifecycle_state.is_some_and(|state| {
             matches!(
@@ -49128,10 +49128,9 @@ mod tests {
 
         assert!(collapsed_guard < session_render);
         assert!(workspace.contains("return row.into_any_element();"));
-        assert!(
-            workspace
-                .contains("} else if collapsed || !selected {\n            cx.theme().transparent")
-        );
+        assert!(workspace.contains("let card_background = if !collapsed"));
+        assert!(workspace.contains(".opacity(if selected { 0.22 } else { 0.14 })"));
+        assert!(workspace.contains("let row_background = if collapsed && selected"));
         assert!(workspace.contains(".bg(row_background)"));
         assert!(workspace.contains(".bg(card_background)"));
         assert!(workspace.contains(".left(px(workspace_offset))"));
