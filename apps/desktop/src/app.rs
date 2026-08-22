@@ -324,7 +324,7 @@ const COMPOSER_PLAN_TOOLTIP_MAX_HEIGHT: f32 = 420.0;
 const COMPOSER_PLAN_EXPANDED_MAX_HEIGHT: f32 = 320.0;
 const COMPOSER_PLAN_TOOLTIP_DELAY: Duration = Duration::from_secs(2);
 const COMPOSER_SURFACE_MIN_HEIGHT: f32 = 112.0;
-const ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT: f32 = 64.0;
+const ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT: f32 = 80.0;
 const COMPOSER_SURFACE_RADIUS: f32 = 20.0;
 const COMPOSER_RUNTIME_MENU_WIDTH: f32 = 320.0;
 const COMPOSER_RUNTIME_MENU_MAX_HEIGHT: f32 = 448.0;
@@ -340,7 +340,7 @@ const NEW_SESSION_RUNTIME_MENU_MIN_HEIGHT: f32 = 104.0;
 const RUNTIME_MENU_VIEWPORT_MARGIN: f32 = 12.0;
 const RUNTIME_MENU_TRIGGER_GAP: f32 = 4.0;
 const COMPOSER_RUNTIME_CHOICE_ROW_HEIGHT: f32 = 36.0;
-const COMPOSER_RUNTIME_AGENT_MENU_CHROME_HEIGHT: f32 = 49.0;
+const COMPOSER_RUNTIME_AGENT_MENU_CHROME_HEIGHT: f32 = 94.0;
 const COMPOSER_RUNTIME_PROFILE_MENU_CHROME_HEIGHT: f32 = 53.0;
 const COMPOSER_RUNTIME_MODEL_MENU_CHROME_HEIGHT: f32 = 55.0;
 const COMPOSER_RUNTIME_AGENT_PROFILE_ROW_HEIGHT: f32 = 40.0;
@@ -23652,6 +23652,7 @@ impl VibexWorkbench {
                                     | RuntimeAuthSourceAvailability::Verifying
                                     | RuntimeAuthSourceAvailability::DiscoveringModels
                             );
+                        let source_meta_action = can_open_models || can_open_authentication;
                         let model_auth_source = auth_source.clone();
                         let authentication_auth_source = auth_source.clone();
                         let authentication_agent_id = source_agent_id.clone();
@@ -23690,22 +23691,32 @@ impl VibexWorkbench {
                                         .flex_1()
                                         .truncate()
                                         .text_sm()
-                                        .child(source.label),
+                                        .child(runtime_auth_source_display_label(&source)),
                                 )
                                 .child(
-                                    div()
+                                    h_flex()
+                                        .w(px(80.0))
                                         .flex_none()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(status_label),
-                                )
-                                .when(can_open_models || can_open_authentication, |this| {
-                                    this.child(
-                                        Icon::new(IconName::ChevronRight)
-                                            .size(px(14.0))
-                                            .text_color(cx.theme().muted_foreground),
-                                    )
-                                }),
+                                        .justify_start()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(status_label),
+                                        )
+                                        .child(div().size(px(14.0)).flex_none().when(
+                                            source_meta_action,
+                                            |this| {
+                                                this.child(
+                                                    Icon::new(IconName::ChevronRight)
+                                                        .size(px(14.0))
+                                                        .text_color(cx.theme().muted_foreground),
+                                                )
+                                            },
+                                        )),
+                                ),
                         )
                         .when(can_open_models, |button| {
                             button.on_click(cx.listener(move |this, _, _, cx| {
@@ -26081,7 +26092,12 @@ impl VibexWorkbench {
                 .map(|option| {
                     format!(
                         "{} / {} / {}",
-                        option.agent_label, option.auth_source_label, option.model_label
+                        option.agent_label,
+                        runtime_auth_source_selection_label(
+                            &selection.auth_source,
+                            &option.auth_source_label,
+                        ),
+                        option.model_label
                     )
                 })
                 .unwrap_or_else(|| {
@@ -26396,6 +26412,8 @@ impl VibexWorkbench {
         };
         let menu_content = match self.composer_runtime_menu_view {
             ComposerRuntimeMenuView::Agent => {
+                let edit_agent_id = menu_agent_id.clone();
+                let edit_label = locale::text("Edit Agent", "编辑 Agent", "編輯 Agent");
                 let rows = agent_choices
                     .into_iter()
                     .map(|agent| {
@@ -26472,6 +26490,21 @@ impl VibexWorkbench {
                             })
                             .children(rows),
                     )
+                    .child(separator())
+                    .child(
+                        h_flex().w_full().flex_none().p_1().child(
+                            Button::new("composer-runtime-edit-agent")
+                                .small()
+                                .ghost()
+                                .w_full()
+                                .justify_start()
+                                .icon(IconName::Settings)
+                                .label(edit_label)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_agent_auth_management(edit_agent_id.clone(), cx)
+                                })),
+                        ),
+                    )
                     .into_any_element()
             }
             ComposerRuntimeMenuView::AuthSource => {
@@ -26498,6 +26531,7 @@ impl VibexWorkbench {
                                     | RuntimeAuthSourceAvailability::Verifying
                                     | RuntimeAuthSourceAvailability::DiscoveringModels
                             );
+                        let source_meta_action = can_open_models || can_open_authentication;
                         let model_agent_id = agent_id.clone();
                         let model_auth_source = auth_source.clone();
                         let authentication_agent_id = agent_id.clone();
@@ -26537,22 +26571,32 @@ impl VibexWorkbench {
                                         .flex_1()
                                         .truncate()
                                         .text_sm()
-                                        .child(source.label),
+                                        .child(runtime_auth_source_display_label(&source)),
                                 )
                                 .child(
-                                    div()
+                                    h_flex()
+                                        .w(px(80.0))
                                         .flex_none()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(status_label),
-                                )
-                                .when(can_open_models || can_open_authentication, |this| {
-                                    this.child(
-                                        Icon::new(IconName::ChevronRight)
-                                            .size(px(14.0))
-                                            .text_color(cx.theme().muted_foreground),
-                                    )
-                                }),
+                                        .justify_start()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(status_label),
+                                        )
+                                        .child(div().size(px(14.0)).flex_none().when(
+                                            source_meta_action,
+                                            |this| {
+                                                this.child(
+                                                    Icon::new(IconName::ChevronRight)
+                                                        .size(px(14.0))
+                                                        .text_color(cx.theme().muted_foreground),
+                                                )
+                                            },
+                                        )),
+                                ),
                         )
                         .when(can_open_models, |button| {
                             button.on_click(cx.listener(move |this, _, _, cx| {
@@ -37663,8 +37707,26 @@ fn runtime_auth_source_label(
         .auth_sources
         .iter()
         .find(|summary| &summary.source == auth_source)
-        .map(|summary| summary.label.clone())
+        .map(runtime_auth_source_display_label)
         .unwrap_or_else(|| auth_source.id().to_string())
+}
+
+fn runtime_auth_source_display_label(source: &RuntimeAuthSourceSummary) -> String {
+    match source.kind {
+        RuntimeAuthSourceKind::AgentAccount => {
+            locale::text("Agent account", "Agent 账户", "Agent 帳戶").to_string()
+        }
+        RuntimeAuthSourceKind::ProviderProfile => source.label.clone(),
+    }
+}
+
+fn runtime_auth_source_selection_label(auth_source: &RuntimeAuthSource, fallback: &str) -> String {
+    match auth_source {
+        RuntimeAuthSource::AgentAccount { .. } => {
+            locale::text("Agent account", "Agent 账户", "Agent 帳戶").to_string()
+        }
+        RuntimeAuthSource::ProviderProfile { .. } => fallback.to_string(),
+    }
 }
 
 fn runtime_provider_model_label(
@@ -37672,7 +37734,16 @@ fn runtime_provider_model_label(
     selection: &SessionRuntimeSelection,
 ) -> String {
     option
-        .map(|option| format!("{} / {}", option.auth_source_label, option.model_label))
+        .map(|option| {
+            format!(
+                "{} / {}",
+                runtime_auth_source_selection_label(
+                    &selection.auth_source,
+                    &option.auth_source_label,
+                ),
+                option.model_label
+            )
+        })
         .unwrap_or_else(|| {
             format!(
                 "{} / {}",
@@ -47943,7 +48014,7 @@ mod tests {
             728.0
         );
         assert_eq!(COMPOSER_SURFACE_MIN_HEIGHT, 112.0);
-        assert_eq!(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT, 64.0);
+        assert_eq!(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT, 80.0);
         assert_eq!(COMPOSER_QUEUE_HEADER_HEIGHT, 36.0);
         assert_eq!(COMPOSER_QUEUE_ROW_HEIGHT, 28.0);
         assert_eq!(COMPOSER_SURFACE_RADIUS, 20.0);
