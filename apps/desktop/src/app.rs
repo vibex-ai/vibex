@@ -33022,13 +33022,6 @@ impl VibexWorkbench {
                                             .flex_none()
                                             .items_center()
                                             .gap_1()
-                                            .child(runtime_controls_cascade),
-                                    )
-                                    .child(
-                                        h_flex()
-                                            .flex_none()
-                                            .items_center()
-                                            .gap_1()
                                             .child(button_with_aria_label(
                                                 Button::new("open-session-usage")
                                                     .ghost()
@@ -33049,6 +33042,13 @@ impl VibexWorkbench {
                                                     "開啟用量統計",
                                                 ),
                                             ))
+                                            .child(runtime_controls_cascade),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .flex_none()
+                                            .items_center()
+                                            .gap_1()
                                             .child(primary_action),
                                     ),
                             ),
@@ -47915,11 +47915,19 @@ mod tests {
         let cascade_runtime_controls = composer
             .find("composer-runtime-controls-cascade")
             .expect("composer cascade should stay beside the submit control");
+        let token_usage = composer
+            .find("open-session-usage")
+            .expect("composer token usage control should be present");
+        let cascade_content = composer
+            .find(".child(runtime_controls_cascade)")
+            .expect("composer cascade content should be present");
         let submit = composer
             .find(".child(primary_action)")
             .expect("composer submit control should remain present");
         assert!(attachment < other_runtime_controls);
         assert!(other_runtime_controls < cascade_runtime_controls);
+        assert!(cascade_runtime_controls < token_usage);
+        assert!(token_usage < cascade_content);
         assert!(cascade_runtime_controls < submit);
         let composer_effort = composer
             .find("Thinking depth")
