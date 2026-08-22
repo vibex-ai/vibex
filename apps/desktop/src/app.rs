@@ -17,14 +17,14 @@ use gpui::{
     AccessibleAction, Anchor, Animation, AnimationExt as _, AnyElement, AnyWindowHandle, App,
     Bounds, ClickEvent, ClipboardEntry, ClipboardItem, Context, Decorations, DragMoveEvent,
     ElementId, Empty, Entity, EntityInputHandler, ExternalPaths, FocusHandle, Focusable as _,
-    FontWeight, HighlightStyle, Hsla, Image, ImageFormat, IntoElement, KeyBinding, KeyDownEvent,
-    Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, Orientation,
-    ParentElement as _, PathBuilder, Pixels, Render, Rgba, Role, ScrollDelta, ScrollStrategy,
-    ScrollWheelEvent, SharedString, Size, StatefulInteractiveElement as _, StyleRefinement,
-    Styled as _, StyledImage as _, StyledText, Subscription, Task, Unbind, WeakEntity, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowDecorations, WindowOptions,
-    canvas, div, img, linear_color_stop, linear_gradient, point, prelude::*, px, relative, rgb,
-    size,
+    FontWeight, Global, HighlightStyle, Hsla, Image, ImageFormat, IntoElement, KeyBinding,
+    KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, Orientation,
+    ParentElement as _, PathBuilder, Pixels, Render, Rgba, Role, ScrollAnchor, ScrollDelta,
+    ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, Size,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _, StyledText,
+    Subscription, Task, Unbind, WeakEntity, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea, WindowDecorations, WindowOptions, canvas, div, img, linear_color_stop,
+    linear_gradient, point, prelude::*, px, relative, rgb, size,
 };
 use gpui_component::{
     ActiveTheme as _, Colorize as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath,
@@ -19275,6 +19275,20 @@ impl VibexWorkbench {
         self.settings_snapshot = Some(self.ui_state.clone());
         self.settings_view.update(cx, |settings, cx| {
             settings.active_section = SettingsSection::General;
+            settings
+                .settings_render_context
+                .target_title
+                .borrow_mut()
+                .take();
+            settings
+                .settings_render_context
+                .target_anchor
+                .borrow_mut()
+                .take();
+            settings
+                .settings_render_context
+                .scroll
+                .set_offset(point(px(0.0), px(0.0)));
             cx.notify();
         });
         self.settings_open = true;
@@ -39159,6 +39173,33 @@ enum SettingsSection {
     About,
 }
 
+#[derive(Clone, Copy)]
+struct SettingsSearchCandidate {
+    section: SettingsSection,
+    title: &'static str,
+    description: &'static str,
+    keywords: &'static [&'static str],
+}
+
+#[derive(Clone)]
+struct SettingsRenderContext {
+    scroll: ScrollHandle,
+    target_title: Rc<RefCell<Option<String>>>,
+    target_anchor: Rc<RefCell<Option<ScrollAnchor>>>,
+}
+
+impl Global for SettingsRenderContext {}
+
+impl SettingsRenderContext {
+    fn new() -> Self {
+        Self {
+            scroll: ScrollHandle::new(),
+            target_title: Rc::new(RefCell::new(None)),
+            target_anchor: Rc::new(RefCell::new(None)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NotificationKind {
     Completed,
@@ -39404,6 +39445,556 @@ fn settings_section_for_query(query: &str) -> Option<SettingsSection> {
     }
 }
 
+const fn settings_search_candidate(
+    section: SettingsSection,
+    title: &'static str,
+    description: &'static str,
+    keywords: &'static [&'static str],
+) -> SettingsSearchCandidate {
+    SettingsSearchCandidate {
+        section,
+        title,
+        description,
+        keywords,
+    }
+}
+
+fn settings_search_candidates(strings: Strings) -> Vec<SettingsSearchCandidate> {
+    let mut candidates = vec![
+        settings_search_candidate(
+            SettingsSection::General,
+            strings.language,
+            strings.language_description,
+            &["language", "locale", "语言", "語言"],
+        ),
+        settings_search_candidate(
+            SettingsSection::General,
+            strings.close_to_tray,
+            strings.close_to_tray_description,
+            &["tray", "close", "托盘", "托盤"],
+        ),
+        settings_search_candidate(
+            SettingsSection::General,
+            locale::text("Startup", "启动行为", "啟動行為"),
+            locale::text(
+                "Choose what opens after the local runtime is ready.",
+                "选择本地运行时就绪后的打开内容。",
+                "選擇本機執行階段就緒後要開啟的內容。",
+            ),
+            &["startup", "restore", "new session", "启动", "啟動"],
+        ),
+        settings_search_candidate(
+            SettingsSection::General,
+            locale::text("Launch at login", "开机启动", "登入時啟動"),
+            locale::text(
+                "Start Vibex when you sign in.",
+                "登录系统时启动 Vibex。",
+                "登入系統時啟動 Vibex。",
+            ),
+            &["login", "launch", "开机", "登入"],
+        ),
+        settings_search_candidate(
+            SettingsSection::General,
+            locale::text("System notifications", "系统通知", "系統通知"),
+            locale::text(
+                "Show desktop notifications for Agent activity.",
+                "显示 Agent 活动的桌面通知。",
+                "顯示 Agent 活動的桌面通知。",
+            ),
+            &["notification", "通知", "desktop"],
+        ),
+        settings_search_candidate(
+            SettingsSection::General,
+            locale::text("Update prompts", "更新提示", "更新提示"),
+            locale::text(
+                "Show update notices and the title-bar update button.",
+                "显示更新提示和标题栏更新按钮。",
+                "顯示更新提示與標題列更新按鈕。",
+            ),
+            &["update", "release", "更新", "版本"],
+        ),
+        settings_search_candidate(
+            SettingsSection::General,
+            locale::text("Agent completed", "Agent 完成", "Agent 完成"),
+            locale::text(
+                "Notify when an Agent turn completes.",
+                "Agent 回合完成时通知。",
+                "Agent 回合完成時通知。",
+            ),
+            &["completed", "finish", "完成"],
+        ),
+        settings_search_candidate(
+            SettingsSection::General,
+            locale::text("Agent needs input", "Agent 需要输入", "Agent 需要輸入"),
+            locale::text(
+                "Notify when an Agent is waiting for input.",
+                "Agent 等待输入时通知。",
+                "Agent 等待輸入時通知。",
+            ),
+            &["needs input", "waiting", "需要输入", "需要輸入"],
+        ),
+        settings_search_candidate(
+            SettingsSection::General,
+            locale::text("Agent failed", "Agent 失败", "Agent 失敗"),
+            locale::text(
+                "Notify when an Agent turn fails.",
+                "Agent 回合失败时通知。",
+                "Agent 回合失敗時通知。",
+            ),
+            &["failed", "error", "失败", "失敗"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Appearance,
+            strings.theme,
+            strings.theme_description,
+            &["theme", "dark", "light", "主题", "主題"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Appearance,
+            strings.interface_font,
+            strings.interface_font_description,
+            &["font", "interface", "ui", "字体", "字體"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Appearance,
+            strings.interface_font_size,
+            strings.interface_font_size_description,
+            &["font size", "interface size", "字号", "字號"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Appearance,
+            strings.interface_font_weight,
+            strings.interface_font_weight_description,
+            &["font weight", "interface weight", "字重"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Appearance,
+            strings.code_font,
+            strings.code_font_description,
+            &["code font", "editor font", "代码字体", "程式碼字體"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Appearance,
+            strings.code_font_size,
+            strings.code_font_size_description,
+            &["code font size", "editor size", "代码字号", "程式碼字號"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Appearance,
+            strings.code_font_weight,
+            strings.code_font_weight_description,
+            &[
+                "code font weight",
+                "editor weight",
+                "代码字重",
+                "程式碼字重",
+            ],
+        ),
+        settings_search_candidate(
+            SettingsSection::Appearance,
+            locale::text("Reduced motion", "减少动效", "減少動效"),
+            locale::text(
+                "Reduce non-essential interface animation.",
+                "减少非必要界面动画。",
+                "減少非必要介面動畫。",
+            ),
+            &["motion", "animation", "动效", "動效"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Appearance,
+            locale::text("High contrast", "高对比度", "高對比度"),
+            locale::text(
+                "Increase borders and focus contrast.",
+                "提高边框和焦点对比度。",
+                "提高邊框與焦點對比度。",
+            ),
+            &["contrast", "accessibility", "对比度", "對比度"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Session,
+            strings.session_turn_preview_rail,
+            strings.session_turn_preview_rail_description,
+            &["session", "preview", "rail", "会话", "會話"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Session,
+            strings.session_content_width,
+            strings.session_content_width_description,
+            &["content width", "conversation width", "宽度", "寬度"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Session,
+            strings.enhanced_command_execution_display,
+            strings.enhanced_command_execution_display_description,
+            &["command", "execution", "tool", "命令", "指令"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Session,
+            strings.enhanced_file_operation_display,
+            strings.enhanced_file_operation_display_description,
+            &["file operation", "file", "文件", "檔案"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Session,
+            locale::text("Queue sending", "队列发送", "佇列傳送"),
+            locale::text(
+                "Choose the default behavior while an Agent is running.",
+                "选择 Agent 运行时的默认队列行为。",
+                "選擇 Agent 執行時的預設佇列行為。",
+            ),
+            &["queue", "sending", "队列", "佇列"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Session,
+            locale::text("Message send key", "消息发送按键", "訊息傳送按鍵"),
+            locale::text(
+                "Choose whether Enter or Cmd/Ctrl+Enter sends a message.",
+                "选择 Enter 或 Cmd/Ctrl+Enter 发送消息。",
+                "選擇 Enter 或 Cmd/Ctrl+Enter 傳送訊息。",
+            ),
+            &["enter", "send key", "message", "消息", "訊息"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Session,
+            locale::text("Auto-continue", "自动继续", "自動繼續"),
+            locale::text(
+                "Apply auto-continue to the selected session.",
+                "为当前选中的会话启用自动继续。",
+                "為目前選取的會話啟用自動繼續。",
+            ),
+            &["auto continue", "continue", "自动继续", "自動繼續"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Session,
+            locale::text("Remembered runtime", "已记住的运行时", "已記住的執行階段"),
+            locale::text(
+                "Clear remembered runtime selections used by new sessions.",
+                "清除新会话使用的已记住运行时选择。",
+                "清除新會話使用的已記住執行階段選擇。",
+            ),
+            &["runtime", "remembered", "运行时", "執行階段"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Session,
+            locale::text("Auto-continue defaults", "自动继续默认项", "自動繼續預設項"),
+            locale::text(
+                "Clear project and session auto-continue overrides.",
+                "清除项目和会话的自动继续覆盖项。",
+                "清除專案與會話的自動繼續覆寫項。",
+            ),
+            &["auto continue", "defaults", "overrides", "默认", "預設"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Session,
+            locale::text("Agent configuration", "Agent 配置", "Agent 設定"),
+            locale::text(
+                "Credentials, providers, MCP, Skills and hooks stay in the Management Center.",
+                "凭据、供应商、MCP、Skills 和 Hooks 仍由管理中心负责。",
+                "憑證、供應商、MCP、Skills 與 Hooks 仍由管理中心負責。",
+            ),
+            &[
+                "agent",
+                "provider",
+                "credentials",
+                "mcp",
+                "skills",
+                "配置",
+                "設定",
+            ],
+        ),
+        settings_search_candidate(
+            SettingsSection::Workbench,
+            locale::text("Sidebar hierarchy", "侧栏层级", "側欄層級"),
+            locale::text(
+                "Choose compact project groups or detailed workspace nesting.",
+                "选择会话视图或工作区视图。",
+                "選擇會話視圖或工作區視圖。",
+            ),
+            &["sidebar", "hierarchy", "workspace", "侧栏", "側欄"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Workbench,
+            locale::text(
+                "Default new-session location",
+                "新会话默认位置",
+                "新會話預設位置",
+            ),
+            locale::text(
+                "Used when a project has no explicit override.",
+                "项目没有覆盖项时使用。",
+                "專案沒有覆寫項時使用。",
+            ),
+            &["new session", "location", "worktree", "位置"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Workbench,
+            locale::text("Remember layout", "记住工作台布局", "記住工作台版面"),
+            locale::text(
+                "Restore panel visibility, sizes and open editor state.",
+                "恢复面板可见性、尺寸和打开的编辑器状态。",
+                "還原面板可見性、尺寸與開啟的編輯器狀態。",
+            ),
+            &["layout", "panels", "布局", "版面"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Workbench,
+            locale::text(
+                "Show Git change count",
+                "显示 Git 变更数量",
+                "顯示 Git 變更數量",
+            ),
+            locale::text(
+                "Show the number of pending changes on the Git activity button.",
+                "在 Git 活动按钮上显示待处理变更数量。",
+                "在 Git 活動按鈕上顯示待處理變更數量。",
+            ),
+            &["git", "change count", "变更", "變更"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Workbench,
+            locale::text("Project overrides", "项目覆盖项", "專案覆寫項"),
+            locale::text(
+                "Review and clear saved new-session location overrides.",
+                "查看并清除已保存的新会话位置覆盖项。",
+                "檢視並清除已儲存的新會話位置覆寫項。",
+            ),
+            &["project", "override", "项目", "專案"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Workbench,
+            locale::text("Reset workbench layout", "重置工作台布局", "重設工作台版面"),
+            locale::text(
+                "Restore default panel visibility and sizes without deleting sessions.",
+                "恢复默认面板可见性和尺寸，不删除会话。",
+                "還原預設面板可見性與尺寸，不刪除會話。",
+            ),
+            &["reset", "layout", "重置", "重設"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Terminal,
+            locale::text("Default shell", "默认 Shell", "預設 Shell"),
+            locale::text(
+                "Applied to both composer and preview terminals.",
+                "同时应用到对话和预览终端。",
+                "同時套用到對話與預覽終端機。",
+            ),
+            &["terminal", "shell", "终端", "終端機"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Terminal,
+            locale::text("Custom shell", "自定义 Shell", "自訂 Shell"),
+            locale::text(
+                "Use an executable not listed by the system.",
+                "使用系统列表中没有的可执行文件。",
+                "使用系統清單中沒有的可執行檔。",
+            ),
+            &["shell", "custom", "自定义", "自訂"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Terminal,
+            locale::text("Working directory", "工作目录", "工作目錄"),
+            locale::text(
+                "Choose the initial directory for new terminals.",
+                "选择新终端的初始目录。",
+                "選擇新終端機的初始目錄。",
+            ),
+            &["terminal", "cwd", "directory", "工作目录", "工作目錄"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Shortcuts,
+            locale::text("All shortcuts", "全部快捷键", "全部快速鍵"),
+            locale::text(
+                "Remove all custom mappings.",
+                "移除全部自定义映射。",
+                "移除全部自訂對應。",
+            ),
+            &["shortcut", "key", "快捷键", "快速鍵"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Data,
+            locale::text("Local storage", "本地存储", "本機儲存"),
+            locale::text(
+                "Database, sessions, terminal records, attachments and diagnostics.",
+                "数据库、会话、终端记录、附件和诊断文件。",
+                "資料庫、會話、終端機記錄、附件與診斷檔案。",
+            ),
+            &["data", "storage", "database", "存储", "儲存"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Data,
+            locale::text("Data directory", "数据目录", "資料目錄"),
+            locale::text(
+                "Reveal the authoritative local runtime home.",
+                "打开权威本地运行时目录。",
+                "開啟權威本機執行階段目錄。",
+            ),
+            &["data", "directory", "home", "目录", "目錄"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Data,
+            locale::text("Usage statistics", "用量统计", "用量統計"),
+            locale::text(
+                "Open the complete Usage page.",
+                "打开完整的用量统计页面。",
+                "開啟完整的用量統計頁面。",
+            ),
+            &["usage", "statistics", "用量", "統計"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Data,
+            locale::text("Diagnostics & recovery", "诊断与恢复", "診斷與復原"),
+            locale::text(
+                "Export diagnostics, create backups and recover data in Management Center.",
+                "在管理中心导出诊断、创建备份和恢复数据。",
+                "在管理中心匯出診斷、建立備份與復原資料。",
+            ),
+            &["diagnostic", "backup", "recovery", "诊断", "診斷"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Data,
+            locale::text("Reset workbench layout", "重置工作台布局", "重設工作台版面"),
+            locale::text(
+                "Does not remove projects, sessions or local data.",
+                "不会删除项目、会话或本地数据。",
+                "不會刪除專案、會話或本機資料。",
+            ),
+            &["reset", "layout", "data", "重置", "重設"],
+        ),
+        settings_search_candidate(
+            SettingsSection::About,
+            locale::text("Software update", "软件更新", "軟體更新"),
+            locale::text(
+                "Check for signed Vibex releases.",
+                "检查已签名的 Vibex 版本。",
+                "檢查已簽署的 Vibex 版本。",
+            ),
+            &["about", "update", "release", "软件", "軟體"],
+        ),
+        settings_search_candidate(
+            SettingsSection::About,
+            locale::text("Version", "版本", "版本"),
+            locale::text(
+                "Installed Vibex desktop version and release channel.",
+                "已安装的 Vibex 桌面版本和发布通道。",
+                "已安裝的 Vibex 桌面版本與發行通道。",
+            ),
+            &["version", "build", "版本", "建置"],
+        ),
+        settings_search_candidate(
+            SettingsSection::About,
+            locale::text("License", "许可证", "授權條款"),
+            "AGPL-3.0-or-later",
+            &["license", "agpl", "许可证", "授權"],
+        ),
+        settings_search_candidate(
+            SettingsSection::About,
+            locale::text("Source code", "源代码", "原始碼"),
+            locale::text(
+                "Vibex is open source.",
+                "Vibex 是开源软件。",
+                "Vibex 是開源軟體。",
+            ),
+            &["source", "github", "open source", "源代码", "原始碼"],
+        ),
+        settings_search_candidate(
+            SettingsSection::About,
+            locale::text("Platform", "平台", "平台"),
+            locale::text(
+                "Current operating system and architecture.",
+                "当前操作系统和架构。",
+                "目前作業系統與架構。",
+            ),
+            &["platform", "os", "architecture", "系统", "系統"],
+        ),
+        settings_search_candidate(
+            SettingsSection::About,
+            locale::text("Environment summary", "环境摘要", "環境摘要"),
+            locale::text(
+                "Copy a non-secret summary for support.",
+                "复制不包含密钥的支持摘要。",
+                "複製不包含密鑰的支援摘要。",
+            ),
+            &["environment", "summary", "support", "环境", "環境"],
+        ),
+        settings_search_candidate(
+            SettingsSection::About,
+            locale::text("Release notes", "发行说明", "發行說明"),
+            locale::text(
+                "Review changes for published releases.",
+                "查看已发布版本的变更。",
+                "檢視已發行版本的變更。",
+            ),
+            &["release", "notes", "changelog", "发行", "發行"],
+        ),
+    ];
+    for (action, _) in FOUNDATION_SHORTCUTS {
+        candidates.push(settings_search_candidate(
+            SettingsSection::Shortcuts,
+            shortcut_action_label(action),
+            shortcut_action_group(action),
+            &["shortcut", "key", "快捷键", "快速鍵"],
+        ));
+    }
+    candidates
+}
+
+fn settings_section_label(section: SettingsSection) -> &'static str {
+    match section {
+        SettingsSection::General => locale::text("General", "常规", "一般"),
+        SettingsSection::Appearance => locale::text("Appearance", "外观", "外觀"),
+        SettingsSection::Workbench => locale::text("Workbench", "工作台", "工作台"),
+        SettingsSection::Session => locale::text("Session", "会话", "會話"),
+        SettingsSection::Terminal => locale::text("Terminal", "终端", "終端機"),
+        SettingsSection::Shortcuts => locale::text("Shortcuts", "快捷键", "快速鍵"),
+        SettingsSection::Data => locale::text("Data & Diagnostics", "数据与诊断", "資料與診斷"),
+        SettingsSection::About => locale::text("About", "关于", "關於"),
+    }
+}
+
+fn settings_search_candidates_for_query(
+    query: &str,
+    strings: Strings,
+) -> Vec<SettingsSearchCandidate> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    settings_search_candidates(strings)
+        .into_iter()
+        .filter(|candidate| {
+            std::iter::once(candidate.title)
+                .chain(std::iter::once(candidate.description))
+                .chain(std::iter::once(settings_section_label(candidate.section)))
+                .chain(candidate.keywords.iter().copied())
+                .any(|term| {
+                    let term = term.to_lowercase();
+                    term.contains(&query) || query.contains(&term)
+                })
+        })
+        .take(8)
+        .collect()
+}
+
+fn settings_row_id(title: &str) -> String {
+    let mut id = String::from("settings-row-");
+    let mut separator = false;
+    for character in title.chars() {
+        if character.is_alphanumeric() {
+            id.push(character.to_ascii_lowercase());
+            separator = false;
+        } else if !separator {
+            id.push('-');
+            separator = true;
+        }
+    }
+    let id = id.trim_end_matches('-');
+    if id == "settings-row" {
+        "settings-row-item".to_string()
+    } else {
+        id.to_string()
+    }
+}
+
 fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
     let mut value = bytes as f64;
@@ -39500,6 +40091,7 @@ struct FoundationSettings {
     session_content_widths: Entity<SelectState<Vec<SessionContentWidthChoice>>>,
     terminal_shells: Entity<SelectState<Vec<ShellChoice>>>,
     search: Entity<InputState>,
+    settings_render_context: SettingsRenderContext,
     active_section: SettingsSection,
 }
 
@@ -39559,17 +40151,24 @@ impl FoundationSettings {
                 "搜尋設定",
             ))
         });
+        let settings_render_context = SettingsRenderContext::new();
+        cx.set_global(settings_render_context.clone());
         cx.new(|cx| {
             cx.subscribe(
                 &search,
-                |this: &mut FoundationSettings, _, event: &InputEvent, cx| {
-                    if matches!(event, InputEvent::Change) {
-                        let query = this.search.read(cx).value().trim().to_ascii_lowercase();
+                |this: &mut FoundationSettings, _, event: &InputEvent, cx| match event {
+                    InputEvent::Change => {
+                        let query = this.search.read(cx).value().trim().to_lowercase();
                         if let Some(section) = settings_section_for_query(&query) {
                             this.active_section = section;
                         }
+                        this.settings_render_context
+                            .target_title
+                            .borrow_mut()
+                            .take();
                         cx.notify();
                     }
+                    InputEvent::PressEnter { .. } | InputEvent::Focus | InputEvent::Blur => {}
                 },
             )
             .detach();
@@ -39646,9 +40245,119 @@ impl FoundationSettings {
                 session_content_widths,
                 terminal_shells,
                 search,
+                settings_render_context,
                 active_section: SettingsSection::General,
             }
         })
+    }
+
+    fn select_settings_search_candidate(
+        &mut self,
+        candidate: SettingsSearchCandidate,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_section = candidate.section;
+        self.search
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.settings_render_context
+            .target_title
+            .borrow_mut()
+            .replace(candidate.title.to_string());
+        cx.notify();
+    }
+
+    fn render_search_results(
+        &self,
+        strings: Strings,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let query = self.search.read(cx).value().trim().to_string();
+        let candidates = settings_search_candidates_for_query(&query, strings);
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let is_dark = cx.theme().is_dark();
+        let border = theme::semantic_color("border", is_dark);
+        let popover = theme::semantic_color("popover", is_dark);
+        let foreground = theme::semantic_color("popover-foreground", is_dark);
+        let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
+        let hover_background = theme::semantic_color("accent", is_dark);
+        Some(
+            v_flex()
+                .id("settings-search-results")
+                .w_full()
+                .max_h(px(280.0))
+                .gap(px(2.0))
+                .overflow_y_scroll()
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(border.opacity(0.72))
+                .bg(popover)
+                .p_1()
+                .children(
+                    candidates
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, candidate)| {
+                            let title = candidate.title;
+                            let description = candidate.description;
+                            let section = settings_section_label(candidate.section);
+                            div()
+                                .id(format!("settings-search-result-{index}"))
+                                .role(Role::Button)
+                                .focusable()
+                                .tab_index(0)
+                                .cursor_pointer()
+                                .w_full()
+                                .aria_label(title)
+                                .px_2()
+                                .py_1()
+                                .rounded(px(6.0))
+                                .hover(|style| style.bg(hover_background.opacity(0.50)))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.select_settings_search_candidate(candidate, window, cx);
+                                }))
+                                .on_key_down(cx.listener(
+                                    move |this, event: &KeyDownEvent, window, cx| {
+                                        if matches!(event.keystroke.key.as_str(), "enter" | "space")
+                                        {
+                                            this.select_settings_search_candidate(
+                                                candidate, window, cx,
+                                            );
+                                            cx.stop_propagation();
+                                        }
+                                    },
+                                ))
+                                .child(
+                                    v_flex()
+                                        .w_full()
+                                        .min_w_0()
+                                        .items_start()
+                                        .gap(px(1.0))
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .truncate()
+                                                .text_sm()
+                                                .text_color(foreground)
+                                                .child(title),
+                                        )
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .truncate()
+                                                .text_xs()
+                                                .text_color(muted_foreground)
+                                                .child(format!("{section} · {description}")),
+                                        ),
+                                )
+                                .into_any_element()
+                        }),
+                )
+                .into_any_element(),
+        )
     }
 
     fn appearance(&self, cx: &App) -> vibex_desktop_model::AppearanceUiState {
@@ -40318,6 +41027,10 @@ impl FoundationSettings {
                     .tooltip(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.active_section = section;
+                        this.settings_render_context
+                            .target_title
+                            .borrow_mut()
+                            .take();
                         cx.notify();
                     }))
                     .into_any_element()
@@ -40332,12 +41045,14 @@ impl FoundationSettings {
                     .small()
                     .text_color(muted_foreground),
             );
+        let search_results = self.render_search_results(strings, cx);
 
         if !wide {
             return v_flex()
                 .w_full()
                 .gap_2()
                 .child(search)
+                .when_some(search_results, |this, results| this.child(results))
                 .child(div().flex().flex_wrap().gap_1().children(buttons))
                 .into_any_element();
         }
@@ -40366,6 +41081,7 @@ impl FoundationSettings {
             .border_color(border.opacity(0.72))
             .bg(theme::semantic_color("sidebar", is_dark))
             .child(search)
+            .when_some(search_results, |this, results| this.child(results))
             .child(
                 v_flex()
                     .gap(px(SETTINGS_NAVIGATION_SECTION_GAP))
@@ -41937,6 +42653,10 @@ impl Render for FoundationSettings {
         let viewport_width = f32::from(window.viewport_size().width);
         let vertical_tabs = viewport_width >= SETTINGS_VERTICAL_TABS_MIN_WIDTH;
         let stacked_rows = viewport_width < SETTINGS_ROW_INLINE_MIN_VIEWPORT_WIDTH;
+        self.settings_render_context
+            .target_anchor
+            .borrow_mut()
+            .take();
         let navigation = self.render_navigation(vertical_tabs, strings, cx);
         let page = match self.active_section {
             SettingsSection::General => {
@@ -41974,6 +42694,20 @@ impl Render for FoundationSettings {
                         .on_click(cx.listener(|this, _, window, cx| this.undo_changes(window, cx))),
                 )
             });
+        let target_anchor = self
+            .settings_render_context
+            .target_anchor
+            .borrow_mut()
+            .take();
+        if let Some(target_anchor) = target_anchor {
+            window.on_next_frame(move |window, cx| {
+                target_anchor.scroll_to(window, cx);
+            });
+            self.settings_render_context
+                .target_title
+                .borrow_mut()
+                .take();
+        }
 
         div()
             .id("foundation-settings")
@@ -41982,6 +42716,11 @@ impl Render for FoundationSettings {
             .w_full()
             .min_w_0()
             .min_h_0()
+            .on_action(cx.listener(|this, _: &InputEnter, window, cx| {
+                if this.search.read(cx).focus_handle(cx).is_focused(window) {
+                    cx.stop_propagation();
+                }
+            }))
             .when(vertical_tabs, |this| {
                 this.min_h(px(320.0)).flex_row().items_start()
             })
@@ -41991,11 +42730,13 @@ impl Render for FoundationSettings {
             .child(
                 div()
                     .id("foundation-settings-page-scroll")
+                    .h_full()
                     .min_w_0()
                     .min_h_0()
                     .flex_1()
+                    .track_scroll(&self.settings_render_context.scroll)
                     .bg(theme::semantic_color("background", cx.theme().is_dark()))
-                    .overflow_y_scrollbar()
+                    .overflow_y_scroll()
                     .child(page),
             )
     }
@@ -42576,8 +43317,19 @@ fn setting_row(
     let is_dark = cx.theme().is_dark();
     let border = theme::semantic_color("border", is_dark);
     let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
+    let target_anchor = cx
+        .try_global::<SettingsRenderContext>()
+        .and_then(|context| {
+            if context.target_title.borrow().as_deref() != Some(title) {
+                return None;
+            }
+            let anchor = ScrollAnchor::for_handle(context.scroll.clone());
+            context.target_anchor.borrow_mut().replace(anchor.clone());
+            Some(anchor)
+        });
 
     div()
+        .id(settings_row_id(title))
         .w_full()
         .min_w_0()
         .flex()
@@ -42590,6 +43342,7 @@ fn setting_row(
         .border_color(border.opacity(0.65))
         .px_0()
         .py_4()
+        .anchor_scroll(target_anchor)
         .child(
             v_flex()
                 .min_w_0()
@@ -50208,7 +50961,52 @@ mod tests {
             .find(".id(\"foundation-settings-page-scroll\")")
             .expect("settings page should own a dedicated scroll viewport");
         assert!(navigation < page_scroll);
-        assert!(settings.contains(".overflow_y_scrollbar()"));
+        let page_viewport = &settings[page_scroll..];
+        assert!(page_viewport.contains(".h_full()"));
+        assert!(page_viewport.contains(".overflow_y_scroll()"));
+        assert!(!page_viewport.contains(".overflow_y_scrollbar()"));
+        assert!(page_viewport.contains(".track_scroll(&self.settings_render_context.scroll)"));
+    }
+
+    #[test]
+    fn settings_search_returns_concrete_localized_candidates() {
+        let english = locale::strings(locale::ResolvedLocale::En);
+        let font_candidates = settings_search_candidates_for_query("font", english);
+        assert!(font_candidates.iter().any(|candidate| {
+            candidate.section == SettingsSection::Appearance && candidate.title == "Code font"
+        }));
+        assert!(
+            font_candidates
+                .iter()
+                .all(|candidate| candidate.section == SettingsSection::Appearance)
+        );
+
+        let shortcut_candidates = settings_search_candidates_for_query("sidebar", english);
+        assert!(shortcut_candidates.iter().any(|candidate| {
+            candidate.section == SettingsSection::Shortcuts && candidate.title == "Toggle sidebar"
+        }));
+
+        let simplified = locale::strings(locale::ResolvedLocale::ZhCn);
+        let notification_candidates = settings_search_candidates_for_query("通知", simplified);
+        assert!(notification_candidates.iter().any(|candidate| {
+            candidate.section == SettingsSection::General && candidate.keywords.contains(&"通知")
+        }));
+        assert!(settings_search_candidates_for_query("", english).is_empty());
+    }
+
+    #[test]
+    fn settings_search_keeps_enter_inside_the_dialog() {
+        let source = include_str!("app.rs");
+        assert!(source.contains("settings-search-results"));
+        assert!(source.contains("select_settings_search_candidate"));
+        let settings = source
+            .split_once("impl Render for FoundationSettings")
+            .and_then(|(_, tail)| tail.split_once("\nfn locale_choices("))
+            .map(|(body, _)| body)
+            .expect("settings renderer should remain inspectable");
+        assert!(settings.contains("_: &InputEnter"));
+        assert!(settings.contains("this.search.read(cx).focus_handle(cx).is_focused(window)"));
+        assert!(settings.contains("cx.stop_propagation()"));
     }
 
     #[test]
