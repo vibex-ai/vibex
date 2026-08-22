@@ -181,7 +181,7 @@ const TITLE_BAR_HEIGHT: f32 = 44.0;
 const TITLE_BAR_COLLAPSED_SIDEBAR_WIDTH: f32 = 112.0;
 const SIDEBAR_PROJECT_LOGO_DIRECTORY: &str = "project-icons";
 const SIDEBAR_LOGO_DISPLAY_SIZE: f32 = 14.0;
-const SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE: f32 = 28.0;
+const SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE: f32 = 18.0;
 const SIDEBAR_WORKSPACE_STATUS_TOP_OFFSET: f32 = 4.0;
 const SIDEBAR_ICON_TITLE_GAP: f32 = 4.0;
 const SIDEBAR_PROJECT_ICON_SLOT_SIZE: f32 = 30.0;
@@ -45066,7 +45066,7 @@ mod tests {
         assert!(trigger.contains(".w(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))"));
         assert!(trigger.contains(".h(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))"));
         assert!(trigger.contains(".child(project_logo)"));
-        assert!(source.contains("const SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE: f32 = 28.0;"));
+        assert!(source.contains("const SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE: f32 = 18.0;"));
         assert!(source.contains("const SIDEBAR_PROJECT_ICON_SLOT_SIZE: f32 = 30.0;"));
         let logo_renderer = source
             .split_once("fn sidebar_project_logo(")
