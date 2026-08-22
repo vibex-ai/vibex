@@ -42999,6 +42999,7 @@ impl Render for FoundationSettings {
             .w_full()
             .min_w_0()
             .min_h_0()
+            .overflow_hidden()
             .on_action(cx.listener(|this, _: &InputEnter, window, cx| {
                 if this.search.read(cx).focus_handle(cx).is_focused(window) {
                     cx.stop_propagation();
@@ -43018,6 +43019,7 @@ impl Render for FoundationSettings {
                     .min_h_0()
                     .flex_1()
                     .track_scroll(&self.settings_render_context.scroll)
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                     .bg(theme::semantic_color("background", cx.theme().is_dark()))
                     .overflow_y_scroll()
                     .child(page),
@@ -51273,8 +51275,12 @@ mod tests {
         let page_viewport = &settings[page_scroll..];
         assert!(page_viewport.contains(".h_full()"));
         assert!(page_viewport.contains(".overflow_y_scroll()"));
+        assert!(page_viewport.contains(".on_scroll_wheel(|_, _, cx| cx.stop_propagation())"));
         assert!(!page_viewport.contains(".overflow_y_scrollbar()"));
         assert!(page_viewport.contains(".track_scroll(&self.settings_render_context.scroll)"));
+        let settings_root = &settings[..page_scroll];
+        assert!(settings_root.contains(".id(\"foundation-settings\")"));
+        assert!(settings_root.contains(".overflow_hidden()"));
     }
 
     #[test]
