@@ -34848,7 +34848,7 @@ fn sidebar_workspace_focus_background(accent: Hsla, is_dark: bool) -> Hsla {
     if is_dark {
         accent.lighten(0.34)
     } else {
-        accent.darken(0.10)
+        accent.darken(0.04)
     }
 }
 
@@ -34856,7 +34856,7 @@ fn sidebar_workspace_focus_border(accent: Hsla, is_dark: bool) -> Hsla {
     if is_dark {
         accent.lighten(0.46)
     } else {
-        accent.darken(0.24)
+        accent.darken(0.14)
     }
 }
 
@@ -43809,6 +43809,8 @@ mod tests {
         let light_border = sidebar_workspace_focus_border(light_accent, false);
         assert!(light_background.l < light_accent.l);
         assert!(light_border.l < light_background.l);
+        assert!(light_background.l > light_accent.l - 0.06);
+        assert!(light_border.l > light_accent.l - 0.18);
 
         let dark_accent = theme::semantic_color("sidebar-accent", true);
         let dark_background = sidebar_workspace_focus_background(dark_accent, true);
