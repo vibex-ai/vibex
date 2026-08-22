@@ -352,11 +352,11 @@ const IMAGE_PREVIEW_HORIZONTAL_PADDING: f32 = 24.0;
 const IMAGE_PREVIEW_VERTICAL_PADDING: f32 = 64.0;
 const SETTINGS_ROW_INLINE_MIN_VIEWPORT_WIDTH: f32 = 760.0;
 const SETTINGS_VERTICAL_TABS_MIN_WIDTH: f32 = 768.0;
-const SETTINGS_NAVIGATION_WIDTH: f32 = 232.0;
+const SETTINGS_NAVIGATION_WIDTH: f32 = 256.0;
 const SETTINGS_NAVIGATION_ROW_HEIGHT: f32 = 34.0;
 const SETTINGS_NAVIGATION_SECTION_GAP: f32 = 4.0;
-const SETTINGS_DIALOG_MAX_WIDTH: f32 = 960.0;
-const SETTINGS_DIALOG_MAX_HEIGHT: f32 = 720.0;
+const SETTINGS_DIALOG_MAX_WIDTH: f32 = 1160.0;
+const SETTINGS_DIALOG_MAX_HEIGHT: f32 = 900.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AutoContinueCountdown {
@@ -3745,7 +3745,6 @@ pub struct VibexWorkbench {
     settings_open: bool,
     settings_snapshot: Option<DesktopUiStateV1>,
     open_settings_on_start: bool,
-    settings_title: Entity<SettingsDialogTitle>,
     settings_view: Entity<FoundationSettings>,
     code_workbench: Entity<CodeWorkbench>,
     preview_fullscreen_active: bool,
@@ -4027,7 +4026,6 @@ impl VibexWorkbench {
         let new_session_project_menu_focus = cx.focus_handle();
         let settings_open_on_start = std::env::var_os("VIBEX_FOUNDATION_OPEN_SETTINGS").is_some();
         let settings_view = FoundationSettings::new(cx.weak_entity(), &ui_state, window, cx);
-        let settings_title = cx.new(|cx| SettingsDialogTitle::new(settings_view.clone(), cx));
         let initial_strings = locale::strings(initial_locale);
         let session_search = cx.new(|cx| {
             InputState::new(window, cx)
@@ -4384,7 +4382,6 @@ impl VibexWorkbench {
             settings_open: false,
             settings_snapshot: None,
             open_settings_on_start: settings_open_on_start,
-            settings_title,
             settings_view,
             code_workbench,
             preview_fullscreen_active: false,
@@ -18959,7 +18956,6 @@ impl VibexWorkbench {
         self.new_session_project_search.update(cx, |input, cx| {
             input.set_placeholder(strings.new_session_search_project, window, cx)
         });
-        self.settings_title.update(cx, |_, cx| cx.notify());
         self.code_workbench
             .update(cx, |workbench, cx| workbench.sync_locale(window, cx));
         self.code_right_rail
@@ -19284,13 +19280,12 @@ impl VibexWorkbench {
         self.settings_open = true;
         eprintln!("vibex-foundation: settings-dialog-open");
         let settings = self.settings_view.clone();
-        let settings_title = self.settings_title.clone();
         let workbench = cx.weak_entity();
         let viewport = window.viewport_size();
         let viewport_width = f32::from(viewport.width);
         let viewport_height = f32::from(viewport.height);
-        let dialog_width = (viewport_width - 16.0).clamp(1.0, SETTINGS_DIALOG_MAX_WIDTH);
-        let dialog_height = (viewport_height - 16.0).clamp(1.0, SETTINGS_DIALOG_MAX_HEIGHT);
+        let dialog_width = (viewport_width - 32.0).clamp(1.0, SETTINGS_DIALOG_MAX_WIDTH);
+        let dialog_height = (viewport_height - 32.0).clamp(1.0, SETTINGS_DIALOG_MAX_HEIGHT);
         let dialog_margin_top = ((viewport_height - dialog_height) / 2.0).max(8.0);
         window.open_dialog(cx, move |dialog, _, cx| {
             let on_close = workbench.clone();
@@ -19298,11 +19293,11 @@ impl VibexWorkbench {
             let popover = theme::semantic_color("popover", is_dark);
             let popover_foreground = theme::semantic_color("popover-foreground", is_dark);
             dialog
-                .title(settings_title.clone())
                 .w(px(dialog_width))
                 .max_w(px(dialog_width))
                 .h(px(dialog_height))
                 .margin_top(px(dialog_margin_top))
+                .p_0()
                 .rounded(px(12.0))
                 .bg(popover)
                 .text_color(popover_foreground)
@@ -39109,66 +39104,6 @@ impl Render for ExternalImportDialog {
     }
 }
 
-struct SettingsDialogTitle {
-    settings: Entity<FoundationSettings>,
-    _settings_subscription: Subscription,
-}
-
-impl SettingsDialogTitle {
-    fn new(settings: Entity<FoundationSettings>, cx: &mut Context<Self>) -> Self {
-        let settings_subscription = cx.observe(&settings, |_, _, cx| cx.notify());
-        Self {
-            settings,
-            _settings_subscription: settings_subscription,
-        }
-    }
-}
-
-impl Render for SettingsDialogTitle {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let appearance = self.settings.read(cx).appearance(cx);
-        let strings = locale::strings(locale::resolve_locale(
-            appearance.locale,
-            locale::system_locale().as_deref(),
-        ));
-        let has_changes = self.settings.read(cx).has_changes(cx);
-        let settings = self.settings.clone();
-
-        div()
-            .w_full()
-            .min_w_0()
-            .flex_row()
-            .items_center()
-            .relative()
-            .pr(px(40.0))
-            .pb_1()
-            .child(
-                v_flex().min_w_0().flex_1().child(
-                    div()
-                        .text_base()
-                        .font_semibold()
-                        .line_height(gpui::relative(1.43))
-                        .child(strings.settings),
-                ),
-            )
-            .when(has_changes, |this| {
-                this.child(
-                    Button::new("undo-settings-changes")
-                        .small()
-                        .ghost()
-                        .icon(IconName::Undo2)
-                        .absolute()
-                        .top(px(-8.0))
-                        .right(px(24.0))
-                        .tooltip(strings.undo_changes)
-                        .on_click(move |_, window, cx| {
-                            settings.update(cx, |settings, cx| settings.undo_changes(window, cx));
-                        }),
-                )
-            })
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsSection {
     General,
@@ -40347,7 +40282,7 @@ impl FoundationSettings {
             .collect::<Vec<_>>();
         let search = Input::new(&self.search)
             .small()
-            .h(px(32.0))
+            .h(px(34.0))
             .w_full()
             .prefix(
                 Icon::new(IconName::Search)
@@ -40382,8 +40317,8 @@ impl FoundationSettings {
             .flex_none()
             .overflow_y_scrollbar()
             .gap_2()
-            .px_3()
-            .pt_1()
+            .px_4()
+            .pt_3()
             .border_r_1()
             .border_color(border.opacity(0.72))
             .bg(theme::semantic_color("sidebar", is_dark))
@@ -41976,6 +41911,26 @@ impl Render for FoundationSettings {
             SettingsSection::Data => self.render_data_page(stacked_rows, cx),
             SettingsSection::About => self.render_about_page(stacked_rows, cx),
         };
+        let has_changes = self.has_changes(cx);
+        let undo_label = strings.undo_changes;
+        let page = div()
+            .relative()
+            .w_full()
+            .min_w_0()
+            .child(page)
+            .when(has_changes, |this| {
+                this.child(
+                    Button::new("undo-settings-changes")
+                        .small()
+                        .ghost()
+                        .icon(IconName::Undo2)
+                        .absolute()
+                        .top(px(20.0))
+                        .right(px(64.0))
+                        .tooltip(undo_label)
+                        .on_click(cx.listener(|this, _, window, cx| this.undo_changes(window, cx))),
+                )
+            });
 
         div()
             .id("foundation-settings")
@@ -42543,8 +42498,8 @@ fn settings_page(
         .gap_5()
         .bg(background)
         .text_color(foreground)
-        .px_6()
-        .py_5()
+        .px(px(70.0))
+        .py_8()
         .child(
             v_flex()
                 .gap_2()
@@ -42587,13 +42542,11 @@ fn setting_row(
         .when(!stacked, |this| {
             this.flex_row().items_center().justify_between()
         })
-        .gap_3()
-        .rounded(px(8.0))
-        .border_1()
-        .border_color(border.opacity(0.82))
-        .bg(theme::semantic_color("card", is_dark).opacity(if is_dark { 0.18 } else { 0.34 }))
-        .px_3()
-        .py_3()
+        .gap_4()
+        .border_b_1()
+        .border_color(border.opacity(0.65))
+        .px_0()
+        .py_4()
         .child(
             v_flex()
                 .min_w_0()
@@ -50135,8 +50088,8 @@ mod tests {
 
     #[test]
     fn settings_dialog_keeps_navigation_outside_the_page_scroll_viewport() {
-        assert_eq!(SETTINGS_DIALOG_MAX_WIDTH, 960.0);
-        assert_eq!(SETTINGS_DIALOG_MAX_HEIGHT, 720.0);
+        assert_eq!(SETTINGS_DIALOG_MAX_WIDTH, 1160.0);
+        assert_eq!(SETTINGS_DIALOG_MAX_HEIGHT, 900.0);
 
         let source = include_str!("app.rs");
         let open_settings = source
@@ -50163,7 +50116,7 @@ mod tests {
 
     #[test]
     fn settings_navigation_keeps_grouped_large_targets() {
-        assert_eq!(SETTINGS_NAVIGATION_WIDTH, 232.0);
+        assert_eq!(SETTINGS_NAVIGATION_WIDTH, 256.0);
         assert_eq!(SETTINGS_NAVIGATION_ROW_HEIGHT, 34.0);
         assert_eq!(SETTINGS_NAVIGATION_SECTION_GAP, 4.0);
         assert_eq!(SETTINGS_ROW_INLINE_MIN_VIEWPORT_WIDTH, 760.0);
@@ -50194,20 +50147,19 @@ mod tests {
     }
 
     #[test]
-    fn settings_title_only_exposes_undo_for_changes_from_this_open() {
+    fn settings_page_keeps_undo_for_changes_from_this_open() {
         let source = include_str!("app.rs");
-        let title = source
-            .split_once("impl Render for SettingsDialogTitle")
-            .and_then(|(_, tail)| tail.split_once("\n#[derive(Debug, Clone, Copy"))
+        let settings = source
+            .split_once("impl Render for FoundationSettings")
+            .and_then(|(_, tail)| tail.split_once("\nfn locale_choices("))
             .map(|(body, _)| body)
-            .expect("settings title should remain inspectable");
-        assert!(title.contains("has_changes"));
-        assert!(title.contains("undo-settings-changes"));
-        assert!(title.contains(".absolute()"));
-        assert!(title.contains(".top(px(-8.0))"));
-        assert!(title.contains(".right(px(24.0))"));
-        assert!(!title.contains("settings_description"));
-        assert!(!title.contains("request_restore_defaults"));
+            .expect("settings page should remain inspectable");
+        assert!(settings.contains("has_changes"));
+        assert!(settings.contains("undo-settings-changes"));
+        assert!(settings.contains(".absolute()"));
+        assert!(settings.contains(".top(px(20.0))"));
+        assert!(settings.contains(".right(px(64.0))"));
+        assert!(!settings.contains("SettingsDialogTitle"));
 
         let open_settings = source
             .split_once("    fn open_settings(")
