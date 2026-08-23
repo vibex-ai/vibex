@@ -4405,6 +4405,12 @@ fn default_acp_preset_features() -> Vec<String> {
         "image_input",
         "file_attachments",
         "session_persistence",
+        // Stdio MCP forwarding is mandatory for every conforming ACP agent, so
+        // the preset grants it by default. Agents that reject forwarded
+        // servers opt out through `without_mcp_server_support()` in the
+        // catalog, and HTTP/SSE entries stay gated on the agent's advertised
+        // `mcpCapabilities` at session open.
+        "mcp_servers",
     ]
     .into_iter()
     .map(ToString::to_string)

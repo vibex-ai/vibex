@@ -27,7 +27,9 @@ use agent_client_protocol_schema::v1::{
     ElicitationContentValue as AcpElicitationContentValue, ElicitationMode as AcpElicitationMode,
     ElicitationPropertySchema as AcpElicitationPropertySchema,
     ElicitationScope as AcpElicitationScope, EnumOption as AcpEnumOption,
-    MultiSelectItems as AcpMultiSelectItems, StringFormat as AcpStringFormat,
+    McpServer as AcpMcpServer, McpServerHttp as AcpMcpServerHttp, McpServerSse as AcpMcpServerSse,
+    McpServerStdio as AcpMcpServerStdio, MultiSelectItems as AcpMultiSelectItems,
+    StringFormat as AcpStringFormat,
 };
 use async_trait::async_trait;
 use command_group::AsyncCommandGroup;
@@ -109,6 +111,7 @@ use vibex_db::{
 };
 
 use crate::auth::{append_known_terminal_auth_fallback, parse_initialize_auth_catalog};
+use crate::host_fs::{resolve_contained_write_path, write_host_file_atomic};
 use crate::process_environment::{
     detach_from_controlling_terminal, sanitize_inherited_appimage_environment,
 };
@@ -598,7 +601,7 @@ fn resolve_acp_mcp_descriptor(
                     .with_diagnostic("mcpServerId", id)
                 })?;
             AcpMcpTransportDescriptor::Stdio {
-                command: command.to_string(),
+                command: resolve_mcp_command_path(command),
                 args: server.args.clone(),
             }
         }
@@ -649,32 +652,79 @@ fn valid_mcp_url(url: Option<&str>) -> Option<String> {
     (!rest.trim_matches('/').is_empty() && !url.contains(' ')).then(|| url.to_string())
 }
 
+/// Environment keys whose value names a directory the agent legitimately owns
+/// (session rollouts, native config, caches). Values are only trusted when they
+/// are absolute; `HOME` itself is never a write root because it would readmit
+/// the whole user profile.
+fn env_key_names_agent_state_home(key: &str) -> bool {
+    key != "HOME"
+        && (key.ends_with("_HOME")
+            || key.ends_with("_CONFIG_DIR")
+            || key.ends_with("_STATE_DIR")
+            || key.ends_with("_DATA_DIR"))
+}
+
+/// Write roots for the ACP filesystem host: the workspace the session is
+/// bound to, the agent's own state home, and the temp directory agents use for
+/// scratch files. Everything else is refused.
+fn acp_fs_write_roots(cwd: &Path, env_overlays: &[(String, String)]) -> Vec<PathBuf> {
+    let mut roots = vec![cwd.to_path_buf(), std::env::temp_dir()];
+    for (key, value) in env_overlays {
+        let candidate = Path::new(value);
+        if env_key_names_agent_state_home(key) && candidate.is_absolute() {
+            roots.push(candidate.to_path_buf());
+        }
+    }
+    roots
+}
+
 fn mcp_servers_json(mcp_servers: &[AcpMcpServerDescriptor]) -> Value {
     Value::Array(mcp_servers.iter().map(mcp_server_json).collect())
 }
 
+/// Serialize a forwarded MCP server through the pinned ACP schema.
+///
+/// The wire shape is discriminated (`type: "http" | "sse"`, untagged for
+/// stdio) and `env` / `headers` are required arrays. Real adapters wrap
+/// `mcpServers` in a skip-on-error array, so any deviation is dropped
+/// silently instead of failing the request: the local descriptor id is
+/// therefore never placed on the wire and the typed builders own the shape.
 fn mcp_server_json(server: &AcpMcpServerDescriptor) -> Value {
-    match &server.transport {
-        AcpMcpTransportDescriptor::Stdio { command, args } => json!({
-            "id": server.id,
-            "name": server.name,
-            "transport": "stdio",
-            "command": command,
-            "args": args
-        }),
-        AcpMcpTransportDescriptor::Http { url } => json!({
-            "id": server.id,
-            "name": server.name,
-            "transport": "http",
-            "url": url
-        }),
-        AcpMcpTransportDescriptor::Sse { url } => json!({
-            "id": server.id,
-            "name": server.name,
-            "transport": "sse",
-            "url": url
-        }),
+    let typed = match &server.transport {
+        AcpMcpTransportDescriptor::Stdio { command, args } => AcpMcpServer::Stdio(
+            AcpMcpServerStdio::new(server.name.clone(), PathBuf::from(command))
+                .args(args.clone())
+                .env(Vec::new()),
+        ),
+        AcpMcpTransportDescriptor::Http { url } => AcpMcpServer::Http(
+            AcpMcpServerHttp::new(server.name.clone(), url.clone()).headers(Vec::new()),
+        ),
+        AcpMcpTransportDescriptor::Sse { url } => AcpMcpServer::Sse(
+            AcpMcpServerSse::new(server.name.clone(), url.clone()).headers(Vec::new()),
+        ),
+    };
+    serde_json::to_value(&typed).unwrap_or_else(|_| Value::Null)
+}
+
+/// Resolve a bare stdio MCP command against `PATH`.
+///
+/// The ACP schema types the stdio `command` as a path and agents are not
+/// required to perform their own lookup, so a bare `npx` can otherwise fail
+/// inside the agent process. Resolution is best-effort: an unresolvable
+/// command is forwarded unchanged so the agent reports the real failure.
+fn resolve_mcp_command_path(command: &str) -> String {
+    let candidate = Path::new(command);
+    if candidate.is_absolute() || candidate.components().count() > 1 {
+        return command.to_string();
     }
+    let Some(path) = std::env::var_os("PATH") else {
+        return command.to_string();
+    };
+    std::env::split_paths(&path)
+        .map(|directory| directory.join(command))
+        .find(|candidate| candidate.is_file())
+        .map(|candidate| candidate.display().to_string())
+        .unwrap_or_else(|| command.to_string())
 }
 
 fn redact_debug_value(value: &Value) -> Value {
@@ -1437,6 +1487,10 @@ struct ProcessShared {
     supports_load_session: bool,
     supports_resume_session: bool,
     supports_list_sessions: bool,
+    /// `agentCapabilities.mcpCapabilities.http` / `.sse`. Stdio is mandatory
+    /// for every agent and therefore not tracked.
+    supports_mcp_http: bool,
+    supports_mcp_sse: bool,
     operation_evidence: BTreeMap<AcpOperation, SessionConfigOperationEvidence>,
 }
 
@@ -1492,6 +1546,9 @@ pub(crate) struct AcpProcess {
     compatibility_identity: String,
     event_enricher: AgentEventEnricherKind,
     workspace_root: PathBuf,
+    /// Roots the agent may write into through `fs/write_text_file`. Reads stay
+    /// unrestricted on purpose (see `host_fs`).
+    fs_write_roots: Vec<PathBuf>,
     command_display: String,
     args_display: String,
     outbound: Mutex<Option<mpsc::UnboundedSender<String>>>,
@@ -3537,6 +3594,44 @@ impl AcpProcess {
         true
     }
 
+    /// MCP servers that may actually be placed on the wire for this process.
+    ///
+    /// Stdio is mandatory for every agent; HTTP and SSE entries are only
+    /// forwarded when initialize advertised `mcpCapabilities`. Forwarding an
+    /// unsupported transport either fails `session/new` outright or is
+    /// dropped by the agent without a diagnostic, so the entry is skipped
+    /// here with an explicit warning instead.
+    fn wire_mcp_servers(&self) -> Vec<AcpMcpServerDescriptor> {
+        if self.mcp_servers.is_empty() {
+            return Vec::new();
+        }
+        let (supports_http, supports_sse) = self
+            .shared
+            .lock()
+            .map(|shared| (shared.supports_mcp_http, shared.supports_mcp_sse))
+            .unwrap_or((false, false));
+        let mut forwarded = Vec::with_capacity(self.mcp_servers.len());
+        for server in &self.mcp_servers {
+            let allowed = match &server.transport {
+                AcpMcpTransportDescriptor::Stdio { .. } => true,
+                AcpMcpTransportDescriptor::Http { .. } => supports_http,
+                AcpMcpTransportDescriptor::Sse { .. } => supports_sse,
+            };
+            if allowed {
+                forwarded.push(server.clone());
+                continue;
+            }
+            self.log_context.for_operation("session/new").emit(
+                RuntimeLogLevel::Warn,
+                "acp_mcp_transport_unsupported",
+                RuntimeMetricResult::Failure,
+                Some("acp_mcp_transport_unsupported"),
+                None,
+            );
+        }
+        forwarded
+    }
+
     fn take_pending_available_commands(
         &self,
         native_session_id: &str,
@@ -4420,21 +4515,17 @@ impl AcpProcess {
             self.respond_error(rpc_id, -32602, "fs/write_text_file requires content");
             return;
         };
-        let path = PathBuf::from(path);
-        if let Some(parent) = path.parent()
-            && let Err(err) = std::fs::create_dir_all(parent)
-        {
-            self.respond_error(
-                rpc_id,
-                -32603,
-                &format!("failed to prepare parent directory: {err}"),
-            );
-            return;
-        }
-        match std::fs::write(&path, content) {
+        let target = match resolve_contained_write_path(Path::new(path), &self.fs_write_roots) {
+            Ok(target) => target,
+            Err(error) => {
+                self.respond_error(rpc_id, -32602, &error.message);
+                return;
+            }
+        };
+        match write_host_file_atomic(&target, content) {
             Ok(()) => self.respond_ok(rpc_id, Value::Null),
-            Err(err) => {
-                self.respond_error(rpc_id, -32603, &format!("failed to write file: {err}"));
+            Err(error) => {
+                self.respond_error(rpc_id, -32603, &error.message);
             }
         }
     }
@@ -10154,6 +10245,24 @@ impl AcpRuntimeClient {
         for key in env_unsets {
             command.env_remove(key);
         }
+        // Adapter-required environment. An explicit overlay value wins, so a
+        // profile can still opt out of a compatibility default.
+        let required_launch_env = self
+            .compatibility_registry
+            .for_agent(&agent_id)
+            .map(|descriptor| descriptor.required_launch_env.clone())
+            .unwrap_or_default();
+        for (key, value) in required_launch_env {
+            if !env_overlays
+                .iter()
+                .any(|(existing, _)| existing.as_str() == key.as_str())
+            {
+                command.env(key, value);
+            }
+        }
+        // Retained for the filesystem host: an agent's native state home is
+        // only knowable from the overlay it was launched with.
+        let spawn_env_overlays = env_overlays.clone();
         for (key, value) in env_overlays {
             command.env(key, value);
         }
@@ -10219,6 +10328,7 @@ impl AcpRuntimeClient {
             compatibility_identity: adapter_identity.compatibility_identity,
             event_enricher: adapter_identity.event_enricher,
             workspace_root: cwd.to_path_buf(),
+            fs_write_roots: acp_fs_write_roots(cwd, &spawn_env_overlays),
             command_display: config.command.clone(),
             args_display: redacted_args_summary(&process_args),
             outbound: Mutex::new(Some(outbound_tx)),
@@ -10350,6 +10460,16 @@ impl AcpRuntimeClient {
             .and_then(|capabilities| capabilities.get("listSessions"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let mcp_capability = |transport: &str| {
+            result
+                .get("agentCapabilities")
+                .and_then(|capabilities| capabilities.get("mcpCapabilities"))
+                .and_then(|capabilities| capabilities.get(transport))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        };
+        let supports_mcp_http = mcp_capability("http");
+        let supports_mcp_sse = mcp_capability("sse");
         let agent_name = result
             .get("agentInfo")
             .and_then(|info| info.get("name"))
@@ -10425,6 +10545,8 @@ impl AcpRuntimeClient {
             shared.supports_load_session = supports_load_session;
             shared.supports_resume_session = supports_resume_session;
             shared.supports_list_sessions = supports_list_sessions;
+            shared.supports_mcp_http = supports_mcp_http;
+            shared.supports_mcp_sse = supports_mcp_sse;
             shared.agent_name = agent_name;
             shared.agent_version = agent_version;
             shared.operation_evidence = operation_evidence;
@@ -10454,7 +10576,7 @@ impl AcpRuntimeClient {
         let (result, registration_barrier) = process
             .request_with_registration_barrier(
                 AcpOperation::SessionNew.method(),
-                build_session_new_params(&process.workspace_root, &process.mcp_servers),
+                build_session_new_params(&process.workspace_root, &process.wire_mcp_servers()),
                 self.handshake_timeout,
             )
             .await?;
@@ -10516,7 +10638,7 @@ impl AcpRuntimeClient {
                 protocol::build_session_resume_params(
                     native_session_id,
                     &process.workspace_root,
-                    mcp_servers_json(&process.mcp_servers),
+                    mcp_servers_json(&process.wire_mcp_servers()),
                 ),
                 self.restore_timeout,
             )
@@ -10568,7 +10690,7 @@ impl AcpRuntimeClient {
                 build_session_load_params(
                     native_session_id,
                     &process.workspace_root,
-                    &process.mcp_servers,
+                    &process.wire_mcp_servers(),
                 ),
                 self.restore_timeout,
             )
@@ -17622,6 +17744,7 @@ mod tests {
             compatibility_identity: "test-acp@1".to_string(),
             event_enricher: AgentEventEnricherKind::Passthrough,
             workspace_root: std::env::temp_dir(),
+            fs_write_roots: vec![std::env::temp_dir()],
             command_display: "mock".to_string(),
             args_display: String::new(),
             outbound: Mutex::new(outbound),
@@ -18340,7 +18463,7 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
                 id: "fs".to_string(),
                 name: "Filesystem".to_string(),
                 transport: AcpMcpTransportDescriptor::Stdio {
-                    command: "npx".to_string(),
+                    command: "/usr/bin/npx".to_string(),
                     args: vec![
                         "-y".to_string(),
                         "@modelcontextprotocol/server-filesystem".to_string(),
@@ -18354,25 +18477,40 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
                     url: "https://example.invalid/mcp".to_string(),
                 },
             },
+            AcpMcpServerDescriptor {
+                id: "events".to_string(),
+                name: "Events".to_string(),
+                transport: AcpMcpTransportDescriptor::Sse {
+                    url: "https://example.invalid/sse".to_string(),
+                },
+            },
         ];
 
+        // The descriptor id stays local: adapters validate `mcpServers`
+        // against the official schema and silently drop anything that does
+        // not match, so only schema fields may be serialized.
         assert_eq!(
             build_session_new_params(&cwd, &servers),
             json!({
                 "cwd": "/tmp/vibex-workspace",
                 "mcpServers": [
                     {
-                        "id": "fs",
                         "name": "Filesystem",
-                        "transport": "stdio",
-                        "command": "npx",
-                        "args": ["-y", "@modelcontextprotocol/server-filesystem"]
+                        "command": "/usr/bin/npx",
+                        "args": ["-y", "@modelcontextprotocol/server-filesystem"],
+                        "env": []
                     },
                     {
-                        "id": "remote",
+                        "type": "http",
                         "name": "Remote",
-                        "transport": "http",
-                        "url": "https://example.invalid/mcp"
+                        "url": "https://example.invalid/mcp",
+                        "headers": []
+                    },
+                    {
+                        "type": "sse",
+                        "name": "Events",
+                        "url": "https://example.invalid/sse",
+                        "headers": []
                     }
                 ]
             })
@@ -18381,6 +18519,43 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
             build_session_load_params("native-1", &cwd, &servers)["mcpServers"],
             build_session_new_params(&cwd, &servers)["mcpServers"]
         );
+    }
+
+    #[test]
+    fn stdio_mcp_commands_resolve_against_path() {
+        // ACP types the stdio command as a path; a bare command that cannot be
+        // resolved is forwarded unchanged so the agent reports the real error.
+        assert_eq!(
+            resolve_mcp_command_path("/usr/bin/env"),
+            "/usr/bin/env".to_string()
+        );
+        assert_eq!(
+            resolve_mcp_command_path("vibex-command-that-does-not-exist"),
+            "vibex-command-that-does-not-exist".to_string()
+        );
+        let resolved = resolve_mcp_command_path("sh");
+        assert!(
+            Path::new(&resolved).is_absolute() || resolved == "sh",
+            "unexpected resolution: {resolved}"
+        );
+    }
+
+    #[test]
+    fn acp_fs_write_roots_cover_workspace_state_home_and_temp() {
+        let overlays = vec![
+            ("CODEX_HOME".to_string(), "/tmp/codex-home".to_string()),
+            ("HOME".to_string(), "/home/someone".to_string()),
+            ("SOME_HOME".to_string(), "relative/path".to_string()),
+            ("UNRELATED".to_string(), "/tmp/unrelated".to_string()),
+        ];
+        let roots = acp_fs_write_roots(Path::new("/tmp/workspace"), &overlays);
+        assert!(roots.contains(&PathBuf::from("/tmp/workspace")));
+        assert!(roots.contains(&std::env::temp_dir()));
+        assert!(roots.contains(&PathBuf::from("/tmp/codex-home")));
+        // `HOME` would readmit the whole profile, and non-absolute or
+        // unrelated values are never roots.
+        assert!(!roots.contains(&PathBuf::from("/home/someone")));
+        assert!(!roots.contains(&PathBuf::from("/tmp/unrelated")));
     }
 
     #[test]
@@ -18432,7 +18607,7 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
         };
         let descriptors = resolve_acp_mcp_descriptors(&config, &resources).unwrap();
         assert_eq!(descriptors.len(), 1);
-        assert_eq!(mcp_server_json(&descriptors[0])["transport"], json!("sse"));
+        assert_eq!(mcp_server_json(&descriptors[0])["type"], json!("sse"));
     }
 
     #[test]
@@ -20138,6 +20313,7 @@ for line in sys.stdin:
         capabilities = {
             "loadSession": True,
             "listSessions": True,
+            "mcpCapabilities": {"http": True, "sse": False},
             "sessionConfig": {
                 "setModel": {"supported": True, "encoding": "typed"},
                 "setMode": {"supported": True, "encoding": "typed"},
@@ -21707,6 +21883,16 @@ for line in sys.stdin:
                     command: None,
                     args: Vec::new(),
                     url: Some("https://example.invalid/mcp".to_string()),
+                },
+                // The mock agent does not advertise `mcpCapabilities.sse`, so
+                // this entry must never reach the wire.
+                ProviderRuntimeMcpServer {
+                    id: "events".to_string(),
+                    display_name: "Events".to_string(),
+                    transport: ProviderRuntimeMcpTransport::Sse,
+                    command: None,
+                    args: Vec::new(),
+                    url: Some("https://example.invalid/sse".to_string()),
                 },
             ],
             skills: Vec::new(),
@@ -27062,21 +27248,23 @@ for line in sys.stdin:
             json!(true)
         );
         let new_session = find_logged_request(&log, "session/new");
+        // Schema-exact wire shape: stdio is untagged with a mandatory `env`,
+        // HTTP carries the `type` discriminator and mandatory `headers`, and
+        // the SSE entry is dropped because the agent never advertised it.
         assert_eq!(
             new_session["params"]["mcpServers"],
             json!([
                 {
-                    "id": "filesystem",
                     "name": "Filesystem",
-                    "transport": "stdio",
                     "command": "mcp-server-filesystem",
-                    "args": ["--root", "/tmp/workspace"]
+                    "args": ["--root", "/tmp/workspace"],
+                    "env": []
                 },
                 {
-                    "id": "remote",
+                    "type": "http",
                     "name": "Remote",
-                    "transport": "http",
-                    "url": "https://example.invalid/mcp"
+                    "url": "https://example.invalid/mcp",
+                    "headers": []
                 }
             ])
         );
@@ -29330,8 +29518,8 @@ for line in sys.stdin:
         );
         let load_session = find_logged_request(&fixture.request_log(), "session/load");
         assert_eq!(
-            load_session["params"]["mcpServers"][0]["id"],
-            json!("filesystem")
+            load_session["params"]["mcpServers"][0]["name"],
+            json!("Filesystem")
         );
         let config = session
             .session_config_state

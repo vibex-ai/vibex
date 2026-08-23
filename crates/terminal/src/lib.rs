@@ -592,6 +592,38 @@ impl TerminalManager {
         Ok(runtime.session.clone())
     }
 
+    /// Kills the child process while keeping the terminal registered.
+    ///
+    /// ACP defines `terminal/kill` as "kill a terminal without releasing it",
+    /// so an agent may still call `terminal/output` and
+    /// `terminal/wait_for_exit` afterwards and only `terminal/release` retires
+    /// the handle. Dropping the registry entry on kill turns those follow-up
+    /// calls into `terminal_not_found`, which the agent surfaces as a generic
+    /// transport failure with the command output lost.
+    ///
+    /// The session deliberately stays `Running` until the child is reaped:
+    /// `refresh_exit_status` is the only writer of `exit_status`, and it skips
+    /// terminals that already left the running state. Marking the session
+    /// killed here would strand `wait_for_exit` on a status that never
+    /// resolves.
+    pub fn kill_retaining(&self, terminal_id: &TerminalId) -> VibexResult<TerminalSession> {
+        let handle = self.runtime_handle(terminal_id)?;
+        let mut runtime = lock_runtime(&handle)?;
+        refresh_exit_status(&mut runtime)?;
+        if runtime.session.status != TerminalStatus::Running {
+            return Ok(runtime.session.clone());
+        }
+        if let Err(err) = runtime.child.kill() {
+            return Err(VibexError::process(
+                "terminal_kill_failed",
+                "failed to kill terminal process",
+            )
+            .with_diagnostic("error", err.to_string()));
+        }
+        refresh_exit_status(&mut runtime)?;
+        Ok(runtime.session.clone())
+    }
+
     /// Returns `None` while the child is still running and a stable exit
     /// result after it has terminated.
     pub fn process_exit_status(
@@ -1188,6 +1220,49 @@ fn command_label() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_retaining_keeps_output_and_exit_status_readable() {
+        let manager = TerminalManager::new();
+        let root = std::env::temp_dir();
+        let session = manager
+            .create_command(
+                &root,
+                TerminalCommandRequest {
+                    workspace_id: WorkspaceId::new(),
+                    title: None,
+                    command: "sleep".to_string(),
+                    args: vec!["30".to_string()],
+                    cwd: Some(root.to_string_lossy().into_owned()),
+                    env: Vec::new(),
+                    rows: 24,
+                    cols: 80,
+                },
+            )
+            .unwrap();
+
+        manager.kill_retaining(&session.id).unwrap();
+
+        // ACP kill does not release: output and the exit status stay
+        // available until the agent calls release explicitly.
+        manager.snapshot(&session.id).unwrap();
+        let mut exit_status = None;
+        for _ in 0..200 {
+            if let Some(status) = manager.process_exit_status(&session.id).unwrap() {
+                exit_status = Some(status);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(exit_status.is_some(), "killed child should report an exit");
+
+        manager.release(&session.id).unwrap();
+        assert_eq!(
+            manager.snapshot(&session.id).unwrap_err().code,
+            "terminal_not_found"
+        );
+    }
 
     #[test]
     fn pty_smoke_captures_marker() {

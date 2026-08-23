@@ -337,6 +337,10 @@ pub struct AcpAgentCompatibility {
     pub adapter_id: AcpAdapterId,
     pub distribution: AcpAdapterDistribution,
     pub command_variants: Vec<CommandVariant>,
+    /// Environment the adapter requires to honour the ACP wire contract.
+    /// Applied at spawn only when the launch environment does not already
+    /// define the key, so an explicit user or profile value stays authoritative.
+    pub required_launch_env: Vec<(String, String)>,
     pub mcp_forwarding: CompatibilitySupport,
     pub safe_multi_session: CompatibilitySupport,
     pub restore_policy: RestorePolicy,
@@ -885,6 +889,7 @@ fn claude_descriptor() -> VibexResult<AcpAgentCompatibility> {
             args: Vec::new(),
             version_args: vec!["--version".to_string()],
         }],
+        required_launch_env: Vec::new(),
         mcp_forwarding: CompatibilitySupport::supported(
             "real bridge contract schema v2: claude-agent-acp@0.64.2",
         ),
@@ -981,6 +986,14 @@ fn codex_descriptor() -> VibexResult<AcpAgentCompatibility> {
             args: Vec::new(),
             version_args: vec!["--version".to_string()],
         }],
+        // codex-acp filters MCP configuration down to the project `.codex`
+        // layer, which silently drops every server the host forwards over the
+        // wire. Without this the whole `session/new.mcpServers` path is a
+        // no-op for Codex even though both sides report success.
+        required_launch_env: vec![(
+            "DISABLE_MCP_CONFIG_FILTERING".to_string(),
+            "true".to_string(),
+        )],
         mcp_forwarding: CompatibilitySupport::supported(
             "real bridge contract schema v2: codex-acp@1.1.9 + @openai/codex@0.146.0",
         ),
@@ -1202,6 +1215,28 @@ mod tests {
         assert!(agent_supports_session_config_probe(
             &AgentId::parse("gemini").unwrap()
         ));
+    }
+
+    #[test]
+    fn codex_requires_the_mcp_config_filtering_opt_out() {
+        let registry = registry();
+        let codex = registry
+            .for_agent(&AgentId::parse(CODEX_AGENT_ID).unwrap())
+            .unwrap();
+        assert_eq!(
+            codex.required_launch_env,
+            vec![(
+                "DISABLE_MCP_CONFIG_FILTERING".to_string(),
+                "true".to_string()
+            )]
+        );
+        assert!(
+            registry
+                .for_agent(&AgentId::parse(CLAUDE_AGENT_ID).unwrap())
+                .unwrap()
+                .required_launch_env
+                .is_empty()
+        );
     }
 
     #[test]

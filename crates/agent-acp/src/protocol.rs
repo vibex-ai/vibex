@@ -24,13 +24,15 @@
 //!    [`agent_client_protocol_schema::v1::ClientCapabilities`] surface cannot
 //!    represent them, so [`build_initialize_params`] serializes the typed base
 //!    and then splices these extension keys back in.
-//! 2. `session/new.mcpServers` on the current wire uses the Vibex descriptor
-//!    shape `{id, name, transport, command|url, args}` while
-//!    the official [`agent_client_protocol_schema::v1::McpServer`] wire shape
-//!    is different. The builder keeps the local descriptor serialization and
-//!    splices it into the typed request base.
-//! 3. `session/load` reuses the same local `mcpServers` quirk (2).
-//! 4. Inbound decoding is deliberately tolerant: the runtime accepts looser
+//! 2. `session/new.mcpServers` and `session/load.mcpServers` are serialized by
+//!    the runtime through the official
+//!    [`agent_client_protocol_schema::v1::McpServer`] types and spliced into
+//!    the typed request base, because the pinned request builders do not
+//!    expose the field. Real adapters wrap `mcpServers` in a skip-on-error
+//!    array, so a non-conforming entry is dropped without any error on either
+//!    side; the shape must stay schema-exact (`env` / `headers` are required
+//!    arrays, HTTP and SSE carry the `type` discriminator).
+//! 3. Inbound decoding is deliberately tolerant: the runtime accepts looser
 //!    shapes than the fixed schema (e.g. permissive permission-request and
 //!    `session/update` payloads from real adapters). [`decode_incoming`]
 //!    therefore classifies by method through the operation matrix and keeps
@@ -606,7 +608,7 @@ fn envelope_key_is_sensitive(key: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// A standard (matrix-known) inbound message. The raw `params` stay
-/// authoritative for the runtime handlers (quirk 5 in the module docs);
+/// authoritative for the runtime handlers (quirk 3 in the module docs);
 /// `operation` is the typed interpretation of the method.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StandardAcpMessage {
@@ -769,7 +771,7 @@ pub(crate) fn build_logout_params() -> Value {
 }
 
 /// Build `session/new` params: typed base (`cwd`) plus the local
-/// `mcpServers` descriptor serialization (quirk 2).
+/// schema-exact `mcpServers` serialization (quirk 2).
 pub(crate) fn build_session_new_params(cwd: &Path, mcp_servers: Value) -> Value {
     let request = NewSessionRequest::new(cwd.display().to_string());
     let mut params = serde_json::to_value(&request).unwrap_or_else(|_| json!({}));

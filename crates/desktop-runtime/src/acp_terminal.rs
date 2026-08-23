@@ -91,8 +91,10 @@ impl AcpTerminalHost for DesktopAcpTerminalHost {
         )
     }
 
+    /// ACP kill must not retire the terminal: the agent still reads the final
+    /// output and the exit status afterwards and releases it explicitly.
     async fn kill(&self, terminal_id: &TerminalId) -> VibexResult<()> {
-        match self.manager.kill(terminal_id) {
+        match self.manager.kill_retaining(terminal_id) {
             Ok(_) => Ok(()),
             Err(error) if error.code == "terminal_not_found" => Ok(()),
             Err(error) => Err(error),
@@ -171,6 +173,38 @@ mod tests {
     fn terminal_output_tail_preserves_utf8_boundaries() {
         assert_eq!(tail_utf8("a你好", 4), ("好".to_string(), true));
         assert_eq!(tail_utf8("safe", 8), ("safe".to_string(), false));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acp_kill_keeps_output_and_exit_status_available_until_release() {
+        let manager = TerminalManager::new();
+        let host = DesktopAcpTerminalHost::new(manager.clone());
+        let terminal_id = host
+            .create(AcpTerminalCreateRequest {
+                session_id: None,
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), "echo started; sleep 30".to_string()],
+                cwd: Some(std::env::temp_dir()),
+                env: Vec::new(),
+                title: None,
+            })
+            .await
+            .unwrap();
+
+        host.kill(&terminal_id).await.unwrap();
+
+        // ACP: kill does not release. The agent still reads the final output
+        // and the exit status before retiring the terminal.
+        host.output(&terminal_id, 1024).await.unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(5), host.wait_for_exit(&terminal_id))
+            .await
+            .expect("killed terminal must report an exit status")
+            .unwrap();
+        assert!(status.exit_code.is_some() || status.signal.is_some());
+
+        host.release(&terminal_id).await.unwrap();
+        assert!(host.output(&terminal_id, 1024).await.is_err());
     }
 
     #[cfg(unix)]

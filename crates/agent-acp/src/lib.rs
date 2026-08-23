@@ -54,6 +54,7 @@ mod bridge_contract;
 mod claude;
 mod codex;
 mod events;
+mod host_fs;
 mod managed_adapter;
 mod private_fs;
 mod process_environment;
