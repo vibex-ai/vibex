@@ -16,7 +16,7 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath,
-    Selectable as _, Sizable as _, Size, StyledExt as _, WindowExt as _,
+    Selectable as _, Sizable as _, Size, StyledExt as _, Theme, WindowExt as _,
     button::{Button, ButtonRounded, ButtonVariants as _, DropdownButton},
     calendar::Date,
     date_picker::{DatePicker, DatePickerEvent, DatePickerState},
@@ -24,6 +24,7 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem},
+    notification::Notification,
     resizable::{h_resizable, resizable_panel, v_resizable},
     scroll::ScrollableElement as _,
     searchable_list::SearchableListItem,
@@ -113,6 +114,47 @@ const FILE_SEARCH_RESULT_LIMIT: u32 = 200;
 const WORKTREE_CONFLICT_RENDER_LIMIT: usize = 256;
 pub const CODE_WORKBENCH_MAX_EAGER_ROWS: usize = 5_000;
 pub const CODE_WORKBENCH_INITIAL_DIFF_ROWS: usize = 500;
+
+struct GitMutationNotification;
+
+fn git_mutation_notice(kind: GitMutationKind) -> Option<&'static str> {
+    match kind {
+        GitMutationKind::Fetch => Some(locale::text(
+            "Pulling latest changes...",
+            "正在拉取最新更改...",
+            "正在擷取最新變更...",
+        )),
+        GitMutationKind::Push => Some(locale::text(
+            "Pushing local commits...",
+            "正在推送本地提交...",
+            "正在推送本機提交...",
+        )),
+        GitMutationKind::Revert => Some(locale::text(
+            "Rolling back selected changes...",
+            "正在回滚所选更改...",
+            "正在回復所選變更...",
+        )),
+        _ => None,
+    }
+}
+
+fn push_git_mutation_notice(
+    kind: GitMutationKind,
+    window: &mut Window,
+    cx: &mut Context<CodeWorkbench>,
+) {
+    let Some(message) = git_mutation_notice(kind) else {
+        return;
+    };
+    Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
+    window.push_notification(
+        Notification::info(message)
+            .id::<GitMutationNotification>()
+            .autohide(true)
+            .on_click(|_, _, _| {}),
+        cx,
+    );
+}
 
 #[derive(Debug)]
 struct PatchListState {
@@ -612,6 +654,7 @@ struct CodeRightRailGitTreeRow {
 struct CodeRightRailGitProjection {
     mode: GitWorkbenchMode,
     pending: bool,
+    pending_kind: Option<GitMutationKind>,
     selected_count: usize,
     root_selection: GitPathSelectionState,
     selection_states: Arc<BTreeMap<String, GitPathSelectionState>>,
@@ -748,9 +791,11 @@ fn right_rail_git_projection(
         })
         .collect::<Vec<_>>();
 
+    let pending_kind = git.pending_mutation.as_ref().map(|scope| scope.kind);
     CodeRightRailGitProjection {
         mode: git.mode,
-        pending: git.pending_mutation.is_some(),
+        pending: pending_kind.is_some(),
+        pending_kind,
         selected_count: git.selected_path_count(),
         root_selection,
         selection_states: Arc::new(selection_states),
@@ -4834,7 +4879,7 @@ impl CodeWorkbench {
         cx.notify();
     }
 
-    pub(crate) fn revert_selected(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn revert_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let paths = self.git.selected_change_paths();
         let Some(workspace) = self.workspace.clone() else {
             return;
@@ -4856,6 +4901,7 @@ impl CodeWorkbench {
                 None,
             ),
             move |git| git.revert(&request).map(Some),
+            Some(window),
             cx,
         );
     }
@@ -4905,11 +4951,17 @@ impl CodeWorkbench {
                 git.commit(&request)?;
                 git.status(&status_workspace).map(Some)
             },
+            None,
             cx,
         );
     }
 
-    pub(crate) fn remote_action(&mut self, kind: GitRemoteActionKind, cx: &mut Context<Self>) {
+    pub(crate) fn remote_action(
+        &mut self,
+        kind: GitRemoteActionKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(workspace) = self.workspace.clone() else {
             return;
         };
@@ -4934,6 +4986,7 @@ impl CodeWorkbench {
                     git.status(&status_workspace).map(Some)
                 }
             },
+            Some(window),
             cx,
         );
     }
@@ -4942,6 +4995,7 @@ impl CodeWorkbench {
         &mut self,
         scope: vibex_desktop_model::GitMutationScope,
         operation: F,
+        mut window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) where
         F: FnOnce(GitHandle) -> VibexResult<Option<GitStatusSummary>> + Send + 'static,
@@ -4960,6 +5014,9 @@ impl CodeWorkbench {
             self.error = Some("Another Git mutation is already running".into());
             cx.notify();
             return;
+        }
+        if let Some(window) = window.as_deref_mut() {
+            push_git_mutation_notice(scope.kind, window, cx);
         }
         let operation_id = scope.operation_id;
         let runner = gpui_tokio::Tokio::spawn(cx, async move { operation(runtime.git()) });
@@ -7679,7 +7736,7 @@ impl CodeRightRail {
         &mut self,
         title: impl Into<SharedString>,
         message: impl Into<SharedString>,
-        action: impl Fn(&mut CodeWorkbench, &mut Context<CodeWorkbench>) + 'static,
+        action: impl Fn(&mut CodeWorkbench, &mut Window, &mut Context<CodeWorkbench>) + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -7710,8 +7767,8 @@ impl CodeRightRail {
                             ),
                         ),
                 )
-                .on_ok(move |_, _, cx| {
-                    let _ = workbench.update(cx, |workbench, cx| action(workbench, cx));
+                .on_ok(move |_, window, cx| {
+                    let _ = workbench.update(cx, |workbench, cx| action(workbench, window, cx));
                     true
                 })
         });
@@ -9969,6 +10026,7 @@ impl CodeRightRail {
             workspace_available,
             mode,
             pending,
+            pending_kind,
             status_loading,
             selected_count,
             root_selection,
@@ -9984,6 +10042,7 @@ impl CodeRightRail {
             self.projection.files.workspace_available,
             git.mode,
             git.pending,
+            git.pending_kind,
             git.status_loading,
             git.selected_count,
             git.root_selection,
@@ -10152,10 +10211,15 @@ impl CodeRightRail {
                                 .icon(Icon::default().path("icons/vibex/download.svg"))
                                 .text_color(cx.theme().sidebar_foreground.opacity(0.48))
                                 .tooltip(locale::text("Fetch", "获取", "擷取"))
+                                .loading(pending_kind == Some(GitMutationKind::Fetch))
                                 .disabled(pending)
-                                .on_click(cx.listener(|this, _, _, cx| {
+                                .on_click(cx.listener(|this, _, window, cx| {
                                     this.update_workbench(cx, |workbench, cx| {
-                                        workbench.remote_action(GitRemoteActionKind::Fetch, cx)
+                                        workbench.remote_action(
+                                            GitRemoteActionKind::Fetch,
+                                            window,
+                                            cx,
+                                        )
                                     })
                                 })),
                         ),
@@ -10172,10 +10236,15 @@ impl CodeRightRail {
                                 .icon(Icon::default().path("icons/vibex/upload.svg"))
                                 .text_color(cx.theme().sidebar_foreground.opacity(0.48))
                                 .tooltip(locale::text("Push", "推送", "推送"))
+                                .loading(pending_kind == Some(GitMutationKind::Push))
                                 .disabled(pending)
-                                .on_click(cx.listener(|this, _, _, cx| {
+                                .on_click(cx.listener(|this, _, window, cx| {
                                     this.update_workbench(cx, |workbench, cx| {
-                                        workbench.remote_action(GitRemoteActionKind::Push, cx)
+                                        workbench.remote_action(
+                                            GitRemoteActionKind::Push,
+                                            window,
+                                            cx,
+                                        )
                                     })
                                 })),
                         ),
@@ -10255,6 +10324,7 @@ impl CodeRightRail {
                                     "回滚所选更改",
                                     "回復所選變更",
                                 ))
+                                .loading(pending_kind == Some(GitMutationKind::Revert))
                                 .disabled(
                                     pending
                                         || lifecycle_action_pending
@@ -10273,7 +10343,9 @@ impl CodeRightRail {
                                             "这将丢弃所选工作树更改。",
                                             "這將捨棄所選工作樹變更。",
                                         ),
-                                        |workbench, cx| workbench.revert_selected(cx),
+                                        |workbench, window, cx| {
+                                            workbench.revert_selected(window, cx)
+                                        },
                                         window,
                                         cx,
                                     )
@@ -10427,6 +10499,7 @@ impl CodeRightRail {
 
     fn render_git_changes(&mut self, pending: bool, cx: &mut Context<Self>) -> AnyElement {
         let change_row_count = self.projection.git.change_rows.len();
+        let pending_kind = self.projection.git.pending_kind;
         let commit_message = self.projection.commit_message.clone();
         let commit_type = self.projection.commit_type.clone();
         let amend = self.projection.amend_commit;
@@ -10647,6 +10720,7 @@ impl CodeRightRail {
                                     .px_4()
                                     .icon(Icon::default().path("icons/vibex/rotate-ccw.svg"))
                                     .label(locale::text("Rollback", "回滚", "回復"))
+                                    .loading(pending_kind == Some(GitMutationKind::Revert))
                                     .disabled(action_pending || selected_count == 0)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.confirm_git_action(
@@ -10660,7 +10734,9 @@ impl CodeRightRail {
                                                 "这将丢弃所选工作树更改。",
                                                 "這將捨棄所選工作樹變更。",
                                             ),
-                                            |workbench, cx| workbench.revert_selected(cx),
+                                            |workbench, window, cx| {
+                                                workbench.revert_selected(window, cx)
+                                            },
                                             window,
                                             cx,
                                         )
@@ -14281,6 +14357,31 @@ mod tests {
         assert!(!changes.contains("更多提交操作"));
         assert!(source.contains("toggle-all-git-directories"));
         assert!(source.contains("select-git-tree-row-wrapper:"));
+    }
+
+    #[test]
+    fn git_mutation_feedback_is_top_centered_and_action_specific() {
+        assert_eq!(
+            git_mutation_notice(GitMutationKind::Fetch),
+            Some("Pulling latest changes...")
+        );
+        assert_eq!(
+            git_mutation_notice(GitMutationKind::Push),
+            Some("Pushing local commits...")
+        );
+        assert_eq!(
+            git_mutation_notice(GitMutationKind::Revert),
+            Some("Rolling back selected changes...")
+        );
+        assert_eq!(git_mutation_notice(GitMutationKind::Commit), None);
+
+        let source = include_str!("code_workbench.rs");
+        assert!(
+            source.contains("Theme::global_mut(cx).notification.placement = Anchor::TopCenter;")
+        );
+        assert!(source.contains("pending_kind == Some(GitMutationKind::Fetch)"));
+        assert!(source.contains("pending_kind == Some(GitMutationKind::Push)"));
+        assert!(source.contains("pending_kind == Some(GitMutationKind::Revert)"));
     }
 
     #[test]
