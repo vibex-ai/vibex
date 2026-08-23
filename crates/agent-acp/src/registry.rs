@@ -164,6 +164,11 @@ pub enum TranscriptStrategy {
 pub enum AgentEventEnricherKind {
     Claude,
     Codex,
+    /// Grok surfaces plan and question activity through `_x.ai` extensions
+    /// rather than standard tool calls.
+    Grok,
+    /// CodeBuddy virtualizes MCP tool calls behind `DeferExecuteTool`.
+    CodeBuddy,
     Passthrough,
 }
 

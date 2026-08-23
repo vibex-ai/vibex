@@ -1365,7 +1365,7 @@ fn materialized_probe_process_args(
     config: &vibex_core::AcpProviderConfig,
     projection: Option<&vibex_config_switch::ResolvedAgentProviderProjection>,
 ) -> Vec<String> {
-    let mut args = effective_acp_process_args(config, agent_id == "opencode");
+    let mut args = effective_acp_process_args(config, agent_id);
     if let Some(projection) = projection {
         append_projection_process_args(agent_id, &mut args, &projection.process_args);
     }

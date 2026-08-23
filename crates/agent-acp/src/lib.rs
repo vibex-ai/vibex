@@ -53,7 +53,9 @@ mod auth;
 mod bridge_contract;
 mod claude;
 mod codex;
+mod dialect;
 mod events;
+mod grok;
 mod host_fs;
 mod managed_adapter;
 mod private_fs;
@@ -83,6 +85,10 @@ pub use codex::{
     CODEX_FORK_EXTENSION_VERSION, CodexAcpSmokeResult, CodexForkPlan, codex_acp_runtime_home_path,
     decode_codex_extension, plan_codex_fork, prepare_codex_acp_runtime_home,
     run_codex_agent_acp_smoke, write_codex_acp_runtime_config,
+};
+pub use dialect::{
+    AgentDialectProfile, AgentHostRequestDialect, AgentSupportTier, DialectLaunchArg,
+    LaunchArgPlacement, McpWireDelivery, agent_dialect_profile, agent_dialect_profiles,
 };
 pub use events::{
     AgentEventEnricher, AgentEventInput, AgentEventInputSource, CanonicalAgentEvent,

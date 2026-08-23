@@ -111,6 +111,13 @@ use vibex_db::{
 };
 
 use crate::auth::{append_known_terminal_auth_fallback, parse_initialize_auth_catalog};
+use crate::dialect::{
+    AgentHostRequestDialect, LaunchArgPlacement, McpWireDelivery, agent_dialect_profile,
+};
+use crate::grok::{
+    build_grok_ask_response, build_grok_exit_plan_response, grok_ask_skip_response,
+    grok_exit_plan_keep_planning_response, parse_grok_ask_user_question, parse_grok_exit_plan_mode,
+};
 use crate::host_fs::{resolve_contained_write_path, write_host_file_atomic};
 use crate::process_environment::{
     detach_from_controlling_terminal, sanitize_inherited_appimage_environment,
@@ -1228,6 +1235,34 @@ struct PendingPermission {
 
 struct PendingElicitation {
     rpc_id: Value,
+    /// The private request this card was created for, or `None` for a
+    /// standard `elicitation/create`. The response encoding differs per
+    /// dialect, so it must be remembered until the user resolves the card.
+    dialect: Option<AgentHostRequestDialect>,
+}
+
+impl PendingElicitation {
+    fn cancelled_response(&self) -> Value {
+        match self.dialect {
+            Some(AgentHostRequestDialect::GrokAskUserQuestion) => grok_ask_skip_response(),
+            Some(AgentHostRequestDialect::GrokExitPlanMode) => {
+                grok_exit_plan_keep_planning_response()
+            }
+            None => elicitation_cancelled_response(),
+        }
+    }
+
+    fn encode(&self, resolution: &vibex_core::ElicitationResolution) -> VibexResult<Value> {
+        match self.dialect {
+            Some(AgentHostRequestDialect::GrokAskUserQuestion) => {
+                Ok(build_grok_ask_response(resolution))
+            }
+            Some(AgentHostRequestDialect::GrokExitPlanMode) => {
+                Ok(build_grok_exit_plan_response(resolution))
+            }
+            None => elicitation_response_value(resolution),
+        }
+    }
 }
 
 struct PendingTerminalCreate {
@@ -2330,7 +2365,7 @@ impl AcpSessionAttachment {
         &self,
         request_id: &str,
         process: &AcpProcess,
-        response: Value,
+        resolution: &vibex_core::ElicitationResolution,
     ) -> VibexResult<bool> {
         let mut state = self
             .state
@@ -2339,6 +2374,10 @@ impl AcpSessionAttachment {
         let Some(pending) = state.pending_elicitations.get(request_id) else {
             return Ok(false);
         };
+        // The encoding is chosen from the request that created the card, not
+        // from the agent identity: a Grok session still receives standard
+        // `elicitation/create` requests alongside its private ones.
+        let response = pending.encode(resolution)?;
         process.respond_ok_checked(pending.rpc_id.clone(), response)?;
         state.pending_elicitations.remove(request_id);
         Ok(true)
@@ -2787,7 +2826,8 @@ impl AcpSessionAttachment {
             process.respond_ok(pending.rpc_id, permission_cancelled_response());
         }
         for pending in elicitations {
-            process.respond_ok(pending.rpc_id, elicitation_cancelled_response());
+            let response = pending.cancelled_response();
+            process.respond_ok(pending.rpc_id, response);
         }
         for pending in terminal_creates {
             process.respond_error(pending.rpc_id, -32000, "terminal permission cancelled");
@@ -3596,13 +3636,33 @@ impl AcpProcess {
 
     /// MCP servers that may actually be placed on the wire for this process.
     ///
-    /// Stdio is mandatory for every agent; HTTP and SSE entries are only
-    /// forwarded when initialize advertised `mcpCapabilities`. Forwarding an
-    /// unsupported transport either fails `session/new` outright or is
-    /// dropped by the agent without a diagnostic, so the entry is skipped
+    /// Two independent gates apply. The agent's dialect decides whether wire
+    /// forwarding reaches the model at all — an agent that reads its own MCP
+    /// config would double-register the same servers, and one that accepts the
+    /// field but drops it would advertise tools it can never call. Then, for
+    /// agents that do deliver, HTTP and SSE entries are only forwarded when
+    /// initialize advertised `mcpCapabilities`; stdio is mandatory for every
+    /// agent. Forwarding an unsupported transport either fails `session/new`
+    /// outright or is dropped without a diagnostic, so entries are skipped
     /// here with an explicit warning instead.
     fn wire_mcp_servers(&self) -> Vec<AcpMcpServerDescriptor> {
         if self.mcp_servers.is_empty() {
+            return Vec::new();
+        }
+        let delivery = agent_dialect_profile(self.agent_id.as_str()).mcp_wire_delivery;
+        if !delivery.forwards_servers() {
+            self.log_context.for_operation("session/new").emit(
+                RuntimeLogLevel::Info,
+                "acp_mcp_wire_forwarding_skipped",
+                RuntimeMetricResult::Success,
+                Some(match delivery {
+                    McpWireDelivery::NativeConfig => "acp_mcp_native_config",
+                    McpWireDelivery::AcceptedButDropped => "acp_mcp_accepted_but_dropped",
+                    McpWireDelivery::Rejected => "acp_mcp_rejected",
+                    McpWireDelivery::Delivered => "acp_mcp_delivered",
+                }),
+                None,
+            );
             return Vec::new();
         }
         let (supports_http, supports_sse) = self
@@ -4335,11 +4395,75 @@ impl AcpProcess {
             AcpOperation::TerminalWaitForExit => self.handle_terminal_wait_for_exit(id, &params),
             // Vibex does not host this operation: single-operation
             // method-not-found response; the connection stays alive.
-            _ => self.respond_error(
-                id,
-                protocol::JSON_RPC_METHOD_NOT_FOUND,
-                &format!("Method not found: {method}"),
-            ),
+            _ => {
+                // Unless the agent's dialect declares that it *blocks* on this
+                // private request. There, method-not-found is not a downgrade:
+                // the agent's own tool call fails outright.
+                if let Some(dialect) =
+                    agent_dialect_profile(self.agent_id.as_str()).handles_host_request(method)
+                {
+                    self.handle_dialect_host_request(dialect, id, &params);
+                    return;
+                }
+                self.respond_error(
+                    id,
+                    protocol::JSON_RPC_METHOD_NOT_FOUND,
+                    &format!("Method not found: {method}"),
+                )
+            }
+        }
+    }
+
+    /// Bridge a blocking private request onto the elicitation surface.
+    ///
+    /// Every early return answers with the dialect's fall-back outcome rather
+    /// than an error, so an unparseable or unroutable request degrades to the
+    /// agent's own pre-bridge behavior (inert rendering for a question, plan
+    /// mode staying active for an approval) instead of failing its tool call.
+    fn handle_dialect_host_request(
+        self: &Arc<Self>,
+        dialect: AgentHostRequestDialect,
+        rpc_id: Value,
+        params: &Value,
+    ) {
+        let fallback = || match dialect {
+            AgentHostRequestDialect::GrokAskUserQuestion => grok_ask_skip_response(),
+            AgentHostRequestDialect::GrokExitPlanMode => grok_exit_plan_keep_planning_response(),
+        };
+        let admission = self.with_routed_params(params, dialect.method(), |attachment| {
+            let request_id = RequestId::new();
+            let normalized = match dialect {
+                AgentHostRequestDialect::GrokAskUserQuestion => parse_grok_ask_user_question(
+                    params,
+                    request_id.clone(),
+                    attachment.logical_session_id().clone(),
+                ),
+                AgentHostRequestDialect::GrokExitPlanMode => parse_grok_exit_plan_mode(
+                    params,
+                    request_id.clone(),
+                    attachment.logical_session_id().clone(),
+                ),
+            };
+            let Some(normalized) = normalized else {
+                return false;
+            };
+            if !attachment.insert_pending_elicitation(
+                &request_id,
+                PendingElicitation {
+                    rpc_id: rpc_id.clone(),
+                    dialect: Some(dialect),
+                },
+            ) {
+                return false;
+            }
+            let delivered = attachment.emit_turn_event(AcpEvent::ElicitationRequest(normalized));
+            if !delivered {
+                attachment.remove_pending_elicitation(request_id.as_str());
+            }
+            delivered
+        });
+        if admission != Some(true) {
+            self.respond_ok(rpc_id, fallback());
         }
     }
 
@@ -4442,6 +4566,7 @@ impl AcpProcess {
                     &request_id,
                     PendingElicitation {
                         rpc_id: rpc_id.clone(),
+                        dialect: None,
                     },
                 ) {
                     return false;
@@ -7880,7 +8005,7 @@ impl AcpRuntimeClient {
             // chunks) and lets failed turns masquerade as normal completions.
             let event_enricher = descriptor
                 .map(|descriptor| descriptor.event_enricher)
-                .unwrap_or(AgentEventEnricherKind::Passthrough);
+                .unwrap_or_else(|| agent_dialect_profile(agent_id.as_str()).event_enricher);
             return Ok(EffectiveAdapterIdentity {
                 compatibility_identity: format!("adapter={adapter_id}@{version}"),
                 adapter_id,
@@ -7909,7 +8034,11 @@ impl AcpRuntimeClient {
                 adapter_version: "unknown".to_string(),
                 compatibility_identity: "unmanaged".to_string(),
                 exact_descriptor: false,
-                event_enricher: AgentEventEnricherKind::Passthrough,
+                // No managed descriptor, but the agent family's dialect is
+                // still known: an agent whose tool calls are virtualized or
+                // whose plan arrives as an extension would otherwise render as
+                // anonymous tool cards.
+                event_enricher: agent_dialect_profile(agent_id.as_str()).event_enricher,
             }))
     }
 
@@ -8173,11 +8302,21 @@ impl AcpRuntimeClient {
             .is_some_and(|descriptor| descriptor.auth_context.supports_logout)
     }
 
+    /// Credentials cleared before launching under the agent's own account.
+    ///
+    /// Only this path scrubs: signing in through the agent's CLI is exactly
+    /// the case where an inherited API key from a dev shell would be picked up
+    /// and validated instead of the browser-login credential. A provider
+    /// profile declares its credentials explicitly and stays authoritative.
     fn agent_account_env_unsets(&self, agent_id: &AgentId) -> Vec<String> {
-        self.compatibility_registry
-            .for_agent(agent_id)
-            .map(|descriptor| descriptor.auth_context.credential_env_keys_to_unset.clone())
-            .unwrap_or_default()
+        if let Some(descriptor) = self.compatibility_registry.for_agent(agent_id) {
+            return descriptor.auth_context.credential_env_keys_to_unset.clone();
+        }
+        agent_dialect_profile(agent_id.as_str())
+            .credential_env_keys_to_unset
+            .iter()
+            .map(|key| (*key).to_string())
+            .collect()
     }
 
     /// Discovers models from the exact default-account launch identity. The
@@ -9575,7 +9714,7 @@ impl AcpRuntimeClient {
             auth_source_revision,
             process_config_revision: 0,
             command: config.command.clone(),
-            args: effective_acp_process_args(config, agent_id.as_str() == OPENCODE_AGENT_ID),
+            args: effective_acp_process_args(config, agent_id.as_str()),
             cwd_policy: config
                 .cwd_template
                 .clone()
@@ -9610,8 +9749,7 @@ impl AcpRuntimeClient {
         let legacy_projection = self
             .config_service
             .legacy_agent_provider_projection_runtime_plan(profile_id, &workspace_key)?;
-        let mut process_args =
-            effective_acp_process_args(config, profile.agent_id.as_str() == OPENCODE_AGENT_ID);
+        let mut process_args = effective_acp_process_args(config, profile.agent_id.as_str());
         let projection_args = match projection_args {
             Some(args) => args.to_vec(),
             None => legacy_projection
@@ -10195,7 +10333,7 @@ impl AcpRuntimeClient {
         let process_args = match materialized_args {
             Some(args) => args,
             None => {
-                let mut args = effective_acp_process_args(config, opencode_error_bridge_enabled);
+                let mut args = effective_acp_process_args(config, agent_id.as_str());
                 if let RuntimeAuthSource::ProviderProfile {
                     provider_profile_id,
                 } = auth_source
@@ -10245,13 +10383,19 @@ impl AcpRuntimeClient {
         for key in env_unsets {
             command.env_remove(key);
         }
-        // Adapter-required environment. An explicit overlay value wins, so a
-        // profile can still opt out of a compatibility default.
+        // Adapter- and dialect-required environment. An explicit overlay value
+        // wins, so a profile can still opt out of a compatibility default.
         let required_launch_env = self
             .compatibility_registry
             .for_agent(&agent_id)
             .map(|descriptor| descriptor.required_launch_env.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                agent_dialect_profile(agent_id.as_str())
+                    .required_launch_env
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                    .collect()
+            });
         for (key, value) in required_launch_env {
             if !env_overlays
                 .iter()
@@ -10764,7 +10908,7 @@ impl AcpRuntimeClient {
                 descriptor.expected_compatibility_identity().to_string() == compatibility_identity
             })
             .map(|descriptor| descriptor.restore_policy)
-            .unwrap_or(RestorePolicy::ResumeThenLoadThenNew)
+            .unwrap_or_else(|| agent_dialect_profile(agent_id.as_str()).restore_policy)
     }
 
     fn restore_key_for_binding(
@@ -13430,12 +13574,36 @@ fn acp_process_strategy_name(strategy: AcpProcessStrategy) -> &'static str {
     }
 }
 
+/// Process arguments for one launch: the configured arguments plus whatever
+/// the agent's dialect requires.
+///
+/// Placement matters. A CLI whose root parser owns a flag rejects it after the
+/// subcommand (`grok --no-auto-update agent stdio`), so leading dialect
+/// arguments go in front of everything the profile configured.
 pub(super) fn effective_acp_process_args(
     config: &AcpProviderConfig,
-    is_opencode: bool,
+    agent_id: &str,
 ) -> Vec<String> {
-    let mut args = config.args.clone();
-    if !is_opencode {
+    let profile = agent_dialect_profile(agent_id);
+    let mut args = Vec::with_capacity(config.args.len() + profile.launch_args.len());
+    args.extend(
+        profile
+            .launch_args
+            .iter()
+            .filter(|arg| arg.placement == LaunchArgPlacement::Leading)
+            .map(|arg| arg.value.to_string()),
+    );
+    args.extend(config.args.iter().cloned());
+    args.extend(
+        profile
+            .launch_args
+            .iter()
+            .filter(|arg| arg.placement == LaunchArgPlacement::Trailing)
+            .map(|arg| arg.value.to_string())
+            // A profile that already carries the flag must not get it twice.
+            .filter(|value| !config.args.contains(value)),
+    );
+    if agent_id != OPENCODE_AGENT_ID {
         return args;
     }
 
@@ -15163,7 +15331,6 @@ impl AcpClient for AcpRuntimeClient {
     }
 
     async fn resolve_elicitation(&self, request: AcpElicitationResolution) -> VibexResult<()> {
-        let response = elicitation_response_value(&request.resolution)?;
         let attachment = self
             .current_attachment(&request.binding.session_id)
             .ok_or_else(|| {
@@ -15195,7 +15362,7 @@ impl AcpClient for AcpRuntimeClient {
                     current.respond_to_pending_elicitation(
                         request.resolution.request_id.as_str(),
                         process.as_ref(),
-                        response,
+                        &request.resolution,
                     )
                 })??;
         if !responded {
@@ -18894,9 +19061,9 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
             disabled_tools: Vec::new(),
         };
 
-        assert_eq!(effective_acp_process_args(&config, false), config.args);
+        assert_eq!(effective_acp_process_args(&config, "cline"), config.args);
         assert_eq!(
-            effective_acp_process_args(&config, true),
+            effective_acp_process_args(&config, OPENCODE_AGENT_ID),
             vec!["acp", "--print-logs", "--log-level", "ERROR"]
         );
 
@@ -18905,7 +19072,52 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
             "--print-logs".to_string(),
             "--log-level=INFO".to_string(),
         ];
-        assert_eq!(effective_acp_process_args(&config, true), config.args);
+        assert_eq!(
+            effective_acp_process_args(&config, OPENCODE_AGENT_ID),
+            config.args
+        );
+    }
+
+    #[test]
+    fn dialect_launch_args_bracket_the_configured_arguments() {
+        let mut config = AcpProviderConfig {
+            command: "grok".to_string(),
+            args: vec!["agent".to_string(), "stdio".to_string()],
+            env: Vec::new(),
+            cwd_template: Some("{workspaceRoot}".to_string()),
+            process_strategy: AcpProcessStrategy::PerSession,
+            terminal_tools: false,
+            terminal_auth: false,
+            models: Vec::new(),
+            modes: Vec::new(),
+            features: Vec::new(),
+            disabled_tools: Vec::new(),
+        };
+        // `agent stdio` rejects the flag, so it must lead.
+        assert_eq!(
+            effective_acp_process_args(&config, GROK_AGENT_ID),
+            vec!["--no-auto-update", "agent", "stdio"]
+        );
+
+        config.command = "npx".to_string();
+        config.args = vec![
+            "-y".to_string(),
+            "@google/gemini-cli".to_string(),
+            "--acp".to_string(),
+        ];
+        assert_eq!(
+            effective_acp_process_args(&config, "gemini"),
+            vec!["-y", "@google/gemini-cli", "--acp", "--skip-trust"]
+        );
+        // A profile that already carries the flag must not get it twice.
+        config.args.push("--skip-trust".to_string());
+        assert_eq!(
+            effective_acp_process_args(&config, "gemini"),
+            vec!["-y", "@google/gemini-cli", "--acp", "--skip-trust"]
+        );
+
+        // An agent without a dialect is untouched.
+        assert_eq!(effective_acp_process_args(&config, "cline"), config.args);
     }
 
     #[test]
@@ -19822,11 +20034,13 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
         let process_id = handle.fence().process_instance_id.clone();
         let process = handle.payload().process();
         let request_id = RequestId::new();
-        assert!(
-            handle
-                .payload()
-                .insert_pending_elicitation(&request_id, PendingElicitation { rpc_id: json!(77) },)
-        );
+        assert!(handle.payload().insert_pending_elicitation(
+            &request_id,
+            PendingElicitation {
+                rpc_id: json!(77),
+                dialect: None,
+            },
+        ));
         let binding = test_restore_binding(
             &session_id,
             process
@@ -20981,7 +21195,39 @@ for line in sys.stdin:
             time.sleep(0.1)
         if prompt_mode == "title_error":
             send_stream_error(session_id, True, "AI_RetryError: title generation failed")
-        if "permission" in text:
+        if "grok_ask" in text:
+            pending_prompt_id = mid
+            send({
+                "jsonrpc": "2.0",
+                "id": 992,
+                "method": "_x.ai/ask_user_question",
+                "params": {
+                    "sessionId": session_id,
+                    "toolCallId": "grok-ask-1",
+                    "questions": [
+                        {
+                            "question": "Which database?",
+                            "options": [
+                                {"label": "Postgres", "description": "relational"},
+                                {"label": "SQLite"},
+                            ],
+                        },
+                    ],
+                },
+            })
+        elif "grok_plan" in text:
+            pending_prompt_id = mid
+            send({
+                "jsonrpc": "2.0",
+                "id": 993,
+                "method": "_x.ai/exit_plan_mode",
+                "params": {
+                    "sessionId": session_id,
+                    "toolCallId": "grok-plan-1",
+                    "planContent": "1. survey the code",
+                },
+            })
+        elif "permission" in text:
             pending_prompt_id = mid
             send({
                 "jsonrpc": "2.0",
@@ -21057,7 +21303,36 @@ for line in sys.stdin:
             "id": pending_prompt_id,
             "result": {"stopReason": "end_turn"},
         })
+    elif method is None and msg.get("id") in (992, 993):
+        # Echo the host reply verbatim so the test can assert the exact wire
+        # encoding Grok would receive.
+        send({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "mock-session-1",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {
+                        "type": "text",
+                        "text": "grok reply " + json.dumps(msg.get("result"), sort_keys=True),
+                    },
+                },
+            },
+        })
+        send({
+            "jsonrpc": "2.0",
+            "id": pending_prompt_id,
+            "result": {"stopReason": "end_turn"},
+        })
 "#;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum MockAcpLauncher {
+        PythonInterpreter,
+        #[cfg(unix)]
+        Shebang,
+    }
 
     struct MockAcpFixture {
         root: PathBuf,
@@ -21074,6 +21349,26 @@ for line in sys.stdin:
         }
 
         fn create_for_agent(label: &str, agent_id: Option<vibex_core::AgentId>) -> Option<Self> {
+            Self::create_with_launcher(label, agent_id, MockAcpLauncher::PythonInterpreter)
+        }
+
+        /// A mock launched through its own shebang instead of an explicit
+        /// `python3 <script>`. Required whenever the agent's dialect prepends
+        /// launch flags: those belong to the agent binary, and the Python
+        /// interpreter would reject them before the script ever runs.
+        #[cfg(unix)]
+        fn create_for_agent_executable(
+            label: &str,
+            agent_id: Option<vibex_core::AgentId>,
+        ) -> Option<Self> {
+            Self::create_with_launcher(label, agent_id, MockAcpLauncher::Shebang)
+        }
+
+        fn create_with_launcher(
+            label: &str,
+            agent_id: Option<vibex_core::AgentId>,
+            launcher: MockAcpLauncher,
+        ) -> Option<Self> {
             if which_python().is_none() {
                 eprintln!("skipping mock ACP runtime test: python3 not found on PATH");
                 return None;
@@ -21084,6 +21379,19 @@ for line in sys.stdin:
             std::fs::create_dir_all(&workspace).unwrap();
             let script_path = root.join("mock-acp-agent.py");
             std::fs::write(&script_path, MOCK_ACP_AGENT).unwrap();
+            let (command, command_args) = match launcher {
+                MockAcpLauncher::PythonInterpreter => (
+                    which_python().unwrap(),
+                    vec![script_path.display().to_string()],
+                ),
+                #[cfg(unix)]
+                MockAcpLauncher::Shebang => {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                    (script_path.display().to_string(), Vec::new())
+                }
+            };
             let request_log = root.join("requests.jsonl");
             let db_path = root.join("vibex.db");
             let service = ProviderConfigService::new(db_path.clone());
@@ -21094,8 +21402,8 @@ for line in sys.stdin:
                     account_alias: None,
                     preset_id: None,
                     config: Some(AcpProviderConfig {
-                        command: which_python().unwrap(),
-                        args: vec![script_path.display().to_string()],
+                        command,
+                        args: command_args,
                         env: vec![vibex_core::AcpProviderEnvReference {
                             key: "VIBEX_MOCK_ACP_REQUEST_LOG".to_string(),
                             source: AcpProviderEnvSource::Literal,
@@ -25377,6 +25685,146 @@ for line in sys.stdin:
             event_rx,
             permission_request_id.expect("permission request id"),
         )
+    }
+
+    /// Grok's `_x.ai/ask_user_question` and `_x.ai/exit_plan_mode` are
+    /// blocking requests: a `method-not-found` reply fails the agent's own
+    /// tool call and, for the plan case, strands it in plan mode. Both must
+    /// reach the elicitation surface and answer in Grok's own encoding.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn grok_blocking_host_requests_bridge_to_elicitation_and_answer_in_its_dialect() {
+        let agent_id = AgentId::parse(GROK_AGENT_ID).unwrap();
+        // Grok's dialect prepends `--no-auto-update`, so the mock has to be
+        // the launched program itself.
+        let Some(fixture) =
+            MockAcpFixture::create_for_agent_executable("grok-host-requests", Some(agent_id))
+        else {
+            return;
+        };
+        let client = Arc::new(fixture.client());
+
+        for (prompt, answers, expected_reply) in [
+            (
+                "grok_ask",
+                BTreeMap::from([(
+                    "Which database?".to_string(),
+                    vibex_core::ElicitationAnswerValue::String("Postgres".to_string()),
+                )]),
+                // Answers are keyed by question text: Grok's questions carry
+                // no id and it correlates the reply by the text it sent.
+                r#"{"answers": {"Which database?": "Postgres"}, "outcome": "accepted", "partial_answers": {}}"#,
+            ),
+            (
+                "grok_plan",
+                BTreeMap::from([(
+                    crate::grok::GROK_PLAN_DECISION_FIELD.to_string(),
+                    vibex_core::ElicitationAnswerValue::String("approved".to_string()),
+                )]),
+                r#"{"feedback": "", "outcome": "approved"}"#,
+            ),
+        ] {
+            let session_id = VibexSessionId::new();
+            let session = client
+                .create_session(AcpCreateSessionRequest {
+                    session_id: session_id.clone(),
+                    provider_profile_id: fixture.profile_id.clone(),
+                    model: None,
+                    workspace_root: fixture.workspace.display().to_string(),
+                    runtime_resources: ProviderRuntimeResources::default(),
+                })
+                .await
+                .unwrap();
+            let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let turn_client = Arc::clone(&client);
+            let turn_binding = binding.clone();
+            let turn_session_id = session_id.clone();
+            let workspace_root = fixture.workspace.display().to_string();
+            let mut turn_task = tokio::spawn(async move {
+                prepare_and_send_turn(
+                    &turn_client,
+                    AcpSendTurnRequest {
+                        session_id: turn_session_id,
+                        message_submission_id: None,
+                        required_runtime: None,
+                        text: prompt.to_string(),
+                        attachments: Vec::new(),
+                        workspace_root,
+                        binding: turn_binding,
+                        runtime_resources: ProviderRuntimeResources::default(),
+                        execution_identity: None,
+                        event_sender: Some(event_tx),
+                        usage_execution_context: None,
+                        usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                        usage_event_sender: None,
+                    },
+                )
+                .await
+            });
+
+            let request;
+            loop {
+                tokio::select! {
+                    event = event_rx.recv() => match event {
+                        Some(AcpEvent::ElicitationRequest(elicitation)) => {
+                            request = elicitation;
+                            break;
+                        }
+                        Some(_) => {}
+                        None => panic!("{prompt}: event channel closed before the host request"),
+                    },
+                    result = &mut turn_task => {
+                        panic!("{prompt}: turn completed before the host request: {result:?}");
+                    }
+                }
+            }
+            assert!(request.tool_call_id.is_some(), "{prompt}");
+
+            let attachment = client.current_attachment(&session_id).unwrap();
+            <AcpRuntimeClient as AcpClient>::resolve_elicitation(
+                &client,
+                AcpElicitationResolution {
+                    binding: binding.clone(),
+                    execution_identity: ProviderTurnExecutionIdentity {
+                        binding_id: attachment.binding_id().clone(),
+                        activation_generation: attachment.fence().activation_generation as i64,
+                        model_id: None,
+                    },
+                    resolution: vibex_core::ElicitationResolution {
+                        request_id: request.id.clone(),
+                        session_id: session_id.clone(),
+                        action: ElicitationResolutionAction::Accept,
+                        answers,
+                        responder_device_id: None,
+                        resolved_at_ms: unix_timestamp_ms(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+            let turn = tokio::time::timeout(Duration::from_secs(10), turn_task)
+                .await
+                .expect("the blocked host request must release the turn")
+                .expect("turn task must not panic")
+                .unwrap();
+            assert!(turn.completed, "{prompt}");
+            let mut transcript = String::new();
+            while let Ok(event) = event_rx.try_recv() {
+                match event {
+                    AcpEvent::AssistantDelta { text_delta, .. } => transcript.push_str(&text_delta),
+                    AcpEvent::AssistantMessage { text, .. } => transcript.push_str(&text),
+                    _ => {}
+                }
+            }
+            assert!(
+                transcript.contains(expected_reply),
+                "{prompt}: agent saw {transcript:?}"
+            );
+            client.close_session(&binding).await.unwrap();
+        }
+        fixture.cleanup();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

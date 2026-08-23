@@ -235,6 +235,158 @@ impl AgentEventEnricher for CodexEventEnricher {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct GrokEventEnricher;
+
+impl AgentEventEnricher for GrokEventEnricher {
+    fn enrich(&self, input: &AgentEventInput) -> Vec<CanonicalAgentEvent> {
+        let kind = normalized_kind(&input.tool_name);
+        // Grok reports plan progress and its interview tool as ordinary tool
+        // calls named after the `_x.ai` extension. Passthrough would render
+        // them as anonymous tool cards with the raw method name.
+        if matches!(
+            kind.as_str(),
+            "x_ai_exit_plan_mode" | "exit_plan_mode" | "update_plan" | "plan_mode"
+        ) && let Some(plan) = grok_plan_event(input)
+        {
+            return vec![plan];
+        }
+        if matches!(
+            kind.as_str(),
+            "x_ai_ask_user_question" | "ask_user_question" | "interview"
+        ) {
+            return vec![collaboration_event(input)];
+        }
+        if matches!(kind.as_str(), "task" | "subagent" | "spawn_subagent") {
+            return vec![collaboration_event(input)];
+        }
+        if is_command_kind(&kind) && command_text(input.raw_input.as_ref()).is_some() {
+            return vec![command_event(input)];
+        }
+        if let Some(files) = file_events(input) {
+            return files;
+        }
+        PassthroughEventEnricher.enrich(input)
+    }
+}
+
+/// Grok carries the plan as `planContent` markdown rather than the ACP step
+/// array, so it becomes a single-step plan instead of an empty one.
+fn grok_plan_event(input: &AgentEventInput) -> Option<CanonicalAgentEvent> {
+    let raw_input = input.raw_input.as_ref()?;
+    let plan = string_value(raw_input, &["planContent", "plan", "content"])?;
+    Some(CanonicalAgentEvent::Plan(PlanPayload {
+        title: public_text(if input.title.trim().is_empty() {
+            "Plan"
+        } else {
+            &input.title
+        }),
+        steps: vec![PlanStepPayload {
+            title: public_text(&plan),
+            status: match input.status {
+                ToolCallStatus::Started => PlanStepStatus::Pending,
+                ToolCallStatus::Progress => PlanStepStatus::Running,
+                ToolCallStatus::Completed => PlanStepStatus::Completed,
+                ToolCallStatus::Failed => PlanStepStatus::Failed,
+            },
+        }],
+    }))
+}
+
+#[derive(Debug, Default)]
+pub struct CodeBuddyEventEnricher;
+
+impl AgentEventEnricher for CodeBuddyEventEnricher {
+    fn enrich(&self, input: &AgentEventInput) -> Vec<CanonicalAgentEvent> {
+        // Unwrap the virtualization layer first: everything downstream keys on
+        // the real tool name.
+        if let Some(unwrapped) = unwrap_codebuddy_deferred_call(input) {
+            return CodeBuddyEventEnricher.enrich(&unwrapped);
+        }
+        let kind = normalized_kind(&input.tool_name);
+        if codebuddy_marks_subagent(input) {
+            return vec![collaboration_event(input)];
+        }
+        if let Some(files) = file_events(input) {
+            return files;
+        }
+        if is_command_kind(&kind) && command_text(input.raw_input.as_ref()).is_some() {
+            return vec![command_event(input)];
+        }
+        PassthroughEventEnricher.enrich(input)
+    }
+}
+
+/// CodeBuddy routes MCP tools through a `DeferExecuteTool` virtualization
+/// layer: the ACP tool call reports the wrapper, while the real call sits in
+/// `raw_input` as `{toolName: "mcp__…", params: {…}}` and the result arrives
+/// re-serialized as a single `{type: "text", text: <inner>}` content part.
+///
+/// Rewrite the event to the inner identity so tool cards resolve, and peel the
+/// result wrapper so consumers see the payload the MCP server actually
+/// returned. Returns `None` for a call that is not virtualized.
+fn unwrap_codebuddy_deferred_call(input: &AgentEventInput) -> Option<AgentEventInput> {
+    let raw_input = input.raw_input.as_ref()?;
+    let tool_name = string_value(raw_input, &["toolName", "tool_name"])?;
+    let mut unwrapped = input.clone();
+    unwrapped.tool_name = tool_name.clone();
+    if unwrapped.title.trim().is_empty() || normalized_kind(&input.title).contains("defer") {
+        unwrapped.title = tool_name;
+    }
+    // The cards peel `params` themselves; keeping the original `raw_input`
+    // would let generic input inference misread the wrapper's own fields.
+    unwrapped.raw_input = raw_input.get("params").cloned();
+    if let Some(inner) = unwrapped
+        .output_summary
+        .as_deref()
+        .and_then(unwrap_codebuddy_deferred_output)
+    {
+        unwrapped.output_summary = Some(inner);
+    }
+    Some(unwrapped)
+}
+
+fn unwrap_codebuddy_deferred_output(text: &str) -> Option<String> {
+    // Cheap guard before parsing a potentially large payload.
+    if !text.contains("\"type\"") {
+        return None;
+    }
+    let value = serde_json::from_str::<Value>(text).ok()?;
+    let object = value.as_object()?;
+    if object.get("type").and_then(Value::as_str) != Some("text") {
+        return None;
+    }
+    object
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// CodeBuddy tags a native sub-agent invocation in `_meta` from the first
+/// frame, long before `subagent_type` reaches `raw_input`. Detecting it early
+/// keeps the collaboration card stable instead of downgrading mid-stream.
+fn codebuddy_marks_subagent(input: &AgentEventInput) -> bool {
+    if input
+        .meta
+        .get("tool_name")
+        .is_some_and(|value| value.eq_ignore_ascii_case("agent"))
+    {
+        return true;
+    }
+    if input
+        .meta
+        .keys()
+        .any(|key| key.contains("subagent") || key.contains("sub_agent"))
+    {
+        return true;
+    }
+    input
+        .raw_input
+        .as_ref()
+        .and_then(|value| string_value(value, &["subagent_type", "subagentType"]))
+        .is_some()
+}
+
 pub fn normalize_agent_event(
     enricher_kind: AgentEventEnricherKind,
     input: &AgentEventInput,
@@ -242,6 +394,8 @@ pub fn normalize_agent_event(
     let events = match enricher_kind {
         AgentEventEnricherKind::Claude => ClaudeEventEnricher.enrich(input),
         AgentEventEnricherKind::Codex => CodexEventEnricher.enrich(input),
+        AgentEventEnricherKind::Grok => GrokEventEnricher.enrich(input),
+        AgentEventEnricherKind::CodeBuddy => CodeBuddyEventEnricher.enrich(input),
         AgentEventEnricherKind::Passthrough => PassthroughEventEnricher.enrich(input),
     };
     events
@@ -885,6 +1039,85 @@ mod tests {
             locations: Vec::new(),
             meta: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn codebuddy_unwraps_deferred_mcp_calls_to_their_real_identity() {
+        let mut event = input(
+            "DeferExecuteTool",
+            json!({
+                "toolName": "mcp__github__create_issue",
+                "params": {"title": "bug", "repo": "vibex"}
+            }),
+        );
+        event.title = "DeferExecuteTool".to_string();
+        // CodeBuddy re-serializes a deferred result into the OpenAI-Agents
+        // content shape; consumers expect the inner payload.
+        event.output_summary = Some(r#"{"type":"text","text":"{\"number\":42}"}"#.to_string());
+
+        let events = CodeBuddyEventEnricher.enrich(&event);
+        let CanonicalAgentEvent::ToolCall(call) = &events[0] else {
+            panic!("expected a tool call: {events:?}");
+        };
+        assert_eq!(call.tool_name, "mcp__github__create_issue");
+        assert_eq!(call.summary, "mcp__github__create_issue");
+        assert_eq!(call.output_summary.as_deref(), Some(r#"{"number":42}"#));
+        // The wrapper's own fields must not reach input inference.
+        assert!(
+            call.input_summary
+                .as_deref()
+                .is_some_and(|summary| !summary.contains("toolName"))
+        );
+
+        // A non-virtualized call keeps its own identity.
+        let plain = input("Read", json!({"path": "src/lib.rs"}));
+        let plain_events = CodeBuddyEventEnricher.enrich(&plain);
+        let CanonicalAgentEvent::ToolCall(call) = &plain_events[0] else {
+            panic!("expected a tool call: {plain_events:?}");
+        };
+        assert_eq!(call.tool_name, "Read");
+        assert_eq!(call.output_summary.as_deref(), Some("safe output"));
+    }
+
+    #[test]
+    fn codebuddy_marks_subagent_invocations_as_collaboration() {
+        let mut meta_tagged = input("Task", json!({}));
+        meta_tagged
+            .meta
+            .insert("tool_name".to_string(), "Agent".to_string());
+        assert!(matches!(
+            CodeBuddyEventEnricher.enrich(&meta_tagged)[0],
+            CanonicalAgentEvent::Collaboration(_)
+        ));
+
+        // `subagent_type` only reaches `raw_input` dozens of frames later, so
+        // both signals must classify.
+        let raw_tagged = input("Task", json!({"subagent_type": "reviewer"}));
+        assert!(matches!(
+            CodeBuddyEventEnricher.enrich(&raw_tagged)[0],
+            CanonicalAgentEvent::Collaboration(_)
+        ));
+    }
+
+    #[test]
+    fn grok_plan_content_becomes_a_plan_rather_than_an_anonymous_tool_call() {
+        let mut event = input("_x.ai/exit_plan_mode", json!({"planContent": "1. survey"}));
+        event.status = ToolCallStatus::Progress;
+        let events = GrokEventEnricher.enrich(&event);
+        let CanonicalAgentEvent::Plan(plan) = &events[0] else {
+            panic!("expected a plan: {events:?}");
+        };
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].title, "1. survey");
+        assert_eq!(plan.steps[0].status, PlanStepStatus::Running);
+
+        // Without plan content there is nothing to project, so the generic
+        // path still applies.
+        let empty = input("_x.ai/exit_plan_mode", json!({}));
+        assert!(matches!(
+            GrokEventEnricher.enrich(&empty)[0],
+            CanonicalAgentEvent::ToolCall(_)
+        ));
     }
 
     #[test]
