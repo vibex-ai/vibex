@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, PtySystem, native_pty_system};
 use serde::Serialize;
@@ -29,6 +29,14 @@ const DEFAULT_RING_CAPACITY: usize = 2000;
 const MIN_RAW_OBSERVATION_CAPACITY: usize = 4096;
 const PRIMARY_DEVICE_ATTRIBUTES_RESPONSE: &[u8] = b"\x1b[?1;2c";
 const PRIMARY_DEVICE_ATTRIBUTES_QUERIES: [&[u8]; 2] = [b"\x1b[c", b"\x1b[0c"];
+/// How long a terminal gets to exit on SIGTERM before the process group is
+/// killed outright. Long enough for a shell to run its traps, short enough
+/// that an agent waiting on `terminal/kill` is not left hanging.
+const TERMINAL_KILL_ESCALATION_TIMEOUT: Duration = Duration::from_millis(500);
+const TERMINAL_KILL_POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// SIGKILL cannot be caught, so this only covers the reap landing in
+/// `exit_status`.
+const TERMINAL_KILL_REAP_TIMEOUT: Duration = Duration::from_millis(500);
 
 type PtyWriter = Box<dyn Write + Send>;
 type PtyMaster = Box<dyn MasterPty + Send>;
@@ -606,22 +614,87 @@ impl TerminalManager {
     /// terminals that already left the running state. Marking the session
     /// killed here would strand `wait_for_exit` on a status that never
     /// resolves.
+    ///
+    /// Blocking: an unresponsive child is escalated over up to
+    /// [`TERMINAL_KILL_ESCALATION_TIMEOUT`]. Callers on an async runtime must
+    /// offload this to a blocking task.
     pub fn kill_retaining(&self, terminal_id: &TerminalId) -> VibexResult<TerminalSession> {
         let handle = self.runtime_handle(terminal_id)?;
-        let mut runtime = lock_runtime(&handle)?;
+        // Signal the whole foreground process group. A PTY child is a session
+        // leader, so its descendants share its group id: signalling only the
+        // leader leaves shells, watchers and grandchildren behind holding the
+        // PTY open.
+        if let Some(session) =
+            self.signal_running_terminal(&handle, TerminationSignal::Term, "terminal_kill_failed")?
+        {
+            return Ok(session);
+        }
+        // Waiting happens without the runtime lock: the reader thread and UI
+        // polling must keep making progress while the child winds down.
+        if let Some(session) =
+            self.await_terminal_exit(&handle, TERMINAL_KILL_ESCALATION_TIMEOUT)?
+        {
+            return Ok(session);
+        }
+        // SIGTERM was ignored or the child is wedged.
+        if let Some(session) =
+            self.signal_running_terminal(&handle, TerminationSignal::Kill, "terminal_kill_failed")?
+        {
+            return Ok(session);
+        }
+        // SIGKILL cannot be caught, so the child is already gone; this only
+        // waits for the reap to land in `exit_status`.
+        if let Some(session) = self.await_terminal_exit(&handle, TERMINAL_KILL_REAP_TIMEOUT)? {
+            return Ok(session);
+        }
+        let runtime = lock_runtime(&handle)?;
+        Ok(runtime.session.clone())
+    }
+
+    /// Deliver `signal` to a still-running terminal. Returns the session when
+    /// it had already exited and nothing needed signalling.
+    fn signal_running_terminal(
+        &self,
+        handle: &TerminalRuntimeHandle,
+        signal: TerminationSignal,
+        failure_code: &'static str,
+    ) -> VibexResult<Option<TerminalSession>> {
+        let mut runtime = lock_runtime(handle)?;
         refresh_exit_status(&mut runtime)?;
         if runtime.session.status != TerminalStatus::Running {
-            return Ok(runtime.session.clone());
+            return Ok(Some(runtime.session.clone()));
         }
-        if let Err(err) = runtime.child.kill() {
-            return Err(VibexError::process(
-                "terminal_kill_failed",
-                "failed to kill terminal process",
-            )
-            .with_diagnostic("error", err.to_string()));
+        // Fall back to the leader when the group cannot be signalled at all.
+        if !signal_process_group(runtime.child.process_id(), signal)
+            && let Err(err) = runtime.child.kill()
+        {
+            return Err(
+                VibexError::process(failure_code, "failed to kill terminal process")
+                    .with_diagnostic("error", err.to_string()),
+            );
         }
         refresh_exit_status(&mut runtime)?;
-        Ok(runtime.session.clone())
+        Ok((runtime.session.status != TerminalStatus::Running).then(|| runtime.session.clone()))
+    }
+
+    /// Poll for the child to be reaped, returning `None` on timeout.
+    fn await_terminal_exit(
+        &self,
+        handle: &TerminalRuntimeHandle,
+        timeout: Duration,
+    ) -> VibexResult<Option<TerminalSession>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            thread::sleep(TERMINAL_KILL_POLL_INTERVAL);
+            let mut runtime = lock_runtime(handle)?;
+            refresh_exit_status(&mut runtime)?;
+            if runtime.session.status != TerminalStatus::Running {
+                return Ok(Some(runtime.session.clone()));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+        }
     }
 
     /// Returns `None` while the child is still running and a stable exit
@@ -889,6 +962,47 @@ fn is_primary_device_attributes_query_prefix(bytes: &[u8]) -> bool {
     PRIMARY_DEVICE_ATTRIBUTES_QUERIES
         .iter()
         .any(|query| bytes.len() < query.len() && query.starts_with(bytes))
+}
+
+/// Signal delivered to a terminal's whole process group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminationSignal {
+    Term,
+    Kill,
+}
+
+/// Deliver `signal` to the process group led by `pid`.
+///
+/// A PTY child is spawned as a session leader, so its group id equals its pid
+/// and every descendant it did not deliberately detach shares that group.
+/// Returns false when the group cannot be signalled, so the caller can fall
+/// back to the leader alone.
+#[cfg(unix)]
+fn signal_process_group(pid: Option<u32>, signal: TerminationSignal) -> bool {
+    let Some(pid) = pid
+        .and_then(|pid| i32::try_from(pid).ok())
+        .filter(|pid| *pid > 1)
+    else {
+        return false;
+    };
+    let signal = match signal {
+        TerminationSignal::Term => libc::SIGTERM,
+        TerminationSignal::Kill => libc::SIGKILL,
+    };
+    // SAFETY: `killpg` only reads the arguments and takes no ownership.
+    let result = unsafe { libc::killpg(pid, signal) };
+    if result == 0 {
+        return true;
+    }
+    // The group is already gone, which is the outcome the caller wanted.
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Windows has no process groups in this sense; the job-object teardown that
+/// `Child::kill` performs is the escalation path.
+#[cfg(not(unix))]
+fn signal_process_group(_pid: Option<u32>, _signal: TerminationSignal) -> bool {
+    false
 }
 
 fn refresh_exit_status(runtime: &mut TerminalRuntime) -> VibexResult<()> {
@@ -1262,6 +1376,165 @@ mod tests {
             manager.snapshot(&session.id).unwrap_err().code,
             "terminal_not_found"
         );
+    }
+
+    /// Locate an interpreter for the signal-handling fixtures. Shell `trap`
+    /// is not dependable here: several `sh` implementations still exit when a
+    /// signal arrives while they wait on a foreground child.
+    #[cfg(unix)]
+    fn fixture_python() -> Option<String> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .map(|directory| directory.join("python3"))
+            .find(|candidate| candidate.is_file())
+            .map(|candidate| candidate.display().to_string())
+    }
+
+    /// Spawn the fixture and wait for it to announce that its signal
+    /// handlers are installed. Killing before that would measure the race, not
+    /// the escalation.
+    #[cfg(unix)]
+    fn spawn_signal_ignoring_terminal(
+        manager: &TerminalManager,
+        program: &str,
+        script: String,
+    ) -> TerminalSession {
+        let root = std::env::temp_dir();
+        let session = manager
+            .create_command(
+                &root,
+                TerminalCommandRequest {
+                    workspace_id: WorkspaceId::new(),
+                    title: None,
+                    command: program.to_string(),
+                    args: vec!["-c".to_string(), script],
+                    cwd: Some(root.to_string_lossy().into_owned()),
+                    env: Vec::new(),
+                    rows: 24,
+                    cols: 80,
+                },
+            )
+            .unwrap();
+        for _ in 0..300 {
+            let ready = manager
+                .snapshot(&session.id)
+                .map(|snapshot| {
+                    snapshot
+                        .chunks
+                        .iter()
+                        .any(|chunk| chunk.data.contains("ready"))
+                })
+                .unwrap_or(false);
+            if ready {
+                return session;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("signal fixture never reported readiness");
+    }
+
+    /// The underlying PTY child killer only sends SIGHUP to the leader and has
+    /// no escalation, so a child ignoring both signals used to survive
+    /// `terminal/kill` outright.
+    #[cfg(unix)]
+    #[test]
+    fn kill_escalates_to_sigkill_when_termination_signals_are_ignored() {
+        let Some(python) = fixture_python() else {
+            eprintln!("skipping escalation test: python3 not found on PATH");
+            return;
+        };
+        let manager = TerminalManager::new();
+        let session = spawn_signal_ignoring_terminal(
+            &manager,
+            &python,
+            "import signal, time\n\
+             signal.signal(signal.SIGTERM, signal.SIG_IGN)\n\
+             signal.signal(signal.SIGHUP, signal.SIG_IGN)\n\
+             print('ready', flush=True)\n\
+             time.sleep(600)\n"
+                .to_string(),
+        );
+
+        let killed = manager.kill_retaining(&session.id).unwrap();
+        assert_ne!(
+            killed.status,
+            TerminalStatus::Running,
+            "a signal-ignoring child must still be reaped by the escalation"
+        );
+        let status = manager
+            .process_exit_status(&session.id)
+            .unwrap()
+            .expect("the escalated kill must produce an exit status");
+        let signal = status.signal.unwrap_or_default();
+        assert!(
+            signal.to_ascii_lowercase().contains("kill"),
+            "escalation must end in SIGKILL, saw {signal:?}"
+        );
+        manager.release(&session.id).unwrap();
+    }
+
+    /// A descendant that ignores SIGHUP is never reached by the leader's own
+    /// teardown; only signalling the process group sweeps it.
+    #[cfg(unix)]
+    #[test]
+    fn kill_sweeps_descendants_that_ignore_the_leader_teardown() {
+        let Some(python) = fixture_python() else {
+            eprintln!("skipping descendant sweep test: python3 not found on PATH");
+            return;
+        };
+        let manager = TerminalManager::new();
+        let marker = std::env::temp_dir().join(format!(
+            "vibex-terminal-kill-{}-{}.pid",
+            std::process::id(),
+            unix_timestamp_ms()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let session = spawn_signal_ignoring_terminal(
+            &manager,
+            &python,
+            format!(
+                "import os, signal, time\n\
+                 if os.fork() == 0:\n\
+                 \x20   signal.signal(signal.SIGHUP, signal.SIG_IGN)\n\
+                 \x20   open({marker:?}, 'w').write(str(os.getpid()))\n\
+                 \x20   time.sleep(600)\n\
+                 else:\n\
+                 \x20   print('ready', flush=True)\n\
+                 \x20   time.sleep(600)\n",
+                marker = marker.display().to_string()
+            ),
+        );
+
+        let descendant = (|| {
+            for _ in 0..300 {
+                if let Ok(contents) = std::fs::read_to_string(&marker)
+                    && let Ok(pid) = contents.trim().parse::<i32>()
+                {
+                    return Some(pid);
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            None
+        })()
+        .expect("the descendant must report its pid");
+
+        manager.kill_retaining(&session.id).unwrap();
+
+        let swept = (0..300).any(|_| {
+            // SAFETY: signal 0 only probes for existence.
+            if unsafe { libc::kill(descendant, 0) } != 0 {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+            false
+        });
+        if !swept {
+            // SAFETY: reap the leak so the test run does not strand it.
+            unsafe { libc::kill(descendant, libc::SIGKILL) };
+        }
+        let _ = std::fs::remove_file(&marker);
+        assert!(swept, "killing the terminal must sweep its descendants");
+        manager.release(&session.id).unwrap();
     }
 
     #[test]

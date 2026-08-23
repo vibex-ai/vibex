@@ -15,6 +15,9 @@ serde_json.workspace = true
 sha2.workspace = true
 vibex-core = { path = "../core" }
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [[bin]]
 name = "vibex-pty-smoke"
 path = "src/bin/vibex-pty-smoke.rs"

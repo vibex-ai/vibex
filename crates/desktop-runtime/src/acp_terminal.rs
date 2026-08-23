@@ -93,8 +93,22 @@ impl AcpTerminalHost for DesktopAcpTerminalHost {
 
     /// ACP kill must not retire the terminal: the agent still reads the final
     /// output and the exit status afterwards and releases it explicitly.
+    ///
+    /// Killing escalates from the process group's SIGTERM to SIGKILL, so it
+    /// runs on a blocking task rather than stalling an async worker.
     async fn kill(&self, terminal_id: &TerminalId) -> VibexResult<()> {
-        match self.manager.kill_retaining(terminal_id) {
+        let manager = self.manager.clone();
+        let terminal_id = terminal_id.clone();
+        let result = tokio::task::spawn_blocking(move || manager.kill_retaining(&terminal_id))
+            .await
+            .map_err(|error| {
+                VibexError::process(
+                    "acp_terminal_kill_task_failed",
+                    "ACP terminal kill task did not complete",
+                )
+                .with_diagnostic("error", error.to_string())
+            })?;
+        match result {
             Ok(_) => Ok(()),
             Err(error) if error.code == "terminal_not_found" => Ok(()),
             Err(error) => Err(error),
