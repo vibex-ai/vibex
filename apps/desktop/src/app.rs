@@ -33520,7 +33520,6 @@ impl VibexWorkbench {
                                 h_flex()
                                     .w_full()
                                     .min_w_0()
-                                    .h(px(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT))
                                     .min_h(px(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT))
                                     .flex_1()
                                     .items_start()
@@ -33531,7 +33530,7 @@ impl VibexWorkbench {
                                     .child(
                                         div()
                                             .min_w_0()
-                                            .h_full()
+                                            .min_h(px(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT))
                                             .flex_1()
                                             .on_prepaint(move |bounds, _, cx| {
                                                 let _ =
@@ -33664,8 +33663,7 @@ impl VibexWorkbench {
                                             ))
                                             .child(
                                                 Input::new(&self.composer_input)
-                                                    .appearance(false)
-                                                    .size_full(),
+                                                    .appearance(false),
                                             ),
                                     )
                                     .child(
@@ -34646,7 +34644,7 @@ impl VibexWorkbench {
                 .flex_1()
                 .min_w_0()
                 .min_h_0()
-                .h_full()
+                .self_stretch()
                 .overflow_hidden()
                 .child(if management_open {
                     div()
@@ -45815,7 +45813,11 @@ mod tests {
     struct ComposerBottomAnchorProbe {
         input: Entity<InputState>,
         root_bottom: Rc<Cell<f32>>,
+        shell_bottom: Rc<Cell<f32>>,
+        center_bottom: Rc<Cell<f32>>,
+        workbench_bottom: Rc<Cell<f32>>,
         composer_bottom: Rc<Cell<f32>>,
+        composer_height: Rc<Cell<f32>>,
     }
 
     struct RuntimePopoverLayoutProbe {
@@ -45849,36 +45851,80 @@ mod tests {
     impl Render for ComposerBottomAnchorProbe {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let root_bottom = self.root_bottom.clone();
+            let shell_bottom = self.shell_bottom.clone();
+            let center_bottom = self.center_bottom.clone();
+            let workbench_bottom = self.workbench_bottom.clone();
             let composer_bottom = self.composer_bottom.clone();
+            let composer_height = self.composer_height.clone();
             v_flex()
-                .w(px(400.0))
-                .h(px(120.0))
-                .justify_end()
+                .size_full()
                 .overflow_hidden()
                 .on_prepaint(move |bounds, _, _| {
                     root_bottom.set(f32::from(bounds.origin.y + bounds.size.height));
                 })
-                .child(v_flex().w_full().flex_1().min_h_0().child(div().flex_1()))
+                .child(div().h(px(TITLE_BAR_HEIGHT)).flex_none())
                 .child(
-                    v_flex()
-                        .w_full()
-                        .flex_none()
-                        .min_h(px(ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT))
+                    h_flex()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_hidden()
                         .on_prepaint(move |bounds, _, _| {
-                            composer_bottom.set(f32::from(bounds.origin.y + bounds.size.height));
+                            shell_bottom.set(f32::from(bounds.origin.y + bounds.size.height));
                         })
                         .child(
-                            h_flex()
-                                .w_full()
-                                .h(px(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT))
-                                .min_h(px(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT))
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .min_h_0()
+                                .self_stretch()
+                                .overflow_hidden()
                                 .child(
-                                    div().h_full().flex_1().child(
-                                        Input::new(&self.input).appearance(false).size_full(),
-                                    ),
+                                    v_flex()
+                                        .size_full()
+                                        .min_h_0()
+                                        .justify_end()
+                                        .overflow_hidden()
+                                        .on_prepaint(move |bounds, _, _| {
+                                            center_bottom.set(f32::from(
+                                                bounds.origin.y + bounds.size.height,
+                                            ));
+                                        })
+                                        .child(v_flex().flex_1().min_h_0().child(div().flex_1()))
+                                        .child(
+                                            v_flex()
+                                                .w_full()
+                                                .flex_none()
+                                                .min_h(px(ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT))
+                                                .on_prepaint(move |bounds, _, _| {
+                                                    workbench_bottom.set(f32::from(
+                                                        bounds.origin.y + bounds.size.height,
+                                                    ));
+                                                    composer_bottom.set(f32::from(
+                                                        bounds.origin.y + bounds.size.height,
+                                                    ));
+                                                    composer_height
+                                                        .set(f32::from(bounds.size.height));
+                                                })
+                                            .child(
+                                                h_flex()
+                                                    .w_full()
+                                                    .min_h(px(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT))
+                                                    .child(
+                                                        div()
+                                                            .min_h(px(
+                                                                ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT,
+                                                            ))
+                                                            .flex_1()
+                                                            .child(
+                                                                Input::new(&self.input)
+                                                                    .appearance(false),
+                                                            ),
+                                                    ),
+                                            )
+                                                .child(h_flex().w_full().h(px(52.0)).flex_none()),
+                                        ),
                                 ),
-                        )
-                        .child(h_flex().w_full().h(px(52.0)).flex_none()),
+                        ),
                 )
         }
     }
@@ -46291,16 +46337,28 @@ mod tests {
         cx.update(gpui_component::init);
         let input_slot = Rc::new(RefCell::new(None));
         let root_bottom = Rc::new(Cell::new(0.0));
+        let shell_bottom = Rc::new(Cell::new(0.0));
+        let center_bottom = Rc::new(Cell::new(0.0));
+        let workbench_bottom = Rc::new(Cell::new(0.0));
         let composer_bottom = Rc::new(Cell::new(0.0));
+        let composer_height = Rc::new(Cell::new(0.0));
         let root_bottom_for_view = root_bottom.clone();
+        let shell_bottom_for_view = shell_bottom.clone();
+        let center_bottom_for_view = center_bottom.clone();
+        let workbench_bottom_for_view = workbench_bottom.clone();
         let composer_bottom_for_view = composer_bottom.clone();
+        let composer_height_for_view = composer_height.clone();
         let (_, cx) = cx.add_window_view(|window, cx| {
             let input = cx.new(|cx| InputState::new(window, cx).auto_grow(2, 8));
             *input_slot.borrow_mut() = Some(input.clone());
             let probe = cx.new(|_| ComposerBottomAnchorProbe {
                 input,
                 root_bottom: root_bottom_for_view,
+                shell_bottom: shell_bottom_for_view,
+                center_bottom: center_bottom_for_view,
+                workbench_bottom: workbench_bottom_for_view,
                 composer_bottom: composer_bottom_for_view,
+                composer_height: composer_height_for_view,
             });
             gpui_component::Root::new(probe, window, cx)
         });
@@ -46308,6 +46366,19 @@ mod tests {
             .borrow()
             .clone()
             .expect("composer input should be created with the probe");
+
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            window.simulate_next_frame(cx);
+            let _ = window.draw(cx);
+            window.simulate_next_frame(cx);
+            let _ = window.draw(cx);
+            window.simulate_next_frame(cx);
+            let _ = window.draw(cx);
+        });
+        let initial_root_bottom = root_bottom.get();
+        let initial_composer_bottom = composer_bottom.get();
+        let initial_composer_height = composer_height.get();
 
         cx.update(|window, cx| {
             input.update(cx, |input, cx| {
@@ -46320,9 +46391,31 @@ mod tests {
             let _ = window.draw(cx);
             window.simulate_next_frame(cx);
             let _ = window.draw(cx);
+            window.simulate_next_frame(cx);
+            let _ = window.draw(cx);
         });
 
-        assert!((composer_bottom.get() - root_bottom.get()).abs() < 0.5);
+        assert!(
+            (composer_bottom.get() - root_bottom.get()).abs() < 0.5,
+            "root={} shell={} center={} workbench={} composer={} initial_root={} initial_composer={}",
+            root_bottom.get(),
+            shell_bottom.get(),
+            center_bottom.get(),
+            workbench_bottom.get(),
+            composer_bottom.get(),
+            initial_root_bottom,
+            initial_composer_bottom
+        );
+        assert!((composer_bottom.get() - shell_bottom.get()).abs() < 0.5);
+        assert!((composer_bottom.get() - center_bottom.get()).abs() < 0.5);
+        assert!((composer_bottom.get() - workbench_bottom.get()).abs() < 0.5);
+        assert!((initial_composer_bottom - initial_root_bottom).abs() < 0.5);
+        assert!(
+            composer_height.get() > initial_composer_height + 1.0,
+            "multiline input should increase composer height: initial={} current={}",
+            initial_composer_height,
+            composer_height.get()
+        );
     }
 
     fn command_entry(
