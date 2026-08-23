@@ -197,7 +197,6 @@ const SIDEBAR_PROJECT_LOGO_MAX_SOURCE_PIXELS: u64 = 40_000_000;
 const TITLE_BAR_NARROW_WINDOW_CONTROL_WIDTH: f32 = 36.0;
 const TITLE_BAR_WIDE_WINDOW_CONTROL_WIDTH: f32 = 44.0;
 const TITLE_BAR_SESSION_TITLE_MAX_WIDTH: f32 = 320.0;
-const TITLE_BAR_SESSION_CONTEXT_MAX_WIDTH: f32 = 420.0;
 const TITLE_BAR_SESSION_MENU_WIDTH: f32 = 220.0;
 const TITLE_BAR_SESSION_MENU_TITLE_MAX_CHARS: usize = 16;
 const SIDEBAR_FLOATING_MAX_WIDTH: f32 = 320.0;
@@ -19571,61 +19570,11 @@ impl VibexWorkbench {
             self.settings_open,
             selected_session.is_some(),
         );
-        let selected_context = selected_session
-            .as_ref()
-            .filter(|_| show_session_context)
-            .and_then(|session| {
-                self.workspace_contexts
-                    .get(session.workspace_id.as_str())
-                    .cloned()
-            });
         let session_title = selected_session
             .as_ref()
             .filter(|_| show_session_context)
             .map(|session| session.title.clone())
             .unwrap_or_else(|| strings.agent_select_session.to_string());
-        let (workspace_project_label, workspace_branch_label, workspace_tooltip) =
-            if let Some(context) = selected_context.as_ref() {
-                let branch = context
-                    .branch
-                    .as_deref()
-                    .map(sidebar_workspace_branch_name)
-                    .unwrap_or_else(|| locale::text("No branch", "无分支", "無分支"))
-                    .to_string();
-                let workspace_name = if context.workspace_mode == WorkspaceMode::VibexWorktree {
-                    self.ui_state
-                        .sidebar
-                        .worktree_titles
-                        .get(context.workspace_id.as_str())
-                        .cloned()
-                        .unwrap_or_else(|| branch.clone())
-                } else {
-                    branch.clone()
-                };
-                let mode = match context.workspace_mode {
-                    WorkspaceMode::CurrentCheckout => {
-                        locale::text("Current Checkout", "当前目录", "目前目錄")
-                    }
-                    WorkspaceMode::VibexWorktree => "Worktree",
-                };
-                (
-                    context.project_name.clone(),
-                    Some(workspace_name.clone()),
-                    format!(
-                        "{} · {mode} · {}",
-                        context.workspace_root, context.project_name
-                    ),
-                )
-            } else if let Some(session) = selected_session.as_ref() {
-                let workspace_name = workspace_display_name(&session.workspace_root);
-                (workspace_name.clone(), None, session.workspace_root.clone())
-            } else {
-                (
-                    strings.no_workspace.to_string(),
-                    None,
-                    strings.no_workspace.to_string(),
-                )
-            };
         let title_session_menu = selected_session
             .as_ref()
             .filter(|_| show_session_context)
@@ -19871,35 +19820,6 @@ impl VibexWorkbench {
                                         )
                                         .when_some(title_session_menu, |this, menu| {
                                             this.child(menu)
-                                        }),
-                                )
-                                .child(
-                                    h_flex()
-                                        .id("title-workspace-context")
-                                        .w_auto()
-                                        .max_w(px(TITLE_BAR_SESSION_CONTEXT_MAX_WIDTH))
-                                        .flex_none()
-                                        .items_center()
-                                        .gap(px(2.0))
-                                        .mt(px(-1.0))
-                                        .text_size(px(11.0))
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(
-                                            div()
-                                                .min_w_0()
-                                                .truncate()
-                                                .child(workspace_project_label),
-                                        )
-                                        .when_some(workspace_branch_label, |this, branch| {
-                                            this.child(
-                                                sidebar_icon("icons/vibex/git-branch.svg")
-                                                    .size(px(10.0)),
-                                            )
-                                            .child(div().min_w_0().truncate().child(branch))
-                                        })
-                                        .tooltip(move |window, cx| {
-                                            Tooltip::new(workspace_tooltip.clone())
-                                                .build(window, cx)
                                         }),
                                 )
                             }),
@@ -52709,14 +52629,9 @@ mod tests {
             .find(".when_some(title_session_menu")
             .map(|offset| main_start + offset)
             .expect("session actions menu should be mounted in the main segment");
-        let workspace_context = title_bar
-            .find(".id(\"title-workspace-context\")")
-            .expect("workspace context should exist");
-
         assert!(sidebar_start < main_start);
         assert!(main_start < session_title);
         assert!(session_title < session_menu);
-        assert!(session_menu < workspace_context);
 
         let sidebar = &title_bar[sidebar_start..main_start];
         assert!(sidebar.contains(".bg(cx.theme().sidebar)"));
@@ -52729,17 +52644,11 @@ mod tests {
         assert!(main.contains(".text_color(cx.theme().foreground)"));
         assert!(main.contains("title-session-title"));
         assert!(main.contains("title_session_menu"));
-        assert!(main.contains("title-workspace-context"));
         assert!(main.contains("TITLE_BAR_SESSION_TITLE_MAX_WIDTH"));
-        assert!(main.contains("TITLE_BAR_SESSION_CONTEXT_MAX_WIDTH"));
         assert!(main.contains(".gap_0()"));
         assert!(main.contains(".py_1()"));
-        assert!(main.contains(".gap(px(2.0))"));
-        assert!(main.contains(".mt(px(-1.0))"));
-        assert!(main.contains(".text_size(px(11.0))"));
-        assert!(main.contains(".size(px(10.0))"));
-        assert!(main.contains("icons/vibex/git-branch.svg"));
-        assert!(title_bar.contains("worktree_titles"));
+        assert!(!title_bar.contains("title-workspace-context"));
+        assert!(!title_bar.contains("TITLE_BAR_SESSION_CONTEXT_MAX_WIDTH"));
         assert!(title_bar.contains("title-session-menu"));
         assert!(title_bar.contains("truncate_title_bar_session_menu_title"));
 
