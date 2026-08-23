@@ -7173,7 +7173,7 @@ fn normalize_claude_model_mode(
     agent_id: &AgentId,
     is_provider_profile: bool,
     has_explicit_model: bool,
-    advertised_modes: Option<&[ProviderSessionConfigValue]>,
+    _advertised_modes: Option<&[ProviderSessionConfigValue]>,
     requested_mode: &str,
 ) -> Option<String> {
     if agent_id.as_str() != CLAUDE_AGENT_ID
@@ -7183,9 +7183,12 @@ fn normalize_claude_model_mode(
     {
         return None;
     }
-    let advertised =
-        advertised_modes.is_some_and(|modes| modes.iter().any(|mode| mode.value == requested_mode));
-    (!advertised).then(|| "default".to_string())
+
+    // Claude ACP probes can report the capability of a native alias instead
+    // of the configured proxy model.  The real session then recomputes modes
+    // for the resolved model and may reject these conditional modes.  Keep
+    // provider-profile switches deterministic by using the unconditional mode.
+    Some("default".to_string())
 }
 
 fn safe_runtime_configuration_cause_code(cause_code: &str) -> String {
@@ -21811,25 +21814,26 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn claude_model_gated_modes_only_survive_exact_model_probe() {
+    fn claude_model_gated_modes_fall_back_even_when_probe_advertises_them() {
         let claude = AgentId::parse(CLAUDE_AGENT_ID).unwrap();
         let codex = AgentId::parse("codex").unwrap();
-        let auto = ProviderSessionConfigValue {
+        let advertised_auto = ProviderSessionConfigValue {
             value: "auto".to_string(),
             label: None,
         };
 
         assert_eq!(
-            normalize_claude_model_mode(&claude, true, true, None, "auto").as_deref(),
+            normalize_claude_model_mode(&claude, true, true, Some(&[advertised_auto]), "auto",)
+                .as_deref(),
             Some("default")
-        );
-        assert_eq!(
-            normalize_claude_model_mode(&claude, true, true, Some(&[auto]), "auto"),
-            None
         );
         assert_eq!(
             normalize_claude_model_mode(&claude, true, true, None, "bypassPermissions").as_deref(),
             Some("default")
+        );
+        assert_eq!(
+            normalize_claude_model_mode(&claude, true, true, None, "acceptEdits"),
+            None
         );
         assert_eq!(
             normalize_claude_model_mode(&codex, true, true, None, "auto"),
