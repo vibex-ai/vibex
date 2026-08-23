@@ -47,6 +47,9 @@ const CODEX_MODEL_PROVIDER_ENV: &str = "MODEL_PROVIDER";
 const CODEX_DEFAULT_AUTH_REQUEST_ENV: &str = "DEFAULT_AUTH_REQUEST";
 const CODEX_DEFAULT_API_KEY_AUTH_REQUEST: &str = r#"{"methodId":"api-key"}"#;
 const CODEX_PROVIDER_ORIGINATOR: &str = "codex_cli_rs";
+const CLAUDE_AGENT_ID: &str = "claude";
+const CLAUDE_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+const CLAUDE_AUTH_TOKEN_ENV: &str = "ANTHROPIC_AUTH_TOKEN";
 const OVERLAY_SECRET_PLACEHOLDER_PREFIX: &str = "__VIBEX_SECRET_ENV_";
 const OVERLAY_SECRET_PLACEHOLDER_SUFFIX: &str = "__";
 
@@ -1244,15 +1247,16 @@ fn project_credential_control(
                     "selected credential cannot be projected to the required Secret environment target",
                 ));
             };
+            let secret_env_key = credential_secret_env_key(descriptor, credential, secret_env_key);
             secret_env.push(ProjectionSecretEnvReference {
-                key: secret_env_key.clone(),
+                key: secret_env_key.to_string(),
                 credential_id: credential.id.clone(),
                 secret_reference: secret_reference.clone(),
             });
             targets.push(ProjectionTargetPreview {
                 field: "credential".to_string(),
                 target_kind: ProjectionTargetKind::Environment,
-                target: secret_env_key.clone(),
+                target: secret_env_key.to_string(),
                 value_preview: if secret_reference.setup_state
                     == ProviderSecretSetupState::Available
                 {
@@ -1361,6 +1365,21 @@ fn descriptor_secret_env_key(descriptor: &AgentProviderProjectionDescriptor) -> 
     match &descriptor.credential_control {
         AgentCredentialControl::Environment { secret_env_key, .. } => Some(secret_env_key),
         _ => None,
+    }
+}
+
+fn credential_secret_env_key<'a>(
+    descriptor: &AgentProviderProjectionDescriptor,
+    credential: &ModelProviderCredentialReference,
+    fallback: &'a str,
+) -> &'a str {
+    if descriptor.route.agent_id.as_str() != CLAUDE_AGENT_ID {
+        return fallback;
+    }
+    match credential.display_name.trim() {
+        CLAUDE_AUTH_TOKEN_ENV => CLAUDE_AUTH_TOKEN_ENV,
+        CLAUDE_API_KEY_ENV => CLAUDE_API_KEY_ENV,
+        _ => fallback,
     }
 }
 
@@ -4010,6 +4029,40 @@ mod tests {
                 expected.agent_id
             );
             assert!(plan.fingerprint.starts_with("sha256:"));
+        }
+    }
+
+    #[test]
+    fn claude_projection_preserves_declared_anthropic_credential_environment() {
+        let descriptor = vibex_core::AgentProviderProjectionRegistry::builtin()
+            .unwrap()
+            .descriptors()
+            .find(|descriptor| descriptor.route.agent_id.as_str() == CLAUDE_AGENT_ID)
+            .cloned()
+            .expect("builtin Claude projection descriptor");
+        let (mut provider, runtime, binding) = typed_projection_fixture(&descriptor);
+
+        for (display_name, expected_key) in [
+            (CLAUDE_AUTH_TOKEN_ENV, CLAUDE_AUTH_TOKEN_ENV),
+            (CLAUDE_API_KEY_ENV, CLAUDE_API_KEY_ENV),
+            ("Claude API credential", CLAUDE_API_KEY_ENV),
+        ] {
+            provider.credentials[0].display_name = display_name.to_string();
+            let plan = AgentProviderProjectionEngine::plan(
+                &provider,
+                &runtime,
+                &binding,
+                &descriptor,
+                "claude-credential-environment",
+            )
+            .unwrap();
+            assert_eq!(plan.secret_env[0].key, expected_key);
+            assert!(
+                plan.preview
+                    .targets
+                    .iter()
+                    .any(|target| target.field == "credential" && target.target == expected_key)
+            );
         }
     }
 
