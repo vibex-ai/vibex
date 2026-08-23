@@ -117,41 +117,60 @@ pub const CODE_WORKBENCH_INITIAL_DIFF_ROWS: usize = 500;
 
 struct GitMutationNotification;
 
-fn git_mutation_notice(kind: GitMutationKind) -> Option<&'static str> {
+fn git_mutation_result_notice(kind: GitMutationKind) -> Option<&'static str> {
     match kind {
-        GitMutationKind::Fetch => Some(locale::text(
-            "Pulling latest changes...",
-            "正在拉取最新更改...",
-            "正在擷取最新變更...",
-        )),
-        GitMutationKind::Push => Some(locale::text(
-            "Pushing local commits...",
-            "正在推送本地提交...",
-            "正在推送本機提交...",
-        )),
+        GitMutationKind::Fetch => Some(locale::text("Pull completed", "拉取已完成", "擷取已完成")),
+        GitMutationKind::Push => Some(locale::text("Push completed", "推送已完成", "推送已完成")),
         GitMutationKind::Revert => Some(locale::text(
-            "Rolling back selected changes...",
-            "正在回滚所选更改...",
-            "正在回復所選變更...",
+            "Rollback completed",
+            "回滚已完成",
+            "回復已完成",
         )),
         _ => None,
     }
 }
 
-fn push_git_mutation_notice(
-    kind: GitMutationKind,
-    window: &mut Window,
-    cx: &mut Context<CodeWorkbench>,
-) {
-    let Some(message) = git_mutation_notice(kind) else {
+fn git_mutation_failure_label(kind: GitMutationKind) -> Option<&'static str> {
+    match kind {
+        GitMutationKind::Fetch => Some(locale::text("Pull failed", "拉取失败", "擷取失敗")),
+        GitMutationKind::Push => Some(locale::text("Push failed", "推送失败", "推送失敗")),
+        GitMutationKind::Revert => Some(locale::text("Rollback failed", "回滚失败", "回復失敗")),
+        _ => None,
+    }
+}
+
+fn push_git_mutation_result_notice(kind: GitMutationKind, window: &mut Window, cx: &mut App) {
+    let Some(message) = git_mutation_result_notice(kind) else {
         return;
     };
     Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
     window.push_notification(
-        Notification::info(message)
+        Notification::success(message)
             .id::<GitMutationNotification>()
             .autohide(true)
             .on_click(|_, _, _| {}),
+        cx,
+    );
+}
+
+fn push_git_mutation_failure_notice(
+    kind: GitMutationKind,
+    error: &str,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(label) = git_mutation_failure_label(kind) else {
+        return;
+    };
+    Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
+    window.push_notification(
+        Notification::error(format!(
+            "{label}: {}",
+            locale::localize_error_message(error)
+        ))
+        .id::<GitMutationNotification>()
+        .autohide(true)
+        .on_click(|_, _, _| {}),
         cx,
     );
 }
@@ -4995,7 +5014,7 @@ impl CodeWorkbench {
         &mut self,
         scope: vibex_desktop_model::GitMutationScope,
         operation: F,
-        mut window: Option<&mut Window>,
+        window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) where
         F: FnOnce(GitHandle) -> VibexResult<Option<GitStatusSummary>> + Send + 'static,
@@ -5015,9 +5034,8 @@ impl CodeWorkbench {
             cx.notify();
             return;
         }
-        if let Some(window) = window.as_deref_mut() {
-            push_git_mutation_notice(scope.kind, window, cx);
-        }
+        let notification_window = window.map(|window| window.window_handle());
+        let mutation_kind = scope.kind;
         let operation_id = scope.operation_id;
         let runner = gpui_tokio::Tokio::spawn(cx, async move { operation(runtime.git()) });
         self.mutation_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
@@ -5038,7 +5056,11 @@ impl CodeWorkbench {
                         if let Some(status) = status {
                             this.file_tree.set_git_changes(&status.changes);
                         }
-                        this.note = Some("Git operation completed".into());
+                        if let Some(window_handle) = notification_window {
+                            let _ = cx.update_window(window_handle, |_, window, cx| {
+                                push_git_mutation_result_notice(mutation_kind, window, cx);
+                            });
+                        }
                         this.load_git_status(cx);
                         this.load_branches(cx);
                         if this.git.mode == GitWorkbenchMode::History {
@@ -5050,7 +5072,19 @@ impl CodeWorkbench {
                             this.commit_reset_window = None;
                         }
                         this.git.fail_mutation(&operation_id, &error.code);
-                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        let message = format!("{}: {}", error.code, error.message);
+                        if let Some(window_handle) = notification_window {
+                            let message = message.clone();
+                            let _ = cx.update_window(window_handle, |_, window, cx| {
+                                push_git_mutation_failure_notice(
+                                    mutation_kind,
+                                    &message,
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }
+                        this.error = Some(message);
                     }
                     Err(error) => {
                         if reset_commit_form {
@@ -5058,7 +5092,19 @@ impl CodeWorkbench {
                         }
                         this.git
                             .fail_mutation(&operation_id, "git_mutation_task_failed");
-                        this.error = Some(format!("Git mutation task failed: {error}"));
+                        let message = format!("Git mutation task failed: {error}");
+                        if let Some(window_handle) = notification_window {
+                            let message = message.clone();
+                            let _ = cx.update_window(window_handle, |_, window, cx| {
+                                push_git_mutation_failure_notice(
+                                    mutation_kind,
+                                    &message,
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }
+                        this.error = Some(message);
                     }
                 }
                 this.persist(cx);
@@ -14362,18 +14408,22 @@ mod tests {
     #[test]
     fn git_mutation_feedback_is_top_centered_and_action_specific() {
         assert_eq!(
-            git_mutation_notice(GitMutationKind::Fetch),
-            Some("Pulling latest changes...")
+            git_mutation_result_notice(GitMutationKind::Fetch),
+            Some("Pull completed")
         );
         assert_eq!(
-            git_mutation_notice(GitMutationKind::Push),
-            Some("Pushing local commits...")
+            git_mutation_result_notice(GitMutationKind::Push),
+            Some("Push completed")
         );
         assert_eq!(
-            git_mutation_notice(GitMutationKind::Revert),
-            Some("Rolling back selected changes...")
+            git_mutation_result_notice(GitMutationKind::Revert),
+            Some("Rollback completed")
         );
-        assert_eq!(git_mutation_notice(GitMutationKind::Commit), None);
+        assert_eq!(git_mutation_result_notice(GitMutationKind::Commit), None);
+        assert_eq!(
+            git_mutation_failure_label(GitMutationKind::Fetch),
+            Some("Pull failed")
+        );
 
         let source = include_str!("code_workbench.rs");
         assert!(
@@ -14382,6 +14432,8 @@ mod tests {
         assert!(source.contains("pending_kind == Some(GitMutationKind::Fetch)"));
         assert!(source.contains("pending_kind == Some(GitMutationKind::Push)"));
         assert!(source.contains("pending_kind == Some(GitMutationKind::Revert)"));
+        assert!(source.contains("push_git_mutation_result_notice"));
+        assert!(source.contains("push_git_mutation_failure_notice"));
     }
 
     #[test]
