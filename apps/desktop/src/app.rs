@@ -26429,6 +26429,7 @@ impl VibexWorkbench {
             .size_full()
             .min_h_0()
             .min_w_0()
+            .justify_end()
             .overflow_hidden()
             .bg(cx.theme().background)
             .child(
@@ -45809,6 +45810,12 @@ mod tests {
         composer_top: Rc<Cell<f32>>,
     }
 
+    struct ComposerBottomAnchorProbe {
+        input: Entity<InputState>,
+        root_bottom: Rc<Cell<f32>>,
+        composer_bottom: Rc<Cell<f32>>,
+    }
+
     struct RuntimePopoverLayoutProbe {
         placement: RuntimeMenuPlacement,
         trigger_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -45834,6 +45841,43 @@ mod tests {
                 .w(px(320.0))
                 .h(px(160.0))
                 .child(Input::new(&self.input).appearance(false).size_full())
+        }
+    }
+
+    impl Render for ComposerBottomAnchorProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let root_bottom = self.root_bottom.clone();
+            let composer_bottom = self.composer_bottom.clone();
+            v_flex()
+                .w(px(400.0))
+                .h(px(120.0))
+                .justify_end()
+                .overflow_hidden()
+                .on_prepaint(move |bounds, _, _| {
+                    root_bottom.set(f32::from(bounds.origin.y + bounds.size.height));
+                })
+                .child(v_flex().w_full().flex_1().min_h_0().child(div().flex_1()))
+                .child(
+                    v_flex()
+                        .w_full()
+                        .flex_none()
+                        .min_h(px(ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT))
+                        .on_prepaint(move |bounds, _, _| {
+                            composer_bottom.set(f32::from(bounds.origin.y + bounds.size.height));
+                        })
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .h(px(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT))
+                                .min_h(px(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT))
+                                .child(
+                                    div().h_full().flex_1().child(
+                                        Input::new(&self.input).appearance(false).size_full(),
+                                    ),
+                                ),
+                        )
+                        .child(h_flex().w_full().h(px(52.0)).flex_none()),
+                )
         }
     }
 
@@ -46238,6 +46282,45 @@ mod tests {
             observed_queue_bottom.get(),
             observed_composer_top.get()
         );
+    }
+
+    #[gpui::test]
+    fn overflowing_composer_stays_anchored_to_the_workbench_bottom(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let input_slot = Rc::new(RefCell::new(None));
+        let root_bottom = Rc::new(Cell::new(0.0));
+        let composer_bottom = Rc::new(Cell::new(0.0));
+        let root_bottom_for_view = root_bottom.clone();
+        let composer_bottom_for_view = composer_bottom.clone();
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let input = cx.new(|cx| InputState::new(window, cx).auto_grow(2, 8));
+            *input_slot.borrow_mut() = Some(input.clone());
+            let probe = cx.new(|_| ComposerBottomAnchorProbe {
+                input,
+                root_bottom: root_bottom_for_view,
+                composer_bottom: composer_bottom_for_view,
+            });
+            gpui_component::Root::new(probe, window, cx)
+        });
+        let input = input_slot
+            .borrow()
+            .clone()
+            .expect("composer input should be created with the probe");
+
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                let text = (0..24)
+                    .map(|line| format!("line {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                input.replace(text, window, cx);
+            });
+            let _ = window.draw(cx);
+            window.simulate_next_frame(cx);
+            let _ = window.draw(cx);
+        });
+
+        assert!((composer_bottom.get() - root_bottom.get()).abs() < 0.5);
     }
 
     fn command_entry(
