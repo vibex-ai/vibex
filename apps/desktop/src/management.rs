@@ -76,7 +76,7 @@ const MANAGEMENT_COMPACT_RESIZE_HANDLE_IDLE_THICKNESS: f32 = 3.0;
 const MANAGEMENT_COMPACT_RESIZE_HANDLE_HOVER_THICKNESS: f32 = 5.0;
 const MANAGEMENT_COMPACT_RESIZE_HANDLE_ANIMATION_MS: u64 = 140;
 const AGENT_AUTH_TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const MANAGEMENT_HOST_TITLE_BAR_HEIGHT: f32 = 44.0;
+const MANAGEMENT_HOST_TITLE_BAR_HEIGHT: f32 = 52.0;
 const MANAGEMENT_COMPACT_RESIZE_STEP: f32 = 16.0;
 const MANAGEMENT_DETAIL_ACTION_HEIGHT: f32 = 42.0;
 const MANAGEMENT_PROVIDER_ROW_HEIGHT: f32 = 72.0;
@@ -16443,7 +16443,7 @@ mod tests {
     fn compact_management_sidebar_preserves_a_reachable_main_panel() {
         assert_eq!(
             management_compact_sidebar_height_limits(620.0),
-            (192.0, 372.0)
+            (192.0, 364.0)
         );
         assert_eq!(
             management_compact_sidebar_height_limits(1_000.0),

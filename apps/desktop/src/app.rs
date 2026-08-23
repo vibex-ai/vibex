@@ -178,7 +178,7 @@ enum ReleaseChannel {
 }
 
 const WORKBENCH_NAVIGATION_LIMIT: usize = 60;
-const TITLE_BAR_HEIGHT: f32 = 44.0;
+const TITLE_BAR_HEIGHT: f32 = 52.0;
 const TITLE_BAR_COLLAPSED_SIDEBAR_WIDTH: f32 = 112.0;
 const SIDEBAR_PROJECT_LOGO_DIRECTORY: &str = "project-icons";
 const SIDEBAR_LOGO_DISPLAY_SIZE: f32 = 14.0;
