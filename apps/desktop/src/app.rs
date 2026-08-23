@@ -43441,7 +43441,6 @@ impl Render for FoundationSettings {
                     .min_h_0()
                     .flex_1()
                     .track_scroll(&self.settings_render_context.scroll)
-                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                     .bg(theme::semantic_color("background", cx.theme().is_dark()))
                     .overflow_y_scroll()
                     .child(page),
@@ -44023,8 +44022,8 @@ fn setting_row(
 ) -> AnyElement {
     let is_dark = cx.theme().is_dark();
     let border = theme::semantic_color("border", is_dark);
-    let accent = theme::semantic_color("accent", is_dark);
-    let accent_foreground = theme::semantic_color("accent-foreground", is_dark);
+    let primary = theme::semantic_color("primary", is_dark);
+    let primary_foreground = theme::semantic_color("primary-foreground", is_dark);
     let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
     let is_highlighted = cx
         .try_global::<SettingsRenderContext>()
@@ -44065,12 +44064,15 @@ fn setting_row(
                         .w_auto()
                         .self_start()
                         .rounded(px(4.0))
-                        .px_1()
-                        .py(px(1.0))
+                        .px_2()
+                        .py(px(2.0))
                         .text_sm()
                         .font_medium()
                         .when(is_highlighted, |this| {
-                            this.bg(accent.opacity(0.34)).text_color(accent_foreground)
+                            this.bg(primary.opacity(0.96))
+                                .border_1()
+                                .border_color(primary)
+                                .text_color(primary_foreground)
                         })
                         .child(title),
                 )
@@ -51823,7 +51825,7 @@ mod tests {
         let page_viewport = &settings[page_scroll..];
         assert!(page_viewport.contains(".h_full()"));
         assert!(page_viewport.contains(".overflow_y_scroll()"));
-        assert!(page_viewport.contains(".on_scroll_wheel(|_, _, cx| cx.stop_propagation())"));
+        assert!(!page_viewport.contains(".on_scroll_wheel(|_, _, cx| cx.stop_propagation()"));
         assert!(!page_viewport.contains(".overflow_y_scrollbar()"));
         assert!(page_viewport.contains(".track_scroll(&self.settings_render_context.scroll)"));
         let settings_root = &settings[..page_scroll];
@@ -51888,7 +51890,8 @@ mod tests {
         assert!(settings.contains(".when(selected"));
         assert!(settings.contains(".whitespace_normal()"));
         assert!(source.contains("let is_highlighted = cx"));
-        assert!(source.contains(".text_color(accent_foreground)"));
+        assert!(source.contains(".text_color(primary_foreground)"));
+        assert!(source.contains(".border_color(primary)"));
         assert!(
             source.contains(".capture_key_down(cx.listener(Self::on_settings_search_key_down))")
         );
