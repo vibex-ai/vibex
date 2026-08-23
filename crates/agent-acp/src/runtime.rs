@@ -187,6 +187,13 @@ const ACP_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const ACP_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const ACP_DEBUG_LOG_LIMIT: usize = 256;
 const ACP_FS_READ_BYTE_LIMIT: u64 = 10 * 1024 * 1024;
+/// Concurrency and deadline for host filesystem work. Both exist to protect
+/// the JSON-RPC reader task, which is the connection's liveness guarantee.
+const ACP_FS_CONCURRENT_OPERATION_LIMIT: usize = 8;
+#[cfg(not(test))]
+const ACP_FS_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const ACP_FS_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 const ACP_IMAGE_ATTACHMENT_BYTE_LIMIT: u64 = 5 * 1024 * 1024;
 const ACP_SUMMARY_LIMIT: usize = 2000;
 const ACP_ACTIVE_MESSAGE_LIMIT: usize = 64 * 1024;
@@ -1603,6 +1610,9 @@ pub(crate) struct AcpProcess {
     /// the agent's native store and the wire is the only source of events.
     transcript_strategy: Option<TranscriptStrategy>,
     transcript_home: Option<PathBuf>,
+    /// Bounds concurrent `fs/*` work so a burst of agent requests cannot
+    /// exhaust the blocking pool the rest of the runtime shares.
+    fs_operation_permits: Arc<tokio::sync::Semaphore>,
     command_display: String,
     args_display: String,
     outbound: Mutex<Option<mpsc::UnboundedSender<String>>>,
@@ -4679,54 +4689,81 @@ impl AcpProcess {
         }
     }
 
-    fn handle_fs_read(&self, rpc_id: Value, params: &Value) {
+    /// Run one filesystem host request off the JSON-RPC reader task.
+    ///
+    /// Reader progress is the liveness guarantee for the whole connection: a
+    /// large file, a stalled network mount or a burst of concurrent requests
+    /// must not be able to hold it. Every operation therefore takes a permit
+    /// from a bounded pool, runs on a blocking thread and is answered with an
+    /// error when it exceeds the deadline.
+    fn spawn_fs_operation<F>(self: &Arc<Self>, rpc_id: Value, operation: F)
+    where
+        F: FnOnce() -> Result<Value, (i64, String)> + Send + 'static,
+    {
+        let process = Arc::clone(self);
+        let permits = Arc::clone(&self.fs_operation_permits);
+        tokio::spawn(async move {
+            let outcome = timeout(ACP_FS_OPERATION_TIMEOUT, async move {
+                let _permit = permits.acquire().await.ok()?;
+                tokio::task::spawn_blocking(operation).await.ok()
+            })
+            .await;
+            match outcome {
+                Ok(Some(Ok(result))) => process.respond_ok(rpc_id, result),
+                Ok(Some(Err((code, message)))) => process.respond_error(rpc_id, code, &message),
+                // A panicked or cancelled blocking task must still release the
+                // agent's request rather than leave it pending forever.
+                Ok(None) => process.respond_error(rpc_id, -32603, "filesystem operation failed"),
+                Err(_) => process.respond_error(
+                    rpc_id,
+                    -32603,
+                    "filesystem operation exceeded the host timeout",
+                ),
+            }
+        });
+    }
+
+    fn handle_fs_read(self: &Arc<Self>, rpc_id: Value, params: &Value) {
         let Some(path) = params.get("path").and_then(Value::as_str) else {
             self.respond_error(rpc_id, -32602, "fs/read_text_file requires a path");
             return;
         };
         let path = PathBuf::from(path);
-        match std::fs::metadata(&path) {
-            Ok(metadata) if metadata.len() > ACP_FS_READ_BYTE_LIMIT => {
-                self.respond_error(rpc_id, -32603, "file exceeds the ACP read size limit");
-                return;
+        let line = params
+            .get("line")
+            .and_then(Value::as_u64)
+            .map(|line| line.max(1) as usize);
+        let limit = params
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|limit| limit as usize);
+        self.spawn_fs_operation(rpc_id, move || {
+            match std::fs::metadata(&path) {
+                Ok(metadata) if metadata.len() > ACP_FS_READ_BYTE_LIMIT => {
+                    return Err((-32603, "file exceeds the ACP read size limit".to_string()));
+                }
+                Err(err) => return Err((-32603, format!("failed to stat file: {err}"))),
+                _ => {}
             }
-            Err(err) => {
-                self.respond_error(rpc_id, -32603, &format!("failed to stat file: {err}"));
-                return;
-            }
-            _ => {}
-        }
-        match std::fs::read_to_string(&path) {
-            Ok(content) => {
-                let line = params
-                    .get("line")
-                    .and_then(Value::as_u64)
-                    .map(|line| line.max(1) as usize);
-                let limit = params
-                    .get("limit")
-                    .and_then(Value::as_u64)
-                    .map(|limit| limit as usize);
-                let content = match (line, limit) {
-                    (None, None) => content,
-                    (line, limit) => {
-                        let start = line.map(|line| line - 1).unwrap_or(0);
-                        let lines = content.lines().skip(start);
-                        let selected: Vec<&str> = match limit {
-                            Some(limit) => lines.take(limit).collect(),
-                            None => lines.collect(),
-                        };
-                        selected.join("\n")
-                    }
-                };
-                self.respond_ok(rpc_id, json!({ "content": content }));
-            }
-            Err(err) => {
-                self.respond_error(rpc_id, -32603, &format!("failed to read file: {err}"));
-            }
-        }
+            let content = std::fs::read_to_string(&path)
+                .map_err(|err| (-32603, format!("failed to read file: {err}")))?;
+            let content = match (line, limit) {
+                (None, None) => content,
+                (line, limit) => {
+                    let start = line.map(|line| line - 1).unwrap_or(0);
+                    let lines = content.lines().skip(start);
+                    let selected: Vec<&str> = match limit {
+                        Some(limit) => lines.take(limit).collect(),
+                        None => lines.collect(),
+                    };
+                    selected.join("\n")
+                }
+            };
+            Ok(json!({ "content": content }))
+        });
     }
 
-    fn handle_fs_write(&self, rpc_id: Value, params: &Value) {
+    fn handle_fs_write(self: &Arc<Self>, rpc_id: Value, params: &Value) {
         let Some(path) = params.get("path").and_then(Value::as_str) else {
             self.respond_error(rpc_id, -32602, "fs/write_text_file requires a path");
             return;
@@ -4735,6 +4772,8 @@ impl AcpProcess {
             self.respond_error(rpc_id, -32602, "fs/write_text_file requires content");
             return;
         };
+        // Containment is decided before the operation is queued: a denied
+        // write must not consume a permit or wait behind other work.
         let target = match resolve_contained_write_path(Path::new(path), &self.fs_write_roots) {
             Ok(target) => target,
             Err(error) => {
@@ -4742,12 +4781,12 @@ impl AcpProcess {
                 return;
             }
         };
-        match write_host_file_atomic(&target, content) {
-            Ok(()) => self.respond_ok(rpc_id, Value::Null),
-            Err(error) => {
-                self.respond_error(rpc_id, -32603, &error.message);
-            }
-        }
+        let content = content.to_string();
+        self.spawn_fs_operation(rpc_id, move || {
+            write_host_file_atomic(&target, &content)
+                .map(|()| Value::Null)
+                .map_err(|error| (-32603, error.message.to_string()))
+        });
     }
 
     fn handle_terminal_create(self: &Arc<Self>, rpc_id: Value, params: &Value) {
@@ -10639,6 +10678,9 @@ impl AcpRuntimeClient {
             fs_write_roots: acp_fs_write_roots(cwd, &spawn_env_overlays),
             transcript_strategy,
             transcript_home: claude_config_home(&spawn_env_overlays),
+            fs_operation_permits: Arc::new(tokio::sync::Semaphore::new(
+                ACP_FS_CONCURRENT_OPERATION_LIMIT,
+            )),
             command_display: config.command.clone(),
             args_display: redacted_args_summary(&process_args),
             outbound: Mutex::new(Some(outbound_tx)),
@@ -18084,6 +18126,9 @@ mod tests {
             fs_write_roots: vec![std::env::temp_dir()],
             transcript_strategy: None,
             transcript_home: None,
+            fs_operation_permits: Arc::new(tokio::sync::Semaphore::new(
+                ACP_FS_CONCURRENT_OPERATION_LIMIT,
+            )),
             command_display: "mock".to_string(),
             args_display: String::new(),
             outbound: Mutex::new(outbound),
@@ -20647,6 +20692,7 @@ request_log_path = os.environ.get("VIBEX_MOCK_ACP_REQUEST_LOG")
 set_model_mode = os.environ.get("VIBEX_MOCK_ACP_SET_MODEL_MODE", "supported")
 model_config_updates = os.environ.get("VIBEX_MOCK_ACP_MODEL_CONFIG_UPDATES") == "true"
 prompt_mode = os.environ.get("VIBEX_MOCK_ACP_PROMPT_MODE", "success")
+fs_paths = {}
 restore_mode = os.environ.get("VIBEX_MOCK_ACP_RESTORE_MODE", "success")
 advertise_resume = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_RESUME") == "true"
 advertise_auth = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_LOGIN") == "true"
@@ -21367,7 +21413,25 @@ for line in sys.stdin:
             time.sleep(0.1)
         if prompt_mode == "title_error":
             send_stream_error(session_id, True, "AI_RetryError: title generation failed")
-        if "grok_ask" in text:
+        if "fs_roundtrip" in text:
+            pending_prompt_id = mid
+            fs_paths["inside"] = os.path.join(os.getcwd(), "acp-fs-roundtrip.txt")
+            # The temp directory is itself a write root, so the escape
+            # target has to sit outside every root.
+            fs_paths["outside"] = os.path.join(
+                os.path.expanduser("~"), ".vibex-acp-escape-test.txt"
+            )
+            send({
+                "jsonrpc": "2.0",
+                "id": 994,
+                "method": "fs/write_text_file",
+                "params": {
+                    "sessionId": session_id,
+                    "path": fs_paths["inside"],
+                    "content": "host-written",
+                },
+            })
+        elif "grok_ask" in text:
             pending_prompt_id = mid
             send({
                 "jsonrpc": "2.0",
@@ -21467,6 +21531,48 @@ for line in sys.stdin:
                 "update": {
                     "sessionUpdate": "agent_message_chunk",
                     "content": {"type": "text", "text": "permission " + verdict},
+                },
+            },
+        })
+        send({
+            "jsonrpc": "2.0",
+            "id": pending_prompt_id,
+            "result": {"stopReason": "end_turn"},
+        })
+    elif method is None and msg.get("id") == 994:
+        # The write is answered asynchronously off the reader task, so the
+        # follow-up read proves the response actually came back.
+        send({
+            "jsonrpc": "2.0",
+            "id": 995,
+            "method": "fs/read_text_file",
+            "params": {"sessionId": "mock-session-1", "path": fs_paths["inside"]},
+        })
+    elif method is None and msg.get("id") == 995:
+        fs_paths["content"] = (msg.get("result") or {}).get("content")
+        send({
+            "jsonrpc": "2.0",
+            "id": 996,
+            "method": "fs/write_text_file",
+            "params": {
+                "sessionId": "mock-session-1",
+                "path": fs_paths["outside"],
+                "content": "escaped",
+            },
+        })
+    elif method is None and msg.get("id") == 996:
+        outcome = "denied" if msg.get("error") else "allowed"
+        send({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "mock-session-1",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {
+                        "type": "text",
+                        "text": "fs " + str(fs_paths.get("content")) + " escape:" + outcome,
+                    },
                 },
             },
         })
@@ -26090,6 +26196,84 @@ for line in sys.stdin:
              {\"type\":\"background_task\",\"uuid\":\"bg-2\",\"status\":\"completed\",\"parentUuid\":\"bg-1\"}\n",
         )
         .unwrap();
+
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    /// Host filesystem work runs off the JSON-RPC reader task, so the round
+    /// trip proves both that responses still reach the agent and that a write
+    /// outside the allowed roots is refused rather than silently performed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fs_host_requests_answer_off_the_reader_task_and_refuse_escapes() {
+        let Some(fixture) = MockAcpFixture::create("fs-roundtrip") else {
+            return;
+        };
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let turn = prepare_and_send_turn(
+            &client,
+            AcpSendTurnRequest {
+                session_id: session_id.clone(),
+                message_submission_id: None,
+                required_runtime: None,
+                text: "fs_roundtrip".to_string(),
+                attachments: Vec::new(),
+                workspace_root: fixture.workspace.display().to_string(),
+                binding: binding.clone(),
+                runtime_resources: ProviderRuntimeResources::default(),
+                execution_identity: None,
+                event_sender: Some(event_tx),
+                usage_execution_context: None,
+                usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                usage_event_sender: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(turn.completed);
+
+        let mut transcript = String::new();
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                AcpEvent::AssistantDelta { text_delta, .. } => transcript.push_str(&text_delta),
+                AcpEvent::AssistantMessage { text, .. } => transcript.push_str(&text),
+                _ => {}
+            }
+        }
+        assert!(
+            transcript.contains("fs host-written"),
+            "the write must be readable back: {transcript:?}"
+        );
+        assert!(
+            transcript.contains("escape:denied"),
+            "a write outside the workspace must be refused: {transcript:?}"
+        );
+        assert!(
+            fixture.workspace.join("acp-fs-roundtrip.txt").is_file(),
+            "the contained write must land on disk"
+        );
+        let escape_target = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .expect("the fixture needs a home directory to target")
+            .join(".vibex-acp-escape-test.txt");
+        assert!(
+            !escape_target.exists(),
+            "the refused write must not touch the filesystem"
+        );
 
         client.close_session(&binding).await.unwrap();
         fixture.cleanup();
