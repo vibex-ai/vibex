@@ -218,6 +218,7 @@ impl RuntimeSelectionResolver for TestSwitchRuntime {
                 .cloned()
                 .unwrap_or_else(|| self.adapter_id.clone()),
             auth_source_revision: 1,
+            selection: _selection.clone(),
             session_config: None,
         })
     }

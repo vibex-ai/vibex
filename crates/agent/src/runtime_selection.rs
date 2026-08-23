@@ -36,6 +36,7 @@ const DEFAULT_RUNTIME_SELECTION_BROADCAST_CAPACITY: usize = 64;
 pub struct ResolvedRuntimeSelection {
     pub adapter_id: AcpAdapterId,
     pub auth_source_revision: i64,
+    pub selection: SessionRuntimeSelection,
     pub session_config: Option<serde_json::Value>,
 }
 
@@ -45,6 +46,7 @@ impl fmt::Debug for ResolvedRuntimeSelection {
             .debug_struct("ResolvedRuntimeSelection")
             .field("adapter_id", &self.adapter_id)
             .field("auth_source_revision", &self.auth_source_revision)
+            .field("selection", &self.selection)
             .field("has_session_config", &self.session_config.is_some())
             .finish()
     }
@@ -223,8 +225,10 @@ impl RuntimeSelectionService {
             .resolver
             .resolve(session_id, &desired, None)
             .await?;
-        let requested_session_config =
-            RuntimeSwitchCoordinator::encode_requested_config(&desired, resolved.session_config)?;
+        let requested_session_config = RuntimeSwitchCoordinator::encode_requested_config(
+            &resolved.selection,
+            resolved.session_config,
+        )?;
         let record = {
             let mut conn = open_database(self.inner.coordinator.database_path())?;
             AgentSessionRuntimeRepository::enqueue_initial_runtime_switch(
@@ -238,7 +242,7 @@ impl RuntimeSelectionService {
                     target_binding_id: RuntimeBindingId::new(),
                     target_adapter_id: resolved.adapter_id,
                     target_auth_source_revision: resolved.auth_source_revision,
-                    desired,
+                    desired: resolved.selection,
                     requested_policy: RuntimeSwitchPolicy::Automatic,
                     active_work_policy: self.seamless_active_work_policy(),
                     requested_session_config,
@@ -323,7 +327,7 @@ impl RuntimeSelectionService {
             .resolve(&request.session_id, &request.desired, None)
             .await?;
         let requested_session_config = RuntimeSwitchCoordinator::encode_requested_config(
-            &request.desired,
+            &resolved.selection,
             resolved.session_config,
         )?;
         RuntimeSwitchRepository::validate_requested_config(&requested_session_config)?;
@@ -340,7 +344,7 @@ impl RuntimeSelectionService {
                     target_binding_id: RuntimeBindingId::new(),
                     target_adapter_id: resolved.adapter_id,
                     target_auth_source_revision: resolved.auth_source_revision,
-                    desired: request.desired,
+                    desired: resolved.selection,
                     requested_policy: RuntimeSwitchPolicy::Automatic,
                     active_work_policy: self.seamless_active_work_policy(),
                     requested_session_config,
@@ -399,7 +403,7 @@ impl RuntimeSelectionService {
                 desired_selection_revision: state.selection_revision,
                 target_adapter_id: resolved.adapter_id,
                 target_auth_source_revision: resolved.auth_source_revision,
-                target_selection: request.target,
+                target_selection: resolved.selection,
                 requested_policy: request.policy,
                 active_work_policy: request.active_work_policy,
                 requested_session_config: resolved.session_config,
@@ -907,6 +911,7 @@ mod tests {
             Ok(ResolvedRuntimeSelection {
                 adapter_id: self.adapter_id.clone(),
                 auth_source_revision: 1,
+                selection: selection.clone(),
                 session_config: Some(serde_json::json!({
                     "model": selection.model_id(),
                     "reasoningEffort": selection.reasoning_effort,

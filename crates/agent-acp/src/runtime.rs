@@ -121,8 +121,8 @@ use crate::protocol::{
     self, AcpDecodedPayload, AcpOperation, AcpOperationStability, AcpWireEncoding, CapabilitySource,
 };
 use crate::registry::{
-    AcpCompatibilityRegistry, AgentEventEnricherKind, CapabilitySupport, RestorePolicy,
-    known_reasoning_effort_values, known_session_mode_values,
+    AcpCompatibilityRegistry, AgentEventEnricherKind, CLAUDE_AGENT_ID, CapabilitySupport,
+    RestorePolicy, known_reasoning_effort_values, known_session_mode_values,
 };
 use crate::session_attachment_registry::{
     SessionAttachmentAcquireKey, SessionAttachmentAcquireOutput, SessionAttachmentAcquireResult,
@@ -6204,6 +6204,7 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
         selection: &SessionRuntimeSelection,
         preferred_adapter_id: Option<&vibex_core::AcpAdapterId>,
     ) -> VibexResult<ResolvedRuntimeSelection> {
+        let mut effective_selection = selection.clone();
         let context = self.target_context(session_id, selection)?;
         let adapter_id = self
             .client
@@ -6292,10 +6293,22 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
         let session_probe = if (selection.reasoning_effort.is_some() || selection.mode_id.is_some())
             && let Some(provider_profile_id) = selection.provider_profile_id()
         {
-            self.manager
-                .probe_session_config(selection.agent_id.clone(), provider_profile_id.clone())
-                .await
-                .ok()
+            let probe = if context.agent_id.as_str() == CLAUDE_AGENT_ID
+                && let Some(model_id) = model_id.as_deref()
+            {
+                self.manager
+                    .probe_session_config_for_model(
+                        selection.agent_id.clone(),
+                        provider_profile_id.clone(),
+                        model_id,
+                    )
+                    .await
+            } else {
+                self.manager
+                    .probe_session_config(selection.agent_id.clone(), provider_profile_id.clone())
+                    .await
+            };
+            probe.ok()
         } else {
             None
         };
@@ -6350,8 +6363,13 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
             }
         }
         if let Some(mode) = selection.mode_id.as_deref() {
-            let mode = validate_effort_value(mode).map_err(runtime_configuration_unavailable)?;
-            let supported = if selection.auth_context_id().is_some() {
+            let mut mode =
+                validate_effort_value(mode).map_err(runtime_configuration_unavailable)?;
+            let advertised_modes = session_probe
+                .as_ref()
+                .is_some_and(|probe| !probe.modes.is_empty())
+                || !context.config.modes.is_empty();
+            let mut supported = if selection.auth_context_id().is_some() {
                 match selection.model {
                     RuntimeModelSelection::Explicit { .. } => {
                         selected_account_model.is_some_and(|model| {
@@ -6376,8 +6394,20 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
                     || session_probe.as_ref().is_some_and(|probe| {
                         probe.modes.iter().any(|candidate| candidate.value == mode)
                     })
-                    || known_session_mode_values(&context.agent_id).contains(&mode.as_str())
+                    || (!advertised_modes
+                        && known_session_mode_values(&context.agent_id).contains(&mode.as_str()))
             };
+            if let Some(normalized) = normalize_claude_model_mode(
+                &context.agent_id,
+                selection.provider_profile_id().is_some(),
+                model_id.as_deref().is_some(),
+                session_probe.as_ref().map(|probe| probe.modes.as_slice()),
+                &mode,
+            ) {
+                mode = normalized;
+                supported = true;
+                effective_selection.mode_id = Some(mode.clone());
+            }
             if !supported {
                 return Err(runtime_configuration_unavailable("mode_unavailable"));
             }
@@ -6406,9 +6436,9 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
 
         let session_config = serde_json::to_value(SessionRuntimeConfigPatch {
             model_id,
-            reasoning_effort: selection.reasoning_effort.clone(),
-            mode_id: selection.mode_id.clone(),
-            config_values: selection.config_values.clone(),
+            reasoning_effort: effective_selection.reasoning_effort.clone(),
+            mode_id: effective_selection.mode_id.clone(),
+            config_values: effective_selection.config_values.clone(),
             ..Default::default()
         })
         .map_err(|_| {
@@ -6420,6 +6450,7 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
         Ok(ResolvedRuntimeSelection {
             adapter_id,
             auth_source_revision: context.auth_source_revision,
+            selection: effective_selection,
             session_config: Some(session_config),
         })
     }
@@ -7136,6 +7167,25 @@ fn runtime_configuration_unavailable(cause_code: &str) -> VibexError {
         "causeCode",
         safe_runtime_configuration_cause_code(cause_code),
     )
+}
+
+fn normalize_claude_model_mode(
+    agent_id: &AgentId,
+    is_provider_profile: bool,
+    has_explicit_model: bool,
+    advertised_modes: Option<&[ProviderSessionConfigValue]>,
+    requested_mode: &str,
+) -> Option<String> {
+    if agent_id.as_str() != CLAUDE_AGENT_ID
+        || !is_provider_profile
+        || !has_explicit_model
+        || !matches!(requested_mode, "auto" | "bypassPermissions")
+    {
+        return None;
+    }
+    let advertised =
+        advertised_modes.is_some_and(|modes| modes.iter().any(|mode| mode.value == requested_mode));
+    (!advertised).then(|| "default".to_string())
 }
 
 fn safe_runtime_configuration_cause_code(cause_code: &str) -> String {
@@ -21758,6 +21808,37 @@ for line in sys.stdin:
         assert!(error.diagnostics.iter().any(|diagnostic| {
             diagnostic.key == "causeCode" && diagnostic.value == expected_cause
         }));
+    }
+
+    #[test]
+    fn claude_model_gated_modes_only_survive_exact_model_probe() {
+        let claude = AgentId::parse(CLAUDE_AGENT_ID).unwrap();
+        let codex = AgentId::parse("codex").unwrap();
+        let auto = ProviderSessionConfigValue {
+            value: "auto".to_string(),
+            label: None,
+        };
+
+        assert_eq!(
+            normalize_claude_model_mode(&claude, true, true, None, "auto").as_deref(),
+            Some("default")
+        );
+        assert_eq!(
+            normalize_claude_model_mode(&claude, true, true, Some(&[auto]), "auto"),
+            None
+        );
+        assert_eq!(
+            normalize_claude_model_mode(&claude, true, true, None, "bypassPermissions").as_deref(),
+            Some("default")
+        );
+        assert_eq!(
+            normalize_claude_model_mode(&codex, true, true, None, "auto"),
+            None
+        );
+        assert_eq!(
+            normalize_claude_model_mode(&claude, true, false, None, "auto"),
+            None
+        );
     }
 
     fn configure_mock_default_agent_runtime(fixture: &MockAcpFixture, agent_id: &AgentId) {
