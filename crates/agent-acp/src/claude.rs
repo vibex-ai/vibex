@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
@@ -245,6 +245,58 @@ pub fn parse_claude_transcript_line(line: &str) -> Result<Option<ClaudeTranscrip
         status,
         raw: value,
     }))
+}
+
+/// Root of Claude's own state directory for a launch.
+///
+/// `CLAUDE_CONFIG_DIR` from the launch environment wins, because that is the
+/// directory the agent process itself will use; otherwise Claude defaults to
+/// `~/.claude`.
+pub fn claude_config_home(launch_env: &[(String, String)]) -> Option<PathBuf> {
+    launch_env
+        .iter()
+        .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| user_home_directory().map(|home| home.join(".claude")))
+}
+
+/// Locate `<native_session_id>.jsonl` under any project directory.
+///
+/// Claude offers no forward `cwd -> project directory` encoding, so discovery
+/// is by session-id filename across the project directories. The session id
+/// becomes a path component, so anything that could traverse out of the
+/// transcript root is rejected outright rather than sanitized.
+pub fn find_claude_transcript(config_home: &Path, native_session_id: &str) -> Option<PathBuf> {
+    if !is_safe_transcript_id(native_session_id) {
+        return None;
+    }
+    let file_name = format!("{native_session_id}.jsonl");
+    for entry in std::fs::read_dir(config_home.join("projects"))
+        .ok()?
+        .flatten()
+    {
+        let candidate = entry.path().join(&file_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn user_home_directory() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|home| !home.as_os_str().is_empty())
+}
+
+fn is_safe_transcript_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_ID_LEN
+        && !value.contains("..")
+        && !value.contains(['/', '\\', ':', '\0'])
 }
 
 pub fn claude_prompt_fingerprint(text: &str) -> String {
@@ -568,6 +620,50 @@ fn bounded_text(value: String, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcript_home_prefers_the_launch_environment_over_the_default() {
+        let overlays = vec![(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "/tmp/managed-claude".to_string(),
+        )];
+        assert_eq!(
+            claude_config_home(&overlays),
+            Some(PathBuf::from("/tmp/managed-claude"))
+        );
+        // An empty override is not a directory; fall back rather than tail
+        // the process root.
+        let empty = vec![("CLAUDE_CONFIG_DIR".to_string(), "   ".to_string())];
+        assert_ne!(claude_config_home(&empty), Some(PathBuf::from("   ")));
+    }
+
+    #[test]
+    fn transcript_discovery_scans_project_directories_and_rejects_traversal() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path();
+        let project = home.join("projects").join("-home-user-repo");
+        std::fs::create_dir_all(&project).unwrap();
+        let transcript = project.join("session-abc.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+
+        // Claude has no forward cwd -> project-directory encoding, so the
+        // session id is discovered by filename across project directories.
+        assert_eq!(
+            find_claude_transcript(home, "session-abc"),
+            Some(transcript)
+        );
+        assert_eq!(find_claude_transcript(home, "session-missing"), None);
+
+        // The id becomes a path component, so traversal shapes are refused
+        // outright instead of sanitized.
+        for unsafe_id in ["", "../session-abc", "nested/session-abc", "a\0b"] {
+            assert_eq!(
+                find_claude_transcript(home, unsafe_id),
+                None,
+                "{unsafe_id:?} must be rejected"
+            );
+        }
+    }
 
     #[test]
     fn extension_decoder_is_versioned_and_bounded() {

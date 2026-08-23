@@ -111,6 +111,7 @@ use vibex_db::{
 };
 
 use crate::auth::{append_known_terminal_auth_fallback, parse_initialize_auth_catalog};
+use crate::claude::{claude_config_home, find_claude_transcript};
 use crate::dialect::{
     AgentHostRequestDialect, LaunchArgPlacement, McpWireDelivery, agent_dialect_profile,
 };
@@ -132,7 +133,7 @@ use crate::protocol::{
 };
 use crate::registry::{
     AcpCompatibilityRegistry, AgentEventEnricherKind, CLAUDE_AGENT_ID, CapabilitySupport,
-    RestorePolicy, known_reasoning_effort_values, known_session_mode_values,
+    RestorePolicy, TranscriptStrategy, known_reasoning_effort_values, known_session_mode_values,
 };
 use crate::session_attachment_registry::{
     SessionAttachmentAcquireKey, SessionAttachmentAcquireOutput, SessionAttachmentAcquireResult,
@@ -158,8 +159,10 @@ use crate::{
     redacted_args_summary,
 };
 use crate::{
-    AgentEventInput, AgentEventInputSource, ClaudeBackgroundWorkRegistry, ClaudeWorkKey,
-    decode_claude_extension, normalize_agent_event, stable_event_correlation_id,
+    AgentEventInput, AgentEventInputSource, ClaudeBackgroundWorkRegistry, ClaudeTranscriptEvent,
+    ClaudeTranscriptEventKind, ClaudeTranscriptTailWatcher, ClaudeWorkKey,
+    claude_transcript_event_input, decode_claude_extension, normalize_agent_event,
+    stable_event_correlation_id,
 };
 
 /// Frozen wire expectation for tests; production initialize params carry the
@@ -198,6 +201,12 @@ const ACP_ELICITATION_TEXT_LIMIT: usize = 4 * 1024;
 const ACP_PENDING_COMMAND_CATALOG_LIMIT: usize = 16;
 const ACP_TERMINAL_OUTPUT_LIMIT: usize = 24 * 1024;
 const ACP_PROCESS_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// Transcript compensation only has to beat the idle sweep, so it polls far
+/// more slowly than the wire.
+#[cfg(not(test))]
+const ACP_TRANSCRIPT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const ACP_TRANSCRIPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const ACP_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 const ACP_PERMISSION_CANCELLED_RESPONSE: &str = "cancelled";
 const OPENCODE_AGENT_ID: &str = "opencode";
@@ -1329,6 +1338,11 @@ struct AcpSessionAttachment {
     state: Mutex<AcpAttachmentShared>,
     crash_receiver: Mutex<Option<broadcast::Receiver<AcpProcessCrash>>>,
     crash_watcher: Mutex<Option<tokio::task::AbortHandle>>,
+    /// Tails the agent's native transcript for work that never reaches the
+    /// ACP wire (background tasks, out-of-turn activity). `None` for agents
+    /// whose native store the runtime cannot parse.
+    transcript_watcher: Mutex<Option<tokio::task::AbortHandle>>,
+    transcript_state: Mutex<Option<ClaudeTranscriptTailWatcher>>,
     registration_barrier: Mutex<Option<AcpRegistrationBarrier>>,
 }
 
@@ -1584,6 +1598,11 @@ pub(crate) struct AcpProcess {
     /// Roots the agent may write into through `fs/write_text_file`. Reads stay
     /// unrestricted on purpose (see `host_fs`).
     fs_write_roots: Vec<PathBuf>,
+    /// How this agent records work that never reaches the ACP wire, and the
+    /// state home it records it in. `None` means the runtime has no parser for
+    /// the agent's native store and the wire is the only source of events.
+    transcript_strategy: Option<TranscriptStrategy>,
+    transcript_home: Option<PathBuf>,
     command_display: String,
     args_display: String,
     outbound: Mutex<Option<mpsc::UnboundedSender<String>>>,
@@ -1743,6 +1762,8 @@ impl AcpSessionAttachment {
             state: Mutex::new(state),
             crash_receiver: Mutex::new(Some(crash_receiver)),
             crash_watcher: Mutex::new(None),
+            transcript_watcher: Mutex::new(None),
+            transcript_state: Mutex::new(None),
             registration_barrier: Mutex::new(registration_barrier),
         };
         attachment.publish_profile_config_evidence();
@@ -1801,6 +1822,78 @@ impl AcpSessionAttachment {
             && let Some(watcher) = watcher.take()
         {
             watcher.abort();
+        }
+    }
+
+    fn set_transcript_watcher(&self, watcher: tokio::task::AbortHandle) {
+        if let Ok(mut current) = self.transcript_watcher.lock()
+            && let Some(previous) = current.replace(watcher)
+        {
+            previous.abort();
+        }
+    }
+
+    fn abort_transcript_watcher(&self) {
+        if let Ok(mut watcher) = self.transcript_watcher.lock()
+            && let Some(watcher) = watcher.take()
+        {
+            watcher.abort();
+        }
+        if let Ok(mut state) = self.transcript_state.lock() {
+            *state = None;
+        }
+    }
+
+    /// Record a prompt the runtime itself sent so the transcript tail does not
+    /// re-emit it: the same text lands in the native store moments later.
+    fn observe_live_transcript_prompt(&self, text: &str) {
+        if let Ok(mut state) = self.transcript_state.lock()
+            && let Some(watcher) = state.as_mut()
+        {
+            watcher.observe_live_prompt(text);
+        }
+    }
+
+    /// Drain one transcript poll.
+    ///
+    /// Background records drive the idle-sweep guard unconditionally: a
+    /// session whose only remaining work is an out-of-turn background task
+    /// must not be swept, and that work is invisible on the wire. This is the
+    /// guarantee the watcher exists for.
+    ///
+    /// Canonical events are delivered through the active turn's sink, so
+    /// records that land while no turn is running are accounted for but not
+    /// rendered — the runtime has no out-of-turn event channel, and adding one
+    /// reaches well past the transcript reader.
+    fn drain_transcript_events(&self, events: Vec<ClaudeTranscriptEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        let process = self.process();
+        let work_key = ClaudeWorkKey {
+            binding_id: self.binding_id.as_str().to_string(),
+            activation_generation: self.activation_generation(),
+        };
+        for event in events {
+            if matches!(
+                event.kind,
+                ClaudeTranscriptEventKind::BackgroundTask
+                    | ClaudeTranscriptEventKind::BackgroundShell
+            ) && let Ok(mut state) = self.state.lock()
+            {
+                match event.status {
+                    ToolCallStatus::Started | ToolCallStatus::Progress => state
+                        .claude_background_work
+                        .begin(work_key.clone(), event.native_event_id.clone()),
+                    ToolCallStatus::Completed | ToolCallStatus::Failed => state
+                        .claude_background_work
+                        .finish(&work_key, &event.native_event_id),
+                }
+            }
+            let input = claude_transcript_event_input(&event, &process.compatibility_identity);
+            for normalized in normalize_agent_event(AgentEventEnricherKind::Claude, &input) {
+                self.emit_turn_event(AcpEvent::Canonical(normalized));
+            }
         }
     }
 
@@ -3381,10 +3474,12 @@ fn normalize_tool_call_snapshot(
 
 impl Drop for AcpSessionAttachment {
     fn drop(&mut self) {
-        if let Ok(watcher) = self.crash_watcher.get_mut()
-            && let Some(watcher) = watcher.take()
-        {
-            watcher.abort();
+        for watcher in [&mut self.crash_watcher, &mut self.transcript_watcher] {
+            if let Ok(watcher) = watcher.get_mut()
+                && let Some(watcher) = watcher.take()
+            {
+                watcher.abort();
+            }
         }
     }
 }
@@ -9059,12 +9154,73 @@ impl AcpRuntimeClient {
         attachment.set_crash_watcher(watcher.abort_handle());
     }
 
+    /// Tail the agent's own transcript for work that never reaches the wire.
+    ///
+    /// Claude records background tasks, task notifications and out-of-turn
+    /// activity in its JSONL store and reports none of it over ACP, so without
+    /// this the idle sweep can retire a session that is still working. The
+    /// watcher is read-only, keeps its own file offset, and is armed only for
+    /// agents whose native store the runtime can parse.
+    fn arm_attachment_transcript_watcher(&self, handle: &AcpAttachmentHandle) {
+        let attachment = handle.payload();
+        let process = attachment.process();
+        if process.transcript_strategy != Some(TranscriptStrategy::ClaudeJsonl) {
+            return;
+        }
+        let Some(home) = process.transcript_home.clone() else {
+            return;
+        };
+        let native_session_id = attachment.native_session_id.clone();
+        let weak_attachment = Arc::downgrade(&attachment);
+        let observability = Arc::clone(&self.observability);
+        let watcher = tokio::spawn(async move {
+            // Claude creates the transcript lazily, so the path is resolved on
+            // every tick until it appears.
+            let mut armed = false;
+            loop {
+                sleep(ACP_TRANSCRIPT_POLL_INTERVAL).await;
+                let Some(attachment) = weak_attachment.upgrade() else {
+                    break;
+                };
+                if !armed {
+                    let Some(path) = find_claude_transcript(&home, &native_session_id) else {
+                        continue;
+                    };
+                    let Ok(mut state) = attachment.transcript_state.lock() else {
+                        break;
+                    };
+                    *state = Some(ClaudeTranscriptTailWatcher::with_observability(
+                        path,
+                        Arc::clone(&observability),
+                    ));
+                    armed = true;
+                }
+                let polled = match attachment.transcript_state.lock() {
+                    Ok(mut state) => match state.as_mut() {
+                        Some(watcher) => watcher.poll(),
+                        None => break,
+                    },
+                    Err(_) => break,
+                };
+                match polled {
+                    Ok(events) => attachment.drain_transcript_events(events),
+                    // A transcript that disappears (session forked, store
+                    // rotated) re-arms on the next tick rather than ending the
+                    // watcher: compensation must survive a relocation.
+                    Err(_) => armed = false,
+                }
+            }
+        });
+        attachment.set_transcript_watcher(watcher.abort_handle());
+    }
+
     async fn detach_attachment(&self, expected: &SessionAttachmentEventFence) {
         let Ok(Some(handle)) = self.attachment_router.registry.remove(expected) else {
             return;
         };
         let attachment = handle.payload();
         attachment.abort_crash_watcher();
+        attachment.abort_transcript_watcher();
         attachment.cancel_pending_host_requests();
         let process = attachment.process();
         process.forget_attachment_terminals(&attachment);
@@ -9222,6 +9378,7 @@ impl AcpRuntimeClient {
                 // are quarantined until durable Commit activates this fence.
                 ready.payload().release_registration_barrier();
                 self.arm_attachment_crash_watcher(&ready);
+                self.arm_attachment_transcript_watcher(&ready);
                 let status = ready
                     .payload()
                     .lease
@@ -10407,6 +10564,13 @@ impl AcpRuntimeClient {
         // Retained for the filesystem host: an agent's native state home is
         // only knowable from the overlay it was launched with.
         let spawn_env_overlays = env_overlays.clone();
+        // The transcript store is a family property, so it is read from the
+        // descriptor regardless of whether the installed version matches it
+        // exactly — a newer managed adapter still writes the same JSONL.
+        let transcript_strategy = self
+            .compatibility_registry
+            .for_agent(&agent_id)
+            .map(|descriptor| descriptor.transcript_strategy);
         for (key, value) in env_overlays {
             command.env(key, value);
         }
@@ -10473,6 +10637,8 @@ impl AcpRuntimeClient {
             event_enricher: adapter_identity.event_enricher,
             workspace_root: cwd.to_path_buf(),
             fs_write_roots: acp_fs_write_roots(cwd, &spawn_env_overlays),
+            transcript_strategy,
+            transcript_home: claude_config_home(&spawn_env_overlays),
             command_display: config.command.clone(),
             args_display: redacted_args_summary(&process_args),
             outbound: Mutex::new(Some(outbound_tx)),
@@ -15132,6 +15298,10 @@ impl AcpClient for AcpRuntimeClient {
                     request.usage_counter_origin,
                     request.usage_event_sender.clone(),
                 )?;
+                // The same prompt reaches the native transcript moments later;
+                // recording it here keeps the tail from replaying it as a
+                // second, out-of-turn message.
+                current.observe_live_transcript_prompt(&request.text);
                 match process.start_request(
                     AcpOperation::SessionPrompt.method(),
                     protocol::build_session_prompt_params(&current.native_session_id, prompt),
@@ -17912,6 +18082,8 @@ mod tests {
             event_enricher: AgentEventEnricherKind::Passthrough,
             workspace_root: std::env::temp_dir(),
             fs_write_roots: vec![std::env::temp_dir()],
+            transcript_strategy: None,
+            transcript_home: None,
             command_display: "mock".to_string(),
             args_display: String::new(),
             outbound: Mutex::new(outbound),
@@ -21491,6 +21663,26 @@ for line in sys.stdin:
             {
                 config.features.push("safe_multi_session".to_string());
             }
+            service
+                .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                    provider_profile_id: self.profile_id.clone(),
+                    config,
+                })
+                .unwrap();
+        }
+
+        fn push_profile_env(&self, key: &str, value: &str) {
+            let service = self.service();
+            let mut config = service
+                .get_acp_profile_config(self.profile_id.clone())
+                .unwrap();
+            config.env.push(vibex_core::AcpProviderEnvReference {
+                key: key.to_string(),
+                source: AcpProviderEnvSource::Literal,
+                value: Some(value.to_string()),
+                secret_lookup_key: None,
+                redacted_hint: "mock fixture value".to_string(),
+            });
             service
                 .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
                     provider_profile_id: self.profile_id.clone(),
@@ -25824,6 +26016,82 @@ for line in sys.stdin:
             );
             client.close_session(&binding).await.unwrap();
         }
+        fixture.cleanup();
+    }
+
+    /// Claude records background work in its own JSONL store and reports none
+    /// of it over ACP. Without the transcript tail the idle sweep can retire a
+    /// session that is still working, so the watcher must be armed with the
+    /// attachment and feed the background-work guard.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn claude_transcript_watcher_accounts_for_background_work_off_the_wire() {
+        let agent_id = AgentId::parse(CLAUDE_AGENT_ID).unwrap();
+        let Some(fixture) =
+            MockAcpFixture::create_for_agent("claude-transcript-watcher", Some(agent_id))
+        else {
+            return;
+        };
+        let transcript_home = fixture.root.join("claude-home");
+        let project = transcript_home.join("projects").join("-mock-project");
+        std::fs::create_dir_all(&project).unwrap();
+        fixture.push_profile_env("CLAUDE_CONFIG_DIR", &transcript_home.display().to_string());
+
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        let attachment = client.current_attachment(&session_id).unwrap();
+        let background_count = || {
+            attachment
+                .payload()
+                .runtime_attachment_snapshot(&session_id, RuntimeAttachmentStatus::Ready)
+                .unwrap()
+                .active_background_work_count
+        };
+        assert_eq!(background_count(), 0);
+
+        // Claude creates the transcript lazily, so the watcher has to arm
+        // itself once the file appears rather than at attachment time.
+        let transcript = project.join(format!(
+            "{}.jsonl",
+            session.native_session_id.as_deref().unwrap()
+        ));
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"background_task\",\"uuid\":\"bg-1\",\"status\":\"running\"}\n",
+        )
+        .unwrap();
+
+        let armed = tokio::time::timeout(Duration::from_secs(5), async {
+            while background_count() == 0 {
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            armed.is_ok(),
+            "the transcript tail must report background work the wire never sends"
+        );
+
+        // A completion record retires the work, so the session becomes
+        // sweepable again.
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"background_task\",\"uuid\":\"bg-1\",\"status\":\"running\"}\n\
+             {\"type\":\"background_task\",\"uuid\":\"bg-2\",\"status\":\"completed\",\"parentUuid\":\"bg-1\"}\n",
+        )
+        .unwrap();
+
+        client.close_session(&binding).await.unwrap();
         fixture.cleanup();
     }
 
