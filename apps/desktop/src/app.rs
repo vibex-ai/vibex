@@ -19495,6 +19495,11 @@ impl VibexWorkbench {
                 .take();
             settings
                 .settings_render_context
+                .highlighted_title
+                .borrow_mut()
+                .take();
+            settings
+                .settings_render_context
                 .target_anchor
                 .borrow_mut()
                 .take();
@@ -39660,6 +39665,7 @@ struct SettingsSearchCandidate {
 struct SettingsRenderContext {
     scroll: ScrollHandle,
     target_title: Rc<RefCell<Option<String>>>,
+    highlighted_title: Rc<RefCell<Option<String>>>,
     target_anchor: Rc<RefCell<Option<ScrollAnchor>>>,
 }
 
@@ -39670,6 +39676,7 @@ impl SettingsRenderContext {
         Self {
             scroll: ScrollHandle::new(),
             target_title: Rc::new(RefCell::new(None)),
+            highlighted_title: Rc::new(RefCell::new(None)),
             target_anchor: Rc::new(RefCell::new(None)),
         }
     }
@@ -40767,6 +40774,10 @@ impl FoundationSettings {
             .target_title
             .borrow_mut()
             .take();
+        self.settings_render_context
+            .highlighted_title
+            .borrow_mut()
+            .take();
         if section == SettingsSection::Data {
             self.start_storage_usage_probe(cx);
         }
@@ -40826,6 +40837,10 @@ impl FoundationSettings {
                     .target_title
                     .borrow_mut()
                     .take();
+                self.settings_render_context
+                    .highlighted_title
+                    .borrow_mut()
+                    .take();
             }
             return;
         };
@@ -40838,6 +40853,10 @@ impl FoundationSettings {
         self.activate_settings_section(candidate.section, cx);
         self.settings_render_context
             .target_title
+            .borrow_mut()
+            .replace(candidate.title.to_string());
+        self.settings_render_context
+            .highlighted_title
             .borrow_mut()
             .replace(candidate.title.to_string());
     }
@@ -40853,6 +40872,10 @@ impl FoundationSettings {
         self.activate_settings_section(candidate.section, cx);
         self.settings_render_context
             .target_title
+            .borrow_mut()
+            .replace(candidate.title.to_string());
+        self.settings_render_context
+            .highlighted_title
             .borrow_mut()
             .replace(candidate.title.to_string());
         let candidates = settings_search_candidates_for_query(
@@ -43992,7 +44015,13 @@ fn setting_row(
 ) -> AnyElement {
     let is_dark = cx.theme().is_dark();
     let border = theme::semantic_color("border", is_dark);
+    let accent = theme::semantic_color("accent", is_dark);
+    let accent_foreground = theme::semantic_color("accent-foreground", is_dark);
     let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
+    let is_highlighted = cx
+        .try_global::<SettingsRenderContext>()
+        .map(|context| context.highlighted_title.borrow().as_deref() == Some(title))
+        .unwrap_or(false);
     let target_anchor = cx
         .try_global::<SettingsRenderContext>()
         .and_then(|context| {
@@ -44023,7 +44052,20 @@ fn setting_row(
             v_flex()
                 .min_w_0()
                 .flex_1()
-                .child(div().text_sm().font_medium().child(title))
+                .child(
+                    div()
+                        .w_auto()
+                        .self_start()
+                        .rounded(px(4.0))
+                        .px_1()
+                        .py(px(1.0))
+                        .text_sm()
+                        .font_medium()
+                        .when(is_highlighted, |this| {
+                            this.bg(accent.opacity(0.34)).text_color(accent_foreground)
+                        })
+                        .child(title),
+                )
                 .child(
                     div()
                         .text_xs()
@@ -51750,10 +51792,13 @@ mod tests {
         assert!(settings.contains("search_selected_index"));
         assert!(settings.contains("search_scroll"));
         assert!(settings.contains("settings_search_result_scroll_index"));
+        assert!(settings.contains("highlighted_title"));
         assert!(settings.contains("move_settings_search_selection"));
         assert!(settings.contains("settings_section_label(candidate.section)"));
         assert!(settings.contains(".when(selected"));
         assert!(settings.contains(".whitespace_normal()"));
+        assert!(source.contains("let is_highlighted = cx"));
+        assert!(source.contains(".text_color(accent_foreground)"));
         assert!(
             source.contains(".capture_key_down(cx.listener(Self::on_settings_search_key_down))")
         );
