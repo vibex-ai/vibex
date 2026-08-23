@@ -26,7 +26,7 @@ use gpui_component::{
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem},
     notification::Notification,
     resizable::{h_resizable, resizable_panel, v_resizable},
-    scroll::ScrollableElement as _,
+    scroll::{ScrollableElement as _, ScrollbarAxis},
     searchable_list::SearchableListItem,
     select::{Select, SelectEvent, SelectState},
     v_flex,
@@ -7040,6 +7040,7 @@ pub struct CodeRightRail {
     file_search_error: Option<String>,
     file_search_generation: u64,
     file_search_task: Option<Task<()>>,
+    file_search_scroll: ScrollHandle,
     history_search_input: Entity<InputState>,
     history_search_generation: u64,
     history_search_task: Option<Task<()>>,
@@ -7220,6 +7221,7 @@ impl CodeRightRail {
             file_search_error: None,
             file_search_generation: 0,
             file_search_task: None,
+            file_search_scroll: ScrollHandle::new(),
             history_search_input,
             history_search_generation: 0,
             history_search_task: None,
@@ -7431,6 +7433,7 @@ impl CodeRightRail {
     fn clear_file_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.file_search_generation = self.file_search_generation.wrapping_add(1);
         self.file_search_task = None;
+        self.file_search_scroll.set_offset(point(px(0.0), px(0.0)));
         self.file_search_loading = false;
         self.file_search_error = None;
         self.file_search_results.clear();
@@ -7452,6 +7455,7 @@ impl CodeRightRail {
         self.file_search_generation = self.file_search_generation.wrapping_add(1);
         let generation = self.file_search_generation;
         self.file_search_task = None;
+        self.file_search_scroll.set_offset(point(px(0.0), px(0.0)));
         self.file_search_collapsed_paths.clear();
         let query = self.file_search_input.read(cx).value().trim().to_string();
         if query.is_empty() {
@@ -8590,6 +8594,7 @@ impl CodeRightRail {
             );
         }
         let results = self.file_search_results.clone();
+        let search_scroll = self.file_search_scroll.clone();
         let file_count = results
             .iter()
             .map(|result| result.path.as_str())
@@ -8660,11 +8665,16 @@ impl CodeRightRail {
             .child(
                 v_flex()
                     .flex_1()
+                    .min_w_0()
                     .min_h_0()
-                    .overflow_scrollbar()
+                    .relative()
+                    .track_scroll(&search_scroll)
+                    .overflow_scroll()
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                     .px_1()
                     .py_1()
-                    .children(rows),
+                    .children(rows)
+                    .scrollbar(&search_scroll, ScrollbarAxis::Both),
             )
             .into_any_element()
     }
