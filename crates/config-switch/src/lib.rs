@@ -365,16 +365,15 @@ impl ProviderConfigService {
             {
                 continue;
             }
-            let mut runtime_config = if profile.kind == ProviderKind::Acp {
-                acp_config_from_options(&profile.provider_options)?
-                    .unwrap_or_else(|| default_runtime_config.clone())
-            } else {
-                default_runtime_config.clone()
-            };
+            let mut runtime_config = acp_config_from_options(&profile.provider_options)?
+                .unwrap_or_else(|| default_runtime_config.clone());
             runtime_config.command = command.command.clone();
             runtime_config.args = command.args.clone();
             if runtime_config.modes.is_empty() {
                 runtime_config.modes = default_runtime_config.modes.clone();
+            }
+            if runtime_config.features.is_empty() {
+                runtime_config.features = default_runtime_config.features.clone();
             }
             runtime_config.models = configured_acp_model_ids(
                 &profile.configured_models,
@@ -1247,7 +1246,7 @@ impl ProviderConfigService {
         provider_profile_id: ProviderProfileId,
     ) -> VibexResult<AcpProviderConfig> {
         let conn = self.open_connection()?;
-        let profile =
+        let mut profile =
             ProviderProfileRepository::get(&conn, &provider_profile_id)?.ok_or_else(|| {
                 VibexError::validation(
                     "provider_profile_not_found",
@@ -1263,13 +1262,21 @@ impl ProviderConfigService {
             .with_diagnostic("providerProfileId", profile.id.as_str())
             .with_diagnostic("providerKind", profile.kind.to_string()));
         }
-        acp_config_from_options(&profile.provider_options)?.ok_or_else(|| {
+        let mut config = acp_config_from_options(&profile.provider_options)?.ok_or_else(|| {
             VibexError::validation(
                 "acp_config_missing",
                 "ACP provider profile is missing typed ACP configuration",
             )
             .with_diagnostic("providerProfileId", profile.id.as_str())
-        })
+        })?;
+        if native_import::hydrate_cc_switch_claude_profile_config(&mut profile, &mut config)? {
+            profile.updated_at_ms =
+                unix_timestamp_ms().max(profile.updated_at_ms.saturating_add(1));
+            ProviderProfileRepository::update(&conn, &profile)?;
+            self.sync_legacy_projection(&conn, &profile)?;
+            self.notify_profile_saved(&profile);
+        }
+        Ok(config)
     }
 
     /// Persists the exact environment variables advertised by one ACP auth
@@ -9071,6 +9078,77 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn managed_acp_reconciliation_preserves_imported_claude_environment() {
+        let dir = tempdir().unwrap();
+        let service = ProviderConfigService::new(dir.path().join("vibex.db"));
+        let agent_id = AgentId::parse("claude").unwrap();
+        let config = AcpProviderConfig {
+            command: "claude-agent-acp".to_string(),
+            args: Vec::new(),
+            env: vec![AcpProviderEnvReference {
+                key: "ANTHROPIC_MODEL".to_string(),
+                source: AcpProviderEnvSource::Literal,
+                value: Some("claude-opus-5[1m]".to_string()),
+                secret_lookup_key: None,
+                redacted_hint: "imported from cc-switch".to_string(),
+            }],
+            cwd_template: Some("{workspaceRoot}".to_string()),
+            process_strategy: AcpProcessStrategy::default(),
+            terminal_tools: false,
+            terminal_auth: false,
+            models: vec!["claude-fable-5[1m]".to_string()],
+            modes: Vec::new(),
+            features: Vec::new(),
+            disabled_tools: Vec::new(),
+        };
+        let profile = service
+            .create_profile(ProviderProfileCreateRequest {
+                agent_id: Some(agent_id.clone()),
+                kind: ProviderKind::Claude,
+                display_name: "Imported Claude".to_string(),
+                account_alias: Some("work".to_string()),
+                base_url: Some("https://claude.example.invalid".to_string()),
+                default_model: Some("claude-fable-5[1m]".to_string()),
+                small_model: None,
+                large_model: None,
+                configured_models: vec![ProviderConfiguredModel {
+                    id: "claude-fable-5[1m]".to_string(),
+                    display_name: None,
+                    enabled: true,
+                    wire_api: None,
+                    capabilities: Default::default(),
+                }],
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: Some(acp_config_to_options(&config).unwrap()),
+                secret_references: Vec::new(),
+            })
+            .unwrap();
+
+        service
+            .reconcile_agent_acp_runtime(
+                agent_id,
+                AgentCommandConfig {
+                    command: "/managed/claude-agent-acp".to_string(),
+                    args: vec!["/managed/adapter.js".to_string()],
+                },
+            )
+            .unwrap();
+
+        let migrated = service.get_profile(&profile.id).unwrap().unwrap();
+        assert_eq!(migrated.kind, ProviderKind::Acp);
+        let runtime = service.get_acp_profile_config(profile.id).unwrap();
+        assert!(runtime.env.iter().any(|reference| {
+            reference.key == "ANTHROPIC_MODEL"
+                && reference.value.as_deref() == Some("claude-opus-5[1m]")
+        }));
+        assert_eq!(runtime.command, "/managed/claude-agent-acp");
+        assert_eq!(runtime.args, vec!["/managed/adapter.js"]);
     }
 
     #[test]

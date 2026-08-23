@@ -1607,7 +1607,7 @@ fn legacy_configured_model_bindings(
             Ok(AgentConfiguredModelBinding {
                 id: legacy_model_binding_id(binding_id, index)?,
                 provider_model_id: model.id.clone(),
-                agent_model_id: legacy_agent_model_id(&profile.agent_id, &model.id),
+                agent_model_id: legacy_agent_model_id(profile, &model.id),
                 wire_protocol_id,
                 sdk_adapter_id,
                 deployment: None,
@@ -1618,8 +1618,22 @@ fn legacy_configured_model_bindings(
         .collect()
 }
 
-fn legacy_agent_model_id(agent_id: &AgentId, provider_model_id: &str) -> String {
-    if agent_id.as_str() != "claude" {
+fn legacy_agent_model_id(profile: &ProviderProfile, provider_model_id: &str) -> String {
+    if profile.agent_id.as_str() != "claude" {
+        return provider_model_id.to_string();
+    }
+
+    // The `opus`/`sonnet`/`haiku` aliases only mean what we intend on
+    // Anthropic's own endpoint. A profile with its own base URL points at a
+    // gateway where the CLI resolves those aliases through the user's
+    // `ANTHROPIC_DEFAULT_*_MODEL` settings, so the session silently runs a
+    // different model than the one selected here. Keep the concrete id there.
+    if profile
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|url| !url.is_empty())
+    {
         return provider_model_id.to_string();
     }
 
@@ -2290,6 +2304,100 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(restored.configured_models, saved.binding.configured_models);
+    }
+
+    #[test]
+    fn legacy_claude_gateway_profile_keeps_concrete_model_ids() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let mut profile = ProviderProfile::local_default(ProviderKind::Claude);
+        profile.id = ProviderProfileId::new();
+        profile.status = ProviderProfileStatus::Enabled;
+        profile.base_url = Some("https://gateway.example.invalid".to_string());
+        profile.default_model = Some("claude-opus-5[1m]".to_string());
+        profile.configured_models = ["claude-opus-5", "claude-opus-5[1m]", "claude-haiku-4-5"]
+            .into_iter()
+            .map(|id| ProviderConfiguredModel {
+                id: id.to_string(),
+                display_name: None,
+                enabled: true,
+                wire_api: None,
+                capabilities: Default::default(),
+            })
+            .collect();
+        ProviderProfileRepository::insert(&conn, &profile).unwrap();
+
+        let saved = ProviderProjectionCompatibilityRepository::sync_legacy_profile(&conn, &profile)
+            .unwrap();
+
+        // A gateway resolves `opus`/`haiku` through the user's
+        // `ANTHROPIC_DEFAULT_*_MODEL` settings, which would run a different
+        // model than the selected one.
+        assert_eq!(
+            saved
+                .binding
+                .configured_models
+                .iter()
+                .map(|model| model.agent_model_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["claude-opus-5", "claude-opus-5[1m]", "claude-haiku-4-5"]
+        );
+
+        assert_eq!(
+            ProviderProjectionCompatibilityRepository::backfill_legacy_profiles(&conn).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn legacy_claude_gateway_profile_repairs_previously_aliased_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let mut profile = ProviderProfile::local_default(ProviderKind::Claude);
+        profile.id = ProviderProfileId::new();
+        profile.status = ProviderProfileStatus::Enabled;
+        profile.base_url = Some("https://gateway.example.invalid".to_string());
+        profile.default_model = Some("claude-opus-5".to_string());
+        profile.configured_models = ["claude-opus-5"]
+            .into_iter()
+            .map(|id| ProviderConfiguredModel {
+                id: id.to_string(),
+                display_name: None,
+                enabled: true,
+                wire_api: None,
+                capabilities: Default::default(),
+            })
+            .collect();
+        ProviderProfileRepository::insert(&conn, &profile).unwrap();
+        let saved = ProviderProjectionCompatibilityRepository::sync_legacy_profile(&conn, &profile)
+            .unwrap();
+
+        // Rows written before the gateway carve-out still carry the alias.
+        conn.execute(
+            "UPDATE agent_configured_model_bindings
+             SET agent_model_id = 'opus'
+             WHERE agent_model_provider_binding_id = ?1",
+            [saved.binding.id.as_str()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            ProviderProjectionCompatibilityRepository::backfill_legacy_profiles(&conn).unwrap(),
+            0
+        );
+        let repaired = AgentModelProviderBindingRepository::get(&conn, &saved.binding.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            repaired
+                .configured_models
+                .iter()
+                .map(|model| model.agent_model_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["claude-opus-5"]
+        );
     }
 
     #[test]

@@ -5240,6 +5240,16 @@ impl AcpRuntimeSwitchBridge {
                         .client
                         .profile_config(provider_profile_id)
                         .map_err(|error| runtime_configuration_unavailable(&error.code))?;
+                    // Profile config reads may perform a one-time native
+                    // import hydration. Capture the revision after that
+                    // migration so the launch snapshot is self-consistent.
+                    let profile = self
+                        .client
+                        .config_service
+                        .get_profile(provider_profile_id)?
+                        .ok_or_else(|| {
+                            runtime_configuration_unavailable("provider_profile_not_found")
+                        })?;
                     let runtime_resources = self
                         .manager
                         .runtime_resources_for_profile(ProviderKind::Acp, provider_profile_id)?;
@@ -11695,6 +11705,15 @@ impl AcpRuntimeClient {
                 let config = self
                     .config_service
                     .get_acp_profile_config(profile.id.clone())?;
+                let profile = self
+                    .config_service
+                    .get_profile(provider_profile_id)?
+                    .ok_or_else(|| {
+                        VibexError::validation(
+                            "provider_profile_not_found",
+                            "Provider Profile was not found for ACP session launch",
+                        )
+                    })?;
                 (profile.agent_id, profile.updated_at_ms, config, Vec::new())
             }
             RuntimeAuthSource::AgentAccount { auth_context_id } => {
@@ -13834,6 +13853,7 @@ async fn launch_agent_auth_process(
 ) -> VibexResult<AgentAuthProcess> {
     let (profile_id, auth_source, auth_source_revision, config, cwd, env_unsets) =
         if let Some(profile_id) = provider_profile_id {
+            let config = client.profile_config(profile_id)?;
             let profile = client
                 .config_service
                 .get_profile(profile_id)?
@@ -13852,7 +13872,6 @@ async fn launch_agent_auth_process(
                 .with_diagnostic("agentId", agent_id.as_str())
                 .with_diagnostic("profileAgentId", profile.agent_id.as_str()));
             }
-            let config = client.profile_config(profile_id)?;
             let cwd = AcpRuntimeClient::resolve_probe_cwd(&config, None)?;
             (
                 profile_id.clone(),
@@ -14467,6 +14486,7 @@ impl AcpClient for AcpRuntimeClient {
             self.detach_attachment(current.fence()).await;
         }
         self.detach_stale_attachment(&request.session_id).await;
+        let config = self.profile_config(&request.provider_profile_id)?;
         let profile = self
             .config_service
             .get_profile(&request.provider_profile_id)?
@@ -14482,7 +14502,6 @@ impl AcpClient for AcpRuntimeClient {
             &auth_source,
             profile.updated_at_ms,
         )?;
-        let config = self.profile_config(&request.provider_profile_id)?;
         let cwd = Self::resolve_workspace_cwd(&config, &request.workspace_root)?;
         let (effective_strategy, fallback_reason) =
             self.pool_decision(&request.provider_profile_id, &config)?;
@@ -14602,6 +14621,7 @@ impl AcpClient for AcpRuntimeClient {
         provider_profile_id: &ProviderProfileId,
         workspace_root: Option<&str>,
     ) -> VibexResult<Vec<ExternalSessionImportCandidate>> {
+        let config = self.profile_config(provider_profile_id)?;
         let profile = self
             .config_service
             .get_profile(provider_profile_id)?
@@ -14611,7 +14631,6 @@ impl AcpClient for AcpRuntimeClient {
                     "Provider Profile was not found for ACP session listing",
                 )
             })?;
-        let config = self.profile_config(provider_profile_id)?;
         let cwd = Self::resolve_probe_cwd(&config, workspace_root)?;
         let probe_resources = ProviderRuntimeResources::default();
         let auth_source = RuntimeAuthSource::provider_profile(provider_profile_id.clone());
@@ -14688,6 +14707,7 @@ impl AcpClient for AcpRuntimeClient {
             self.detach_attachment(current.fence()).await;
         }
         self.detach_stale_attachment(&request.session_id).await;
+        let config = self.profile_config(&request.provider_profile_id)?;
         let profile = self
             .config_service
             .get_profile(&request.provider_profile_id)?
@@ -14703,7 +14723,6 @@ impl AcpClient for AcpRuntimeClient {
             &auth_source,
             profile.updated_at_ms,
         )?;
-        let config = self.profile_config(&request.provider_profile_id)?;
         let cwd = Self::resolve_workspace_cwd(&config, &request.workspace_root)?;
         let env_unsets = Vec::new();
         let lease = self
@@ -15197,6 +15216,7 @@ impl AcpClient for AcpRuntimeClient {
         &self,
         provider_profile_id: &ProviderProfileId,
     ) -> VibexResult<Vec<AgentModelCapabilities>> {
+        let config = self.profile_config(provider_profile_id)?;
         let profile = self
             .config_service
             .get_profile(provider_profile_id)?
@@ -15207,7 +15227,6 @@ impl AcpClient for AcpRuntimeClient {
                 )
                 .with_diagnostic("providerProfileId", provider_profile_id.as_str())
             })?;
-        let config = self.profile_config(provider_profile_id)?;
         let auth_source = RuntimeAuthSource::provider_profile(provider_profile_id.clone());
         self.list_runtime_model_capabilities_for_source(
             &profile.agent_id,

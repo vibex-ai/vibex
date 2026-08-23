@@ -19508,6 +19508,7 @@ impl VibexWorkbench {
             let is_dark = cx.theme().is_dark();
             let popover = theme::semantic_color("popover", is_dark);
             let popover_foreground = theme::semantic_color("popover-foreground", is_dark);
+            let settings_for_content = settings.clone();
             dialog
                 .w(px(dialog_width))
                 .max_w(px(dialog_width))
@@ -19527,7 +19528,7 @@ impl VibexWorkbench {
                         cx.notify();
                     });
                 })
-                .content(move |content, _, _| content.child(settings.clone()))
+                .content(move |content, _, _| content.min_h_0().child(settings_for_content.clone()))
         });
         cx.notify();
     }
@@ -51844,6 +51845,10 @@ mod tests {
             .map(|(body, _)| body)
             .expect("settings dialog should remain inspectable");
         assert!(open_settings.contains(".h(px(dialog_height))"));
+        assert!(open_settings.contains(".content(move |content, _, _|"));
+        assert!(open_settings.contains(".min_h_0()"));
+        assert!(open_settings.contains(".child(settings_for_content.clone())"));
+        assert!(!open_settings.contains("\n                .child(settings.clone())"));
 
         let settings = source
             .split_once("impl Render for FoundationSettings")
@@ -51866,6 +51871,14 @@ mod tests {
         let settings_root = &settings[..page_scroll];
         assert!(settings_root.contains(".id(\"foundation-settings\")"));
         assert!(settings_root.contains(".overflow_hidden()"));
+
+        let navigation = source
+            .split_once("    fn render_navigation(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_general_page("))
+            .map(|(body, _)| body)
+            .expect("settings navigation should remain inspectable");
+        assert!(navigation.contains(".overflow_hidden()"));
+        assert!(!navigation.contains(".overflow_y_scrollbar()"));
     }
 
     #[test]

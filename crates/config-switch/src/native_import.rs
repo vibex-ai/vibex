@@ -30,6 +30,34 @@ const CC_SWITCH_DB_PATH_OPTION_KEY: &str = "ccSwitchDbPath";
 const CC_SWITCH_PROVIDER_ID_OPTION_KEY: &str = "ccSwitchProviderId";
 const CC_SWITCH_APP_TYPE_OPTION_KEY: &str = "ccSwitchAppType";
 const CC_SWITCH_WEBSITE_URL_OPTION_KEY: &str = "ccSwitchWebsiteUrl";
+const CC_SWITCH_CLAUDE_ENV_HYDRATED_OPTION_KEY: &str = "ccSwitchClaudeEnvHydrated";
+const CLAUDE_ACP_COMMAND: &str = "claude-agent-acp";
+
+// These values change Claude Code's model selection, routing, or timeouts but
+// do not carry credentials. Keep this list explicit: importing arbitrary
+// `env` keys would make a native config an unreviewed process overlay.
+const CC_SWITCH_CLAUDE_NON_SECRET_ENV_KEYS: &[&str] = &[
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_REASONING_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "CLAUDE_CODE_PROXY_RESOLVES_HOSTS",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "MCP_TIMEOUT",
+    "MCP_TOOL_TIMEOUT",
+    "CLAUDE_API_TIMEOUT",
+    "BASH_DEFAULT_TIMEOUT_MS",
+    "BASH_MAX_TIMEOUT_MS",
+    "DISABLE_INSTALLATION_CHECKS",
+];
 
 #[derive(Debug, Clone, Default)]
 struct NativeImportRoots {
@@ -198,6 +226,13 @@ impl ProviderConfigService {
                 args: runtime.args,
             },
         )?;
+        // Older cc-switch imports were converted to ACP before Claude's
+        // non-secret environment was preserved. Reading the typed config once
+        // here lets the lazy hydration path repair those profiles as part of
+        // an explicit re-import without touching credentials.
+        if profile.agent_id.as_str() == "claude" {
+            let _ = self.get_acp_profile_config(profile.id.clone())?;
+        }
         self.get_profile(&profile.id)?.ok_or_else(|| {
             VibexError::storage(
                 "provider_native_import_profile_readback_failed",
@@ -900,6 +935,22 @@ fn cc_switch_simple_import_item(
     let account_alias = cc_switch_json_string(&settings, &["account", "accountAlias"])
         .or(Some(row.provider_id.clone()));
     let import_item_id = deterministic_request_id(&cc_switch_import_suffix(&mapping, &row));
+    let mut provider_options = ProviderOptions {
+        schema_version: 1,
+        entries: cc_switch_metadata_entries(db_path, &row, &mapping),
+    };
+    if mapping.agent_id.as_str() == "claude" {
+        let config = cc_switch_claude_acp_config(&settings, default_model.as_deref());
+        let encoded = crate::acp_config_to_options(&config)
+            .expect("cc-switch Claude non-secret environment must form a valid ACP config");
+        provider_options.entries.extend(encoded.entries);
+        if !config.env.is_empty() {
+            provider_options.entries.push(option_entry(
+                CC_SWITCH_CLAUDE_ENV_HYDRATED_OPTION_KEY,
+                "true",
+            ));
+        }
+    }
 
     ProviderNativeImportItem {
         import_item_id,
@@ -913,15 +964,165 @@ fn cc_switch_simple_import_item(
         small_model: None,
         large_model: None,
         reasoning_effort: None,
-        provider_options: ProviderOptions {
-            schema_version: 1,
-            entries: cc_switch_metadata_entries(db_path, &row, &mapping),
-        },
+        provider_options,
         secret_references,
         status,
         redacted_fields,
         diagnostics: Vec::new(),
     }
+}
+
+fn cc_switch_claude_acp_config(
+    settings: &JsonValue,
+    default_model: Option<&str>,
+) -> AcpProviderConfig {
+    AcpProviderConfig {
+        command: CLAUDE_ACP_COMMAND.to_string(),
+        args: Vec::new(),
+        env: cc_switch_claude_non_secret_env_references(settings),
+        cwd_template: Some("{workspaceRoot}".to_string()),
+        process_strategy: AcpProcessStrategy::default(),
+        terminal_tools: false,
+        terminal_auth: false,
+        models: default_model
+            .filter(|model| !model.chars().any(char::is_control))
+            .map(|model| vec![model.to_string()])
+            .unwrap_or_default(),
+        modes: Vec::new(),
+        features: Vec::new(),
+        disabled_tools: Vec::new(),
+    }
+}
+
+fn cc_switch_claude_non_secret_env_references(
+    settings: &JsonValue,
+) -> Vec<AcpProviderEnvReference> {
+    CC_SWITCH_CLAUDE_NON_SECRET_ENV_KEYS
+        .iter()
+        .filter_map(|key| {
+            let value = cc_switch_json_env_scalar(settings, key)?;
+            if value.is_empty()
+                || value.chars().any(char::is_control)
+                || is_secret_key(key)
+                || (is_proxy_env_key(key) && proxy_url_contains_credentials(&value))
+            {
+                return None;
+            }
+            Some(AcpProviderEnvReference {
+                key: (*key).to_string(),
+                source: AcpProviderEnvSource::Literal,
+                value: Some(value),
+                secret_lookup_key: None,
+                redacted_hint: "imported from cc-switch".to_string(),
+            })
+        })
+        .collect()
+}
+
+fn cc_switch_json_env_scalar(settings: &JsonValue, key: &str) -> Option<String> {
+    let mut containers = vec![settings];
+    for container_key in ["env", "environment", "config", "settings", "provider"] {
+        if let Some(container) = settings.get(container_key) {
+            containers.push(container);
+        }
+    }
+    containers.into_iter().find_map(|container| {
+        let value = container.get(key)?;
+        let value = match value {
+            JsonValue::String(value) => value.trim().to_string(),
+            JsonValue::Bool(_) | JsonValue::Number(_) => value.to_string(),
+            _ => return None,
+        };
+        (!value.is_empty()).then_some(value)
+    })
+}
+
+fn is_proxy_env_key(key: &str) -> bool {
+    matches!(
+        key,
+        "HTTP_PROXY" | "HTTPS_PROXY" | "ALL_PROXY" | "http_proxy" | "https_proxy" | "all_proxy"
+    )
+}
+
+fn proxy_url_contains_credentials(value: &str) -> bool {
+    if reqwest::Url::parse(value).is_ok_and(|url| {
+        !url.username().is_empty() || url.password().is_some_and(|password| !password.is_empty())
+    }) {
+        return true;
+    }
+    // A malformed proxy must not become a way to smuggle userinfo through
+    // the allowlist. Valid host-only proxy values have no `@` authority.
+    value
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split('/').next())
+        .is_some_and(|authority| authority.contains('@'))
+}
+
+/// Repairs a legacy cc-switch Claude ACP profile without overwriting values
+/// that a user has explicitly edited in Vibex. The marker is persisted with
+/// the typed config so this source import is a one-time migration.
+pub(crate) fn hydrate_cc_switch_claude_profile_config(
+    profile: &mut ProviderProfile,
+    config: &mut AcpProviderConfig,
+) -> VibexResult<bool> {
+    if profile.agent_id.as_str() != "claude"
+        || provider_option_value(
+            &profile.provider_options,
+            CC_SWITCH_CLAUDE_ENV_HYDRATED_OPTION_KEY,
+        )
+        .as_deref()
+            == Some("true")
+    {
+        return Ok(false);
+    }
+    let Some(identity) = cc_switch_import_identity(&profile.provider_options) else {
+        return Ok(false);
+    };
+    if !matches!(identity.app_type.as_str(), "claude" | "claude-code") {
+        return Ok(false);
+    }
+
+    // Native config can disappear or become unreadable after an import. The
+    // already stored ACP profile remains usable in that case.
+    let settings = match read_cc_switch_provider_settings(
+        Path::new(&identity.db_path),
+        &identity.app_type,
+        &identity.provider_id,
+    ) {
+        Ok(settings) => settings,
+        Err(_) => return Ok(false),
+    };
+    let imported_env = cc_switch_claude_non_secret_env_references(&settings);
+    if imported_env.is_empty() {
+        return Ok(false);
+    }
+
+    let mut existing_keys = config
+        .env
+        .iter()
+        .map(|reference| reference.key.clone())
+        .collect::<std::collections::HashSet<_>>();
+    for reference in imported_env {
+        if existing_keys.insert(reference.key.clone()) {
+            config.env.push(reference);
+        }
+    }
+    config.env.sort_by(|left, right| left.key.cmp(&right.key));
+
+    let encoded = crate::acp_config_to_options(config)?
+        .entries
+        .into_iter()
+        .next()
+        .expect("typed ACP config encoding always returns one entry");
+    profile.provider_options.entries.retain(|entry| {
+        entry.key != "acp.config.v1" && entry.key != CC_SWITCH_CLAUDE_ENV_HYDRATED_OPTION_KEY
+    });
+    profile.provider_options.entries.push(encoded);
+    profile.provider_options.entries.push(option_entry(
+        CC_SWITCH_CLAUDE_ENV_HYDRATED_OPTION_KEY,
+        "true",
+    ));
+    Ok(true)
 }
 
 fn cc_switch_acp_import_item(
@@ -2283,6 +2484,8 @@ mod tests {
         ProviderNativeImportSource, ProviderProfileId,
     };
 
+    use crate::{acp_config_from_options, acp_config_to_options};
+
     use super::*;
 
     #[derive(Default)]
@@ -2440,7 +2643,7 @@ wire_api = "responses"
                     "claude-alpha",
                     "claude",
                     "Claude Alpha",
-                    r#"{"env":{"ANTHROPIC_BASE_URL":"https://claude.example.invalid","ANTHROPIC_AUTH_TOKEN":"claude-secret"},"model":"claude-sonnet"}"#,
+                    r#"{"env":{"ANTHROPIC_BASE_URL":"https://claude.example.invalid","ANTHROPIC_AUTH_TOKEN":"claude-secret","ANTHROPIC_MODEL":"claude-opus-5[1m]","CLAUDE_CODE_PROXY_RESOLVES_HOSTS":"1","HTTP_PROXY":"http://proxy.example.invalid:8080","HTTPS_PROXY":"http://user:password@credentialed.example.invalid:8080","MCP_TIMEOUT":"30000","DISABLE_INSTALLATION_CHECKS":"1"},"model":"claude-sonnet"}"#,
                     Option::<String>::None,
                 ),
             )
@@ -2541,6 +2744,48 @@ wire_api = "responses"
                 && item.base_url.as_deref() == Some("https://claude.example.invalid")
                 && item.default_model.as_deref() == Some("claude-sonnet")
         }));
+        let claude_item = preview
+            .items
+            .iter()
+            .find(|item| item.display_name == "Claude Alpha")
+            .unwrap();
+        let claude_config = acp_config_from_options(&claude_item.provider_options)
+            .unwrap()
+            .expect("Claude cc-switch import should carry typed ACP config");
+        assert!(claude_config.env.iter().any(|reference| {
+            reference.key == "ANTHROPIC_MODEL"
+                && reference.value.as_deref() == Some("claude-opus-5[1m]")
+                && reference.source == AcpProviderEnvSource::Literal
+        }));
+        assert!(claude_config.env.iter().any(|reference| {
+            reference.key == "HTTP_PROXY"
+                && reference.value.as_deref() == Some("http://proxy.example.invalid:8080")
+        }));
+        assert!(claude_config.env.iter().any(|reference| {
+            reference.key == "MCP_TIMEOUT" && reference.value.as_deref() == Some("30000")
+        }));
+        assert!(claude_config.env.iter().any(|reference| {
+            reference.key == "DISABLE_INSTALLATION_CHECKS"
+                && reference.value.as_deref() == Some("1")
+        }));
+        assert!(
+            !claude_config
+                .env
+                .iter()
+                .any(|reference| reference.key == "ANTHROPIC_BASE_URL")
+        );
+        assert!(
+            !claude_config
+                .env
+                .iter()
+                .any(|reference| reference.key == "ANTHROPIC_AUTH_TOKEN")
+        );
+        assert!(
+            !claude_config
+                .env
+                .iter()
+                .any(|reference| reference.key == "HTTPS_PROXY")
+        );
         let opencode_item = preview
             .items
             .iter()
@@ -2567,6 +2812,126 @@ wire_api = "responses"
         assert!(!preview_debug.contains("claude-secret"));
         assert!(!preview_debug.contains("opencode-secret"));
         assert!(!preview_debug.contains("future-secret"));
+    }
+
+    #[test]
+    fn native_import_lazy_hydrates_legacy_cc_switch_claude_profile() {
+        let cc_switch_dir = tempdir().unwrap();
+        let db_path = cc_switch_dir.path().join("cc-switch.db");
+        let connection = Connection::open(&db_path).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE providers (
+                    id TEXT PRIMARY KEY,
+                    app_type TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    settings_config TEXT NOT NULL,
+                    website_url TEXT
+                )",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, website_url)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                (
+                    "claude-alpha",
+                    "claude",
+                    "Claude Alpha",
+                    r#"{"env":{"ANTHROPIC_MODEL":"claude-opus-5[1m]","HTTP_PROXY":"http://proxy.example.invalid:8080","HTTPS_PROXY":"http://user:password@credentialed.example.invalid:8080","ANTHROPIC_AUTH_TOKEN":"secret-value"},"model":"claude-fable-5[1m]"}"#,
+                    Option::<String>::None,
+                ),
+            )
+            .unwrap();
+
+        let config = AcpProviderConfig {
+            command: CLAUDE_ACP_COMMAND.to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd_template: Some("{workspaceRoot}".to_string()),
+            process_strategy: AcpProcessStrategy::default(),
+            terminal_tools: false,
+            terminal_auth: false,
+            models: vec!["claude-fable-5[1m]".to_string()],
+            modes: vec!["default".to_string()],
+            features: Vec::new(),
+            disabled_tools: Vec::new(),
+        };
+        let mut provider_options = ProviderOptions {
+            schema_version: 1,
+            entries: vec![
+                option_entry("nativeSource", CC_SWITCH_NATIVE_SOURCE),
+                option_entry(CC_SWITCH_DB_PATH_OPTION_KEY, db_path.display().to_string()),
+                option_entry(CC_SWITCH_PROVIDER_ID_OPTION_KEY, "claude-alpha"),
+                option_entry(CC_SWITCH_APP_TYPE_OPTION_KEY, "claude"),
+            ],
+        };
+        provider_options
+            .entries
+            .extend(acp_config_to_options(&config).unwrap().entries);
+
+        let service = ProviderConfigService::new(cc_switch_dir.path().join("vibex.db"));
+        let profile = service
+            .create_profile(ProviderProfileCreateRequest {
+                agent_id: Some(builtin_agent_id("claude")),
+                kind: ProviderKind::Acp,
+                display_name: "Legacy Claude Alpha".to_string(),
+                account_alias: Some("claude-alpha".to_string()),
+                base_url: Some("https://claude.example.invalid".to_string()),
+                default_model: Some("claude-fable-5[1m]".to_string()),
+                small_model: None,
+                large_model: None,
+                configured_models: vec![vibex_core::ProviderConfiguredModel {
+                    id: "claude-fable-5[1m]".to_string(),
+                    display_name: None,
+                    enabled: true,
+                    wire_api: None,
+                    capabilities: Default::default(),
+                }],
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: Some(provider_options),
+                secret_references: Vec::new(),
+            })
+            .unwrap();
+
+        let hydrated = service.get_acp_profile_config(profile.id.clone()).unwrap();
+        assert!(hydrated.env.iter().any(|reference| {
+            reference.key == "ANTHROPIC_MODEL"
+                && reference.value.as_deref() == Some("claude-opus-5[1m]")
+        }));
+        assert!(hydrated.env.iter().any(|reference| {
+            reference.key == "HTTP_PROXY"
+                && reference.value.as_deref() == Some("http://proxy.example.invalid:8080")
+        }));
+        assert!(
+            !hydrated
+                .env
+                .iter()
+                .any(|reference| reference.key == "HTTPS_PROXY")
+        );
+        assert!(
+            !hydrated
+                .env
+                .iter()
+                .any(|reference| reference.key == "ANTHROPIC_AUTH_TOKEN")
+        );
+
+        let persisted = service.get_profile(&profile.id).unwrap().unwrap();
+        assert!(!format!("{persisted:?}").contains("secret-value"));
+        assert_eq!(
+            provider_option_value(
+                &persisted.provider_options,
+                CC_SWITCH_CLAUDE_ENV_HYDRATED_OPTION_KEY
+            )
+            .as_deref(),
+            Some("true")
+        );
+        let second_read = service.get_acp_profile_config(profile.id).unwrap();
+        assert_eq!(second_read.env, hydrated.env);
     }
 
     #[test]
