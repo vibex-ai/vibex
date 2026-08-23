@@ -22846,6 +22846,7 @@ impl VibexWorkbench {
         };
         let session_generating = display_state == AgentSessionState::Running;
         let session_needs_approval = display_state == AgentSessionState::NeedsInput;
+        let session_has_error = display_state == AgentSessionState::Error;
         let has_unread_completion = !selected
             && self
                 .unread_agent_completion_session_ids
@@ -23213,6 +23214,7 @@ impl VibexWorkbench {
                                 !pinned
                                     && !session_needs_approval
                                     && !has_unread_completion
+                                    && !session_has_error
                                     && display_state != AgentSessionState::Idle,
                                 |this| {
                                     this.child(sidebar_session_status_indicator(
@@ -23258,9 +23260,12 @@ impl VibexWorkbench {
                                                 .child(label),
                                         )
                                     })
-                                    .when(state_label.is_none() && !has_unread_completion, |this| {
-                                        this.child(time_label)
-                                    })
+                                    .when(
+                                        state_label.is_none()
+                                            && !has_unread_completion
+                                            && !session_has_error,
+                                        |this| this.child(time_label),
+                                    )
                                 },
                             )
                             .when(has_unread_completion, |this| {
@@ -23272,6 +23277,9 @@ impl VibexWorkbench {
                                         .rounded_full()
                                         .bg(cx.theme().primary),
                                 )
+                            })
+                            .when(session_has_error, |this| {
+                                this.child(sidebar_status_dot(cx.theme().danger))
                             }),
                     ),
             )
@@ -48812,6 +48820,10 @@ mod tests {
             sidebar_session
                 .contains("let session_generating = display_state == AgentSessionState::Running")
         );
+        assert!(
+            sidebar_session
+                .contains("let session_has_error = display_state == AgentSessionState::Error")
+        );
         assert!(sidebar_session.contains("sidebar_session_status_indicator(\n                                        display_state,\n                                        auto_continue_enabled,\n                                        cx,\n                                    )"));
         assert!(source.contains(".color(if auto_continue_enabled {"));
         assert!(source.contains("cx.theme().success"));
@@ -48829,12 +48841,21 @@ mod tests {
         assert!(sidebar_session.contains("Icon::new(IconName::TriangleAlert)"));
         assert!(!sidebar_session.contains("sidebar-session-error-{session_id_string}"));
         assert!(!sidebar_session.contains(".child(strings.sidebar_state_error)"));
+        assert!(sidebar_session.contains("&& !session_has_error\n                                    && display_state != AgentSessionState::Idle"));
+        assert!(sidebar_session.contains(
+            "&& !session_has_error,\n                                        |this| this.child(time_label)"
+        ));
+        assert!(sidebar_session.contains(
+            ".when(session_has_error, |this| {\n                                this.child(sidebar_status_dot(cx.theme().danger))"
+        ));
         assert!(
             sidebar_session.contains("this.group_hover(&hover_group, |style| style.invisible())")
         );
         assert!(sidebar_session.contains("sidebar-session-actions-{session_id_string}"));
         assert!(sidebar_session.contains(".group_hover(&hover_group, |style| style.visible())"));
-        assert!(sidebar_session.contains("state_label.is_none() && !has_unread_completion"));
+        assert!(sidebar_session.contains(
+            "state_label.is_none()\n                                            && !has_unread_completion\n                                            && !session_has_error"
+        ));
     }
 
     #[test]
