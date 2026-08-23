@@ -178,7 +178,7 @@ enum ReleaseChannel {
 }
 
 const WORKBENCH_NAVIGATION_LIMIT: usize = 60;
-const TITLE_BAR_HEIGHT: f32 = 52.0;
+const TITLE_BAR_HEIGHT: f32 = 50.0;
 const TITLE_BAR_COLLAPSED_SIDEBAR_WIDTH: f32 = 112.0;
 const SIDEBAR_PROJECT_LOGO_DIRECTORY: &str = "project-icons";
 const SIDEBAR_LOGO_DISPLAY_SIZE: f32 = 14.0;
@@ -19528,7 +19528,7 @@ impl VibexWorkbench {
                         cx.notify();
                     });
                 })
-                .child(settings.clone())
+                .content(move |content, _, _| content.child(settings.clone()))
         });
         cx.notify();
     }
@@ -19880,8 +19880,9 @@ impl VibexWorkbench {
                                         .max_w(px(TITLE_BAR_SESSION_CONTEXT_MAX_WIDTH))
                                         .flex_none()
                                         .items_center()
-                                        .gap_1()
-                                        .text_xs()
+                                        .gap(px(2.0))
+                                        .mt(px(-1.0))
+                                        .text_size(px(11.0))
                                         .text_color(cx.theme().muted_foreground)
                                         .child(
                                             div()
@@ -19892,7 +19893,7 @@ impl VibexWorkbench {
                                         .when_some(workspace_branch_label, |this, branch| {
                                             this.child(
                                                 sidebar_icon("icons/vibex/git-branch.svg")
-                                                    .size(px(12.0)),
+                                                    .size(px(10.0)),
                                             )
                                             .child(div().min_w_0().truncate().child(branch))
                                         })
@@ -41779,7 +41780,7 @@ impl FoundationSettings {
             .w(px(SETTINGS_NAVIGATION_WIDTH))
             .h_full()
             .flex_none()
-            .overflow_y_scrollbar()
+            .overflow_hidden()
             .gap_2()
             .px_4()
             .pt_3()
@@ -52733,6 +52734,10 @@ mod tests {
         assert!(main.contains("TITLE_BAR_SESSION_CONTEXT_MAX_WIDTH"));
         assert!(main.contains(".gap_0()"));
         assert!(main.contains(".py_1()"));
+        assert!(main.contains(".gap(px(2.0))"));
+        assert!(main.contains(".mt(px(-1.0))"));
+        assert!(main.contains(".text_size(px(11.0))"));
+        assert!(main.contains(".size(px(10.0))"));
         assert!(main.contains("icons/vibex/git-branch.svg"));
         assert!(title_bar.contains("worktree_titles"));
         assert!(title_bar.contains("title-session-menu"));
