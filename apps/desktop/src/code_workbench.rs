@@ -8648,8 +8648,27 @@ impl CodeRightRail {
                 }
             }
         }
+        // GPUI applies a scroll area's offset to every child during prepaint, so
+        // the scrollbar must be a sibling of the scrolling content.
+        let scroll_content = v_flex()
+            .id("file-search-scroll-content")
+            .flex_none()
+            .size_auto()
+            .min_size_full()
+            .px_1()
+            .py_1()
+            .children(rows);
+        let scroll_area = div()
+            .id("file-search-scroll")
+            .size_full()
+            .flex()
+            .track_scroll(&search_scroll)
+            .overflow_scroll()
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .child(scroll_content);
         v_flex()
             .flex_1()
+            .min_w_0()
             .min_h_0()
             .child(
                 div()
@@ -8663,18 +8682,12 @@ impl CodeRightRail {
                     .child(summary),
             )
             .child(
-                v_flex()
+                div()
                     .flex_1()
                     .min_w_0()
                     .min_h_0()
                     .relative()
-                    .id("file-search-scroll")
-                    .track_scroll(&search_scroll)
-                    .overflow_scroll()
-                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                    .px_1()
-                    .py_1()
-                    .children(rows)
+                    .child(scroll_area)
                     .scrollbar(&search_scroll, ScrollbarAxis::Both),
             )
             .into_any_element()
