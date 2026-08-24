@@ -7570,14 +7570,14 @@ fn normalize_claude_model_mode(
     if agent_id.as_str() != CLAUDE_AGENT_ID
         || !is_provider_profile
         || !has_explicit_model
-        || !matches!(requested_mode, "auto" | "bypassPermissions")
+        || requested_mode != "auto"
     {
         return None;
     }
 
     // Claude ACP probes can report the capability of a native alias instead
     // of the configured proxy model.  The real session then recomputes modes
-    // for the resolved model and may reject these conditional modes.  Keep
+    // for the resolved model and may reject the model-gated `auto` mode.  Keep
     // provider-profile switches deterministic by using the unconditional mode.
     Some("default".to_string())
 }
@@ -22685,7 +22685,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn claude_model_gated_modes_fall_back_even_when_probe_advertises_them() {
+    fn claude_model_gated_auto_mode_falls_back_but_bypass_permissions_is_preserved() {
         let claude = AgentId::parse(CLAUDE_AGENT_ID).unwrap();
         let codex = AgentId::parse("codex").unwrap();
         let advertised_auto = ProviderSessionConfigValue {
@@ -22700,7 +22700,7 @@ for line in sys.stdin:
         );
         assert_eq!(
             normalize_claude_model_mode(&claude, true, true, None, "bypassPermissions").as_deref(),
-            Some("default")
+            None
         );
         assert_eq!(
             normalize_claude_model_mode(&claude, true, true, None, "acceptEdits"),

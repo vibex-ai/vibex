@@ -198,12 +198,12 @@ agent_auth_model_catalog_snapshots(
   `session/set_model` result. A failed model probe records its attempt and error
   without blocking the Provider save or removing an existing successful model
   snapshot.
-- Claude Provider Profile model probes are advisory for conditional permission
-  modes. For an explicit configured model, normalize `auto` and
-  `bypassPermissions` to `default` before persisting or applying a runtime
-  switch, even when the probe advertises them: the Claude ACP adapter can
-  resolve a proxy model to a native alias and recompute a narrower
-  `availableModes` set in the real session.
+- Claude Provider Profile model probes are advisory for model-gated `auto`
+  mode. For an explicit configured model, normalize `auto` to `default` before
+  persisting or applying a runtime switch: the Claude ACP adapter can resolve
+  a proxy model to a native alias and recompute a narrower `availableModes` set
+  in the real session. Preserve root-level `bypassPermissions` selections so
+  they reach the adapter's `session/set_mode` request unchanged.
 - When `session/new.configOptions` advertises the model as a config option, the
   model probe uses `session/set_config_option` first because Agents such as
   OpenCode return the selected model's complete mode, effort, and generic option
