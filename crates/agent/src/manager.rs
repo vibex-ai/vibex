@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc};
+use vibex_config_switch::secrets::resolve_provider_secret_reference;
 use vibex_core::{
     AgentAuthCatalog, AgentAuthContextStatus, AgentAuthenticateRequest, AgentAuthenticateResult,
     AgentAuthenticationCancelRequest, AgentCommandDiscoverRequest, AgentCommandDiscoverResponse,
@@ -18,19 +19,19 @@ use vibex_core::{
     ExternalSessionImportCandidateStatus, ExternalSessionImportDiagnostic,
     ExternalSessionImportPreview, ExternalSessionImportPreviewRequest,
     ExternalSessionImportRequest, ExternalSessionImportResult, ExternalSessionImportSource,
-    ExternalSessionImportedTimelineCount, FetchTimelineRequest, ForkAgentSessionRequest, McpServer,
-    McpServerTransportKind, MessageAttachment, MessageSubmissionId, PermissionRequest, ProjectId,
-    PromptKind, PromptStatus, ProviderBinding, ProviderBindingMetadata, ProviderCapabilities,
-    ProviderCapabilitiesResponse, ProviderDefaultScopeKind, ProviderKind, ProviderNativeBinding,
-    ProviderProfileDefaultScope, ProviderProfileId, ProviderProfileStatus,
-    RenameAgentSessionRequest, ResolveElicitationRequest, ResolvePermissionRequest,
-    RuntimeLeaseRole, RuntimeModelSelection, SendAgentMessageRequest, SessionRuntimeSelection,
-    SessionRuntimeSelectionStatus, SystemNoticeLevel, SystemNoticePayload, TimelineErrorPayload,
-    TimelineItem, TimelineLiveEvent, TimelinePage, TimelinePayload, TimelineRedactionState,
-    TimelineSource, TransportKind, TurnExecutionAttribution, UsageExecutionId, UserMessagePayload,
-    VibexError, VibexResult, VibexSessionId, WorkspaceId, agent_id_for_provider_kind,
-    agent_session_turn_requires_continuation, builtin_agent_definitions,
-    latest_timeline_turn_ended_normally, unix_timestamp_ms,
+    ExternalSessionImportedTimelineCount, FetchTimelineRequest, ForkAgentSessionRequest,
+    McpSecretTarget, McpServer, McpServerSecretReference, McpServerTransportKind,
+    MessageAttachment, MessageSubmissionId, PermissionRequest, ProjectId, PromptKind, PromptStatus,
+    ProviderBinding, ProviderBindingMetadata, ProviderCapabilities, ProviderCapabilitiesResponse,
+    ProviderDefaultScopeKind, ProviderKind, ProviderNativeBinding, ProviderProfileDefaultScope,
+    ProviderProfileId, ProviderProfileStatus, RenameAgentSessionRequest, ResolveElicitationRequest,
+    ResolvePermissionRequest, RuntimeLeaseRole, RuntimeModelSelection, SendAgentMessageRequest,
+    SessionRuntimeSelection, SessionRuntimeSelectionStatus, SystemNoticeLevel, SystemNoticePayload,
+    TimelineErrorPayload, TimelineItem, TimelineLiveEvent, TimelinePage, TimelinePayload,
+    TimelineRedactionState, TimelineSource, TransportKind, TurnExecutionAttribution,
+    UsageExecutionId, UserMessagePayload, VibexError, VibexResult, VibexSessionId, WorkspaceId,
+    agent_id_for_provider_kind, agent_session_turn_requires_continuation,
+    builtin_agent_definitions, latest_timeline_turn_ended_normally, unix_timestamp_ms,
 };
 use vibex_db::{
     AgentAuthContextRepository, AgentAuthenticationOperationRepository, AgentConfigRepository,
@@ -3677,6 +3678,19 @@ fn runtime_mcp_server_from_record(server: McpServer) -> Option<ProviderRuntimeMc
         McpServerTransportKind::Http => ProviderRuntimeMcpTransport::Http,
         McpServerTransportKind::Sse => ProviderRuntimeMcpTransport::Sse,
     };
+    let env = merged_mcp_entries(
+        server.env.iter().map(|entry| (&entry.name, &entry.value)),
+        &server.secret_references,
+        McpSecretTarget::Environment,
+    );
+    let headers = merged_mcp_entries(
+        server
+            .headers
+            .iter()
+            .map(|entry| (&entry.name, &entry.value)),
+        &server.secret_references,
+        McpSecretTarget::Header,
+    );
     match transport {
         ProviderRuntimeMcpTransport::Stdio if server.command.as_deref()?.trim().is_empty() => None,
         ProviderRuntimeMcpTransport::Stdio => Some(ProviderRuntimeMcpServer {
@@ -3685,7 +3699,9 @@ fn runtime_mcp_server_from_record(server: McpServer) -> Option<ProviderRuntimeMc
             transport,
             command: server.command,
             args: server.args,
+            env,
             url: None,
+            headers: Vec::new(),
         }),
         ProviderRuntimeMcpTransport::Http | ProviderRuntimeMcpTransport::Sse
             if server.url.as_deref()?.trim().is_empty() =>
@@ -3699,10 +3715,47 @@ fn runtime_mcp_server_from_record(server: McpServer) -> Option<ProviderRuntimeMc
                 transport,
                 command: None,
                 args: Vec::new(),
+                env: Vec::new(),
                 url: server.url,
+                headers,
             })
         }
     }
+}
+
+/// Combine the stored plain entries with the secrets configured for the same
+/// target.
+///
+/// Secret values never live in the database: they are held by the configured
+/// backend and resolved here, at the moment the server is forwarded. A secret
+/// that is still a placeholder, unset, or fails to resolve is skipped rather
+/// than forwarded as an empty value, which would look configured to the agent
+/// while silently failing at the MCP server. A resolved secret wins over a
+/// stored entry with the same name.
+fn merged_mcp_entries<'a>(
+    stored: impl Iterator<Item = (&'a String, &'a String)>,
+    secret_references: &[McpServerSecretReference],
+    target: McpSecretTarget,
+) -> Vec<(String, String)> {
+    let mut entries: Vec<(String, String)> = stored
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    for reference in secret_references
+        .iter()
+        .filter(|reference| reference.target == target)
+    {
+        let resolved = resolve_provider_secret_reference(
+            reference.backend,
+            reference.setup_state,
+            &reference.lookup_key,
+        );
+        let Ok(Some(value)) = resolved else {
+            continue;
+        };
+        entries.retain(|(name, _)| !name.eq_ignore_ascii_case(&reference.lookup_key));
+        entries.push((reference.lookup_key.clone(), value));
+    }
+    entries
 }
 
 fn turn_resource_summary(
@@ -4761,6 +4814,125 @@ mod tests {
 
         cleanup_db(&db_path);
         let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    /// MCP credentials never live in the database: plain entries are stored,
+    /// secrets stay with the configured backend and are resolved only when the
+    /// server is actually forwarded.
+    #[test]
+    fn mcp_runtime_entries_merge_stored_values_with_resolved_secrets() {
+        use vibex_config_switch::secrets::store_provider_secret;
+        use vibex_core::{
+            McpSecretTarget, McpServerEnvEntry, McpServerHeaderEntry, McpServerId,
+            McpServerScopeKind, McpServerSecretReference, McpServerStatus, McpServerTransportKind,
+            ProviderSecretBackend, ProviderSecretKind, ProviderSecretSetupState, RequestId,
+        };
+
+        let server_id = McpServerId::new();
+        let lookup_key = format!("VIBEX_TEST_MCP_TOKEN_{}", RequestId::new().as_str());
+        store_provider_secret(&lookup_key, "resolved-secret").unwrap();
+        let secret_reference =
+            |target: McpSecretTarget, lookup_key: &str, setup| McpServerSecretReference {
+                id: RequestId::new(),
+                mcp_server_id: server_id.clone(),
+                secret_kind: ProviderSecretKind::Environment,
+                backend: ProviderSecretBackend::OsKeychain,
+                setup_state: setup,
+                lookup_key: lookup_key.to_string(),
+                display_label: "token".to_string(),
+                redacted_hint: "configured".to_string(),
+                target,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            };
+        let base = McpServer {
+            id: server_id.clone(),
+            display_name: "Filesystem".to_string(),
+            transport_kind: McpServerTransportKind::Stdio,
+            status: McpServerStatus::Enabled,
+            scope_kind: McpServerScopeKind::User,
+            project_id: None,
+            workspace_id: None,
+            command: Some("mcp-filesystem".to_string()),
+            args: Vec::new(),
+            env: vec![
+                McpServerEnvEntry {
+                    name: "MCP_ROOT".to_string(),
+                    value: "/tmp/workspace".to_string(),
+                },
+                McpServerEnvEntry {
+                    name: lookup_key.clone(),
+                    value: "stale-placeholder".to_string(),
+                },
+            ],
+            url: None,
+            headers: Vec::new(),
+            description: None,
+            tags: Vec::new(),
+            secret_references: vec![
+                secret_reference(
+                    McpSecretTarget::Environment,
+                    &lookup_key,
+                    ProviderSecretSetupState::Available,
+                ),
+                // An unconfigured secret must be skipped, not forwarded as an
+                // empty value that looks configured to the agent.
+                secret_reference(
+                    McpSecretTarget::Environment,
+                    "MCP_UNSET",
+                    ProviderSecretSetupState::Missing,
+                ),
+            ],
+            provider_matrix: Vec::new(),
+            agent_matrix: Vec::new(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            deleted_at_ms: None,
+        };
+
+        let stdio = runtime_mcp_server_from_record(base.clone()).unwrap();
+        assert!(
+            stdio
+                .env
+                .contains(&("MCP_ROOT".to_string(), "/tmp/workspace".to_string()))
+        );
+        // The resolved secret replaces the stored placeholder of the same name.
+        assert!(
+            stdio
+                .env
+                .contains(&(lookup_key.clone(), "resolved-secret".to_string()))
+        );
+        assert!(!stdio.env.iter().any(|(name, _)| name == "MCP_UNSET"));
+        assert!(stdio.headers.is_empty(), "stdio servers carry no headers");
+
+        let remote = McpServer {
+            transport_kind: McpServerTransportKind::Http,
+            command: None,
+            env: Vec::new(),
+            url: Some("https://example.invalid/mcp".to_string()),
+            headers: vec![McpServerHeaderEntry {
+                name: "X-Tenant".to_string(),
+                value: "acme".to_string(),
+            }],
+            secret_references: vec![secret_reference(
+                McpSecretTarget::Header,
+                &lookup_key,
+                ProviderSecretSetupState::Available,
+            )],
+            ..base
+        };
+        let remote = runtime_mcp_server_from_record(remote).unwrap();
+        assert!(
+            remote
+                .headers
+                .contains(&("X-Tenant".to_string(), "acme".to_string()))
+        );
+        assert!(
+            remote
+                .headers
+                .contains(&(lookup_key, "resolved-secret".to_string()))
+        );
+        assert!(remote.env.is_empty(), "remote servers carry no environment");
     }
 
     #[test]

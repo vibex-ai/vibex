@@ -2161,6 +2161,7 @@ mod tests {
                 "47:agent_default_usage_model_nullable",
                 "48:agent_usage_counter_scope",
                 "49:message_submission_runtime_policy",
+                "50:mcp_server_env_and_headers",
             ]
         );
         assert_eq!(

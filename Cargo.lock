@@ -9785,6 +9785,7 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "tracing",
+ "vibex-config-switch",
  "vibex-core",
  "vibex-db",
 ]

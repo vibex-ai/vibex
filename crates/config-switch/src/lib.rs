@@ -32,31 +32,31 @@ use vibex_core::{
     HookInstallPreviewRequest, HookInstallState, HookUpdateRequest, McpSecretTarget, McpServer,
     McpServerAgentMatrix, McpServerAgentMatrixListRequest, McpServerCreateRequest,
     McpServerDeleteRequest, McpServerDiscoverRequest, McpServerDiscovery,
-    McpServerDiscoveryResponse, McpServerForAgentListRequest, McpServerImportRequest,
-    McpServerImportResult, McpServerProviderMatrix, McpServerSecretReferenceCreateRequest,
-    McpServerSetAgentMatrixRequest, McpServerSetProviderMatrixRequest, McpServerTransportKind,
-    McpServerUpdateRequest, McpServerValidateRequest, McpServerValidationResult,
-    McpServerValidationStatus, Prompt, PromptCreateRequest, PromptDeleteRequest,
-    PromptUpdateRequest, PromptValidateRequest, PromptValidationResult, PromptValidationStatus,
-    ProviderBindingMetadata, ProviderCapabilities, ProviderCapabilityProbeResult,
-    ProviderCapabilityProbeStatus, ProviderCapabilitySummary, ProviderConfiguredModel,
-    ProviderDefaultScopeKind, ProviderFailoverRecommendation, ProviderFailoverRecommendationReason,
-    ProviderFailoverRecommendationRequest, ProviderFailoverRecommendationStatus,
-    ProviderHealthProbeKind, ProviderHealthProbeResult, ProviderHealthStatus,
-    ProviderHealthSummary, ProviderInjectionField, ProviderInjectionOverlayFile,
-    ProviderInjectionPreview, ProviderInjectionPreviewRequest, ProviderInjectionStrategy,
-    ProviderKind, ProviderOptions, ProviderProfile, ProviderProfileCreateRequest,
-    ProviderProfileDefaultScope, ProviderProfileDefaultSelection, ProviderProfileDeleteRequest,
-    ProviderProfileDuplicateRequest, ProviderProfileId, ProviderProfileSetDefaultRequest,
-    ProviderProfileStatus, ProviderProfileUpdateRequest, ProviderRunCapabilityProbesRequest,
-    ProviderRunCapabilityProbesResult, ProviderRunHealthProbesRequest,
-    ProviderRunHealthProbesResult, ProviderSecretBackend, ProviderSecretKind,
-    ProviderSecretReference, ProviderSecretReferenceCreateRequest, ProviderSecretSetupState,
-    ProviderUsageBalance, ProviderUsageListRequest, ProviderUsageRecord, ProviderUsageSummary,
-    RequestId, ResourceAgentMatrixSourceKind, ResourceDiscoveryStatus, Skill, SkillAgentMatrix,
-    SkillAgentMatrixListRequest, SkillCreateRequest, SkillDeleteRequest, SkillDiscoverRequest,
-    SkillDiscovery, SkillDiscoveryResponse, SkillForAgentListRequest, SkillImportRequest,
-    SkillImportResult, SkillProviderMatrix, SkillSetAgentMatrixRequest,
+    McpServerDiscoveryResponse, McpServerEnvEntry, McpServerForAgentListRequest,
+    McpServerHeaderEntry, McpServerImportRequest, McpServerImportResult, McpServerProviderMatrix,
+    McpServerSecretReferenceCreateRequest, McpServerSetAgentMatrixRequest,
+    McpServerSetProviderMatrixRequest, McpServerTransportKind, McpServerUpdateRequest,
+    McpServerValidateRequest, McpServerValidationResult, McpServerValidationStatus, Prompt,
+    PromptCreateRequest, PromptDeleteRequest, PromptUpdateRequest, PromptValidateRequest,
+    PromptValidationResult, PromptValidationStatus, ProviderBindingMetadata, ProviderCapabilities,
+    ProviderCapabilityProbeResult, ProviderCapabilityProbeStatus, ProviderCapabilitySummary,
+    ProviderConfiguredModel, ProviderDefaultScopeKind, ProviderFailoverRecommendation,
+    ProviderFailoverRecommendationReason, ProviderFailoverRecommendationRequest,
+    ProviderFailoverRecommendationStatus, ProviderHealthProbeKind, ProviderHealthProbeResult,
+    ProviderHealthStatus, ProviderHealthSummary, ProviderInjectionField,
+    ProviderInjectionOverlayFile, ProviderInjectionPreview, ProviderInjectionPreviewRequest,
+    ProviderInjectionStrategy, ProviderKind, ProviderOptions, ProviderProfile,
+    ProviderProfileCreateRequest, ProviderProfileDefaultScope, ProviderProfileDefaultSelection,
+    ProviderProfileDeleteRequest, ProviderProfileDuplicateRequest, ProviderProfileId,
+    ProviderProfileSetDefaultRequest, ProviderProfileStatus, ProviderProfileUpdateRequest,
+    ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
+    ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, ProviderSecretBackend,
+    ProviderSecretKind, ProviderSecretReference, ProviderSecretReferenceCreateRequest,
+    ProviderSecretSetupState, ProviderUsageBalance, ProviderUsageListRequest, ProviderUsageRecord,
+    ProviderUsageSummary, RequestId, ResourceAgentMatrixSourceKind, ResourceDiscoveryStatus, Skill,
+    SkillAgentMatrix, SkillAgentMatrixListRequest, SkillCreateRequest, SkillDeleteRequest,
+    SkillDiscoverRequest, SkillDiscovery, SkillDiscoveryResponse, SkillForAgentListRequest,
+    SkillImportRequest, SkillImportResult, SkillProviderMatrix, SkillSetAgentMatrixRequest,
     SkillSetProviderMatrixRequest, SkillSourceKind, SkillUpdateRequest, SkillValidateRequest,
     SkillValidationResult, SkillValidationStatus, VibexError, VibexResult,
     acp_agent_catalog_entries, builtin_agent_definitions, unix_timestamp_ms,
@@ -3412,7 +3412,18 @@ fn mcp_candidate_from_value(
         workspace_id: None,
         command,
         args,
+        // Values that carry credentials stay out of the database: they are
+        // imported as secret references instead, and resolved at forwarding
+        // time from the configured backend.
+        env: non_secret_entries(object, &["env", "environment"])
+            .into_iter()
+            .map(|(name, value)| McpServerEnvEntry { name, value })
+            .collect(),
         url,
+        headers: non_secret_entries(object, HEADER_CONFIG_KEYS)
+            .into_iter()
+            .map(|(name, value)| McpServerHeaderEntry { name, value })
+            .collect(),
         description: Some(format!(
             "Imported from existing {} MCP config",
             agent_id.as_str()
@@ -3477,13 +3488,77 @@ fn command_and_args_fields(
     (command, args)
 }
 
+/// Header keys used by the native configs Vibex imports from.
+const HEADER_CONFIG_KEYS: &[&str] = &["headers", "http_headers", "httpHeaders", "requestHeaders"];
+
+/// Entries from a native config that are safe to store verbatim.
+///
+/// Anything that looks like a credential is skipped: those are imported as
+/// secret references and resolved from the configured backend at forwarding
+/// time, so the value never reaches the database.
+fn non_secret_entries(
+    object: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Vec<(String, String)> {
+    let mut entries: Vec<(String, String)> = Vec::new();
+    let mut seen = HashSet::new();
+    for key in keys {
+        let Some(map) = object.get(*key).and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        for (name, value) in map {
+            let name = name.trim();
+            let Some(value) = value.as_str().map(str::trim) else {
+                continue;
+            };
+            if name.is_empty()
+                || name.contains('\0')
+                || value.is_empty()
+                || looks_like_secret_name(name)
+            {
+                continue;
+            }
+            if seen.insert(name.to_ascii_lowercase()) {
+                entries.push((name.to_string(), value.to_string()));
+            }
+        }
+    }
+    entries.sort_by(|left, right| {
+        left.0
+            .to_ascii_lowercase()
+            .cmp(&right.0.to_ascii_lowercase())
+    });
+    entries
+}
+
+fn looks_like_secret_name(name: &str) -> bool {
+    let normalized = name.to_ascii_lowercase();
+    [
+        "authorization",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "api_key",
+        "apikey",
+        "api-key",
+        "credential",
+        "cookie",
+        "session",
+        "private",
+        "signature",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
 fn header_secret_references(
     object: &serde_json::Map<String, serde_json::Value>,
 ) -> Vec<McpServerSecretReferenceCreateRequest> {
     let mut headers = Vec::new();
     let mut seen = HashSet::new();
-    for key in ["headers", "http_headers", "httpHeaders", "requestHeaders"] {
-        let Some(header_object) = object.get(key).and_then(serde_json::Value::as_object) else {
+    for key in HEADER_CONFIG_KEYS {
+        let Some(header_object) = object.get(*key).and_then(serde_json::Value::as_object) else {
             continue;
         };
         for header_name in header_object.keys() {
@@ -10505,7 +10580,9 @@ mod tests {
                     workspace_id: None,
                     command: None,
                     args: Vec::new(),
+                    env: Vec::new(),
                     url: None,
+                    headers: Vec::new(),
                     description: None,
                     tags: Vec::new(),
                     secret_references: Vec::new(),
@@ -10526,7 +10603,9 @@ mod tests {
                 workspace_id: None,
                 command: Some("mcp-filesystem".to_string()),
                 args: vec!["--root".to_string(), "/tmp/workspace".to_string()],
+                env: Vec::new(),
                 url: None,
+                headers: Vec::new(),
                 description: None,
                 tags: vec!["filesystem".to_string()],
                 secret_references: vec![McpServerSecretReferenceCreateRequest {
@@ -10655,7 +10734,9 @@ args = ["--root", "/tmp/workspace"]
                 workspace_id: None,
                 command: Some("mcp-workspace".to_string()),
                 args: vec!["--old".to_string()],
+                env: Vec::new(),
                 url: None,
+                headers: Vec::new(),
                 description: Some("User curated description".to_string()),
                 tags: vec!["curated".to_string()],
                 secret_references: Vec::new(),
@@ -10688,7 +10769,9 @@ args = ["--root", "/tmp/workspace"]
                         workspace_id: None,
                         command: Some("mcp-workspace".to_string()),
                         args: vec!["--new".to_string()],
+                        env: Vec::new(),
                         url: None,
+                        headers: Vec::new(),
                         description: Some("Imported description".to_string()),
                         tags: vec!["imported".to_string()],
                         secret_references: Vec::new(),

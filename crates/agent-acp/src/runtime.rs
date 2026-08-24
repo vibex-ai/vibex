@@ -27,7 +27,8 @@ use agent_client_protocol_schema::v1::{
     ElicitationContentValue as AcpElicitationContentValue, ElicitationMode as AcpElicitationMode,
     ElicitationPropertySchema as AcpElicitationPropertySchema,
     ElicitationScope as AcpElicitationScope, EnumOption as AcpEnumOption,
-    McpServer as AcpMcpServer, McpServerHttp as AcpMcpServerHttp, McpServerSse as AcpMcpServerSse,
+    EnvVariable as AcpEnvVariable, HttpHeader as AcpHttpHeader, McpServer as AcpMcpServer,
+    McpServerHttp as AcpMcpServerHttp, McpServerSse as AcpMcpServerSse,
     McpServerStdio as AcpMcpServerStdio, MultiSelectItems as AcpMultiSelectItems,
     StringFormat as AcpStringFormat,
 };
@@ -626,6 +627,7 @@ fn resolve_acp_mcp_descriptor(
             AcpMcpTransportDescriptor::Stdio {
                 command: resolve_mcp_command_path(command),
                 args: server.args.clone(),
+                env: server.env.clone(),
             }
         }
         ProviderRuntimeMcpTransport::Http => {
@@ -636,7 +638,10 @@ fn resolve_acp_mcp_descriptor(
                 )
                 .with_diagnostic("mcpServerId", id)
             })?;
-            AcpMcpTransportDescriptor::Http { url }
+            AcpMcpTransportDescriptor::Http {
+                url,
+                headers: server.headers.clone(),
+            }
         }
         ProviderRuntimeMcpTransport::Sse => {
             let url = valid_mcp_url(server.url.as_deref()).ok_or_else(|| {
@@ -646,7 +651,10 @@ fn resolve_acp_mcp_descriptor(
                 )
                 .with_diagnostic("mcpServerId", id)
             })?;
-            AcpMcpTransportDescriptor::Sse { url }
+            AcpMcpTransportDescriptor::Sse {
+                url,
+                headers: server.headers.clone(),
+            }
         }
     };
 
@@ -714,19 +722,32 @@ fn mcp_servers_json(mcp_servers: &[AcpMcpServerDescriptor]) -> Value {
 /// therefore never placed on the wire and the typed builders own the shape.
 fn mcp_server_json(server: &AcpMcpServerDescriptor) -> Value {
     let typed = match &server.transport {
-        AcpMcpTransportDescriptor::Stdio { command, args } => AcpMcpServer::Stdio(
+        AcpMcpTransportDescriptor::Stdio { command, args, env } => AcpMcpServer::Stdio(
             AcpMcpServerStdio::new(server.name.clone(), PathBuf::from(command))
                 .args(args.clone())
-                .env(Vec::new()),
+                .env(
+                    env.iter()
+                        .map(|(name, value)| AcpEnvVariable::new(name.clone(), value.clone()))
+                        .collect(),
+                ),
         ),
-        AcpMcpTransportDescriptor::Http { url } => AcpMcpServer::Http(
-            AcpMcpServerHttp::new(server.name.clone(), url.clone()).headers(Vec::new()),
+        AcpMcpTransportDescriptor::Http { url, headers } => AcpMcpServer::Http(
+            AcpMcpServerHttp::new(server.name.clone(), url.clone())
+                .headers(acp_http_headers(headers)),
         ),
-        AcpMcpTransportDescriptor::Sse { url } => AcpMcpServer::Sse(
-            AcpMcpServerSse::new(server.name.clone(), url.clone()).headers(Vec::new()),
+        AcpMcpTransportDescriptor::Sse { url, headers } => AcpMcpServer::Sse(
+            AcpMcpServerSse::new(server.name.clone(), url.clone())
+                .headers(acp_http_headers(headers)),
         ),
     };
     serde_json::to_value(&typed).unwrap_or_else(|_| Value::Null)
+}
+
+fn acp_http_headers(headers: &[(String, String)]) -> Vec<AcpHttpHeader> {
+    headers
+        .iter()
+        .map(|(name, value)| AcpHttpHeader::new(name.clone(), value.clone()))
+        .collect()
 }
 
 /// Resolve a bare stdio MCP command against `PATH`.
@@ -1654,9 +1675,19 @@ struct AcpMcpServerDescriptor {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AcpMcpTransportDescriptor {
-    Stdio { command: String, args: Vec<String> },
-    Http { url: String },
-    Sse { url: String },
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+    },
+    Http {
+        url: String,
+        headers: Vec<(String, String)>,
+    },
+    Sse {
+        url: String,
+        headers: Vec<(String, String)>,
+    },
 }
 
 #[derive(Clone)]
@@ -14092,7 +14123,7 @@ fn mcp_servers_fingerprint(servers: &[AcpMcpServerDescriptor]) -> String {
         hash_named_component(&mut hasher, b"server_id", server.id.as_bytes());
         hash_named_component(&mut hasher, b"server_name", server.name.as_bytes());
         match &server.transport {
-            AcpMcpTransportDescriptor::Stdio { command, args } => {
+            AcpMcpTransportDescriptor::Stdio { command, args, env } => {
                 hash_named_component(&mut hasher, b"transport", b"stdio");
                 hash_named_component(&mut hasher, b"command", command.as_bytes());
                 hash_named_component(
@@ -14103,18 +14134,34 @@ fn mcp_servers_fingerprint(servers: &[AcpMcpServerDescriptor]) -> String {
                 for arg in args {
                     hash_named_component(&mut hasher, b"arg", arg.as_bytes());
                 }
+                hash_mcp_entries(&mut hasher, b"env", env);
             }
-            AcpMcpTransportDescriptor::Http { url } => {
+            AcpMcpTransportDescriptor::Http { url, headers } => {
                 hash_named_component(&mut hasher, b"transport", b"http");
                 hash_named_component(&mut hasher, b"url", url.as_bytes());
+                hash_mcp_entries(&mut hasher, b"header", headers);
             }
-            AcpMcpTransportDescriptor::Sse { url } => {
+            AcpMcpTransportDescriptor::Sse { url, headers } => {
                 hash_named_component(&mut hasher, b"transport", b"sse");
                 hash_named_component(&mut hasher, b"url", url.as_bytes());
+                hash_mcp_entries(&mut hasher, b"header", headers);
             }
         }
     }
     format!("sha256:{}", hex_digest(hasher.finalize().as_slice()))
+}
+
+/// Fold MCP environment or header entries into the spawn fingerprint.
+///
+/// Values participate so a rotated credential produces a new fingerprint and
+/// the stale process is replaced. The fingerprint is a one-way digest, so no
+/// secret material is recoverable from it.
+fn hash_mcp_entries(hasher: &mut Sha256, label: &[u8], entries: &[(String, String)]) {
+    hash_named_component(hasher, label, &(entries.len() as u64).to_be_bytes());
+    for (name, value) in entries {
+        hash_named_component(hasher, label, name.as_bytes());
+        hash_named_component(hasher, label, value.as_bytes());
+    }
 }
 
 fn hash_component(hasher: &mut Sha256, bytes: &[u8]) {
@@ -18852,6 +18899,7 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
                         "-y".to_string(),
                         "@modelcontextprotocol/server-filesystem".to_string(),
                     ],
+                    env: vec![("MCP_ROOT".to_string(), "/tmp/workspace".to_string())],
                 },
             },
             AcpMcpServerDescriptor {
@@ -18859,6 +18907,7 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
                 name: "Remote".to_string(),
                 transport: AcpMcpTransportDescriptor::Http {
                     url: "https://example.invalid/mcp".to_string(),
+                    headers: vec![("Authorization".to_string(), "Bearer token".to_string())],
                 },
             },
             AcpMcpServerDescriptor {
@@ -18866,6 +18915,7 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
                 name: "Events".to_string(),
                 transport: AcpMcpTransportDescriptor::Sse {
                     url: "https://example.invalid/sse".to_string(),
+                    headers: Vec::new(),
                 },
             },
         ];
@@ -18882,13 +18932,13 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
                         "name": "Filesystem",
                         "command": "/usr/bin/npx",
                         "args": ["-y", "@modelcontextprotocol/server-filesystem"],
-                        "env": []
+                        "env": [{"name": "MCP_ROOT", "value": "/tmp/workspace"}]
                     },
                     {
                         "type": "http",
                         "name": "Remote",
                         "url": "https://example.invalid/mcp",
-                        "headers": []
+                        "headers": [{"name": "Authorization", "value": "Bearer token"}]
                     },
                     {
                         "type": "sse",
@@ -18964,7 +19014,9 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
                 transport: ProviderRuntimeMcpTransport::Stdio,
                 command: None,
                 args: Vec::new(),
+                env: Vec::new(),
                 url: None,
+                headers: Vec::new(),
             }],
             skills: Vec::new(),
         };
@@ -18985,7 +19037,9 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
                 transport: ProviderRuntimeMcpTransport::Sse,
                 command: None,
                 args: Vec::new(),
+                env: Vec::new(),
                 url: Some("https://example.invalid/sse".to_string()),
+                headers: Vec::new(),
             }],
             skills: Vec::new(),
         };
@@ -22480,7 +22534,9 @@ for line in sys.stdin:
                     transport: ProviderRuntimeMcpTransport::Stdio,
                     command: Some("mcp-server-filesystem".to_string()),
                     args: vec!["--root".to_string(), "/tmp/workspace".to_string()],
+                    env: Vec::new(),
                     url: None,
+                    headers: Vec::new(),
                 },
                 ProviderRuntimeMcpServer {
                     id: "remote".to_string(),
@@ -22488,7 +22544,9 @@ for line in sys.stdin:
                     transport: ProviderRuntimeMcpTransport::Http,
                     command: None,
                     args: Vec::new(),
+                    env: Vec::new(),
                     url: Some("https://example.invalid/mcp".to_string()),
+                    headers: Vec::new(),
                 },
                 // The mock agent does not advertise `mcpCapabilities.sse`, so
                 // this entry must never reach the wire.
@@ -22498,7 +22556,9 @@ for line in sys.stdin:
                     transport: ProviderRuntimeMcpTransport::Sse,
                     command: None,
                     args: Vec::new(),
+                    env: Vec::new(),
                     url: Some("https://example.invalid/sse".to_string()),
+                    headers: Vec::new(),
                 },
             ],
             skills: Vec::new(),

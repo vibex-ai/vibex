@@ -191,6 +191,22 @@ pub enum ResourceDiscoveryStatus {
     Error,
 }
 
+/// One environment variable handed to a stdio MCP server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerEnvEntry {
+    pub name: String,
+    pub value: String,
+}
+
+/// One header sent to an HTTP or SSE MCP server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerHeaderEntry {
+    pub name: String,
+    pub value: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpServer {
@@ -203,7 +219,14 @@ pub struct McpServer {
     pub workspace_id: Option<WorkspaceId>,
     pub command: Option<String>,
     pub args: Vec<String>,
+    /// Environment handed to a stdio server at launch. Required on the ACP
+    /// wire, so it is stored rather than reconstructed at forwarding time.
+    #[serde(default)]
+    pub env: Vec<McpServerEnvEntry>,
     pub url: Option<String>,
+    /// Headers sent to an HTTP or SSE server. Required on the ACP wire.
+    #[serde(default)]
+    pub headers: Vec<McpServerHeaderEntry>,
     pub description: Option<String>,
     pub tags: Vec<String>,
     pub secret_references: Vec<McpServerSecretReference>,
@@ -263,7 +286,11 @@ pub struct McpServerCreateRequest {
     pub workspace_id: Option<WorkspaceId>,
     pub command: Option<String>,
     pub args: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<McpServerEnvEntry>,
     pub url: Option<String>,
+    #[serde(default)]
+    pub headers: Vec<McpServerHeaderEntry>,
     pub description: Option<String>,
     pub tags: Vec<String>,
     pub secret_references: Vec<McpServerSecretReferenceCreateRequest>,
@@ -282,7 +309,11 @@ pub struct McpServerUpdateRequest {
     pub workspace_id: Option<WorkspaceId>,
     pub command: Option<String>,
     pub args: Option<Vec<String>>,
+    #[serde(default)]
+    pub env: Option<Vec<McpServerEnvEntry>>,
     pub url: Option<String>,
+    #[serde(default)]
+    pub headers: Option<Vec<McpServerHeaderEntry>>,
     pub description: Option<String>,
     pub tags: Option<Vec<String>>,
 }

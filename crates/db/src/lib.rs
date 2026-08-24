@@ -73,7 +73,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 49;
+pub const CURRENT_SCHEMA_VERSION: i64 = 50;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -6058,7 +6058,9 @@ impl McpServerRepository {
             workspace_id: request.workspace_id,
             command: request.command,
             args: request.args,
+            env: request.env,
             url: request.url,
+            headers: request.headers,
             description: request.description,
             tags: request.tags,
             secret_references,
@@ -6076,9 +6078,13 @@ impl McpServerRepository {
             INSERT INTO mcp_servers (
                 mcp_server_id, display_name, transport_kind, status, scope_kind,
                 project_id, workspace_id, command, args_json, url, description,
-                tags_json, created_at_ms, updated_at_ms, deleted_at_ms
+                tags_json, created_at_ms, updated_at_ms, deleted_at_ms,
+                env_json, headers_json
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+            VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                ?16, ?17
+            )
             ",
             params![
                 server.id.as_str(),
@@ -6095,7 +6101,9 @@ impl McpServerRepository {
                 json_to_db(&server.tags)?,
                 server.created_at_ms,
                 server.updated_at_ms,
-                server.deleted_at_ms
+                server.deleted_at_ms,
+                json_to_db(&server.env)?,
+                json_to_db(&server.headers)?
             ],
         )
         .map_err(storage_err(
@@ -6114,7 +6122,8 @@ impl McpServerRepository {
                 "
                 SELECT mcp_server_id, display_name, transport_kind, status, scope_kind,
                     project_id, workspace_id, command, args_json, url, description,
-                    tags_json, created_at_ms, updated_at_ms, deleted_at_ms
+                    tags_json, created_at_ms, updated_at_ms, deleted_at_ms,
+                    env_json, headers_json
                 FROM mcp_servers
                 WHERE deleted_at_ms IS NULL
                 ORDER BY updated_at_ms DESC, display_name ASC
@@ -6151,7 +6160,8 @@ impl McpServerRepository {
                 "
                 SELECT s.mcp_server_id, s.display_name, s.transport_kind, s.status, s.scope_kind,
                     s.project_id, s.workspace_id, s.command, s.args_json, s.url, s.description,
-                    s.tags_json, s.created_at_ms, s.updated_at_ms, s.deleted_at_ms
+                    s.tags_json, s.created_at_ms, s.updated_at_ms, s.deleted_at_ms,
+                    s.env_json, s.headers_json
                 FROM mcp_servers s
                 INNER JOIN mcp_server_provider_matrix m
                     ON m.mcp_server_id = s.mcp_server_id
@@ -6200,7 +6210,8 @@ impl McpServerRepository {
                 "
                 SELECT DISTINCT s.mcp_server_id, s.display_name, s.transport_kind, s.status, s.scope_kind,
                     s.project_id, s.workspace_id, s.command, s.args_json, s.url, s.description,
-                    s.tags_json, s.created_at_ms, s.updated_at_ms, s.deleted_at_ms
+                    s.tags_json, s.created_at_ms, s.updated_at_ms, s.deleted_at_ms,
+                    s.env_json, s.headers_json
                 FROM mcp_servers s
                 LEFT JOIN mcp_server_agent_matrix am
                     ON am.mcp_server_id = s.mcp_server_id
@@ -6254,7 +6265,8 @@ impl McpServerRepository {
                 "
                 SELECT mcp_server_id, display_name, transport_kind, status, scope_kind,
                     project_id, workspace_id, command, args_json, url, description,
-                    tags_json, created_at_ms, updated_at_ms, deleted_at_ms
+                    tags_json, created_at_ms, updated_at_ms, deleted_at_ms,
+                    env_json, headers_json
                 FROM mcp_servers
                 WHERE mcp_server_id = ?1 AND deleted_at_ms IS NULL
                 ",
@@ -6287,7 +6299,9 @@ impl McpServerRepository {
                 url = ?10,
                 description = ?11,
                 tags_json = ?12,
-                updated_at_ms = ?13
+                updated_at_ms = ?13,
+                env_json = ?14,
+                headers_json = ?15
             WHERE mcp_server_id = ?1 AND deleted_at_ms IS NULL
             ",
             params![
@@ -6303,7 +6317,9 @@ impl McpServerRepository {
                 server.url,
                 server.description,
                 json_to_db(&server.tags)?,
-                server.updated_at_ms
+                server.updated_at_ms,
+                json_to_db(&server.env)?,
+                json_to_db(&server.headers)?
             ],
         )
         .map_err(storage_err(
@@ -9660,6 +9676,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_usage_model_id_nullable_table_rebuild(conn, &mut applied)?;
     apply_usage_counter_scope_column(conn, &mut applied)?;
     apply_message_submission_runtime_policy(conn, &mut applied)?;
+    apply_mcp_server_env_and_headers(conn, &mut applied)?;
 
     // Seed compatibility Profiles before the v37 backfill while no caller
     // transaction is active. Repository reads may run inside a transaction and
@@ -10289,6 +10306,52 @@ fn apply_usage_model_id_nullable_table_rebuild(
 /// added by an earlier migration. Existing rows keep `session` — the contract
 /// they were actually computed under — so the read path can tell a legacy row
 /// from one written with the contract known and repair it from the raw reading.
+/// Storage for MCP environment and header entries.
+///
+/// Both are required fields on the ACP wire, so they need storage of their own
+/// rather than being reconstructed at forwarding time. Applied after the
+/// migration array because the versions there all precede the table rebuilds
+/// above, and a recorded version must match the order it ran in.
+fn apply_mcp_server_env_and_headers(
+    conn: &mut Connection,
+    applied: &mut Vec<String>,
+) -> VibexResult<()> {
+    const VERSION: i64 = 50;
+    const NAME: &str = "mcp_server_env_and_headers";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+
+    let tx = conn.transaction().map_err(storage_err(
+        "migration_transaction_failed",
+        "failed to start MCP server env and header migration transaction",
+    ))?;
+    tx.execute_batch(
+        "
+        ALTER TABLE mcp_servers ADD COLUMN env_json TEXT NOT NULL DEFAULT '[]';
+        ALTER TABLE mcp_servers ADD COLUMN headers_json TEXT NOT NULL DEFAULT '[]';
+        ",
+    )
+    .map_err(storage_err(
+        "migration_apply_failed",
+        "failed to add the MCP server env and header columns",
+    ))?;
+    tx.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record MCP server env and header migration",
+    ))?;
+    tx.commit().map_err(storage_err(
+        "migration_commit_failed",
+        "failed to commit MCP server env and header migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
+}
+
 fn apply_usage_counter_scope_column(
     conn: &mut Connection,
     applied: &mut Vec<String>,
@@ -11932,6 +11995,9 @@ fn map_mcp_server_without_children(row: &rusqlite::Row<'_>) -> rusqlite::Result<
         created_at_ms: row.get(12)?,
         updated_at_ms: row.get(13)?,
         deleted_at_ms: row.get(14)?,
+        // Rows written before the columns existed read as NULL.
+        env: optional_json_from_db_sql(row.get(15)?)?.unwrap_or_default(),
+        headers: optional_json_from_db_sql(row.get(16)?)?.unwrap_or_default(),
     })
 }
 
@@ -12561,7 +12627,8 @@ mod tests {
             [
                 "47:agent_default_usage_model_nullable",
                 "48:agent_usage_counter_scope",
-                "49:message_submission_runtime_policy"
+                "49:message_submission_runtime_policy",
+                "50:mcp_server_env_and_headers"
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -12695,6 +12762,7 @@ mod tests {
                 "47:agent_default_usage_model_nullable",
                 "48:agent_usage_counter_scope",
                 "49:message_submission_runtime_policy",
+                "50:mcp_server_env_and_headers",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -12808,7 +12876,8 @@ mod tests {
                 "46:runtime_auth_source_nullable_legacy_columns",
                 "47:agent_default_usage_model_nullable",
                 "48:agent_usage_counter_scope",
-                "49:message_submission_runtime_policy"
+                "49:message_submission_runtime_policy",
+                "50:mcp_server_env_and_headers"
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -12960,7 +13029,8 @@ mod tests {
                 "46:runtime_auth_source_nullable_legacy_columns",
                 "47:agent_default_usage_model_nullable",
                 "48:agent_usage_counter_scope",
-                "49:message_submission_runtime_policy"
+                "49:message_submission_runtime_policy",
+                "50:mcp_server_env_and_headers"
             ]
         );
         assert_eq!(
@@ -14368,7 +14438,8 @@ mod tests {
                 "46:runtime_auth_source_nullable_legacy_columns",
                 "47:agent_default_usage_model_nullable",
                 "48:agent_usage_counter_scope",
-                "49:message_submission_runtime_policy"
+                "49:message_submission_runtime_policy",
+                "50:mcp_server_env_and_headers"
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
@@ -15058,7 +15129,9 @@ mod tests {
             workspace_id: None,
             command: Some("mcp-filesystem".to_string()),
             args: vec!["--root".to_string(), "/tmp/workspace".to_string()],
+            env: Vec::new(),
             url: None,
+            headers: Vec::new(),
             description: Some("Local filesystem MCP server".to_string()),
             tags: vec!["local".to_string(), "filesystem".to_string()],
             secret_references: vec![McpServerSecretReferenceCreateRequest {

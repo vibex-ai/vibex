@@ -62,7 +62,13 @@ pub struct ProviderRuntimeMcpServer {
     pub transport: ProviderRuntimeMcpTransport,
     pub command: Option<String>,
     pub args: Vec<String>,
+    /// Environment for a stdio server, with resolved secrets already merged
+    /// in. Required on the ACP wire.
+    pub env: Vec<(String, String)>,
     pub url: Option<String>,
+    /// Headers for an HTTP or SSE server, with resolved secrets already merged
+    /// in. Required on the ACP wire.
+    pub headers: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]

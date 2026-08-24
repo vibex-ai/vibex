@@ -14,5 +14,6 @@ serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+vibex-config-switch = { path = "../config-switch" }
 vibex-core = { path = "../core" }
 vibex-db = { path = "../db" }
