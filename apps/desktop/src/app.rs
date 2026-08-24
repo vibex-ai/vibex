@@ -182,7 +182,7 @@ const TITLE_BAR_HEIGHT: f32 = 50.0;
 const TITLE_BAR_COLLAPSED_SIDEBAR_WIDTH: f32 = 112.0;
 const SIDEBAR_PROJECT_LOGO_DIRECTORY: &str = "project-icons";
 const SIDEBAR_LOGO_DISPLAY_SIZE: f32 = 14.0;
-const SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE: f32 = 18.0;
+const SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE: f32 = 16.0;
 const SIDEBAR_WORKSPACE_STATUS_TOP_OFFSET: f32 = 4.0;
 const SIDEBAR_ICON_TITLE_GAP: f32 = 4.0;
 const SIDEBAR_PROJECT_ICON_SLOT_SIZE: f32 = 30.0;
@@ -225,7 +225,7 @@ const SIDEBAR_INLINE_TRANSITION_DURATION: Duration = Duration::from_millis(200);
 const SIDEBAR_FLOATING_TRANSITION_DURATION: Duration = Duration::from_millis(200);
 const SIDEBAR_REORDER_TRANSITION_DURATION: Duration = Duration::from_millis(160);
 const SIDEBAR_REORDER_ROW_HEIGHT: f32 = 32.0;
-const SIDEBAR_PROJECT_GROUP_GAP: f32 = 16.0;
+const SIDEBAR_PROJECT_GROUP_GAP: f32 = 12.0;
 const SIDEBAR_PROJECT_REORDER_GAP: f32 = 12.0;
 const SIDEBAR_PROJECT_CONTENT_GAP: f32 = 4.0;
 const SIDEBAR_SESSION_REORDER_GAP: f32 = 2.0;
@@ -48300,7 +48300,7 @@ mod tests {
         assert!(trigger.contains(".w(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))"));
         assert!(trigger.contains(".h(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))"));
         assert!(trigger.contains(".child(project_logo)"));
-        assert!(source.contains("const SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE: f32 = 18.0;"));
+        assert!(source.contains("const SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE: f32 = 16.0;"));
         assert!(source.contains("const SIDEBAR_PROJECT_ICON_SLOT_SIZE: f32 = 30.0;"));
         let logo_renderer = source
             .split_once("fn sidebar_project_logo(")
@@ -48355,7 +48355,7 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_root_children("))
             .map(|(body, _)| body)
             .expect("agent sidebar renderer should remain inspectable");
-        assert!(source.contains("const SIDEBAR_PROJECT_GROUP_GAP: f32 = 16.0;"));
+        assert!(source.contains("const SIDEBAR_PROJECT_GROUP_GAP: f32 = 12.0;"));
         assert!(source.contains("const SIDEBAR_PROJECT_CONTENT_GAP: f32 = 4.0;"));
         assert!(sidebar.contains(".gap(px(SIDEBAR_PROJECT_GROUP_GAP))"));
 
