@@ -15608,51 +15608,75 @@ impl VibexWorkbench {
                 title,
                 safety: None,
             };
-            let session = if deferred_creation {
+            let recovery_session_id = optimistic_session_id.clone();
+            let creation = if deferred_creation {
                 runtime
                     .agent()
                     .manager()
                     .create_session_deferred_with_id(create_request, optimistic_session_id)
-                    .await?
+                    .await
             } else {
                 runtime
                     .agent()
                     .manager()
                     .create_session_with_id(create_request, optimistic_session_id)
-                    .await?
+                    .await
+            };
+            let session = match creation {
+                Ok(session) => session,
+                Err(error) => {
+                    // The manager persists the Logical Session before runtime
+                    // materialization. Surface that durable error session so
+                    // the optimistic first message is never discarded when
+                    // initialization fails after persistence.
+                    if let Ok(session) = runtime
+                        .agent()
+                        .manager()
+                        .get_session(&recovery_session_id)
+                        .await
+                    {
+                        let _ = created_tx.send(NewSessionCreateSignal::SessionReady(
+                            session,
+                            runtime.workspace().list().ok(),
+                            has_initial_message,
+                        ));
+                    }
+                    return Err(error.into());
+                }
             };
             let workspaces = runtime.workspace().list().ok();
             let session_id = session.id.clone();
             let message_runtime = runtime.clone();
-            let desired_runtime = message_runtime
-                .agent()
-                .runtime_selection()
-                .get_selection_state(&session_id)
-                .map(|state| state.effective)
-                .unwrap_or_else(|_| selection.clone());
-            let prepared_submission = if has_initial_message && command_invocation.is_none() {
-                let coordinator = message_runtime.agent().message_submission();
-                let reasoning_effort = desired_runtime.reasoning_effort.clone();
-                let submission_id = coordinator.prepare_submission(SendAgentMessageRequest {
-                    session_id: session_id.clone(),
-                    message_idempotency_key: format!(
-                        "gpui:new-session:{}:{}",
-                        session_id.as_str(),
-                        unix_timestamp_ms()
-                    ),
-                    desired_runtime: desired_runtime.clone(),
-                    text: text.clone(),
-                    attachments: attachments.clone(),
-                    reasoning_effort,
-                    correlation_id: None,
-                })?;
-                Some((coordinator, submission_id))
-            } else {
-                None
-            };
             let initial_message = if has_initial_message {
                 let initial_attachments = attachments;
                 Some(async move {
+                    let desired_runtime = message_runtime
+                        .agent()
+                        .runtime_selection()
+                        .get_selection_state(&session_id)
+                        .map(|state| state.effective)
+                        .unwrap_or_else(|_| selection.clone());
+                    let prepared_submission = if command_invocation.is_none() {
+                        let coordinator = message_runtime.agent().message_submission();
+                        let reasoning_effort = desired_runtime.reasoning_effort.clone();
+                        let submission_id =
+                            coordinator.prepare_submission(SendAgentMessageRequest {
+                                session_id: session_id.clone(),
+                                message_idempotency_key: format!(
+                                    "gpui:new-session:{}:{}",
+                                    session_id.as_str(),
+                                    unix_timestamp_ms()
+                                ),
+                                desired_runtime: desired_runtime.clone(),
+                                text: text.clone(),
+                                attachments: initial_attachments.clone(),
+                                reasoning_effort,
+                                correlation_id: None,
+                            })?;
+                        Some((coordinator, submission_id))
+                    } else {
+                        None
+                    };
                     if let Some(invocation) = command_invocation {
                         if *initial_turn_interrupt_rx.borrow() {
                             return Err(initial_message_interrupted_error());
@@ -15901,30 +15925,48 @@ impl VibexWorkbench {
                         }
                     }
                     Ok(Err(error)) => {
-                        this.fail_pending_new_session(
-                            &pending_session_id,
-                            generation,
-                            draft.clone(),
-                            NewSessionFailure {
-                                code: error.code.clone(),
-                                message: format!("{}: {}", error.code, error.message),
-                            },
-                            window,
-                            cx,
-                        );
+                        if created_session_id.is_some() {
+                            this.runtime_note = Some(format!(
+                                "Session created; runtime initialization failed: {}",
+                                error
+                            ));
+                            this.reconcile_sidebar_state();
+                            this.refresh_workspace_contexts(cx);
+                        } else {
+                            this.fail_pending_new_session(
+                                &pending_session_id,
+                                generation,
+                                draft.clone(),
+                                NewSessionFailure {
+                                    code: error.code.clone(),
+                                    message: format!("{}: {}", error.code, error.message),
+                                },
+                                window,
+                                cx,
+                            );
+                        }
                     }
                     Err(error) => {
-                        this.fail_pending_new_session(
-                            &pending_session_id,
-                            generation,
-                            draft,
-                            NewSessionFailure {
-                                code: "new_session_task_failed".to_string(),
-                                message: format!("session creation failed: {error}"),
-                            },
-                            window,
-                            cx,
-                        );
+                        if created_session_id.is_some() {
+                            this.runtime_note = Some(format!(
+                                "Session created; runtime initialization failed: {}",
+                                error
+                            ));
+                            this.reconcile_sidebar_state();
+                            this.refresh_workspace_contexts(cx);
+                        } else {
+                            this.fail_pending_new_session(
+                                &pending_session_id,
+                                generation,
+                                draft,
+                                NewSessionFailure {
+                                    code: "new_session_task_failed".to_string(),
+                                    message: format!("session creation failed: {error}"),
+                                },
+                                window,
+                                cx,
+                            );
+                        }
                     }
                 }
                 cx.notify();
@@ -50246,6 +50288,31 @@ mod tests {
         assert!(pending_open.contains("self.set_session_turn_pending(&session_id, true);"));
         assert!(pending_open.contains("self.agent_loading = false;"));
         assert!(!pending_open.contains("self.agent_action_pending = true;"));
+    }
+
+    #[test]
+    fn new_session_keeps_durable_failure_and_message_visible() {
+        let source = include_str!("app.rs");
+        let submit = source
+            .split_once("    fn submit_new_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn choose_runtime_selection("))
+            .map(|(body, _)| body)
+            .expect("new-session submission should remain inspectable");
+
+        assert!(submit.contains("get_session(&recovery_session_id)"));
+        assert!(submit.contains("NewSessionCreateSignal::SessionReady("));
+        assert!(submit.contains("if created_session_id.is_some()"));
+        assert!(submit.contains("runtime initialization failed"));
+
+        let initial_message = submit
+            .find("let initial_message = if has_initial_message")
+            .expect("initial message preparation should remain deferred");
+        let announce = submit
+            .find("announce_created_session_before_initial_message(")
+            .expect("durable session should be announced before its initial message runs");
+        assert!(initial_message < announce);
+        assert!(submit[initial_message..announce].contains("prepare_submission"));
+        assert!(submit[initial_message..announce].contains("get_selection_state(&session_id)"));
     }
 
     #[test]

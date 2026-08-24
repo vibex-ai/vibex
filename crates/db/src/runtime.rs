@@ -5270,10 +5270,15 @@ impl AgentSessionRuntimeRepository {
             ));
         }
 
-        let tx = conn.transaction().map_err(storage_err(
-            "runtime_selection_initial_enqueue_transaction_failed",
-            "failed to start initial runtime selection transaction",
-        ))?;
+        // Initial enqueue reads the empty runtime state and then writes the
+        // desired selection. Acquire the write lock before that read so a WAL
+        // snapshot cannot become stale while the transaction is upgraded.
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "runtime_selection_initial_enqueue_transaction_failed",
+                "failed to start initial runtime selection transaction",
+            ))?;
         if let Some(existing) = RuntimeSwitchRepository::get_by_idempotency_key_tx(
             &tx,
             &request.session_id,
@@ -6452,6 +6457,69 @@ mod tests {
             state.runtime_selection_error_code.as_deref(),
             Some("runtime_switch_configuration_unavailable")
         );
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn initial_switch_enqueue_waits_for_concurrent_writer_before_reading() {
+        let temp = temp_db_path("initial-switch-concurrent-writer");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let session_id = seeded_session(&conn, "initial-switch-concurrent-writer");
+        let request = desired_enqueue_request(
+            &session_id,
+            "initial-switch-concurrent-writer",
+            0,
+            sample_selection(),
+        );
+        drop(conn);
+
+        let mut result_conn = open_database(&temp).unwrap();
+        let mut writer_conn = open_database(&temp).unwrap();
+        let writer_session_id = session_id.clone();
+        let (writer_ready_tx, writer_ready_rx) = mpsc::channel();
+        let (release_writer_tx, release_writer_rx) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            let tx = writer_conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            tx.execute(
+                "UPDATE agent_sessions
+                 SET updated_at_ms = updated_at_ms + 1
+                 WHERE session_id = ?1",
+                params![writer_session_id.as_str()],
+            )
+            .unwrap();
+            writer_ready_tx.send(()).unwrap();
+            release_writer_rx.recv().unwrap();
+            tx.commit().unwrap();
+        });
+        writer_ready_rx.recv().unwrap();
+
+        let switch_id = RuntimeSwitchId::new();
+        let result = thread::spawn(move || {
+            AgentSessionRuntimeRepository::enqueue_initial_runtime_switch(
+                &mut result_conn,
+                switch_id,
+                &request,
+            )
+        });
+        thread::sleep(Duration::from_millis(100));
+        release_writer_tx.send(()).unwrap();
+        writer.join().unwrap();
+        let record = result.join().unwrap().unwrap();
+
+        assert_eq!(record.session_id, session_id);
+        assert_eq!(record.desired_selection_revision, 1);
+        let conn = open_database(&temp).unwrap();
+        let state = AgentSessionRuntimeRepository::get_runtime_state(&conn, &record.session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.runtime_selection_status,
+            Some(SessionRuntimeSelectionStatus::Preparing)
+        );
+        assert_eq!(state.selection_revision, 1);
         cleanup_db(temp);
     }
 
