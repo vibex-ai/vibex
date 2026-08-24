@@ -8572,6 +8572,36 @@ impl CodeRightRail {
             .into_any_element()
     }
 
+    fn render_file_search_scroll_area(rows: Vec<AnyElement>, scroll: &ScrollHandle) -> AnyElement {
+        // GPUI applies a scroll area's offset to every child during prepaint, so
+        // the scrollbar must be a sibling of the scrolling content.
+        let scroll_content = v_flex()
+            .id("file-search-scroll-content")
+            .flex_none()
+            .size_auto()
+            .min_size_full()
+            .px_1()
+            .py_1()
+            .children(rows);
+        let scroll_area = v_flex()
+            .id("file-search-scroll")
+            .size_full()
+            .items_start()
+            .track_scroll(scroll)
+            .overflow_scroll()
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .child(scroll_content);
+        div()
+            .size_full()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .relative()
+            .child(scroll_area)
+            .scrollbar(scroll, ScrollbarAxis::Both)
+            .into_any_element()
+    }
+
     fn render_file_search_results(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let query = self.file_search_input.read(cx).value().trim().to_string();
         if self.file_search_loading {
@@ -8648,24 +8678,6 @@ impl CodeRightRail {
                 }
             }
         }
-        // GPUI applies a scroll area's offset to every child during prepaint, so
-        // the scrollbar must be a sibling of the scrolling content.
-        let scroll_content = v_flex()
-            .id("file-search-scroll-content")
-            .flex_none()
-            .size_auto()
-            .min_size_full()
-            .px_1()
-            .py_1()
-            .children(rows);
-        let scroll_area = div()
-            .id("file-search-scroll")
-            .size_full()
-            .flex()
-            .track_scroll(&search_scroll)
-            .overflow_scroll()
-            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-            .child(scroll_content);
         v_flex()
             .flex_1()
             .min_w_0()
@@ -8681,15 +8693,7 @@ impl CodeRightRail {
                     .text_color(cx.theme().muted_foreground)
                     .child(summary),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .min_h_0()
-                    .relative()
-                    .child(scroll_area)
-                    .scrollbar(&search_scroll, ScrollbarAxis::Both),
-            )
+            .child(Self::render_file_search_scroll_area(rows, &search_scroll))
             .into_any_element()
     }
 
@@ -14553,6 +14557,84 @@ mod tests {
         assert!(indicator.contains(".top(px(0.5))"));
         assert!(!indicator.contains("h(px(1.5))"));
         assert!(!indicator.contains("gpui::white()"));
+    }
+
+    struct FileSearchScrollProbe {
+        scroll: ScrollHandle,
+    }
+
+    impl Render for FileSearchScrollProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let rows = (0..40)
+                .map(|index| {
+                    let row = div().w(px(360.0)).h(px(24.0)).flex_none();
+                    let row = if index == 39 {
+                        row.debug_selector(|| "file-search-scroll-last-row".to_string())
+                    } else {
+                        row
+                    };
+                    row.into_any_element()
+                })
+                .collect();
+            div()
+                .w(px(240.0))
+                .h(px(180.0))
+                .child(CodeRightRail::render_file_search_scroll_area(
+                    rows,
+                    &self.scroll,
+                ))
+        }
+    }
+
+    #[gpui::test]
+    fn file_search_scroll_area_moves_content_with_wheel(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let scroll = ScrollHandle::new();
+        let observed_scroll = scroll.clone();
+        let (_, cx) = cx.add_window_view(|_, _| FileSearchScrollProbe { scroll });
+
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(observed_scroll.max_offset().y > px(0.0));
+        assert!(observed_scroll.max_offset().x > px(0.0));
+        let initial_y = cx
+            .debug_bounds("file-search-scroll-last-row")
+            .expect("last search row should be laid out")
+            .origin
+            .y;
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(20.0), px(20.0)),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let scrolled_y = cx
+            .debug_bounds("file-search-scroll-last-row")
+            .expect("last search row should remain laid out")
+            .origin
+            .y;
+        assert!(
+            scrolled_y < initial_y,
+            "initial: {initial_y:?}, scrolled: {scrolled_y:?}"
+        );
+        assert!(observed_scroll.offset().y < px(0.0));
+        assert_eq!(observed_scroll.offset().x, px(0.0));
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(20.0), px(20.0)),
+            delta: gpui::ScrollDelta::Pixels(point(px(-120.0), px(0.0))),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        assert!(observed_scroll.offset().x < px(0.0));
     }
 
     #[gpui::test]
