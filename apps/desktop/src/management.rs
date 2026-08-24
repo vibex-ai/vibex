@@ -429,6 +429,7 @@ enum ManagementMutation {
 struct ManagementTaskSuccess {
     message: String,
     agent_install_state: Option<(AgentId, vibex_core::AgentManagedInstallState)>,
+    provider_profiles: Vec<vibex_core::ProviderProfile>,
 }
 
 impl ManagementTaskSuccess {
@@ -440,6 +441,18 @@ impl ManagementTaskSuccess {
         Self {
             message,
             agent_install_state: Some((agent_id, state)),
+            provider_profiles: Vec::new(),
+        }
+    }
+
+    fn with_provider_profiles(
+        message: String,
+        provider_profiles: Vec<vibex_core::ProviderProfile>,
+    ) -> Self {
+        Self {
+            message,
+            agent_install_state: None,
+            provider_profiles,
         }
     }
 }
@@ -449,6 +462,7 @@ impl From<String> for ManagementTaskSuccess {
         Self {
             message,
             agent_install_state: None,
+            provider_profiles: Vec::new(),
         }
     }
 }
@@ -3249,6 +3263,35 @@ impl ManagementCenter {
         }
     }
 
+    fn apply_provider_profile_success(
+        &mut self,
+        provider_profiles: &[vibex_core::ProviderProfile],
+    ) {
+        for profile in provider_profiles {
+            if let Some(existing) = self
+                .provider_profiles
+                .iter_mut()
+                .find(|existing| existing.id == profile.id)
+            {
+                *existing = profile.clone();
+            } else {
+                self.provider_profiles.push(profile.clone());
+            }
+
+            let projection = vibex_desktop_model::ProviderProfileProjection::from_profile(profile);
+            if let Some(existing) = self
+                .snapshot
+                .profiles
+                .iter_mut()
+                .find(|existing| existing.id == projection.id)
+            {
+                *existing = projection;
+            } else {
+                self.snapshot.profiles.push(projection);
+            }
+        }
+    }
+
     fn selected_agent_installation_pending(&self) -> bool {
         self.selected_agent_id.as_deref().is_some_and(|agent_id| {
             self.snapshot.agents.iter().any(|agent| {
@@ -5281,6 +5324,7 @@ impl ManagementCenter {
                                 agent.apply_managed_install_state(state);
                             }
                         }
+                        this.apply_provider_profile_success(&success.provider_profiles);
                         this.notice = Some(success.message);
                         cx.notify();
                         if !matches!(&completed_mutation, ManagementMutation::AgentUpdateCheck(_)) {
@@ -6620,7 +6664,7 @@ impl ManagementCenter {
         };
         let existing_profiles = self.provider_profiles.clone();
         let active_locale = locale::current_locale();
-        self.begin_simple_task(
+        self.begin_task_with_success(
             ManagementMutation::ProviderPreview(
                 if import {
                     "native-import"
@@ -6641,7 +6685,7 @@ impl ManagementCenter {
                 };
                 let preview = providers.preview_native_import(request.clone())?;
                 if !import {
-                    return Ok(match active_locale {
+                    return Ok(ManagementTaskSuccess::from(match active_locale {
                         ResolvedLocale::En => format!(
                             "Native preview: {} item(s), {} file(s)",
                             preview.items.len(),
@@ -6657,7 +6701,7 @@ impl ManagementCenter {
                             preview.items.len(),
                             preview.files.len()
                         ),
-                    });
+                    }));
                 }
                 if let Some(target_agent_id) = target_agent_id.as_ref() {
                     let import_item_ids = pending_cc_switch_import_item_ids(
@@ -6673,6 +6717,7 @@ impl ManagementCenter {
                     }
                     let mut imported_count = 0usize;
                     let mut missing_secret_count = 0usize;
+                    let mut imported_profiles = Vec::new();
                     for import_item_id in import_item_ids {
                         let result = providers.create_profile_from_import(
                             vibex_core::ProviderNativeImportCreateRequest {
@@ -6681,6 +6726,7 @@ impl ManagementCenter {
                             },
                         )?;
                         imported_count += 1;
+                        imported_profiles.push(result.profile);
                         if result.diagnostics.iter().any(|diagnostic| {
                             diagnostic.code
                                 == "provider_native_import_cc_switch_secret_keychain_unavailable"
@@ -6688,7 +6734,7 @@ impl ManagementCenter {
                             missing_secret_count += 1;
                         }
                     }
-                    return Ok(match active_locale {
+                    let message = match active_locale {
                         ResolvedLocale::En if missing_secret_count > 0 => format!(
                             "Imported {imported_count} cc-switch configuration(s); {missing_secret_count} require API Key setup"
                         ),
@@ -6707,7 +6753,11 @@ impl ManagementCenter {
                         ResolvedLocale::ZhTw => {
                             format!("已匯入 {imported_count} 個 cc-switch 配置")
                         }
-                    });
+                    };
+                    return Ok(ManagementTaskSuccess::with_provider_profiles(
+                        message,
+                        imported_profiles,
+                    ));
                 }
                 let item = preview
                     .items
@@ -6719,12 +6769,12 @@ impl ManagementCenter {
                             "no importable native Provider record was found",
                         )
                     })?;
-                providers
+                let result = providers
                     .create_profile_from_import(vibex_core::ProviderNativeImportCreateRequest {
                         preview_request: request,
                         import_item_id: item.import_item_id.clone(),
-                    })
-                    .map(|result| match active_locale {
+                    })?;
+                let message = match active_locale {
                         ResolvedLocale::En => {
                             format!("Imported native profile {}", result.profile.display_name)
                         }
@@ -6734,7 +6784,11 @@ impl ManagementCenter {
                         ResolvedLocale::ZhTw => {
                             format!("已匯入原生配置 {}", result.profile.display_name)
                         }
-                    })
+                    };
+                Ok(ManagementTaskSuccess::with_provider_profiles(
+                    message,
+                    vec![result.profile],
+                ))
             },
         );
     }
@@ -16154,6 +16208,30 @@ mod tests {
         assert!(center.read_with(cx, |center, _| {
             center.navigation.is_dirty(ManagementSection::Agents)
         }));
+    }
+
+    #[gpui::test]
+    fn imported_provider_profiles_are_projected_before_refresh(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        let mut profile = vibex_core::ProviderProfile::local_default(ProviderKind::Codex);
+        profile.display_name = "Imported provider".to_string();
+
+        center.update(cx, |center, _| {
+            center.apply_provider_profile_success(std::slice::from_ref(&profile));
+            assert_eq!(center.provider_profiles.len(), 1);
+            assert_eq!(center.snapshot.profiles.len(), 1);
+            assert_eq!(
+                center.snapshot.profiles[0].display_name,
+                "Imported provider"
+            );
+        });
+
+        center.update(cx, |center, _| {
+            center.apply_provider_profile_success(std::slice::from_ref(&profile));
+            assert_eq!(center.provider_profiles.len(), 1);
+            assert_eq!(center.snapshot.profiles.len(), 1);
+        });
     }
 
     #[test]
