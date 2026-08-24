@@ -200,6 +200,7 @@ impl ProviderConfigService {
         let agents = self.list_agents(AgentListRequest {
             include_disabled: true,
         })?;
+        let conn = self.open_connection()?;
         let versioned_agent_ids = vibex_core::agent_provider_rollout_manifest()?
             .into_iter()
             .filter(|entry| {
@@ -212,6 +213,15 @@ impl ProviderConfigService {
         let mut refreshed = 0;
         for agent in agents.agents {
             if !agent.added || !agent.installed || !versioned_agent_ids.contains(&agent.id) {
+                continue;
+            }
+            if AgentDiscoveryRepository::latest_for_agent(
+                &conn,
+                &agent.id,
+                DEFAULT_AGENT_CWD_SCOPE,
+            )?
+            .is_some_and(|discovery| agent_version_cache_is_fresh(&discovery, unix_timestamp_ms()))
+            {
                 continue;
             }
             self.refresh_agent_snapshot(AgentRefreshSnapshotRequest {
@@ -3916,6 +3926,14 @@ fn trusted_version_probe_binary_names(agent_id: &str) -> Option<&'static [&'stat
 }
 
 const CLI_VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const AGENT_VERSION_CACHE_TTL_MS: i64 = 5 * 60 * 1_000;
+
+fn agent_version_cache_is_fresh(discovery: &AgentDiscoveryRecord, now_ms: i64) -> bool {
+    discovery.version.is_some()
+        && discovery.install_status == AgentInstallStatus::Installed
+        && discovery.discovered_at_ms <= now_ms
+        && now_ms.saturating_sub(discovery.discovered_at_ms) < AGENT_VERSION_CACHE_TTL_MS
+}
 
 fn probe_cli_version(binary_path: &Path) -> Result<String, &'static str> {
     let mut command = Command::new(binary_path);
@@ -10054,6 +10072,42 @@ mod tests {
             calls_after_first_refresh,
             "an idempotent version refresh must not publish ProfilesChanged"
         );
+    }
+
+    #[test]
+    fn fresh_detected_agent_version_cache_is_reused_until_ttl() {
+        let agent_id = AgentId::parse("opencode").unwrap();
+        let discovery = AgentDiscoveryRecord {
+            discovery_record_id: "discovery_cache".to_string(),
+            agent_id,
+            cwd_scope: DEFAULT_AGENT_CWD_SCOPE.to_string(),
+            install_status: AgentInstallStatus::Installed,
+            config_status: AgentConfigStatus::Configured,
+            runtime_status: AgentRuntimeStatus::Ready,
+            binary_path: Some("/bin/opencode".to_string()),
+            version: Some("1.18.11".to_string()),
+            native_config_paths: Vec::new(),
+            models: Vec::new(),
+            modes: vec!["default".to_string()],
+            diagnostics: Vec::new(),
+            discovered_at_ms: 10_000,
+        };
+
+        assert!(agent_version_cache_is_fresh(
+            &discovery,
+            10_000 + AGENT_VERSION_CACHE_TTL_MS - 1
+        ));
+        assert!(!agent_version_cache_is_fresh(
+            &discovery,
+            10_000 + AGENT_VERSION_CACHE_TTL_MS
+        ));
+        assert!(!agent_version_cache_is_fresh(
+            &AgentDiscoveryRecord {
+                version: None,
+                ..discovery
+            },
+            10_000 + 1
+        ));
     }
 
     #[test]

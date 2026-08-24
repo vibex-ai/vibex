@@ -614,12 +614,14 @@ pub struct ManagementCenter {
     automation_steps: Vec<AutomationRunStep>,
     devices: Vec<vibex_core::RemoteDeviceDetail>,
     loading: bool,
+    details_ready: bool,
     mutation: Option<ManagementMutation>,
     agent_mutations: BTreeMap<String, ManagementMutation>,
     error: Option<String>,
     notice: Option<String>,
     generation: u64,
     refresh_task: Option<Task<()>>,
+    refresh_pending: bool,
     agent_install_refresh_task: Option<Task<()>>,
     mutation_task: Option<Task<()>>,
     profile_secret_task: Option<Task<()>>,
@@ -1078,12 +1080,14 @@ impl ManagementCenter {
             automation_steps: Vec::new(),
             devices: Vec::new(),
             loading: false,
+            details_ready: false,
             mutation: None,
             agent_mutations: BTreeMap::new(),
             error: None,
             notice: None,
             generation: 0,
             refresh_task: None,
+            refresh_pending: false,
             agent_install_refresh_task: None,
             mutation_task: None,
             profile_secret_task: None,
@@ -1164,11 +1168,16 @@ impl ManagementCenter {
     }
 
     pub fn set_runtime(&mut self, runtime: Arc<DesktopRuntime>, cx: &mut Context<Self>) {
-        if self
+        let runtime_changed = self
             .runtime
             .as_ref()
-            .is_some_and(|current| !Arc::ptr_eq(current, &runtime))
-        {
+            .is_none_or(|current| !Arc::ptr_eq(current, &runtime));
+        if runtime_changed {
+            self.generation = self.generation.saturating_add(1);
+            self.refresh_pending = false;
+            self.loading = false;
+            self.details_ready = false;
+            self.refresh_task = None;
             self.agent_auth_generation = self.agent_auth_generation.saturating_add(1);
             self.clear_agent_auth_terminal();
             self.agent_auth_scope = None;
@@ -1184,7 +1193,9 @@ impl ManagementCenter {
         self.runtime = Some(runtime);
         self.error = None;
         self.notice = None;
-        self.refresh(cx);
+        if runtime_changed || (self.snapshot.agents.is_empty() && !self.loading) {
+            self.refresh(cx);
+        }
     }
 
     pub fn sync_locale(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1287,7 +1298,10 @@ impl ManagementCenter {
     pub fn clear_runtime(&mut self, cx: &mut Context<Self>) {
         self.clear_agent_auth_terminal();
         self.runtime = None;
+        self.generation = self.generation.saturating_add(1);
         self.loading = false;
+        self.details_ready = false;
+        self.refresh_pending = false;
         self.agent_install_refresh_task = None;
         self.agent_auth_generation = self.agent_auth_generation.saturating_add(1);
         self.agent_auth_loading = false;
@@ -3102,7 +3116,69 @@ impl ManagementCenter {
     }
 
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        if self.loading {
+            self.refresh_pending = true;
+            return;
+        }
+        self.start_agent_refresh(cx);
+    }
+
+    fn start_agent_refresh(&mut self, cx: &mut Context<Self>) {
         let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        self.generation = self.generation.saturating_add(1);
+        let generation = self.generation;
+        self.loading = true;
+        self.error = None;
+        let entity = cx.weak_entity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move { load_agent_snapshot(runtime) });
+        self.refresh_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                if generation != this.generation {
+                    return;
+                }
+                match outcome {
+                    Ok(Ok(agents)) => {
+                        this.loading = false;
+                        this.apply_agent_snapshot(agents, cx);
+                        cx.notify();
+                        this.start_fast_snapshot(cx);
+                    }
+                    Ok(Err(error)) => {
+                        this.loading = false;
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                        if this.refresh_pending {
+                            this.refresh_pending = false;
+                            this.refresh(cx);
+                        }
+                    }
+                    Err(error) => {
+                        this.loading = false;
+                        this.error = Some(format!(
+                            "{}: {error}",
+                            management_error_text(
+                                "Config center refresh failed",
+                                "配置中心刷新失败",
+                                "配置中心重新整理失敗",
+                            )
+                        ));
+                        cx.notify();
+                        if this.refresh_pending {
+                            this.refresh_pending = false;
+                            this.refresh(cx);
+                        }
+                    }
+                }
+            });
+        }));
+    }
+
+    fn start_fast_snapshot(&mut self, cx: &mut Context<Self>) {
+        let Some(runtime) = self.runtime.clone() else {
+            self.loading = false;
             return;
         };
         self.generation = self.generation.saturating_add(1);
@@ -3111,11 +3187,62 @@ impl ManagementCenter {
         self.error = None;
         let default_scope = management_provider_default_scope(self.pairing_workspace_id.clone());
         let entity = cx.weak_entity();
-        let runner =
-            gpui_tokio::Tokio::spawn(
-                cx,
-                async move { load_snapshot(runtime, default_scope).await },
-            );
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            load_snapshot(runtime, default_scope, false).await
+        });
+        self.refresh_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                if generation != this.generation {
+                    return;
+                }
+                this.loading = false;
+                let success = matches!(&outcome, Ok(Ok(_)));
+                match outcome {
+                    Ok(Ok(snapshot)) => {
+                        this.apply_snapshot(snapshot, cx);
+                        cx.notify();
+                        this.start_full_refresh(cx);
+                    }
+                    Ok(Err(error)) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message))
+                    }
+                    Err(error) => {
+                        this.error = Some(format!(
+                            "{}: {error}",
+                            management_error_text(
+                                "Config center refresh failed",
+                                "配置中心刷新失败",
+                                "配置中心重新整理失敗",
+                            )
+                        ))
+                    }
+                }
+                if !success {
+                    cx.notify();
+                    if this.refresh_pending {
+                        this.refresh_pending = false;
+                        this.refresh(cx);
+                    }
+                }
+            });
+        }));
+    }
+
+    fn start_full_refresh(&mut self, cx: &mut Context<Self>) {
+        let Some(runtime) = self.runtime.clone() else {
+            self.loading = false;
+            return;
+        };
+        self.generation = self.generation.saturating_add(1);
+        let generation = self.generation;
+        self.loading = true;
+        self.error = None;
+        let default_scope = management_provider_default_scope(self.pairing_workspace_id.clone());
+        let entity = cx.weak_entity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            load_snapshot(runtime, default_scope, true).await
+        });
         self.refresh_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
@@ -3140,21 +3267,24 @@ impl ManagementCenter {
                     }
                 }
                 cx.notify();
+                if this.refresh_pending {
+                    this.refresh_pending = false;
+                    this.refresh(cx);
+                }
             });
         }));
     }
 
-    fn apply_snapshot(&mut self, snapshot: ManagementSnapshot, cx: &mut Context<Self>) {
-        self.snapshot = snapshot.center;
-        self.provider_profiles = snapshot.provider_profiles;
-        self.provider_display_order = snapshot.provider_display_order;
-        self.provider_display_order_drag_state = None;
-        self.provider_display_order_drop_target = None;
-        self.model_provider_agent_ids = snapshot.model_provider_agent_ids;
-        self.acp_configs = snapshot.acp_configs;
-        self.native_import_preview = snapshot.native_import_preview;
-        self.agent_profile_states = snapshot.agent_profile_states;
-        self.projection_states = snapshot.projection_states;
+    fn apply_agent_snapshot(&mut self, agents: Vec<AgentSnapshotEntry>, cx: &mut Context<Self>) {
+        self.snapshot.agents = agents;
+        self.reconcile_selected_agent();
+        self.sync_projection_editor();
+        self.load_agent_auth(false, cx);
+        self.schedule_agent_install_refresh(cx);
+    }
+
+    fn reconcile_selected_agent(&mut self) {
+        let previous_agent_id = self.selected_agent_id.clone();
         if !self.snapshot.agents.iter().any(|agent| {
             self.selected_agent_id.as_deref() == Some(agent.id.as_str())
                 && (agent.added || agent.managed_install.managed)
@@ -3166,6 +3296,27 @@ impl ManagementCenter {
                 .find(|agent| agent.added)
                 .map(|agent| agent.id.as_str().to_string());
         }
+        if previous_agent_id != self.selected_agent_id {
+            self.selected_provider_profile_id = None;
+            self.selected_acp_profile_id = None;
+            self.acp_config_draft = None;
+            self.native_export_preview = None;
+        }
+    }
+
+    fn apply_snapshot(&mut self, snapshot: ManagementSnapshot, cx: &mut Context<Self>) {
+        self.details_ready = true;
+        self.snapshot = snapshot.center;
+        self.provider_profiles = snapshot.provider_profiles;
+        self.provider_display_order = snapshot.provider_display_order;
+        self.provider_display_order_drag_state = None;
+        self.provider_display_order_drop_target = None;
+        self.model_provider_agent_ids = snapshot.model_provider_agent_ids;
+        self.acp_configs = snapshot.acp_configs;
+        self.native_import_preview = snapshot.native_import_preview;
+        self.agent_profile_states = snapshot.agent_profile_states;
+        self.projection_states = snapshot.projection_states;
+        self.reconcile_selected_agent();
         let selected_agent_id = self.selected_agent_id.as_deref();
         let selected_profile_is_valid =
             self.selected_provider_profile_id
@@ -7228,11 +7379,18 @@ impl ManagementCenter {
         agents.sort_by_cached_key(management_agent_sort_key);
         let mut agent_rows = v_flex().w_full().gap(px(6.0));
         if agents.is_empty() {
-            agent_rows = agent_rows.child(compact_empty_state(
-                management_no_matching_agents_title(),
-                management_no_matching_agents_description(),
-                cx,
-            ));
+            let (title, description) = if self.loading && self.snapshot.agents.is_empty() {
+                (
+                    management_loading_agents_title(),
+                    management_loading_agents_description(),
+                )
+            } else {
+                (
+                    management_no_matching_agents_title(),
+                    management_no_matching_agents_description(),
+                )
+            };
+            agent_rows = agent_rows.child(compact_empty_state(title, description, cx));
         }
         for agent in agents {
             let id = agent.id.as_str().to_string();
@@ -9570,6 +9728,13 @@ impl ManagementCenter {
 
     fn render_providers(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let copy = management_copy();
+        if self.loading && !self.details_ready {
+            return detail_empty_state(
+                management_loading_agents_title(),
+                management_loading_agents_description(),
+                cx,
+            );
+        }
         let selected_agent = self
             .snapshot
             .agents
@@ -15315,6 +15480,18 @@ fn management_add_label() -> &'static str {
     management_locale_text("Add", "添加", "新增")
 }
 
+fn management_loading_agents_title() -> &'static str {
+    management_locale_text("Loading Agents", "正在加载 Agent", "正在載入 Agent")
+}
+
+fn management_loading_agents_description() -> &'static str {
+    management_locale_text(
+        "Loading the installed Agent catalog.",
+        "正在加载已安装的 Agent 列表。",
+        "正在載入已安裝的 Agent 清單。",
+    )
+}
+
 fn management_no_matching_agents_title() -> &'static str {
     management_locale_text("No matching Agents", "没有匹配的 Agent", "沒有符合的 Agent")
 }
@@ -15736,15 +15913,27 @@ fn management_no_skill_selection_description() -> &'static str {
     )
 }
 
+fn load_agent_snapshot(runtime: Arc<DesktopRuntime>) -> VibexResult<Vec<AgentSnapshotEntry>> {
+    let provider = runtime.management().providers().management();
+    Ok(provider
+        .list_agents(AgentListRequest {
+            include_disabled: true,
+        })?
+        .agents)
+}
+
 async fn load_snapshot(
     runtime: Arc<DesktopRuntime>,
     default_scope: vibex_core::ProviderProfileDefaultScope,
+    refresh_agent_versions: bool,
 ) -> VibexResult<ManagementSnapshot> {
     let management: ManagementHandle = runtime.management();
     let provider = management.providers().management();
     // Config Center refresh is the explicit, bounded slow path for installed
     // versioned Agent CLIs. Ordinary Agent catalog reads remain process-free.
-    provider.refresh_detected_agent_versions()?;
+    if refresh_agent_versions {
+        provider.refresh_detected_agent_versions()?;
+    }
     let agents = provider.list_agents(AgentListRequest {
         include_disabled: true,
     })?;
@@ -16975,10 +17164,10 @@ mod tests {
         assert_eq!(managed_install.matches(".probe_agent(").count(), 1);
         assert!(managed_install.contains(".refresh_auth_methods("));
         let selection = source
-            .split_once("fn apply_snapshot(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn export_diagnostics("))
+            .split_once("    fn reconcile_selected_agent(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn apply_snapshot("))
             .map(|(body, _)| body)
-            .expect("management snapshot application should remain inspectable");
+            .expect("selected Agent reconciliation should remain inspectable");
         assert!(selection.contains("agent.managed_install.managed"));
         assert_eq!(discover.matches(".probe_agent(").count(), 1);
         assert_eq!(detect_after_install.matches(".probe_agent(").count(), 1);
@@ -17597,6 +17786,22 @@ mod tests {
             version_refresh < agent_list,
             "versioned Agent identity must be refreshed before capability state is loaded"
         );
+    }
+
+    #[test]
+    fn config_center_refresh_applies_fast_state_before_authoritative_probe() {
+        let source = include_str!("management.rs");
+        let refresh = source
+            .split_once("    fn start_agent_refresh(")
+            .and_then(|(_, tail)| tail.split_once("    fn apply_snapshot("))
+            .map(|(body, _)| body)
+            .expect("Config Center refresh implementation should remain inspectable");
+
+        assert!(refresh.contains("load_agent_snapshot(runtime)"));
+        assert!(refresh.contains("this.apply_agent_snapshot(agents, cx)"));
+        assert!(refresh.contains("this.start_fast_snapshot(cx)"));
+        assert!(source.contains("load_snapshot(runtime, default_scope, false)"));
+        assert!(source.contains("load_snapshot(runtime, default_scope, true)"));
     }
 
     #[test]
