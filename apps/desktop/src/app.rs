@@ -23184,6 +23184,9 @@ impl VibexWorkbench {
                                         .truncate()
                                         .text_sm()
                                         .when(selected, |this| this.font_semibold())
+                                        .group_hover(&hover_group, |style| {
+                                            style.text_color(cx.theme().sidebar_foreground)
+                                        })
                                         .child(session.title.clone()),
                                 ),
                             ),
@@ -48814,6 +48817,8 @@ mod tests {
         assert!(sidebar_session.contains(".top(px(8.0))"));
         assert!(sidebar_session.contains("cx.theme().sidebar_foreground.opacity(0.56)"));
         assert!(sidebar_session.contains(".when(selected, |this| this.font_semibold())"));
+        assert!(sidebar_session.contains(".group_hover(&hover_group, |style| {"));
+        assert!(sidebar_session.contains("style.text_color(cx.theme().sidebar_foreground)"));
         assert!(!sidebar_session.contains("selected, self.agent_turn_pending"));
         assert!(!sidebar_session.contains("let branch_path ="));
         assert!(!sidebar_session.contains(".when_some(branch_path"));
