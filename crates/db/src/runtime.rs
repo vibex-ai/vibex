@@ -4170,6 +4170,115 @@ impl MessageSubmissionRepository {
         Ok(())
     }
 
+    /// Rewrites a queued submission to the runtime selection resolved by the
+    /// adapter. Runtime adapters may normalize a requested control (for
+    /// example, Pi maps unsupported reasoning to `off`); the durable record
+    /// and its payload must converge on that same selection before dispatch.
+    pub fn normalize_runtime_selection(
+        conn: &mut Connection,
+        submission_id: &MessageSubmissionId,
+        expected: &SessionRuntimeSelection,
+        normalized: &SessionRuntimeSelection,
+    ) -> VibexResult<()> {
+        if expected == normalized {
+            return Ok(());
+        }
+
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "message_submission_runtime_normalization_transaction_failed",
+                "failed to start message submission runtime normalization",
+            ))?;
+        let current = Self::get(&tx, submission_id)?.ok_or_else(|| {
+            VibexError::storage(
+                "message_submission_missing",
+                "durable message submission was not found",
+            )
+        })?;
+        if current.status != MessageSubmissionStatus::AwaitingRuntime {
+            return Err(cas_conflict(
+                "message_submission_runtime_normalization_conflict",
+                "message submission is no longer awaiting runtime normalization",
+            ));
+        }
+        if current.desired_runtime_selection != *expected {
+            if current.desired_runtime_selection == *normalized {
+                tx.commit().map_err(storage_err(
+                    "message_submission_runtime_normalization_transaction_failed",
+                    "failed to finish message submission runtime normalization",
+                ))?;
+                return Ok(());
+            }
+            return Err(cas_conflict(
+                "message_submission_runtime_normalization_conflict",
+                "message submission runtime changed before normalization",
+            ));
+        }
+
+        let payload = Self::get_payload_conn(&tx, submission_id)?.ok_or_else(|| {
+            VibexError::storage(
+                "message_submission_payload_missing",
+                "durable message submission payload was not found",
+            )
+        })?;
+        if payload.request.desired_runtime != *expected {
+            return Err(VibexError::storage(
+                "message_submission_runtime_normalization_payload_mismatch",
+                "durable message submission payload does not match its runtime selection",
+            ));
+        }
+
+        let mut request = payload.request;
+        request.desired_runtime = normalized.clone();
+        request.reasoning_effort = normalized.reasoning_effort.clone();
+        let now = unix_timestamp_ms();
+        let changed = tx
+            .execute(
+                "UPDATE agent_message_submissions
+                 SET desired_runtime_selection_json = ?2, updated_at_ms = ?3
+                 WHERE submission_id = ?1 AND status = ?4",
+                params![
+                    submission_id.as_str(),
+                    json_to_db(normalized)?,
+                    now,
+                    enum_to_db(&MessageSubmissionStatus::AwaitingRuntime)?,
+                ],
+            )
+            .map_err(storage_err(
+                "message_submission_runtime_normalization_failed",
+                "failed to normalize message submission runtime",
+            ))?;
+        if changed != 1 {
+            return Err(cas_conflict(
+                "message_submission_runtime_normalization_conflict",
+                "message submission changed before runtime normalization",
+            ));
+        }
+        let changed = tx
+            .execute(
+                "UPDATE agent_message_submission_payloads
+                 SET payload_json = ?2, updated_at_ms = ?3
+                 WHERE submission_id = ?1",
+                params![submission_id.as_str(), json_to_db(&request)?, now],
+            )
+            .map_err(storage_err(
+                "message_submission_runtime_normalization_payload_update_failed",
+                "failed to normalize message submission payload",
+            ))?;
+        if changed != 1 {
+            return Err(VibexError::storage(
+                "message_submission_payload_update_failed",
+                "failed to update message submission payload",
+            ));
+        }
+        tx.commit().map_err(storage_err(
+            "message_submission_runtime_normalization_transaction_failed",
+            "failed to commit message submission runtime normalization",
+        ))?;
+        Ok(())
+    }
+
     pub fn mark_about_to_prompt(
         conn: &Connection,
         submission_id: &MessageSubmissionId,

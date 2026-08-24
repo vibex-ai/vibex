@@ -219,6 +219,7 @@ const ACP_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 const ACP_PERMISSION_CANCELLED_RESPONSE: &str = "cancelled";
 const OPENCODE_AGENT_ID: &str = "opencode";
 const GROK_AGENT_ID: &str = "grok";
+const PI_AGENT_ID: &str = "pi";
 const OPENCODE_DEFAULT_MODEL: &str = "opencode-default";
 const OPENCODE_INLINE_CONFIG_ENV: &str = "OPENCODE_CONFIG_CONTENT";
 const OPENCODE_PROVIDER_API_KEY_ENV: &str = "VIBEX_OPENCODE_PROVIDER_API_KEY";
@@ -6619,6 +6620,25 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
             .map(validate_model_value)
             .transpose()
             .map_err(runtime_configuration_unavailable)?;
+        let current_config = self
+            .client
+            .current_attachment(session_id)
+            .filter(|attachment| {
+                let process = attachment.payload().process();
+                process.agent_id == effective_selection.agent_id
+                    && process.auth_source == effective_selection.auth_source
+            })
+            .map(|attachment| attachment.payload().runtime_config_state());
+        let pi_reasoning_supported = pi_model_reasoning_supported(
+            &self.client.config_service,
+            &effective_selection,
+            model_id.as_deref(),
+        );
+        normalize_pi_runtime_selection(
+            &mut effective_selection,
+            current_config.as_ref(),
+            pi_reasoning_supported,
+        );
         let models = match selection.provider_profile_id() {
             Some(provider_profile_id) => Some(
                 self.manager
@@ -6681,7 +6701,8 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
                 return Err(runtime_configuration_unavailable("model_unavailable"));
             }
         }
-        let session_probe = if (selection.reasoning_effort.is_some() || selection.mode_id.is_some())
+        let session_probe = if (effective_selection.reasoning_effort.is_some()
+            || effective_selection.mode_id.is_some())
             && let Some(provider_profile_id) = selection.provider_profile_id()
         {
             let probe = if context.agent_id.as_str() == CLAUDE_AGENT_ID
@@ -6703,7 +6724,7 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
         } else {
             None
         };
-        if let Some(effort) = selection.reasoning_effort.as_deref() {
+        if let Some(effort) = effective_selection.reasoning_effort.as_deref() {
             let effort =
                 validate_effort_value(effort).map_err(runtime_configuration_unavailable)?;
             // Discovery evidence first; the registry acceptance set keeps
@@ -6753,7 +6774,7 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
                 ));
             }
         }
-        if let Some(mode) = selection.mode_id.as_deref() {
+        if let Some(mode) = effective_selection.mode_id.as_deref() {
             let mut mode =
                 validate_effort_value(mode).map_err(runtime_configuration_unavailable)?;
             let advertised_modes = session_probe
@@ -7558,6 +7579,71 @@ fn runtime_configuration_unavailable(cause_code: &str) -> VibexError {
         "causeCode",
         safe_runtime_configuration_cause_code(cause_code),
     )
+}
+
+fn pi_model_reasoning_supported(
+    config_service: &ProviderConfigService,
+    selection: &SessionRuntimeSelection,
+    model_id: Option<&str>,
+) -> bool {
+    if selection.agent_id.as_str() != PI_AGENT_ID || selection.provider_profile_id().is_none() {
+        return true;
+    }
+    let Some(model_id) = model_id else {
+        return false;
+    };
+    config_service
+        .get_profile(selection.provider_profile_id().expect("checked above"))
+        .ok()
+        .flatten()
+        .and_then(|profile| {
+            profile
+                .configured_models
+                .into_iter()
+                .find(|model| model.id == model_id)
+        })
+        .and_then(|model| model.capabilities.reasoning)
+        .unwrap_or(false)
+}
+
+fn normalize_pi_runtime_selection(
+    selection: &mut SessionRuntimeSelection,
+    current: Option<&SessionRuntimeConfigState>,
+    reasoning_supported: bool,
+) {
+    if selection.agent_id.as_str() != PI_AGENT_ID {
+        return;
+    }
+    if !reasoning_supported {
+        if selection.reasoning_effort.is_some() || selection.mode_id.is_some() {
+            selection.reasoning_effort = Some("off".to_string());
+            selection.mode_id = Some("off".to_string());
+        }
+        return;
+    }
+    let next = match (
+        selection.reasoning_effort.as_deref(),
+        selection.mode_id.as_deref(),
+    ) {
+        (None, None) => return,
+        (Some(value), None) | (None, Some(value)) => value.to_string(),
+        (Some(reasoning), Some(mode)) if reasoning == mode => reasoning.to_string(),
+        (Some(reasoning), Some(mode)) => {
+            let current = current.and_then(|state| {
+                state
+                    .effective_mode
+                    .as_deref()
+                    .or(state.effective_reasoning_effort.as_deref())
+            });
+            match current {
+                Some(value) if value == mode => reasoning.to_string(),
+                Some(value) if value == reasoning => mode.to_string(),
+                _ => mode.to_string(),
+            }
+        }
+    };
+    selection.reasoning_effort = Some(next.clone());
+    selection.mode_id = Some(next);
 }
 
 fn normalize_claude_model_mode(
@@ -12619,7 +12705,7 @@ impl AcpRuntimeClient {
         generation: i64,
         discovery: &ProviderSessionConfigState,
     ) -> SessionConfigPlanner {
-        let aliases = self
+        let mut aliases = self
             .compatibility_registry
             .for_agent(&process.agent_id)
             .and_then(|descriptor| {
@@ -12630,6 +12716,12 @@ impl AcpRuntimeClient {
             })
             .cloned()
             .unwrap_or_default();
+        if process.agent_id.as_str() == PI_AGENT_ID {
+            aliases
+                .entry(crate::session_config::CANONICAL_REASONING_EFFORT.to_string())
+                .or_default()
+                .push("thought_level".to_string());
+        }
         let mut operations = process.operation_evidence(generation);
         if !discovery.options.is_empty() {
             operations
@@ -22714,6 +22806,59 @@ for line in sys.stdin:
             normalize_claude_model_mode(&claude, true, false, None, "auto"),
             None
         );
+    }
+
+    #[test]
+    fn pi_shared_thinking_selection_follows_the_changed_dimension() {
+        let current = SessionRuntimeConfigState {
+            effective_reasoning_effort: Some("high".to_string()),
+            effective_mode: Some("high".to_string()),
+            ..Default::default()
+        };
+
+        let mut effort_change = SessionRuntimeSelection {
+            reasoning_effort: Some("low".to_string()),
+            mode_id: Some("high".to_string()),
+            ..SessionRuntimeSelection::provider(
+                AgentId::parse(PI_AGENT_ID).unwrap(),
+                ProviderProfileId::new(),
+                "gpt-5.6-sol",
+            )
+        };
+        normalize_pi_runtime_selection(&mut effort_change, Some(&current), true);
+        assert_eq!(effort_change.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(effort_change.mode_id.as_deref(), Some("low"));
+
+        let mut mode_change = SessionRuntimeSelection {
+            reasoning_effort: Some("high".to_string()),
+            mode_id: Some("low".to_string()),
+            ..effort_change.clone()
+        };
+        normalize_pi_runtime_selection(&mut mode_change, Some(&current), true);
+        assert_eq!(mode_change.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(mode_change.mode_id.as_deref(), Some("low"));
+
+        let mut unrelated = SessionRuntimeSelection {
+            reasoning_effort: Some("low".to_string()),
+            mode_id: Some("high".to_string()),
+            ..SessionRuntimeSelection::provider(
+                AgentId::parse("codex").unwrap(),
+                ProviderProfileId::new(),
+                "gpt-5",
+            )
+        };
+        normalize_pi_runtime_selection(&mut unrelated, Some(&current), true);
+        assert_eq!(unrelated.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(unrelated.mode_id.as_deref(), Some("high"));
+
+        let mut unsupported = SessionRuntimeSelection {
+            reasoning_effort: Some("high".to_string()),
+            mode_id: Some("high".to_string()),
+            ..effort_change
+        };
+        normalize_pi_runtime_selection(&mut unsupported, Some(&current), false);
+        assert_eq!(unsupported.reasoning_effort.as_deref(), Some("off"));
+        assert_eq!(unsupported.mode_id.as_deref(), Some("off"));
     }
 
     fn configure_mock_default_agent_runtime(fixture: &MockAcpFixture, agent_id: &AgentId) {

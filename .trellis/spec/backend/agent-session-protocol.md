@@ -3949,6 +3949,14 @@ agent_message_submission_payloads(
   selection before classifying the submission: advance to Ready when the fresh state
   is Ready/effective at the requested runtime, and fail only when that fresh state
   still diverges.
+- Runtime resolution may canonicalize an explicit control before the Ready gate
+  (for example, Pi maps reasoning/mode values to `off` when the selected model
+  does not advertise reasoning). When the resolved selection differs, the message
+  worker must update both `agent_message_submissions.desired_runtime_selection_json`
+  and the isolated payload's `desiredRuntime`/`reasoningEffort` in one immediate
+  transaction, then re-read and gate against that canonical selection. Leaving the
+  original request in durable storage can strand the worker in `AwaitingRuntime`
+  even though the session is already Ready.
 - `ReadyToDispatch -> AboutToPrompt` is the durable no-replay boundary. The
   manager normally creates the user Timeline item only after that CAS,
   immediately before provider admission. Success stores the user item and
@@ -4003,6 +4011,7 @@ agent_message_submission_payloads(
 | Queued payload/session mismatch or cancellation CAS inconsistency | Roll back every Timeline/status write and return `message_submission_cancel_*`; never publish a partial user history. |
 | Old `FailedUsingPrevious` state retries the already effective selection and exact current runtime materializes successfully | CAS the selection to `Ready`, clear only the session projection error, and retain the failed switch journal. |
 | Linked switch commits between selection and switch reads | Reread selection; dispatch once if it converged, otherwise `message_submission_runtime_changed_after_commit`. |
+| Adapter resolves a queued selection to a canonical runtime | Atomically rewrite the submission and payload to the resolved selection before the Ready/effective gate; dispatch once using the canonical Effort/Mode. |
 | Current binding missing, stale, non-current, or config/generation mismatch | `message_submission_runtime_binding_*`; no provider call. |
 | Current committed ACP attachment missing or mismatched | `turn_execution_identity_mismatch`; no `session/prompt`. |
 | Installed ACP coordinator weak reference cannot upgrade | `message_submission_coordinator_unavailable`; no direct fallback or user Timeline item. |
@@ -4022,9 +4031,15 @@ agent_message_submission_payloads(
 - Base: a Claude or Codex ACP session with no explicit Effort/Mode uses the
   Adapter-converged defaults and still dispatches through the exact current
   binding once.
+- Good: a Pi Provider Profile without reasoning support receives a queued
+  `high/high` request, converges it to `off/off`, rewrites the durable payload,
+  and completes one provider turn.
 - Bad: call `ensure_attachment` from durable prepare using the old request
   binding, auto-fail over to another Profile, or replace durable current
   authority with an adapter-local binding.
+- Bad: leave an unsupported Pi `high/high` request in the submission while the
+  session selection is `off/off`; the worker never satisfies `effective ==
+  desired` and remains queued indefinitely.
 - Bad: classify an unknown post-prompt error as Failed and resend on startup.
 - Bad: cancel an initialization-time submission without first materializing its
   durable payload, leaving the selected session with an empty Timeline.
@@ -4038,7 +4053,8 @@ agent_message_submission_payloads(
   dispatch-result transaction, and range load.
 - Coordinator tests cover concurrent same-key submit, caller drop, per-session
   order, cross-session parallelism, desired gate, terminal switch outcomes,
-  committed-switch selection-read races, AboutToPrompt ambiguity, and result-fenced
+  committed-switch selection-read races, adapter runtime canonicalization with
+  an atomic submission/payload rewrite, AboutToPrompt ambiguity, and result-fenced
   recovery.
 - Manager/ACP tests cover dropped-coordinator fail-closed, no durable
   failover/history bridge/binding update, prepare/send identity mismatch, and
@@ -4063,6 +4079,10 @@ Composer switch -> await switch -> manager reads legacy session binding
   -> ensure/restore attachment -> prompt -> retry unknown failures
 ```
 
+```text
+persist requested Pi high/high -> compare against Ready off/off -> keep polling
+```
+
 #### Correct
 
 ```text
@@ -4078,6 +4098,9 @@ initialization-time interrupt
   -> immediate transaction appends queued user payloads in submission order
   -> records each one-item result range and marks the submissions Cancelled
   -> commit -> publish user Timeline items -> no provider prompt
+
+resolve requested Pi high/high -> transactionally persist off/off in submission
+and payload -> compare canonical selection -> dispatch once
 ```
 
 ## Scenario: Hidden Context Bridge Injection And Success-Only Cursor Commit

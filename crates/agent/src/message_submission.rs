@@ -67,6 +67,12 @@ pub trait MessageRuntimeSelection: Send + Sync {
         session_id: &VibexSessionId,
     ) -> VibexResult<AgentSessionRuntimeSelectionState>;
 
+    async fn resolve_desired_runtime(
+        &self,
+        session_id: &VibexSessionId,
+        desired: &SessionRuntimeSelection,
+    ) -> VibexResult<SessionRuntimeSelection>;
+
     async fn set_desired_runtime(
         &self,
         request: SetDesiredAgentSessionRuntimeRequest,
@@ -87,6 +93,14 @@ impl MessageRuntimeSelection for RuntimeSelectionService {
         session_id: &VibexSessionId,
     ) -> VibexResult<AgentSessionRuntimeSelectionState> {
         RuntimeSelectionService::get_selection_state(self, session_id)
+    }
+
+    async fn resolve_desired_runtime(
+        &self,
+        session_id: &VibexSessionId,
+        desired: &SessionRuntimeSelection,
+    ) -> VibexResult<SessionRuntimeSelection> {
+        RuntimeSelectionService::resolve_desired_runtime(self, session_id, desired).await
     }
 
     async fn set_desired_runtime(
@@ -482,6 +496,28 @@ impl MessageSubmissionCoordinator {
             if current.status != MessageSubmissionStatus::AwaitingRuntime {
                 return Ok(());
             }
+            let state = self
+                .runtime_selection
+                .get_selection_state(&current.session_id)?;
+            if state.desired != current.desired_runtime_selection {
+                let normalized = self
+                    .runtime_selection
+                    .resolve_desired_runtime(
+                        &current.session_id,
+                        &current.desired_runtime_selection,
+                    )
+                    .await?;
+                if normalized != current.desired_runtime_selection {
+                    let mut conn = self.open_connection()?;
+                    MessageSubmissionRepository::normalize_runtime_selection(
+                        &mut conn,
+                        &current.submission_id,
+                        &current.desired_runtime_selection,
+                        &normalized,
+                    )?;
+                    continue;
+                }
+            }
             if current.required_runtime_policy == RuntimeSwitchPolicy::ForceFreshSession {
                 if let Some(switch_id) = current.required_switch_id.as_ref() {
                     if self.handle_terminal_switch(&current, switch_id)? {
@@ -498,6 +534,18 @@ impl MessageSubmissionCoordinator {
                         .await;
                     match result {
                         Ok(response) => {
+                            let next = self
+                                .runtime_selection
+                                .get_selection_state(&current.session_id)?;
+                            if next.desired != current.desired_runtime_selection {
+                                let mut conn = self.open_connection()?;
+                                MessageSubmissionRepository::normalize_runtime_selection(
+                                    &mut conn,
+                                    &current.submission_id,
+                                    &current.desired_runtime_selection,
+                                    &next.desired,
+                                )?;
+                            }
                             let conn = self.open_connection()?;
                             MessageSubmissionRepository::associate_required_switch(
                                 &conn,
@@ -512,9 +560,6 @@ impl MessageSubmissionCoordinator {
                 sleep(self.config.poll_interval).await;
                 continue;
             }
-            let state = self
-                .runtime_selection
-                .get_selection_state(&current.session_id)?;
             if state.effective == current.desired_runtime_selection
                 && state.status == SessionRuntimeSelectionStatus::Ready
             {
@@ -582,6 +627,15 @@ impl MessageSubmissionCoordinator {
                     .await;
                 match result {
                     Ok(next) => {
+                        if next.desired != current.desired_runtime_selection {
+                            let mut conn = self.open_connection()?;
+                            MessageSubmissionRepository::normalize_runtime_selection(
+                                &mut conn,
+                                &current.submission_id,
+                                &current.desired_runtime_selection,
+                                &next.desired,
+                            )?;
+                        }
                         if let Some(switch_id) = next.pending_switch_id.as_ref() {
                             let conn = self.open_connection()?;
                             MessageSubmissionRepository::associate_required_switch(
@@ -1164,6 +1218,7 @@ mod tests {
         scripted_reads: Mutex<HashMap<VibexSessionId, VecDeque<AgentSessionRuntimeSelectionState>>>,
         set_calls: AtomicUsize,
         fresh_calls: AtomicUsize,
+        normalized_desired: Mutex<Option<SessionRuntimeSelection>>,
     }
 
     #[async_trait]
@@ -1191,6 +1246,19 @@ mod tests {
                 })
         }
 
+        async fn resolve_desired_runtime(
+            &self,
+            _session_id: &VibexSessionId,
+            desired: &SessionRuntimeSelection,
+        ) -> VibexResult<SessionRuntimeSelection> {
+            Ok(self
+                .normalized_desired
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| desired.clone()))
+        }
+
         async fn set_desired_runtime(
             &self,
             request: SetDesiredAgentSessionRuntimeRequest,
@@ -1200,8 +1268,14 @@ mod tests {
             let state = states.get_mut(&request.session_id).ok_or_else(|| {
                 VibexError::validation("session_not_found", "Agent session was not found")
             })?;
-            state.desired = request.desired.clone();
-            state.effective = request.desired;
+            let resolved = self
+                .normalized_desired
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or(request.desired);
+            state.desired = resolved.clone();
+            state.effective = resolved;
             state.status = SessionRuntimeSelectionStatus::Ready;
             state.selection_revision += 1;
             state.pending_switch_id = None;
@@ -1375,6 +1449,22 @@ mod tests {
         )
     }
 
+    fn pi_selection(
+        model: &str,
+        reasoning_effort: Option<&str>,
+        mode_id: Option<&str>,
+    ) -> SessionRuntimeSelection {
+        SessionRuntimeSelection {
+            reasoning_effort: reasoning_effort.map(str::to_string),
+            mode_id: mode_id.map(str::to_string),
+            ..SessionRuntimeSelection::provider(
+                AgentId::parse("pi").unwrap(),
+                ProviderProfileId::parse("provider_pi_test").unwrap(),
+                model,
+            )
+        }
+    }
+
     fn seed_session(
         db_path: &Path,
         label: &str,
@@ -1440,6 +1530,7 @@ mod tests {
             scripted_reads: Mutex::new(HashMap::new()),
             set_calls: AtomicUsize::new(0),
             fresh_calls: AtomicUsize::new(0),
+            normalized_desired: Mutex::new(None),
         });
         let dispatcher = Arc::new(MockDispatcher {
             db_path: db_path.to_path_buf(),
@@ -1471,13 +1562,14 @@ mod tests {
         key: &str,
         desired_runtime: SessionRuntimeSelection,
     ) -> SendAgentMessageRequest {
+        let reasoning_effort = desired_runtime.reasoning_effort.clone();
         SendAgentMessageRequest {
             session_id: session_id.clone(),
             message_idempotency_key: key.to_string(),
             desired_runtime,
             text: "durable message".to_string(),
             attachments: Vec::new(),
-            reasoning_effort: None,
+            reasoning_effort,
             correlation_id: None,
         }
     }
@@ -1791,6 +1883,44 @@ mod tests {
             .unwrap();
         assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 1);
         assert_eq!(items.len(), 2);
+        cleanup_db(db_path);
+    }
+
+    #[tokio::test]
+    async fn normalized_runtime_selection_updates_submission_before_dispatch() {
+        let db_path = temp_db_path("normalized-runtime");
+        let initial = pi_selection("old-model", Some("off"), Some("off"));
+        let normalized = pi_selection("gpt-5.6-sol", Some("off"), Some("off"));
+        let requested = pi_selection("gpt-5.6-sol", Some("high"), Some("high"));
+        let session_id = seed_session(&db_path, "normalized-runtime", initial.clone());
+        let (coordinator, runtime, dispatcher) = harness(&db_path, &session_id, initial, false);
+        *runtime.normalized_desired.lock().unwrap() = Some(normalized.clone());
+
+        let items = tokio::time::timeout(
+            Duration::from_secs(2),
+            coordinator.submit(request(&session_id, "normalized-runtime", requested)),
+        )
+        .await
+        .expect("normalized runtime submission should not wait forever")
+        .unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(runtime.set_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 1);
+
+        let conn = open_database(&db_path).unwrap();
+        let record =
+            MessageSubmissionRepository::get_by_key(&conn, &session_id, "normalized-runtime")
+                .unwrap()
+                .unwrap();
+        assert_eq!(record.desired_runtime_selection, normalized);
+        let payload = MessageSubmissionRepository::get_payload(&conn, &record.submission_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            payload.request.desired_runtime,
+            record.desired_runtime_selection
+        );
+        assert_eq!(payload.request.reasoning_effort.as_deref(), Some("off"));
         cleanup_db(db_path);
     }
 

@@ -367,6 +367,19 @@ impl RuntimeSelectionService {
         Ok(event.state)
     }
 
+    pub async fn resolve_desired_runtime(
+        &self,
+        session_id: &VibexSessionId,
+        desired: &SessionRuntimeSelection,
+    ) -> VibexResult<SessionRuntimeSelection> {
+        Ok(self
+            .inner
+            .resolver
+            .resolve(session_id, desired, None)
+            .await?
+            .selection)
+    }
+
     pub async fn switch_runtime(
         &self,
         request: SwitchAgentSessionRuntimeRequest,

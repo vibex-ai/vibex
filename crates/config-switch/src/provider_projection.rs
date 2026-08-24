@@ -2052,6 +2052,31 @@ fn projected_runtime_model_id(
             opencode_model_key(&provider_id, &model.agent_model_id)
         );
     }
+    if matches!(
+        descriptor.provider_control,
+        AgentProviderControl::ManagedConfigOverlay {
+            strategy: ConfigOverlayStrategy::PiModelsJson
+        }
+    ) || matches!(
+        descriptor.model_control,
+        AgentModelControl::ManagedConfigOverlay {
+            strategy: ConfigOverlayStrategy::PiModelsJson
+        }
+    ) {
+        let provider_id = sanitize_provider_id(
+            provider
+                .vendor_hint
+                .as_deref()
+                .unwrap_or_else(|| provider.id.as_str()),
+        );
+        return format!(
+            "{provider_id}/{}",
+            model
+                .agent_model_id
+                .strip_prefix(&format!("{provider_id}/"))
+                .unwrap_or(&model.agent_model_id)
+        );
+    }
     model.agent_model_id.clone()
 }
 
@@ -2466,7 +2491,7 @@ fn pi_overlay(
         serde_json::json!([{
             "id": model_id,
             "name": model_id,
-            "reasoning": false,
+            "reasoning": pi_model_reasoning(provider, model),
             "input": ["text"],
             "contextWindow": 128000,
             "maxTokens": 16384,
@@ -2481,6 +2506,20 @@ fn pi_overlay(
     serialized_json(serde_json::json!({
         "providers": {provider_id: entry},
     }))
+}
+
+fn pi_model_reasoning(
+    provider: &ModelProviderProfile,
+    model: Option<&AgentConfiguredModelBinding>,
+) -> bool {
+    model
+        .and_then(|model| {
+            provider.configured_models.iter().find(|configured| {
+                configured.id == model.provider_model_id || configured.id == model.agent_model_id
+            })
+        })
+        .and_then(|model| model.capabilities.reasoning)
+        .unwrap_or(false)
 }
 
 fn qwen_code_overlay(
@@ -3902,7 +3941,12 @@ mod tests {
             .unwrap_or_else(|error| panic!("{} projection failed: {error:?}", expected.agent_id));
             assert_eq!(plan.secret_env.len(), 1, "{}", expected.agent_id);
             assert_eq!(plan.secret_env[0].key, expected.secret_env_key);
-            assert_eq!(plan.effective_model.as_deref(), Some("agent-model"));
+            let expected_model = if expected.agent_id == "pi" {
+                "matrix-provider/agent-model"
+            } else {
+                "agent-model"
+            };
+            assert_eq!(plan.effective_model.as_deref(), Some(expected_model));
             assert_eq!(
                 plan.overlay_files.len(),
                 if expected.overlay_path.is_some() {
@@ -4291,6 +4335,53 @@ mod tests {
             projected_runtime_model_id(&provider, &descriptor, &binding.configured_models[0]),
             "fake/model-a"
         );
+    }
+
+    #[test]
+    fn pi_projection_namespaces_models_by_overlay_provider() {
+        let (provider, _, binding, descriptor) = fixture(ConfigOverlayStrategy::PiModelsJson);
+
+        assert_eq!(
+            projected_runtime_model_id(&provider, &descriptor, &binding.configured_models[0]),
+            "fake/model-a"
+        );
+
+        let mut prequalified = binding.configured_models[0].clone();
+        prequalified.agent_model_id = "fake/model-a".to_string();
+        assert_eq!(
+            projected_runtime_model_id(&provider, &descriptor, &prequalified),
+            "fake/model-a"
+        );
+    }
+
+    #[test]
+    fn pi_overlay_projects_declared_reasoning_capability() {
+        let (mut provider, _, binding, _) = fixture(ConfigOverlayStrategy::PiModelsJson);
+        let endpoint = provider.endpoints.first().cloned().unwrap();
+
+        let content = pi_overlay(
+            &provider,
+            Some(&endpoint),
+            binding.configured_models.first(),
+            "PI_API_KEY",
+        )
+        .unwrap();
+        let overlay: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            overlay["providers"]["fake"]["models"][0]["reasoning"],
+            false
+        );
+
+        provider.configured_models[0].capabilities.reasoning = Some(true);
+        let content = pi_overlay(
+            &provider,
+            Some(&endpoint),
+            binding.configured_models.first(),
+            "PI_API_KEY",
+        )
+        .unwrap();
+        let overlay: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(overlay["providers"]["fake"]["models"][0]["reasoning"], true);
     }
 
     #[test]
