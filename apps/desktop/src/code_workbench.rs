@@ -8668,6 +8668,7 @@ impl CodeRightRail {
                     .min_w_0()
                     .min_h_0()
                     .relative()
+                    .id("file-search-scroll")
                     .track_scroll(&search_scroll)
                     .overflow_scroll()
                     .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
