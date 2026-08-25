@@ -7617,8 +7617,8 @@ fn normalize_pi_runtime_selection(
     if !reasoning_supported {
         if selection.reasoning_effort.is_some() || selection.mode_id.is_some() {
             selection.reasoning_effort = Some("off".to_string());
-            selection.mode_id = Some("off".to_string());
         }
+        selection.mode_id = None;
         return;
     }
     let next = match (
@@ -7631,19 +7631,19 @@ fn normalize_pi_runtime_selection(
         (Some(reasoning), Some(mode)) => {
             let current = current.and_then(|state| {
                 state
-                    .effective_mode
+                    .effective_reasoning_effort
                     .as_deref()
-                    .or(state.effective_reasoning_effort.as_deref())
+                    .or(state.effective_mode.as_deref())
             });
             match current {
                 Some(value) if value == mode => reasoning.to_string(),
                 Some(value) if value == reasoning => mode.to_string(),
-                _ => mode.to_string(),
+                _ => reasoning.to_string(),
             }
         }
     };
-    selection.reasoning_effort = Some(next.clone());
-    selection.mode_id = Some(next);
+    selection.reasoning_effort = Some(next);
+    selection.mode_id = None;
 }
 
 fn normalize_claude_model_mode(
@@ -11064,6 +11064,7 @@ impl AcpRuntimeClient {
         let mut state = AcpAttachmentShared::default();
         apply_session_state_to_attachment(
             &mut state,
+            &process.agent_id,
             process.auth_source.provider_profile_id(),
             &native_session_id,
             &result,
@@ -11116,6 +11117,7 @@ impl AcpRuntimeClient {
         let mut state = AcpAttachmentShared::default();
         apply_session_state_to_attachment(
             &mut state,
+            &process.agent_id,
             process.auth_source.provider_profile_id(),
             native_session_id,
             &result,
@@ -11168,6 +11170,7 @@ impl AcpRuntimeClient {
         let mut state = AcpAttachmentShared::default();
         apply_session_state_to_attachment(
             &mut state,
+            &process.agent_id,
             process.auth_source.provider_profile_id(),
             native_session_id,
             &result,
@@ -11251,12 +11254,16 @@ impl AcpRuntimeClient {
             }
             _ => binding.auth_source_revision,
         };
-        if binding.auth_source != process.auth_source
-            || auth_source_revision != process.auth_source_revision
-        {
+        if binding.auth_source != process.auth_source {
             return Err(VibexError::conflict(
                 "restore_auth_source_mismatch",
                 "ACP binding and process authentication sources do not match",
+            ));
+        }
+        if auth_source_revision != process.auth_source_revision {
+            return Err(VibexError::conflict(
+                "restore_auth_source_revision_mismatch",
+                "ACP binding and process authentication source revisions do not match",
             ));
         }
         let state_home = match &binding.auth_source {
@@ -12056,6 +12063,7 @@ impl AcpRuntimeClient {
                 let current_mode_id = extract_current_mode_id(response);
                 let mut discovery = extract_provider_session_config_state(
                     response,
+                    Some(&process.agent_id),
                     process_profile_id.as_ref(),
                     Some(&current.native_session_id),
                 );
@@ -12668,6 +12676,7 @@ pub(crate) fn validate_restore_response(
 
 fn apply_session_state_to_attachment(
     state: &mut AcpAttachmentShared,
+    agent_id: &AgentId,
     provider_profile_id: Option<&ProviderProfileId>,
     native_session_id: &str,
     response: &Value,
@@ -12677,6 +12686,7 @@ fn apply_session_state_to_attachment(
     state.current_mode_id = extract_current_mode_id(response);
     state.session_config_state = extract_provider_session_config_state(
         response,
+        Some(agent_id),
         provider_profile_id,
         Some(native_session_id),
     );
@@ -14854,15 +14864,21 @@ async fn runtime_session_probe_from_response(
         (None, None)
     };
     let model_response_ref = model_response.as_ref();
-    let modes = model_response_ref
-        .filter(|response| response_has_mode_evidence(response))
-        .or_else(|| {
-            model_config_update
-                .as_ref()
-                .filter(|update| response_has_mode_evidence(update))
-        })
-        .map(|response| extract_config_values(mode_candidates(response)))
-        .unwrap_or_else(|| extract_config_values(mode_candidates(session)));
+    let modes = if process.agent_id.as_str() == PI_AGENT_ID {
+        // pi-acp exposes thinking levels through both `thought_level` and the
+        // legacy ACP mode surface. Keep only the semantic reasoning dimension.
+        Vec::new()
+    } else {
+        model_response_ref
+            .filter(|response| response_has_mode_evidence(response))
+            .or_else(|| {
+                model_config_update
+                    .as_ref()
+                    .filter(|update| response_has_mode_evidence(update))
+            })
+            .map(|response| extract_config_values(mode_candidates(response)))
+            .unwrap_or_else(|| extract_config_values(mode_candidates(session)))
+    };
     let mut reasoning_efforts = model_response_ref
         .filter(|response| response_has_config_options(response))
         .or(model_config_update.as_ref())
@@ -17110,11 +17126,19 @@ fn extract_current_mode_id(response: &Value) -> Option<String> {
 
 fn extract_provider_session_config_state(
     response: &Value,
+    agent_id: Option<&AgentId>,
     provider_profile_id: Option<&ProviderProfileId>,
     native_session_id: Option<&str>,
 ) -> Option<ProviderSessionConfigState> {
     let models = extract_config_values(model_candidates(response));
-    let modes = extract_config_values(mode_candidates(response));
+    // Pi's adapter mirrors thinking levels through legacy ACP `modes` for
+    // compatibility. They are reasoning effort, not conversation/approval
+    // modes, and must not create a second selector in Vibex.
+    let modes = if agent_id.is_some_and(|agent_id| agent_id.as_str() == PI_AGENT_ID) {
+        Vec::new()
+    } else {
+        extract_config_values(mode_candidates(response))
+    };
     let options = extract_config_options(response);
     let current_model = extract_current_model_id(response)
         .map(|value| ProviderSessionConfigValue { value, label: None });
@@ -17483,6 +17507,7 @@ fn normalize_session_list_candidates(
                 updated_at_ms: session_updated_at_ms(session),
                 session_config_state: extract_provider_session_config_state(
                     session,
+                    None,
                     Some(provider_profile_id),
                     session
                         .get("sessionId")
@@ -19780,6 +19805,48 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
     }
 
     #[test]
+    fn pi_thinking_modes_are_exposed_only_as_reasoning_effort() {
+        let pi = AgentId::parse(PI_AGENT_ID).unwrap();
+        let state = extract_provider_session_config_state(
+            &json!({
+                "modes": {
+                    "availableModes": [
+                        { "id": "low", "name": "Thinking: low" },
+                        { "id": "high", "name": "Thinking: high" }
+                    ],
+                    "currentModeId": "high"
+                },
+                "configOptions": [{
+                    "type": "select",
+                    "id": "thought_level",
+                    "category": "thought_level",
+                    "name": "Thinking",
+                    "currentValue": "high",
+                    "options": [
+                        { "value": "low", "name": "Thinking: low" },
+                        { "value": "high", "name": "Thinking: high" }
+                    ]
+                }]
+            }),
+            Some(&pi),
+            None,
+            Some("native-pi"),
+        )
+        .unwrap();
+
+        assert!(state.modes.is_empty());
+        let probe = agent_session_config_probe_from_state(&state);
+        assert_eq!(
+            probe
+                .reasoning_efforts
+                .iter()
+                .map(|effort| effort.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "high"]
+        );
+    }
+
+    #[test]
     fn pooled_model_state_never_falls_back_to_another_session() {
         let first = AcpAttachmentShared {
             current_model_id: Some("global/model".to_string()),
@@ -19795,6 +19862,7 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
                     "currentModelId": "session/model"
                 }
             }),
+            Some(&AgentId::parse("mock").unwrap()),
             Some(&ProviderProfileId::new()),
             Some("native-2"),
         )
@@ -20053,9 +20121,13 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
             ]
         });
 
-        let state =
-            extract_provider_session_config_state(&response, Some(&profile_id), Some("native-1"))
-                .expect("config state");
+        let state = extract_provider_session_config_state(
+            &response,
+            Some(&AgentId::parse("mock").unwrap()),
+            Some(&profile_id),
+            Some("native-1"),
+        )
+        .expect("config state");
 
         assert_eq!(state.provider_kind, ProviderKind::Acp);
         assert_eq!(state.provider_profile_id.as_ref(), Some(&profile_id));
@@ -22827,7 +22899,7 @@ for line in sys.stdin:
         };
         normalize_pi_runtime_selection(&mut effort_change, Some(&current), true);
         assert_eq!(effort_change.reasoning_effort.as_deref(), Some("low"));
-        assert_eq!(effort_change.mode_id.as_deref(), Some("low"));
+        assert_eq!(effort_change.mode_id, None);
 
         let mut mode_change = SessionRuntimeSelection {
             reasoning_effort: Some("high".to_string()),
@@ -22836,7 +22908,7 @@ for line in sys.stdin:
         };
         normalize_pi_runtime_selection(&mut mode_change, Some(&current), true);
         assert_eq!(mode_change.reasoning_effort.as_deref(), Some("low"));
-        assert_eq!(mode_change.mode_id.as_deref(), Some("low"));
+        assert_eq!(mode_change.mode_id, None);
 
         let mut unrelated = SessionRuntimeSelection {
             reasoning_effort: Some("low".to_string()),
@@ -22858,7 +22930,7 @@ for line in sys.stdin:
         };
         normalize_pi_runtime_selection(&mut unsupported, Some(&current), false);
         assert_eq!(unsupported.reasoning_effort.as_deref(), Some("off"));
-        assert_eq!(unsupported.mode_id.as_deref(), Some("off"));
+        assert_eq!(unsupported.mode_id, None);
     }
 
     fn configure_mock_default_agent_runtime(fixture: &MockAcpFixture, agent_id: &AgentId) {

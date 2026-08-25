@@ -11122,7 +11122,10 @@ impl VibexWorkbench {
                         arguments: invocation.arguments,
                         prompt_id: invocation.prompt_id,
                         attachments,
-                        reasoning_effort,
+                        // Commands execute against the manager's durable effective
+                        // runtime. Do not fence them with a composer snapshot that
+                        // may have been superseded by runtime normalization.
+                        reasoning_effort: None,
                         correlation_id: None,
                     })
                     .await
@@ -15731,7 +15734,9 @@ impl VibexWorkbench {
                             arguments: invocation.arguments,
                             prompt_id: invocation.prompt_id,
                             attachments: initial_attachments.clone(),
-                            reasoning_effort: desired_runtime.reasoning_effort.clone(),
+                            // The newly committed session runtime is authoritative;
+                            // command admission must not compare it with the draft.
+                            reasoning_effort: None,
                             correlation_id: None,
                         });
                         tokio::pin!(command);
