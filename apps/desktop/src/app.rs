@@ -16831,6 +16831,7 @@ impl VibexWorkbench {
                                 .find(|session| session.id == updated.id)
                             {
                                 *session = updated;
+                                this.invalidate_sidebar_projection_cache();
                             }
                             if this.sidebar_rename_target
                                 == Some(SidebarRenameTarget::Session(renamed_session_id.clone()))
@@ -47215,6 +47216,24 @@ mod tests {
             .expect("sidebar session delete menu item should remain inspectable");
         assert!(menu.contains(".disabled(session_deletion_pending)"));
         assert!(!menu.contains("mutation_pending"));
+    }
+
+    #[test]
+    fn session_rename_invalidates_the_sidebar_projection_cache() {
+        let source = include_str!("app.rs");
+        let rename = source
+            .split_once("    fn rename_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn confirm_delete_session("))
+            .map(|(body, _)| body)
+            .expect("session rename should remain inspectable");
+        let replace_session = rename
+            .find("*session = updated;")
+            .expect("successful rename should replace the authoritative session");
+        let invalidate_projection = rename
+            .find("this.invalidate_sidebar_projection_cache();")
+            .expect("successful rename should invalidate cached sidebar rows");
+
+        assert!(replace_session < invalidate_projection);
     }
 
     #[test]
