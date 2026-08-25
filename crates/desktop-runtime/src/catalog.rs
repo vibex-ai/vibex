@@ -101,9 +101,12 @@ impl RuntimeOptionCatalogService {
     }
 
     pub async fn list(&self) -> Result<SessionRuntimeOptionCatalog, VibexError> {
-        let agents = self.provider_config.list_agents(AgentListRequest {
+        let mut agents = self.provider_config.list_agents(AgentListRequest {
             include_disabled: true,
         })?;
+        agents
+            .agents
+            .retain(|agent| vibex_core::is_user_visible_agent(&agent.id));
         let profiles = self.provider_config.list_runtime_profiles()?;
         let snapshots = self.snapshot_map()?;
         let model_snapshots = self.model_snapshot_records()?;

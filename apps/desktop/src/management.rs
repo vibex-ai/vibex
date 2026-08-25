@@ -3276,7 +3276,10 @@ impl ManagementCenter {
     }
 
     fn apply_agent_snapshot(&mut self, agents: Vec<AgentSnapshotEntry>, cx: &mut Context<Self>) {
-        self.snapshot.agents = agents;
+        self.snapshot.agents = agents
+            .into_iter()
+            .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
+            .collect();
         self.reconcile_selected_agent();
         self.sync_projection_editor();
         self.load_agent_auth(false, cx);
@@ -3478,7 +3481,11 @@ impl ManagementCenter {
             let _ = entity.update(cx, |this, cx| {
                 this.agent_install_refresh_task = None;
                 if let Ok(Ok(agents)) = outcome {
-                    this.snapshot.agents = agents.agents;
+                    this.snapshot.agents = agents
+                        .agents
+                        .into_iter()
+                        .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
+                        .collect();
                 }
                 if this.selected_agent_installation_pending() {
                     this.schedule_agent_install_refresh(cx);
@@ -7373,6 +7380,7 @@ impl ManagementCenter {
             .snapshot
             .agents
             .iter()
+            .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
             .filter(|agent| management_agent_matches_search(agent, &query))
             .cloned()
             .collect::<Vec<_>>();
@@ -15919,7 +15927,10 @@ fn load_agent_snapshot(runtime: Arc<DesktopRuntime>) -> VibexResult<Vec<AgentSna
         .list_agents(AgentListRequest {
             include_disabled: true,
         })?
-        .agents)
+        .agents
+        .into_iter()
+        .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
+        .collect())
 }
 
 async fn load_snapshot(
@@ -15934,10 +15945,18 @@ async fn load_snapshot(
     if refresh_agent_versions {
         provider.refresh_detected_agent_versions()?;
     }
-    let agents = provider.list_agents(AgentListRequest {
-        include_disabled: true,
-    })?;
-    let catalog = provider.list_agent_catalog()?;
+    let agents = provider
+        .list_agents(AgentListRequest {
+            include_disabled: true,
+        })?
+        .agents
+        .into_iter()
+        .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
+        .collect::<Vec<_>>();
+    let mut catalog = provider.list_agent_catalog()?;
+    catalog
+        .agents
+        .retain(|agent| vibex_core::is_user_visible_agent(&agent.id));
     let model_provider_agent_ids = vibex_core::model_provider_configurable_agent_ids()?
         .into_iter()
         .map(|agent_id| agent_id.as_str().to_string())
@@ -15976,7 +15995,7 @@ async fn load_snapshot(
                 .map(|project_id| project_id.as_str().to_string())
         })
         .unwrap_or_else(|| "management-global".to_string());
-    for agent in agents.agents.iter().filter(|agent| agent.added) {
+    for agent in agents.iter().filter(|agent| agent.added) {
         let response = provider.list_agent_model_provider_profiles(
             vibex_core::AgentModelProviderProfileListRequest {
                 agent_id: agent.id.clone(),
@@ -16132,7 +16151,7 @@ async fn load_snapshot(
         .len();
     Ok(ManagementSnapshot {
         center: ProviderCenterSnapshot {
-            agents: agents.agents,
+            agents,
             catalog: Some(catalog),
             profiles: profiles
                 .iter()

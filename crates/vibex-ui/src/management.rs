@@ -873,6 +873,7 @@ impl ManagementWorkflowController {
                     self.state.agents = response
                         .agents
                         .iter()
+                        .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
                         .map(AgentStatusProjection::from_entry)
                         .collect();
                 }

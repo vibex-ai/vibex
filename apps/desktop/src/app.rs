@@ -5425,7 +5425,10 @@ impl VibexWorkbench {
                                     ));
                             }
                             this.runtime_provider_profiles = profiles;
-                            this.agent_snapshots = agents;
+                            this.agent_snapshots = agents
+                                .into_iter()
+                                .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
+                                .collect();
                             if this.reconcile_new_session_runtime_selection()
                                 && this.new_session_open
                             {
@@ -5557,7 +5560,10 @@ impl VibexWorkbench {
                                     ));
                             }
                             this.runtime_provider_profiles = profiles;
-                            this.agent_snapshots = agents;
+                            this.agent_snapshots = agents
+                                .into_iter()
+                                .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
+                                .collect();
                             this.sessions = sessions;
                             // Rehydrate both project defaults and explicit
                             // session overrides for every authoritative row.
@@ -37176,7 +37182,11 @@ fn persisted_runtime_selection(
 }
 
 fn is_new_session_agent_available(agent: &AgentSnapshotEntry) -> bool {
-    agent.added && agent.enabled && agent.installed && agent.deleted_at_ms.is_none()
+    vibex_core::is_user_visible_agent(&agent.id)
+        && agent.added
+        && agent.enabled
+        && agent.installed
+        && agent.deleted_at_ms.is_none()
 }
 
 async fn discover_desktop_composer_commands(

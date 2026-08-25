@@ -325,6 +325,30 @@ pub struct AgentCatalogListResponse {
     pub agents: Vec<AgentDefinition>,
 }
 
+/// Returns whether an Agent is currently part of Vibex's user-facing catalog.
+///
+/// The ACP catalog intentionally contains more integrations than the product
+/// is ready to expose. Keep this presentation policy separate from the runtime
+/// catalog so hidden integrations remain available for development and probes.
+pub fn is_user_visible_agent(agent_id: &AgentId) -> bool {
+    matches!(
+        agent_id.as_str(),
+        "claude"
+            | "cline"
+            | "codebuddy-code"
+            | "codex"
+            | "cursor"
+            | "gemini"
+            | "copilot"
+            | "devin"
+            | "grok"
+            | "hermes"
+            | "opencode"
+            | "pi"
+            | "deepseek-harness"
+    )
+}
+
 impl AgentSnapshotEntry {
     pub fn from_definition(
         definition: &AgentDefinition,
@@ -849,5 +873,40 @@ mod tests {
                 "{agent_id}"
             );
         }
+    }
+
+    #[test]
+    fn user_visible_agent_policy_matches_the_supported_product_catalog() {
+        let definitions = builtin_agent_definitions();
+        let visible = definitions
+            .iter()
+            .filter(|definition| is_user_visible_agent(&definition.id))
+            .map(|definition| definition.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = [
+            "claude",
+            "cline",
+            "codebuddy-code",
+            "codex",
+            "cursor",
+            "deepseek-harness",
+            "devin",
+            "gemini",
+            "copilot",
+            "grok",
+            "hermes",
+            "opencode",
+            "pi",
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(visible, expected);
+        assert!(
+            definitions
+                .iter()
+                .filter(|definition| !is_user_visible_agent(&definition.id))
+                .all(|definition| !expected.contains(definition.id.as_str()))
+        );
     }
 }
