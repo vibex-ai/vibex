@@ -22,6 +22,10 @@ pub struct OpenSettings;
 
 #[derive(Action, Clone, PartialEq)]
 #[action(namespace = vibex, no_json)]
+pub struct OpenConversationFind;
+
+#[derive(Action, Clone, PartialEq)]
+#[action(namespace = vibex, no_json)]
 pub struct RetryRuntime;
 
 #[derive(Action, Clone, PartialEq)]

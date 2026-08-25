@@ -135,8 +135,8 @@ use vibex_ui::{
 };
 
 use crate::actions::{
-    NavigateBack, NavigateForward, OpenSettings, RetryRuntime, SaveActiveFile, ToggleComposerMode,
-    TogglePreview, ToggleRightRail, ToggleSidebar,
+    NavigateBack, NavigateForward, OpenConversationFind, OpenSettings, RetryRuntime,
+    SaveActiveFile, ToggleComposerMode, TogglePreview, ToggleRightRail, ToggleSidebar,
 };
 use crate::assets::{agent_brand_icon, agent_brand_logo, model_brand_icon, window_icon};
 use crate::code_workbench::{
@@ -3786,6 +3786,11 @@ pub struct VibexWorkbench {
     session_search: Entity<InputState>,
     session_search_open: bool,
     session_search_selected_index: usize,
+    conversation_find: Entity<InputState>,
+    conversation_find_open: bool,
+    conversation_find_active_index: usize,
+    conversation_find_query: String,
+    conversation_find_active_item_id: Option<String>,
     session_search_scroll: VirtualListScrollHandle,
     session_search_index: BTreeMap<String, SessionSearchIndexEntry>,
     session_search_index_loading: bool,
@@ -4058,6 +4063,15 @@ impl VibexWorkbench {
                 .placeholder(initial_strings.session_search_placeholder)
                 .submit_on_enter(true)
         });
+        let conversation_find = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(locale::text(
+                    "Find in conversation",
+                    "在当前会话中查找",
+                    "在目前會話中尋找",
+                ))
+                .submit_on_enter(true)
+        });
         let sidebar_rename_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(initial_strings.sidebar_rename_placeholder)
         });
@@ -4134,6 +4148,26 @@ impl VibexWorkbench {
                     InputEvent::Focus
                     | InputEvent::Blur
                     | InputEvent::PressEnter { shift: true, .. } => {}
+                },
+            ),
+            cx.subscribe_in(
+                &conversation_find,
+                window,
+                |this, _, event, _, cx| match event {
+                    InputEvent::Change => {
+                        this.conversation_find_active_index = 0;
+                        this.conversation_find_query = normalized_session_search_query(
+                            this.conversation_find.read(cx).value().as_ref(),
+                        );
+                        this.reveal_active_conversation_find_match(cx);
+                    }
+                    InputEvent::PressEnter { shift: false, .. } => {
+                        this.select_next_conversation_find_match(1, cx)
+                    }
+                    InputEvent::PressEnter { shift: true, .. } => {
+                        this.select_next_conversation_find_match(-1, cx)
+                    }
+                    InputEvent::Focus | InputEvent::Blur => {}
                 },
             ),
             cx.subscribe_in(
@@ -4423,6 +4457,11 @@ impl VibexWorkbench {
             session_search,
             session_search_open: false,
             session_search_selected_index: 0,
+            conversation_find,
+            conversation_find_open: false,
+            conversation_find_active_index: 0,
+            conversation_find_query: String::new(),
+            conversation_find_active_item_id: None,
             session_search_scroll: VirtualListScrollHandle::new(),
             session_search_index: BTreeMap::new(),
             session_search_index_loading: false,
@@ -17637,6 +17676,104 @@ impl VibexWorkbench {
         ));
     }
 
+    fn conversation_find_matches(&self, cx: &App) -> Vec<SessionSearchTarget> {
+        let query =
+            normalized_session_search_query(self.conversation_find.read(cx).value().as_ref());
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let Some(session_id) = self.selected_session_id.clone() else {
+            return Vec::new();
+        };
+        session_search_documents(&self.timeline.items)
+            .into_iter()
+            .flat_map(|document| {
+                let match_count = session_search_match_ranges(&document.text, &query).len();
+                std::iter::repeat_n(
+                    SessionSearchTarget {
+                        session_id: session_id.clone(),
+                        turn_id: document.turn_id,
+                        item_id: document.item_id,
+                        first_sequence: document.first_sequence,
+                    },
+                    match_count,
+                )
+            })
+            .collect()
+    }
+
+    fn open_conversation_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ui_state.workbench.active_tab != "agent"
+            || self.new_session_open
+            || self.selected_session_id.is_none()
+        {
+            return;
+        }
+        self.conversation_find_open = true;
+        self.conversation_find
+            .update(cx, |input, cx| input.focus(window, cx));
+        self.reveal_active_conversation_find_match(cx);
+        cx.notify();
+    }
+
+    fn close_conversation_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.conversation_find_open = false;
+        self.conversation_find_active_item_id = None;
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    fn select_next_conversation_find_match(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let count = self.conversation_find_matches(cx).len();
+        if count == 0 {
+            self.conversation_find_active_index = 0;
+            self.conversation_find_active_item_id = None;
+            cx.notify();
+            return;
+        }
+        self.conversation_find_active_index = if delta < 0 {
+            self.conversation_find_active_index
+                .checked_sub(delta.unsigned_abs())
+                .unwrap_or(count - 1)
+        } else {
+            (self.conversation_find_active_index + delta as usize) % count
+        };
+        self.reveal_active_conversation_find_match(cx);
+    }
+
+    fn reveal_active_conversation_find_match(&mut self, cx: &mut Context<Self>) {
+        let matches = self.conversation_find_matches(cx);
+        if matches.is_empty() {
+            self.conversation_find_active_index = 0;
+            self.conversation_find_active_item_id = None;
+            cx.notify();
+            return;
+        }
+        self.conversation_find_active_index = self
+            .conversation_find_active_index
+            .min(matches.len().saturating_sub(1));
+        for target in &matches {
+            self.timeline_process_expansion
+                .insert(target.turn_id.clone(), true);
+            self.timeline_measured_turn_heights.remove(&target.turn_id);
+        }
+        self.rebuild_timeline_sizes();
+        let target = &matches[self.conversation_find_active_index];
+        self.conversation_find_active_item_id = target.item_id.clone();
+        if let Some(turn_index) = self
+            .conversation_turns()
+            .iter()
+            .position(|turn| turn.id == target.turn_id)
+        {
+            self.timeline_scroll_wheel_idle_task = None;
+            self.timeline_follow.set_following_bottom(false);
+            self.timeline_scroll_to_latest_pending = false;
+            self.timeline_scroll
+                .scroll_to_item(turn_index, ScrollStrategy::Center);
+        }
+        cx.notify();
+    }
+
     fn open_session_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.session_search_open = true;
         self.session_search_selected_index = 0;
@@ -19101,6 +19238,15 @@ impl VibexWorkbench {
             return;
         }
         self.switch_to_composer_terminal(window.window_handle(), window, cx);
+    }
+
+    fn on_open_conversation_find(
+        &mut self,
+        _: &OpenConversationFind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_conversation_find(window, cx);
     }
 
     fn on_open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
@@ -26399,6 +26545,7 @@ impl VibexWorkbench {
             })
             .when_some(turn_preview_rail, |this, rail| this.child(rail));
         let runtime_controls = self.render_runtime_controls(cx);
+        let conversation_find = self.render_conversation_find(cx);
         let composer = self.render_composer(cx);
         v_flex()
             .id("agent-workbench")
@@ -26529,6 +26676,7 @@ impl VibexWorkbench {
                 };
                 this.child(control)
             })
+            .when_some(conversation_find, |this, find| this.child(find))
             .child(composer)
             .into_any_element()
     }
@@ -28560,6 +28708,111 @@ impl VibexWorkbench {
         )
     }
 
+    fn render_conversation_find(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.conversation_find_open {
+            return None;
+        }
+        let match_count = self.conversation_find_matches(cx).len();
+        let current = if match_count == 0 {
+            "0/0".to_string()
+        } else {
+            format!(
+                "{}/{}",
+                self.conversation_find_active_index + 1,
+                match_count
+            )
+        };
+        let previous_label = locale::text("Previous match", "上一项", "上一項");
+        let next_label = locale::text("Next match", "下一项", "下一項");
+        let close_label = locale::text("Close find", "关闭查找", "關閉尋找");
+        Some(
+            h_flex()
+                .id("conversation-find-bar")
+                .w_full()
+                .flex_none()
+                .justify_center()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().background)
+                .px_4()
+                .py_2()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .max_w(px(720.0))
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .h(px(34.0))
+                                .min_w_0()
+                                .flex_1()
+                                .rounded(px(6.0))
+                                .bg(cx.theme().muted.opacity(0.42))
+                                .child(
+                                    Input::new(&self.conversation_find)
+                                        .h_full()
+                                        .w_full()
+                                        .appearance(false)
+                                        .prefix(
+                                            Icon::new(IconName::Search)
+                                                .small()
+                                                .text_color(cx.theme().muted_foreground),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w(px(54.0))
+                                .flex_none()
+                                .text_center()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(current),
+                        )
+                        .child(
+                            Button::new("conversation-find-previous")
+                                .small()
+                                .ghost()
+                                .compact()
+                                .size(px(32.0))
+                                .icon(IconName::ArrowUp)
+                                .tooltip(previous_label)
+                                .disabled(match_count == 0)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.select_next_conversation_find_match(-1, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("conversation-find-next")
+                                .small()
+                                .ghost()
+                                .compact()
+                                .size(px(32.0))
+                                .icon(IconName::ArrowDown)
+                                .tooltip(next_label)
+                                .disabled(match_count == 0)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.select_next_conversation_find_match(1, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("conversation-find-close")
+                                .small()
+                                .ghost()
+                                .compact()
+                                .size(px(32.0))
+                                .icon(IconName::Close)
+                                .tooltip(close_label)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.close_conversation_find(window, cx)
+                                })),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_timeline_turn(
         &mut self,
         turn: &TimelineConversationTurn,
@@ -29488,11 +29741,19 @@ impl VibexWorkbench {
         cx: &App,
     ) -> AnyElement {
         if self.session_search_highlight_query_for_rows(rows).is_some() {
+            let active = self.conversation_find_open
+                && self
+                    .conversation_find_active_item_id
+                    .as_ref()
+                    .is_some_and(|active_id| {
+                        rows.iter()
+                            .any(|row| row.item_ids.iter().any(|id| id == active_id))
+                    });
             div()
                 .w_full()
                 .min_w_0()
                 .rounded(px(6.0))
-                .bg(cx.theme().warning.opacity(0.10))
+                .bg(cx.theme().warning.opacity(if active { 0.20 } else { 0.10 }))
                 .child(element)
                 .into_any_element()
         } else {
@@ -29504,6 +29765,18 @@ impl VibexWorkbench {
         &'a self,
         rows: &[TimelineRow],
     ) -> Option<&'a str> {
+        if self.conversation_find_open && !self.conversation_find_query.is_empty() {
+            return rows
+                .iter()
+                .any(|row| {
+                    !session_search_match_ranges(
+                        &session_search_row_text(row),
+                        &self.conversation_find_query,
+                    )
+                    .is_empty()
+                })
+                .then_some(self.conversation_find_query.as_str());
+        }
         let query = self.session_search_highlight_query.as_deref()?;
         let item_id = self.session_search_highlight_item_id.as_deref()?;
         rows.iter()
@@ -39739,6 +40012,7 @@ const FOUNDATION_SHORTCUTS: &[(&str, &str)] = &[
     ("toggle_right_rail", "cmd-shift-r"),
     ("toggle_composer_mode", "cmd-shift-t"),
     ("open_settings", "cmd-,"),
+    ("open_conversation_find", "cmd-f"),
     ("retry_runtime", "cmd-r"),
     ("save_active_file", "cmd-s"),
     ("navigate_back", "alt-left"),
@@ -39756,6 +40030,7 @@ fn shortcut_action_label(action: &str) -> &'static str {
             "切換對話/終端機模式",
         ),
         "open_settings" => "Open settings",
+        "open_conversation_find" => "Find in conversation",
         "retry_runtime" => "Retry runtime",
         "save_active_file" => "Save active file",
         "navigate_back" => "Navigate back",
@@ -39768,7 +40043,7 @@ fn shortcut_action_group(action: &str) -> &'static str {
     match action {
         "toggle_sidebar" | "toggle_preview" | "toggle_right_rail" => "Workbench",
         "toggle_composer_mode" => locale::text("Composer", "输入框", "輸入框"),
-        "open_settings" => "Navigation",
+        "open_settings" | "open_conversation_find" => "Navigation",
         "retry_runtime" => "Runtime",
         "save_active_file" => "Editor",
         "navigate_back" | "navigate_forward" => "Navigation",
@@ -43703,12 +43978,17 @@ impl Render for VibexWorkbench {
             .on_action(cx.listener(Self::on_toggle_right_rail))
             .on_action(cx.listener(Self::on_toggle_composer_mode))
             .on_action(cx.listener(Self::on_open_settings))
+            .on_action(cx.listener(Self::on_open_conversation_find))
             .on_action(cx.listener(Self::on_retry_runtime))
             .on_action(cx.listener(Self::on_save_active_file))
             .on_action(cx.listener(Self::on_navigate_back))
             .on_action(cx.listener(Self::on_navigate_forward))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if this.attachment_image_preview.is_some() && event.keystroke.key == "escape" {
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if this.conversation_find_open && event.keystroke.key == "escape" {
+                    this.close_conversation_find(window, cx);
+                    cx.stop_propagation();
+                } else if this.attachment_image_preview.is_some() && event.keystroke.key == "escape"
+                {
                     this.close_attachment_preview(cx);
                     cx.stop_propagation();
                 }
@@ -43829,6 +44109,9 @@ fn bind_action(bindings: &mut Vec<KeyBinding>, keystroke: &str, action: &str, un
             push!(ToggleComposerMode, "vibex::ToggleComposerMode")
         }
         "open_settings" | "vibex::OpenSettings" => push!(OpenSettings, "vibex::OpenSettings"),
+        "open_conversation_find" | "vibex::OpenConversationFind" => {
+            push!(OpenConversationFind, "vibex::OpenConversationFind")
+        }
         "retry_runtime" | "vibex::RetryRuntime" => push!(RetryRuntime, "vibex::RetryRuntime"),
         "save_active_file" | "vibex::SaveActiveFile" => {
             push!(SaveActiveFile, "vibex::SaveActiveFile")
@@ -43848,6 +44131,7 @@ fn action_name(action: &str) -> &'static str {
         "toggle_right_rail" => "vibex::ToggleRightRail",
         "toggle_composer_mode" => "vibex::ToggleComposerMode",
         "open_settings" => "vibex::OpenSettings",
+        "open_conversation_find" => "vibex::OpenConversationFind",
         "retry_runtime" => "vibex::RetryRuntime",
         "save_active_file" => "vibex::SaveActiveFile",
         "navigate_back" => "vibex::NavigateBack",
@@ -45504,6 +45788,45 @@ mod tests {
         assert!(excerpt.contains("目标会话内容"));
         assert!(excerpt.chars().count() <= SESSION_SEARCH_EXCERPT_MAX_CHARS + 6);
         assert!(session_search_excerpt(&text, "not present").is_none());
+    }
+
+    #[test]
+    fn conversation_find_registers_local_search_navigation_and_focus_order() {
+        let source = include_str!("app.rs");
+        let shortcuts = source
+            .split_once("const FOUNDATION_SHORTCUTS")
+            .and_then(|(_, tail)| tail.split_once("fn shortcut_action_label"))
+            .map(|(body, _)| body)
+            .expect("foundation shortcuts should remain inspectable");
+        assert!(shortcuts.contains("(\"open_conversation_find\", \"cmd-f\")"));
+
+        let renderer = source
+            .split_once("    fn render_conversation_find(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_timeline_turn("))
+            .map(|(body, _)| body)
+            .expect("conversation find renderer should remain inspectable");
+        let input = renderer
+            .find("Input::new(&self.conversation_find)")
+            .expect("find input should render");
+        let previous = renderer
+            .find("Button::new(\"conversation-find-previous\")")
+            .expect("previous control should render");
+        let next = renderer
+            .find("Button::new(\"conversation-find-next\")")
+            .expect("next control should render");
+        let close = renderer
+            .find("Button::new(\"conversation-find-close\")")
+            .expect("close control should render");
+        assert!(input < previous && previous < next && next < close);
+        assert!(renderer.contains("self.conversation_find_matches(cx).len()"));
+
+        let highlights = source
+            .split_once("    fn session_search_highlight_query_for_rows")
+            .and_then(|(_, tail)| tail.split_once("\n    fn session_search_highlighted_row_text"))
+            .map(|(body, _)| body)
+            .expect("timeline highlighting should remain inspectable");
+        assert!(highlights.contains("self.conversation_find_open"));
+        assert!(highlights.contains("session_search_match_ranges"));
     }
 
     #[test]
