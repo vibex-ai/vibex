@@ -6497,6 +6497,10 @@ impl VibexWorkbench {
     }
 
     fn pause_auto_continue(&mut self, session_id: &VibexSessionId, cx: &mut Context<Self>) {
+        // A manual stop opts this session out of future automatic continuations.
+        if self.auto_continue_enabled(session_id) {
+            self.set_auto_continue_enabled(session_id.clone(), false, cx);
+        }
         if let Some(countdown) = self.auto_continue_countdowns.remove(session_id.as_str()) {
             self.auto_continue_paused_turn_session_ids
                 .insert(session_id.as_str().to_string());
@@ -14203,6 +14207,11 @@ impl VibexWorkbench {
         else {
             return;
         };
+        // An explicit user interrupt cancels this session's persisted
+        // auto-continue preference until the user enables it again.
+        if self.auto_continue_enabled(&session_id) {
+            self.set_auto_continue_enabled(session_id.clone(), false, cx);
+        }
         self.notification_suppressed_session_ids
             .insert(session_id.as_str().to_string());
         let has_queued_messages = self
@@ -49874,6 +49883,22 @@ mod tests {
         assert!(state.contains("this.tick_auto_continue_countdown"));
         assert!(state.contains("self.pause_auto_continue(&session_id, cx);"));
         assert!(state.contains("self.continue_session_by_id("));
+
+        let pause = source
+            .split_once("    fn pause_auto_continue(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn activate_continue_button("))
+            .map(|(body, _)| body)
+            .expect("manual auto-continue pause should remain inspectable");
+        assert!(pause.contains("self.set_auto_continue_enabled(session_id.clone(), false, cx)"));
+
+        let interrupt = source
+            .split_once("    fn interrupt_session_with_queue_behavior(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn continue_session("))
+            .map(|(body, _)| body)
+            .expect("manual interruption should remain inspectable");
+        assert!(
+            interrupt.contains("self.set_auto_continue_enabled(session_id.clone(), false, cx)")
+        );
 
         let composer = source
             .split_once("    fn render_composer(")

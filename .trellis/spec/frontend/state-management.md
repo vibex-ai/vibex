@@ -1298,6 +1298,9 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   authoritative session snapshot also invalidates them when either state or
   `updatedAtMs` changes, so an `Idle -> Error` transition cannot reuse a normal
   completion cached in the same millisecond.
+  A manual stop of an auto-continue countdown or continuation turn also writes
+  a session-level disabled override; the project default must not re-enable
+  automatic continuation until the user explicitly enables it again.
 - Claude/Codex JSONL support in this surface is offline import only. Adding the
   offline import crates must not introduce a Native online runtime route or
   provider-specific timeline rendering.
