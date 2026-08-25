@@ -43988,6 +43988,20 @@ impl Render for VibexWorkbench {
             .on_action(cx.listener(Self::on_save_active_file))
             .on_action(cx.listener(Self::on_navigate_back))
             .on_action(cx.listener(Self::on_navigate_forward))
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                let modifiers = event.keystroke.modifiers;
+                if event.keystroke.key.eq_ignore_ascii_case("f")
+                    && (modifiers.control || modifiers.platform)
+                    && !modifiers.alt
+                    && !modifiers.shift
+                    && this.ui_state.workbench.active_tab == "agent"
+                    && !this.new_session_open
+                    && this.selected_session_id.is_some()
+                {
+                    this.open_conversation_find(window, cx);
+                    cx.stop_propagation();
+                }
+            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.conversation_find_open && event.keystroke.key == "escape" {
                     this.close_conversation_find(window, cx);
@@ -45804,6 +45818,15 @@ mod tests {
             .map(|(body, _)| body)
             .expect("foundation shortcuts should remain inspectable");
         assert!(shortcuts.contains("(\"open_conversation_find\", \"cmd-f\")"));
+
+        let workbench = source
+            .split_once(".id(\"vibex-foundation\")")
+            .and_then(|(_, tail)| tail.split_once(".on_drag_move("))
+            .map(|(body, _)| body)
+            .expect("workbench keyboard handlers should remain inspectable");
+        assert!(workbench.contains(".capture_key_down("));
+        assert!(workbench.contains("modifiers.control || modifiers.platform"));
+        assert!(workbench.contains("this.open_conversation_find(window, cx)"));
 
         let renderer = source
             .split_once("    fn render_conversation_find(")
