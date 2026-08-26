@@ -2574,6 +2574,13 @@ agent_discovery_records(
 - Base: Gemini uses its Agent-owned cloud credential flow; Config Center shows
   installation/authentication but no model-provider card, while its seeded ACP
   runtime profile remains available through `list_by_agent`.
+- Good: Google Antigravity 1.0.0 accepts a Profile-scoped `GEMINI_API_KEY` and
+  `GOOGLE_GEMINI_BASE_URL`; it appends `/v1beta/models/...` to the configured
+  origin and selects the Profile model through its advertised ACP `model`
+  config option. Vibex therefore gives each Antigravity Profile a private
+  `GEMINI_HOME`, strips a trailing `/v1` or `/v1beta` from the endpoint before
+  launch, and uses restart-and-resume switching rather than relying on the
+  ignored `GEMINI_MODEL` process variable.
 - Bad: a newly supported typed projector persists successfully but disappears
   after refresh because `ProviderProfileRepository::list` still contains only
   `claude`, `codex`, and `opencode`.

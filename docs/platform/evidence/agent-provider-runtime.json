@@ -3,9 +3,9 @@
   "status": "passed",
   "claimScope": "manifest_and_contract",
   "realRuntimeVerification": "blocked",
-  "capturedAt": "2026-08-26T08:03:39.118Z",
+  "capturedAt": "2026-08-26T18:26:35.867Z",
   "source": {
-    "captureParentCommit": "2496a6657a9f97dd773234f36c8957a7709eeb62",
+    "captureParentCommit": "e813ebe8ad20e171a1b7031be60c058c18613d24",
     "rustToolchain": "rustc-1.97.0",
     "sourceInputRoots": [
       "crates/core/src/acp_catalog.rs",
@@ -53,27 +53,27 @@
       "crates/vibex-ui/Cargo.toml",
       "apps/desktop/Cargo.toml"
     ],
-    "sourceInputTreeSha256": "6248e9acd0323f21e66e89100acca69b93879cebbfb16567d14530f4e833e54c",
+    "sourceInputTreeSha256": "4c6df3f066eb2fa428ee27ba688e705113910c67bfc9688eb0de700fde1ef454",
     "bindings": {
-      "catalog": "5e444dac44d7ac3c898f7a1fe488b69731700a28fc8c5b904e4dfb678093a9f0",
-      "manifest": "c28668b14f064fffb914241a409ced41fad515a7cb4f861c7f7fed5f100059df",
-      "probe": "b535868baef84ea51380b8416ce18cb84dce6aeba526c69fbc55c01350eb9c61",
+      "catalog": "7fc67eac9f64de6b78b911bfea098bdc12cdbd502f03956faef88cedeab38554",
+      "manifest": "4352bc13e3b87f0ed7a74588d5ed140d9c99c5c3541711bdbb190da5a7d4e8ab",
+      "probe": "f139fad5dd54217f08b122d4386cf4432600bda3cb4dcfd54ca7532e465cf1b1",
       "database": "1abe4a8df63fc3f909a2297737a0c3408a80cad742a8aff7c3e0accf942b14bb",
-      "remote": "4c12fcf6b99b795bb9ecad044fac950eab4eb379f7205d888facf12f5303d818",
+      "remote": "b24996d2f1466dbbb89698f524d5631fc3345d3673d6ce63d9f06219025df088",
       "ui": "78effccaaae03b8eb4a2ddcd1b24f1fef0e95dd707c66269782c7f3c10999ab6",
       "switch": "20a2cf091c012b2ac8165cde9f361f62a0edbacd66d66620ecdbb9196fbd2a87",
-      "scripts": "bf41a9b102d7a1589794a4524435b959eb46e3078169fcc5fc0b6b27f0afe6f4",
+      "scripts": "40773b90ee542074b704b785e29438f046dbc3c1e3c78464a55b84e3cbc224d0",
       "packageMetadata": "a4e23c06de51d6786c90bfad1d68cd8ea88a2cc00e7113c2fadf4f77448d73d7"
     },
     "cargoLockSha256": "1ffad260f0c4d15d53165b2672c9149103ab92cb3dc7796f69216170af364333",
     "packageJsonSha256": "3bf13132c815037285846cd90920224559d666d9c18e15db3c1d694e7a783dfa",
-    "rolloutManifestSha256": "9d1684a9317ac8bb0484307604272b450a5cf97fd756acce256f2ef070a1d139"
+    "rolloutManifestSha256": "26b6f03163101ef976fbb1d44a919024db4e298b949340aeb3340994ece9766c"
   },
   "manifest": {
     "schemaVersion": "agent-provider-runtime-manifest.v1",
-    "totalAgents": 35,
+    "totalAgents": 36,
     "builtinCount": 3,
-    "catalogCount": 32,
+    "catalogCount": 33,
     "entries": [
       {
         "agentId": "claude",
@@ -137,6 +137,37 @@
         "evidenceState": "documented",
         "sourceEvidenceReference": "provider-config/opencode-inline-provider-v1",
         "smokeId": "builtin-provider-opencode",
+        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
+      },
+      {
+        "agentId": "antigravity",
+        "catalogVersion": "1.0.0",
+        "adapterId": "antigravity-acp",
+        "descriptorId": "projection_antigravity_runtime_v1",
+        "descriptorVersion": "1",
+        "versionPolicy": {
+          "kind": "detected_semver",
+          "requirement": ">=1.0.0"
+        },
+        "capabilityMode": "replaceable_provider",
+        "runtimeHomeStrategy": "vibex_private",
+        "switchBehavior": "restart_and_resume",
+        "credentialKinds": [
+          "api_key"
+        ],
+        "modelInterfaces": [
+          {
+            "wireProtocolId": "google_generative_ai",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "integrationKind": "direct",
+            "userSelectable": false,
+            "processScoped": true
+          }
+        ],
+        "evidenceState": "documented",
+        "sourceEvidenceReference": "research/acp-agent/antigravity@1.0.0",
+        "smokeId": "agent-provider-antigravity",
         "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
@@ -1204,6 +1235,41 @@
       "liveSwitchVerified": false,
       "binaryOnlyVerified": false,
       "sourceEvidenceReference": "provider-config/opencode-inline-provider-v1",
+      "recordedAt": null
+    },
+    {
+      "agentId": "antigravity",
+      "smokeId": "agent-provider-antigravity",
+      "catalogVersion": "1.0.0",
+      "descriptorId": "projection_antigravity_runtime_v1",
+      "descriptorVersion": "1",
+      "versionPolicy": "detected_semver",
+      "capabilityMode": "replaceable_provider",
+      "switchBehavior": "restart_and_resume",
+      "status": "blocked",
+      "execution": "not_run",
+      "diagnosticCode": "operator_prerequisites_unavailable",
+      "detectedIdentity": null,
+      "descriptorMatch": "not_checked",
+      "projectionFingerprint": null,
+      "facts": {
+        "binaryIdentity": "blocked",
+        "acpHandshake": "blocked",
+        "authentication": "blocked",
+        "session": "blocked",
+        "modelCatalog": "blocked",
+        "modelSelection": "blocked",
+        "providerProjection": "blocked",
+        "sessionResume": "blocked",
+        "switchCompatibility": "blocked",
+        "redaction": "blocked"
+      },
+      "redactionPassed": false,
+      "sourceSurvivedPrepareFailure": false,
+      "providerVerified": false,
+      "liveSwitchVerified": false,
+      "binaryOnlyVerified": false,
+      "sourceEvidenceReference": "research/acp-agent/antigravity@1.0.0",
       "recordedAt": null
     },
     {
@@ -2386,8 +2452,8 @@
     "absolutePathPersisted": false
   },
   "summary": {
-    "totalAgents": 35,
-    "blockedRealSmokes": 35,
+    "totalAgents": 36,
+    "blockedRealSmokes": 36,
     "passedRealSmokes": 0,
     "providerVerifiedAgents": 0,
     "liveSwitchVerifiedAgents": 0,

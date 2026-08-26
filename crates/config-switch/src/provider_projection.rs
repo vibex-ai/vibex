@@ -1362,16 +1362,16 @@ fn project_model_control(
     }
 }
 
-/// Gemini CLI treats `GOOGLE_GEMINI_BASE_URL` as an origin and appends the
-/// Google Generative Language API path itself. Provider forms commonly store
-/// an OpenAI-style `/v1` suffix; forwarding it verbatim produces
+/// Gemini CLI and Antigravity treat `GOOGLE_GEMINI_BASE_URL` as an origin and
+/// append the Google Generative Language API path themselves. Provider forms
+/// commonly store an OpenAI-style `/v1` suffix; forwarding it verbatim produces
 /// `/v1/v1beta/models/...` and makes every prompt fail after a successful ACP
 /// handshake. Keep other Agents byte-for-byte unchanged.
 fn environment_base_url(
     descriptor: &AgentProviderProjectionDescriptor,
     endpoint_url: &str,
 ) -> String {
-    if descriptor.route.agent_id.as_str() != "gemini" {
+    if !matches!(descriptor.route.agent_id.as_str(), "antigravity" | "gemini") {
         return endpoint_url.to_string();
     }
 
@@ -1387,30 +1387,33 @@ fn environment_base_url(
 }
 
 #[cfg(test)]
-mod gemini_base_url_tests {
+mod google_generative_ai_base_url_tests {
     use super::*;
 
     #[test]
-    fn gemini_environment_base_url_removes_api_path_suffixes() {
-        let descriptor = AgentProviderProjectionRegistry::builtin()
-            .unwrap()
-            .descriptors()
-            .find(|descriptor| descriptor.route.agent_id.as_str() == "gemini")
-            .cloned()
-            .unwrap();
+    fn google_generative_ai_environment_base_url_removes_api_path_suffixes() {
+        let registry = AgentProviderProjectionRegistry::builtin().unwrap();
 
-        assert_eq!(
-            environment_base_url(&descriptor, "https://gateway.example/v1"),
-            "https://gateway.example"
-        );
-        assert_eq!(
-            environment_base_url(&descriptor, "https://gateway.example/v1beta/"),
-            "https://gateway.example"
-        );
-        assert_eq!(
-            environment_base_url(&descriptor, "https://gateway.example/custom/"),
-            "https://gateway.example/custom"
-        );
+        for agent_id in ["antigravity", "gemini"] {
+            let descriptor = registry
+                .descriptors()
+                .find(|descriptor| descriptor.route.agent_id.as_str() == agent_id)
+                .cloned()
+                .unwrap();
+
+            assert_eq!(
+                environment_base_url(&descriptor, "https://gateway.example/v1"),
+                "https://gateway.example"
+            );
+            assert_eq!(
+                environment_base_url(&descriptor, "https://gateway.example/v1beta/"),
+                "https://gateway.example"
+            );
+            assert_eq!(
+                environment_base_url(&descriptor, "https://gateway.example/custom/"),
+                "https://gateway.example/custom"
+            );
+        }
     }
 }
 
@@ -1445,6 +1448,7 @@ fn inline_overlay_env_key(strategy: &ConfigOverlayStrategy) -> Option<&'static s
 
 fn private_home_env_key(agent_id: &str) -> Option<&'static str> {
     match agent_id {
+        "antigravity" => Some("GEMINI_HOME"),
         "copilot" => Some("COPILOT_HOME"),
         "codewhale" => Some("CODEWHALE_HOME"),
         "codex" => Some("CODEX_HOME"),
@@ -3458,8 +3462,17 @@ mod tests {
         runtime_home_env_key: Option<&'static str>,
     }
 
-    fn typed_projection_expectations() -> [TypedProjectionExpectation; 17] {
+    fn typed_projection_expectations() -> [TypedProjectionExpectation; 18] {
         [
+            TypedProjectionExpectation {
+                agent_id: "antigravity",
+                base_url_key: Some("GOOGLE_GEMINI_BASE_URL"),
+                secret_env_key: "GEMINI_API_KEY",
+                model_env_key: None,
+                overlay_path: None,
+                overlay_format: None,
+                runtime_home_env_key: Some("GEMINI_HOME"),
+            },
             TypedProjectionExpectation {
                 agent_id: "copilot",
                 base_url_key: Some("COPILOT_PROVIDER_BASE_URL"),
@@ -3950,7 +3963,7 @@ mod tests {
     fn all_typed_catalog_projectors_map_provider_env_secret_model_and_private_state() {
         let descriptors = vibex_core::catalog_projection_descriptors().unwrap();
         let expectations = typed_projection_expectations();
-        assert_eq!(expectations.len(), 17);
+        assert_eq!(expectations.len(), 18);
 
         for expected in expectations {
             let descriptor = descriptors
@@ -3996,6 +4009,11 @@ mod tests {
                     assert_eq!(key, expected_key)
                 }
                 (AgentModelControl::ManagedConfigOverlay { .. }, None) => {}
+                (AgentModelControl::AcpConfigOption { aliases }, None)
+                    if expected.agent_id == "antigravity" =>
+                {
+                    assert_eq!(aliases, &["model"])
+                }
                 (control, expected_key) => panic!(
                     "{} model control {control:?} does not match model env expectation {expected_key:?}",
                     expected.agent_id
@@ -4058,7 +4076,7 @@ mod tests {
             }
             if let Some(base_url_key) = expected.base_url_key {
                 let base_url = non_secret_env.get(base_url_key).unwrap();
-                if matches!(expected.agent_id, "gemini" | "poolside") {
+                if matches!(expected.agent_id, "antigravity" | "gemini" | "poolside") {
                     assert_eq!(base_url, "https://provider.example.invalid");
                 } else {
                     assert_eq!(base_url, "https://provider.example.invalid/v1/");

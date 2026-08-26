@@ -259,7 +259,7 @@ fn at_least_or_manual(version: &str) -> (AgentVersionPolicy, AgentVersionCompati
 
 fn mode_for(agent_id: &str) -> AgentProviderCapabilityMode {
     match agent_id {
-        "amp-acp" | "antigravity" | "auggie" | "cursor" | "devin" | "junie" | "qoder" => {
+        "amp-acp" | "auggie" | "cursor" | "devin" | "junie" | "qoder" => {
             AgentProviderCapabilityMode::AgentManaged
         }
         "kiro" => AgentProviderCapabilityMode::CloudCredential,
@@ -317,6 +317,7 @@ fn catalog_projection_shape(
 ) -> VibexResult<CatalogProjectionShape> {
     if mode == AgentProviderCapabilityMode::ReplaceableProvider {
         return match agent_id {
+            "antigravity" => Ok(antigravity_projection_shape()),
             "codebuddy-code" => Ok(environment_projection_shape(
                 "CODEBUDDY_BASE_URL",
                 "CODEBUDDY_API_KEY",
@@ -540,6 +541,33 @@ fn catalog_projection_shape(
         },
         AgentProviderCapabilityMode::ReplaceableProvider => unreachable!(),
     })
+}
+
+fn antigravity_projection_shape() -> CatalogProjectionShape {
+    CatalogProjectionShape {
+        provider_control: AgentProviderControl::Environment {
+            base_url_key: Some("GOOGLE_GEMINI_BASE_URL".to_string()),
+        },
+        credential_control: AgentCredentialControl::Environment {
+            secret_env_key: "GEMINI_API_KEY".to_string(),
+            accepted_secret_kinds: vec![ProviderSecretKind::ApiKey],
+        },
+        // Antigravity 1.0.0 ignores GEMINI_MODEL at process startup but
+        // advertises and applies the standard ACP `model` config option.
+        model_control: AgentModelControl::AcpConfigOption {
+            aliases: vec!["model".to_string()],
+        },
+        credential_kinds: vec![AgentCredentialKind::ApiKey],
+        model_interfaces: vec![catalog_interface(
+            WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI,
+            false,
+            true,
+        )],
+        runtime_home_strategy: AgentRuntimeHomeStrategy::VibexPrivate,
+        switch_behavior: ProviderSwitchBehavior::RestartAndResume,
+        evidence_state: ProjectionEvidenceState::Documented,
+        capability_diagnostic_code: Some("agent_projection_runtime_verification_required"),
+    }
 }
 
 fn environment_projection_shape(
@@ -1289,11 +1317,15 @@ mod tests {
             .unwrap();
         assert_eq!(
             antigravity.capability_mode,
-            AgentProviderCapabilityMode::AgentManaged
+            AgentProviderCapabilityMode::ReplaceableProvider
         );
         assert_eq!(
             antigravity.runtime_home_strategy,
-            AgentRuntimeHomeStrategy::AgentManaged
+            AgentRuntimeHomeStrategy::VibexPrivate
+        );
+        assert_eq!(
+            antigravity.switch_behavior,
+            ProviderSwitchBehavior::RestartAndResume
         );
         assert!(
             manifest
@@ -1574,6 +1606,7 @@ mod tests {
             }
         );
         let typed_projectors = [
+            "antigravity",
             "copilot",
             "codewhale",
             "crow-cli",
@@ -1600,7 +1633,7 @@ mod tests {
             "minion-code",
             "nova",
         ];
-        assert_eq!(typed_projectors.len(), 17);
+        assert_eq!(typed_projectors.len(), 18);
         assert_eq!(blocked_projectors.len(), 6);
 
         for descriptor in descriptors
@@ -1647,6 +1680,10 @@ mod tests {
                     AgentCredentialControl::Environment { .. }
                 ));
                 match (descriptor.provider_control, descriptor.model_control) {
+                    (
+                        AgentProviderControl::Environment { .. },
+                        AgentModelControl::AcpConfigOption { .. },
+                    ) if descriptor.route.agent_id.as_str() == "antigravity" => {}
                     (
                         AgentProviderControl::Environment { .. },
                         AgentModelControl::ProcessEnvironment { .. },
@@ -1703,6 +1740,7 @@ mod tests {
             "claude",
             "codex",
             "opencode",
+            "antigravity",
             "gemini",
             "glm-acp-agent",
             "copilot",
@@ -1735,6 +1773,10 @@ mod tests {
         };
 
         assert_eq!(
+            protocols("antigravity"),
+            vec![WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI]
+        );
+        assert_eq!(
             protocols("gemini"),
             vec![WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI]
         );
@@ -1747,6 +1789,30 @@ mod tests {
                 WIRE_PROTOCOL_OPENAI_RESPONSES,
                 WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE,
             ]
+        );
+
+        let antigravity = descriptors
+            .iter()
+            .find(|descriptor| descriptor.route.agent_id.as_str() == "antigravity")
+            .unwrap();
+        assert_eq!(
+            antigravity.provider_control,
+            AgentProviderControl::Environment {
+                base_url_key: Some("GOOGLE_GEMINI_BASE_URL".to_string())
+            }
+        );
+        assert_eq!(
+            antigravity.credential_control,
+            AgentCredentialControl::Environment {
+                secret_env_key: "GEMINI_API_KEY".to_string(),
+                accepted_secret_kinds: vec![ProviderSecretKind::ApiKey],
+            }
+        );
+        assert_eq!(
+            antigravity.model_control,
+            AgentModelControl::AcpConfigOption {
+                aliases: vec!["model".to_string()]
+            }
         );
 
         let gemini = descriptors
