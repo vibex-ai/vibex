@@ -1641,6 +1641,7 @@ pub(crate) struct AcpProcess {
     next_request_id: AtomicU64,
     pending_requests: Mutex<HashMap<u64, PendingTransportResponse>>,
     pending_prompt_requests: Mutex<HashMap<String, u64>>,
+    unbarriered_session_registrations: AtomicU64,
     probe_config_update_waiters: Mutex<HashMap<String, oneshot::Sender<Value>>>,
     /// Armed before `session/new` on a probe process. Some Agents (Copilot
     /// CLI) publish their full `configOptions` set — reasoning effort
@@ -3748,11 +3749,14 @@ impl AcpProcess {
     }
 
     fn has_pending_registration_request(&self) -> bool {
-        self.pending_requests.lock().is_ok_and(|pending| {
-            pending
-                .values()
-                .any(|response| response.registration_release.is_some())
-        })
+        self.unbarriered_session_registrations
+            .load(Ordering::Acquire)
+            > 0
+            || self.pending_requests.lock().is_ok_and(|pending| {
+                pending
+                    .values()
+                    .any(|response| response.registration_release.is_some())
+            })
     }
 
     fn buffer_available_commands(&self, params: &Value) -> bool {
@@ -10833,6 +10837,7 @@ impl AcpRuntimeClient {
             next_request_id: AtomicU64::new(1),
             pending_requests: Mutex::new(HashMap::new()),
             pending_prompt_requests: Mutex::new(HashMap::new()),
+            unbarriered_session_registrations: AtomicU64::new(0),
             probe_config_update_waiters: Mutex::new(HashMap::new()),
             probe_initial_config_update: Mutex::new(None),
             pending_available_commands: Mutex::new(PendingAvailableCommandCatalogs::default()),
@@ -11072,13 +11077,56 @@ impl AcpRuntimeClient {
         &self,
         process: &Arc<AcpProcess>,
     ) -> VibexResult<OpenedAcpSession> {
-        let (result, registration_barrier) = process
-            .request_with_registration_barrier(
-                AcpOperation::SessionNew.method(),
-                build_session_new_params(&process.workspace_root, &process.wire_mcp_servers()),
-                self.handshake_timeout,
-            )
-            .await?;
+        // Copilot publishes model-sensitive options only after the
+        // `session/new` result. A registration barrier blocks the reader at
+        // that result, so the trailing update cannot be observed until after
+        // runtime configuration has already been planned. Capture it on the
+        // unbarriered path and fold it into the attachment's initial state.
+        let (result, registration_barrier, trailing_config_update) = if process.agent_id.as_str()
+            == "copilot"
+        {
+            let config_update = process.arm_initial_probe_config_update();
+            process
+                .unbarriered_session_registrations
+                .fetch_add(1, Ordering::AcqRel);
+            let result = process
+                .request(
+                    AcpOperation::SessionNew.method(),
+                    build_session_new_params(&process.workspace_root, &process.wire_mcp_servers()),
+                    self.handshake_timeout,
+                )
+                .await;
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    process
+                        .unbarriered_session_registrations
+                        .fetch_sub(1, Ordering::AcqRel);
+                    process.disarm_initial_probe_config_update();
+                    return Err(error);
+                }
+            };
+            let update = match timeout(ACP_PROBE_CONFIG_UPDATE_TIMEOUT, config_update).await {
+                Ok(Ok(update)) => Some(update),
+                Ok(Err(_)) | Err(_) => {
+                    process.disarm_initial_probe_config_update();
+                    None
+                }
+            };
+            process
+                .unbarriered_session_registrations
+                .fetch_sub(1, Ordering::AcqRel);
+            (result, None, update)
+        } else {
+            let (result, barrier) = process
+                .request_with_registration_barrier(
+                    AcpOperation::SessionNew.method(),
+                    build_session_new_params(&process.workspace_root, &process.wire_mcp_servers()),
+                    self.handshake_timeout,
+                )
+                .await?;
+            (result, Some(barrier), None)
+        };
         let native_session_id = result
             .get("sessionId")
             .and_then(Value::as_str)
@@ -11102,10 +11150,19 @@ impl AcpRuntimeClient {
         if let Some(commands) = process.take_pending_available_commands(&native_session_id) {
             state.available_commands = commands;
         }
+        if let Some(update) = trailing_config_update {
+            apply_session_state_to_attachment(
+                &mut state,
+                &process.agent_id,
+                process.auth_source.provider_profile_id(),
+                &native_session_id,
+                &update,
+            );
+        }
         Ok(OpenedAcpSession {
             native_session_id,
             state,
-            registration_barrier: Some(registration_barrier),
+            registration_barrier,
         })
     }
 
@@ -18349,6 +18406,7 @@ mod tests {
             next_request_id: AtomicU64::new(1),
             pending_requests: Mutex::new(HashMap::new()),
             pending_prompt_requests: Mutex::new(HashMap::new()),
+            unbarriered_session_registrations: AtomicU64::new(0),
             probe_config_update_waiters: Mutex::new(HashMap::new()),
             probe_initial_config_update: Mutex::new(None),
             pending_available_commands: Mutex::new(PendingAvailableCommandCatalogs::default()),
@@ -26933,6 +26991,53 @@ for line in sys.stdin:
                 .unwrap()
                 .contains_key(&binding_id)
         );
+        fixture.cleanup();
+    }
+
+    /// Copilot can send its first config update immediately after the
+    /// `session/new` response. The normal attachment registration barrier
+    /// prevents the reader from observing that update, so Copilot's
+    /// unbarriered handshake must seed the attachment before activation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_creation_absorbs_config_update_during_registration() {
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "create-post-session-config",
+            Some(vibex_core::AgentId::parse("copilot").unwrap()),
+        ) else {
+            return;
+        };
+        fixture.enable_post_session_config_update();
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+
+        let attachment = client.current_attachment(&session_id).unwrap();
+        let state = attachment.payload().runtime_config_state();
+        assert_eq!(state.effective_reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(state.preferred_reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(
+            state.effective_mode.as_deref(),
+            Some("https://agentclientprotocol.com/protocol/session-modes#agent")
+        );
+        let planner = attachment.payload().session_config_planner().unwrap();
+        let reasoning = crate::session_config::CanonicalSessionConfigKey::parse(
+            crate::session_config::CANONICAL_REASONING_EFFORT,
+        )
+        .unwrap();
+        assert!(planner.option_for_key(&reasoning).unwrap().is_some());
+
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        client.close_session(&binding).await.unwrap();
         fixture.cleanup();
     }
 
