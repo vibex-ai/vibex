@@ -35,8 +35,8 @@ use crate::protocol::{
 };
 use crate::runtime::{
     ACP_PROBE_TIMEOUT, AcpProcess, AcpProcessLaunch, AcpProcessPurpose, AcpRuntimeClient,
-    append_projection_process_args, effective_acp_process_args, extract_current_model_id,
-    extract_model_ids, validate_restore_response,
+    append_projection_process_args, apply_startup_model_to_config, effective_acp_process_args,
+    extract_current_model_id, extract_model_ids, validate_restore_response,
 };
 
 const PROBE_SOURCE_REVISION: &str = "runtime-probe-v2";
@@ -431,7 +431,12 @@ impl AcpRuntimeClient {
                     "ACP provider profile is unavailable for this runtime probe",
                 )
             })?;
-        let config = self.profile_config(&profile_id)?;
+        let mut config = self.profile_config(&profile_id)?;
+        let target_model = projection_context
+            .projection
+            .as_ref()
+            .and_then(|projection| projection.effective_model.as_deref());
+        apply_startup_model_to_config(&mut config, profile.agent_id.as_str(), target_model);
         let process_args = materialized_probe_process_args(
             profile.agent_id.as_str(),
             &config,
@@ -604,6 +609,8 @@ impl AcpRuntimeClient {
 
             self.transition_probe_stage(record, AgentRuntimeProbeStage::ApplyingModelAndConfig)?;
             let target_model = projection.and_then(|value| value.effective_model.as_deref());
+            let startup_model = process.startup_model();
+            let is_copilot = runtime.version_identity.route.agent_id.as_str() == "copilot";
             let mut model_apply_response = None;
             let model_fact = if let Some(model) = target_model {
                 if !models.is_empty() && !models.iter().any(|candidate| candidate == model) {
@@ -611,6 +618,16 @@ impl AcpRuntimeClient {
                         capability: AgentRuntimeProbeCapability::ModelSelection,
                         status: AgentRuntimeProbeFactStatus::Failed,
                         diagnostic_code: Some("target_model_not_advertised".to_string()),
+                    }
+                } else if is_copilot {
+                    if startup_model == Some(model) {
+                        AgentRuntimeProbeFact::passed(AgentRuntimeProbeCapability::ModelSelection)
+                    } else {
+                        AgentRuntimeProbeFact {
+                            capability: AgentRuntimeProbeCapability::ModelSelection,
+                            status: AgentRuntimeProbeFactStatus::Failed,
+                            diagnostic_code: Some("startup_model_not_applied".to_string()),
+                        }
                     }
                 } else {
                     let result = process
@@ -642,6 +659,8 @@ impl AcpRuntimeClient {
                         },
                     }
                 }
+            } else if is_copilot && startup_model.is_some() {
+                AgentRuntimeProbeFact::passed(AgentRuntimeProbeCapability::ModelSelection)
             } else if extract_current_model_id(&session).is_some() {
                 AgentRuntimeProbeFact::passed(AgentRuntimeProbeCapability::ModelSelection)
             } else {
@@ -676,6 +695,7 @@ impl AcpRuntimeClient {
                 &initialize,
                 &session,
                 model_apply_response.as_ref(),
+                startup_model,
                 projection,
                 expected_provider_identities,
             );
@@ -1147,6 +1167,7 @@ fn effective_provider_fact(
     initialize: &Value,
     session: &Value,
     model_apply_response: Option<&Value>,
+    startup_model: Option<&str>,
     projection: Option<&vibex_config_switch::ResolvedAgentProviderProjection>,
     expected_provider_identities: &[String],
 ) -> AgentRuntimeProbeFact {
@@ -1169,7 +1190,8 @@ fn effective_provider_fact(
     let current_model = model_apply_response
         .and_then(extract_current_model_id)
         .or_else(|| extract_current_model_id(session))
-        .or_else(|| extract_current_model_id(initialize));
+        .or_else(|| extract_current_model_id(initialize))
+        .or_else(|| startup_model.map(ToString::to_string));
     classify_effective_provider(
         explicit,
         expected_provider_identities,
@@ -1480,12 +1502,38 @@ mod tests {
             fingerprint: "sha256:0123456789abcdef".to_string(),
         };
         let session = json!({"models": {"availableModels": [{"modelId": "target-model"}]}});
-        let fact = effective_provider_fact(&json!({}), &session, None, Some(&projection), &[]);
+        let fact =
+            effective_provider_fact(&json!({}), &session, None, None, Some(&projection), &[]);
         assert_eq!(fact.status, AgentRuntimeProbeFactStatus::Blocked);
         assert_eq!(
             fact.diagnostic_code.as_deref(),
             Some("effective_provider_not_confirmed")
         );
+    }
+
+    #[test]
+    fn startup_model_confirms_model_when_copilot_omits_current_model() {
+        let projection = ResolvedAgentProviderProjection {
+            binding_id: AgentModelProviderBindingId::new(),
+            non_secret_env: BTreeMap::new(),
+            secret_env: Vec::new(),
+            overlay_root: PathBuf::from("probe-root"),
+            overlay_files: Vec::new(),
+            process_args: Vec::new(),
+            session_config: Vec::new(),
+            effective_model: Some("target-model".to_string()),
+            switch_behavior: ProviderSwitchBehavior::RestartAndResume,
+            fingerprint: "sha256:0123456789abcdef".to_string(),
+        };
+        let fact = effective_provider_fact(
+            &json!({"endpoint": "https://profile.example"}),
+            &json!({}),
+            None,
+            Some("target-model"),
+            Some(&projection),
+            &["https://profile.example".to_string()],
+        );
+        assert_eq!(fact.status, AgentRuntimeProbeFactStatus::Passed);
     }
 
     #[test]
@@ -1632,6 +1680,36 @@ mod tests {
                 stakpak_config_path.to_string_lossy().as_ref(),
                 "acp",
             ]
+        );
+    }
+
+    #[test]
+    fn copilot_probe_args_replace_existing_model_with_startup_projection() {
+        let mut config = AcpProviderConfig {
+            command: "copilot".to_string(),
+            args: vec![
+                "--acp".to_string(),
+                "--model=stale-model".to_string(),
+                "--model".to_string(),
+                "older-model".to_string(),
+            ],
+            env: Vec::new(),
+            cwd_template: Some("{workspaceRoot}".to_string()),
+            process_strategy: AcpProcessStrategy::PerSession,
+            terminal_tools: false,
+            terminal_auth: false,
+            models: Vec::new(),
+            modes: Vec::new(),
+            features: Vec::new(),
+            disabled_tools: Vec::new(),
+        };
+
+        apply_startup_model_to_config(&mut config, "copilot", Some("target-model"));
+
+        assert_eq!(config.args, vec!["--acp", "--model", "target-model"]);
+        assert_eq!(
+            crate::runtime::startup_model_from_config(&config, "copilot").as_deref(),
+            Some("target-model")
         );
     }
 

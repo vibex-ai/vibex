@@ -157,12 +157,19 @@ agent_auth_model_catalog_snapshots(
 - Agent account model snapshots are keyed by context id, positive context
   revision, and runtime fingerprint. Their model descriptors and per-model
   reasoning/mode/features are evidence from that exact authenticated launch.
-- Account discovery switches each enumerated model inside the same short-lived
-  authenticated ACP session and captures the resulting reasoning, mode, and
-  generic options. A direct catalog such as Codex `model/list` remains
-  authoritative for model ids and reasoning levels, while model-scoped ACP
-  responses supply modes and generic options. One model's current controls
-  must never be copied across every model.
+- Account discovery normally switches each enumerated model inside the same
+  short-lived authenticated ACP session and captures the resulting reasoning,
+  mode, and generic options. A direct catalog such as Codex `model/list`
+  remains authoritative for model ids and reasoning levels, while
+  model-scoped ACP responses supply modes and generic options. One model's
+  current controls must never be copied across every model.
+- Agents with process-scoped model selection are the explicit exception:
+  Copilot receives `--model <id>` at process launch, so discovery starts one
+  short-lived authenticated process per model and never sends
+  `session/set_model` on that process. A Copilot runtime model change is
+  therefore `RestartAndResume`, not live ACP mutation; the initial discovery
+  process may only enumerate models and collect profile-level fallback
+  controls.
 - A source summary is published independently from `options`. An authenticated
   Agent account with no enumerated models publishes one `AgentDefault` option,
   not a guessed model id. The serialized projection key is `agent-default`;

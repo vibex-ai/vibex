@@ -336,7 +336,7 @@ pub(crate) struct AcpProcessLaunch<'a> {
 /// Copilot selects its model when the CLI process starts.  It does not expose
 /// the model through ACP's live session configuration operations, so the
 /// selected product model must be part of the process launch configuration.
-fn apply_startup_model_to_config(
+pub(crate) fn apply_startup_model_to_config(
     config: &mut AcpProviderConfig,
     agent_id: &str,
     model: Option<&str>,
@@ -369,7 +369,10 @@ fn apply_startup_model_to_config(
     config.args = args;
 }
 
-fn startup_model_from_config(config: &AcpProviderConfig, agent_id: &str) -> Option<String> {
+pub(crate) fn startup_model_from_config(
+    config: &AcpProviderConfig,
+    agent_id: &str,
+) -> Option<String> {
     if agent_id != "copilot" {
         return None;
     }
@@ -389,6 +392,7 @@ fn startup_model_from_config(config: &AcpProviderConfig, agent_id: &str) -> Opti
     None
 }
 
+#[derive(Clone, Copy)]
 struct AcpAuthSourceLaunchContext<'a> {
     auth_source: &'a RuntimeAuthSource,
     auth_source_revision: i64,
@@ -3446,6 +3450,10 @@ impl AcpSessionAttachment {
 }
 
 impl AcpProcess {
+    pub(crate) fn startup_model(&self) -> Option<&str> {
+        self.startup_model.as_deref()
+    }
+
     fn runtime_model_id(&self, product_model_id: &str) -> String {
         self.model_id_projection.runtime_id(product_model_id)
     }
@@ -14947,6 +14955,33 @@ async fn probe_runtime_session_configs_with_config(
         config,
         env_unsets,
     } = source;
+    if agent_id.as_str() == "copilot"
+        && !matches!(&targets, RuntimeSessionProbeTargets::Explicit(models) if models.len() == 1)
+    {
+        return probe_copilot_runtime_session_configs_with_config(
+            client,
+            AcpAuthSourceLaunchContext {
+                auth_source,
+                auth_source_revision,
+                agent_id,
+                config,
+                env_unsets,
+            },
+            materialized_env,
+            targets,
+        )
+        .await;
+    }
+    let startup_model = match &targets {
+        RuntimeSessionProbeTargets::Explicit(models)
+            if agent_id.as_str() == "copilot" && models.len() == 1 =>
+        {
+            models.first().map(String::as_str)
+        }
+        _ => None,
+    };
+    let mut launch_config = config.clone();
+    apply_startup_model_to_config(&mut launch_config, agent_id.as_str(), startup_model);
     let probe_cwd = std::env::var("HOME")
         .map(PathBuf::from)
         .ok()
@@ -14960,7 +14995,7 @@ async fn probe_runtime_session_configs_with_config(
                 auth_source,
                 auth_source_revision,
                 agent_id,
-                config,
+                config: &launch_config,
                 cwd: &probe_cwd,
                 runtime_resources: &probe_resources,
                 env_unsets,
@@ -15001,6 +15036,9 @@ async fn probe_runtime_session_configs_with_config(
                     None
                 }
             };
+        let model_config_update = (agent_id.as_str() == "copilot")
+            .then(|| initial_config_update.clone())
+            .flatten();
         let session = session?;
         let initial = runtime_session_probe_from_response(
             &process,
@@ -15021,7 +15059,7 @@ async fn probe_runtime_session_configs_with_config(
                 &initialize,
                 &session,
                 Some(&model_id),
-                None,
+                model_config_update.clone(),
             )
             .await;
             model_results.push((model_id, result));
@@ -15033,6 +15071,120 @@ async fn probe_runtime_session_configs_with_config(
     };
 
     let probed = probe.await;
+    process.shutdown().await;
+    probed
+}
+
+/// Copilot binds its model to the CLI process. Discover the initial catalog
+/// once, then launch one short-lived process per model so model-scoped options
+/// are collected without pretending that ACP can mutate the live session.
+async fn probe_copilot_runtime_session_configs_with_config(
+    client: &AcpRuntimeClient,
+    source: AcpAuthSourceLaunchContext<'_>,
+    materialized_env: Option<Vec<(String, String)>>,
+    targets: RuntimeSessionProbeTargets<'_>,
+) -> VibexResult<AcpRuntimeSessionProbeBatch> {
+    let target_models = match targets {
+        RuntimeSessionProbeTargets::Explicit(models) => Some(models.to_vec()),
+        RuntimeSessionProbeTargets::Discovered => None,
+    };
+    let initial =
+        probe_copilot_runtime_session_once(client, source, materialized_env.clone(), None).await?;
+    let target_models = target_models.unwrap_or_else(|| initial.models.clone());
+    let mut model_results = Vec::with_capacity(target_models.len());
+    for model_id in target_models {
+        let result = probe_copilot_runtime_session_once(
+            client,
+            source,
+            materialized_env.clone(),
+            Some(&model_id),
+        )
+        .await;
+        model_results.push((model_id, result));
+    }
+    Ok(AcpRuntimeSessionProbeBatch {
+        initial,
+        model_results,
+    })
+}
+
+async fn probe_copilot_runtime_session_once(
+    client: &AcpRuntimeClient,
+    source: AcpAuthSourceLaunchContext<'_>,
+    materialized_env: Option<Vec<(String, String)>>,
+    target_model: Option<&str>,
+) -> VibexResult<AcpRuntimeSessionProbe> {
+    let AcpAuthSourceLaunchContext {
+        auth_source,
+        auth_source_revision,
+        agent_id,
+        config,
+        env_unsets,
+    } = source;
+    let mut launch_config = config.clone();
+    apply_startup_model_to_config(&mut launch_config, agent_id.as_str(), target_model);
+    let probe_cwd = std::env::var("HOME")
+        .map(PathBuf::from)
+        .ok()
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(std::env::temp_dir);
+    let probe_resources = ProviderRuntimeResources::default();
+    let process = client
+        .spawn_process(
+            AcpProcessInstanceId::new(),
+            AcpProcessLaunch {
+                auth_source,
+                auth_source_revision,
+                agent_id,
+                config: &launch_config,
+                cwd: &probe_cwd,
+                runtime_resources: &probe_resources,
+                env_unsets,
+                purpose: AcpProcessPurpose::Probe,
+                process_strategy_effective: AcpProcessStrategy::PerSession,
+                pool_fallback_reason: None,
+            },
+            None,
+            materialized_env,
+            None,
+        )
+        .await?;
+
+    let probed = async {
+        let initialize = process
+            .request(
+                AcpOperation::Initialize.method(),
+                build_initialize_params(false, false, false, false, false),
+                ACP_PROBE_TIMEOUT,
+            )
+            .await?;
+        let initial_config_update = process.arm_initial_probe_config_update();
+        let session = process
+            .request(
+                AcpOperation::SessionNew.method(),
+                build_session_new_params(&probe_cwd, &[]),
+                ACP_PROBE_TIMEOUT,
+            )
+            .await;
+        let initial_config_update =
+            match timeout(ACP_PROBE_CONFIG_UPDATE_TIMEOUT, initial_config_update).await {
+                Ok(Ok(update)) => Some(update),
+                Ok(Err(_)) | Err(_) => {
+                    process.disarm_initial_probe_config_update();
+                    None
+                }
+            };
+        let session = session?;
+        runtime_session_probe_from_response(
+            &process,
+            &initialize,
+            &session,
+            target_model,
+            initial_config_update,
+        )
+        .await
+    }
+    .await;
     process.shutdown().await;
     probed
 }
@@ -15056,67 +15208,80 @@ async fn runtime_session_probe_from_response(
                     "ACP session/new did not return a session identity",
                 )
             })?;
-        let model_config_id = model_config_options(session)
-            .into_iter()
-            .find_map(|option| {
-                option
-                    .get("id")
-                    .or_else(|| option.get("configId"))
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string)
-            });
-        let initial_config_update = process.register_probe_config_update(native_session_id);
-        let (response, config_update) = if let Some(config_id) = model_config_id {
-            match process
-                .request(
-                    AcpOperation::SessionSetConfigOption.method(),
-                    protocol::build_session_set_config_option_raw_params(
-                        native_session_id,
-                        &config_id,
-                        json!(model_id),
-                    ),
-                    ACP_PROBE_TIMEOUT,
-                )
-                .await
-            {
-                Ok(response) => (response, initial_config_update),
-                Err(_) => {
-                    process.cancel_probe_config_update(native_session_id);
-                    let fallback_config_update =
-                        process.register_probe_config_update(native_session_id);
-                    let response = process
-                        .request(
-                            AcpOperation::SessionSetModel.method(),
-                            protocol::build_session_set_model_params(native_session_id, model_id),
-                            ACP_PROBE_TIMEOUT,
-                        )
-                        .await?;
-                    (response, fallback_config_update)
-                }
+        if process.agent_id.as_str() == "copilot" {
+            if process.startup_model() != Some(model_id) {
+                return Err(VibexError::provider(
+                    "agent_runtime_probe_startup_model_mismatch",
+                    "Copilot probe process was not started with the requested model",
+                ));
             }
+            (None, initial_config_update)
         } else {
-            let response = process
-                .request(
-                    AcpOperation::SessionSetModel.method(),
-                    protocol::build_session_set_model_params(native_session_id, model_id),
-                    ACP_PROBE_TIMEOUT,
-                )
-                .await?;
-            (response, initial_config_update)
-        };
-        let config_update = if response_has_config_options(&response) {
-            process.cancel_probe_config_update(native_session_id);
-            None
-        } else {
-            match timeout(ACP_PROBE_CONFIG_UPDATE_TIMEOUT, config_update).await {
-                Ok(Ok(update)) => Some(update),
-                Ok(Err(_)) | Err(_) => {
-                    process.cancel_probe_config_update(native_session_id);
-                    None
+            let model_config_id = model_config_options(session)
+                .into_iter()
+                .find_map(|option| {
+                    option
+                        .get("id")
+                        .or_else(|| option.get("configId"))
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                });
+            let initial_config_update = process.register_probe_config_update(native_session_id);
+            let (response, config_update) = if let Some(config_id) = model_config_id {
+                match process
+                    .request(
+                        AcpOperation::SessionSetConfigOption.method(),
+                        protocol::build_session_set_config_option_raw_params(
+                            native_session_id,
+                            &config_id,
+                            json!(model_id),
+                        ),
+                        ACP_PROBE_TIMEOUT,
+                    )
+                    .await
+                {
+                    Ok(response) => (response, initial_config_update),
+                    Err(_) => {
+                        process.cancel_probe_config_update(native_session_id);
+                        let fallback_config_update =
+                            process.register_probe_config_update(native_session_id);
+                        let response = process
+                            .request(
+                                AcpOperation::SessionSetModel.method(),
+                                protocol::build_session_set_model_params(
+                                    native_session_id,
+                                    model_id,
+                                ),
+                                ACP_PROBE_TIMEOUT,
+                            )
+                            .await?;
+                        (response, fallback_config_update)
+                    }
                 }
-            }
-        };
-        (Some(response), config_update)
+            } else {
+                let response = process
+                    .request(
+                        AcpOperation::SessionSetModel.method(),
+                        protocol::build_session_set_model_params(native_session_id, model_id),
+                        ACP_PROBE_TIMEOUT,
+                    )
+                    .await?;
+                (response, initial_config_update)
+            };
+            let config_update = if response_has_config_options(&response) {
+                process.cancel_probe_config_update(native_session_id);
+                None
+            } else {
+                match timeout(ACP_PROBE_CONFIG_UPDATE_TIMEOUT, config_update).await {
+                    Ok(Ok(update)) => Some(update),
+                    Ok(Err(_)) | Err(_) => {
+                        process.cancel_probe_config_update(native_session_id);
+                        None
+                    }
+                }
+            };
+            (Some(response), config_update)
+        }
     } else {
         (None, initial_config_update)
     };
@@ -23909,6 +24074,48 @@ for line in sys.stdin:
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn copilot_agent_account_discovery_starts_each_model_without_live_switch() {
+        let agent_id = AgentId::parse("copilot").unwrap();
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "copilot-agent-account-model-discovery",
+            Some(agent_id.clone()),
+        ) else {
+            return;
+        };
+        configure_mock_default_agent_runtime(&fixture, &agent_id);
+        let client = fixture.client();
+        let conn = open_database(&fixture.db_path).unwrap();
+        let context = AgentAuthContextRepository::ensure_default(&conn, &agent_id).unwrap();
+        drop(conn);
+
+        let snapshot = client
+            .discover_agent_auth_model_catalog(&context)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            snapshot.discovery_source,
+            AgentModelDiscoverySource::SessionConfig
+        );
+        assert_eq!(snapshot.status, AgentAuthModelCatalogStatus::Available);
+        assert_eq!(
+            snapshot
+                .models
+                .iter()
+                .map(|model| model.model_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mock/model-1", "mock/model-2"]
+        );
+        assert!(snapshot.runtime_options_complete);
+
+        let log = fixture.request_log();
+        assert_eq!(logged_request_count(&log, "initialize"), 3);
+        assert_eq!(logged_request_count(&log, "session/new"), 3);
+        assert_eq!(logged_request_count(&log, "session/set_model"), 0);
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn codex_account_discovery_merges_direct_reasoning_with_acp_controls() {
         let agent_id = AgentId::parse("codex").unwrap();
         let Some(fixture) =
@@ -27296,6 +27503,38 @@ for line in sys.stdin:
 
         let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
         client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn copilot_model_probe_uses_startup_model_without_session_set_model() {
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "copilot-model-probe-startup",
+            Some(vibex_core::AgentId::parse("copilot").unwrap()),
+        ) else {
+            return;
+        };
+        fixture.enable_post_session_config_update();
+        let client = AcpRuntimeClient::new(ProviderConfigService::new(fixture.db_path.clone()));
+
+        let probed = client
+            .probe_runtime_session_config_for_model(&fixture.profile_id, "mock/model-2")
+            .await
+            .unwrap();
+
+        assert_eq!(probed.models, vec!["mock/model-2".to_string()]);
+        assert_eq!(
+            probed
+                .reasoning_efforts
+                .iter()
+                .map(|effort| effort.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high"]
+        );
+        assert_eq!(
+            logged_request_count(&fixture.request_log(), "session/set_model"),
+            0
+        );
         fixture.cleanup();
     }
 
