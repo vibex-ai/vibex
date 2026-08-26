@@ -225,6 +225,7 @@ const OPENCODE_INLINE_CONFIG_ENV: &str = "OPENCODE_CONFIG_CONTENT";
 const OPENCODE_PROVIDER_API_KEY_ENV: &str = "VIBEX_OPENCODE_PROVIDER_API_KEY";
 const OPENCODE_MODEL_API_ERROR_CODE: &str = "opencode_model_api_error";
 const OPENCODE_MODEL_API_RETRYING_CODE: &str = "opencode_model_api_retrying";
+const GROK_MODEL_API_UNAVAILABLE_CODE: &str = "grok_model_api_unavailable";
 const ACP_TURN_STOPPED_ERROR_CODE: &str = "acp_turn_stopped_abnormally";
 const CODEX_STREAM_RECONNECTING_CODE: &str = "codex_stream_reconnecting";
 const CODEX_STREAM_RECONNECT_EXHAUSTED_CODE: &str = "codex_stream_reconnect_exhausted";
@@ -1195,6 +1196,24 @@ fn codex_terminal_http_status(text: &str) -> Option<u16> {
     };
     parts.next()?;
     (400..=599).contains(&status).then_some(status)
+}
+
+fn grok_upstream_capacity_failure(
+    agent_id: &AgentId,
+    method: &str,
+    rpc_code: &str,
+    stderr_summary: &str,
+) -> bool {
+    if agent_id.as_str() != GROK_AGENT_ID
+        || method != AcpOperation::SessionPrompt.method()
+        || rpc_code != "-32603"
+    {
+        return false;
+    }
+    let lower = stderr_summary.to_ascii_lowercase();
+    lower.contains("503 service unavailable")
+        || lower.contains("waiting for service resource allocation")
+        || lower.contains("model is at capacity")
 }
 
 /// Some ACP adapters surface a terminal provider failure as an ordinary
@@ -4086,7 +4105,14 @@ impl AcpProcess {
                         .as_deref()
                         .unwrap_or(failure.message.as_str()),
                 );
-                let stderr_summary = self.stderr_summary().unwrap_or_default();
+                let mut stderr_summary = self.stderr_summary().unwrap_or_default();
+                if self.agent_id.as_str() == GROK_AGENT_ID
+                    && method == AcpOperation::SessionPrompt.method()
+                    && failure.code == "-32603"
+                    && stderr_summary.is_empty()
+                {
+                    stderr_summary = self.wait_for_stderr_summary().await.unwrap_or_default();
+                }
                 if failure_requires_authentication
                     || acp_authentication_required_text(&rpc_message)
                     || acp_authentication_required_text(&stderr_summary)
@@ -4096,6 +4122,24 @@ impl AcpProcess {
                         &rpc_message,
                         &stderr_summary,
                     ));
+                }
+                if grok_upstream_capacity_failure(
+                    &self.agent_id,
+                    method,
+                    &failure.code,
+                    &stderr_summary,
+                ) {
+                    return Err(VibexError::provider(
+                        GROK_MODEL_API_UNAVAILABLE_CODE,
+                        "Grok model service is temporarily unavailable",
+                    )
+                    .with_recovery_hint(
+                        "Retry later or switch to another configured model/provider.",
+                    )
+                    .with_diagnostic("method", method)
+                    .with_diagnostic("rpcCode", failure.code)
+                    .with_diagnostic("rpcMessage", rpc_message)
+                    .with_diagnostic("stderrSummary", stderr_summary));
                 }
                 if latest_stream_error.is_some() || failure.code == OPENCODE_MODEL_API_ERROR_CODE {
                     Err(VibexError::provider(
@@ -17977,6 +18021,35 @@ mod tests {
         assert!(!provider_terminal_error_text("model stream recovered"));
         assert!(provider_terminal_error_text(
             "Error: provider request failed"
+        ));
+    }
+
+    #[test]
+    fn grok_internal_error_preserves_upstream_capacity_failure() {
+        let grok = AgentId::parse(GROK_AGENT_ID).unwrap();
+        assert!(grok_upstream_capacity_failure(
+            &grok,
+            AcpOperation::SessionPrompt.method(),
+            "-32603",
+            "503 Service Unavailable: waiting for service resource allocation"
+        ));
+        assert!(!grok_upstream_capacity_failure(
+            &grok,
+            AcpOperation::SessionNew.method(),
+            "-32603",
+            "503 Service Unavailable"
+        ));
+        assert!(!grok_upstream_capacity_failure(
+            &AgentId::parse(OPENCODE_AGENT_ID).unwrap(),
+            AcpOperation::SessionPrompt.method(),
+            "-32603",
+            "503 Service Unavailable"
+        ));
+        assert!(!grok_upstream_capacity_failure(
+            &grok,
+            AcpOperation::SessionPrompt.method(),
+            "-32603",
+            "serialization error: missing field id"
         ));
     }
 
