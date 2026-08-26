@@ -542,10 +542,7 @@ impl AcpRuntimeClient {
                     timeout_duration.min(ACP_PROBE_TIMEOUT),
                 )
                 .await?;
-            let agent_version = initialize
-                .get("agentInfo")
-                .and_then(|info| info.get("version"))
-                .and_then(Value::as_str)
+            let agent_version = extract_reported_agent_version(&initialize)
                 .map(safe_identity_value)
                 .filter(|value| !value.is_empty());
             let adapter_version = runtime.version_identity.adapter_version.clone();
@@ -1239,6 +1236,19 @@ fn normalize_provider_identity(value: &str) -> Option<String> {
     Some(url.origin().ascii_serialization().to_ascii_lowercase())
 }
 
+fn extract_reported_agent_version(initialize: &Value) -> Option<&str> {
+    initialize
+        .get("agentInfo")
+        .and_then(|info| info.get("version"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            initialize
+                .get("_meta")
+                .and_then(|meta| meta.get("agentVersion"))
+                .and_then(Value::as_str)
+        })
+}
+
 fn binary_identity_fact(
     runtime: &AgentRuntimeProfile,
     observed_agent_version: Option<&str>,
@@ -1435,6 +1445,23 @@ mod tests {
         assert_eq!(
             classify_authentication(Some(true), false).status,
             AgentRuntimeProbeFactStatus::Passed
+        );
+    }
+
+    #[test]
+    fn reported_agent_version_accepts_standard_and_grok_metadata() {
+        assert_eq!(
+            extract_reported_agent_version(&json!({
+                "agentInfo": {"version": "2.0.0"},
+                "_meta": {"agentVersion": "1.0.8"}
+            })),
+            Some("2.0.0")
+        );
+        assert_eq!(
+            extract_reported_agent_version(&json!({
+                "_meta": {"agentVersion": "1.0.8"}
+            })),
+            Some("1.0.8")
         );
     }
 
