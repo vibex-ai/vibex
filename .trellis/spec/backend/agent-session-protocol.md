@@ -356,6 +356,18 @@ let options = catalog.list().await?;
 The successful Agent snapshot provides fast fallback; real sessions calibrate
 only their own Profiles without probing during a catalog read.
 
+### CodeBuddy Code ACP compatibility note
+
+CodeBuddy Code 2.137.1 advertises reasoning as the `thought_level` select
+config option (category `thought_level`), while Vibex persists the
+provider-neutral selection as `reasoning_effort`. The ACP attachment planner
+must register `thought_level` as an Agent-dialect alias and send the selected
+value back with `session/set_config_option { configId: "thought_level" }`.
+Without that alias, `session/new` can succeed but `apply_session_config` fails
+with `runtime_switch_configuration_unavailable`, leaving the Logical Session
+stuck in `initializing`. Keep this alias capability scoped to CodeBuddy rather
+than exposing a provider-specific key in Core or UI contracts.
+
 ## Scenario: Claude ACP Extension And Transcript Compensation
 
 ### 1. Scope / Trigger

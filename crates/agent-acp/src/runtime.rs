@@ -12971,6 +12971,23 @@ fn apply_startup_model_to_attachment_state(process: &AcpProcess, state: &mut Acp
     }
 }
 
+fn add_dialect_session_config_aliases(
+    agent_id: &AgentId,
+    aliases: &mut BTreeMap<String, Vec<String>>,
+) {
+    if matches!(agent_id.as_str(), PI_AGENT_ID | "codebuddy-code") {
+        let reasoning_aliases = aliases
+            .entry(crate::session_config::CANONICAL_REASONING_EFFORT.to_string())
+            .or_default();
+        if !reasoning_aliases
+            .iter()
+            .any(|alias| alias == "thought_level")
+        {
+            reasoning_aliases.push("thought_level".to_string());
+        }
+    }
+}
+
 fn agent_session_config_probe_from_state(
     state: &ProviderSessionConfigState,
 ) -> AgentSessionConfigProbe {
@@ -13005,12 +13022,7 @@ impl AcpRuntimeClient {
             })
             .cloned()
             .unwrap_or_default();
-        if process.agent_id.as_str() == PI_AGENT_ID {
-            aliases
-                .entry(crate::session_config::CANONICAL_REASONING_EFFORT.to_string())
-                .or_default()
-                .push("thought_level".to_string());
-        }
+        add_dialect_session_config_aliases(&process.agent_id, &mut aliases);
         let mut operations = process.operation_evidence(generation);
         if !discovery.options.is_empty() {
             operations
@@ -20213,6 +20225,70 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
                 .collect::<Vec<_>>(),
             vec!["model"]
         );
+    }
+
+    #[test]
+    fn codebuddy_maps_thought_level_to_canonical_reasoning_effort() {
+        let mut aliases = BTreeMap::new();
+        add_dialect_session_config_aliases(
+            &AgentId::parse("codebuddy-code").unwrap(),
+            &mut aliases,
+        );
+        let options = extract_provider_session_config_state(
+            &json!({
+                "configOptions": [{
+                    "id": "thought_level",
+                    "name": "Deep Thinking",
+                    "category": "thought_level",
+                    "type": "select",
+                    "currentValue": "enabled",
+                    "options": [
+                        { "value": "minimal", "name": "Minimal" },
+                        { "value": "enabled", "name": "On (default)" }
+                    ]
+                }]
+            }),
+            Some(&AgentId::parse("codebuddy-code").unwrap()),
+            None,
+            Some("native-codebuddy"),
+        )
+        .unwrap()
+        .options;
+        let planner = SessionConfigPlanner::new(
+            "codebuddy-code-acp@2.137.1",
+            1,
+            aliases,
+            BTreeMap::from([(
+                AcpOperation::SessionSetConfigOption,
+                SessionConfigOperationEvidence {
+                    support: CapabilitySupport::Supported,
+                    source: CapabilitySource::NegotiatedRuntime,
+                    encoding: AcpWireEncoding::VersionedRaw,
+                    stability: AcpOperationStability::VersionedUnstable,
+                    compatibility_identity: "codebuddy-code-acp@2.137.1".to_string(),
+                    activation_generation: 1,
+                },
+            )]),
+            options,
+        );
+        let plan = planner
+            .plan(&SessionConfigFieldRequest {
+                key: CanonicalSessionConfigKey::parse(
+                    crate::session_config::CANONICAL_REASONING_EFFORT,
+                )
+                .unwrap(),
+                kind: SessionConfigFieldKind::ReasoningEffort,
+                value: "minimal".to_string(),
+            })
+            .unwrap();
+        assert!(matches!(
+            plan,
+            SessionConfigPlan::Live {
+                operation: AcpOperation::SessionSetConfigOption,
+                option_id: Some(ref option_id),
+                ..
+            } if option_id == "thought_level"
+        ));
     }
 
     #[test]
