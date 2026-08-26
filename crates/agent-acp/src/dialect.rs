@@ -230,6 +230,26 @@ const AGENT_DIALECT_PROFILES: &[AgentDialectProfile] = &[
             AgentHostRequestDialect::GrokAskUserQuestion,
             AgentHostRequestDialect::GrokExitPlanMode,
         ]),
+    // Copilot CLI activates BYOK purely from `COPILOT_PROVIDER_BASE_URL`
+    // (`copilot help providers`): when that variable is present the CLI stops
+    // using the GitHub login entirely. An inherited value from a dev shell
+    // would therefore silently redirect an agent-account session to a foreign
+    // endpoint, so the whole `COPILOT_PROVIDER_*` credential surface is cleared
+    // on that path. A provider profile sets these keys explicitly and stays
+    // authoritative.
+    AgentDialectProfile::generic("copilot")
+        .profiled("`COPILOT_PROVIDER_BASE_URL` alone switches the CLI off the GitHub login")
+        .with_credential_scrub(&[
+            "COPILOT_PROVIDER_BASE_URL",
+            "COPILOT_PROVIDER_API_KEY",
+            "COPILOT_PROVIDER_BEARER_TOKEN",
+            "COPILOT_PROVIDER_TYPE",
+            "COPILOT_PROVIDER_WIRE_API",
+            "COPILOT_PROVIDER_HEADERS",
+            "COPILOT_PROVIDER_MODEL_ID",
+            "COPILOT_PROVIDER_WIRE_MODEL",
+            "COPILOT_MODEL",
+        ]),
     // cursor-agent reads `~/.cursor/mcp.json`, shared with the IDE. A stale
     // `CURSOR_API_KEY` makes the CLI validate that key instead of falling back
     // to the browser login credential.
@@ -359,6 +379,30 @@ mod tests {
                 .mcp_wire_delivery
                 .forwards_servers()
         );
+    }
+
+    /// BYOK activates from the presence of `COPILOT_PROVIDER_BASE_URL` alone,
+    /// so an inherited dev-shell value would redirect an agent-account session
+    /// to a foreign endpoint without any visible signal.
+    #[test]
+    fn copilot_scrubs_the_whole_byok_env_surface_on_the_agent_account_path() {
+        let copilot = agent_dialect_profile("copilot");
+        assert_eq!(copilot.support_tier, AgentSupportTier::DialectProfiled);
+        for key in [
+            "COPILOT_PROVIDER_BASE_URL",
+            "COPILOT_PROVIDER_API_KEY",
+            "COPILOT_PROVIDER_BEARER_TOKEN",
+            "COPILOT_MODEL",
+        ] {
+            assert!(
+                copilot.credential_env_keys_to_unset.contains(&key),
+                "{key} must be cleared before an agent-account launch"
+            );
+        }
+        // Copilot has no launch-flag or MCP deviation; the catalog command
+        // already carries `--acp` and the private home isolates its config.
+        assert!(copilot.launch_args.is_empty());
+        assert!(copilot.mcp_wire_delivery.forwards_servers());
     }
 
     #[test]

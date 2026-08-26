@@ -145,7 +145,7 @@ use crate::session_attachment_registry::{
 use crate::session_config::{
     CanonicalSessionConfigKey, SessionConfigFieldKind, SessionConfigFieldRequest,
     SessionConfigOperationEvidence, SessionConfigPlan, SessionConfigPlanner, normalize_identifier,
-    validate_effort_value, validate_model_value,
+    validate_effort_value, validate_mode_value, validate_model_value,
 };
 use crate::session_restore::{
     RestoreCapabilityEvidence, RestoreCapabilityMap, classify_restore_error,
@@ -1642,6 +1642,14 @@ pub(crate) struct AcpProcess {
     pending_requests: Mutex<HashMap<u64, PendingTransportResponse>>,
     pending_prompt_requests: Mutex<HashMap<String, u64>>,
     probe_config_update_waiters: Mutex<HashMap<String, oneshot::Sender<Value>>>,
+    /// Armed before `session/new` on a probe process. Some Agents (Copilot
+    /// CLI) publish their full `configOptions` set — reasoning effort
+    /// included — only in an unsolicited `config_option_update` that follows
+    /// the `session/new` result. The native session id is not known until
+    /// that result arrives, so the keyed waiter above cannot win that race;
+    /// this session-agnostic slot can, because a probe process serves exactly
+    /// one session.
+    probe_initial_config_update: Mutex<Option<oneshot::Sender<Value>>>,
     pending_available_commands: Mutex<PendingAvailableCommandCatalogs>,
     active_terminal_owners: Mutex<HashMap<TerminalId, Weak<AcpSessionAttachment>>>,
     request_admission: Mutex<()>,
@@ -5058,6 +5066,22 @@ impl AcpProcess {
         receiver
     }
 
+    /// Arms the session-agnostic probe slot. Must be called *before*
+    /// `session/new` so an immediate `config_option_update` cannot be dropped.
+    fn arm_initial_probe_config_update(&self) -> oneshot::Receiver<Value> {
+        let (sender, receiver) = oneshot::channel();
+        if let Ok(mut slot) = self.probe_initial_config_update.lock() {
+            *slot = Some(sender);
+        }
+        receiver
+    }
+
+    fn disarm_initial_probe_config_update(&self) {
+        if let Ok(mut slot) = self.probe_initial_config_update.lock() {
+            *slot = None;
+        }
+    }
+
     fn cancel_probe_config_update(&self, native_session_id: &str) {
         if let Ok(mut waiters) = self.probe_config_update_waiters.lock() {
             waiters.remove(native_session_id);
@@ -5085,7 +5109,13 @@ impl AcpProcess {
             .probe_config_update_waiters
             .lock()
             .ok()
-            .and_then(|mut waiters| waiters.remove(native_session_id));
+            .and_then(|mut waiters| waiters.remove(native_session_id))
+            .or_else(|| {
+                self.probe_initial_config_update
+                    .lock()
+                    .ok()
+                    .and_then(|mut slot| slot.take())
+            });
         let Some(sender) = sender else {
             return false;
         };
@@ -6775,8 +6805,7 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
             }
         }
         if let Some(mode) = effective_selection.mode_id.as_deref() {
-            let mut mode =
-                validate_effort_value(mode).map_err(runtime_configuration_unavailable)?;
+            let mut mode = validate_mode_value(mode).map_err(runtime_configuration_unavailable)?;
             let advertised_modes = session_probe
                 .as_ref()
                 .is_some_and(|probe| !probe.modes.is_empty())
@@ -6933,7 +6962,7 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
         let mode_id = runtime_state
             .effective_mode
             .as_deref()
-            .map(validate_effort_value)
+            .map(validate_mode_value)
             .transpose()
             .map_err(runtime_configuration_unavailable)?;
         let selection = SessionRuntimeSelection {
@@ -10805,6 +10834,7 @@ impl AcpRuntimeClient {
             pending_requests: Mutex::new(HashMap::new()),
             pending_prompt_requests: Mutex::new(HashMap::new()),
             probe_config_update_waiters: Mutex::new(HashMap::new()),
+            probe_initial_config_update: Mutex::new(None),
             pending_available_commands: Mutex::new(PendingAvailableCommandCatalogs::default()),
             active_terminal_owners: Mutex::new(HashMap::new()),
             request_admission: Mutex::new(()),
@@ -14746,15 +14776,33 @@ async fn probe_runtime_session_configs_with_config(
             )
             .await?;
         let _ = initialize;
+        // Armed before the request so an Agent that publishes its full option
+        // set immediately after `session/new` cannot lose the race.
+        let initial_config_update = process.arm_initial_probe_config_update();
         let session = process
             .request(
                 AcpOperation::SessionNew.method(),
                 build_session_new_params(&probe_cwd, &[]),
                 ACP_PROBE_TIMEOUT,
             )
-            .await?;
-        let initial =
-            runtime_session_probe_from_response(&process, &initialize, &session, None).await?;
+            .await;
+        let initial_config_update =
+            match timeout(ACP_PROBE_CONFIG_UPDATE_TIMEOUT, initial_config_update).await {
+                Ok(Ok(update)) => Some(update),
+                Ok(Err(_)) | Err(_) => {
+                    process.disarm_initial_probe_config_update();
+                    None
+                }
+            };
+        let session = session?;
+        let initial = runtime_session_probe_from_response(
+            &process,
+            &initialize,
+            &session,
+            None,
+            initial_config_update,
+        )
+        .await?;
         let target_models = match targets {
             RuntimeSessionProbeTargets::Explicit(models) => models.to_vec(),
             RuntimeSessionProbeTargets::Discovered => initial.models.clone(),
@@ -14766,6 +14814,7 @@ async fn probe_runtime_session_configs_with_config(
                 &initialize,
                 &session,
                 Some(&model_id),
+                None,
             )
             .await;
             model_results.push((model_id, result));
@@ -14786,6 +14835,7 @@ async fn runtime_session_probe_from_response(
     initialize: &Value,
     session: &Value,
     target_model: Option<&str>,
+    initial_config_update: Option<Value>,
 ) -> VibexResult<AcpRuntimeSessionProbe> {
     let (model_response, model_config_update) = if let Some(model_id) = target_model {
         let native_session_id = session
@@ -14861,7 +14911,7 @@ async fn runtime_session_probe_from_response(
         };
         (Some(response), config_update)
     } else {
-        (None, None)
+        (None, initial_config_update)
     };
     let model_response_ref = model_response.as_ref();
     let modes = if process.agent_id.as_str() == PI_AGENT_ID {
@@ -18300,6 +18350,7 @@ mod tests {
             pending_requests: Mutex::new(HashMap::new()),
             pending_prompt_requests: Mutex::new(HashMap::new()),
             probe_config_update_waiters: Mutex::new(HashMap::new()),
+            probe_initial_config_update: Mutex::new(None),
             pending_available_commands: Mutex::new(PendingAvailableCommandCatalogs::default()),
             active_terminal_owners: Mutex::new(HashMap::new()),
             request_admission: Mutex::new(()),
@@ -20909,6 +20960,9 @@ pending_prompt_id = None
 request_log_path = os.environ.get("VIBEX_MOCK_ACP_REQUEST_LOG")
 set_model_mode = os.environ.get("VIBEX_MOCK_ACP_SET_MODEL_MODE", "supported")
 model_config_updates = os.environ.get("VIBEX_MOCK_ACP_MODEL_CONFIG_UPDATES") == "true"
+post_session_config_update = (
+    os.environ.get("VIBEX_MOCK_ACP_POST_SESSION_CONFIG_UPDATE") == "true"
+)
 prompt_mode = os.environ.get("VIBEX_MOCK_ACP_PROMPT_MODE", "success")
 fs_paths = {}
 restore_mode = os.environ.get("VIBEX_MOCK_ACP_RESTORE_MODE", "success")
@@ -21061,6 +21115,63 @@ for line in sys.stdin:
                 },
             },
         })
+        # Copilot CLI shape: standard mode URIs in the session/new result, and
+        # the reasoning-effort option only in an unsolicited follow-up update.
+        standard_mode = "https://agentclientprotocol.com/protocol/session-modes#"
+        modes = (
+            [
+                {"id": standard_mode + "agent", "label": "Agent"},
+                {"id": standard_mode + "plan", "label": "Plan"},
+            ]
+            if post_session_config_update
+            else [
+                {"id": "build", "label": "Build"},
+                {"id": "review", "label": "Review"},
+            ]
+        )
+        effort_option = {
+            "id": "reasoning_effort",
+            "label": "Reasoning effort",
+            "type": "select",
+            "currentValue": "medium",
+            "options": [
+                {"value": "low", "label": "Low"},
+                {"value": "medium", "label": "Medium"},
+                {"value": "high", "label": "High"},
+            ],
+        }
+        mode_option = {
+            "id": "mode",
+            "category": "mode",
+            "label": "Mode",
+            "type": "select",
+            "currentValue": modes[0]["id"],
+            "options": [
+                {"value": mode["id"], "label": mode["label"]} for mode in modes
+            ],
+        }
+        config_options = [
+            {
+                "id": "model",
+                "category": "model",
+                "label": "Model",
+                "type": "select",
+                "currentValue": model_1,
+                "options": [
+                    {"value": model_1, "label": "Model 1"},
+                    {"value": model_2, "label": "Model 2"},
+                ],
+            },
+            {
+                "id": "autoApply",
+                "label": "Auto apply",
+                "type": "boolean",
+                "currentValue": True,
+                "defaultValue": False,
+            },
+        ]
+        if not post_session_config_update:
+            config_options.append(effort_option)
         send({
             "jsonrpc": "2.0",
             "id": mid,
@@ -21071,45 +21182,24 @@ for line in sys.stdin:
                     "currentModelId": model_1,
                 },
                 "modes": {
-                    "availableModes": [
-                        {"id": "build", "label": "Build"},
-                        {"id": "review", "label": "Review"},
-                    ],
-                    "currentModeId": "build",
+                    "availableModes": modes,
+                    "currentModeId": modes[0]["id"],
                 },
-                "configOptions": [
-                    {
-                        "id": "model",
-                        "category": "model",
-                        "label": "Model",
-                        "type": "select",
-                        "currentValue": model_1,
-                        "options": [
-                            {"value": model_1, "label": "Model 1"},
-                            {"value": model_2, "label": "Model 2"},
-                        ],
-                    },
-                    {
-                        "id": "autoApply",
-                        "label": "Auto apply",
-                        "type": "boolean",
-                        "currentValue": True,
-                        "defaultValue": False,
-                    },
-                    {
-                        "id": "reasoning_effort",
-                        "label": "Reasoning effort",
-                        "type": "select",
-                        "currentValue": "medium",
-                        "options": [
-                            {"value": "low", "label": "Low"},
-                            {"value": "medium", "label": "Medium"},
-                            {"value": "high", "label": "High"},
-                        ],
-                    }
-                ],
+                "configOptions": config_options,
             },
         })
+        if post_session_config_update:
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "config_option_update",
+                        "configOptions": [mode_option, effort_option],
+                    },
+                },
+            })
     elif method == "session/set_model":
         session_id = msg.get("params", {}).get("sessionId", "mock-session-1")
         model_id = msg.get("params", {}).get("modelId", model_1)
@@ -22046,6 +22136,29 @@ for line in sys.stdin:
                 value: Some(mode.to_string()),
                 secret_lookup_key: None,
                 redacted_hint: "mock set-model failure mode".to_string(),
+            });
+            service
+                .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                    provider_profile_id: self.profile_id.clone(),
+                    config,
+                })
+                .unwrap();
+        }
+
+        /// Makes the mock behave like Copilot CLI: standard mode URIs, and the
+        /// reasoning-effort option delivered only in an unsolicited
+        /// `config_option_update` that follows the `session/new` result.
+        fn enable_post_session_config_update(&self) {
+            let service = self.service();
+            let mut config = service
+                .get_acp_profile_config(self.profile_id.clone())
+                .unwrap();
+            config.env.push(vibex_core::AcpProviderEnvReference {
+                key: "VIBEX_MOCK_ACP_POST_SESSION_CONFIG_UPDATE".to_string(),
+                source: AcpProviderEnvSource::Literal,
+                value: Some("true".to_string()),
+                secret_lookup_key: None,
+                redacted_hint: "mock post-session config update".to_string(),
             });
             service
                 .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
@@ -30497,6 +30610,47 @@ for line in sys.stdin:
             ))
             .await
             .unwrap();
+        fixture.cleanup();
+    }
+
+    /// Copilot CLI publishes its reasoning-effort option only in an
+    /// unsolicited `config_option_update` that trails the `session/new`
+    /// result, and spells its modes as ACP standard mode URIs. Both must
+    /// survive the initial probe, or the session runtime selection has no
+    /// evidence that either control exists.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn probe_absorbs_the_config_option_update_that_trails_session_new() {
+        let Some(fixture) = MockAcpFixture::create("probe-post-session-config") else {
+            return;
+        };
+        fixture.enable_post_session_config_update();
+        let client = AcpRuntimeClient::new(ProviderConfigService::new(fixture.db_path.clone()));
+
+        let probed = client
+            .probe_runtime_session_config(&fixture.profile_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            probed
+                .reasoning_efforts
+                .iter()
+                .map(|effort| effort.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high"],
+            "the trailing update is the only place the effort option appears"
+        );
+        assert_eq!(
+            probed
+                .modes
+                .iter()
+                .map(|mode| mode.value.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "https://agentclientprotocol.com/protocol/session-modes#agent",
+                "https://agentclientprotocol.com/protocol/session-modes#plan",
+            ]
+        );
         fixture.cleanup();
     }
 

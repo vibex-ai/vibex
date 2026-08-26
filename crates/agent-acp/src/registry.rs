@@ -1202,7 +1202,7 @@ mod tests {
         // Every pinned value must survive catalog validation, and fallbacks
         // must stay inside the validation acceptance sets.
         for mode in &fallback_modes {
-            assert!(crate::session_config::validate_effort_value(&mode.value).is_ok());
+            assert!(crate::session_config::validate_mode_value(&mode.value).is_ok());
             assert!(known_session_mode_values(&claude).contains(&mode.value.as_str()));
         }
         for effort in &fallback_efforts {

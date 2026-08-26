@@ -32,6 +32,7 @@ pub const CANONICAL_SANDBOX_MODE: &str = "sandbox_mode";
 const MAX_CANONICAL_KEY_LEN: usize = 80;
 const MAX_MODEL_ID_LEN: usize = 160;
 const MAX_EFFORT_VALUE_LEN: usize = 64;
+const MAX_MODE_VALUE_LEN: usize = 160;
 const MAX_CATALOG_LABEL_LEN: usize = 160;
 const RUNTIME_OPTION_CATALOG_DOMAIN: &[u8] = b"vibex/runtime-option-catalog/v2";
 const REASONING_EFFORT_MODE_VALUES: &[&str] = &[
@@ -1309,7 +1310,7 @@ fn catalog_modes(
         .into_iter()
         .flat_map(|entry| entry.modes.iter())
         .filter_map(|mode| {
-            let value = validate_effort_value(&mode.value).ok()?;
+            let value = validate_mode_value(&mode.value).ok()?;
             Some(SessionConfigValue {
                 value,
                 label: mode.label.as_deref().map(bounded_catalog_label),
@@ -1328,7 +1329,7 @@ fn catalog_modes_from_values(
     let mut modes = values
         .into_iter()
         .filter_map(|mode| {
-            let value = validate_effort_value(&mode.value).ok()?;
+            let value = validate_mode_value(&mode.value).ok()?;
             Some(SessionConfigValue {
                 value,
                 label: mode.label.as_deref().map(bounded_catalog_label),
@@ -1339,7 +1340,7 @@ fn catalog_modes_from_values(
         modes = fallback_session_modes(agent_id)
             .into_iter()
             .filter_map(|mode| {
-                let value = validate_effort_value(&mode.value).ok()?;
+                let value = validate_mode_value(&mode.value).ok()?;
                 Some(SessionConfigValue {
                     value,
                     label: mode.label.as_deref().map(bounded_catalog_label),
@@ -1723,16 +1724,51 @@ pub fn validate_model_value(value: &str) -> Result<String, &'static str> {
     Ok(value.to_string())
 }
 
+/// The ACP specification defines a small set of *standard* session-mode
+/// identifiers that are spelled as fragment URIs under
+/// `https://agentclientprotocol.com/protocol/session-modes#<slug>`. Copilot CLI
+/// advertises exactly those, so the bare-identifier shape
+/// [`validate_effort_value`] accepts is not sufficient for modes.
+const ACP_STANDARD_SESSION_MODE_PREFIX: &str =
+    "https://agentclientprotocol.com/protocol/session-modes#";
+
+fn is_bare_option_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+/// Session-mode ids accept both shapes an ACP Agent may advertise: a bare
+/// identifier (`plan`, `agent-full-access`) and the specification's standard
+/// mode URI. The URI form keeps its slug under the same charset, so a mode id
+/// can never smuggle arbitrary text into the wire or into a canonical key.
+pub fn validate_mode_value(value: &str) -> Result<String, &'static str> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("acp_session_config_mode_empty");
+    }
+    if value.len() > MAX_MODE_VALUE_LEN {
+        return Err("acp_session_config_mode_invalid");
+    }
+    if is_bare_option_identifier(value) {
+        return Ok(value.to_string());
+    }
+    if value
+        .strip_prefix(ACP_STANDARD_SESSION_MODE_PREFIX)
+        .is_some_and(is_bare_option_identifier)
+    {
+        return Ok(value.to_string());
+    }
+    Err("acp_session_config_mode_invalid")
+}
+
 pub fn validate_effort_value(value: &str) -> Result<String, &'static str> {
     let value = value.trim();
     if value.is_empty() {
         return Err("acp_session_config_effort_empty");
     }
-    if value.len() > MAX_EFFORT_VALUE_LEN
-        || !value
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
-    {
+    if value.len() > MAX_EFFORT_VALUE_LEN || !is_bare_option_identifier(value) {
         return Err("acp_session_config_effort_invalid");
     }
     Ok(value.to_string())
@@ -2658,6 +2694,67 @@ mod tests {
             build_runtime_option_catalog(&[agent], &[explicitly_disabled], &evidence)
                 .options
                 .is_empty()
+        );
+    }
+
+    /// Copilot CLI advertises the ACP specification's standard session-mode
+    /// URIs. The bare-identifier charset that guards reasoning-effort values
+    /// rejects them, so modes need their own acceptance shape — otherwise the
+    /// mode never reaches the wire and session creation fails outright.
+    #[test]
+    fn mode_values_accept_standard_acp_mode_uris_but_not_arbitrary_text() {
+        for value in [
+            "plan",
+            "agent-full-access",
+            "https://agentclientprotocol.com/protocol/session-modes#agent",
+            "https://agentclientprotocol.com/protocol/session-modes#autopilot",
+        ] {
+            assert_eq!(validate_mode_value(value).as_deref(), Ok(value));
+        }
+        for value in [
+            "",
+            "   ",
+            "https://example.com/session-modes#agent",
+            "https://agentclientprotocol.com/protocol/session-modes#a/b",
+            "https://agentclientprotocol.com/protocol/session-modes#",
+            "mode with spaces",
+        ] {
+            assert!(
+                validate_mode_value(value).is_err(),
+                "{value:?} must not pass mode validation"
+            );
+        }
+        // Reasoning effort keeps the stricter bare-identifier shape.
+        assert!(
+            validate_effort_value("https://agentclientprotocol.com/protocol/session-modes#agent")
+                .is_err()
+        );
+    }
+
+    /// The runtime option catalog is what the mode picker renders. Dropping the
+    /// URI form here would leave Copilot sessions with an empty mode list.
+    #[test]
+    fn catalog_modes_keep_standard_acp_mode_uris() {
+        let modes = catalog_modes_from_values(
+            vec![
+                ProviderSessionConfigValue {
+                    value: "https://agentclientprotocol.com/protocol/session-modes#agent"
+                        .to_string(),
+                    label: Some("Agent".to_string()),
+                },
+                ProviderSessionConfigValue {
+                    value: "not a mode".to_string(),
+                    label: None,
+                },
+            ],
+            &AgentId::parse("copilot").unwrap(),
+        );
+        assert_eq!(
+            modes
+                .iter()
+                .map(|mode| mode.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["https://agentclientprotocol.com/protocol/session-modes#agent"]
         );
     }
 }

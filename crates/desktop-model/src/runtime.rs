@@ -174,7 +174,7 @@ where
                 RuntimeConfigDimension::Mode => candidate
                     .label
                     .clone()
-                    .unwrap_or_else(|| candidate.value.clone()),
+                    .unwrap_or_else(|| session_mode_fallback_label(&candidate.value)),
             };
             values.entry(candidate.value.clone()).or_insert(label);
         }
@@ -210,6 +210,19 @@ where
         }
     });
     choices.collect()
+}
+
+/// ACP spells its standard session modes as fragment URIs
+/// (`…/session-modes#autopilot`). An Agent that sends one without a label would
+/// otherwise put the whole URL in the mode picker, so fall back to the fragment.
+fn session_mode_fallback_label(value: &str) -> String {
+    let slug = value.rsplit_once('#').map_or(value, |(_, slug)| slug);
+    let slug = if slug.is_empty() { value } else { slug };
+    let mut characters = slug.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
+        None => value.to_string(),
+    }
 }
 
 fn reasoning_effort_rank(value: &str) -> (u8, String) {
@@ -522,5 +535,17 @@ mod tests {
                 .map(|value| value.value.as_str()),
             Some("false")
         );
+    }
+
+    #[test]
+    fn unlabelled_standard_acp_modes_render_their_fragment_not_the_url() {
+        assert_eq!(
+            session_mode_fallback_label(
+                "https://agentclientprotocol.com/protocol/session-modes#autopilot"
+            ),
+            "Autopilot"
+        );
+        assert_eq!(session_mode_fallback_label("plan"), "Plan");
+        assert_eq!(session_mode_fallback_label(""), "");
     }
 }
