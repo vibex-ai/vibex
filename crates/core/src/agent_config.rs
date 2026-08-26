@@ -343,6 +343,7 @@ pub fn is_user_visible_agent(agent_id: &AgentId) -> bool {
             | "devin"
             | "grok"
             | "hermes"
+            | "kimi"
             | "opencode"
             | "pi"
             | "deepseek-harness"
@@ -895,6 +896,7 @@ mod tests {
             "copilot",
             "grok",
             "hermes",
+            "kimi",
             "opencode",
             "pi",
         ]
