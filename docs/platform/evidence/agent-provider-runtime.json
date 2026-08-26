@@ -3,9 +3,9 @@
   "status": "passed",
   "claimScope": "manifest_and_contract",
   "realRuntimeVerification": "blocked",
-  "capturedAt": "2026-08-21T07:08:41.495Z",
+  "capturedAt": "2026-08-26T07:37:56.547Z",
   "source": {
-    "captureParentCommit": "90465899dee3748955dc56e4944d2eaa12b5cb3d",
+    "captureParentCommit": "a607f5bd2f1b9d4b55d68ad6f2dd3a6b733e87c1",
     "rustToolchain": "rustc-1.97.0",
     "sourceInputRoots": [
       "crates/core/src/acp_catalog.rs",
@@ -53,21 +53,21 @@
       "crates/vibex-ui/Cargo.toml",
       "apps/desktop/Cargo.toml"
     ],
-    "sourceInputTreeSha256": "dfac1435ab1a893dc0204ac2ef50b9bef187a8337102db5ae035ef107b410851",
+    "sourceInputTreeSha256": "2ad0142d99349858f57a76e5b7ae1da35b376b047490a6d200ad6befdbf3f7ff",
     "bindings": {
-      "catalog": "0383e76913841b1405ba3fb57ffc71c9d3016fb19af54427271d92dc8f36b879",
-      "manifest": "2b0c18700a02679ea659ae551a4c2867ebec5cd2fb9ceeb8c550225532dba0ac",
-      "probe": "39d17c4c3c91f30f8fc0ceb09d1e528bb3b745552c21e747ba711d2e81992f2f",
-      "database": "0ace5cfc6f53906288aabc098d21459b8019c9c97d5e5fb0cd4a3950cab5189c",
-      "remote": "341d02a6ccf83c94d56f4d170e4d1da7a0912b11c5384cbad4119a9a007d21c0",
-      "ui": "e068ca537dcfc5855d5410fc955163e5fb6ee4f30787544d26cd041e86981a87",
-      "switch": "a3490a3b058ef2498685a5df82eedc6c3ddc56def0731ff309303e31285c53bf",
+      "catalog": "5e444dac44d7ac3c898f7a1fe488b69731700a28fc8c5b904e4dfb678093a9f0",
+      "manifest": "c28668b14f064fffb914241a409ced41fad515a7cb4f861c7f7fed5f100059df",
+      "probe": "367fff1e7ad2ef025529da9c5813f230f5a052ff4cb21df3bad68ebab4905948",
+      "database": "1abe4a8df63fc3f909a2297737a0c3408a80cad742a8aff7c3e0accf942b14bb",
+      "remote": "e2e8adc51b02571e287427a70fa30b754b4c68b69f4061ee0d208a7fed6fb1ed",
+      "ui": "78effccaaae03b8eb4a2ddcd1b24f1fef0e95dd707c66269782c7f3c10999ab6",
+      "switch": "20a2cf091c012b2ac8165cde9f361f62a0edbacd66d66620ecdbb9196fbd2a87",
       "scripts": "bf41a9b102d7a1589794a4524435b959eb46e3078169fcc5fc0b6b27f0afe6f4",
-      "packageMetadata": "cefacf2b461aca71e531a5f7548e2d89dd63e9518e54c08ce822cc61b71efc0e"
+      "packageMetadata": "a4e23c06de51d6786c90bfad1d68cd8ea88a2cc00e7113c2fadf4f77448d73d7"
     },
-    "cargoLockSha256": "b333a7de10311d5da23d658ce99e33fdb754a82c2e933476a59a5800afdfbdc4",
+    "cargoLockSha256": "1ffad260f0c4d15d53165b2672c9149103ab92cb3dc7796f69216170af364333",
     "packageJsonSha256": "3bf13132c815037285846cd90920224559d666d9c18e15db3c1d694e7a783dfa",
-    "rolloutManifestSha256": "9378f5875a8b6ac2d713506fa0fe9c82c57cfbe95d9b446477361a514de6210a"
+    "rolloutManifestSha256": "9d1684a9317ac8bb0484307604272b450a5cf97fd756acce256f2ef070a1d139"
   },
   "manifest": {
     "schemaVersion": "agent-provider-runtime-manifest.v1",
@@ -600,13 +600,13 @@
       },
       {
         "agentId": "grok",
-        "catalogVersion": "0.2.11",
+        "catalogVersion": "1.0.8",
         "adapterId": "grok-acp",
         "descriptorId": "projection_grok_runtime_v1",
         "descriptorVersion": "1",
         "versionPolicy": {
           "kind": "detected_semver",
-          "requirement": ">=0.2.11"
+          "requirement": ">=1.0.8"
         },
         "capabilityMode": "replaceable_provider",
         "runtimeHomeStrategy": "vibex_private",
@@ -625,7 +625,7 @@
           }
         ],
         "evidenceState": "documented",
-        "sourceEvidenceReference": "research/acp-agent/grok@0.2.11",
+        "sourceEvidenceReference": "research/acp-agent/grok@1.0.8",
         "smokeId": "agent-provider-grok",
         "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
@@ -1804,7 +1804,7 @@
     {
       "agentId": "grok",
       "smokeId": "agent-provider-grok",
-      "catalogVersion": "0.2.11",
+      "catalogVersion": "1.0.8",
       "descriptorId": "projection_grok_runtime_v1",
       "descriptorVersion": "1",
       "versionPolicy": "detected_semver",
@@ -1833,7 +1833,7 @@
       "providerVerified": false,
       "liveSwitchVerified": false,
       "binaryOnlyVerified": false,
-      "sourceEvidenceReference": "research/acp-agent/grok@0.2.11",
+      "sourceEvidenceReference": "research/acp-agent/grok@1.0.8",
       "recordedAt": null
     },
     {

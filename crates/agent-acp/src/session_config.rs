@@ -996,6 +996,12 @@ pub fn build_runtime_option_catalog(
         let fallback_features = catalog_features(evidence);
         for (model_id, model_label) in configured_models {
             let model_evidence = evidence_models.get(&model_id).copied();
+            let allow_profile_runtime_options = !has_explicit_model_configuration;
+            let allow_profile_modes_and_features = allow_profile_runtime_options
+                || model_evidence.is_some_and(|model| {
+                    model.source == SessionModelCatalogSource::Session
+                        && !model.runtime_options_complete
+                });
             let modes = model_evidence
                 .filter(|model| model.runtime_options_complete || !model.modes.is_empty())
                 .map(|model| {
@@ -1004,7 +1010,11 @@ pub fn build_runtime_option_catalog(
                         ..Default::default()
                     }))
                 })
-                .unwrap_or_else(|| fallback_modes.clone());
+                .unwrap_or_else(|| {
+                    allow_profile_modes_and_features
+                        .then(|| fallback_modes.clone())
+                        .unwrap_or_default()
+                });
             let features = model_evidence
                 .filter(|model| model.runtime_options_complete || !model.options.is_empty())
                 .map(|model| {
@@ -1013,7 +1023,11 @@ pub fn build_runtime_option_catalog(
                         ..Default::default()
                     }))
                 })
-                .unwrap_or_else(|| fallback_features.clone());
+                .unwrap_or_else(|| {
+                    allow_profile_modes_and_features
+                        .then(|| fallback_features.clone())
+                        .unwrap_or_default()
+                });
             let feature_config_values = features
                 .iter()
                 .filter_map(|feature| {
@@ -1038,11 +1052,15 @@ pub fn build_runtime_option_catalog(
                     })
                     .map(catalog_reasoning_efforts)
                     .unwrap_or_else(|| {
-                        catalog_reasoning_effort_values(
-                            evidence
-                                .map(|evidence| evidence.reasoning_efforts.as_slice())
-                                .unwrap_or_default(),
-                        )
+                        allow_profile_runtime_options
+                            .then(|| {
+                                catalog_reasoning_effort_values(
+                                    evidence
+                                        .map(|evidence| evidence.reasoning_efforts.as_slice())
+                                        .unwrap_or_default(),
+                                )
+                            })
+                            .unwrap_or_default()
                     }),
                 modes,
                 features,
@@ -2614,6 +2632,67 @@ mod tests {
                 .options
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn configured_model_does_not_inherit_session_global_runtime_options() {
+        let definitions = builtin_agent_definitions();
+        let definition = definitions
+            .iter()
+            .find(|definition| definition.id.as_str() == "grok")
+            .unwrap();
+        let mut agent = AgentSnapshotEntry::from_definition(definition, None, None);
+        agent.added = true;
+        agent.enabled = true;
+        agent.config_status = AgentConfigStatus::Configured;
+        agent.runtime_status = AgentRuntimeStatus::Ready;
+        let profile = ProviderProfileSummary {
+            id: vibex_core::ProviderProfileId::new(),
+            agent_id: agent.id.clone(),
+            kind: ProviderKind::Acp,
+            display_name: "Grok Provider".to_string(),
+            status: ProviderProfileStatus::Enabled,
+            account_alias: None,
+            default_model: Some("gpt-5.6-sol".to_string()),
+            configured_models: vec![ProviderConfiguredModel {
+                id: "gpt-5.6-sol".to_string(),
+                display_name: None,
+                enabled: true,
+                wire_api: None,
+                capabilities: Default::default(),
+            }],
+            secret_setup_state: ProviderSecretSetupState::Available,
+            updated_at_ms: 1,
+        };
+        let evidence = BTreeMap::from([(
+            profile.id.clone(),
+            RuntimeOptionCatalogProfileEvidence {
+                reasoning_efforts: vec![AgentReasoningEffort {
+                    value: "low".to_string(),
+                    description: None,
+                }],
+                modes: vec![ProviderSessionConfigValue {
+                    value: "plan".to_string(),
+                    label: Some("Plan".to_string()),
+                }],
+                options: vec![catalog_option(
+                    "permission-mode",
+                    None,
+                    ProviderSessionConfigOptionKind::Select,
+                    "ask",
+                    &[("ask", "Ask"), ("auto", "Automatic")],
+                )],
+                ..Default::default()
+            },
+        )]);
+
+        let catalog = build_runtime_option_catalog(&[agent], &[profile], &evidence);
+
+        assert_eq!(catalog.options.len(), 1);
+        assert!(catalog.options[0].reasoning_efforts.is_empty());
+        assert!(catalog.options[0].modes.is_empty());
+        assert!(catalog.options[0].features.is_empty());
+        assert!(catalog.options[0].selection.config_values.is_empty());
     }
 
     #[test]

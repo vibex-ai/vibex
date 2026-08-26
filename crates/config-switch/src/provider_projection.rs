@@ -2317,7 +2317,6 @@ fn grok_overlay(
     config.insert("name".to_string(), serde_json::json!(provider.display_name));
     config.insert("env_key".to_string(), serde_json::json!(secret_env_key));
     config.insert("api_backend".to_string(), serde_json::json!("responses"));
-    config.insert("auth_scheme".to_string(), serde_json::json!("bearer"));
     serialized_toml(serde_json::json!({
         "model": {model_id: config},
         "models": {"default": model_id},
@@ -3745,7 +3744,7 @@ mod tests {
                 assert_eq!(model["base_url"].as_str(), Some(ENDPOINT));
                 assert_eq!(model["env_key"].as_str(), Some("VIBEX_GROK_API_KEY"));
                 assert_eq!(model["api_backend"].as_str(), Some("responses"));
-                assert_eq!(model["auth_scheme"].as_str(), Some("bearer"));
+                assert!(model.get("auth_scheme").is_none());
             }
             "hermes" => {
                 let value: serde_yaml::Value = serde_yaml::from_str(&overlay.content).unwrap();

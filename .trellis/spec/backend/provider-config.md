@@ -74,6 +74,107 @@ profile in this order:
 Do not inject through a Native Claude/Codex SDK and do not write user home
 configuration as the default switching mechanism.
 
+## Scenario: Model-Scoped ACP Runtime Options
+
+### 1. Scope / Trigger
+
+- Trigger: the Runtime Option Catalog combines a configured Provider Profile
+  model with Agent-, Profile-, or model-scoped ACP session configuration
+  evidence.
+- This contract prevents one model's reasoning effort, mode, or dynamic option
+  from making another model selectable with an unsupported value.
+
+### 2. Signatures
+
+```text
+build_runtime_option_catalog(
+  agents: AgentSnapshotEntry[],
+  profiles: ProviderProfileSummary[],
+  evidence_by_profile: Map<ProviderProfileId, RuntimeOptionCatalogProfileEvidence>
+) -> SessionRuntimeOptionCatalog
+
+SessionModelCatalogEntry {
+  model_id,
+  reasoning_efforts,
+  modes,
+  options,
+  runtime_options_complete,
+  source: session | probe
+}
+```
+
+### 3. Contracts
+
+- A Profile with `configured_models` or `default_model` emits only those
+  explicitly configured model ids.
+- Reasoning effort is model-scoped for an explicit model. It is emitted only
+  when the matching `SessionModelCatalogEntry` is complete or carries an
+  explicit non-empty effort list. Profile/Agent-global effort evidence is not a
+  capability grant for that model.
+- A complete matching model entry is authoritative even when its effort, mode,
+  or option lists are empty.
+- Profile-global modes/options may supplement an incomplete live Session entry
+  for the same model because ACP commonly splits current-model identity and
+  session-wide configuration across fields. They must not supplement a missing
+  model entry or a model-only probe entry for an explicit Provider model.
+- When the Profile has no explicit model configuration and its models are
+  discovered wholly from the same probe evidence, profile-global runtime
+  options may be used as conservative fallback metadata.
+- Provider overlays carry only runtime-supported keys. Grok TOML uses
+  `model.<id>.{base_url,name,env_key,api_backend}` and
+  `models.default`; do not add the obsolete `auth_scheme` key.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Explicit model has matching effort metadata | Emit exactly that model's efforts. |
+| Explicit model has no matching model evidence | Emit no reasoning effort, mode, or feature inherited from Agent/Profile fallback. |
+| Matching model evidence is complete with empty option lists | Emit empty lists; do not fall back. |
+| Incomplete live Session entry identifies the same model | Keep its model evidence and allow session-wide mode/feature fields to supplement it. |
+| User submits an unadvertised effort | Resolver returns `runtime_configuration_unavailable` with cause `reasoning_effort_unavailable`. |
+| Grok overlay contains an unsupported field | Remove the field from the projector rather than ignoring the runtime warning. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: Grok `grok-4.6` advertises `low/medium/high/xhigh`; its catalog row
+  exposes those values.
+- Base: a configured OpenAI-compatible model appears in Grok's model list but
+  advertises no effort metadata; the row remains usable with no effort selected.
+- Bad: copy Grok 4.x session-global `low` onto that configured model, then let
+  the stricter runtime resolver reject new-session creation before ACP starts.
+
+### 6. Tests Required
+
+- Catalog unit: explicit configured model plus profile-global effort/mode/options
+  produces empty runtime-option lists.
+- Catalog unit: matching model entry with explicit effort preserves the effort.
+- Catalog unit: an incomplete live Session model entry still receives its
+  session-wide mode/features.
+- Projection unit: Grok TOML contains `env_key` and `api_backend = "responses"`
+  and does not contain `auth_scheme`.
+- Runtime resolver: an effort absent from model evidence remains a structured
+  `reasoning_effort_unavailable` failure.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+configured model has no effort evidence
+  -> inherit Agent/Profile effort [low, high]
+  -> UI persists low
+  -> resolver rejects session creation
+```
+
+#### Correct
+
+```text
+configured model has no effort evidence
+  -> expose the model with an empty effort selector
+  -> create the session using provider/base URL/credential/model projection
+```
+
 If a provider stores native conversation state under its profile/config home
 such as Codex `CODEX_HOME`, the controlled profile directory must be stable for
 the Vibex session and Provider Profile. A per-turn temporary directory is only

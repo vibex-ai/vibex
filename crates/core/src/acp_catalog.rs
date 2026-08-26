@@ -212,7 +212,7 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "grok",
         "Grok",
         "xAI's Grok Build agentic coding CLI with plan mode and parallel subagents. Requires a SuperGrok or X Premium+ subscription.",
-        "0.2.11",
+        "1.0.8",
         "https://docs.x.ai/build/overview",
         &["grok", "agent", "stdio"],
     ),
