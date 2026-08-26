@@ -332,6 +332,62 @@ pub(crate) struct AcpProcessLaunch<'a> {
     pub(crate) pool_fallback_reason: Option<String>,
 }
 
+/// Copilot selects its model when the CLI process starts.  It does not expose
+/// the model through ACP's live session configuration operations, so the
+/// selected product model must be part of the process launch configuration.
+fn apply_startup_model_to_config(
+    config: &mut AcpProviderConfig,
+    agent_id: &str,
+    model: Option<&str>,
+) {
+    let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) else {
+        return;
+    };
+    if agent_id != "copilot" {
+        return;
+    }
+
+    let mut args = Vec::with_capacity(config.args.len() + 2);
+    let mut skip_next_model = false;
+    for arg in &config.args {
+        if skip_next_model {
+            skip_next_model = false;
+            continue;
+        }
+        if arg == "--model" {
+            skip_next_model = true;
+            continue;
+        }
+        if arg.starts_with("--model=") {
+            continue;
+        }
+        args.push(arg.clone());
+    }
+    args.push("--model".to_string());
+    args.push(model.to_string());
+    config.args = args;
+}
+
+fn startup_model_from_config(config: &AcpProviderConfig, agent_id: &str) -> Option<String> {
+    if agent_id != "copilot" {
+        return None;
+    }
+    let mut args = config.args.iter();
+    while let Some(arg) = args.next() {
+        if let Some(model) = arg.strip_prefix("--model=") {
+            return (!model.trim().is_empty()).then(|| model.trim().to_string());
+        }
+        if arg == "--model" {
+            return args
+                .next()
+                .map(|model| model.trim())
+                .filter(|model| !model.is_empty())
+                .map(ToString::to_string);
+        }
+    }
+    None
+}
+
 struct AcpAuthSourceLaunchContext<'a> {
     auth_source: &'a RuntimeAuthSource,
     auth_source_revision: i64,
@@ -1637,6 +1693,7 @@ pub(crate) struct AcpProcess {
     fs_operation_permits: Arc<tokio::sync::Semaphore>,
     command_display: String,
     args_display: String,
+    startup_model: Option<String>,
     outbound: Mutex<Option<mpsc::UnboundedSender<String>>>,
     next_request_id: AtomicU64,
     pending_requests: Mutex<HashMap<u64, PendingTransportResponse>>,
@@ -5708,6 +5765,12 @@ impl AcpRuntimeSwitchBridge {
                     (context.revision, config, runtime_resources, env_unsets)
                 }
             };
+        let mut config = config;
+        apply_startup_model_to_config(
+            &mut config,
+            selection.agent_id.as_str(),
+            selection.model_id(),
+        );
         let cwd = AcpRuntimeClient::resolve_workspace_cwd(&config, &session.workspace_root)
             .map_err(|error| runtime_configuration_unavailable(&error.code))?;
         let (process_strategy_effective, pool_fallback_reason) = self
@@ -10656,6 +10719,7 @@ impl AcpRuntimeClient {
         } = launch;
         let agent_id = agent_id.clone();
         let adapter_identity = self.effective_adapter_identity(&agent_id, config)?;
+        let startup_model = startup_model_from_config(config, agent_id.as_str());
         let model_id_projection = match auth_source {
             RuntimeAuthSource::ProviderProfile {
                 provider_profile_id,
@@ -10833,6 +10897,7 @@ impl AcpRuntimeClient {
             )),
             command_display: config.command.clone(),
             args_display: redacted_args_summary(&process_args),
+            startup_model,
             outbound: Mutex::new(Some(outbound_tx)),
             next_request_id: AtomicU64::new(1),
             pending_requests: Mutex::new(HashMap::new()),
@@ -11159,6 +11224,11 @@ impl AcpRuntimeClient {
                 &update,
             );
         }
+        // Copilot does not echo the process-scoped model in its ACP session
+        // response. Preserve the launch selection as the effective model so
+        // the durable runtime fence can converge without a live set-model
+        // request that Copilot cannot satisfy.
+        apply_startup_model_to_attachment_state(process, &mut state);
         Ok(OpenedAcpSession {
             native_session_id,
             state,
@@ -11212,6 +11282,7 @@ impl AcpRuntimeClient {
         if let Some(commands) = process.take_pending_available_commands(native_session_id) {
             state.available_commands = commands;
         }
+        apply_startup_model_to_attachment_state(process, &mut state);
         Ok(OpenedAcpSession {
             native_session_id: native_session_id.to_string(),
             state,
@@ -11265,6 +11336,7 @@ impl AcpRuntimeClient {
         if let Some(commands) = process.take_pending_available_commands(native_session_id) {
             state.available_commands = commands;
         }
+        apply_startup_model_to_attachment_state(process, &mut state);
         Ok(OpenedAcpSession {
             native_session_id: native_session_id.to_string(),
             state,
@@ -12441,6 +12513,12 @@ impl AcpRuntimeClient {
                 (context.agent_id, context.revision, config, env_unsets)
             }
         };
+        let mut config = config;
+        apply_startup_model_to_config(
+            &mut config,
+            agent_id.as_str(),
+            selected_model_from_binding(binding).as_deref(),
+        );
         let cwd = Self::resolve_workspace_cwd(&config, workspace_root)?;
         let (process_strategy_effective, pool_fallback_reason) =
             self.pool_decision_for_agent(&agent_id, &config)?;
@@ -12779,6 +12857,22 @@ fn apply_session_state_to_attachment(
     );
 }
 
+fn apply_startup_model_to_attachment_state(process: &AcpProcess, state: &mut AcpAttachmentShared) {
+    if state.current_model_id.is_some() {
+        return;
+    }
+    let Some(model) = process.startup_model.as_deref() else {
+        return;
+    };
+    state.current_model_id = Some(model.to_string());
+    if let Some(config) = state.session_config_state.as_mut() {
+        config.current_model = Some(ProviderSessionConfigValue {
+            value: model.to_string(),
+            label: None,
+        });
+    }
+}
+
 fn agent_session_config_probe_from_state(
     state: &ProviderSessionConfigState,
 ) -> AgentSessionConfigProbe {
@@ -12855,6 +12949,9 @@ impl AcpRuntimeClient {
             operations,
             discovery.options.clone(),
         );
+        if process.agent_id.as_str() == "copilot" {
+            planner = planner.with_startup_projection(crate::session_config::CANONICAL_MODEL);
+        }
         if process.agent_id.as_str() == GROK_AGENT_ID {
             planner = planner.with_reasoning_effort_mode_bridge();
         }
@@ -15246,7 +15343,7 @@ impl AcpClient for AcpRuntimeClient {
             self.detach_attachment(current.fence()).await;
         }
         self.detach_stale_attachment(&request.session_id).await;
-        let config = self.profile_config(&request.provider_profile_id)?;
+        let mut config = self.profile_config(&request.provider_profile_id)?;
         let profile = self
             .config_service
             .get_profile(&request.provider_profile_id)?
@@ -15256,6 +15353,11 @@ impl AcpClient for AcpRuntimeClient {
                     "Provider Profile was not found for ACP session creation",
                 )
             })?;
+        apply_startup_model_to_config(
+            &mut config,
+            profile.agent_id.as_str(),
+            request.model.as_deref(),
+        );
         let auth_source = RuntimeAuthSource::provider_profile(request.provider_profile_id.clone());
         let identity = self.attachment_identity_candidate(
             &request.session_id,
@@ -18402,6 +18504,7 @@ mod tests {
             )),
             command_display: "mock".to_string(),
             args_display: String::new(),
+            startup_model: None,
             outbound: Mutex::new(outbound),
             next_request_id: AtomicU64::new(1),
             pending_requests: Mutex::new(HashMap::new()),
@@ -21210,6 +21313,14 @@ for line in sys.stdin:
         }
         config_options = [
             {
+                "id": "allow_all",
+                "label": "Allow all",
+                "type": "boolean",
+                "currentValue": False,
+                "defaultValue": False,
+            },
+        ] if post_session_config_update else [
+            {
                 "id": "model",
                 "category": "model",
                 "label": "Model",
@@ -21230,21 +21341,26 @@ for line in sys.stdin:
         ]
         if not post_session_config_update:
             config_options.append(effort_option)
+        session_result = {
+            "sessionId": session_id,
+            "models": {
+                "availableModels": [{"modelId": model_1}],
+                "currentModelId": model_1,
+            },
+            "modes": {
+                "availableModes": modes,
+                "currentModeId": modes[0]["id"],
+            },
+            "configOptions": config_options,
+        }
+        if post_session_config_update:
+            # Copilot's ACP response omits the model catalog/current model;
+            # the CLI process already selected it from --model at startup.
+            session_result.pop("models", None)
         send({
             "jsonrpc": "2.0",
             "id": mid,
-            "result": {
-                "sessionId": session_id,
-                "models": {
-                    "availableModels": [{"modelId": model_1}],
-                    "currentModelId": model_1,
-                },
-                "modes": {
-                    "availableModes": modes,
-                    "currentModeId": modes[0]["id"],
-                },
-                "configOptions": config_options,
-            },
+            "result": session_result,
         })
         if post_session_config_update:
             send({
@@ -27035,6 +27151,50 @@ for line in sys.stdin:
         )
         .unwrap();
         assert!(planner.option_for_key(&reasoning).unwrap().is_some());
+
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn copilot_model_is_selected_at_process_start_without_live_switch() {
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "copilot-startup-model",
+            Some(vibex_core::AgentId::parse("copilot").unwrap()),
+        ) else {
+            return;
+        };
+        fixture.enable_post_session_config_update();
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: Some("mock/model-2".to_string()),
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+
+        let process = client
+            .live_process(&session_id)
+            .expect("Copilot process should remain attached");
+        assert_eq!(process.startup_model.as_deref(), Some("mock/model-2"));
+        assert_eq!(
+            session
+                .session_config_state
+                .as_ref()
+                .and_then(|state| state.current_model.as_ref())
+                .map(|model| model.value.as_str()),
+            Some("mock/model-2")
+        );
+        assert_eq!(
+            logged_request_count(&fixture.request_log(), "session/set_model"),
+            0
+        );
 
         let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
         client.close_session(&binding).await.unwrap();
