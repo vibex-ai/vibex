@@ -259,7 +259,7 @@ fn at_least_or_manual(version: &str) -> (AgentVersionPolicy, AgentVersionCompati
 
 fn mode_for(agent_id: &str) -> AgentProviderCapabilityMode {
     match agent_id {
-        "amp-acp" | "auggie" | "cursor" | "devin" | "junie" | "qoder" => {
+        "amp-acp" | "antigravity" | "auggie" | "cursor" | "devin" | "junie" | "qoder" => {
             AgentProviderCapabilityMode::AgentManaged
         }
         "kiro" => AgentProviderCapabilityMode::CloudCredential,
@@ -1281,8 +1281,20 @@ mod tests {
     fn manifest_has_exact_catalog_coverage_and_unique_routes() {
         let manifest = agent_provider_rollout_manifest().unwrap();
         validate_rollout_manifest(&manifest).unwrap();
-        assert_eq!(manifest.len(), 35);
+        assert_eq!(manifest.len(), 36);
         assert!(manifest.iter().any(|entry| entry.agent_id.as_str() == "pi"));
+        let antigravity = manifest
+            .iter()
+            .find(|entry| entry.agent_id.as_str() == "antigravity")
+            .unwrap();
+        assert_eq!(
+            antigravity.capability_mode,
+            AgentProviderCapabilityMode::AgentManaged
+        );
+        assert_eq!(
+            antigravity.runtime_home_strategy,
+            AgentRuntimeHomeStrategy::AgentManaged
+        );
         assert!(
             manifest
                 .iter()

@@ -333,7 +333,8 @@ pub struct AgentCatalogListResponse {
 pub fn is_user_visible_agent(agent_id: &AgentId) -> bool {
     matches!(
         agent_id.as_str(),
-        "claude"
+        "antigravity"
+            | "claude"
             | "cline"
             | "codebuddy-code"
             | "codex"
@@ -465,6 +466,7 @@ impl AgentSnapshotEntry {
 /// absent, stale, or not directly executable.
 pub fn acp_registry_agent_id(agent_id: &AgentId) -> Option<&'static str> {
     match agent_id.as_str() {
+        "antigravity" => return Some("antigravity-acp"),
         "claude" => return Some("claude-acp"),
         "codex" => return Some("codex-acp"),
         "deepseek-harness" => return Some("deepseek-harness-acp"),
@@ -706,6 +708,7 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         let expected = [
             "amp-acp",
+            "antigravity",
             "auggie",
             "claude",
             "cline",
@@ -786,6 +789,10 @@ mod tests {
 
     #[test]
     fn managed_registry_mapping_is_explicit_and_fail_closed() {
+        assert_eq!(
+            acp_registry_agent_id(&AgentId::parse("antigravity").unwrap()),
+            Some("antigravity-acp")
+        );
         assert_eq!(
             acp_registry_agent_id(&AgentId::parse("claude").unwrap()),
             Some("claude-acp")
@@ -885,6 +892,7 @@ mod tests {
             .map(|definition| definition.id.as_str())
             .collect::<std::collections::BTreeSet<_>>();
         let expected = [
+            "antigravity",
             "claude",
             "cline",
             "codebuddy-code",

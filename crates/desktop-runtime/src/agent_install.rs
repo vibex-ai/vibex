@@ -5542,6 +5542,10 @@ mod tests {
     #[test]
     fn registry_aliases_and_latest_managed_agents_are_explicit() {
         assert_eq!(
+            require_registry_id(&AgentId::parse("antigravity").unwrap()).unwrap(),
+            "antigravity-acp"
+        );
+        assert_eq!(
             require_registry_id(&AgentId::parse("claude").unwrap()).unwrap(),
             "claude-acp"
         );

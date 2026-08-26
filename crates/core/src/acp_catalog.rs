@@ -51,6 +51,14 @@ impl AcpAgentCatalogEntry {
 
 const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
     AcpAgentCatalogEntry::new(
+        "antigravity",
+        "Google Antigravity",
+        "Google's AI coding agent connected through its first-party ACP server",
+        "1.0.0",
+        "https://antigravity.google/docs/ide/extensions",
+        &["agy_acp_server"],
+    ),
+    AcpAgentCatalogEntry::new(
         "amp-acp",
         "Amp",
         "ACP wrapper for Amp - the frontier coding agent",
@@ -357,7 +365,7 @@ mod tests {
     #[test]
     fn catalog_ids_and_presets_are_unique_and_commands_are_complete() {
         let entries = acp_agent_catalog_entries();
-        assert_eq!(entries.len(), 32);
+        assert_eq!(entries.len(), 33);
 
         let ids = entries
             .iter()
@@ -370,6 +378,12 @@ mod tests {
         assert_eq!(ids.len(), entries.len());
         assert_eq!(presets.len(), entries.len());
         assert!(entries.iter().all(|entry| !entry.command.is_empty()));
+        let antigravity = entries
+            .iter()
+            .find(|entry| entry.id == "antigravity")
+            .unwrap();
+        assert_eq!(antigravity.version, "1.0.0");
+        assert_eq!(antigravity.command, &["agy_acp_server"]);
         assert_eq!(
             entries
                 .iter()

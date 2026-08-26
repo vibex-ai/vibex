@@ -423,6 +423,7 @@ const FILE_INTEGRATION_ASSETS: &[(&str, &[u8])] = &[
 
 const AGENT_BRAND_ASSETS: &[(&str, &[u8])] = &[
     bundled_icon_asset!("agents/amp-acp.svg"),
+    bundled_icon_asset!("agents/antigravity.svg"),
     bundled_icon_asset!("agents/auggie.svg"),
     bundled_icon_asset!("agents/cline.svg"),
     bundled_icon_asset!("agents/codebuddy-code.svg"),
@@ -478,6 +479,10 @@ const fn themed_agent_asset(path: &'static str) -> BrandAsset {
 }
 
 const CATALOG_AGENT_BRANDS: &[(&str, BrandAsset)] = &[
+    (
+        "antigravity",
+        themed_agent_asset("icons/vibex/agents/antigravity.svg"),
+    ),
     (
         "amp-acp",
         colored_agent_asset("icons/vibex/agents/amp-acp.svg"),
