@@ -14103,22 +14103,31 @@ fn acp_process_strategy_name(strategy: AcpProcessStrategy) -> &'static str {
 /// the agent's dialect requires.
 ///
 /// Placement matters. A CLI whose root parser owns a flag rejects it after the
-/// subcommand (`grok --no-auto-update agent stdio`), so leading dialect
-/// arguments go in front of everything the profile configured.
+/// subcommand (`grok --no-auto-update agent stdio`). When an interpreter runs
+/// the CLI script, the script path remains first and the root flag follows it.
 pub(super) fn effective_acp_process_args(
     config: &AcpProviderConfig,
     agent_id: &str,
 ) -> Vec<String> {
     let profile = agent_dialect_profile(agent_id);
     let mut args = Vec::with_capacity(config.args.len() + profile.launch_args.len());
-    args.extend(
-        profile
-            .launch_args
-            .iter()
-            .filter(|arg| arg.placement == LaunchArgPlacement::Leading)
-            .map(|arg| arg.value.to_string()),
-    );
     args.extend(config.args.iter().cloned());
+    let leading_args = profile
+        .launch_args
+        .iter()
+        .filter(|arg| arg.placement == LaunchArgPlacement::Leading)
+        .map(|arg| arg.value.to_string())
+        .filter(|value| !config.args.contains(value));
+    let leading_index = if Path::new(&config.command)
+        .file_stem()
+        .is_some_and(|name| name == "node")
+        && !config.args.is_empty()
+    {
+        1
+    } else {
+        0
+    };
+    args.splice(leading_index..leading_index, leading_args);
     args.extend(
         profile
             .launch_args
@@ -19697,6 +19706,22 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
         assert_eq!(
             effective_acp_process_args(&config, GROK_AGENT_ID),
             vec!["--no-auto-update", "agent", "stdio"]
+        );
+
+        config.command = "/usr/bin/node".to_string();
+        config.args = vec![
+            "/private/grok/bin/grok".to_string(),
+            "agent".to_string(),
+            "stdio".to_string(),
+        ];
+        assert_eq!(
+            effective_acp_process_args(&config, GROK_AGENT_ID),
+            vec![
+                "/private/grok/bin/grok",
+                "--no-auto-update",
+                "agent",
+                "stdio"
+            ]
         );
 
         config.command = "npx".to_string();
