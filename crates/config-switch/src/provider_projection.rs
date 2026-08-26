@@ -1150,8 +1150,9 @@ fn project_provider_control(
     match &descriptor.provider_control {
         AgentProviderControl::Environment { base_url_key } => {
             if let (Some(key), Some(endpoint)) = (base_url_key, endpoint) {
-                env.insert(key.clone(), endpoint.url.clone());
-                targets.push(endpoint_target(key, &endpoint.url));
+                let endpoint_url = environment_base_url(descriptor, &endpoint.url);
+                env.insert(key.clone(), endpoint_url.clone());
+                targets.push(endpoint_target(key, &endpoint_url));
             }
         }
         AgentProviderControl::ManagedConfigOverlay { strategy } => {
@@ -1358,6 +1359,58 @@ fn project_model_control(
             model,
         )),
         AgentModelControl::Unsupported | AgentModelControl::Unverified => {}
+    }
+}
+
+/// Gemini CLI treats `GOOGLE_GEMINI_BASE_URL` as an origin and appends the
+/// Google Generative Language API path itself. Provider forms commonly store
+/// an OpenAI-style `/v1` suffix; forwarding it verbatim produces
+/// `/v1/v1beta/models/...` and makes every prompt fail after a successful ACP
+/// handshake. Keep other Agents byte-for-byte unchanged.
+fn environment_base_url(
+    descriptor: &AgentProviderProjectionDescriptor,
+    endpoint_url: &str,
+) -> String {
+    if descriptor.route.agent_id.as_str() != "gemini" {
+        return endpoint_url.to_string();
+    }
+
+    let trimmed = endpoint_url.trim_end_matches('/');
+    for api_suffix in ["/v1beta", "/v1"] {
+        if let Some(origin) = trimmed.strip_suffix(api_suffix)
+            && !origin.is_empty()
+        {
+            return origin.to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+#[cfg(test)]
+mod gemini_base_url_tests {
+    use super::*;
+
+    #[test]
+    fn gemini_environment_base_url_removes_api_path_suffixes() {
+        let descriptor = AgentProviderProjectionRegistry::builtin()
+            .unwrap()
+            .descriptors()
+            .cloned()
+            .find(|descriptor| descriptor.route.agent_id.as_str() == "gemini")
+            .unwrap();
+
+        assert_eq!(
+            environment_base_url(&descriptor, "https://gateway.example/v1"),
+            "https://gateway.example"
+        );
+        assert_eq!(
+            environment_base_url(&descriptor, "https://gateway.example/v1beta/"),
+            "https://gateway.example"
+        );
+        assert_eq!(
+            environment_base_url(&descriptor, "https://gateway.example/custom/"),
+            "https://gateway.example/custom"
+        );
     }
 }
 
@@ -3985,7 +4038,7 @@ mod tests {
             }
             if let Some(base_url_key) = expected.base_url_key {
                 let base_url = non_secret_env.get(base_url_key).unwrap();
-                if expected.agent_id == "poolside" {
+                if matches!(expected.agent_id, "gemini" | "poolside") {
                     assert_eq!(base_url, "https://provider.example.invalid");
                 } else {
                     assert_eq!(base_url, "https://provider.example.invalid/v1/");
