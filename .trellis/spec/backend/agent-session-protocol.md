@@ -1388,6 +1388,13 @@ ContinueAgentTurnRequest {
   adapter versions attach a `messageId` to the same account, capacity, rate,
   or upstream failure; those known terminal error forms must be normalized the
   same way before `end_turn` can synthesize a final Agent message.
+- Provider stderr used to classify a prompt failure is request-scoped. A later
+  request must not inherit an earlier request's capacity/authentication marker
+  from the process debug ring. Grok may stream a non-empty completed answer and
+  then return its known upstream-capacity RPC error while closing the prompt;
+  in that exact case the streamed answer is authoritative and the turn completes
+  without appending a contradictory failure. The same RPC error with no Agent
+  output remains a structured Provider failure.
 - After eligibility is confirmed, `continue_turn` materializes the exact
   DB-current runtime through an internal `BackgroundWorker` lifecycle lease and
   holds that lease through prompt completion. A missing, swept, or crashed
@@ -1452,6 +1459,9 @@ ContinueAgentTurnRequest {
 - ACP runtime test: a capacity failure delivered as unattributed Codex text plus
   `end_turn` remains a retryable Provider error and emits no Agent delta/final
   message.
+- ACP runtime tests: stderr classification excludes lines older than the current
+  request, and Grok suppresses its late capacity error only after non-empty
+  Agent output has streamed.
 - Manager unit test: `continue_turn` rejects an idle session with
   an explicit final Agent message with
   `agent_continue_requires_incomplete_turn`, and accepts an idle session whose

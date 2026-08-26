@@ -498,11 +498,13 @@ impl AcpDebugLog {
         self.messages.iter().cloned().collect()
     }
 
-    fn trailing_stderr(&self) -> Option<String> {
+    fn trailing_stderr_since(&self, sequence: u64) -> Option<String> {
         let lines = self
             .messages
             .iter()
-            .filter(|message| message.direction == AcpDebugDirection::Stderr)
+            .filter(|message| {
+                message.sequence >= sequence && message.direction == AcpDebugDirection::Stderr
+            })
             .map(|message| message.message.as_str())
             .collect::<Vec<_>>();
         if lines.is_empty() {
@@ -1220,6 +1222,16 @@ fn grok_upstream_capacity_failure(
         || lower.contains("model is at capacity")
 }
 
+fn grok_streamed_answer_overrides_capacity_failure(
+    agent_id: &AgentId,
+    error: &VibexError,
+    has_assistant_output: bool,
+) -> bool {
+    agent_id.as_str() == GROK_AGENT_ID
+        && error.code == GROK_MODEL_API_UNAVAILABLE_CODE
+        && has_assistant_output
+}
+
 /// Some ACP adapters surface a terminal provider failure as an ordinary
 /// `agent_message_chunk` and still complete the prompt with `end_turn`.  The
 /// absence of `messageId` is the strongest signal, but Codex has also emitted
@@ -1630,6 +1642,7 @@ struct PendingTransportResponse {
 struct StartedAcpRequest {
     id: u64,
     prompt_session_id: Option<String>,
+    stderr_sequence: u64,
     response: oneshot::Receiver<Result<Value, AcpRpcFailure>>,
     registration_release: Option<oneshot::Sender<()>>,
 }
@@ -2302,6 +2315,19 @@ impl AcpSessionAttachment {
         let index = turn.chunk_index;
         turn.chunk_index = turn.chunk_index.saturating_add(1);
         index
+    }
+
+    fn has_assistant_output(&self) -> bool {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| {
+                state
+                    .active_turn
+                    .as_ref()
+                    .map(|turn| !turn.assistant_text.trim().is_empty())
+            })
+            .unwrap_or(false)
     }
 
     fn append_assistant_text(&self, text: &str, phase: Option<AgentMessagePhase>) {
@@ -4031,6 +4057,11 @@ impl AcpProcess {
                 return Err(error);
             }
         }
+        let stderr_sequence = self
+            .debug_log
+            .lock()
+            .map(|debug_log| debug_log.next_sequence)
+            .unwrap_or_default();
         if let Err(error) = self.send_value(&json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -4047,6 +4078,7 @@ impl AcpProcess {
         Ok(StartedAcpRequest {
             id,
             prompt_session_id,
+            stderr_sequence,
             response,
             registration_release,
         })
@@ -4072,6 +4104,7 @@ impl AcpProcess {
         let StartedAcpRequest {
             id,
             prompt_session_id,
+            stderr_sequence,
             response,
             registration_release,
         } = request;
@@ -4113,13 +4146,18 @@ impl AcpProcess {
                         .as_deref()
                         .unwrap_or(failure.message.as_str()),
                 );
-                let mut stderr_summary = self.stderr_summary().unwrap_or_default();
+                let mut stderr_summary = self
+                    .stderr_summary_since(stderr_sequence)
+                    .unwrap_or_default();
                 if self.agent_id.as_str() == GROK_AGENT_ID
                     && method == AcpOperation::SessionPrompt.method()
                     && failure.code == "-32603"
                     && stderr_summary.is_empty()
                 {
-                    stderr_summary = self.wait_for_stderr_summary().await.unwrap_or_default();
+                    stderr_summary = self
+                        .wait_for_stderr_summary_since(stderr_sequence)
+                        .await
+                        .unwrap_or_default();
                 }
                 if failure_requires_authentication
                     || acp_authentication_required_text(&rpc_message)
@@ -4273,16 +4311,24 @@ impl AcpProcess {
     }
 
     fn stderr_summary(&self) -> Option<String> {
+        self.stderr_summary_since(0)
+    }
+
+    fn stderr_summary_since(&self, sequence: u64) -> Option<String> {
         self.debug_log
             .lock()
             .ok()
-            .and_then(|debug_log| debug_log.trailing_stderr())
+            .and_then(|debug_log| debug_log.trailing_stderr_since(sequence))
     }
 
     async fn wait_for_stderr_summary(&self) -> Option<String> {
+        self.wait_for_stderr_summary_since(0).await
+    }
+
+    async fn wait_for_stderr_summary_since(&self, sequence: u64) -> Option<String> {
         let deadline = Instant::now() + ACP_STDERR_DRAIN_TIMEOUT;
         loop {
-            let summary = self.stderr_summary();
+            let summary = self.stderr_summary_since(sequence);
             if summary.is_some() || Instant::now() >= deadline {
                 return summary;
             }
@@ -15993,6 +16039,24 @@ impl AcpClient for AcpRuntimeClient {
             );
         let response = match result {
             Ok(response) => response,
+            Err(err)
+                if grok_streamed_answer_overrides_capacity_failure(
+                    &process.agent_id,
+                    &err,
+                    payload.has_assistant_output(),
+                ) =>
+            {
+                // Grok can finish streaming the answer and then fail an
+                // ancillary upstream allocation performed before it closes the
+                // prompt RPC. The streamed answer is authoritative; do not
+                // append a contradictory failure after it.
+                let events = turn_guard.complete(true, AgentUsageExecutionStatus::Completed)?;
+                return Ok(AcpTurn {
+                    events,
+                    binding_update: Some(payload.acp_session()),
+                    completed: true,
+                });
+            }
             Err(err) => {
                 let status = usage_status_for_error(&err);
                 turn_guard.abort(err.code != OPENCODE_MODEL_API_ERROR_CODE, status);
@@ -18219,6 +18283,43 @@ mod tests {
     }
 
     #[test]
+    fn grok_completed_answer_wins_over_late_capacity_failure() {
+        let grok = AgentId::parse(GROK_AGENT_ID).unwrap();
+        let error = VibexError::provider(
+            GROK_MODEL_API_UNAVAILABLE_CODE,
+            "Grok model service is temporarily unavailable",
+        );
+        assert!(grok_streamed_answer_overrides_capacity_failure(
+            &grok, &error, true
+        ));
+        assert!(!grok_streamed_answer_overrides_capacity_failure(
+            &grok, &error, false
+        ));
+        assert!(!grok_streamed_answer_overrides_capacity_failure(
+            &AgentId::parse(OPENCODE_AGENT_ID).unwrap(),
+            &error,
+            true
+        ));
+    }
+
+    #[test]
+    fn stderr_summary_since_excludes_previous_request_failures() {
+        let mut log = AcpDebugLog::default();
+        log.record_line(
+            AcpDebugDirection::Stderr,
+            "503 Service Unavailable: waiting for service resource allocation",
+        );
+        let next_request_sequence = log.next_sequence;
+        log.record_line(AcpDebugDirection::Stderr, "current request failed");
+
+        assert_eq!(
+            log.trailing_stderr_since(next_request_sequence).as_deref(),
+            Some("current request failed")
+        );
+        assert_eq!(log.trailing_stderr_since(log.next_sequence), None);
+    }
+
+    #[test]
     fn standard_context_and_prompt_usage_are_merged_without_losing_fields() {
         let context = decode_context_window_usage(&json!({ "used": 12_500, "size": 200_000 }));
         assert!(context.diagnostics.is_empty());
@@ -18811,6 +18912,7 @@ mod tests {
                 StartedAcpRequest {
                     id: 1,
                     prompt_session_id: None,
+                    stderr_sequence: 0,
                     response: receiver,
                     registration_release: None,
                 },
