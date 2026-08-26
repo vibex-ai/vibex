@@ -557,7 +557,11 @@ impl WorkspaceBackend for NativeBackend {
                 .map(|workspaces| {
                     workspaces
                         .into_iter()
-                        .map(|(project, workspace)| WorkspaceSummary { project, workspace })
+                        .map(|(project, workspace)| WorkspaceSummary {
+                            project,
+                            workspace,
+                            git_branch: None,
+                        })
                         .collect()
                 })
                 .map_err(Into::into)
@@ -575,7 +579,11 @@ impl WorkspaceBackend for NativeBackend {
             runtime
                 .workspace()
                 .open(&request.payload)
-                .map(|(project, workspace)| WorkspaceSummary { project, workspace })
+                .map(|(project, workspace)| WorkspaceSummary {
+                    project,
+                    workspace,
+                    git_branch: None,
+                })
                 .map_err(Into::into)
         })
     }
@@ -587,7 +595,11 @@ impl WorkspaceBackend for NativeBackend {
             runtime
                 .workspace()
                 .get(&workspace_id)
-                .map(|(project, workspace)| WorkspaceSummary { project, workspace })
+                .map(|(project, workspace)| WorkspaceSummary {
+                    project,
+                    workspace,
+                    git_branch: None,
+                })
                 .map_err(Into::into)
         })
     }

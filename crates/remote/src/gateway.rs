@@ -4215,6 +4215,7 @@ fn mutation_requires_idempotency(kind: &str) -> bool {
     matches!(
         kind,
         "open_workspace"
+            | "delete_workspace"
             | "set_desired_runtime"
             | "cancel_runtime_switch"
             | "send_message"

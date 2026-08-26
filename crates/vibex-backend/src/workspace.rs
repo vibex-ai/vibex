@@ -8,6 +8,11 @@ use crate::{BackendBound, BackendFuture, MutationRequest};
 pub struct WorkspaceSummary {
     pub project: ProjectRecord,
     pub workspace: WorkspaceRecord,
+    /// The branch observed while the workspace list was produced. Native
+    /// callers may leave this unset; remote summaries provide it for compact
+    /// clients that mirror the desktop Worktree row.
+    #[serde(default)]
+    pub git_branch: Option<String>,
 }
 
 pub trait WorkspaceBackend: BackendBound {

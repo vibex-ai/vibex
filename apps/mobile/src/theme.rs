@@ -88,8 +88,9 @@ pub const DRAWER_ROW_HEIGHT: f32 = 52.0;
 pub const SIDEBAR_ROW_HEIGHT: f32 = 44.0;
 /// Indent per tree level, matching the desktop's nested sidebar spacing.
 pub const SIDEBAR_INDENT: f32 = 14.0;
-/// Width of the drag handle column on the right of every sidebar row. A pan
-/// that starts here moves the row; anywhere else it scrolls the list.
+/// Width of one trailing sidebar affordance column. Project/session/folder
+/// rows reserve two columns (menu plus grip); Worktree rows reserve one menu
+/// column and use a long press for moving.
 pub const SIDEBAR_GRIP_WIDTH: f32 = 34.0;
 pub const DRAWER_ACTION_HEIGHT: f32 = 40.0;
 pub const DRAWER_SECTION_HEIGHT: f32 = 40.0;

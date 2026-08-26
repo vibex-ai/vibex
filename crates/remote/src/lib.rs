@@ -52,11 +52,12 @@ use vibex_core::{
     RemoteSidebarOrganizationMutation, RemoteSidebarOrganizationResponse,
     RemoteSidebarOrganizationSnapshot, RemoteTerminalCreateResponse, RemoteTerminalKillResponse,
     RemoteTerminalListResponse, RemoteTerminalResizeResponse, RemoteTerminalSnapshotResponse,
-    RemoteTerminalWriteResponse, RemoteWorkbenchListWorkspacesResponse,
-    RemoteWorkbenchOpenWorkspaceResponse, RemoteWorkbenchRequest, RequestId,
-    ResolveElicitationRequest, ResolvePermissionRequest, RuntimeLeaseRole,
-    SessionRuntimeOptionCatalog, TerminalSession, TerminalStatus, TimelineLiveEvent, VibexError,
-    VibexResult, WorkspaceAggregateStatus, WorkspaceId, WorkspaceMode, unix_timestamp_ms,
+    RemoteTerminalWriteResponse, RemoteWorkbenchDeleteWorkspaceResponse,
+    RemoteWorkbenchListWorkspacesResponse, RemoteWorkbenchOpenWorkspaceResponse,
+    RemoteWorkbenchRequest, RequestId, ResolveElicitationRequest, ResolvePermissionRequest,
+    RuntimeLeaseRole, SessionRuntimeOptionCatalog, TerminalSession, TerminalStatus,
+    TimelineLiveEvent, VibexError, VibexResult, WorkspaceAggregateStatus, WorkspaceId,
+    WorkspaceMode, unix_timestamp_ms,
 };
 use vibex_db::{
     DbConnection, GitSnapshotRepository, RecentFileRepository, RemoteAuditRepository,
@@ -2437,6 +2438,30 @@ async fn dispatch_workbench_request(
             )?;
             let summary = open_workspace_summary(runtime, request.request)?;
             serde_json::to_value(RemoteWorkbenchOpenWorkspaceResponse { summary })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteWorkbenchRequest::DeleteWorkspace(request) => {
+            let auth = authorize_workbench_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateFile,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let mut conn = open_migrated_database(&runtime.db_path)?;
+            let result = WorkspaceRepository::delete_workspace(&mut conn, &request.workspace_id);
+            audit_workbench_mutation(
+                runtime,
+                &auth,
+                RemoteAuditTargetKind::WorkspaceFile,
+                request.workspace_id.as_str(),
+                format!("Workspace delete: {}", request.workspace_id.as_str()),
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            result?;
+            serde_json::to_value(RemoteWorkbenchDeleteWorkspaceResponse { deleted: true })
                 .map_err(remote_payload_encode_error)
         }
         RemoteWorkbenchRequest::FileListTree(request) => {
@@ -5167,6 +5192,94 @@ mod tests {
         assert_eq!(
             payload.file.content.as_deref(),
             Some("pub fn marker() {}\n")
+        );
+
+        cleanup_db(db_path);
+        cleanup_workspace(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn remote_workbench_workspace_delete_is_full_control_only_and_removes_listing() {
+        let (db_path, manager) = test_agent_manager("workbench-delete");
+        let workspace_root = temp_workspace_root("delete");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let workspace = ensure_workspace(&db_path, &workspace_root);
+        let full_auth = pair_device(
+            &db_path,
+            RemoteDevicePermissionLevel::FullControl,
+            "Controller",
+        );
+        let reader_auth = pair_device(&db_path, RemoteDevicePermissionLevel::ReadOnly, "Reader");
+        let router = build_router_with_agent_and_workbench(
+            RemoteServiceConfig::loopback_disabled(),
+            manager,
+            RemoteWorkbenchRuntime::new(db_path.clone(), TerminalManager::new()),
+        );
+
+        let before = post_workbench(
+            router.clone(),
+            RemoteOperationKind::WorkspaceFile,
+            RemoteWorkbenchRequest::ListWorkspaces(
+                vibex_core::RemoteWorkbenchListWorkspacesRequest {
+                    auth: full_auth.clone(),
+                },
+            ),
+        )
+        .await;
+        let before_payload: vibex_core::RemoteWorkbenchListWorkspacesResponse =
+            serde_json::from_value(before.payload.unwrap()).unwrap();
+        assert!(
+            before_payload
+                .workspaces
+                .iter()
+                .any(|summary| summary.workspace.id == workspace.id)
+        );
+
+        let denied = post_workbench(
+            router.clone(),
+            RemoteOperationKind::WorkspaceFile,
+            RemoteWorkbenchRequest::DeleteWorkspace(
+                vibex_core::RemoteWorkbenchDeleteWorkspaceRequest {
+                    auth: reader_auth,
+                    workspace_id: workspace.id.clone(),
+                },
+            ),
+        )
+        .await;
+        assert_eq!(denied.status, RemoteEnvelopeStatus::Error);
+        assert_eq!(denied.error.unwrap().code, "remote_permission_denied");
+
+        let deleted = post_workbench(
+            router.clone(),
+            RemoteOperationKind::WorkspaceFile,
+            RemoteWorkbenchRequest::DeleteWorkspace(
+                vibex_core::RemoteWorkbenchDeleteWorkspaceRequest {
+                    auth: full_auth.clone(),
+                    workspace_id: workspace.id.clone(),
+                },
+            ),
+        )
+        .await;
+        let deleted_payload: vibex_core::RemoteWorkbenchDeleteWorkspaceResponse =
+            serde_json::from_value(deleted.payload.unwrap()).unwrap();
+        assert_eq!(deleted.status, RemoteEnvelopeStatus::Ok);
+        assert!(deleted_payload.deleted);
+
+        let after = post_workbench(
+            router,
+            RemoteOperationKind::WorkspaceFile,
+            RemoteWorkbenchRequest::ListWorkspaces(
+                vibex_core::RemoteWorkbenchListWorkspacesRequest { auth: full_auth },
+            ),
+        )
+        .await;
+        let after_payload: vibex_core::RemoteWorkbenchListWorkspacesResponse =
+            serde_json::from_value(after.payload.unwrap()).unwrap();
+        assert!(
+            !after_payload
+                .workspaces
+                .iter()
+                .any(|summary| summary.workspace.id == workspace.id)
         );
 
         cleanup_db(db_path);

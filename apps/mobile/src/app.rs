@@ -30,8 +30,9 @@ use vibex_core::{
     WorkspaceRecord, agent_session_turn_requires_continuation, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
-    RuntimeCascadeChoice, RuntimeCascadeProjection, SidebarOrganizationItem,
-    SidebarOrganizationView, SidebarState, TimelineConversationTurn, TimelineRow, TimelineRowKind,
+    NewSessionLocation, RuntimeCascadeChoice, RuntimeCascadeProjection, SidebarHierarchyMode,
+    SidebarOrganizationItem, SidebarOrganizationView, SidebarProjectLogo, SidebarProjectLogoColor,
+    SidebarState, TimelineConversationTurn, TimelineRow, TimelineRowKind,
 };
 use vibex_remote_client::{
     RemoteConnectionState, RemoteLifecycleSignal, WebRemoteBackend, ZeroConfigLanPairingSession,
@@ -119,8 +120,19 @@ enum LanPairingOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionActionKind {
     Rename,
-    Archive,
     Delete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceActionKind {
+    Rename,
+    Delete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeOptionsTarget {
+    ActiveSession,
+    NewSession,
 }
 
 /// Touch shells cannot rely on hover, so the sidebar keeps only the most-used
@@ -166,6 +178,13 @@ struct SessionActionPrompt {
     current_title: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceActionPrompt {
+    kind: WorkspaceActionKind,
+    workspace_id: String,
+    current_title: String,
+}
+
 enum SessionMutationOutcome {
     Renamed(Box<vibex_core::AgentSession>),
     Removed,
@@ -183,6 +202,7 @@ enum MobileOverlay {
     Settings,
     Usage,
     NewProject,
+    NewSession,
 }
 
 #[derive(Clone)]
@@ -308,25 +328,38 @@ pub struct MobileApp {
     lan_pairing_task: Option<Task<()>>,
     operation_busy: bool,
     new_session_busy: bool,
+    new_session_open: bool,
+    new_session_project_id: Option<String>,
+    new_session_workspace_id: Option<String>,
+    new_session_workspace_mode: WorkspaceMode,
+    new_session_runtime: Option<SessionRuntimeSelection>,
+    new_session_title_input: Entity<TextInput>,
+    new_session_prompt_input: Entity<TextInput>,
     new_project_input: Entity<TextInput>,
     new_project_busy: bool,
     new_project_error: Option<String>,
     session_action: Option<SessionActionPrompt>,
+    workspace_action: Option<WorkspaceActionPrompt>,
+    workspace_action_busy: bool,
     sidebar_row_menu: Option<SidebarRowMenu>,
     sidebar_name_prompt: Option<SidebarNamePrompt>,
     sidebar_name_input: Entity<TextInput>,
     /// The Desktop's sidebar tree, mirrored so the phone renders the layout the
     /// user arranged there rather than a second, divergent ordering.
     sidebar_view: SidebarOrganizationView,
-    collapsed_workspace_ids: BTreeSet<String>,
+    sidebar_selected_workspace_id: Option<String>,
     sidebar_sync_busy: bool,
     sidebar_drag: Option<SidebarDrag>,
+    sidebar_drag_candidate: Option<(usize, SidebarRow)>,
+    sidebar_drag_long_press: Option<Task<()>>,
+    sidebar_batch_mode: bool,
     /// Top edge and right edge of the row list in window space, recorded during
     /// paint so a touch pan can be resolved to a row without hit-test plumbing.
     sidebar_list_frame: Rc<Cell<(f32, f32)>>,
     session_action_input: Entity<TextInput>,
     session_action_busy: bool,
     runtime_options_open: bool,
+    runtime_options_target: RuntimeOptionsTarget,
     runtime_draft: Option<SessionRuntimeSelection>,
     runtime_feature_inputs: BTreeMap<String, Entity<TextInput>>,
     runtime_switch_generation: u64,
@@ -406,26 +439,49 @@ impl MobileApp {
             lan_pairing_task: None,
             operation_busy: false,
             new_session_busy: false,
+            new_session_open: false,
+            new_session_project_id: None,
+            new_session_workspace_id: None,
+            new_session_workspace_mode: WorkspaceMode::CurrentCheckout,
+            new_session_runtime: None,
+            new_session_title_input: cx.new(|cx| {
+                TextInput::new(
+                    locale::text("Session title", "会话标题", "工作階段標題"),
+                    cx,
+                )
+            }),
+            new_session_prompt_input: cx.new(|cx| {
+                TextInput::new(
+                    locale::text("Initial prompt", "初始提示词", "初始提示詞"),
+                    cx,
+                )
+            }),
             new_project_input: cx
                 .new(|cx| TextInput::new(locale::text("Project path", "项目路径", "專案路徑"), cx)),
             new_project_busy: false,
             new_project_error: None,
             session_action: None,
+            workspace_action: None,
+            workspace_action_busy: false,
             sidebar_row_menu: None,
             sidebar_name_prompt: None,
             sidebar_name_input: cx.new(|cx| {
                 TextInput::new(locale::text("Folder name", "文件夹名称", "資料夾名稱"), cx)
             }),
             sidebar_view: SidebarOrganizationView::default(),
-            collapsed_workspace_ids: BTreeSet::new(),
+            sidebar_selected_workspace_id: None,
             sidebar_sync_busy: false,
             sidebar_drag: None,
+            sidebar_drag_candidate: None,
+            sidebar_drag_long_press: None,
+            sidebar_batch_mode: false,
             sidebar_list_frame: Rc::new(Cell::new((0.0, 0.0))),
             session_action_input: cx.new(|cx| {
                 TextInput::new(locale::text("Session name", "会话名称", "工作階段名稱"), cx)
             }),
             session_action_busy: false,
             runtime_options_open: false,
+            runtime_options_target: RuntimeOptionsTarget::ActiveSession,
             runtime_draft: None,
             runtime_feature_inputs: BTreeMap::new(),
             runtime_switch_generation: 0,
@@ -1219,6 +1275,21 @@ impl MobileApp {
                 } else {
                     false
                 };
+                if applied && this.new_session_open && this.new_session_runtime.is_none() {
+                    this.new_session_runtime = this
+                        .controller
+                        .as_ref()
+                        .and_then(|controller| controller.state.runtime_options.value.as_ref())
+                        .and_then(|catalog| {
+                            catalog
+                                .options
+                                .iter()
+                                .find(|option| {
+                                    option.availability == RuntimeOptionAvailability::Available
+                                })
+                                .map(|option| option.selection.clone())
+                        });
+                }
                 if applied && this.runtime_options_open {
                     this.sync_runtime_feature_inputs(cx);
                 }
@@ -1234,10 +1305,12 @@ impl MobileApp {
             return;
         }
         let can_switch = self.backend.as_ref().is_some_and(|backend| {
-            backend
-                .capability_snapshot()
-                .agent
-                .supports(BackendOperation::AgentSwitchRuntime)
+            let operation = if self.runtime_options_target == RuntimeOptionsTarget::NewSession {
+                BackendOperation::AgentCreateSession
+            } else {
+                BackendOperation::AgentSwitchRuntime
+            };
+            backend.capability_snapshot().agent.supports(operation)
         });
         if !can_switch {
             return;
@@ -1266,6 +1339,79 @@ impl MobileApp {
             cx.notify();
             return;
         };
+        self.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
+        self.runtime_draft = Some(desired);
+        self.runtime_options_open = true;
+        self.runtime_switch_error = None;
+        self.sync_runtime_feature_inputs(cx);
+        if !has_catalog {
+            self.refresh_runtime_options(cx);
+        }
+        cx.notify();
+    }
+
+    fn open_new_session_runtime_options(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.runtime_switch_busy_generation.is_some()
+            || !self.new_session_open
+            || !self.backend.as_ref().is_some_and(|backend| {
+                backend
+                    .capability_snapshot()
+                    .agent
+                    .supports(BackendOperation::AgentCreateSession)
+            })
+        {
+            return;
+        }
+        let (desired, has_catalog) = self
+            .controller
+            .as_ref()
+            .map(|controller| {
+                let desired = self
+                    .new_session_runtime
+                    .clone()
+                    .or_else(|| {
+                        controller
+                            .state
+                            .runtime_selection
+                            .value
+                            .as_ref()
+                            .map(|state| state.desired.clone())
+                    })
+                    .or_else(|| {
+                        controller
+                            .state
+                            .runtime_options
+                            .value
+                            .as_ref()?
+                            .options
+                            .iter()
+                            .find(|option| {
+                                option.availability == RuntimeOptionAvailability::Available
+                            })
+                            .map(|option| option.selection.clone())
+                    });
+                (desired, controller.state.runtime_options.value.is_some())
+            })
+            .unwrap_or((None, false));
+        let Some(desired) = desired else {
+            self.error = Some(BackendError::loading(
+                "mobile_runtime_catalog_loading",
+                locale::text(
+                    "The desktop has not published an available Agent runtime yet.",
+                    "桌面端尚未发布可用的 Agent 运行时。",
+                    "桌面版尚未發佈可用的 Agent 執行環境。",
+                ),
+            ));
+            self.refresh_runtime_options(cx);
+            cx.notify();
+            return;
+        };
+        self.runtime_options_target = RuntimeOptionsTarget::NewSession;
         self.runtime_draft = Some(desired);
         self.runtime_options_open = true;
         self.runtime_switch_error = None;
@@ -1279,6 +1425,7 @@ impl MobileApp {
     fn close_runtime_options(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.runtime_switch_busy_generation.is_none() {
             self.runtime_options_open = false;
+            self.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
             self.runtime_draft = None;
             self.runtime_feature_inputs.clear();
             self.runtime_switch_error = None;
@@ -1290,6 +1437,7 @@ impl MobileApp {
         self.runtime_switch_generation = self.runtime_switch_generation.wrapping_add(1);
         self.runtime_switch_busy_generation = None;
         self.runtime_options_open = false;
+        self.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
         self.runtime_draft = None;
         self.runtime_feature_inputs.clear();
         self.runtime_switch_error = None;
@@ -1400,19 +1548,12 @@ impl MobileApp {
             cx.notify();
             return;
         }
-        let Some(backend) = self.backend.clone() else {
-            return;
-        };
-        let Some((session_id, state, catalog)) = self.controller.as_ref().and_then(|controller| {
+        let Some((catalog, desired)) = self.controller.as_ref().and_then(|controller| {
             Some((
-                controller.state.selected_session_id.clone()?,
-                controller.state.runtime_selection.value.clone()?,
                 controller.state.runtime_options.value.clone()?,
+                self.runtime_draft.clone()?,
             ))
         }) else {
-            return;
-        };
-        let Some(desired) = self.runtime_draft.clone() else {
             return;
         };
         if !runtime_selection_is_available(&catalog.options, &desired) {
@@ -1427,6 +1568,37 @@ impl MobileApp {
             cx.notify();
             return;
         }
+
+        if self.runtime_options_target == RuntimeOptionsTarget::NewSession {
+            self.new_session_runtime = Some(desired);
+            self.runtime_options_open = false;
+            self.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
+            self.runtime_draft = None;
+            self.runtime_feature_inputs.clear();
+            self.runtime_switch_error = None;
+            self.notice = Some(
+                locale::text(
+                    "New session runtime selected",
+                    "已选择新会话运行时",
+                    "已選擇新工作階段執行環境",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let Some((session_id, state)) = self.controller.as_ref().and_then(|controller| {
+            Some((
+                controller.state.selected_session_id.clone()?,
+                controller.state.runtime_selection.value.clone()?,
+            ))
+        }) else {
+            return;
+        };
 
         self.runtime_switch_generation = self.runtime_switch_generation.wrapping_add(1);
         let generation = self.runtime_switch_generation;
@@ -1465,6 +1637,7 @@ impl MobileApp {
                             controller.state.runtime_selection.resolve(state);
                         }
                         this.runtime_options_open = false;
+                        this.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
                         this.runtime_draft = None;
                         this.runtime_feature_inputs.clear();
                         this.runtime_switch_error = None;
@@ -1495,13 +1668,6 @@ impl MobileApp {
                             .into_iter()
                             .map(|summary| summary.workspace)
                             .collect();
-                        let workspace_ids = this
-                            .workspaces
-                            .iter()
-                            .map(|workspace| workspace.id.as_str().to_string())
-                            .collect::<BTreeSet<_>>();
-                        this.collapsed_workspace_ids
-                            .retain(|workspace_id| workspace_ids.contains(workspace_id));
                         let active_workspace = this
                             .controller
                             .as_ref()
@@ -1535,6 +1701,7 @@ impl MobileApp {
     }
 
     fn ensure_workbench(&mut self, workspace_id: vibex_core::WorkspaceId, cx: &mut Context<Self>) {
+        self.sidebar_selected_workspace_id = Some(workspace_id.as_str().to_string());
         let session_id = self
             .controller
             .as_ref()
@@ -1579,12 +1746,27 @@ impl MobileApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let has_workspace = self
+            .workspace_summaries
+            .iter()
+            .any(|summary| summary.project.id.as_str() == project_id);
         let workspace = self
             .workspace_summaries
             .iter()
-            .find(|summary| summary.project.id.as_str() == project_id)
+            .filter(|summary| summary.project.id.as_str() == project_id)
+            .find(|summary| summary.workspace.mode == WorkspaceMode::CurrentCheckout)
+            .or_else(|| {
+                self.workspace_summaries
+                    .iter()
+                    .find(|summary| summary.project.id.as_str() == project_id)
+            })
             .map(|summary| (summary.workspace.root_path.clone(), summary.workspace.mode));
         self.start_session_creation(workspace, window, cx);
+        self.new_session_project_id = Some(project_id);
+        if !has_workspace {
+            self.new_session_workspace_id = None;
+        }
+        self.apply_project_new_session_preference();
     }
 
     fn create_session_in_workspace(
@@ -1599,6 +1781,49 @@ impl MobileApp {
             .find(|workspace| workspace.id.as_str() == workspace_id)
             .map(|workspace| (workspace.root_path.clone(), workspace.mode));
         self.start_session_creation(workspace, window, cx);
+        if let Some(workspace) = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id.as_str() == workspace_id)
+        {
+            self.new_session_project_id = Some(workspace.project_id.as_str().to_string());
+            self.new_session_workspace_id = Some(workspace_id);
+        }
+    }
+
+    fn supports_new_session_worktree(&self) -> bool {
+        self.backend.as_ref().is_some_and(|backend| {
+            backend
+                .capability_snapshot()
+                .git
+                .supports(BackendOperation::GitWorktreeCreate)
+        })
+    }
+
+    fn normalize_new_session_workspace_mode(&self, mode: WorkspaceMode) -> WorkspaceMode {
+        if mode == WorkspaceMode::VibexWorktree && !self.supports_new_session_worktree() {
+            WorkspaceMode::CurrentCheckout
+        } else {
+            mode
+        }
+    }
+
+    fn apply_project_new_session_preference(&mut self) {
+        let Some(project_id) = self.new_session_project_id.as_deref() else {
+            return;
+        };
+        let Some(location) = self
+            .sidebar_view
+            .project_location_preferences
+            .get(project_id)
+        else {
+            return;
+        };
+        let mode = match location {
+            NewSessionLocation::CurrentCheckout => WorkspaceMode::CurrentCheckout,
+            NewSessionLocation::NewWorktree => WorkspaceMode::VibexWorktree,
+        };
+        self.new_session_workspace_mode = self.normalize_new_session_workspace_mode(mode);
     }
 
     fn start_session_creation(
@@ -1613,13 +1838,114 @@ impl MobileApp {
         let Some(controller) = self.controller.as_ref() else {
             return;
         };
-        let active_session = controller.state.active_session.value.as_ref();
-        let runtime = controller
+        let active_session = controller.state.active_session.value.clone();
+        let active_runtime = controller
             .state
             .runtime_selection
             .value
             .as_ref()
-            .map(|state| state.desired.clone())
+            .map(|state| state.desired.clone());
+        let catalog_runtime = controller
+            .state
+            .runtime_options
+            .value
+            .as_ref()
+            .and_then(|catalog| {
+                catalog
+                    .options
+                    .iter()
+                    .find(|option| option.availability == RuntimeOptionAvailability::Available)
+                    .map(|option| option.selection.clone())
+            });
+        let active_runtime_available = active_runtime.as_ref().is_none_or(|runtime| {
+            controller
+                .state
+                .runtime_options
+                .value
+                .as_ref()
+                .is_none_or(|catalog| runtime_selection_is_available(&catalog.options, runtime))
+        });
+        let active_session_ref = active_session.as_ref();
+        let workspace = workspace_override
+            .or_else(|| {
+                active_session_ref
+                    .map(|session| (session.workspace_root.clone(), session.workspace_mode))
+            })
+            .or_else(|| {
+                self.workspaces
+                    .iter()
+                    .find(|workspace| workspace.mode == WorkspaceMode::CurrentCheckout)
+                    .or_else(|| self.workspaces.first())
+                    .map(|workspace| (workspace.root_path.clone(), workspace.mode))
+            });
+        let Some((workspace_root, workspace_mode)) = workspace else {
+            self.error = Some(BackendError::failed(
+                "mobile_workspace_required",
+                locale::text(
+                    "Open a workspace on the desktop before creating a mobile session.",
+                    "请先在桌面端打开工作区，再创建移动端会话。",
+                    "請先在桌面版開啟工作區，再建立行動端工作階段。",
+                ),
+            ));
+            self.refresh_workspaces(cx);
+            cx.notify();
+            return;
+        };
+        self.new_session_workspace_mode = self.normalize_new_session_workspace_mode(workspace_mode);
+        self.new_session_runtime = active_runtime
+            .filter(|_| active_runtime_available)
+            .or(catalog_runtime);
+        self.new_session_workspace_id = self
+            .workspaces
+            .iter()
+            .find(|candidate| candidate.root_path == workspace_root)
+            .map(|candidate| candidate.id.as_str().to_string());
+        if self.new_session_project_id.is_none() {
+            self.new_session_project_id = self
+                .workspaces
+                .iter()
+                .find(|candidate| candidate.root_path == workspace_root)
+                .map(|candidate| candidate.project_id.as_str().to_string())
+                .or_else(|| {
+                    active_session_ref.map(|session| session.project_id.as_str().to_string())
+                });
+        }
+        self.apply_project_new_session_preference();
+        self.new_session_title_input
+            .update(cx, |input, cx| input.set_text("", cx));
+        self.new_session_prompt_input
+            .update(cx, |input, cx| input.set_text("", cx));
+        self.new_session_open = true;
+        self.error = None;
+        self.show_overlay(MobileOverlay::NewSession, window, cx);
+        let needs_runtime_catalog = self
+            .controller
+            .as_ref()
+            .is_some_and(|controller| controller.state.runtime_options.value.is_none());
+        if needs_runtime_catalog {
+            self.refresh_runtime_options(cx);
+        }
+        cx.notify();
+    }
+
+    fn submit_new_session(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.new_session_busy {
+            return;
+        }
+        let Some(controller) = self.controller.as_ref() else {
+            return;
+        };
+        let runtime = self
+            .new_session_runtime
+            .clone()
+            .or_else(|| {
+                controller
+                    .state
+                    .runtime_selection
+                    .value
+                    .as_ref()
+                    .map(|state| state.desired.clone())
+            })
             .or_else(|| {
                 controller
                     .state
@@ -1630,18 +1956,6 @@ impl MobileApp {
                     .iter()
                     .find(|option| option.availability == RuntimeOptionAvailability::Available)
                     .map(|option| option.selection.clone())
-            });
-        let workspace = workspace_override
-            .or_else(|| {
-                active_session
-                    .map(|session| (session.workspace_root.clone(), session.workspace_mode))
-            })
-            .or_else(|| {
-                self.workspaces
-                    .iter()
-                    .find(|workspace| workspace.mode == WorkspaceMode::CurrentCheckout)
-                    .or_else(|| self.workspaces.first())
-                    .map(|workspace| (workspace.root_path.clone(), workspace.mode))
             });
         let Some(runtime) = runtime else {
             self.error = Some(BackendError::loading(
@@ -1656,38 +1970,100 @@ impl MobileApp {
             cx.notify();
             return;
         };
-        let Some((workspace_root, workspace_mode)) = workspace else {
+        let workspace_root = self
+            .new_session_workspace_id
+            .as_deref()
+            .and_then(|id| {
+                self.workspaces
+                    .iter()
+                    .find(|workspace| workspace.id.as_str() == id)
+            })
+            .map(|workspace| workspace.root_path.clone())
+            .or_else(|| {
+                self.new_session_project_id
+                    .as_deref()
+                    .and_then(|project_id| {
+                        self.workspace_summaries
+                            .iter()
+                            .find(|summary| summary.project.id.as_str() == project_id)
+                            .map(|summary| summary.workspace.root_path.clone())
+                    })
+            });
+        let Some(workspace_root) = workspace_root else {
             self.error = Some(BackendError::failed(
                 "mobile_workspace_required",
                 locale::text(
-                    "Open a workspace on the desktop before creating a mobile session.",
-                    "请先在桌面端打开工作区，再创建移动端会话。",
-                    "請先在桌面版開啟工作區，再建立行動端工作階段。",
+                    "Choose a project with an open workspace first.",
+                    "请先选择一个已打开工作区的项目。",
+                    "請先選擇一個已開啟工作區的專案。",
                 ),
             ));
-            self.refresh_workspaces(cx);
             cx.notify();
             return;
         };
+        let title = self
+            .new_session_title_input
+            .read(cx)
+            .text()
+            .trim()
+            .to_string();
+        let prompt = self
+            .new_session_prompt_input
+            .read(cx)
+            .text()
+            .trim()
+            .to_string();
+        let workspace_mode =
+            self.normalize_new_session_workspace_mode(self.new_session_workspace_mode);
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
         let request = MutationRequest::new(CreateAgentSessionRequest {
-            runtime,
+            runtime: runtime.clone(),
             workspace_root,
             workspace_mode,
-            title: None,
+            title: (!title.is_empty()).then_some(title),
             safety: None,
         });
-        let runner = gpui_tokio::Tokio::spawn(cx, controller.create_session(request));
         self.new_session_busy = true;
         self.error = None;
-        self.start_drawer_snap(0.0, Some(window), cx);
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let session = backend.create_session(request).await?;
+            let prompt_result = if prompt.is_empty() {
+                None
+            } else {
+                Some(
+                    backend
+                        .send_message(MutationRequest::new(SendAgentMessageRequest {
+                            session_id: session.id.clone(),
+                            message_idempotency_key: RequestId::new().into_string(),
+                            desired_runtime: runtime.clone(),
+                            text: prompt,
+                            attachments: Vec::new(),
+                            reasoning_effort: runtime.reasoning_effort.clone(),
+                            correlation_id: None,
+                        }))
+                        .await
+                        .map(|_| ()),
+                )
+            };
+            Ok::<_, BackendError>((session, prompt_result))
+        });
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
             let _ = entity.update(cx, |this, cx| {
                 this.new_session_busy = false;
                 match outcome {
-                    Ok(session) => {
+                    Ok((session, prompt_result)) => {
+                        this.new_session_open = false;
+                        this.new_session_runtime = None;
+                        this.dismiss_overlay(None, cx);
                         this.refresh_sessions(cx);
-                        this.open_session(session.id, cx);
+                        let session_id = session.id.clone();
+                        this.open_session(session_id, cx);
+                        if let Some(Err(error)) = prompt_result {
+                            this.error = Some(error);
+                        }
                     }
                     Err(error) => this.error = Some(error),
                 }
@@ -1753,14 +2129,6 @@ impl MobileApp {
                         .map(SessionMutationOutcome::Renamed)
                 })
             }
-            SessionActionKind::Archive => {
-                let future =
-                    controller.archive_session(MutationRequest::new(prompt.session_id.clone()));
-                Box::pin(async move {
-                    future.await?;
-                    Ok(SessionMutationOutcome::Removed)
-                })
-            }
             SessionActionKind::Delete => {
                 let future =
                     controller.delete_session(MutationRequest::new(prompt.session_id.clone()));
@@ -1809,15 +2177,142 @@ impl MobileApp {
                         }
                         this.session_action = None;
                         this.notice = Some(match prompt.kind {
-                            SessionActionKind::Archive => {
-                                locale::common("Session archived").to_string()
-                            }
                             SessionActionKind::Delete => {
                                 locale::common("Session deleted").to_string()
                             }
                             SessionActionKind::Rename => unreachable!(),
                         });
                         this.refresh_sessions(cx);
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    fn begin_workspace_action(
+        &mut self,
+        kind: WorkspaceActionKind,
+        workspace_id: String,
+        current_title: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace_action_busy {
+            return;
+        }
+        if kind == WorkspaceActionKind::Rename {
+            self.session_action_input
+                .update(cx, |input, cx| input.set_text(current_title.clone(), cx));
+        }
+        self.workspace_action = Some(WorkspaceActionPrompt {
+            kind,
+            workspace_id,
+            current_title,
+        });
+        self.error = None;
+        cx.notify();
+    }
+
+    fn cancel_workspace_action(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.workspace_action_busy {
+            self.workspace_action = None;
+            cx.notify();
+        }
+    }
+
+    fn confirm_workspace_action(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace_action_busy {
+            return;
+        }
+        let Some(prompt) = self.workspace_action.clone() else {
+            return;
+        };
+        if prompt.kind == WorkspaceActionKind::Rename {
+            let title = self.session_action_input.read(cx).text().trim().to_string();
+            self.workspace_action = None;
+            self.send_sidebar_mutation(
+                RemoteSidebarOrganizationMutation::SetWorktreeTitle {
+                    workspace_id: prompt.workspace_id,
+                    title,
+                },
+                false,
+                cx,
+            );
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let can_delete = backend
+            .capability_snapshot()
+            .workspace
+            .supports(BackendOperation::WorkspaceDelete)
+            && self.workspaces.iter().any(|workspace| {
+                workspace.id.as_str() == prompt.workspace_id
+                    && workspace.mode == WorkspaceMode::VibexWorktree
+            });
+        if !can_delete {
+            self.workspace_action = None;
+            self.error = Some(BackendError::failed(
+                "mobile_workspace_delete_unsupported",
+                locale::text(
+                    "This desktop does not expose worktree deletion.",
+                    "此桌面端不支持删除工作树。",
+                    "此桌面版不支援刪除工作樹。",
+                ),
+            ));
+            cx.notify();
+            return;
+        }
+        let workspace_id = prompt.workspace_id.clone();
+        let session_ids = self
+            .sessions()
+            .iter()
+            .filter(|session| session.workspace_id.as_str() == workspace_id)
+            .map(|session| session.id.clone())
+            .collect::<Vec<_>>();
+        self.workspace_action_busy = true;
+        self.error = None;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            for session_id in session_ids {
+                backend
+                    .delete_session(MutationRequest::new(session_id))
+                    .await?;
+            }
+            backend
+                .delete_workspace(MutationRequest::new(
+                    vibex_core::WorkspaceId::parse(workspace_id).map_err(|_| {
+                        BackendError::failed("workspace_invalid", "invalid workspace id")
+                    })?,
+                ))
+                .await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.workspace_action_busy = false;
+                match outcome {
+                    Ok(()) => {
+                        this.workspace_action = None;
+                        this.notice = Some(
+                            locale::text("Worktree deleted", "Worktree 已删除", "Worktree 已刪除")
+                                .to_string(),
+                        );
+                        this.refresh_sessions(cx);
+                        this.refresh_workspaces(cx);
                     }
                     Err(error) => this.error = Some(error),
                 }
@@ -1991,8 +2486,12 @@ impl MobileApp {
                     project_id: summary.project.id.as_str().to_string(),
                     label: workspace_label(&summary.workspace.root_path).to_string(),
                     detail: summary.workspace.root_path.clone(),
+                    branch: summary.git_branch.clone(),
                     mode: summary.workspace.mode,
-                    collapsed: self.collapsed_workspace_ids.contains(&workspace_id),
+                    collapsed: self
+                        .sidebar_view
+                        .collapsed_workspace_ids
+                        .contains(&workspace_id),
                 }
             })
             .collect()
@@ -2022,9 +2521,31 @@ impl MobileApp {
     }
 
     fn toggle_workspace(&mut self, workspace_id: String, cx: &mut Context<Self>) {
-        if !self.collapsed_workspace_ids.remove(&workspace_id) {
-            self.collapsed_workspace_ids.insert(workspace_id);
+        self.sidebar_selected_workspace_id = Some(workspace_id.clone());
+        if let Ok(workspace_id_value) = vibex_core::WorkspaceId::parse(workspace_id.clone()) {
+            self.ensure_workbench(workspace_id_value, cx);
         }
+        let collapsed = !self
+            .sidebar_view
+            .collapsed_workspace_ids
+            .contains(&workspace_id);
+        if collapsed {
+            self.sidebar_view
+                .collapsed_workspace_ids
+                .insert(workspace_id.clone());
+        } else {
+            self.sidebar_view
+                .collapsed_workspace_ids
+                .remove(&workspace_id);
+        }
+        self.send_sidebar_mutation(
+            RemoteSidebarOrganizationMutation::SetWorkspaceCollapsed {
+                workspace_id,
+                collapsed,
+            },
+            false,
+            cx,
+        );
         cx.notify();
     }
 
@@ -2056,22 +2577,14 @@ impl MobileApp {
         cx.notify();
     }
 
-    /// Starts a move if the pan began on a row's grip column. Anywhere else the
-    /// pan stays a list scroll, which is what a finger usually means.
+    /// Non-workspace rows begin moving from the trailing grip column. A
+    /// Worktree deliberately has no grip, so it arms a long-press move on the
+    /// row body instead.
     fn begin_sidebar_drag(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) -> bool {
         if self.sidebar_search_open {
             return false;
         }
         let (list_top, list_right) = self.sidebar_list_frame.get();
-        if list_right <= 0.0
-            || !press_is_on_grip(
-                f32::from(event.position.x),
-                list_right,
-                theme::SIDEBAR_GRIP_WIDTH,
-            )
-        {
-            return false;
-        }
         let rows = self.mobile_sidebar_rows(self.sidebar_search_input.read(cx).text());
         let offset_y = f32::from(self.drawer_scroll.0.borrow().base_handle.offset().y);
         let position = row_at_position(
@@ -2087,21 +2600,75 @@ impl MobileApp {
         let Some(row) = rows.get(index).cloned() else {
             return false;
         };
-        if row.kind == SidebarRowKind::Workspace {
+        let can_organize = self.backend.as_ref().is_some_and(|backend| {
+            backend
+                .capability_snapshot()
+                .agent
+                .supports(BackendOperation::AgentSidebarOrganizationMutate)
+        });
+        if !can_organize {
             return false;
         }
-        self.sidebar_drag = Some(SidebarDrag {
-            index,
-            row,
-            pointer_y: f32::from(event.position.y),
-            target: None,
-        });
-        cx.notify();
-        true
+        if row.kind != SidebarRowKind::Workspace
+            && !press_is_on_grip(
+                f32::from(event.position.x),
+                list_right,
+                theme::SIDEBAR_GRIP_WIDTH,
+            )
+        {
+            return false;
+        }
+        if row.kind == SidebarRowKind::Workspace
+            && press_is_on_grip(
+                f32::from(event.position.x),
+                list_right,
+                theme::SIDEBAR_GRIP_WIDTH,
+            )
+        {
+            // The workspace menu occupies this edge. It is not a drag
+            // affordance, and holding it must not start a move underneath.
+            return false;
+        }
+        if row.kind != SidebarRowKind::Workspace {
+            self.sidebar_drag = Some(SidebarDrag {
+                index,
+                row,
+                pointer_y: f32::from(event.position.y),
+                target: None,
+            });
+            cx.notify();
+            return true;
+        }
+        self.sidebar_drag_candidate = Some((index, row));
+        let entity = cx.weak_entity();
+        self.sidebar_drag_long_press = Some(cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(380))
+                .await;
+            let _ = entity.update(cx, |this, cx| {
+                if let Some((candidate_index, candidate_row)) = this.sidebar_drag_candidate.take() {
+                    this.sidebar_drag = Some(SidebarDrag {
+                        index: candidate_index,
+                        row: candidate_row,
+                        pointer_y: 0.0,
+                        target: None,
+                    });
+                    cx.notify();
+                }
+            });
+        }));
+        false
     }
 
     fn advance_sidebar_drag(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
         let Some(drag) = self.sidebar_drag.as_ref() else {
+            if self.sidebar_drag_candidate.is_some()
+                && let ScrollDelta::Pixels(delta) = event.delta
+                && (f32::from(delta.x).abs() + f32::from(delta.y).abs()) > 10.0
+            {
+                self.sidebar_drag_candidate = None;
+                self.sidebar_drag_long_press = None;
+            }
             return;
         };
         let index = drag.index;
@@ -2111,11 +2678,20 @@ impl MobileApp {
         let pointer_y = f32::from(event.position.y);
         let position = row_at_position(pointer_y, list_top, offset_y, theme::SIDEBAR_ROW_HEIGHT);
         let mut target = drop_target(&rows, index, position);
-        if target
-            .as_ref()
-            .is_some_and(|candidate| rows[candidate.index].kind == SidebarRowKind::Workspace)
-        {
-            target = None;
+        if let Some(candidate) = target.as_ref() {
+            let candidate_row = &rows[candidate.index];
+            if rows[index].kind == SidebarRowKind::Workspace {
+                // Worktrees reorder only among siblings in their project. They
+                // are never organization items, so a folder/session target is
+                // not a legal drop and there is no "into" operation here.
+                if candidate_row.kind != SidebarRowKind::Workspace
+                    || candidate_row.project_id != rows[index].project_id
+                {
+                    target = None;
+                }
+            } else if candidate_row.kind == SidebarRowKind::Workspace {
+                target = None;
+            }
         }
         // A folder cannot be filed inside itself or its own descendants.
         if let Some(candidate) = target.as_ref()
@@ -2134,11 +2710,11 @@ impl MobileApp {
 
     fn finish_sidebar_drag(&mut self, cancelled: bool, cx: &mut Context<Self>) {
         let Some(drag) = self.sidebar_drag.take() else {
+            self.sidebar_drag_candidate = None;
+            self.sidebar_drag_long_press = None;
             return;
         };
-        if drag.row.kind == SidebarRowKind::Workspace {
-            return;
-        }
+        self.sidebar_drag_long_press = None;
         cx.notify();
         let Some(target) = drag.target.filter(|_| !cancelled) else {
             return;
@@ -2147,6 +2723,35 @@ impl MobileApp {
         let Some(anchor) = rows.get(target.index) else {
             return;
         };
+        if drag.row.kind == SidebarRowKind::Workspace {
+            let (Some(workspace_id), Some(project_id), Some(anchor_workspace_id)) = (
+                drag.row.workspace_id.clone(),
+                drag.row.project_id.clone(),
+                anchor.workspace_id.clone(),
+            ) else {
+                return;
+            };
+            if anchor.kind != SidebarRowKind::Workspace
+                || anchor.project_id.as_deref() != Some(project_id.as_str())
+            {
+                return;
+            }
+            self.send_sidebar_mutation(
+                RemoteSidebarOrganizationMutation::MoveWorkspaces {
+                    project_id,
+                    workspace_ids: vec![workspace_id],
+                    anchor_workspace_id: Some(anchor_workspace_id),
+                    position: match target.position {
+                        SidebarDropPosition::Before => RemoteSidebarDropPosition::Before,
+                        SidebarDropPosition::After => RemoteSidebarDropPosition::After,
+                        SidebarDropPosition::Into => return,
+                    },
+                },
+                true,
+                cx,
+            );
+            return;
+        }
         if anchor.kind == SidebarRowKind::Workspace {
             return;
         }
@@ -2251,10 +2856,19 @@ impl MobileApp {
         // The tree belongs to whichever desktop is paired, so switching hosts
         // must not leave the previous desktop's folders on screen.
         self.sidebar_view = SidebarOrganizationView::default();
-        self.collapsed_workspace_ids.clear();
+        self.sidebar_selected_workspace_id = None;
         self.sidebar_drag = None;
+        self.sidebar_drag_candidate = None;
+        self.sidebar_drag_long_press = None;
+        self.sidebar_batch_mode = false;
         self.sidebar_row_menu = None;
         self.sidebar_name_prompt = None;
+        self.workspace_action = None;
+        self.workspace_action_busy = false;
+        self.new_session_open = false;
+        self.new_session_project_id = None;
+        self.new_session_workspace_id = None;
+        self.new_session_runtime = None;
         self.sidebar_projects_initialized = false;
         self.sidebar_search_open = false;
         self.sidebar_search_input
@@ -2281,6 +2895,119 @@ impl MobileApp {
             false,
             cx,
         );
+        cx.notify();
+    }
+
+    fn toggle_hierarchy_mode(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let mode = match self.sidebar_view.hierarchy_mode {
+            SidebarHierarchyMode::Compact => SidebarHierarchyMode::Detailed,
+            SidebarHierarchyMode::Detailed => SidebarHierarchyMode::Compact,
+        };
+        self.sidebar_view.hierarchy_mode = mode;
+        self.send_sidebar_mutation(
+            RemoteSidebarOrganizationMutation::SetHierarchyMode {
+                mode: match mode {
+                    SidebarHierarchyMode::Compact => {
+                        vibex_core::RemoteSidebarHierarchyMode::Compact
+                    }
+                    SidebarHierarchyMode::Detailed => {
+                        vibex_core::RemoteSidebarHierarchyMode::Detailed
+                    }
+                },
+            },
+            false,
+            cx,
+        );
+        cx.notify();
+    }
+
+    fn toggle_sidebar_batch_mode(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sidebar_batch_mode = !self.sidebar_batch_mode;
+        if !self.sidebar_batch_mode {
+            self.sidebar_state.selected_ids.clear();
+        }
+        cx.notify();
+    }
+
+    fn toggle_all_sidebar_sessions(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let session_ids = self
+            .sessions()
+            .iter()
+            .filter(|session| session.deleted_at_ms.is_none())
+            .map(|session| session.id.as_str().to_string())
+            .collect::<BTreeSet<_>>();
+        if session_ids.is_empty() {
+            return;
+        }
+        if self.sidebar_state.selected_ids == session_ids {
+            self.sidebar_state.selected_ids.clear();
+        } else {
+            self.sidebar_state.selected_ids = session_ids;
+        }
+        cx.notify();
+    }
+
+    fn toggle_sidebar_row_selection(&mut self, session_id: String, cx: &mut Context<Self>) {
+        if self.sidebar_batch_mode {
+            self.sidebar_state.toggle_selected(session_id);
+            cx.notify();
+        }
+    }
+
+    fn delete_selected_sessions(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.operation_busy {
+            return;
+        }
+        let ids = self
+            .sidebar_state
+            .selected_ids
+            .iter()
+            .filter_map(|id| VibexSessionId::parse(id.clone()).ok())
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        self.operation_busy = true;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            for id in ids {
+                backend.delete_session(MutationRequest::new(id)).await?;
+            }
+            Ok::<_, BackendError>(())
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.operation_busy = false;
+                match outcome {
+                    Ok(()) => {
+                        this.sidebar_state.selected_ids.clear();
+                        this.sidebar_batch_mode = false;
+                        this.refresh_sessions(cx);
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
         cx.notify();
     }
 
@@ -2359,9 +3086,36 @@ impl MobileApp {
             self.toggle_project(project_id, cx);
         }
         if let Some(workspace_id) = workspace_id
-            && self.collapsed_workspace_ids.contains(&workspace_id)
+            && self
+                .sidebar_view
+                .collapsed_workspace_ids
+                .contains(&workspace_id)
         {
             self.toggle_workspace(workspace_id, cx);
+        }
+        // A session may be nested below several project/worktree folders. Walk
+        // its authoritative placement chain so locating it also reveals every
+        // collapsed folder ancestor.
+        let mut parent = Some(SidebarOrganizationItem::Session(
+            session_id.as_str().to_string(),
+        ));
+        let mut seen = BTreeSet::new();
+        while let Some(item) = parent {
+            let Some(folder_id) = self.sidebar_view.organization.parent_of(&item) else {
+                break;
+            };
+            if !seen.insert(folder_id.clone()) {
+                break;
+            }
+            if self
+                .sidebar_view
+                .organization
+                .collapsed_folder_ids
+                .contains(&folder_id)
+            {
+                self.toggle_folder(folder_id.clone(), cx);
+            }
+            parent = Some(SidebarOrganizationItem::Folder(folder_id));
         }
         let query = self.sidebar_search_input.read(cx).text().to_string();
         if let Some(index) = self
@@ -3322,6 +4076,9 @@ impl MobileApp {
                     cx.stop_propagation();
                     return;
                 }
+                if self.sidebar_drag_candidate.is_some() {
+                    self.advance_sidebar_drag(event, cx);
+                }
             }
             TouchPhase::Ended | TouchPhase::Cancelled => {
                 if self.sidebar_drag.is_some() {
@@ -3330,6 +4087,8 @@ impl MobileApp {
                     cx.stop_propagation();
                     return;
                 }
+                self.sidebar_drag_candidate = None;
+                self.sidebar_drag_long_press = None;
             }
         }
         cx.stop_propagation();
@@ -4146,6 +4905,9 @@ impl MobileApp {
             .when_some(session_action, |root, prompt| {
                 root.child(self.render_session_action_prompt(&prompt, cx))
             })
+            .when_some(self.workspace_action.as_ref(), |root, prompt| {
+                root.child(self.render_workspace_action_prompt(prompt, cx))
+            })
             .when(self.runtime_options_open, |root| {
                 root.child(self.render_runtime_options_sheet(cx))
             })
@@ -4160,7 +4922,7 @@ impl MobileApp {
         &self,
         menu: &SidebarRowMenu,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> gpui::AnyElement {
         let row = menu.row.clone();
         let mut sheet = div()
             .w_full()
@@ -4228,12 +4990,6 @@ impl MobileApp {
                         false,
                     ),
                     (
-                        "mobile-row-menu-archive",
-                        SessionActionKind::Archive,
-                        locale::common("Archive"),
-                        false,
-                    ),
-                    (
                         "mobile-row-menu-delete",
                         SessionActionKind::Delete,
                         locale::common("Delete"),
@@ -4256,6 +5012,29 @@ impl MobileApp {
                 }
                 let pin_session_id = row.id().to_string();
                 let pinned = row.pinned;
+                let auto_continue_session_id = row.id().to_string();
+                let auto_continue = row.auto_continue;
+                sheet = entry(
+                    sheet,
+                    "mobile-row-menu-auto-continue",
+                    if auto_continue {
+                        locale::text("Disable auto continue", "关闭自动继续", "關閉自動繼續")
+                            .to_string()
+                    } else {
+                        locale::text("Auto continue", "自动继续", "自動繼續").to_string()
+                    },
+                    false,
+                    Box::new(move |this, _, cx| {
+                        this.send_sidebar_mutation(
+                            RemoteSidebarOrganizationMutation::SetSessionAutoContinue {
+                                session_id: auto_continue_session_id.clone(),
+                                enabled: !auto_continue,
+                            },
+                            false,
+                            cx,
+                        );
+                    }),
+                );
                 sheet = entry(
                     sheet,
                     "mobile-row-menu-pin",
@@ -4358,7 +5137,60 @@ impl MobileApp {
                     }),
                 );
             }
-            SidebarRowKind::Workspace => {}
+            SidebarRowKind::Workspace => {
+                let Some(workspace_id) = row.workspace_id.clone() else {
+                    return div().into_any_element();
+                };
+                let managed_worktree = self.workspaces.iter().any(|workspace| {
+                    workspace.id.as_str() == workspace_id
+                        && workspace.mode == WorkspaceMode::VibexWorktree
+                });
+                if !managed_worktree {
+                    return div().into_any_element();
+                }
+                let workspace_id_for_rename = workspace_id.clone();
+                let title = row.label.clone();
+                sheet = entry(
+                    sheet,
+                    "mobile-row-menu-workspace-rename",
+                    locale::common("Rename").to_string(),
+                    false,
+                    Box::new(move |this, _, cx| {
+                        this.begin_workspace_action(
+                            WorkspaceActionKind::Rename,
+                            workspace_id_for_rename.clone(),
+                            title.clone(),
+                            cx,
+                        );
+                    }),
+                );
+                let can_delete = self.backend.as_ref().is_some_and(|backend| {
+                    backend
+                        .capability_snapshot()
+                        .workspace
+                        .supports(BackendOperation::WorkspaceDelete)
+                }) && self.workspaces.iter().any(|workspace| {
+                    workspace.id.as_str() == workspace_id
+                        && workspace.mode == WorkspaceMode::VibexWorktree
+                });
+                if can_delete {
+                    let workspace_id_for_delete = workspace_id;
+                    sheet = entry(
+                        sheet,
+                        "mobile-row-menu-workspace-delete",
+                        locale::common("Delete").to_string(),
+                        true,
+                        Box::new(move |this, _, cx| {
+                            this.begin_workspace_action(
+                                WorkspaceActionKind::Delete,
+                                workspace_id_for_delete.clone(),
+                                row.label.clone(),
+                                cx,
+                            );
+                        }),
+                    );
+                }
+            }
         }
 
         div()
@@ -4378,6 +5210,7 @@ impl MobileApp {
                 }),
             )
             .child(sheet)
+            .into_any_element()
     }
 
     fn render_folder_name_prompt(
@@ -4506,16 +5339,6 @@ impl MobileApp {
                 locale::common("Rename"),
                 false,
             ),
-            SessionActionKind::Archive => (
-                locale::text("Archive session", "归档会话", "封存工作階段"),
-                locale::text(
-                    "The session leaves the active list but remains available in desktop history.",
-                    "会话将从活动列表中移除，但仍保留在桌面端历史记录中。",
-                    "工作階段會從使用中清單移除，但仍保留在桌面版歷史記錄中。",
-                ),
-                locale::common("Archive"),
-                false,
-            ),
             SessionActionKind::Delete => (
                 locale::text("Delete session", "删除会话", "刪除工作階段"),
                 locale::text(
@@ -4642,6 +5465,141 @@ impl MobileApp {
             )
     }
 
+    fn render_workspace_action_prompt(
+        &self,
+        prompt: &WorkspaceActionPrompt,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let rename = prompt.kind == WorkspaceActionKind::Rename;
+        let heading = if rename {
+            locale::text("Rename Worktree", "重命名 Worktree", "重新命名 Worktree")
+        } else {
+            locale::text("Delete Worktree", "删除 Worktree", "刪除 Worktree")
+        };
+        let detail = if rename {
+            locale::text(
+                "The title is mirrored to the desktop sidebar.",
+                "标题会同步到桌面端侧栏。",
+                "標題會同步到桌面版側欄。",
+            )
+        } else {
+            locale::text(
+                "Sessions under this Worktree will also be deleted.",
+                "此 Worktree 下的会话也会被删除。",
+                "此 Worktree 下的工作階段也會被刪除。",
+            )
+        };
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme::backdrop(0.72))
+            .p_4()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(360.0))
+                    .rounded(px(theme::RADIUS_CARD))
+                    .border_1()
+                    .border_color(theme::border_default())
+                    .bg(theme::bg_card())
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_size(px(theme::FONT_HEADING))
+                            .text_color(theme::text_primary())
+                            .child(heading),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(theme::FONT_CAPTION))
+                            .text_color(theme::text_muted())
+                            .child(detail),
+                    )
+                    .when(rename, |dialog| {
+                        dialog.child(
+                            div()
+                                .h(px(theme::TOUCH_TARGET))
+                                .rounded(px(theme::RADIUS_CONTROL))
+                                .border_1()
+                                .border_color(theme::border_default())
+                                .bg(theme::bg_primary())
+                                .px_1()
+                                .child(self.session_action_input.clone()),
+                        )
+                    })
+                    .when(!rename, |dialog| {
+                        dialog.child(
+                            div()
+                                .text_size(px(theme::FONT_BODY))
+                                .text_color(theme::text_secondary())
+                                .child(prompt.current_title.clone()),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("cancel-workspace-action")
+                                    .h(px(theme::TOUCH_TARGET))
+                                    .px_4()
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .border_1()
+                                    .border_color(theme::border_default())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(Self::cancel_workspace_action),
+                                    )
+                                    .child(locale::common("Cancel")),
+                            )
+                            .child(
+                                div()
+                                    .id("confirm-workspace-action")
+                                    .h(px(theme::TOUCH_TARGET))
+                                    .px_4()
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .bg(if rename {
+                                        rgb(theme::TEXT_PRIMARY)
+                                    } else {
+                                        rgb(theme::ACCENT_RED)
+                                    })
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .text_color(rgb(theme::BG_PRIMARY))
+                                    .when(!self.workspace_action_busy, |button| {
+                                        button.on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(Self::confirm_workspace_action),
+                                        )
+                                    })
+                                    .when(self.workspace_action_busy, |button| button.opacity(0.55))
+                                    .child(if self.workspace_action_busy {
+                                        locale::common("Working...")
+                                    } else if rename {
+                                        locale::common("Rename")
+                                    } else {
+                                        locale::common("Delete")
+                                    }),
+                            ),
+                    ),
+            )
+    }
+
     fn render_runtime_options_sheet(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let catalog = self
             .controller
@@ -4668,10 +5626,12 @@ impl MobileApp {
                 .is_some_and(|draft| runtime_selection_is_available(&catalog.options, draft))
         });
         let can_switch = self.backend.as_ref().is_some_and(|backend| {
-            backend
-                .capability_snapshot()
-                .agent
-                .supports(BackendOperation::AgentSwitchRuntime)
+            let operation = if self.runtime_options_target == RuntimeOptionsTarget::NewSession {
+                BackendOperation::AgentCreateSession
+            } else {
+                BackendOperation::AgentSwitchRuntime
+            };
+            backend.capability_snapshot().agent.supports(operation)
         });
         let can_apply = can_switch && selection_available && !busy;
         let selected_agent = draft.as_ref().map(|draft| draft.agent_id.to_string());
@@ -6174,57 +7134,102 @@ impl MobileApp {
                     SidebarDropPosition::Into => row,
                 }
             })
-            .child(self.render_sidebar_grip(row, cx))
+            .child(self.render_sidebar_actions(row, cx))
             .into_any_element()
     }
 
-    /// The grip is the only place a pan means "move this row"; everywhere else
-    /// a finger scrolls the list.
-    fn render_sidebar_grip(&self, row: &SidebarRow, cx: &mut Context<Self>) -> gpui::AnyElement {
-        if row.kind == SidebarRowKind::Workspace {
-            return div().into_any_element();
-        }
-        let can_move = self.backend.as_ref().is_some_and(|backend| {
+    /// The trailing column keeps menu and drag affordances separate. Worktree
+    /// rows intentionally expose only their menu; their move gesture is a
+    /// long press on the row body.
+    fn render_sidebar_actions(&self, row: &SidebarRow, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let can_organize = self.backend.as_ref().is_some_and(|backend| {
             backend
                 .capability_snapshot()
                 .agent
                 .supports(BackendOperation::AgentSidebarOrganizationMutate)
         });
-        if !can_move {
+        let show_menu = match row.kind {
+            SidebarRowKind::Session => true,
+            SidebarRowKind::Folder | SidebarRowKind::Workspace => can_organize,
+            SidebarRowKind::Project => false,
+        };
+        let show_menu = if row.kind == SidebarRowKind::Workspace {
+            can_organize
+                && row.workspace_id.as_deref().is_some_and(|workspace_id| {
+                    self.workspaces.iter().any(|workspace| {
+                        workspace.id.as_str() == workspace_id
+                            && workspace.mode == WorkspaceMode::VibexWorktree
+                    })
+                })
+        } else {
+            show_menu
+        };
+        let show_grip = row.kind != SidebarRowKind::Workspace && can_organize;
+        if !show_menu && !show_grip {
             return div().into_any_element();
         }
         let menu_row = row.clone();
-        div()
-            .id(format!("mobile-sidebar-grip-{}", row.id()))
+        let mut actions = div()
+            .id(format!("mobile-sidebar-actions-{}", row.id()))
             .absolute()
             .top_0()
             .bottom_0()
             .right_0()
-            .w(px(theme::SIDEBAR_GRIP_WIDTH))
+            .w(px(if show_menu && show_grip {
+                theme::SIDEBAR_GRIP_WIDTH * 2.0
+            } else {
+                theme::SIDEBAR_GRIP_WIDTH
+            }))
             .flex()
             .items_center()
-            .justify_center()
-            .cursor_pointer()
-            .active(|style| style.bg(theme::row_pressed_bg()))
-            // A tap on the grip opens the row's actions; a pan from it moves the
-            // row, which the drawer gesture handler picks up by press position.
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.sidebar_row_menu = Some(SidebarRowMenu {
-                        row: menu_row.clone(),
-                    });
-                    cx.notify();
-                }),
-            )
-            .child(
-                svg()
-                    .path("icons/grip-vertical.svg")
-                    .size(px(15.0))
-                    .text_color(theme::sidebar_text_muted()),
-            )
-            .into_any_element()
+            .justify_end();
+        if show_menu {
+            actions = actions.child(
+                div()
+                    .id(format!("mobile-sidebar-menu-{}", row.id()))
+                    .size(px(theme::SIDEBAR_GRIP_WIDTH))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.sidebar_row_menu = Some(SidebarRowMenu {
+                                row: menu_row.clone(),
+                            });
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        svg()
+                            .path("icons/ellipsis-vertical.svg")
+                            .size(px(16.0))
+                            .text_color(theme::sidebar_text_muted()),
+                    ),
+            );
+        }
+        if show_grip {
+            actions = actions.child(
+                div()
+                    .id(format!("mobile-sidebar-grip-{}", row.id()))
+                    .size(px(theme::SIDEBAR_GRIP_WIDTH))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        svg()
+                            .path("icons/grip-vertical.svg")
+                            .size(px(15.0))
+                            .text_color(theme::sidebar_text_muted()),
+                    ),
+            );
+        }
+        actions.into_any_element()
     }
 
     fn render_sidebar_folder_row(
@@ -6239,7 +7244,7 @@ impl MobileApp {
             .h_full()
             .mx(px(theme::SPACING_SM))
             .pl(px(indent))
-            .pr(px(theme::SIDEBAR_GRIP_WIDTH))
+            .pr(px(theme::SIDEBAR_GRIP_WIDTH * 2.0))
             .rounded(px(theme::RADIUS_CONTROL))
             .flex()
             .items_center()
@@ -6291,6 +7296,14 @@ impl MobileApp {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let project_id = row.id().to_string();
+        let project_appearance = self
+            .sidebar_view
+            .project_appearances
+            .get(&project_id)
+            .cloned()
+            .unwrap_or_default();
+        let project_icon_path = sidebar_project_icon_path(&project_appearance);
+        let project_icon_color = sidebar_project_icon_color(project_appearance.color);
         let new_session_project_id = project_id.clone();
         let can_create_session = self.backend.as_ref().is_some_and(|backend| {
             backend
@@ -6303,7 +7316,7 @@ impl MobileApp {
             .h_full()
             .mx(px(theme::SPACING_SM))
             .pl(px(indent))
-            .pr(px(theme::SIDEBAR_GRIP_WIDTH))
+            .pr(px(theme::SIDEBAR_GRIP_WIDTH * 2.0))
             .rounded(px(theme::RADIUS_CONTROL))
             .flex()
             .items_center()
@@ -6338,9 +7351,9 @@ impl MobileApp {
                     .justify_center()
                     .child(
                         svg()
-                            .path("icons/boxes.svg")
+                            .path(project_icon_path)
                             .size(px(18.0))
-                            .text_color(rgb(theme::ACCENT_PURPLE)),
+                            .text_color(project_icon_color),
                     ),
             )
             .child(
@@ -6431,12 +7444,38 @@ impl MobileApp {
                 .agent
                 .supports(BackendOperation::AgentCreateSession)
         });
+        let workspace_selected = row.selected
+            || self.sidebar_selected_workspace_id.as_deref() == Some(workspace_id.as_str());
         let status_color = sidebar_workspace_status_color(row.state);
-        let detail = row
-            .detail
-            .as_deref()
-            .map(|detail| format!("{} · {detail}", workspace_mode_label(workspace_mode)))
-            .unwrap_or_else(|| workspace_mode_label(workspace_mode).to_string());
+        let status_indicator = if matches!(
+            row.state,
+            Some(AgentSessionState::Running | AgentSessionState::Initializing)
+        ) {
+            svg()
+                .path("icons/refresh.svg")
+                .size(px(theme::ICON_STATUS + 2.0))
+                .flex_shrink_0()
+                .text_color(rgb(status_color))
+                .into_any_element()
+        } else {
+            div()
+                .size(px(theme::ICON_STATUS))
+                .flex_shrink_0()
+                .rounded_full()
+                .bg(rgb(status_color))
+                .into_any_element()
+        };
+        let detail = row.detail.clone().unwrap_or_else(|| {
+            format!(
+                "{} · {}",
+                workspace_mode_label(workspace_mode),
+                self.workspaces
+                    .iter()
+                    .find(|workspace| workspace.id.as_str() == workspace_id)
+                    .map(|workspace| workspace.root_path.as_str())
+                    .unwrap_or_default()
+            )
+        });
         div()
             .id(format!("mobile-workspace-row-{workspace_id}"))
             .h_full()
@@ -6447,8 +7486,12 @@ impl MobileApp {
             .flex()
             .items_center()
             .gap(px(theme::SPACING_XS))
-            .when(row.selected, |workspace| {
-                workspace.bg(theme::sidebar_selected_bg())
+            .when(workspace_selected, |workspace| {
+                workspace
+                    .bg(theme::sidebar_selected_bg())
+                    .when(!row.collapsed, |workspace| {
+                        workspace.border_1().border_color(rgb(theme::ACCENT_BLUE))
+                    })
             })
             .cursor_pointer()
             .active(|style| style.bg(theme::row_pressed_bg()))
@@ -6475,12 +7518,7 @@ impl MobileApp {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(
-                        div()
-                            .size(px(theme::ICON_STATUS))
-                            .rounded_full()
-                            .bg(rgb(status_color)),
-                    ),
+                    .child(status_indicator),
             )
             .child(
                 div()
@@ -6571,22 +7609,50 @@ impl MobileApp {
         let Some(session) = sessions.iter().find(|session| session.id == session_id) else {
             return div().into_any_element();
         };
-        let status = match row.state.unwrap_or(session.state) {
-            AgentSessionState::Running => theme::ACCENT_GREEN,
+        let session_state = row.state.unwrap_or(session.state);
+        let status = match session_state {
+            AgentSessionState::Running | AgentSessionState::Initializing if row.auto_continue => {
+                theme::ACCENT_GREEN
+            }
+            AgentSessionState::Running => theme::ACCENT_BLUE,
             AgentSessionState::NeedsInput => theme::ACCENT_YELLOW,
             AgentSessionState::Error => theme::ACCENT_RED,
             AgentSessionState::Initializing => theme::ACCENT_BLUE,
-            AgentSessionState::Idle => theme::ACCENT_GREEN,
+            AgentSessionState::Idle => theme::ACCENT_DIM,
             AgentSessionState::Archived | AgentSessionState::Closed => theme::ACCENT_DIM,
         };
-        let is_selected = row.selected;
+        let state_label = sidebar_session_state_label(session_state);
+        let show_status = !row.pinned
+            && matches!(
+                session_state,
+                AgentSessionState::Running
+                    | AgentSessionState::Initializing
+                    | AgentSessionState::NeedsInput
+                    | AgentSessionState::Error
+            );
+        let show_time = !row.pinned
+            && !row.unread
+            && state_label.is_none()
+            && !matches!(
+                session_state,
+                AgentSessionState::Running
+                    | AgentSessionState::Initializing
+                    | AgentSessionState::NeedsInput
+                    | AgentSessionState::Error
+            );
+        let is_selected = row.selected
+            || self
+                .sidebar_state
+                .selected_ids
+                .contains(session_id.as_str());
         let open_session_id = session_id.clone();
+        let batch_session_id = session_id.clone();
         div()
             .id(format!("mobile-session-row-{}", row.id()))
             .h_full()
             .mx(px(theme::SPACING_SM))
             .pl(px(indent))
-            .pr(px(theme::SIDEBAR_GRIP_WIDTH))
+            .pr(px(theme::SIDEBAR_GRIP_WIDTH * 2.0))
             .rounded(px(theme::RADIUS_CONTROL))
             .flex()
             .items_center()
@@ -6596,7 +7662,25 @@ impl MobileApp {
             .active(|style| style.bg(theme::row_pressed_bg()))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(move |this, _, _, cx| this.open_session(open_session_id.clone(), cx)),
+                cx.listener(move |this, _, _, cx| {
+                    if this.sidebar_batch_mode {
+                        this.toggle_sidebar_row_selection(batch_session_id.to_string(), cx);
+                    } else {
+                        this.open_session(open_session_id.clone(), cx);
+                    }
+                }),
+            )
+            .when(
+                session.workspace_mode == WorkspaceMode::VibexWorktree,
+                |row| {
+                    row.child(
+                        svg()
+                            .path("icons/git-branch.svg")
+                            .size(px(13.0))
+                            .flex_shrink_0()
+                            .text_color(theme::sidebar_text_muted()),
+                    )
+                },
             )
             .child(
                 svg()
@@ -6609,15 +7693,6 @@ impl MobileApp {
                         theme::sidebar_text_muted()
                     }),
             )
-            .when(row.pinned, |row| {
-                row.child(
-                    svg()
-                        .path("icons/pin.svg")
-                        .size(px(11.0))
-                        .flex_shrink_0()
-                        .text_color(rgb(theme::ACCENT_YELLOW)),
-                )
-            })
             .child(
                 div()
                     .flex_1()
@@ -6635,22 +7710,64 @@ impl MobileApp {
             )
             .child(
                 div()
-                    .w(px(52.0))
+                    .w(px(96.0))
                     .flex_shrink_0()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .text_right()
-                    .text_size(px(theme::FONT_MICRO))
-                    .text_color(theme::sidebar_text_muted())
-                    .child(session_sidebar_time_label(session.last_message_at_ms)),
-            )
-            .child(
-                div()
-                    .size(px(theme::ICON_STATUS))
-                    .flex_shrink_0()
-                    .rounded_full()
-                    .bg(rgb(status)),
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(5.0))
+                    .when(row.pinned, |right| {
+                        right.child(
+                            svg()
+                                .path("icons/pin.svg")
+                                .size(px(11.0))
+                                .text_color(rgb(theme::ACCENT_YELLOW)),
+                        )
+                    })
+                    .when(row.unread, |right| {
+                        right.child(
+                            div()
+                                .size(px(7.0))
+                                .rounded_full()
+                                .bg(rgb(theme::ACCENT_BLUE)),
+                        )
+                    })
+                    .when(show_status, |right| {
+                        right.child(
+                            div()
+                                .size(px(theme::ICON_STATUS))
+                                .rounded_full()
+                                .bg(rgb(status)),
+                        )
+                    })
+                    .when_some(
+                        (!row.pinned).then_some(state_label).flatten(),
+                        |right, label| {
+                            right.child(
+                                div()
+                                    .max_w(px(48.0))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(px(theme::FONT_MICRO))
+                                    .text_color(theme::sidebar_text_muted())
+                                    .child(label),
+                            )
+                        },
+                    )
+                    .when(show_time, |right| {
+                        right.child(
+                            div()
+                                .w(px(52.0))
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .text_right()
+                                .text_size(px(theme::FONT_MICRO))
+                                .text_color(theme::sidebar_text_muted())
+                                .child(session_sidebar_time_label(session.last_message_at_ms)),
+                        )
+                    }),
             )
             .into_any_element()
     }
@@ -6760,6 +7877,13 @@ impl MobileApp {
             && project_ids
                 .iter()
                 .all(|project_id| self.sidebar_view.collapsed_project_ids.contains(project_id));
+        let all_sidebar_session_ids = sessions
+            .iter()
+            .filter(|session| session.deleted_at_ms.is_none())
+            .map(|session| session.id.as_str().to_string())
+            .collect::<BTreeSet<_>>();
+        let all_sidebar_sessions_selected = !all_sidebar_session_ids.is_empty()
+            && self.sidebar_state.selected_ids == all_sidebar_session_ids;
         let list_frame = self.sidebar_list_frame.clone();
         let can_locate_session = self
             .controller
@@ -6905,6 +8029,68 @@ impl MobileApp {
                                     .flex()
                                     .items_center()
                                     .gap(px(2.0))
+                                    .child(
+                                        div()
+                                            .id("mobile-drawer-hierarchy-mode")
+                                            .aria_label(locale::text(
+                                                "Switch sidebar hierarchy",
+                                                "切换侧栏层级",
+                                                "切換側欄層級",
+                                            ))
+                                            .size(px(32.0))
+                                            .rounded(px(theme::RADIUS_CONTROL))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor_pointer()
+                                            .active(|style| style.bg(theme::row_pressed_bg()))
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(Self::toggle_hierarchy_mode),
+                                            )
+                                            .child(
+                                                svg()
+                                                    .path(match self.sidebar_view.hierarchy_mode {
+                                                        SidebarHierarchyMode::Compact => {
+                                                            "icons/chevrons-right-left.svg"
+                                                        }
+                                                        SidebarHierarchyMode::Detailed => {
+                                                            "icons/chevrons-left-right.svg"
+                                                        }
+                                                    })
+                                                    .size(px(16.0))
+                                                    .text_color(theme::sidebar_text_secondary()),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("mobile-drawer-batch-mode")
+                                            .aria_label(locale::text(
+                                                "Select sessions",
+                                                "选择会话",
+                                                "選擇工作階段",
+                                            ))
+                                            .size(px(32.0))
+                                            .rounded(px(theme::RADIUS_CONTROL))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .when(self.sidebar_batch_mode, |button| {
+                                                button.bg(theme::sidebar_selected_bg())
+                                            })
+                                            .cursor_pointer()
+                                            .active(|style| style.bg(theme::row_pressed_bg()))
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(Self::toggle_sidebar_batch_mode),
+                                            )
+                                            .child(
+                                                svg()
+                                                    .path("icons/list-checks.svg")
+                                                    .size(px(16.0))
+                                                    .text_color(theme::sidebar_text_secondary()),
+                                            ),
+                                    )
                                     // Same order and same marks as the desktop
                                     // sessions toolbar: collapse, locate, new,
                                     // search. The desktop "more" menu has no
@@ -7093,6 +8279,105 @@ impl MobileApp {
                                                 .path("icons/x.svg")
                                                 .size(px(14.0))
                                                 .text_color(theme::sidebar_text_muted()),
+                                        ),
+                                ),
+                        )
+                    })
+                    .when(self.sidebar_batch_mode, |body| {
+                        body.child(
+                            div()
+                                .id("mobile-sidebar-batch-bar")
+                                .h(px(theme::TOUCH_TARGET))
+                                .flex_shrink_0()
+                                .px(px(theme::SPACING_MD))
+                                .flex()
+                                .items_center()
+                                .gap(px(theme::SPACING_SM))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_size(px(theme::FONT_CAPTION))
+                                        .text_color(theme::sidebar_text_muted())
+                                        .child(format!(
+                                            "{} selected",
+                                            self.sidebar_state.selected_ids.len()
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .id("mobile-sidebar-batch-select-all")
+                                        .aria_label(locale::text(
+                                            if all_sidebar_sessions_selected {
+                                                "Clear selection"
+                                            } else {
+                                                "Select all sessions"
+                                            },
+                                            if all_sidebar_sessions_selected {
+                                                "清除选择"
+                                            } else {
+                                                "选择全部会话"
+                                            },
+                                            if all_sidebar_sessions_selected {
+                                                "清除選取"
+                                            } else {
+                                                "選取全部工作階段"
+                                            },
+                                        ))
+                                        .size(px(32.0))
+                                        .rounded(px(theme::RADIUS_CONTROL))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .when(!all_sidebar_session_ids.is_empty(), |button| {
+                                            button
+                                                .cursor_pointer()
+                                                .active(|style| style.bg(theme::row_pressed_bg()))
+                                                .on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(Self::toggle_all_sidebar_sessions),
+                                                )
+                                        })
+                                        .when(all_sidebar_session_ids.is_empty(), |button| {
+                                            button.opacity(0.4)
+                                        })
+                                        .child(
+                                            svg()
+                                                .path("icons/list-checks.svg")
+                                                .size(px(16.0))
+                                                .text_color(theme::sidebar_text_secondary()),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("mobile-sidebar-batch-delete")
+                                        .size(px(32.0))
+                                        .rounded(px(theme::RADIUS_CONTROL))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .when(
+                                            !self.sidebar_state.selected_ids.is_empty(),
+                                            |button| {
+                                                button
+                                                    .cursor_pointer()
+                                                    .active(|style| {
+                                                        style.bg(theme::row_pressed_bg())
+                                                    })
+                                                    .on_mouse_up(
+                                                        MouseButton::Left,
+                                                        cx.listener(Self::delete_selected_sessions),
+                                                    )
+                                            },
+                                        )
+                                        .when(
+                                            self.sidebar_state.selected_ids.is_empty(),
+                                            |button| button.opacity(0.4),
+                                        )
+                                        .child(
+                                            svg()
+                                                .path("icons/trash-2.svg")
+                                                .size(px(16.0))
+                                                .text_color(rgb(theme::ACCENT_RED)),
                                         ),
                                 ),
                         )
@@ -7492,6 +8777,16 @@ fn settings_info_row(
     detail: String,
     accent: gpui::Hsla,
 ) -> gpui::AnyElement {
+    settings_info_row_base(id, icon, title, detail, accent).into_any_element()
+}
+
+fn settings_info_row_base(
+    id: &'static str,
+    icon: &'static str,
+    title: String,
+    detail: String,
+    accent: gpui::Hsla,
+) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .w_full()
@@ -7532,10 +8827,401 @@ fn settings_info_row(
                         .child(detail),
                 ),
         )
-        .into_any_element()
 }
 
 impl MobileApp {
+    fn cycle_new_session_project(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let projects = self.sidebar_projects();
+        if projects.is_empty() {
+            return;
+        }
+        let next = self
+            .new_session_project_id
+            .as_ref()
+            .and_then(|id| projects.iter().position(|project| &project.id == id))
+            .map(|index| (index + 1) % projects.len())
+            .unwrap_or(0);
+        self.new_session_project_id = Some(projects[next].id.clone());
+        self.new_session_workspace_id = self
+            .workspace_summaries
+            .iter()
+            .filter(|summary| summary.project.id.as_str() == projects[next].id)
+            .find(|summary| summary.workspace.mode == WorkspaceMode::CurrentCheckout)
+            .or_else(|| {
+                self.workspace_summaries
+                    .iter()
+                    .find(|summary| summary.project.id.as_str() == projects[next].id)
+            })
+            .map(|summary| summary.workspace.id.as_str().to_string());
+        if let Some(workspace_id) = self.new_session_workspace_id.as_deref()
+            && let Some(workspace) = self
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id.as_str() == workspace_id)
+        {
+            self.new_session_workspace_mode =
+                self.normalize_new_session_workspace_mode(workspace.mode);
+        } else {
+            self.new_session_workspace_mode = WorkspaceMode::CurrentCheckout;
+        }
+        self.apply_project_new_session_preference();
+        cx.notify();
+    }
+
+    fn cycle_new_session_workspace(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project_id) = self.new_session_project_id.as_deref() else {
+            return;
+        };
+        let workspaces = self
+            .workspaces
+            .iter()
+            .filter(|workspace| workspace.project_id.as_str() == project_id)
+            .collect::<Vec<_>>();
+        if workspaces.is_empty() {
+            return;
+        }
+        let next = self
+            .new_session_workspace_id
+            .as_ref()
+            .and_then(|id| {
+                workspaces
+                    .iter()
+                    .position(|workspace| workspace.id.as_str() == id)
+            })
+            .map(|index| (index + 1) % workspaces.len())
+            .unwrap_or(0);
+        self.new_session_workspace_id = Some(workspaces[next].id.as_str().to_string());
+        self.new_session_workspace_mode =
+            self.normalize_new_session_workspace_mode(workspaces[next].mode);
+        cx.notify();
+    }
+
+    fn toggle_new_session_workspace_mode(
+        &mut self,
+        mode: WorkspaceMode,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if mode == WorkspaceMode::VibexWorktree && !self.supports_new_session_worktree() {
+            return;
+        }
+        self.new_session_workspace_mode = mode;
+        cx.notify();
+    }
+
+    fn render_new_session_mode_button(
+        &self,
+        id: &'static str,
+        mode: WorkspaceMode,
+        label: String,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let available =
+            mode == WorkspaceMode::CurrentCheckout || self.supports_new_session_worktree();
+        div()
+            .id(id)
+            .h(px(theme::TOUCH_TARGET))
+            .flex_1()
+            .rounded(px(theme::RADIUS_CONTROL))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(theme::FONT_CAPTION))
+            .text_color(if !available {
+                theme::text_muted()
+            } else if self.new_session_workspace_mode == mode {
+                theme::text_primary()
+            } else {
+                theme::text_muted()
+            })
+            .when(
+                self.new_session_workspace_mode == mode && available,
+                |button| button.bg(theme::sidebar_selected_bg()),
+            )
+            .when(available, |button| button.cursor_pointer())
+            .when(!available, |button| button.opacity(0.42))
+            .active(|style| style.bg(theme::row_pressed_bg()))
+            .when(available, |button| {
+                button.on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, event, window, cx| {
+                        this.toggle_new_session_workspace_mode(mode, event, window, cx)
+                    }),
+                )
+            })
+            .child(label)
+            .into_any_element()
+    }
+
+    fn render_new_session(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let project_label = self
+            .new_session_project_id
+            .as_deref()
+            .and_then(|id| {
+                self.sidebar_projects()
+                    .into_iter()
+                    .find(|project| project.id == id)
+            })
+            .map(|project| project.label)
+            .unwrap_or_else(|| locale::text("Choose project", "选择项目", "選擇專案").to_string());
+        let workspace_display = self
+            .new_session_workspace_id
+            .as_deref()
+            .and_then(|id| {
+                self.workspaces
+                    .iter()
+                    .find(|workspace| workspace.id.as_str() == id)
+            })
+            .map(|workspace| {
+                self.sidebar_view
+                    .worktree_titles
+                    .get(workspace.id.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| workspace_label(&workspace.root_path).to_string())
+            })
+            .unwrap_or_else(|| {
+                locale::text("Choose workspace", "选择工作区", "選擇工作區").to_string()
+            });
+        let runtime_catalog = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.runtime_options.value.as_ref());
+        let runtime_selection = self.new_session_runtime.as_ref().or_else(|| {
+            self.controller
+                .as_ref()
+                .and_then(|controller| controller.state.runtime_selection.value.as_ref())
+                .map(|state| &state.desired)
+        });
+        let runtime_summary = runtime_selection_summary(runtime_catalog, runtime_selection);
+        let runtime_summary_detail = if runtime_summary.secondary.is_empty() {
+            locale::text(
+                "Select an Agent runtime",
+                "选择 Agent 运行时",
+                "選擇 Agent 執行環境",
+            )
+            .to_string()
+        } else {
+            runtime_summary.secondary.clone()
+        };
+        div()
+            .absolute()
+            .inset_0()
+            .bg(theme::bg_primary())
+            .block_mouse_except_scroll()
+            .flex()
+            .flex_col()
+            .child(self.render_overlay_header("mobile-new-session", "New session", cx))
+            .child(
+                div()
+                    .id("mobile-new-session-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .on_scroll_wheel(cx.listener(Self::consume_drawer_scroll))
+                    .px(px(theme::SPACING_LG))
+                    .py(px(theme::SPACING_MD))
+                    .child(settings_section_heading("Project"))
+                    .child(
+                        div()
+                            .id("mobile-new-session-project")
+                            .h(px(theme::TOUCH_TARGET))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(theme::border_default())
+                            .bg(theme::bg_card_dim())
+                            .px(px(theme::SPACING_MD))
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACING_SM))
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(Self::cycle_new_session_project),
+                            )
+                            .child(
+                                svg()
+                                    .path("icons/folder.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_muted()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(px(theme::FONT_BODY))
+                                    .text_color(theme::text_primary())
+                                    .child(project_label),
+                            )
+                            .child(
+                                svg()
+                                    .path("icons/chevron-right.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_muted()),
+                            ),
+                    )
+                    .child(settings_section_heading("Workspace"))
+                    .child(
+                        div()
+                            .id("mobile-new-session-workspace")
+                            .h(px(theme::TOUCH_TARGET))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(theme::border_default())
+                            .bg(theme::bg_card_dim())
+                            .px(px(theme::SPACING_MD))
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACING_SM))
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(Self::cycle_new_session_workspace),
+                            )
+                            .child(
+                                svg()
+                                    .path("icons/git-branch.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_muted()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(px(theme::FONT_BODY))
+                                    .text_color(theme::text_primary())
+                                    .child(workspace_display),
+                            )
+                            .child(
+                                svg()
+                                    .path("icons/chevron-right.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_muted()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .mt(px(theme::SPACING_SM))
+                            .w_full()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .bg(theme::bg_card_dim())
+                            .p(px(2.0))
+                            .flex()
+                            .gap(px(2.0))
+                            .child(
+                                self.render_new_session_mode_button(
+                                    "mobile-new-session-current",
+                                    WorkspaceMode::CurrentCheckout,
+                                    locale::text("Current Checkout", "当前检出", "目前檢出")
+                                        .to_string(),
+                                    cx,
+                                ),
+                            )
+                            .child(
+                                self.render_new_session_mode_button(
+                                    "mobile-new-session-worktree",
+                                    WorkspaceMode::VibexWorktree,
+                                    locale::text("New Worktree", "新建 Worktree", "新建 Worktree")
+                                        .to_string(),
+                                    cx,
+                                ),
+                            ),
+                    )
+                    .child(settings_section_heading("Runtime"))
+                    .child(
+                        settings_info_row_base(
+                            "mobile-new-session-runtime",
+                            "icons/activity.svg",
+                            runtime_summary.primary,
+                            runtime_summary_detail,
+                            theme::text_muted(),
+                        )
+                        .cursor_pointer()
+                        .active(|style| style.bg(theme::row_pressed_bg()))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(Self::open_new_session_runtime_options),
+                        )
+                        .child(
+                            svg()
+                                .path("icons/chevron-right.svg")
+                                .size(px(theme::ICON_SM))
+                                .text_color(theme::text_muted()),
+                        ),
+                    )
+                    .child(settings_section_heading("Details"))
+                    .child(
+                        div()
+                            .h(px(theme::TOUCH_TARGET))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(theme::border_default())
+                            .bg(theme::bg_card())
+                            .px(px(2.0))
+                            .child(self.new_session_title_input.clone()),
+                    )
+                    .child(
+                        div()
+                            .h(px(120.0))
+                            .mt(px(theme::SPACING_SM))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(theme::border_default())
+                            .bg(theme::bg_card())
+                            .px(px(2.0))
+                            .child(self.new_session_prompt_input.clone()),
+                    )
+                    .child(
+                        div()
+                            .id("mobile-new-session-submit")
+                            .h(px(theme::TOUCH_TARGET))
+                            .w_full()
+                            .mt(px(theme::SPACING_LG))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .bg(theme::sidebar_selected_bg())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(theme::FONT_BODY))
+                            .text_color(theme::text_primary())
+                            .when(!self.new_session_busy, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(Self::submit_new_session),
+                                    )
+                            })
+                            .when(self.new_session_busy, |button| button.opacity(0.55))
+                            .child(if self.new_session_busy {
+                                locale::common("Creating...")
+                            } else {
+                                locale::common("Create session")
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_new_project(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let can_open_project = self.backend.as_ref().is_some_and(|backend| {
             backend
@@ -8050,6 +9736,7 @@ impl MobileApp {
             MobileOverlay::Settings => self.render_settings(cx),
             MobileOverlay::Usage => self.render_usage(cx),
             MobileOverlay::NewProject => self.render_new_project(cx),
+            MobileOverlay::NewSession => self.render_new_session(cx),
         }
     }
 }
@@ -8491,14 +10178,119 @@ fn sidebar_workspace_status_color(state: Option<AgentSessionState>) -> u32 {
     }
 }
 
+fn sidebar_session_state_label(state: AgentSessionState) -> Option<&'static str> {
+    match state {
+        AgentSessionState::Initializing => Some(locale::text("Starting", "启动中", "啟動中")),
+        AgentSessionState::NeedsInput => Some(locale::text("Needs input", "待输入", "等待輸入")),
+        AgentSessionState::Error => Some(locale::common("Error")),
+        AgentSessionState::Archived => Some(locale::common("Archived")),
+        AgentSessionState::Running | AgentSessionState::Idle | AgentSessionState::Closed => None,
+    }
+}
+
 fn agent_icon_path(agent_id: &str) -> &'static str {
     let normalized = agent_id.to_ascii_lowercase();
-    if normalized.contains("claude") {
+    if normalized.contains("claude") || normalized.contains("anthropic") {
         "icons/claude.svg"
-    } else if normalized.contains("openai") || normalized.contains("codex") {
+    } else if normalized.contains("openai")
+        || normalized.contains("codex")
+        || normalized.contains("chatgpt")
+    {
         "icons/openai.svg"
+    } else if normalized.contains("gemini") {
+        "icons/gemini.svg"
+    } else if normalized.contains("copilot") {
+        "icons/copilot.svg"
+    } else if normalized.contains("qwen")
+        || normalized.contains("tongyi")
+        || normalized.contains("dashscope")
+    {
+        "icons/qwen.svg"
+    } else if normalized.contains("opencode") || normalized.contains("open-code") {
+        "icons/opencode.svg"
     } else {
-        "brand/logo.svg"
+        const CATALOG_AGENT_PATHS: &[(&str, &str)] = &[
+            ("amp-acp", "icons/agents/amp-acp.svg"),
+            ("auggie", "icons/agents/auggie.svg"),
+            ("cline", "icons/agents/cline.svg"),
+            ("codebuddy-code", "icons/agents/codebuddy-code.svg"),
+            ("codewhale", "icons/agents/codewhale.svg"),
+            ("crow-cli", "icons/agents/crow-cli.svg"),
+            ("cursor", "icons/agents/cursor.svg"),
+            ("deepagents", "icons/agents/deepagents.svg"),
+            ("deepseek-harness", "icons/agents/deepseek-harness.svg"),
+            ("devin", "icons/agents/devin.svg"),
+            ("dimcode", "icons/agents/dimcode.svg"),
+            ("dirac", "icons/agents/dirac.svg"),
+            ("factory-droid", "icons/agents/factory-droid.svg"),
+            ("glm-acp-agent", "icons/agents/glm-acp-agent.svg"),
+            ("goose", "icons/agents/goose.svg"),
+            ("grok", "icons/agents/grok.svg"),
+            ("hermes", "icons/agents/hermes.svg"),
+            ("junie", "icons/agents/junie.svg"),
+            ("kilo", "icons/agents/kilo.svg"),
+            ("kimi", "icons/agents/kimi.svg"),
+            ("kiro", "icons/agents/kiro.svg"),
+            ("minion-code", "icons/agents/minion-code.svg"),
+            ("mistral-vibe", "icons/agents/mistral-vibe.svg"),
+            ("nova", "icons/agents/nova.svg"),
+            ("pi", "icons/agents/pi.svg"),
+            ("poolside", "icons/agents/poolside.svg"),
+            ("qoder", "icons/agents/qoder.svg"),
+            ("stakpak", "icons/agents/stakpak.svg"),
+            ("vtcode", "icons/agents/vtcode.svg"),
+        ];
+        CATALOG_AGENT_PATHS
+            .iter()
+            .find_map(|(needle, path)| normalized.contains(needle).then_some(*path))
+            .unwrap_or("brand/logo.svg")
+    }
+}
+
+fn sidebar_project_icon_path(
+    appearance: &vibex_desktop_model::SidebarProjectAppearance,
+) -> &'static str {
+    if appearance.custom_logo_file.is_some() {
+        return "icons/image.svg";
+    }
+    match appearance.logo {
+        SidebarProjectLogo::Boxes => "icons/boxes.svg",
+        SidebarProjectLogo::Code => "icons/code-xml.svg",
+        SidebarProjectLogo::Terminal => "icons/file-terminal.svg",
+        SidebarProjectLogo::Database => "icons/database.svg",
+        SidebarProjectLogo::GitBranch => "icons/git-branch.svg",
+        SidebarProjectLogo::Hash => "icons/hash.svg",
+        SidebarProjectLogo::Book => "icons/book-open-text.svg",
+        SidebarProjectLogo::Sparkles => "icons/sparkles.svg",
+        SidebarProjectLogo::Folder => "icons/folder.svg",
+        SidebarProjectLogo::Briefcase => "icons/briefcase.svg",
+        SidebarProjectLogo::Box => "icons/box.svg",
+        SidebarProjectLogo::Globe => "icons/globe.svg",
+        SidebarProjectLogo::Server => "icons/server.svg",
+        SidebarProjectLogo::Cpu => "icons/cpu.svg",
+        SidebarProjectLogo::Layers => "icons/layers.svg",
+        SidebarProjectLogo::Braces => "icons/braces.svg",
+        SidebarProjectLogo::Rocket => "icons/rocket.svg",
+        SidebarProjectLogo::Wrench => "icons/wrench.svg",
+        SidebarProjectLogo::Gift => "icons/gift.svg",
+        SidebarProjectLogo::Chart => "icons/chart-column.svg",
+        SidebarProjectLogo::Palette => "icons/palette.svg",
+        SidebarProjectLogo::Gauge => "icons/gauge.svg",
+        SidebarProjectLogo::Workflow => "icons/workflow.svg",
+        SidebarProjectLogo::Package => "icons/package.svg",
+    }
+}
+
+fn sidebar_project_icon_color(color: SidebarProjectLogoColor) -> gpui::Hsla {
+    match color {
+        SidebarProjectLogoColor::Neutral => theme::sidebar_text_muted(),
+        SidebarProjectLogoColor::Blue => rgb(theme::ACCENT_BLUE).into(),
+        SidebarProjectLogoColor::Cyan => rgb(0x22d3ee).into(),
+        SidebarProjectLogoColor::Green => rgb(theme::ACCENT_GREEN).into(),
+        SidebarProjectLogoColor::Yellow => rgb(theme::ACCENT_YELLOW).into(),
+        SidebarProjectLogoColor::Orange => rgb(0xf97316).into(),
+        SidebarProjectLogoColor::Red => rgb(theme::ACCENT_RED).into(),
+        SidebarProjectLogoColor::Magenta => rgb(0xe879f9).into(),
     }
 }
 
@@ -8738,6 +10530,19 @@ mod tests {
                 .code,
             "mobile_runtime_feature_value_too_long"
         );
+    }
+
+    #[test]
+    fn agent_sidebar_icons_cover_catalog_brands_and_unknown_fallback() {
+        assert_eq!(agent_icon_path("grok-acp"), "icons/agents/grok.svg");
+        assert_eq!(
+            agent_icon_path("deepseek-harness"),
+            "icons/agents/deepseek-harness.svg"
+        );
+        assert_eq!(agent_icon_path("anthropic-cli"), "icons/claude.svg");
+        assert_eq!(agent_icon_path("chatgpt-acp"), "icons/openai.svg");
+        assert_eq!(agent_icon_path("tongyi"), "icons/qwen.svg");
+        assert_eq!(agent_icon_path("unknown-provider"), "brand/logo.svg");
     }
 
     struct DrawerScrollIsolationProbe {

@@ -113,9 +113,8 @@ use vibex_desktop_model::{
     WorktreeLifecycleDisplayState, active_collaborations, composer_trigger_at, current_agent_plan,
     custom_worktree_path_is_absolute, parse_unified_diff,
     sidebar_project_custom_logo_file_is_valid, sidebar_project_items,
-    sidebar_project_items_for_workspace, sidebar_project_projections,
-    sidebar_project_projections_with_workspace_order, sidebar_root_items,
-    timeline_agent_message_count_after_sequence, timeline_conversation_turns,
+    sidebar_project_items_for_workspace, sidebar_project_projections_with_workspace_order,
+    sidebar_root_items, timeline_agent_message_count_after_sequence, timeline_conversation_turns,
 };
 use vibex_desktop_runtime::{
     DesktopEvent, DesktopRuntime, DesktopRuntimeConfig, DesktopRuntimeFacade, PREVIEW_APP_ID,
@@ -4986,9 +4985,41 @@ impl VibexWorkbench {
             revision: 0,
             organization: self.ui_state.sidebar.organization.clone(),
             collapsed_project_ids: self.sidebar_state.collapsed_ids.clone(),
+            collapsed_workspace_ids: self.ui_state.sidebar.collapsed_workspace_ids.clone(),
             pinned_session_ids: self.sidebar_state.pinned_ids.clone(),
             session_order: self.sidebar_state.row_order.clone(),
+            hierarchy_mode: self.ui_state.sidebar.hierarchy_mode,
+            project_order: self.ui_state.sidebar.project_order.clone(),
+            workspace_order: self.ui_state.sidebar.workspace_order.clone(),
+            project_appearances: self.ui_state.sidebar.project_appearances.clone(),
+            worktree_titles: self.ui_state.sidebar.worktree_titles.clone(),
+            project_location_preferences: self
+                .ui_state
+                .sidebar
+                .project_location_preferences
+                .clone(),
+            auto_continue_project_ids: self.auto_continue_default_project_ids.clone(),
+            auto_continue_session_overrides: self
+                .ui_state
+                .session
+                .auto_continue_session_overrides
+                .clone(),
+            auto_continue_session_ids: self.auto_continue_session_ids.clone(),
+            unread_session_ids: self.unread_agent_completion_session_ids.clone(),
         };
+        // Keep the remote order complete even when a newly-created Worktree has
+        // not been written to the persisted preference list yet. This lets a
+        // mobile long-press reorder any visible sibling without falling back to
+        // an id-sorted position after the next snapshot.
+        for (project, workspace) in &self.workspaces {
+            let order = view
+                .workspace_order
+                .entry(project.id.as_str().to_string())
+                .or_default();
+            if !order.iter().any(|id| id == workspace.id.as_str()) {
+                order.push(workspace.id.as_str().to_string());
+            }
+        }
         // The revision is a content fingerprint rather than a counter so that
         // Desktop-side edits invalidate a client's pending drag too, without
         // instrumenting every local mutation site.
@@ -5029,8 +5060,17 @@ impl VibexWorkbench {
                         }
                         if effect.navigation {
                             self.sidebar_state.collapsed_ids = view.collapsed_project_ids.clone();
+                            self.ui_state.sidebar.collapsed_workspace_ids =
+                                view.collapsed_workspace_ids.clone();
                             self.sidebar_state.pinned_ids = view.pinned_session_ids.clone();
+                            self.ui_state.sidebar.hierarchy_mode = view.hierarchy_mode;
+                            self.ui_state.sidebar.workspace_order = view.workspace_order.clone();
+                            self.ui_state.sidebar.worktree_titles = view.worktree_titles.clone();
+                            self.ui_state.session.auto_continue_session_overrides =
+                                view.auto_continue_session_overrides.clone();
+                            self.auto_continue_session_ids = view.auto_continue_session_ids.clone();
                             self.queue_agent_ui_state();
+                            self.queue_ui_state();
                         }
                         self.invalidate_sidebar_projection_cache();
                         cx.notify();

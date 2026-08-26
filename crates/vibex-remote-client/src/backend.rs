@@ -74,7 +74,8 @@ use vibex_core::{
     RemoteTerminalCreateResponse, RemoteTerminalKillRequest, RemoteTerminalKillResponse,
     RemoteTerminalListRequest, RemoteTerminalListResponse, RemoteTerminalResizeRequest,
     RemoteTerminalResizeResponse, RemoteTerminalSnapshotRequest, RemoteTerminalSnapshotResponse,
-    RemoteTerminalWriteRequest, RemoteTerminalWriteResponse, RemoteWorkbenchListWorkspacesRequest,
+    RemoteTerminalWriteRequest, RemoteTerminalWriteResponse, RemoteWorkbenchDeleteWorkspaceRequest,
+    RemoteWorkbenchDeleteWorkspaceResponse, RemoteWorkbenchListWorkspacesRequest,
     RemoteWorkbenchListWorkspacesResponse, RemoteWorkbenchOpenWorkspaceRequest,
     RemoteWorkbenchOpenWorkspaceResponse, RemoteWorkbenchRequest, RenameAgentSessionRequest,
     ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest,
@@ -1253,11 +1254,35 @@ impl WorkspaceBackend for WebRemoteBackend {
         })
     }
 
-    fn delete_workspace(&self, _request: MutationRequest<WorkspaceId>) -> BackendFuture<'_, ()> {
-        self.unsupported(
-            "remote_workspace_delete_unavailable",
-            "remote worktree deletion is not exposed by this Gateway",
-        )
+    fn delete_workspace(&self, request: MutationRequest<WorkspaceId>) -> BackendFuture<'_, ()> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload =
+                RemoteWorkbenchRequest::DeleteWorkspace(RemoteWorkbenchDeleteWorkspaceRequest {
+                    auth: this.auth(),
+                    workspace_id: request.payload,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::WorkspaceFile,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            let response = decode::<RemoteWorkbenchDeleteWorkspaceResponse>(value)?;
+            if response.deleted {
+                Ok(())
+            } else {
+                Err(BackendError::failed(
+                    "remote_workspace_delete_failed",
+                    "remote desktop did not delete the workspace",
+                ))
+            }
+        })
     }
 
     fn delete_project(&self, _request: MutationRequest<ProjectId>) -> BackendFuture<'_, ()> {
@@ -2482,6 +2507,7 @@ fn summary_to_backend(summary: ProjectWorkspaceSummary) -> WorkspaceSummary {
     WorkspaceSummary {
         project: summary.project,
         workspace: summary.workspace,
+        git_branch: summary.git_branch,
     }
 }
 
@@ -2592,6 +2618,10 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
                 (
                     BackendOperation::WorkspaceOpen,
                     permits(RemoteActionClass::ReadProject),
+                ),
+                (
+                    BackendOperation::WorkspaceDelete,
+                    permits(RemoteActionClass::MutateFile),
                 ),
             ])
         } else {
@@ -3084,6 +3114,29 @@ mod tests {
             !read_only
                 .agent
                 .supports(BackendOperation::AgentManageSession)
+        );
+    }
+
+    #[test]
+    fn remote_workspace_delete_capability_follows_device_permissions() {
+        let full = remote_capabilities(Some(&full_control_server_info(&["workspace_file"])));
+        assert!(full.workspace.supports(BackendOperation::WorkspaceList));
+        assert!(full.workspace.supports(BackendOperation::WorkspaceDelete));
+
+        let mut read_only = full_control_server_info(&["workspace_file"]);
+        read_only.device_permissions = vibex_core::remote_permissions_for_level(
+            vibex_core::RemoteDevicePermissionLevel::ReadOnly,
+        );
+        let read_only = remote_capabilities(Some(&read_only));
+        assert!(
+            read_only
+                .workspace
+                .supports(BackendOperation::WorkspaceList)
+        );
+        assert!(
+            !read_only
+                .workspace
+                .supports(BackendOperation::WorkspaceDelete)
         );
     }
 

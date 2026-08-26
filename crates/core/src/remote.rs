@@ -948,6 +948,7 @@ impl RemoteAgentRequest {
 pub enum RemoteWorkbenchOperationKind {
     ListWorkspaces,
     OpenWorkspace,
+    DeleteWorkspace,
     FileListTree,
     FileRead,
     FileSearch,
@@ -1000,6 +1001,19 @@ pub struct RemoteWorkbenchOpenWorkspaceRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RemoteWorkbenchOpenWorkspaceResponse {
     pub summary: ProjectWorkspaceSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteWorkbenchDeleteWorkspaceRequest {
+    pub auth: RemoteAuthProof,
+    pub workspace_id: crate::ids::WorkspaceId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteWorkbenchDeleteWorkspaceResponse {
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1314,6 +1328,7 @@ pub struct RemoteTerminalKillResponse {
 pub enum RemoteWorkbenchRequest {
     ListWorkspaces(RemoteWorkbenchListWorkspacesRequest),
     OpenWorkspace(RemoteWorkbenchOpenWorkspaceRequest),
+    DeleteWorkspace(RemoteWorkbenchDeleteWorkspaceRequest),
     FileListTree(RemoteFileTreeRequest),
     FileRead(RemoteFileReadRequest),
     FileSearch(RemoteFileSearchRequest),
@@ -1348,6 +1363,7 @@ impl RemoteWorkbenchRequest {
         match self {
             Self::ListWorkspaces(_) => RemoteWorkbenchOperationKind::ListWorkspaces,
             Self::OpenWorkspace(_) => RemoteWorkbenchOperationKind::OpenWorkspace,
+            Self::DeleteWorkspace(_) => RemoteWorkbenchOperationKind::DeleteWorkspace,
             Self::FileListTree(_) => RemoteWorkbenchOperationKind::FileListTree,
             Self::FileRead(_) => RemoteWorkbenchOperationKind::FileRead,
             Self::FileSearch(_) => RemoteWorkbenchOperationKind::FileSearch,
@@ -1881,9 +1897,61 @@ pub struct RemoteSidebarOrganizationSnapshot {
     #[serde(default)]
     pub collapsed_project_ids: Vec<String>,
     #[serde(default)]
+    pub collapsed_workspace_ids: Vec<String>,
+    #[serde(default)]
     pub pinned_session_ids: Vec<String>,
     #[serde(default)]
     pub session_order: Vec<String>,
+    /// The persisted Desktop hierarchy selector. Older servers omit this and
+    /// compact clients must keep using Compact as the compatibility default.
+    #[serde(default)]
+    pub hierarchy_mode: RemoteSidebarHierarchyMode,
+    #[serde(default)]
+    pub project_order: Vec<String>,
+    #[serde(default)]
+    pub workspace_order: std::collections::BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub project_appearances: std::collections::BTreeMap<String, RemoteSidebarProjectAppearance>,
+    #[serde(default)]
+    pub worktree_titles: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub project_new_session_locations:
+        std::collections::BTreeMap<String, RemoteSidebarNewSessionLocation>,
+    #[serde(default)]
+    pub auto_continue_project_ids: Vec<String>,
+    #[serde(default)]
+    pub auto_continue_session_overrides: std::collections::BTreeMap<String, bool>,
+    #[serde(default)]
+    pub auto_continue_session_ids: Vec<String>,
+    #[serde(default)]
+    pub unread_session_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteSidebarHierarchyMode {
+    Detailed,
+    #[default]
+    Compact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteSidebarNewSessionLocation {
+    NewWorktree,
+    #[default]
+    CurrentCheckout,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteSidebarProjectAppearance {
+    #[serde(default)]
+    pub logo: String,
+    #[serde(default)]
+    pub color: String,
+    #[serde(default)]
+    pub custom_logo_file: Option<String>,
 }
 
 /// Where a move drops its payload relative to an anchor item.
@@ -1909,6 +1977,16 @@ pub enum RemoteSidebarOrganizationMutation {
         #[serde(default)]
         project_id: Option<String>,
     },
+    /// Drag and drop managed Worktree rows within one project's workspace list.
+    /// Workspaces are not organization items, so their order travels separately
+    /// from the folder/session placement tree.
+    MoveWorkspaces {
+        project_id: String,
+        workspace_ids: Vec<String>,
+        #[serde(default)]
+        anchor_workspace_id: Option<String>,
+        position: RemoteSidebarDropPosition,
+    },
     CreateFolder {
         name: String,
         #[serde(default)]
@@ -1933,9 +2011,24 @@ pub enum RemoteSidebarOrganizationMutation {
         project_id: String,
         collapsed: bool,
     },
+    SetWorkspaceCollapsed {
+        workspace_id: String,
+        collapsed: bool,
+    },
     SetSessionPinned {
         session_id: String,
         pinned: bool,
+    },
+    SetSessionAutoContinue {
+        session_id: String,
+        enabled: bool,
+    },
+    SetWorktreeTitle {
+        workspace_id: String,
+        title: String,
+    },
+    SetHierarchyMode {
+        mode: RemoteSidebarHierarchyMode,
     },
 }
 
@@ -2378,6 +2471,28 @@ mod tests {
             json["data"]["auth"]["authToken"],
             "auth-token-returned-once"
         );
+    }
+
+    #[test]
+    fn remote_workbench_delete_workspace_serializes_with_stable_tag() {
+        let workspace_id = crate::ids::WorkspaceId::new();
+        let request =
+            RemoteWorkbenchRequest::DeleteWorkspace(RemoteWorkbenchDeleteWorkspaceRequest {
+                auth: RemoteAuthProof {
+                    device_id: DeviceId::new(),
+                    auth_token: "workspace-delete-token".to_string(),
+                },
+                workspace_id: workspace_id.clone(),
+            });
+
+        let json = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(
+            request.operation_kind(),
+            RemoteWorkbenchOperationKind::DeleteWorkspace
+        );
+        assert_eq!(json["type"], "delete_workspace");
+        assert_eq!(json["data"]["workspaceId"], workspace_id.as_str());
     }
 
     #[test]

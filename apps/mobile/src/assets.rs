@@ -18,11 +18,13 @@ const ICONS: &[&str] = &[
     "icons/plus.svg",
     "icons/circle-plus.svg",
     "icons/search.svg",
+    "icons/list-checks.svg",
     "icons/sliders-horizontal.svg",
     "icons/refresh.svg",
     "icons/scan-line.svg",
     "icons/send.svg",
     "icons/stop.svg",
+    "icons/zap.svg",
     "icons/x.svg",
     "icons/settings.svg",
     "icons/activity.svg",
@@ -35,7 +37,29 @@ const ICONS: &[&str] = &[
     "icons/crosshair.svg",
     "icons/grip-vertical.svg",
     "icons/folder.svg",
+    "icons/git-branch.svg",
+    "icons/image.svg",
     "icons/boxes.svg",
+    "icons/code-xml.svg",
+    "icons/file-terminal.svg",
+    "icons/database.svg",
+    "icons/hash.svg",
+    "icons/book-open-text.svg",
+    "icons/sparkles.svg",
+    "icons/briefcase.svg",
+    "icons/box.svg",
+    "icons/globe.svg",
+    "icons/cpu.svg",
+    "icons/layers.svg",
+    "icons/braces.svg",
+    "icons/rocket.svg",
+    "icons/wrench.svg",
+    "icons/gift.svg",
+    "icons/chart-column.svg",
+    "icons/palette.svg",
+    "icons/gauge.svg",
+    "icons/workflow.svg",
+    "icons/package.svg",
     "icons/log-out.svg",
     "icons/ellipsis-vertical.svg",
     "icons/chevrons-right-left.svg",
@@ -45,6 +69,39 @@ const ICONS: &[&str] = &[
     "icons/trash-2.svg",
     "icons/openai.svg",
     "icons/claude.svg",
+    "icons/opencode.svg",
+    "icons/gemini.svg",
+    "icons/qwen.svg",
+    "icons/copilot.svg",
+    "icons/agents/amp-acp.svg",
+    "icons/agents/auggie.svg",
+    "icons/agents/cline.svg",
+    "icons/agents/codebuddy-code.svg",
+    "icons/agents/codewhale.svg",
+    "icons/agents/crow-cli.svg",
+    "icons/agents/cursor.svg",
+    "icons/agents/deepagents.svg",
+    "icons/agents/deepseek-harness.svg",
+    "icons/agents/devin.svg",
+    "icons/agents/dimcode.svg",
+    "icons/agents/dirac.svg",
+    "icons/agents/factory-droid.svg",
+    "icons/agents/glm-acp-agent.svg",
+    "icons/agents/goose.svg",
+    "icons/agents/grok.svg",
+    "icons/agents/hermes.svg",
+    "icons/agents/junie.svg",
+    "icons/agents/kilo.svg",
+    "icons/agents/kimi.svg",
+    "icons/agents/kiro.svg",
+    "icons/agents/minion-code.svg",
+    "icons/agents/mistral-vibe.svg",
+    "icons/agents/nova.svg",
+    "icons/agents/pi.svg",
+    "icons/agents/poolside.svg",
+    "icons/agents/qoder.svg",
+    "icons/agents/stakpak.svg",
+    "icons/agents/vtcode.svg",
 ];
 
 pub struct MobileAssets;
@@ -67,6 +124,9 @@ impl AssetSource for MobileAssets {
             "icons/plus.svg" => Some(include_bytes!("../assets/icons/plus.svg")),
             "icons/circle-plus.svg" => Some(include_bytes!("../assets/icons/circle-plus.svg")),
             "icons/search.svg" => Some(include_bytes!("../assets/icons/search.svg")),
+            "icons/list-checks.svg" => {
+                Some(include_bytes!("../../desktop/assets/icons/list-checks.svg"))
+            }
             "icons/sliders-horizontal.svg" => {
                 Some(include_bytes!("../assets/icons/sliders-horizontal.svg"))
             }
@@ -74,6 +134,7 @@ impl AssetSource for MobileAssets {
             "icons/scan-line.svg" => Some(include_bytes!("../assets/icons/scan-line.svg")),
             "icons/send.svg" => Some(include_bytes!("../assets/icons/send.svg")),
             "icons/stop.svg" => Some(include_bytes!("../assets/icons/stop.svg")),
+            "icons/zap.svg" => Some(include_bytes!("../../desktop/assets/icons/zap.svg")),
             "icons/x.svg" => Some(include_bytes!("../assets/icons/x.svg")),
             "icons/settings.svg" => Some(include_bytes!("../assets/icons/settings.svg")),
             "icons/activity.svg" => Some(include_bytes!("../assets/icons/activity.svg")),
@@ -88,7 +149,39 @@ impl AssetSource for MobileAssets {
             "icons/crosshair.svg" => Some(include_bytes!("../assets/icons/crosshair.svg")),
             "icons/grip-vertical.svg" => Some(include_bytes!("../assets/icons/grip-vertical.svg")),
             "icons/folder.svg" => Some(include_bytes!("../assets/icons/folder.svg")),
+            "icons/git-branch.svg" => {
+                Some(include_bytes!("../../desktop/assets/icons/git-branch.svg"))
+            }
+            "icons/image.svg" => Some(include_bytes!("../../desktop/assets/icons/image.svg")),
             "icons/boxes.svg" => Some(include_bytes!("../../desktop/assets/icons/boxes.svg")),
+            "icons/code-xml.svg" => Some(include_bytes!("../../desktop/assets/icons/code-xml.svg")),
+            "icons/file-terminal.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/file-terminal.svg"
+            )),
+            "icons/database.svg" => Some(include_bytes!("../../desktop/assets/icons/database.svg")),
+            "icons/hash.svg" => Some(include_bytes!("../../desktop/assets/icons/hash.svg")),
+            "icons/book-open-text.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/book-open-text.svg"
+            )),
+            "icons/sparkles.svg" => Some(include_bytes!("../../desktop/assets/icons/sparkles.svg")),
+            "icons/briefcase.svg" => {
+                Some(include_bytes!("../../desktop/assets/icons/briefcase.svg"))
+            }
+            "icons/box.svg" => Some(include_bytes!("../../desktop/assets/icons/box.svg")),
+            "icons/globe.svg" => Some(include_bytes!("../../desktop/assets/icons/globe.svg")),
+            "icons/cpu.svg" => Some(include_bytes!("../../desktop/assets/icons/cpu.svg")),
+            "icons/layers.svg" => Some(include_bytes!("../../desktop/assets/icons/layers.svg")),
+            "icons/braces.svg" => Some(include_bytes!("../../desktop/assets/icons/braces.svg")),
+            "icons/rocket.svg" => Some(include_bytes!("../../desktop/assets/icons/rocket.svg")),
+            "icons/wrench.svg" => Some(include_bytes!("../../desktop/assets/icons/wrench.svg")),
+            "icons/gift.svg" => Some(include_bytes!("../../desktop/assets/icons/gift.svg")),
+            "icons/chart-column.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/chart-column.svg"
+            )),
+            "icons/palette.svg" => Some(include_bytes!("../../desktop/assets/icons/palette.svg")),
+            "icons/gauge.svg" => Some(include_bytes!("../../desktop/assets/icons/gauge.svg")),
+            "icons/workflow.svg" => Some(include_bytes!("../../desktop/assets/icons/workflow.svg")),
+            "icons/package.svg" => Some(include_bytes!("../../desktop/assets/icons/package.svg")),
             "icons/log-out.svg" => Some(include_bytes!("../assets/icons/log-out.svg")),
             "icons/ellipsis-vertical.svg" => {
                 Some(include_bytes!("../assets/icons/ellipsis-vertical.svg"))
@@ -110,6 +203,97 @@ impl AssetSource for MobileAssets {
             // and desktop sidebar show the same Agent identity.
             "icons/openai.svg" => Some(include_bytes!("../../desktop/assets/icons/openai.svg")),
             "icons/claude.svg" => Some(include_bytes!("../../desktop/assets/icons/claude.svg")),
+            "icons/opencode.svg" => Some(include_bytes!("../../desktop/assets/icons/opencode.svg")),
+            "icons/gemini.svg" => Some(include_bytes!("../../desktop/assets/icons/gemini.svg")),
+            "icons/qwen.svg" => Some(include_bytes!("../../desktop/assets/icons/qwen.svg")),
+            "icons/copilot.svg" => Some(include_bytes!("../../desktop/assets/icons/copilot.svg")),
+            "icons/agents/amp-acp.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/agents/amp-acp.svg"
+            )),
+            "icons/agents/auggie.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/agents/auggie.svg"
+            )),
+            "icons/agents/cline.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/agents/cline.svg"
+            )),
+            "icons/agents/codebuddy-code.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/agents/codebuddy-code.svg"
+            )),
+            "icons/agents/codewhale.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/agents/codewhale.svg"
+            )),
+            "icons/agents/crow-cli.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/agents/crow-cli.svg"
+            )),
+            "icons/agents/cursor.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/agents/cursor.svg"
+            )),
+            "icons/agents/deepagents.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/agents/deepagents.svg"
+            )),
+            "icons/agents/deepseek-harness.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/agents/deepseek-harness.svg"
+            )),
+            "icons/agents/devin.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/agents/devin.svg"
+            )),
+            "icons/agents/dimcode.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/agents/dimcode.svg"
+            )),
+            "icons/agents/dirac.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/agents/dirac.svg"
+            )),
+            "icons/agents/factory-droid.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/agents/factory-droid.svg"
+            )),
+            "icons/agents/glm-acp-agent.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/agents/glm-acp-agent.svg"
+            )),
+            "icons/agents/goose.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/agents/goose.svg"
+            )),
+            "icons/agents/grok.svg" => {
+                Some(include_bytes!("../../desktop/assets/icons/agents/grok.svg"))
+            }
+            "icons/agents/hermes.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/agents/hermes.svg"
+            )),
+            "icons/agents/junie.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/agents/junie.svg"
+            )),
+            "icons/agents/kilo.svg" => {
+                Some(include_bytes!("../../desktop/assets/icons/agents/kilo.svg"))
+            }
+            "icons/agents/kimi.svg" => {
+                Some(include_bytes!("../../desktop/assets/icons/agents/kimi.svg"))
+            }
+            "icons/agents/kiro.svg" => {
+                Some(include_bytes!("../../desktop/assets/icons/agents/kiro.svg"))
+            }
+            "icons/agents/minion-code.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/agents/minion-code.svg"
+            )),
+            "icons/agents/mistral-vibe.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/agents/mistral-vibe.svg"
+            )),
+            "icons/agents/nova.svg" => {
+                Some(include_bytes!("../../desktop/assets/icons/agents/nova.svg"))
+            }
+            "icons/agents/pi.svg" => {
+                Some(include_bytes!("../../desktop/assets/icons/agents/pi.svg"))
+            }
+            "icons/agents/poolside.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/agents/poolside.svg"
+            )),
+            "icons/agents/qoder.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/agents/qoder.svg"
+            )),
+            "icons/agents/stakpak.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/agents/stakpak.svg"
+            )),
+            "icons/agents/vtcode.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/agents/vtcode.svg"
+            )),
             _ => None,
         };
         Ok(bytes.map(Cow::Borrowed))
