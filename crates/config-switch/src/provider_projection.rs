@@ -1395,8 +1395,8 @@ mod gemini_base_url_tests {
         let descriptor = AgentProviderProjectionRegistry::builtin()
             .unwrap()
             .descriptors()
-            .cloned()
             .find(|descriptor| descriptor.route.agent_id.as_str() == "gemini")
+            .cloned()
             .unwrap();
 
         assert_eq!(
@@ -2129,6 +2129,26 @@ fn projected_runtime_model_id(
                 .strip_prefix(&format!("{provider_id}/"))
                 .unwrap_or(&model.agent_model_id)
         );
+    }
+    if matches!(
+        descriptor.provider_control,
+        AgentProviderControl::ManagedConfigOverlay {
+            strategy: ConfigOverlayStrategy::HermesYaml
+        }
+    ) || matches!(
+        descriptor.model_control,
+        AgentModelControl::ManagedConfigOverlay {
+            strategy: ConfigOverlayStrategy::HermesYaml
+        }
+    ) {
+        // Hermes exposes custom-provider models through ACP as `custom:<model>`
+        // regardless of the provider name in config.yaml. Keep this mapping
+        // idempotent for callers that already supplied the qualified form.
+        let model_id = model
+            .agent_model_id
+            .strip_prefix("custom:")
+            .unwrap_or(&model.agent_model_id);
+        return format!("custom:{model_id}");
     }
     model.agent_model_id.clone()
 }
@@ -3993,10 +4013,10 @@ mod tests {
             .unwrap_or_else(|error| panic!("{} projection failed: {error:?}", expected.agent_id));
             assert_eq!(plan.secret_env.len(), 1, "{}", expected.agent_id);
             assert_eq!(plan.secret_env[0].key, expected.secret_env_key);
-            let expected_model = if expected.agent_id == "pi" {
-                "matrix-provider/agent-model"
-            } else {
-                "agent-model"
+            let expected_model = match expected.agent_id {
+                "pi" => "matrix-provider/agent-model",
+                "hermes" => "custom:agent-model",
+                _ => "agent-model",
             };
             assert_eq!(plan.effective_model.as_deref(), Some(expected_model));
             assert_eq!(
@@ -4612,6 +4632,16 @@ mod tests {
             .find(|descriptor| descriptor.route.agent_id.as_str() == "hermes")
             .unwrap();
         let (mut provider, runtime, binding) = typed_projection_fixture(&descriptor);
+        assert_eq!(
+            projected_runtime_model_id(&provider, &descriptor, &binding.configured_models[0]),
+            "custom:agent-model"
+        );
+        let mut prequalified = binding.configured_models[0].clone();
+        prequalified.agent_model_id = "custom:agent-model".to_string();
+        assert_eq!(
+            projected_runtime_model_id(&provider, &descriptor, &prequalified),
+            "custom:agent-model"
+        );
         let lookup_key = format!("hermes-materialize-{}", RequestId::new());
         let secret_value = "hermes-private-secret";
         let AgentCredential::ApiKey { secret, .. } = &mut provider.credentials[0].credential else {

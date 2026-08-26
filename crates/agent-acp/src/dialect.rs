@@ -268,6 +268,7 @@ const AGENT_DIALECT_PROFILES: &[AgentDialectProfile] = &[
     // toolsets at launch.
     AgentDialectProfile::generic("hermes")
         .profiled("registers MCP toolsets from ~/.hermes/config.yaml at launch")
+        .with_enricher(AgentEventEnricherKind::Hermes)
         .with_mcp_delivery(McpWireDelivery::NativeConfig),
     // Kimi Code reads `~/.kimi-code/mcp.json`.
     AgentDialectProfile::generic("kimi")
@@ -374,6 +375,10 @@ mod tests {
                 "{agent_id} must not receive forwarded MCP servers"
             );
         }
+        assert_eq!(
+            agent_dialect_profile("hermes").event_enricher,
+            AgentEventEnricherKind::Hermes
+        );
         assert!(
             agent_dialect_profile("gemini")
                 .mcp_wire_delivery

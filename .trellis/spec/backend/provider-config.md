@@ -3967,6 +3967,93 @@ Only descriptor-owned, redacted projection targets define the expected provider
 identity. Raw endpoint paths, query strings, credentials, and response payloads
 do not enter durable evidence.
 
+## Scenario: Hermes ACP Provider Projection And Event Normalization
+
+### 1. Scope / Trigger
+
+- Trigger: creating or resuming a Hermes `0.19.x` ACP session from a Vibex
+  Provider Profile that uses a managed `HermesYaml` overlay.
+- This contract covers the model-id boundary and the conservative translation of
+  Hermes tool updates into Vibex timeline events.
+
+### 2. Signatures
+
+```text
+projected_runtime_model_id(provider, descriptor, configured_model) -> String
+normalize_agent_event(AgentEventEnricherKind::Hermes, input)
+  -> Vec<CanonicalAgentEvent>
+```
+
+The overlay writes a custom Provider entry to Hermes `config.yaml` and selects
+that Provider/model pair through `model.provider` and `model.default`.
+
+### 3. Contracts
+
+- Vibex keeps the product model id unqualified. Hermes exposes models from a
+  custom Provider over ACP as `custom:<model>`; every outbound session/model
+  selection therefore uses that qualified id, and the reverse projection maps
+  it back to the product id.
+- The projection is idempotent: an already qualified `custom:<model>` must not
+  become `custom:custom:<model>`.
+- Hermes ACP tool updates use generic kinds, so the event enricher may recover
+  only the verified title forms: `read:`, `write:`, `patch`, `search:`,
+  `terminal:`, `python:`, `web search:`, and `todo`. Terminal/Python titles may
+  supply a command when `rawInput` is absent; diff blocks become file
+  operations. Unknown or ambiguous calls remain generic ToolCall events.
+- Standard ACP message, reasoning, plan, permission, elicitation, terminal,
+  filesystem, configuration, and usage updates remain on the shared runtime
+  paths; the Hermes enricher must not reinterpret them.
+- Credentials are resolved only while materializing the private overlay. Model
+  projections, previews, Debug output, and event summaries remain secret-free.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Product model is `gpt-x` | ACP/runtime model is `custom:gpt-x`. |
+| Product model is already `custom:gpt-x` | Keep exactly `custom:gpt-x`. |
+| Hermes title is unknown or lacks a verified prefix | Emit a generic ToolCall. |
+| Hermes diff contains a bounded file path | Emit a FileOperation with the inferred operation. |
+| Secret lookup or endpoint projection fails | Return the existing typed projection error; do not spawn. |
+
+### 5. Good/Base/Bad Cases
+
+- Good: the overlay selects `custom:configured-model`, the ACP session starts,
+  and a terminal title becomes a bounded command event while reasoning and plan
+  updates remain visible.
+- Base: a provider emits a new generic tool title; Vibex keeps the raw bounded
+  ToolCall until a versioned Hermes descriptor proves a new mapping.
+- Bad: send the unqualified product id to Hermes, double-prefix a qualified id,
+  or classify every generic `execute` update as a shell command.
+
+### 6. Tests Required
+
+- Projection tests assert unqualified and prequalified Hermes model ids both
+  resolve to one `custom:<model>` runtime id and reverse-map correctly.
+- Overlay tests assert endpoint/model/provider fields and late secret
+  materialization remain deterministic and redacted.
+- Event tests cover terminal, write/diff, and read titles plus the generic
+  fallback for an ambiguous title.
+- The Hermes ACP smoke must exercise session creation and prompt streaming with
+  the projected model before claiming the Provider binding is usable.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+session_new.model = configured_model.agent_model_id.clone();
+```
+
+#### Correct
+
+```rust
+session_new.model = projected_runtime_model_id(provider, descriptor, model);
+```
+
+The ACP-facing id belongs to Hermes' custom-provider namespace; the product id
+must remain stable for Provider/Profile selectors and persisted bindings.
+
 ## Scenario: Source-Aware ACP Launch Projection
 
 ### 1. Scope / Trigger

@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use vibex_agent::ProviderEvent;
 use vibex_core::{
@@ -236,6 +236,75 @@ impl AgentEventEnricher for CodexEventEnricher {
 }
 
 #[derive(Debug, Default)]
+pub struct HermesEventEnricher;
+
+impl AgentEventEnricher for HermesEventEnricher {
+    fn enrich(&self, input: &AgentEventInput) -> Vec<CanonicalAgentEvent> {
+        // Hermes' ACP adapter maps its native tool names to the generic ACP
+        // `kind` enum. Its generated title is stable, so recover only the
+        // known names and keep unknown calls on the generic path.
+        let mut normalized = input.clone();
+        if let Some(tool_name) = hermes_tool_name(&input.tool_name, &input.title) {
+            normalized.tool_name = tool_name.to_string();
+        }
+
+        if let Some(files) = file_events(&normalized) {
+            return files;
+        }
+
+        let kind = normalized_kind(&normalized.tool_name);
+        if matches!(kind.as_str(), "terminal" | "execute_code") {
+            if normalized.raw_input.is_none()
+                && let Some(command) = hermes_command_from_title(&input.title)
+            {
+                normalized.raw_input = Some(json!({"command": command}));
+            }
+            if command_text(normalized.raw_input.as_ref()).is_some() {
+                return vec![command_event(&normalized)];
+            }
+        }
+        if kind == "web_search" {
+            return vec![web_search_event(&normalized)];
+        }
+        if kind == "todo" && todo_items(normalized.raw_input.as_ref()).is_some() {
+            return vec![todo_event(&normalized)];
+        }
+        PassthroughEventEnricher.enrich(&normalized)
+    }
+}
+
+fn hermes_tool_name(tool_kind: &str, title: &str) -> Option<&'static str> {
+    let kind = normalized_kind(tool_kind);
+    let title = title.trim().to_ascii_lowercase();
+    match kind.as_str() {
+        "read" if title.starts_with("read:") => Some("read_file"),
+        "edit" if title.starts_with("write:") => Some("write_file"),
+        "edit" if title.starts_with("patch") => Some("patch"),
+        "search" if title.starts_with("search:") => Some("search_files"),
+        "execute" if title.starts_with("terminal:") => Some("terminal"),
+        "execute" if title.starts_with("python:") => Some("execute_code"),
+        "fetch" if title.starts_with("web search:") => Some("web_search"),
+        "other" if title.starts_with("todo") => Some("todo"),
+        _ => None,
+    }
+}
+
+fn hermes_command_from_title(title: &str) -> Option<String> {
+    let title = title.trim();
+    ["terminal:", "python:", "execute:"]
+        .iter()
+        .find_map(|prefix| {
+            let prefix_len = prefix.len();
+            title
+                .get(..prefix_len)
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+                .then(|| title[prefix_len..].trim())
+                .filter(|command| !command.is_empty())
+                .map(str::to_string)
+        })
+}
+
+#[derive(Debug, Default)]
 pub struct GrokEventEnricher;
 
 impl AgentEventEnricher for GrokEventEnricher {
@@ -394,6 +463,7 @@ pub fn normalize_agent_event(
     let events = match enricher_kind {
         AgentEventEnricherKind::Claude => ClaudeEventEnricher.enrich(input),
         AgentEventEnricherKind::Codex => CodexEventEnricher.enrich(input),
+        AgentEventEnricherKind::Hermes => HermesEventEnricher.enrich(input),
         AgentEventEnricherKind::Grok => GrokEventEnricher.enrich(input),
         AgentEventEnricherKind::CodeBuddy => CodeBuddyEventEnricher.enrich(input),
         AgentEventEnricherKind::Passthrough => PassthroughEventEnricher.enrich(input),
@@ -1275,6 +1345,68 @@ mod tests {
             }
             other => panic!("expected camelCase command event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn hermes_titles_restore_tool_identity_and_product_semantics() {
+        let mut terminal = input("execute", json!({}));
+        terminal.title = "terminal: cargo test -p vibex-agent-acp".to_string();
+        terminal.raw_input = None;
+        let terminal = normalize_agent_event(AgentEventEnricherKind::Hermes, &terminal);
+        let CanonicalAgentEvent::CommandExecution(command) = &terminal[0].event else {
+            panic!("expected Hermes terminal command: {terminal:?}");
+        };
+        assert_eq!(command.command, "cargo test -p vibex-agent-acp");
+
+        let mut write = input("edit", json!({}));
+        write.title = "write: src/lib.rs".to_string();
+        write.raw_input = None;
+        write.content = Some(json!({
+            "type": "diff",
+            "path": "src/lib.rs",
+            "newText": "fn main() {}"
+        }));
+        let write = normalize_agent_event(AgentEventEnricherKind::Hermes, &write);
+        assert!(matches!(
+            &write[0].event,
+            CanonicalAgentEvent::FileOperation(FileOperationPayload {
+                operation: FileOperationKind::Write,
+                path,
+                ..
+            }) if path == "src/lib.rs"
+        ));
+
+        let mut read = input("read", json!({}));
+        read.title = "read: src/lib.rs".to_string();
+        read.raw_input = None;
+        let read = normalize_agent_event(AgentEventEnricherKind::Hermes, &read);
+        let CanonicalAgentEvent::ToolCall(call) = &read[0].event else {
+            panic!("expected generic Hermes read tool: {read:?}");
+        };
+        assert_eq!(call.tool_name, "read_file");
+
+        let mut todo = input(
+            "other",
+            json!({
+                "items": [{"title": "Run the focused tests", "status": "in_progress"}]
+            }),
+        );
+        todo.title = "todo".to_string();
+        let todo = normalize_agent_event(AgentEventEnricherKind::Hermes, &todo);
+        assert!(matches!(
+            &todo[0].event,
+            CanonicalAgentEvent::TodoUpdate(update)
+                if update.items.len() == 1
+                    && update.items[0].status == PlanStepStatus::Running
+        ));
+
+        let mut unknown = input("execute", json!({"description": "not a command"}));
+        unknown.title = "execute: maybe a future Hermes tool".to_string();
+        let unknown = normalize_agent_event(AgentEventEnricherKind::Hermes, &unknown);
+        assert!(matches!(
+            &unknown[0].event,
+            CanonicalAgentEvent::ToolCall(call) if call.tool_name == "execute"
+        ));
     }
 
     #[test]

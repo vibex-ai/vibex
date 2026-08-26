@@ -164,6 +164,9 @@ pub enum TranscriptStrategy {
 pub enum AgentEventEnricherKind {
     Claude,
     Codex,
+    /// Hermes emits generic ACP kinds, but its titles and diff blocks retain
+    /// enough stable tool metadata for conservative product normalization.
+    Hermes,
     /// Grok surfaces plan and question activity through `_x.ai` extensions
     /// rather than standard tool calls.
     Grok,

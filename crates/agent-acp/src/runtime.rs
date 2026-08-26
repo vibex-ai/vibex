@@ -15254,6 +15254,7 @@ async fn runtime_session_probe_from_response(
     target_model: Option<&str>,
     initial_config_update: Option<Value>,
 ) -> VibexResult<AcpRuntimeSessionProbe> {
+    let runtime_target_model = target_model.map(|model| process.runtime_model_id(model));
     let (model_response, model_config_update) = if let Some(model_id) = target_model {
         let native_session_id = session
             .get("sessionId")
@@ -15292,7 +15293,7 @@ async fn runtime_session_probe_from_response(
                         protocol::build_session_set_config_option_raw_params(
                             native_session_id,
                             &config_id,
-                            json!(model_id),
+                            json!(runtime_target_model.as_deref().unwrap_or(model_id)),
                         ),
                         ACP_PROBE_TIMEOUT,
                     )
@@ -15308,7 +15309,7 @@ async fn runtime_session_probe_from_response(
                                 AcpOperation::SessionSetModel.method(),
                                 protocol::build_session_set_model_params(
                                     native_session_id,
-                                    model_id,
+                                    runtime_target_model.as_deref().unwrap_or(model_id),
                                 ),
                                 ACP_PROBE_TIMEOUT,
                             )
@@ -15320,7 +15321,10 @@ async fn runtime_session_probe_from_response(
                 let response = process
                     .request(
                         AcpOperation::SessionSetModel.method(),
-                        protocol::build_session_set_model_params(native_session_id, model_id),
+                        protocol::build_session_set_model_params(
+                            native_session_id,
+                            runtime_target_model.as_deref().unwrap_or(model_id),
+                        ),
                         ACP_PROBE_TIMEOUT,
                     )
                     .await?;
@@ -15365,7 +15369,8 @@ async fn runtime_session_probe_from_response(
         .map(extract_probe_reasoning_efforts)
         .unwrap_or_else(|| extract_probe_reasoning_efforts(session));
     if reasoning_efforts.is_empty() {
-        reasoning_efforts = extract_initialize_reasoning_efforts(initialize, target_model);
+        reasoning_efforts =
+            extract_initialize_reasoning_efforts(initialize, runtime_target_model.as_deref());
     }
     let options = model_response_ref
         .filter(|response| response_has_config_options(response))
@@ -15376,12 +15381,22 @@ async fn runtime_session_probe_from_response(
         models: target_model
             .map(|model| vec![model.to_string()])
             .unwrap_or_else(|| {
-                let models = extract_model_ids(session);
-                if models.is_empty() {
-                    extract_model_ids(initialize)
-                } else {
-                    models
+                let models = {
+                    let models = extract_model_ids(session);
+                    if models.is_empty() {
+                        extract_model_ids(initialize)
+                    } else {
+                        models
+                    }
+                };
+                let mut product_models = Vec::with_capacity(models.len());
+                for model in models {
+                    let model = process.product_model_id(&model);
+                    if !product_models.contains(&model) {
+                        product_models.push(model);
+                    }
                 }
+                product_models
             }),
         modes,
         reasoning_efforts,
@@ -18567,6 +18582,19 @@ mod tests {
     }
 
     #[test]
+    fn model_id_projection_round_trips_qualified_hermes_ids() {
+        let projection = AcpModelIdProjection::new(vec![LegacyAgentProviderModelIdProjection {
+            product_model_id: "gpt-5.6-sol".to_string(),
+            runtime_model_id: "custom:gpt-5.6-sol".to_string(),
+        }])
+        .unwrap();
+
+        assert_eq!(projection.runtime_id("gpt-5.6-sol"), "custom:gpt-5.6-sol");
+        assert_eq!(projection.product_id("custom:gpt-5.6-sol"), "gpt-5.6-sol");
+        assert_eq!(projection.product_id("unmapped"), "unmapped");
+    }
+
+    #[test]
     fn events_runtime_snapshot_uses_exact_enricher_or_passthrough() {
         let snapshot = ToolCallSnapshot {
             title: "Run tests".to_string(),
@@ -21589,7 +21617,9 @@ def control_value(name, fallback):
 
 
 def runtime_model_id(model_id):
-    return (model_prefix + "/" + model_id) if model_prefix else model_id
+    if not model_prefix:
+        return model_id
+    return (model_prefix + model_id) if model_prefix.endswith(":") else (model_prefix + "/" + model_id)
 
 
 model_1 = runtime_model_id("mock/model-1")
@@ -31502,6 +31532,80 @@ for line in sys.stdin:
             .expect("model-scoped probe must select its target model");
         assert_eq!(model_request["params"]["configId"], "model");
         assert_eq!(model_request["params"]["value"], "mock/model-2");
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hermes_model_probe_maps_custom_model_ids_at_the_acp_boundary() {
+        const SECRET_ENV: &str = "VIBEX_TEST_HERMES_PROVIDER_KEY";
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "hermes-model-probe",
+            Some(AgentId::parse("hermes").unwrap()),
+        ) else {
+            return;
+        };
+        let service = fixture.service();
+        let mut config = service
+            .get_acp_profile_config(fixture.profile_id.clone())
+            .unwrap();
+        config.models = vec!["mock/model-1".to_string(), "mock/model-2".to_string()];
+        let conn = open_database(&fixture.db_path).unwrap();
+        persist_managed_runtime(&conn, "hermes", "hermes-acp", "0.19.0", &config);
+        vibex_db::ProviderSecretReferenceRepository::replace_for_profile(
+            &conn,
+            &fixture.profile_id,
+            &[vibex_core::ProviderSecretReference {
+                id: RequestId::new(),
+                provider_profile_id: fixture.profile_id.clone(),
+                secret_kind: vibex_core::ProviderSecretKind::ApiKey,
+                backend: ProviderSecretBackend::Environment,
+                setup_state: vibex_core::ProviderSecretSetupState::Available,
+                lookup_key: SECRET_ENV.to_string(),
+                display_label: "VIBEX_HERMES_API_KEY".to_string(),
+                redacted_hint: "test environment".to_string(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            }],
+        )
+        .unwrap();
+        drop(conn);
+        unsafe {
+            std::env::set_var(SECRET_ENV, "hermes-test-secret");
+        }
+        service
+            .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                provider_profile_id: fixture.profile_id.clone(),
+                config,
+            })
+            .unwrap();
+        fixture.set_model_prefix("custom:");
+
+        let client = AcpRuntimeClient::new(service);
+        let probed = client
+            .probe_runtime_session_config(&fixture.profile_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            probed.models,
+            vec!["mock/model-1".to_string(), "mock/model-2".to_string()]
+        );
+
+        let model_probe = client
+            .probe_runtime_session_config_for_model(&fixture.profile_id, "mock/model-2")
+            .await
+            .unwrap();
+        assert_eq!(model_probe.models, vec!["mock/model-2".to_string()]);
+        let model_request = fixture
+            .request_log()
+            .into_iter()
+            .rev()
+            .find(|entry| entry["method"] == "session/set_config_option")
+            .expect("Hermes model probe must select its target model");
+        assert_eq!(model_request["params"]["configId"], "model");
+        assert_eq!(model_request["params"]["value"], "custom:mock/model-2");
+        unsafe {
+            std::env::remove_var(SECRET_ENV);
+        }
         fixture.cleanup();
     }
 
