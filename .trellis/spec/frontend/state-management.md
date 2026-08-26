@@ -327,6 +327,15 @@ sessions with different unsent text, assert that each Composer shows only its ow
 draft, and assert that returning to the first session restores its original
 content.
 
+Editing the latest sent user message must use the same inline attachment marker
+model as the Composer. Reconstruct persisted attachment offsets into marker-backed
+input content, render those markers through the shared attachment overlay, and
+convert the edited marker text back into authoritative message text plus attachment
+offsets on submission. Paste must accept the same bounded image, local path, HTML
+data-image, and Vibex clipboard metadata shapes as the ordinary Composer; deleting
+or moving across an attachment marker must remain atomic rather than exposing or
+partially editing its placeholder token.
+
 When a new-session draft includes an initial message, await session creation
 only long enough to obtain the authoritative session record. Commit and select
 that session immediately, attach its timeline view, and submit the initial

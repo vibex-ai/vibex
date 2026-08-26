@@ -2751,7 +2751,8 @@ struct InlineUserMessageEdit {
     source_session_id: VibexSessionId,
     user_sequence: i64,
     expected_source_end_sequence: i64,
-    attachments: Vec<MessageAttachment>,
+    attachments: Vec<InlineComposerAttachment>,
+    geometry: ComposerGeometry,
 }
 
 impl InlineUserMessageEdit {
@@ -10746,6 +10747,36 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    fn remove_user_message_inline_attachment(
+        &mut self,
+        attachment_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(marker) = self
+            .inline_user_message_edit
+            .as_ref()
+            .and_then(|edit| {
+                edit.attachments
+                    .iter()
+                    .find(|item| item.attachment.id == attachment_id)
+            })
+            .map(|item| item.marker.clone())
+        else {
+            return;
+        };
+        let text = self.user_message_edit_input.read(cx).value().to_string();
+        if let Some(start) = text.find(&marker) {
+            let range = inline_composer_attachment_padded_range(&text, start..start + marker.len());
+            self.user_message_edit_input.update(cx, |input, cx| {
+                input.set_selected_range(range, cx);
+                input.replace("", window, cx);
+                input.focus(window, cx);
+            });
+        }
+        cx.notify();
+    }
+
     fn inline_attachment_key_action(
         &self,
         edit: InlineAttachmentEdit,
@@ -10875,6 +10906,30 @@ impl VibexWorkbench {
         }
     }
 
+    fn capture_user_message_inline_attachment_edit(
+        &mut self,
+        edit: InlineAttachmentEdit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(attachments) = self
+            .inline_user_message_edit
+            .as_ref()
+            .map(|edit| edit.attachments.clone())
+        else {
+            return;
+        };
+        let input = self.user_message_edit_input.clone();
+        match self.inline_attachment_key_action(edit, &input, &attachments, cx) {
+            InlineAttachmentKeyAction::Remove(attachment_id) => {
+                self.remove_user_message_inline_attachment(&attachment_id, window, cx);
+                cx.stop_propagation();
+            }
+            InlineAttachmentKeyAction::Handled => cx.stop_propagation(),
+            InlineAttachmentKeyAction::None => {}
+        }
+    }
+
     fn capture_composer_paste(
         &mut self,
         new_session: bool,
@@ -10896,6 +10951,58 @@ impl VibexWorkbench {
         let captured = self.paste_composer_clipboard_to(new_session, window, cx);
         reveal_composer_cursor_after_layout(input, window);
         if captured {
+            cx.stop_propagation();
+        }
+    }
+
+    fn capture_user_message_edit_paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.user_message_edit_input.update(cx, |input, cx| {
+            EntityInputHandler::marked_text_range(input, window, cx).is_some()
+        }) {
+            return;
+        }
+        let Some(clipboard) = cx.read_from_clipboard() else {
+            return;
+        };
+        let mut captured = false;
+        for entry in clipboard.into_entries() {
+            match entry {
+                ClipboardEntry::Image(image) => {
+                    captured |= self.add_user_message_edit_image(&image, window, cx);
+                }
+                ClipboardEntry::ExternalPaths(paths) => {
+                    for path in paths.paths() {
+                        captured |= self.add_user_message_edit_path(path, None, window, cx);
+                    }
+                }
+                ClipboardEntry::String(string) => {
+                    if let Some(metadata) = string.metadata_json::<VibexMessageClipboard>()
+                        && self.add_user_message_edit_clipboard(metadata, window, cx)
+                    {
+                        captured = true;
+                        continue;
+                    }
+                    if let Some((format, bytes)) = decode_html_data_image(&string.text) {
+                        captured |= self.add_user_message_edit_image(
+                            &Image::from_bytes(format, bytes),
+                            window,
+                            cx,
+                        );
+                    }
+                    if let Some(metadata) = string.metadata.as_deref()
+                        && let Some((format, bytes)) = decode_html_data_image(metadata)
+                    {
+                        captured |= self.add_user_message_edit_image(
+                            &Image::from_bytes(format, bytes),
+                            window,
+                            cx,
+                        );
+                    }
+                }
+            }
+        }
+        if captured {
+            reveal_composer_cursor_after_layout(self.user_message_edit_input.clone(), window);
             cx.stop_propagation();
         }
     }
@@ -11987,6 +12094,96 @@ impl VibexWorkbench {
         let _ = (new_session, cx);
     }
 
+    fn add_user_message_edit_path(
+        &mut self,
+        path: &std::path::Path,
+        label: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(edit) = self.inline_user_message_edit.as_mut() else {
+            return false;
+        };
+        let label = label.unwrap_or_else(|| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("attachment")
+                .to_string()
+        });
+        self.composer_attachment_serial = self.composer_attachment_serial.saturating_add(1);
+        let serial = self.composer_attachment_serial;
+        let marker = inline_composer_attachment_marker(serial);
+        edit.attachments.push(InlineComposerAttachment {
+            attachment: ComposerAttachment {
+                id: format!("attachment:{serial}"),
+                label,
+                path: Some(path.to_string_lossy().into_owned()),
+                mime_type: attachment_mime_type(path),
+            },
+            marker: marker.clone(),
+        });
+        self.user_message_edit_input.update(cx, |input, cx| {
+            input.replace(inline_composer_attachment_insertion(&marker), window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+        true
+    }
+
+    fn add_user_message_edit_image(
+        &mut self,
+        image: &Image,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match self.persist_composer_image(image) {
+            Ok(path) => self.add_user_message_edit_path(
+                &path,
+                Some(format!(
+                    "{}.{}",
+                    locale::text("Pasted image", "粘贴的图片", "貼上的圖片"),
+                    image.format().extension()
+                )),
+                window,
+                cx,
+            ),
+            Err(error) => {
+                self.agent_error = Some(format!("clipboard image capture failed: {error}"));
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    fn add_user_message_edit_clipboard(
+        &mut self,
+        clipboard: VibexMessageClipboard,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !clipboard.is_supported() {
+            return false;
+        }
+        let Some((insertion, attachments, serial)) = vibex_message_composer_insertion(
+            &clipboard.text,
+            &clipboard.attachments,
+            self.composer_attachment_serial,
+        ) else {
+            return false;
+        };
+        let Some(edit) = self.inline_user_message_edit.as_mut() else {
+            return false;
+        };
+        self.composer_attachment_serial = serial;
+        edit.attachments.extend(attachments);
+        self.user_message_edit_input.update(cx, |input, cx| {
+            input.replace(insertion, window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+        true
+    }
+
     fn add_composer_path(
         &mut self,
         path: &std::path::Path,
@@ -12011,22 +12208,7 @@ impl VibexWorkbench {
                 .to_string()
         });
         let path_string = path.to_string_lossy().to_string();
-        let mime_type = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .and_then(|extension| match extension.to_ascii_lowercase().as_str() {
-                "png" => Some("image/png"),
-                "jpg" | "jpeg" => Some("image/jpeg"),
-                "gif" => Some("image/gif"),
-                "webp" => Some("image/webp"),
-                "svg" => Some("image/svg+xml"),
-                "bmp" => Some("image/bmp"),
-                "tif" | "tiff" => Some("image/tiff"),
-                "ico" => Some("image/ico"),
-                "pbm" | "pgm" | "ppm" | "pnm" => Some("image/x-portable-anymap"),
-                _ => None,
-            })
-            .map(str::to_string);
+        let mime_type = attachment_mime_type(path);
         self.composer_attachment_serial = self.composer_attachment_serial.saturating_add(1);
         let serial = self.composer_attachment_serial;
         let marker = inline_composer_attachment_marker(serial);
@@ -14679,6 +14861,9 @@ impl VibexWorkbench {
             return;
         }
         let measured_turn_id = turn_id.clone();
+        let (initial, attachments, serial) =
+            composer_queue_edit_insertion(&initial, &attachments, self.composer_attachment_serial);
+        self.composer_attachment_serial = serial;
         self.inline_user_message_edit = Some(InlineUserMessageEdit {
             turn_id,
             row_id,
@@ -14686,6 +14871,7 @@ impl VibexWorkbench {
             user_sequence,
             expected_source_end_sequence,
             attachments,
+            geometry: ComposerGeometry::default(),
         });
         self.timeline_measured_turn_heights
             .remove(&measured_turn_id);
@@ -14720,8 +14906,9 @@ impl VibexWorkbench {
         if self.agent_action_pending || self.session_turn_pending(&edit.source_session_id) {
             return;
         }
-        let text = self.user_message_edit_input.read(cx).value().to_string();
-        if text.trim().is_empty() && edit.attachments.is_empty() {
+        let raw_text = self.user_message_edit_input.read(cx).value().to_string();
+        let (text, attachments) = composer_submission_payload(&raw_text, &edit.attachments);
+        if text.trim().is_empty() && attachments.is_empty() {
             return;
         }
         self.replace_latest_user_message(
@@ -14729,7 +14916,7 @@ impl VibexWorkbench {
             edit.user_sequence,
             edit.expected_source_end_sequence,
             text,
-            edit.attachments,
+            attachments,
             cx,
         );
     }
@@ -28120,6 +28307,12 @@ impl VibexWorkbench {
                 self.composer_queue_edit_attachments.clone(),
                 self.composer_queue_edit_geometry.input_bounds,
             )
+        } else if let Some(edit) = self.inline_user_message_edit.as_ref() {
+            (
+                self.user_message_edit_input.clone(),
+                edit.attachments.clone(),
+                edit.geometry.input_bounds,
+            )
         } else if self.new_session_open {
             (
                 self.new_session_input.clone(),
@@ -30347,42 +30540,77 @@ impl VibexWorkbench {
     fn render_inline_user_message_editor(
         &mut self,
         message_id: &str,
-        attachments: Vec<MessageAttachment>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let attachment_content = (!attachments.is_empty()).then(|| {
-            self.render_user_message_inline_content(
-                message_id,
-                String::new(),
-                attachments.clone(),
-                None,
-                cx,
-            )
-        });
-        let can_submit = !self
-            .user_message_edit_input
-            .read(cx)
-            .value()
-            .trim()
-            .is_empty()
-            || !attachments.is_empty();
+        let attachments = self
+            .inline_user_message_edit
+            .as_ref()
+            .map(|edit| edit.attachments.as_slice())
+            .unwrap_or_default();
+        let raw_text = self.user_message_edit_input.read(cx).value().to_string();
+        let (_, submitted_attachments) = composer_submission_payload(&raw_text, attachments);
+        let can_submit = !raw_text.trim().is_empty() || !submitted_attachments.is_empty();
         let pending = self.agent_action_pending
             || self
                 .inline_user_message_edit
                 .as_ref()
                 .is_some_and(|edit| self.session_turn_pending(&edit.source_session_id));
+        let geometry_entity = cx.entity().downgrade();
         v_flex()
             .w_full()
             .min_w_0()
             .gap_2()
-            .when_some(attachment_content, |this, attachments| {
-                this.child(attachments)
-            })
             .child(
-                Input::new(&self.user_message_edit_input)
-                    .appearance(false)
+                div()
                     .w_full()
-                    .disabled(pending),
+                    .min_w_0()
+                    .on_prepaint(move |bounds, _, cx| {
+                        let _ = geometry_entity.update(cx, |this, cx| {
+                            if let Some(edit) = this.inline_user_message_edit.as_mut()
+                                && edit.geometry.input_bounds != Some(bounds)
+                            {
+                                edit.geometry.input_bounds = Some(bounds);
+                                cx.notify();
+                            }
+                        });
+                    })
+                    .capture_action(cx.listener(|this, _: &InputBackspace, window, cx| {
+                        this.capture_user_message_inline_attachment_edit(
+                            InlineAttachmentEdit::Backspace,
+                            window,
+                            cx,
+                        )
+                    }))
+                    .capture_action(cx.listener(|this, _: &InputDelete, window, cx| {
+                        this.capture_user_message_inline_attachment_edit(
+                            InlineAttachmentEdit::Delete,
+                            window,
+                            cx,
+                        )
+                    }))
+                    .capture_action(cx.listener(|this, _: &InputMoveLeft, window, cx| {
+                        this.capture_user_message_inline_attachment_edit(
+                            InlineAttachmentEdit::Left,
+                            window,
+                            cx,
+                        )
+                    }))
+                    .capture_action(cx.listener(|this, _: &InputMoveRight, window, cx| {
+                        this.capture_user_message_inline_attachment_edit(
+                            InlineAttachmentEdit::Right,
+                            window,
+                            cx,
+                        )
+                    }))
+                    .capture_action(cx.listener(|this, _: &InputPaste, window, cx| {
+                        this.capture_user_message_edit_paste(window, cx)
+                    }))
+                    .child(
+                        Input::new(&self.user_message_edit_input)
+                            .appearance(false)
+                            .w_full()
+                            .disabled(pending),
+                    ),
             )
             .child(
                 h_flex()
@@ -30462,7 +30690,7 @@ impl VibexWorkbench {
             .session_search_highlight_query_for_rows(std::slice::from_ref(row))
             .map(str::to_string);
         let inline_content = if editing {
-            self.render_inline_user_message_editor(&row.id, attachments, cx)
+            self.render_inline_user_message_editor(&row.id, cx)
         } else {
             self.render_user_message_inline_content(
                 &row.id,
@@ -37516,6 +37744,24 @@ fn command_source_label(source_kind: AgentCommandSourceKind) -> &'static str {
         AgentCommandSourceKind::Reference => "Reference",
         AgentCommandSourceKind::ClientBuiltin => "Built-in",
     }
+}
+
+fn attachment_mime_type(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .and_then(|extension| match extension.to_ascii_lowercase().as_str() {
+            "png" => Some("image/png"),
+            "jpg" | "jpeg" => Some("image/jpeg"),
+            "gif" => Some("image/gif"),
+            "webp" => Some("image/webp"),
+            "svg" => Some("image/svg+xml"),
+            "bmp" => Some("image/bmp"),
+            "tif" | "tiff" => Some("image/tiff"),
+            "ico" => Some("image/ico"),
+            "pbm" | "pgm" | "ppm" | "pnm" => Some("image/x-portable-anymap"),
+            _ => None,
+        })
+        .map(str::to_string)
 }
 
 fn inline_composer_attachment_marker(serial: u64) -> String {
@@ -51837,6 +52083,42 @@ mod tests {
     }
 
     #[test]
+    fn sent_user_message_editor_uses_inline_attachment_markers_and_image_paste() {
+        let source = include_str!("app.rs");
+        let begin = source
+            .split_once("    fn begin_inline_user_message_edit(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn cancel_inline_user_message_edit("))
+            .map(|(body, _)| body)
+            .expect("sent-message edit initializer should remain inspectable");
+        assert!(begin.contains("composer_queue_edit_insertion("));
+        assert!(begin.contains("geometry: ComposerGeometry::default()"));
+
+        let editor = source
+            .split_once("    fn render_inline_user_message_editor(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_user_message_row("))
+            .map(|(body, _)| body)
+            .expect("sent-message editor should remain inspectable");
+        assert!(editor.contains("capture_user_message_inline_attachment_edit"));
+        assert!(editor.contains("capture_user_message_edit_paste"));
+        assert!(editor.contains("geometry.input_bounds"));
+
+        let overlay = source
+            .split_once("    fn render_inline_composer_attachments(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_attachment_image_preview("))
+            .map(|(body, _)| body)
+            .expect("inline attachment overlay should remain inspectable");
+        assert!(overlay.contains("self.inline_user_message_edit.as_ref()"));
+        assert!(overlay.contains("self.user_message_edit_input.clone()"));
+
+        let submit = source
+            .split_once("    fn submit_inline_user_message_edit(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn replace_latest_user_message("))
+            .map(|(body, _)| body)
+            .expect("sent-message edit submission should remain inspectable");
+        assert!(submit.contains("composer_submission_payload(&raw_text, &edit.attachments)"));
+    }
+
+    #[test]
     fn composer_queue_edit_uses_the_inline_attachment_overlay() {
         let source = include_str!("app.rs");
         let queue = source
@@ -52905,6 +53187,7 @@ mod tests {
             user_sequence: 7,
             expected_source_end_sequence: 9,
             attachments: Vec::new(),
+            geometry: ComposerGeometry::default(),
         };
         assert!(edit.matches("timeline-row-7", Some(&source_session_id)));
         assert!(!edit.matches("timeline-row-8", Some(&source_session_id)));
