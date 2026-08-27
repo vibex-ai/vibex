@@ -571,6 +571,13 @@ impl SessionConfigPlanner {
         config_option: Option<&ProviderSessionConfigOption>,
         config_evidence: Option<&SessionConfigOperationEvidence>,
     ) -> SessionConfigPlan {
+        // A startup projection is stronger than a live operation: the selected
+        // Provider/model participates in process identity and must be applied
+        // before session creation. Do not fall through to an Agent's
+        // catalogue-gated live mutation merely because that method exists.
+        if self.startup_projections.contains(key.as_str()) {
+            return SessionConfigPlan::RestartAndResume;
+        }
         for evidence in self.supported_operation_candidates(&AcpOperation::SessionSetModel) {
             if matches!(
                 evidence.encoding,
@@ -2257,6 +2264,32 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn startup_projection_wins_over_advertised_live_model_operation() {
+        let planner = SessionConfigPlanner::new(
+            "adapter=test@1",
+            3,
+            BTreeMap::new(),
+            BTreeMap::from([evidence(
+                AcpOperation::SessionSetModel,
+                AcpWireEncoding::VersionedRaw,
+                3,
+            )]),
+            Vec::new(),
+        )
+        .with_startup_projection(CANONICAL_MODEL);
+        let request = SessionConfigFieldRequest {
+            key: CanonicalSessionConfigKey::parse(CANONICAL_MODEL).unwrap(),
+            kind: SessionConfigFieldKind::Model,
+            value: "provider-model-outside-catalog".to_string(),
+        };
+
+        assert_eq!(
+            planner.plan(&request).unwrap(),
+            SessionConfigPlan::RestartAndResume
+        );
     }
 
     #[test]

@@ -134,7 +134,8 @@ use crate::protocol::{
 };
 use crate::registry::{
     AcpCompatibilityRegistry, AgentEventEnricherKind, CLAUDE_AGENT_ID, CapabilitySupport,
-    RestorePolicy, TranscriptStrategy, known_reasoning_effort_values, known_session_mode_values,
+    ModelSelectionStrategy, RestorePolicy, TranscriptStrategy, known_reasoning_effort_values,
+    known_session_mode_values,
 };
 use crate::session_attachment_registry::{
     SessionAttachmentAcquireKey, SessionAttachmentAcquireOutput, SessionAttachmentAcquireResult,
@@ -333,9 +334,10 @@ pub(crate) struct AcpProcessLaunch<'a> {
     pub(crate) pool_fallback_reason: Option<String>,
 }
 
-/// Copilot selects its model when the CLI process starts.  It does not expose
-/// the model through ACP's live session configuration operations, so the
-/// selected product model must be part of the process launch configuration.
+/// Applies a model at the process boundary when the Agent cannot select it as
+/// ordinary live session configuration. Provider-backed Codex already carries
+/// the model in its isolated `CODEX_HOME`; retaining it here makes the startup
+/// selection explicit and prevents a later catalogue-gated `set_model` call.
 pub(crate) fn apply_startup_model_to_config(
     config: &mut AcpProviderConfig,
     agent_id: &str,
@@ -344,6 +346,10 @@ pub(crate) fn apply_startup_model_to_config(
     let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) else {
         return;
     };
+    if agent_id == "codex" {
+        config.models = vec![model.to_string()];
+        return;
+    }
     if agent_id != "copilot" {
         return;
     }
@@ -374,6 +380,17 @@ pub(crate) fn startup_model_from_config(
     agent_id: &str,
 ) -> Option<String> {
     if agent_id == "antigravity" {
+        return config
+            .models
+            .first()
+            .map(|model| model.trim())
+            .filter(|model| !model.is_empty())
+            .map(ToString::to_string);
+    }
+    // A Codex model is a startup guarantee only for a real Provider projection.
+    // Generic ACP test/profile configs may carry discovery models without a
+    // projected Codex state home.
+    if agent_id == "codex" && config.env.iter().any(|entry| entry.key == "CODEX_HOME") {
         return config
             .models
             .first()
@@ -5618,7 +5635,7 @@ pub struct AcpRuntimeClient {
     prompt_gate_sessions: Mutex<BTreeSet<VibexSessionId>>,
     process_registry: AcpProcessRegistry<AcpProcess>,
     observability: Arc<RuntimeObservability>,
-    compatibility_registry: AcpCompatibilityRegistry,
+    pub(crate) compatibility_registry: AcpCompatibilityRegistry,
     multi_session_contracts: Mutex<HashMap<String, MultiSessionContractEvidence>>,
     #[cfg(test)]
     test_multi_session_identities: Mutex<HashMap<String, String>>,
@@ -13135,7 +13152,19 @@ impl AcpRuntimeClient {
             operations,
             discovery.options.clone(),
         );
-        if process.agent_id.as_str() == "copilot" {
+        if process.auth_source.provider_profile_id().is_some()
+            && self
+                .compatibility_registry
+                .for_agent(&process.agent_id)
+                .filter(|descriptor| {
+                    descriptor.expected_compatibility_identity().as_str()
+                        == process.compatibility_identity
+                })
+                .is_some_and(|descriptor| {
+                    descriptor.model_selection_strategy == ModelSelectionStrategy::StartupProjection
+                })
+            && process.startup_model().is_some()
+        {
             planner = planner.with_startup_projection(crate::session_config::CANONICAL_MODEL);
         }
         if process.agent_id.as_str() == GROK_AGENT_ID {

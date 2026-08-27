@@ -153,6 +153,32 @@ pub enum AgentAuthVerificationStrategy {
     InitializeThenSessionConfig,
 }
 
+/// Defines how strongly an Agent's advertised model list constrains explicit
+/// Provider-backed model selections. A missing model is not universally a
+/// rejection: many adapters only advertise their built-in account catalogue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelCatalogSemantics {
+    /// The advertised list is authoritative for this exact compatibility
+    /// identity. Values outside it must not be sent to the Agent.
+    Closed,
+    /// The list is discovery evidence only. A configured value may be tried
+    /// and must be confirmed by the runtime before prompt admission.
+    Advisory,
+    /// No catalogue contract is known; use a prepared-session probe and fail
+    /// closed unless the selected value can be confirmed.
+    ProbeRequired,
+}
+
+/// Lifecycle boundary at which an explicit model becomes authoritative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelSelectionStrategy {
+    /// Select through negotiated ACP session configuration operations.
+    RuntimeNegotiated,
+    /// The Provider projection selects the model before process/session start;
+    /// ACP must report the same effective model before the session can commit.
+    StartupProjection,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentAuthContextCapabilities {
     pub credential_env_keys_to_unset: Vec<String>,
@@ -364,6 +390,8 @@ pub struct AcpAgentCompatibility {
     pub operation_support: BTreeMap<AcpOperation, VersionedOperationDescriptor>,
     pub native_state_home_policy: NativeStateHomePolicy,
     pub auth_context: AgentAuthContextCapabilities,
+    pub model_catalog_semantics: ModelCatalogSemantics,
+    pub model_selection_strategy: ModelSelectionStrategy,
     pub config_option_alias_compatibility: ConfigOptionAliasCompatibility,
     pub config_option_aliases: BTreeMap<String, Vec<String>>,
     pub transcript_strategy: TranscriptStrategy,
@@ -934,6 +962,8 @@ fn claude_descriptor() -> VibexResult<AcpAgentCompatibility> {
             supports_direct_model_catalog: false,
             verification_strategy: AgentAuthVerificationStrategy::InitializeThenSessionConfig,
         },
+        model_catalog_semantics: ModelCatalogSemantics::ProbeRequired,
+        model_selection_strategy: ModelSelectionStrategy::RuntimeNegotiated,
         config_option_alias_compatibility: ConfigOptionAliasCompatibility {
             adapter_version_requirement: parse_requirement(
                 CLAUDE_CONFIG_ALIAS_VERSION_REQUIREMENT,
@@ -1039,6 +1069,12 @@ fn codex_descriptor() -> VibexResult<AcpAgentCompatibility> {
             supports_direct_model_catalog: true,
             verification_strategy: AgentAuthVerificationStrategy::InitializeThenSessionConfig,
         },
+        // codex-acp advertises the built-in Codex catalogue even when a custom
+        // model_provider is projected. The list therefore cannot reject a
+        // Provider-configured model; the startup projection and effective
+        // session state are the authority instead.
+        model_catalog_semantics: ModelCatalogSemantics::Advisory,
+        model_selection_strategy: ModelSelectionStrategy::StartupProjection,
         config_option_alias_compatibility: ConfigOptionAliasCompatibility {
             adapter_version_requirement: parse_requirement(
                 CODEX_CONFIG_ALIAS_VERSION_REQUIREMENT,
@@ -1123,6 +1159,8 @@ fn zcode_descriptor() -> VibexResult<AcpAgentCompatibility> {
             supports_direct_model_catalog: false,
             verification_strategy: AgentAuthVerificationStrategy::InitializeThenSessionConfig,
         },
+        model_catalog_semantics: ModelCatalogSemantics::ProbeRequired,
+        model_selection_strategy: ModelSelectionStrategy::RuntimeNegotiated,
         config_option_alias_compatibility: ConfigOptionAliasCompatibility {
             adapter_version_requirement: parse_requirement(
                 ZCODE_CONFIG_ALIAS_VERSION_REQUIREMENT,

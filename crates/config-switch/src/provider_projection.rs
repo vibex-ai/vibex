@@ -1667,7 +1667,7 @@ fn build_overlay(
         ConfigOverlayStrategy::CodexStableHome => (
             "config.toml",
             "toml",
-            codex_overlay(provider, endpoint),
+            codex_overlay(provider, endpoint, model),
             false,
         ),
         ConfigOverlayStrategy::OpenCodeInlineProvider => (
@@ -1854,6 +1854,7 @@ fn build_overlay(
 fn codex_overlay(
     provider: &ModelProviderProfile,
     endpoint: Option<&ModelProviderEndpoint>,
+    model: Option<&AgentConfiguredModelBinding>,
 ) -> String {
     let provider_id = sanitize_provider_id(
         provider
@@ -1862,6 +1863,12 @@ fn codex_overlay(
             .unwrap_or_else(|| provider.id.as_str()),
     );
     let mut lines = vec![format!("model_provider = {}", toml_quote(&provider_id))];
+    if let Some(model) = model {
+        // Select Provider-configured models before codex-acp creates the
+        // session. codex-acp's model/list is its built-in catalogue and its
+        // live set-model path rejects otherwise valid custom-provider ids.
+        lines.push(format!("model = {}", toml_quote(&model.agent_model_id)));
+    }
     lines.push(String::new());
     lines.push(format!("[model_providers.{}]", toml_quote(&provider_id)));
     lines.push(format!("name = {}", toml_quote(&provider.display_name)));
@@ -3639,10 +3646,21 @@ mod tests {
     fn codex_overlay_identifies_the_codex_http_engine_to_compatible_gateways() {
         let (provider, _, _, _) = fixture(ConfigOverlayStrategy::CodexStableHome);
         let endpoint = provider.endpoints.first().unwrap();
-        let content = codex_overlay(&provider, Some(endpoint));
+        let model = AgentConfiguredModelBinding {
+            id: AgentConfiguredModelBindingId::new(),
+            provider_model_id: "model-a".to_string(),
+            agent_model_id: "custom-model-a".to_string(),
+            wire_protocol_id: WIRE_PROTOCOL_OPENAI_RESPONSES.to_string(),
+            sdk_adapter_id: None,
+            deployment: None,
+            enabled: true,
+            process_scoped: true,
+        };
+        let content = codex_overlay(&provider, Some(endpoint), Some(&model));
         let config: toml::Value = toml::from_str(&content).unwrap();
         let projected = &config["model_providers"]["fake"];
 
+        assert_eq!(config["model"].as_str(), Some("custom-model-a"));
         assert_eq!(
             projected["http_headers"]["originator"].as_str(),
             Some(CODEX_PROVIDER_ORIGINATOR)

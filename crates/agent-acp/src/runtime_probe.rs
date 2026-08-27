@@ -33,6 +33,7 @@ use crate::protocol::{
     self, AcpOperation, build_initialize_params, build_session_load_params,
     build_session_new_params, build_session_resume_params,
 };
+use crate::registry::{ModelCatalogSemantics, ModelSelectionStrategy};
 use crate::runtime::{
     ACP_PROBE_TIMEOUT, AcpProcess, AcpProcessLaunch, AcpProcessPurpose, AcpRuntimeClient,
     append_projection_process_args, apply_startup_model_to_config, effective_acp_process_args,
@@ -611,13 +612,37 @@ impl AcpRuntimeClient {
             let target_model = projection.and_then(|value| value.effective_model.as_deref());
             let startup_model = process.startup_model();
             let is_copilot = runtime.version_identity.route.agent_id.as_str() == "copilot";
+            let compatibility = self
+                .compatibility_registry
+                .for_agent(&runtime.version_identity.route.agent_id);
+            let catalog_semantics = compatibility
+                .map(|descriptor| descriptor.model_catalog_semantics)
+                .unwrap_or(ModelCatalogSemantics::ProbeRequired);
+            let selection_strategy = compatibility
+                .map(|descriptor| descriptor.model_selection_strategy)
+                .unwrap_or(ModelSelectionStrategy::RuntimeNegotiated);
             let mut model_apply_response = None;
             let model_fact = if let Some(model) = target_model {
-                if !models.is_empty() && !models.iter().any(|candidate| candidate == model) {
+                if catalog_semantics == ModelCatalogSemantics::Closed
+                    && !models.is_empty()
+                    && !models.iter().any(|candidate| candidate == model)
+                {
                     AgentRuntimeProbeFact {
                         capability: AgentRuntimeProbeCapability::ModelSelection,
                         status: AgentRuntimeProbeFactStatus::Failed,
-                        diagnostic_code: Some("target_model_not_advertised".to_string()),
+                        diagnostic_code: Some(
+                            "target_model_not_advertised_by_closed_catalog".to_string(),
+                        ),
+                    }
+                } else if selection_strategy == ModelSelectionStrategy::StartupProjection {
+                    if startup_model == Some(model) {
+                        AgentRuntimeProbeFact::passed(AgentRuntimeProbeCapability::ModelSelection)
+                    } else {
+                        AgentRuntimeProbeFact {
+                            capability: AgentRuntimeProbeCapability::ModelSelection,
+                            status: AgentRuntimeProbeFactStatus::Failed,
+                            diagnostic_code: Some("startup_model_not_applied".to_string()),
+                        }
                     }
                 } else if is_copilot {
                     if startup_model == Some(model) {

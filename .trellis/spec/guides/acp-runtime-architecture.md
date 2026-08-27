@@ -79,6 +79,16 @@ runtime initialize capabilities
   > conservative fallback
 ```
 
+Model discovery is evidence, not a universal allow-list. Each exact Adapter
+compatibility descriptor classifies its model catalogue as closed, advisory, or
+probe-required and declares whether explicit models are selected through live
+ACP configuration or through a pre-session Provider projection. Provider model
+ids remain product ids in durable state, are translated only at the Adapter
+boundary, and must converge before prompt admission. In particular, an advisory
+built-in catalogue must not reject a model explicitly configured for a custom
+Provider; an Adapter that requires startup projection must not retry that model
+through a catalogue-gated live mutation after session creation.
+
 Adapter-level quirk compatibility stays inside the adapter module
 (`crates/agent-acp/src/protocol.rs` documents the current wire quirks). ACP
 method names, JSON-RPC ids, and raw update payloads must never leak into the
