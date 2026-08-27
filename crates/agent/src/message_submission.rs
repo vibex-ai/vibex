@@ -821,7 +821,7 @@ impl MessageSubmissionCoordinator {
             .await;
         let items = match result {
             Ok(items) => items,
-            Err(_) => {
+            Err(error) => {
                 if let Some(items) = self.persisted_dispatch_result(
                     record,
                     dispatch_start_sequence,
@@ -836,6 +836,21 @@ impl MessageSubmissionCoordinator {
                     );
                 }
                 let conn = self.open_connection()?;
+                if TimelineRepository::latest_sequence(&conn, &record.session_id)?
+                    <= dispatch_start_sequence
+                {
+                    // AgentManager persists the user boundary before it calls the
+                    // provider. With no new Timeline item, the request failed in
+                    // admission/runtime validation and could not have reached ACP.
+                    MessageSubmissionRepository::fail(
+                        &conn,
+                        &record.submission_id,
+                        MessageSubmissionStatus::AboutToPrompt,
+                        &safe_error_code(&error.code),
+                        Some(PRE_DISPATCH_ERROR_DETAIL),
+                    )?;
+                    return Ok(());
+                }
                 MessageSubmissionRepository::mark_ambiguous(
                     &conn,
                     &record.submission_id,
@@ -2280,12 +2295,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ambiguous_dispatch_errors_never_persist_provider_text() {
+    async fn pre_dispatch_errors_fail_without_claiming_ambiguous_delivery() {
         const SENSITIVE_SENTINEL: &str = "prompt-secret-SHOULD-NOT-PERSIST";
 
-        let db_path = temp_db_path("ambiguous-redaction");
+        let db_path = temp_db_path("pre-dispatch-redaction");
         let initial = selection("gpt-5");
-        let session_id = seed_session(&db_path, "ambiguous-redaction", initial.clone());
+        let session_id = seed_session(&db_path, "pre-dispatch-redaction", initial.clone());
         let (coordinator, _runtime, dispatcher) =
             harness(&db_path, &session_id, initial.clone(), false);
         *dispatcher.failure_message.lock().unwrap() = Some(format!(
@@ -2295,23 +2310,30 @@ mod tests {
         let error = coordinator
             .submit(request(
                 &session_id,
-                "ambiguous-provider-error",
+                "pre-dispatch-provider-error",
                 initial.clone(),
             ))
             .await
             .unwrap_err();
-        assert_eq!(error.code, "message_submission_prompt_dispatch_ambiguous");
+        assert_eq!(error.code, "mock_dispatch_failed");
         let state = coordinator
             .get_submission(&GetMessageSubmissionRequest {
                 session_id: session_id.clone(),
-                message_idempotency_key: "ambiguous-provider-error".to_string(),
+                message_idempotency_key: "pre-dispatch-provider-error".to_string(),
             })
             .unwrap();
+        assert_eq!(state.status, MessageSubmissionStatus::Failed);
         assert_eq!(
             state.error_detail_redacted.as_deref(),
-            Some(AMBIGUOUS_PROMPT_ERROR_DETAIL)
+            Some(PRE_DISPATCH_ERROR_DETAIL)
         );
         assert!(!format!("{state:?}").contains(SENSITIVE_SENTINEL));
+        let conn = open_database(&db_path).unwrap();
+        assert_eq!(
+            TimelineRepository::latest_sequence(&conn, &session_id).unwrap(),
+            0
+        );
+        drop(conn);
 
         let terminalized = {
             let mut conn = open_database(&db_path).unwrap();

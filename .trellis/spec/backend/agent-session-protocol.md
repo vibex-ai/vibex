@@ -4010,9 +4010,14 @@ agent_message_submission_payloads(
 - Every ordinary message, including Claude/Codex, requires the installed
   coordinator. A dropped coordinator fails closed without a direct dispatch or
   user Timeline fallback.
-- An error after `AboutToPrompt` without a complete durable result fence is
-  `AmbiguousPromptDispatch`; startup never calls the provider again. Completed
-  retries reconstruct the response from the durable Timeline range.
+- `AboutToPrompt` is conservative crash-recovery fencing, not proof that ACP
+  accepted a request. If dispatch returns an error and the Timeline sequence did
+  not advance past its pre-dispatch fence, manager admission failed before the
+  user boundary and provider call; preserve the stable error code and transition
+  to `Failed`. Once any Timeline item was appended, an error without a complete
+  durable result fence is `AmbiguousPromptDispatch`; startup never calls the
+  provider again. Completed retries reconstruct the response from the durable
+  Timeline range.
 - Submission delivery and Agent turn success are separate outcomes. If dispatch
   returns an error after the submitted user item and non-error Agent/Provider
   output have already been persisted beyond the pre-dispatch Timeline fence,
@@ -4044,7 +4049,8 @@ agent_message_submission_payloads(
 | Current binding missing, stale, non-current, or config/generation mismatch | `message_submission_runtime_binding_*`; no provider call. |
 | Current committed ACP attachment missing or mismatched | `turn_execution_identity_mismatch`; no `session/prompt`. |
 | Installed ACP coordinator weak reference cannot upgrade | `message_submission_coordinator_unavailable`; no direct fallback or user Timeline item. |
-| Provider/receipt uncertainty after AboutToPrompt | `message_submission_prompt_dispatch_ambiguous`; never replay automatically. |
+| Dispatch error after AboutToPrompt with no Timeline advance | Preserve the stable admission/runtime error as `Failed`; ACP was not called. |
+| Provider/receipt uncertainty after a Timeline advance | `message_submission_prompt_dispatch_ambiguous`; never replay automatically. |
 | Dispatch returns an error after durable Agent/Provider output | Record the fenced Timeline range as Completed; retain the separate turn error/state. |
 | Startup sees AboutToPrompt with complete result fence | Advance Dispatched then Completed without provider work. |
 
@@ -4069,7 +4075,10 @@ agent_message_submission_payloads(
 - Bad: leave an unsupported Pi `high/high` request in the submission while the
   session selection is `off/off`; the worker never satisfies `effective ==
   desired` and remains queued indefinitely.
-- Bad: classify an unknown post-prompt error as Failed and resend on startup.
+- Bad: classify an unknown post-Timeline-boundary error as Failed and resend on startup.
+- Bad: classify a prompt-admission error with no Timeline advance as ambiguous,
+  hide its actionable code in a transient notice, and leave an idle conversation
+  looking like the user message was silently accepted.
 - Bad: cancel an initialization-time submission without first materializing its
   durable payload, leaving the selected session with an empty Timeline.
 
@@ -4083,8 +4092,8 @@ agent_message_submission_payloads(
 - Coordinator tests cover concurrent same-key submit, caller drop, per-session
   order, cross-session parallelism, desired gate, terminal switch outcomes,
   committed-switch selection-read races, adapter runtime canonicalization with
-  an atomic submission/payload rewrite, AboutToPrompt ambiguity, and result-fenced
-  recovery.
+  an atomic submission/payload rewrite, pre-Timeline admission failure,
+  post-Timeline AboutToPrompt ambiguity, and result-fenced recovery.
 - Manager/ACP tests cover dropped-coordinator fail-closed, no durable
   failover/history bridge/binding update, prepare/send identity mismatch, and
   ForceFresh dispatch exclusively to the current target native session. Manager

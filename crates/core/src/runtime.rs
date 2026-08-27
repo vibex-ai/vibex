@@ -1683,9 +1683,10 @@ impl MessageSubmissionStatus {
                 next,
                 Self::AboutToPrompt | Self::AwaitingRuntime | Self::Failed | Self::Cancelled
             ),
-            Self::AboutToPrompt => {
-                matches!(next, Self::Dispatched | Self::AmbiguousPromptDispatch)
-            }
+            Self::AboutToPrompt => matches!(
+                next,
+                Self::Dispatched | Self::Failed | Self::AmbiguousPromptDispatch
+            ),
             Self::Dispatched => next == Self::Completed,
             Self::Completed | Self::Failed | Self::Cancelled | Self::AmbiguousPromptDispatch => {
                 false
@@ -2276,8 +2277,8 @@ mod tests {
         assert!(M::ReadyToDispatch.can_transition_to(M::AboutToPrompt));
         assert!(M::AboutToPrompt.can_transition_to(M::Dispatched));
         assert!(M::AboutToPrompt.can_transition_to(M::AmbiguousPromptDispatch));
+        assert!(M::AboutToPrompt.can_transition_to(M::Failed));
         assert!(M::Dispatched.can_transition_to(M::Completed));
-        assert!(!M::AboutToPrompt.can_transition_to(M::Failed));
         assert!(!M::AboutToPrompt.can_transition_to(M::Cancelled));
         assert!(!M::Dispatched.can_transition_to(M::Failed));
         assert!(!M::AwaitingRuntime.can_transition_to(M::Dispatched));
