@@ -7,7 +7,8 @@ use vibex_core::{
     AgentProviderProjectionPreviewRequest, AgentRuntimeProbeCancelRequest,
     AgentRuntimeProbeListRequest, AgentRuntimeProbeRecord, AgentRuntimeProbeStartRequest,
     AgentRuntimeProfile, AgentRuntimeProfileCreateRequest, AgentRuntimeProfileUpdateRequest,
-    ModelProviderProfile, ModelProviderProfileCreateRequest, ModelProviderProfileUpdateRequest,
+    AgentSnapshotEntry, CustomAgentCreateRequest, CustomAgentDeleteRequest, ModelProviderProfile,
+    ModelProviderProfileCreateRequest, ModelProviderProfileUpdateRequest,
     ProviderCredentialSecretMutationRequest, ProviderHealthSummary, ProviderProfileId,
     ProviderProfileSummary, ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult,
     RelayPeerId, RelayRoomId,
@@ -48,6 +49,16 @@ pub struct ManagementProfileSelectionRequest {
 
 pub trait ManagementBackend: BackendBound {
     fn list_agents(&self, request: AgentListRequest) -> BackendFuture<'_, AgentListResponse>;
+
+    fn create_custom_agent(
+        &self,
+        request: MutationRequest<CustomAgentCreateRequest>,
+    ) -> BackendFuture<'_, AgentSnapshotEntry>;
+
+    fn delete_custom_agent(
+        &self,
+        request: MutationRequest<CustomAgentDeleteRequest>,
+    ) -> BackendFuture<'_, ()>;
 
     fn list_profiles(&self) -> BackendFuture<'_, Vec<ProviderProfileSummary>>;
 

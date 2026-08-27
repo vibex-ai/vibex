@@ -449,6 +449,20 @@ impl ManagementBackend for DisconnectedBackend {
         disconnected_future!()
     }
 
+    fn create_custom_agent(
+        &self,
+        _request: MutationRequest<vibex_core::CustomAgentCreateRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentSnapshotEntry> {
+        disconnected_future!()
+    }
+
+    fn delete_custom_agent(
+        &self,
+        _request: MutationRequest<vibex_core::CustomAgentDeleteRequest>,
+    ) -> BackendFuture<'_, ()> {
+        disconnected_future!()
+    }
+
     fn list_profiles(&self) -> BackendFuture<'_, Vec<ProviderProfileSummary>> {
         disconnected_future!()
     }

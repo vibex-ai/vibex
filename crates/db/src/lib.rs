@@ -73,7 +73,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 50;
+pub const CURRENT_SCHEMA_VERSION: i64 = 51;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -1848,6 +1848,7 @@ pub struct DatabaseSmokeResult {
 pub struct WorkspaceRepository;
 pub struct SessionRepository;
 pub struct AgentConfigRepository;
+pub struct CustomAgentDefinitionRepository;
 pub struct AgentDiscoveryRepository;
 pub struct ProviderProfileRepository;
 pub struct ProviderSecretReferenceRepository;
@@ -2922,6 +2923,85 @@ impl AgentConfigRepository {
             "agent_config_lookup_failed",
             "failed to lookup agent config",
         ))
+    }
+}
+
+impl CustomAgentDefinitionRepository {
+    pub fn upsert(conn: &Connection, definition: &AgentConfig) -> VibexResult<()> {
+        let now = unix_timestamp_ms();
+        conn.execute(
+            "
+            INSERT INTO custom_agent_definitions (
+                agent_id, definition_json, created_at_ms, updated_at_ms, deleted_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, NULL)
+            ON CONFLICT(agent_id) DO UPDATE SET
+                definition_json = excluded.definition_json,
+                updated_at_ms = excluded.updated_at_ms,
+                deleted_at_ms = NULL
+            ",
+            params![
+                definition.agent_id.as_str(),
+                json_to_db(definition)?,
+                definition.created_at_ms,
+                now
+            ],
+        )
+        .map_err(storage_err(
+            "custom_agent_upsert_failed",
+            "failed to save custom Agent definition",
+        ))?;
+        Ok(())
+    }
+
+    pub fn list(conn: &Connection) -> VibexResult<Vec<AgentConfig>> {
+        let mut stmt = conn.prepare(
+            "SELECT definition_json FROM custom_agent_definitions WHERE deleted_at_ms IS NULL ORDER BY updated_at_ms ASC, agent_id ASC"
+        ).map_err(storage_err("custom_agent_list_failed", "failed to list custom Agent definitions"))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(storage_err(
+                "custom_agent_list_failed",
+                "failed to list custom Agent definitions",
+            ))?;
+        let mut definitions = Vec::new();
+        for row in rows {
+            let json = row.map_err(storage_err(
+                "custom_agent_decode_failed",
+                "failed to decode custom Agent definition",
+            ))?;
+            definitions.push(serde_json::from_str(&json).map_err(|error| {
+                VibexError::storage(
+                    "custom_agent_decode_failed",
+                    format!("failed to decode custom Agent definition: {error}"),
+                )
+            })?);
+        }
+        Ok(definitions)
+    }
+
+    pub fn get(conn: &Connection, agent_id: &AgentId) -> VibexResult<Option<AgentConfig>> {
+        let json = conn.query_row(
+            "SELECT definition_json FROM custom_agent_definitions WHERE agent_id = ?1 AND deleted_at_ms IS NULL",
+            params![agent_id.as_str()],
+            |row| row.get::<_, String>(0),
+        ).optional().map_err(storage_err("custom_agent_lookup_failed", "failed to lookup custom Agent definition"))?;
+        json.map(|json| {
+            serde_json::from_str(&json).map_err(|error| {
+                VibexError::storage(
+                    "custom_agent_decode_failed",
+                    format!("failed to decode custom Agent definition: {error}"),
+                )
+            })
+        })
+        .transpose()
+    }
+
+    pub fn delete(conn: &Connection, agent_id: &AgentId) -> VibexResult<()> {
+        conn.execute(
+            "UPDATE custom_agent_definitions SET deleted_at_ms = ?2, updated_at_ms = ?2 WHERE agent_id = ?1",
+            params![agent_id.as_str(), unix_timestamp_ms()],
+        ).map_err(storage_err("custom_agent_delete_failed", "failed to delete custom Agent definition"))?;
+        Ok(())
     }
 }
 
@@ -9677,6 +9757,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_usage_counter_scope_column(conn, &mut applied)?;
     apply_message_submission_runtime_policy(conn, &mut applied)?;
     apply_mcp_server_env_and_headers(conn, &mut applied)?;
+    apply_custom_acp_agent_definitions(conn, &mut applied)?;
 
     // Seed compatibility Profiles before the v37 backfill while no caller
     // transaction is active. Repository reads may run inside a transaction and
@@ -9684,6 +9765,42 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     ProviderProfileRepository::ensure_local_defaults(conn)?;
     ProviderProjectionCompatibilityRepository::backfill_legacy_profiles(conn)?;
     Ok(applied)
+}
+
+fn apply_custom_acp_agent_definitions(
+    conn: &mut Connection,
+    applied: &mut Vec<String>,
+) -> VibexResult<()> {
+    const VERSION: i64 = 51;
+    const NAME: &str = "custom_acp_agent_definitions";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS custom_agent_definitions (
+            agent_id TEXT PRIMARY KEY,
+            definition_json TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            deleted_at_ms INTEGER NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_custom_agent_definitions_active
+            ON custom_agent_definitions(deleted_at_ms, updated_at_ms);",
+    )
+    .map_err(storage_err(
+        "migration_apply_failed",
+        "failed to create custom Agent definitions",
+    ))?;
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record custom Agent migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
 }
 
 fn apply_message_submission_runtime_policy(
@@ -12628,7 +12745,8 @@ mod tests {
                 "47:agent_default_usage_model_nullable",
                 "48:agent_usage_counter_scope",
                 "49:message_submission_runtime_policy",
-                "50:mcp_server_env_and_headers"
+                "50:mcp_server_env_and_headers",
+                "51:custom_acp_agent_definitions"
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -12763,6 +12881,7 @@ mod tests {
                 "48:agent_usage_counter_scope",
                 "49:message_submission_runtime_policy",
                 "50:mcp_server_env_and_headers",
+                "51:custom_acp_agent_definitions",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -12877,7 +12996,8 @@ mod tests {
                 "47:agent_default_usage_model_nullable",
                 "48:agent_usage_counter_scope",
                 "49:message_submission_runtime_policy",
-                "50:mcp_server_env_and_headers"
+                "50:mcp_server_env_and_headers",
+                "51:custom_acp_agent_definitions"
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -13030,7 +13150,8 @@ mod tests {
                 "47:agent_default_usage_model_nullable",
                 "48:agent_usage_counter_scope",
                 "49:message_submission_runtime_policy",
-                "50:mcp_server_env_and_headers"
+                "50:mcp_server_env_and_headers",
+                "51:custom_acp_agent_definitions"
             ]
         );
         assert_eq!(
@@ -14439,7 +14560,8 @@ mod tests {
                 "47:agent_default_usage_model_nullable",
                 "48:agent_usage_counter_scope",
                 "49:message_submission_runtime_policy",
-                "50:mcp_server_env_and_headers"
+                "50:mcp_server_env_and_headers",
+                "51:custom_acp_agent_definitions"
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)

@@ -1181,6 +1181,20 @@ mod tests {
             error_future()
         }
 
+        fn create_custom_agent(
+            &self,
+            _request: MutationRequest<vibex_core::CustomAgentCreateRequest>,
+        ) -> BackendFuture<'_, vibex_core::AgentSnapshotEntry> {
+            error_future()
+        }
+
+        fn delete_custom_agent(
+            &self,
+            _request: MutationRequest<vibex_core::CustomAgentDeleteRequest>,
+        ) -> BackendFuture<'_, ()> {
+            error_future()
+        }
+
         fn list_profiles(&self) -> BackendFuture<'_, Vec<ProviderProfileSummary>> {
             error_future()
         }

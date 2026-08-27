@@ -60,6 +60,26 @@ impl ProviderManagementFacade {
         self.service.list_agents(request)
     }
 
+    pub fn create_custom_agent(
+        &self,
+        request: vibex_core::CustomAgentCreateRequest,
+    ) -> VibexResult<vibex_core::AgentSnapshotEntry> {
+        let _claim = self
+            .mutation_guard
+            .claim(format!("agent:custom:create:{}", request.agent_id))?;
+        self.service.create_custom_agent(request)
+    }
+
+    pub fn delete_custom_agent(
+        &self,
+        request: vibex_core::CustomAgentDeleteRequest,
+    ) -> VibexResult<()> {
+        let _claim = self
+            .mutation_guard
+            .claim(format!("agent:custom:delete:{}", request.agent_id))?;
+        self.service.delete_custom_agent(request)
+    }
+
     pub fn refresh_detected_agent_versions(&self) -> VibexResult<usize> {
         self.service.refresh_detected_agent_versions()
     }

@@ -633,6 +633,7 @@ pub struct ManagementCenter {
     discover_agents_after_refresh: bool,
     mcp_import_open: bool,
     skill_import_open: bool,
+    custom_agent_editor_open: bool,
     mcp_discovery: Option<vibex_core::McpServerDiscoveryResponse>,
     skill_discovery: Option<vibex_core::SkillDiscoveryResponse>,
     mcp_validation: Option<(String, String, bool)>,
@@ -673,6 +674,10 @@ pub struct ManagementCenter {
     selected_acp_profile_id: Option<String>,
     acp_config_draft: Option<vibex_core::AcpProviderConfig>,
     agent_search: Entity<InputState>,
+    custom_agent_id: Entity<InputState>,
+    custom_agent_label: Entity<InputState>,
+    custom_agent_command: Entity<InputState>,
+    custom_agent_args: Entity<InputState>,
     mcp_search: Entity<InputState>,
     skill_search: Entity<InputState>,
     profile_name: Entity<InputState>,
@@ -706,6 +711,28 @@ impl ManagementCenter {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let copy = management_copy();
         let agent_search = cx.new(|cx| InputState::new(window, cx).placeholder(copy.search_agents));
+        let custom_agent_id = cx.new(|cx| InputState::new(window, cx).placeholder("my-acp-agent"));
+        let custom_agent_label = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "Display name",
+                "显示名称",
+                "顯示名稱",
+            ))
+        });
+        let custom_agent_command = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "ACP command",
+                "ACP 命令",
+                "ACP 命令",
+            ))
+        });
+        let custom_agent_args = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "Arguments separated by spaces",
+                "以空格分隔参数",
+                "以空格分隔參數",
+            ))
+        });
         let mcp_search = cx.new(|cx| InputState::new(window, cx).placeholder(copy.search_mcp));
         let skill_search = cx.new(|cx| InputState::new(window, cx).placeholder(copy.search_skills));
         let profile_name = cx.new(|cx| {
@@ -1099,6 +1126,7 @@ impl ManagementCenter {
             discover_agents_after_refresh: false,
             mcp_import_open: false,
             skill_import_open: false,
+            custom_agent_editor_open: false,
             mcp_discovery: None,
             skill_discovery: None,
             mcp_validation: None,
@@ -1139,6 +1167,10 @@ impl ManagementCenter {
             selected_acp_profile_id: None,
             acp_config_draft: None,
             agent_search,
+            custom_agent_id,
+            custom_agent_label,
+            custom_agent_command,
+            custom_agent_args,
             mcp_search,
             skill_search,
             profile_name,
@@ -4663,13 +4695,86 @@ impl ManagementCenter {
         );
     }
 
+    fn create_custom_agent(&mut self, cx: &mut Context<Self>) {
+        let id = self.custom_agent_id.read(cx).value().trim().to_string();
+        let label = self.custom_agent_label.read(cx).value().trim().to_string();
+        let command = self
+            .custom_agent_command
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let args = self
+            .custom_agent_args
+            .read(cx)
+            .value()
+            .split_whitespace()
+            .map(ToString::to_string)
+            .collect();
+        let Ok(agent_id) = AgentId::parse(id) else {
+            self.error = Some(
+                management_locale_text(
+                    "Use a lowercase kebab-case Agent id",
+                    "Agent ID 必须使用小写短横线格式",
+                    "Agent ID 必須使用小寫連字號格式",
+                )
+                .into(),
+            );
+            cx.notify();
+            return;
+        };
+        if label.is_empty() || command.is_empty() {
+            self.error = Some(
+                management_locale_text(
+                    "Display name and command are required",
+                    "显示名称和命令不能为空",
+                    "顯示名稱和命令不能為空",
+                )
+                .into(),
+            );
+            cx.notify();
+            return;
+        }
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        let selected_id = agent_id.as_str().to_string();
+        self.custom_agent_editor_open = false;
+        self.selected_agent_id = Some(selected_id.clone());
+        self.begin_simple_task(
+            ManagementMutation::AgentToggle(format!("custom:{selected_id}")),
+            cx,
+            async move {
+                runtime
+                    .management()
+                    .providers()
+                    .management()
+                    .create_custom_agent(vibex_core::CustomAgentCreateRequest {
+                        agent_id,
+                        label,
+                        description: None,
+                        command: vibex_core::AgentCommandConfig { command, args },
+                        env: BTreeMap::new(),
+                    })?;
+                Ok(management_locale_text(
+                    "Custom ACP Agent added",
+                    "自定义 ACP Agent 已添加",
+                    "自訂 ACP Agent 已新增",
+                )
+                .to_string())
+            },
+        );
+    }
+
     fn set_agent_added(&mut self, agent_id: String, added: bool, cx: &mut Context<Self>) {
-        let managed = self
+        let selected_agent = self
             .snapshot
             .agents
             .iter()
-            .find(|agent| agent.id.as_str() == agent_id)
-            .is_some_and(|agent| agent.managed_install.managed);
+            .find(|agent| agent.id.as_str() == agent_id);
+        let managed = selected_agent.is_some_and(|agent| agent.managed_install.managed);
+        let custom = selected_agent
+            .is_some_and(|agent| agent.source_kind == vibex_core::AgentSourceKind::Custom);
         if managed && added {
             self.install_managed_agent(agent_id, false, cx);
             return;
@@ -4701,6 +4806,19 @@ impl ManagementCenter {
             cx,
             async move {
                 let providers = runtime.management().providers().management();
+                if custom && !added {
+                    providers.delete_custom_agent(vibex_core::CustomAgentDeleteRequest {
+                        agent_id: parsed_agent_id.clone(),
+                    })?;
+                    runtime.agent().delete_auth_catalog(&parsed_agent_id)?;
+                    return Ok(management_locale_text_for(
+                        active_locale,
+                        "Custom Agent deleted; session history was preserved",
+                        "自定义 Agent 已删除，会话历史已保留",
+                        "自訂 Agent 已刪除，工作階段歷史已保留",
+                    )
+                    .to_string());
+                }
                 providers.update_agent_config(AgentUpdateConfigRequest {
                     agent_id: parsed_agent_id.clone(),
                     added: Some(added),
@@ -7380,7 +7498,10 @@ impl ManagementCenter {
             .snapshot
             .agents
             .iter()
-            .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
+            .filter(|agent| {
+                agent.source_kind == vibex_core::AgentSourceKind::Custom
+                    || vibex_core::is_user_visible_agent(&agent.id)
+            })
             .filter(|agent| management_agent_matches_search(agent, &query))
             .cloned()
             .collect::<Vec<_>>();
@@ -7603,7 +7724,60 @@ impl ManagementCenter {
             .size_full()
             .min_h_0()
             .gap(px(10.0))
-            .child(management_search_input(&self.agent_search, cx))
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(management_search_input(&self.agent_search, cx)),
+                    )
+                    .child(
+                        Button::new("management-custom-agent-open")
+                            .small()
+                            .outline()
+                            .icon(IconName::Plus)
+                            .label(management_locale_text("Custom", "自定义", "自訂"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.custom_agent_editor_open = !this.custom_agent_editor_open;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .when(self.custom_agent_editor_open, |panel| {
+                panel.child(
+                    v_flex()
+                        .w_full()
+                        .gap_2()
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .p_2()
+                        .child(div().text_sm().font_medium().child(management_locale_text(
+                            "Add custom ACP Agent",
+                            "添加自定义 ACP Agent",
+                            "新增自訂 ACP Agent",
+                        )))
+                        .child(Input::new(&self.custom_agent_id).small().w_full())
+                        .child(Input::new(&self.custom_agent_label).small().w_full())
+                        .child(Input::new(&self.custom_agent_command).small().w_full())
+                        .child(Input::new(&self.custom_agent_args).small().w_full())
+                        .child(
+                            Button::new("management-custom-agent-save")
+                                .small()
+                                .primary()
+                                .label(management_locale_text(
+                                    "Add Agent",
+                                    "添加 Agent",
+                                    "新增 Agent",
+                                ))
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.create_custom_agent(cx)),
+                                ),
+                        ),
+                )
+            })
             .child(
                 div()
                     .id("management-agent-list-scroll")

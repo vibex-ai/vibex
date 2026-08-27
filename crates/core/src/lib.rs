@@ -67,7 +67,8 @@ pub use agent_config::{
     AgentManagedDistributionKind, AgentManagedInstallState, AgentManagedInstallStatus,
     AgentRefreshSnapshotRequest, AgentRefreshSnapshotResponse, AgentRuntimeKind,
     AgentRuntimeStatus, AgentSnapshotEntry, AgentSourceKind, AgentUpdateConfigRequest,
-    acp_registry_agent_id, agent_id_for_provider_kind, builtin_agent_definitions,
+    CustomAgentCreateRequest, CustomAgentDeleteRequest, acp_registry_agent_id,
+    agent_id_for_provider_kind, builtin_agent_definitions, custom_agent_definition,
     is_user_visible_agent,
 };
 pub use agent_provider_runtime::*;

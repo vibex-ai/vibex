@@ -2034,6 +2034,26 @@ impl ManagementBackend for WebRemoteBackend {
         )
     }
 
+    fn create_custom_agent(
+        &self,
+        _request: MutationRequest<vibex_core::CustomAgentCreateRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentSnapshotEntry> {
+        self.unsupported(
+            "remote_custom_agent_management_unavailable",
+            "custom Agent management is only available on the authoritative desktop",
+        )
+    }
+
+    fn delete_custom_agent(
+        &self,
+        _request: MutationRequest<vibex_core::CustomAgentDeleteRequest>,
+    ) -> BackendFuture<'_, ()> {
+        self.unsupported(
+            "remote_custom_agent_management_unavailable",
+            "custom Agent management is only available on the authoritative desktop",
+        )
+    }
+
     fn list_profiles(&self) -> BackendFuture<'_, Vec<ProviderProfileSummary>> {
         let this = self.clone();
         Box::pin(async move {

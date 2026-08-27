@@ -64,6 +64,7 @@ pub struct AgentManager {
     /// Route-aware online runtime registry (plan §4.1/§6.1). `ProviderKind`
     /// is no longer the dispatch key; multiple ACP agents coexist here.
     runtimes: HashMap<vibex_core::AgentRuntimeRouteKey, Arc<dyn AgentProvider>>,
+    generic_acp_runtime: Option<Arc<dyn AgentProvider>>,
     live_events: broadcast::Sender<TimelineLiveEvent>,
     notification_events: broadcast::Sender<AgentNotificationIntent>,
     runtime_selection: OnceLock<Weak<RuntimeSelectionService>>,
@@ -149,6 +150,7 @@ impl AgentManager {
         let manager = Self {
             db_path,
             runtimes: HashMap::new(),
+            generic_acp_runtime: None,
             live_events,
             notification_events,
             runtime_selection: OnceLock::new(),
@@ -194,6 +196,26 @@ impl AgentManager {
             .with_diagnostic("runtimeRoute", describe_runtime_route(&route)));
         }
         self.runtimes.insert(route, provider);
+        Ok(())
+    }
+
+    /// Registers the provider used for persisted custom ACP Agents.
+    pub fn register_generic_acp_runtime(
+        &mut self,
+        provider: Arc<dyn AgentProvider>,
+    ) -> VibexResult<()> {
+        if provider.kind() != ProviderKind::Acp {
+            return Err(VibexError::validation(
+                "runtime_route_transport_invalid",
+                "generic online runtime must be an ACP provider",
+            ));
+        }
+        if self.generic_acp_runtime.replace(provider).is_some() {
+            return Err(VibexError::conflict(
+                "generic_acp_runtime_already_registered",
+                "generic ACP runtime is already registered",
+            ));
+        }
         Ok(())
     }
 
@@ -2692,15 +2714,20 @@ impl AgentManager {
         reject_disabled: bool,
     ) -> VibexResult<ResolvedAgent> {
         let agent_id = agent_id.unwrap_or_else(|| agent_id_for_provider_kind(legacy_provider_kind));
+        let conn = self.open_migrated()?;
+        let config = AgentConfigRepository::get(&conn, &agent_id)?;
         let definition = builtin_agent_definitions()
             .into_iter()
             .find(|definition| definition.id == agent_id)
+            .or_else(|| {
+                config
+                    .as_ref()
+                    .and_then(vibex_core::custom_agent_definition)
+            })
             .ok_or_else(|| {
                 VibexError::validation("agent_not_found", "Agent was not found")
                     .with_diagnostic("agentId", agent_id.as_str())
             })?;
-        let conn = self.open_migrated()?;
-        let config = AgentConfigRepository::get(&conn, &agent_id)?;
         let enabled = config
             .as_ref()
             .map(|config| config.enabled)
@@ -2731,16 +2758,24 @@ impl AgentManager {
         &self,
         route: &vibex_core::AgentRuntimeRouteKey,
     ) -> VibexResult<Arc<dyn AgentProvider>> {
-        self.runtimes.get(route).cloned().ok_or_else(|| {
-            VibexError::capability(
-                "provider_unregistered",
-                format!(
-                    "no online runtime is registered for route {}",
-                    describe_runtime_route(route)
-                ),
-            )
-            .with_diagnostic("runtimeRoute", describe_runtime_route(route))
-        })
+        self.runtimes
+            .get(route)
+            .cloned()
+            .or_else(|| {
+                (route.transport_kind == TransportKind::Acp)
+                    .then(|| self.generic_acp_runtime.clone())
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                VibexError::capability(
+                    "provider_unregistered",
+                    format!(
+                        "no online runtime is registered for route {}",
+                        describe_runtime_route(route)
+                    ),
+                )
+                .with_diagnostic("runtimeRoute", describe_runtime_route(route))
+            })
     }
 
     fn route_for_agent(&self, agent_id: &AgentId) -> VibexResult<vibex_core::AgentRuntimeRouteKey> {
@@ -2748,6 +2783,15 @@ impl AgentManager {
             .keys()
             .find(|route| route.agent_id == *agent_id && route.transport_kind == TransportKind::Acp)
             .cloned()
+            .or_else(|| {
+                self.generic_acp_runtime
+                    .as_ref()
+                    .map(|_| vibex_core::AgentRuntimeRouteKey {
+                        agent_id: agent_id.clone(),
+                        transport_kind: TransportKind::Acp,
+                        adapter_id: vibex_core::default_acp_adapter_id(agent_id),
+                    })
+            })
             .ok_or_else(|| {
                 VibexError::capability(
                     "provider_unregistered",

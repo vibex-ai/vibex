@@ -1220,6 +1220,40 @@ impl ManagementBackend for NativeBackend {
         })
     }
 
+    fn create_custom_agent(
+        &self,
+        request: MutationRequest<vibex_core::CustomAgentCreateRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentSnapshotEntry> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .create_custom_agent(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn delete_custom_agent(
+        &self,
+        request: MutationRequest<vibex_core::CustomAgentDeleteRequest>,
+    ) -> BackendFuture<'_, ()> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .delete_custom_agent(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
     fn list_profiles(&self) -> BackendFuture<'_, Vec<vibex_core::ProviderProfileSummary>> {
         let runtime = self.runtime.clone();
         Box::pin(async move {

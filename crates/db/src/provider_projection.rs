@@ -2178,6 +2178,7 @@ mod tests {
                 "48:agent_usage_counter_scope",
                 "49:message_submission_runtime_policy",
                 "50:mcp_server_env_and_headers",
+                "51:custom_acp_agent_definitions",
             ]
         );
         assert_eq!(

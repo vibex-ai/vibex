@@ -28,48 +28,51 @@ use vibex_core::{
     AgentModelProviderProfileTestResult, AgentModelProviderProfileUpdateRequest,
     AgentModelProviderSetDefaultRequest, AgentModelProviderTestStatus, AgentRefreshSnapshotRequest,
     AgentRefreshSnapshotResponse, AgentRuntimeKind, AgentRuntimeStatus, AgentSnapshotEntry,
-    AgentUpdateConfigRequest, Hook, HookCreateRequest, HookDeleteRequest, HookInstallPreview,
-    HookInstallPreviewRequest, HookInstallState, HookUpdateRequest, McpSecretTarget, McpServer,
-    McpServerAgentMatrix, McpServerAgentMatrixListRequest, McpServerCreateRequest,
-    McpServerDeleteRequest, McpServerDiscoverRequest, McpServerDiscovery,
-    McpServerDiscoveryResponse, McpServerEnvEntry, McpServerForAgentListRequest,
-    McpServerHeaderEntry, McpServerImportRequest, McpServerImportResult, McpServerProviderMatrix,
-    McpServerSecretReferenceCreateRequest, McpServerSetAgentMatrixRequest,
-    McpServerSetProviderMatrixRequest, McpServerTransportKind, McpServerUpdateRequest,
-    McpServerValidateRequest, McpServerValidationResult, McpServerValidationStatus, Prompt,
-    PromptCreateRequest, PromptDeleteRequest, PromptUpdateRequest, PromptValidateRequest,
-    PromptValidationResult, PromptValidationStatus, ProviderBindingMetadata, ProviderCapabilities,
-    ProviderCapabilityProbeResult, ProviderCapabilityProbeStatus, ProviderCapabilitySummary,
-    ProviderConfiguredModel, ProviderDefaultScopeKind, ProviderFailoverRecommendation,
-    ProviderFailoverRecommendationReason, ProviderFailoverRecommendationRequest,
-    ProviderFailoverRecommendationStatus, ProviderHealthProbeKind, ProviderHealthProbeResult,
-    ProviderHealthStatus, ProviderHealthSummary, ProviderInjectionField,
-    ProviderInjectionOverlayFile, ProviderInjectionPreview, ProviderInjectionPreviewRequest,
-    ProviderInjectionStrategy, ProviderKind, ProviderOptions, ProviderProfile,
-    ProviderProfileCreateRequest, ProviderProfileDefaultScope, ProviderProfileDefaultSelection,
-    ProviderProfileDeleteRequest, ProviderProfileDuplicateRequest, ProviderProfileId,
-    ProviderProfileSetDefaultRequest, ProviderProfileStatus, ProviderProfileUpdateRequest,
-    ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
-    ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, ProviderSecretBackend,
-    ProviderSecretKind, ProviderSecretReference, ProviderSecretReferenceCreateRequest,
-    ProviderSecretSetupState, ProviderUsageBalance, ProviderUsageListRequest, ProviderUsageRecord,
-    ProviderUsageSummary, RequestId, ResourceAgentMatrixSourceKind, ResourceDiscoveryStatus, Skill,
-    SkillAgentMatrix, SkillAgentMatrixListRequest, SkillCreateRequest, SkillDeleteRequest,
-    SkillDiscoverRequest, SkillDiscovery, SkillDiscoveryResponse, SkillForAgentListRequest,
-    SkillImportRequest, SkillImportResult, SkillProviderMatrix, SkillSetAgentMatrixRequest,
+    AgentUpdateConfigRequest, CustomAgentCreateRequest, CustomAgentDeleteRequest, Hook,
+    HookCreateRequest, HookDeleteRequest, HookInstallPreview, HookInstallPreviewRequest,
+    HookInstallState, HookUpdateRequest, McpSecretTarget, McpServer, McpServerAgentMatrix,
+    McpServerAgentMatrixListRequest, McpServerCreateRequest, McpServerDeleteRequest,
+    McpServerDiscoverRequest, McpServerDiscovery, McpServerDiscoveryResponse, McpServerEnvEntry,
+    McpServerForAgentListRequest, McpServerHeaderEntry, McpServerImportRequest,
+    McpServerImportResult, McpServerProviderMatrix, McpServerSecretReferenceCreateRequest,
+    McpServerSetAgentMatrixRequest, McpServerSetProviderMatrixRequest, McpServerTransportKind,
+    McpServerUpdateRequest, McpServerValidateRequest, McpServerValidationResult,
+    McpServerValidationStatus, Prompt, PromptCreateRequest, PromptDeleteRequest,
+    PromptUpdateRequest, PromptValidateRequest, PromptValidationResult, PromptValidationStatus,
+    ProviderBindingMetadata, ProviderCapabilities, ProviderCapabilityProbeResult,
+    ProviderCapabilityProbeStatus, ProviderCapabilitySummary, ProviderConfiguredModel,
+    ProviderDefaultScopeKind, ProviderFailoverRecommendation, ProviderFailoverRecommendationReason,
+    ProviderFailoverRecommendationRequest, ProviderFailoverRecommendationStatus,
+    ProviderHealthProbeKind, ProviderHealthProbeResult, ProviderHealthStatus,
+    ProviderHealthSummary, ProviderInjectionField, ProviderInjectionOverlayFile,
+    ProviderInjectionPreview, ProviderInjectionPreviewRequest, ProviderInjectionStrategy,
+    ProviderKind, ProviderOptions, ProviderProfile, ProviderProfileCreateRequest,
+    ProviderProfileDefaultScope, ProviderProfileDefaultSelection, ProviderProfileDeleteRequest,
+    ProviderProfileDuplicateRequest, ProviderProfileId, ProviderProfileSetDefaultRequest,
+    ProviderProfileStatus, ProviderProfileUpdateRequest, ProviderRunCapabilityProbesRequest,
+    ProviderRunCapabilityProbesResult, ProviderRunHealthProbesRequest,
+    ProviderRunHealthProbesResult, ProviderSecretBackend, ProviderSecretKind,
+    ProviderSecretReference, ProviderSecretReferenceCreateRequest, ProviderSecretSetupState,
+    ProviderUsageBalance, ProviderUsageListRequest, ProviderUsageRecord, ProviderUsageSummary,
+    RequestId, ResourceAgentMatrixSourceKind, ResourceDiscoveryStatus, Skill, SkillAgentMatrix,
+    SkillAgentMatrixListRequest, SkillCreateRequest, SkillDeleteRequest, SkillDiscoverRequest,
+    SkillDiscovery, SkillDiscoveryResponse, SkillForAgentListRequest, SkillImportRequest,
+    SkillImportResult, SkillProviderMatrix, SkillSetAgentMatrixRequest,
     SkillSetProviderMatrixRequest, SkillSourceKind, SkillUpdateRequest, SkillValidateRequest,
     SkillValidationResult, SkillValidationStatus, VibexError, VibexResult,
-    acp_agent_catalog_entries, builtin_agent_definitions, unix_timestamp_ms,
+    acp_agent_catalog_entries, builtin_agent_definitions, custom_agent_definition,
+    unix_timestamp_ms,
 };
 use vibex_db::{
     AgentAuthCatalogSnapshotRepository, AgentConfigRepository,
     AgentDefaultModelProviderProfileRepository, AgentDiscoveryRepository,
     AgentManagedInstallationRepository, AgentModelProviderDisplayOrderRepository,
-    AgentModelProviderFailoverRepository, AgentRuntimeOptionSnapshotRepository, HookRepository,
-    McpServerRepository, PromptRepository, ProviderCapabilityRepository,
-    ProviderDefaultProfileRepository, ProviderHealthRepository, ProviderInjectionPreviewRepository,
-    ProviderProfileRepository, ProviderSecretReferenceRepository, ProviderUsageRepository,
-    SkillRepository, apply_migrations, open_database,
+    AgentModelProviderFailoverRepository, AgentRuntimeOptionSnapshotRepository,
+    CustomAgentDefinitionRepository, HookRepository, McpServerRepository, PromptRepository,
+    ProviderCapabilityRepository, ProviderDefaultProfileRepository, ProviderHealthRepository,
+    ProviderInjectionPreviewRepository, ProviderProfileRepository,
+    ProviderSecretReferenceRepository, ProviderUsageRepository, SkillRepository, apply_migrations,
+    open_database,
 };
 
 mod native_export;
@@ -162,7 +165,7 @@ impl ProviderConfigService {
 
     pub fn list_agents(&self, request: AgentListRequest) -> VibexResult<AgentListResponse> {
         let conn = self.open_connection()?;
-        let definitions = builtin_agent_definitions();
+        let definitions = agent_definitions(&conn)?;
         let configs = AgentConfigRepository::list(&conn)?;
         let managed_installations = AgentManagedInstallationRepository::list(&conn)?
             .into_iter()
@@ -234,26 +237,106 @@ impl ProviderConfigService {
     }
 
     pub fn list_agent_catalog(&self) -> VibexResult<AgentCatalogListResponse> {
+        let conn = self.open_connection()?;
         Ok(AgentCatalogListResponse {
-            agents: builtin_agent_definitions(),
+            agents: agent_definitions(&conn)?,
         })
+    }
+
+    pub fn create_custom_agent(
+        &self,
+        request: CustomAgentCreateRequest,
+    ) -> VibexResult<AgentSnapshotEntry> {
+        validate_agent_label(&request.label)?;
+        if request.command.command.trim().is_empty() {
+            return Err(VibexError::validation(
+                "custom_agent_command_empty",
+                "custom ACP Agent command must not be empty",
+            ));
+        }
+        if request
+            .env
+            .keys()
+            .any(|key| key.trim().is_empty() || key.contains('='))
+        {
+            return Err(VibexError::validation(
+                "custom_agent_env_key_invalid",
+                "custom ACP Agent environment keys must be non-empty names without '='",
+            ));
+        }
+        let conn = self.open_connection()?;
+        if builtin_agent_definitions()
+            .iter()
+            .any(|definition| definition.id == request.agent_id)
+            || CustomAgentDefinitionRepository::get(&conn, &request.agent_id)?.is_some()
+        {
+            return Err(VibexError::conflict(
+                "custom_agent_id_conflict",
+                "an Agent with this id already exists",
+            )
+            .with_diagnostic("agentId", request.agent_id.as_str()));
+        }
+        let now = unix_timestamp_ms();
+        let order_index = agent_definitions(&conn)?
+            .iter()
+            .map(|definition| definition.order_index)
+            .max()
+            .unwrap_or(0)
+            + 10;
+        let config = AgentConfig {
+            agent_id: request.agent_id,
+            runtime_kind: AgentRuntimeKind::Acp,
+            source_kind: vibex_core::AgentSourceKind::Custom,
+            label_override: Some(request.label),
+            description_override: request.description,
+            enabled: true,
+            order_index,
+            command: Some(request.command),
+            env: request.env,
+            params: serde_json::json!({"connection": "acp", "custom": true}),
+            created_at_ms: now,
+            updated_at_ms: now,
+            deleted_at_ms: None,
+        };
+        CustomAgentDefinitionRepository::upsert(&conn, &config)?;
+        AgentConfigRepository::upsert(&conn, &config)?;
+        let definition = custom_agent_definition(&config).expect("new custom Agent is active");
+        self.ensure_default_acp_profile_for_agent(&conn, &definition, &config)?;
+        Ok(AgentSnapshotEntry::from_definition(
+            &definition,
+            Some(&config),
+            None,
+        ))
+    }
+
+    pub fn delete_custom_agent(&self, request: CustomAgentDeleteRequest) -> VibexResult<()> {
+        let conn = self.open_connection()?;
+        let definition = CustomAgentDefinitionRepository::get(&conn, &request.agent_id)?
+            .ok_or_else(|| {
+                VibexError::validation("custom_agent_not_found", "custom Agent was not found")
+            })?;
+        CustomAgentDefinitionRepository::delete(&conn, &request.agent_id)?;
+        let mut config =
+            AgentConfigRepository::get(&conn, &request.agent_id)?.unwrap_or(definition);
+        config.enabled = false;
+        config.deleted_at_ms = Some(unix_timestamp_ms());
+        config.updated_at_ms = unix_timestamp_ms();
+        AgentConfigRepository::upsert(&conn, &config)?;
+        Ok(())
     }
 
     pub fn update_agent_config(
         &self,
         request: AgentUpdateConfigRequest,
     ) -> VibexResult<AgentSnapshotEntry> {
-        let definition = builtin_agent_definitions()
-            .into_iter()
-            .find(|definition| definition.id == request.agent_id)
-            .ok_or_else(|| {
-                VibexError::validation("agent_not_found", "Agent was not found")
-                    .with_diagnostic("agentId", request.agent_id.as_str())
-            })?;
         if let Some(label) = request.label_override.as_deref() {
             validate_agent_label(label)?;
         }
         let conn = self.open_connection()?;
+        let definition = agent_definition(&conn, &request.agent_id)?.ok_or_else(|| {
+            VibexError::validation("agent_not_found", "Agent was not found")
+                .with_diagnostic("agentId", request.agent_id.as_str())
+        })?;
         let now = unix_timestamp_ms();
         let existing = AgentConfigRepository::get(&conn, &request.agent_id)?;
         let created_at_ms = existing
@@ -485,14 +568,11 @@ impl ProviderConfigService {
         &self,
         request: AgentRefreshSnapshotRequest,
     ) -> VibexResult<AgentRefreshSnapshotResponse> {
-        let definition = builtin_agent_definitions()
-            .into_iter()
-            .find(|definition| definition.id == request.agent_id)
-            .ok_or_else(|| {
-                VibexError::validation("agent_not_found", "Agent was not found")
-                    .with_diagnostic("agentId", request.agent_id.as_str())
-            })?;
         let conn = self.open_connection()?;
+        let definition = agent_definition(&conn, &request.agent_id)?.ok_or_else(|| {
+            VibexError::validation("agent_not_found", "Agent was not found")
+                .with_diagnostic("agentId", request.agent_id.as_str())
+        })?;
         let config = AgentConfigRepository::get(&conn, &definition.id)?;
         let snapshot = AgentSnapshotEntry::from_definition(&definition, config.as_ref(), None);
         let cwd_scope = request
@@ -4772,7 +4852,10 @@ fn default_acp_runtime_config_for_agent(
     conn: &vibex_db::DbConnection,
     agent_id: &AgentId,
 ) -> VibexResult<AcpProviderConfig> {
-    let definition = require_agent_definition(agent_id)?;
+    let definition = agent_definition(conn, agent_id)?.ok_or_else(|| {
+        VibexError::validation("agent_not_found", "Agent was not found")
+            .with_diagnostic("agentId", agent_id.as_str())
+    })?;
     let agent_config = AgentConfigRepository::get(conn, agent_id)?;
     let preset_id = agent_config
         .as_ref()
@@ -7612,6 +7695,31 @@ fn validate_display_name(display_name: &str) -> VibexResult<()> {
     Ok(())
 }
 
+fn agent_definitions(conn: &vibex_db::DbConnection) -> VibexResult<Vec<AgentDefinition>> {
+    let mut definitions = builtin_agent_definitions();
+    definitions.extend(
+        CustomAgentDefinitionRepository::list(conn)?
+            .iter()
+            .filter_map(custom_agent_definition),
+    );
+    Ok(definitions)
+}
+
+fn agent_definition(
+    conn: &vibex_db::DbConnection,
+    agent_id: &AgentId,
+) -> VibexResult<Option<AgentDefinition>> {
+    if let Some(definition) = builtin_agent_definitions()
+        .into_iter()
+        .find(|definition| definition.id == *agent_id)
+    {
+        return Ok(Some(definition));
+    }
+    Ok(CustomAgentDefinitionRepository::get(conn, agent_id)?
+        .as_ref()
+        .and_then(custom_agent_definition))
+}
+
 fn require_agent_definition(agent_id: &AgentId) -> VibexResult<AgentDefinition> {
     builtin_agent_definitions()
         .into_iter()
@@ -7629,6 +7737,11 @@ fn validate_profile_agent_kind(
     let Some(agent_id) = agent_id else {
         return Ok(());
     };
+    // ACP profiles are also the typed launch boundary for persisted custom
+    // Agents; their identity is validated by the calling catalog service.
+    if provider_kind == ProviderKind::Acp {
+        return Ok(());
+    }
     require_agent_definition(agent_id)?;
     let configuration_kind = agent_model_provider_kind(agent_id);
     if provider_kind != ProviderKind::Acp && provider_kind != configuration_kind {
@@ -8685,6 +8798,74 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(projection_error.code, "agent_model_interface_unsupported");
+    }
+
+    #[test]
+    fn custom_acp_agent_round_trips_through_the_dynamic_catalog() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("vibex.db");
+        let service = ProviderConfigService::new(&db_path);
+        let agent_id = AgentId::parse("my-acp-agent").unwrap();
+
+        let created = service
+            .create_custom_agent(CustomAgentCreateRequest {
+                agent_id: agent_id.clone(),
+                label: "My ACP Agent".to_string(),
+                description: Some("Locally configured ACP Agent".to_string()),
+                command: AgentCommandConfig {
+                    command: "my-acp-agent".to_string(),
+                    args: vec!["--acp".to_string()],
+                },
+                env: [("EXAMPLE_MODE".to_string(), "safe".to_string())]
+                    .into_iter()
+                    .collect(),
+            })
+            .unwrap();
+        assert_eq!(created.source_kind, vibex_core::AgentSourceKind::Custom);
+        assert!(created.enabled);
+
+        let reopened = ProviderConfigService::new(&db_path);
+        let listed = reopened
+            .list_agents(AgentListRequest {
+                include_disabled: true,
+            })
+            .unwrap();
+        let custom = listed
+            .agents
+            .iter()
+            .find(|agent| agent.id == agent_id)
+            .unwrap();
+        assert_eq!(custom.label, "My ACP Agent");
+        assert_eq!(custom.command.as_ref().unwrap().args, ["--acp"]);
+        assert!(reopened.get_agent_acp_runtime_config(&agent_id).is_ok());
+
+        reopened
+            .delete_custom_agent(CustomAgentDeleteRequest {
+                agent_id: agent_id.clone(),
+            })
+            .unwrap();
+        assert!(
+            !reopened
+                .list_agent_catalog()
+                .unwrap()
+                .agents
+                .iter()
+                .any(|agent| agent.id == agent_id)
+        );
+        assert!(
+            reopened
+                .create_custom_agent(CustomAgentCreateRequest {
+                    agent_id: AgentId::parse("claude").unwrap(),
+                    label: "Collision".to_string(),
+                    description: None,
+                    command: AgentCommandConfig {
+                        command: "collision".to_string(),
+                        args: Vec::new()
+                    },
+                    env: Default::default(),
+                })
+                .is_err()
+        );
     }
 
     #[test]

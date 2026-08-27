@@ -2152,6 +2152,7 @@ fn build_agent_manager(
             )?;
         }
     }
+    manager.register_generic_acp_runtime(acp_provider)?;
     Ok((manager, acp_config_service, acp_runtime))
 }
 

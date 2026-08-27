@@ -294,6 +294,22 @@ pub struct AgentListResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CustomAgentCreateRequest {
+    pub agent_id: AgentId,
+    pub label: String,
+    pub description: Option<String>,
+    pub command: AgentCommandConfig,
+    pub env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomAgentDeleteRequest {
+    pub agent_id: AgentId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentUpdateConfigRequest {
     pub agent_id: AgentId,
     pub added: Option<bool>,
@@ -350,6 +366,35 @@ pub fn is_user_visible_agent(agent_id: &AgentId) -> bool {
             | "zcode"
             | "deepseek-harness"
     )
+}
+
+/// Builds a runtime definition from a persisted custom Agent configuration.
+/// Custom definitions deliberately use conservative ACP capabilities.
+pub fn custom_agent_definition(config: &AgentConfig) -> Option<AgentDefinition> {
+    if config.source_kind != AgentSourceKind::Custom || config.deleted_at_ms.is_some() {
+        return None;
+    }
+    Some(AgentDefinition {
+        id: config.agent_id.clone(),
+        label: config
+            .label_override
+            .clone()
+            .unwrap_or_else(|| config.agent_id.as_str().to_string()),
+        description: config.description_override.clone(),
+        runtime_kind: AgentRuntimeKind::Acp,
+        source_kind: AgentSourceKind::Custom,
+        default_enabled: config.enabled,
+        order_index: config.order_index,
+        command: config.command.clone(),
+        env: config.env.clone(),
+        params: config.params.clone(),
+        modes: Vec::new(),
+        capability_hints: vec![
+            "acp_connection".to_string(),
+            "agent_messages".to_string(),
+            "tool_calls".to_string(),
+        ],
+    })
 }
 
 impl AgentSnapshotEntry {
