@@ -10224,6 +10224,7 @@ fn agent_icon_path(agent_id: &str) -> &'static str {
             ("dirac", "icons/agents/dirac.svg"),
             ("factory-droid", "icons/agents/factory-droid.svg"),
             ("glm-acp-agent", "icons/agents/glm-acp-agent.svg"),
+            ("zcode", "icons/agents/glm-acp-agent.svg"),
             ("goose", "icons/agents/goose.svg"),
             ("grok", "icons/agents/grok.svg"),
             ("hermes", "icons/agents/hermes.svg"),
@@ -10535,6 +10536,7 @@ mod tests {
     #[test]
     fn agent_sidebar_icons_cover_catalog_brands_and_unknown_fallback() {
         assert_eq!(agent_icon_path("grok-acp"), "icons/agents/grok.svg");
+        assert_eq!(agent_icon_path("zcode"), "icons/agents/glm-acp-agent.svg");
         assert_eq!(
             agent_icon_path("deepseek-harness"),
             "icons/agents/deepseek-harness.svg"

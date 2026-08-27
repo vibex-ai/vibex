@@ -530,6 +530,10 @@ const CATALOG_AGENT_BRANDS: &[(&str, BrandAsset)] = &[
         "glm-acp-agent",
         themed_agent_asset("icons/vibex/agents/glm-acp-agent.svg"),
     ),
+    (
+        "zcode",
+        themed_agent_asset("icons/vibex/agents/glm-acp-agent.svg"),
+    ),
     ("goose", themed_agent_asset("icons/vibex/agents/goose.svg")),
     ("grok", themed_agent_asset("icons/vibex/agents/grok.svg")),
     (
@@ -944,6 +948,7 @@ mod tests {
             "dirac",
             "factory-droid",
             "glm-acp-agent",
+            "zcode",
             "goose",
             "grok",
             "hermes",
@@ -971,6 +976,18 @@ mod tests {
                 "{identity} must use GPUI's theme-aware Icon renderer"
             );
         }
+    }
+
+    #[test]
+    fn zcode_uses_the_glm_agent_brand_asset() {
+        assert_eq!(
+            agent_brand_asset("zcode"),
+            agent_brand_asset("glm-acp-agent")
+        );
+        assert_eq!(
+            agent_brand_asset("ZCode ACP Server"),
+            agent_brand_asset("glm-acp-agent")
+        );
     }
 
     #[test]
