@@ -349,6 +349,51 @@ environment key and the final ACP authentication decision.
 - ACP dialect tests assert Kimi forwards MCP descriptors and scrubs inherited Kimi/OpenAI credential overrides on Agent-account launches.
 - Run the runtime rollout evidence gate after changing the catalog version or projection descriptor.
 
+## Scenario: ZCode Managed Bridge And Private Provider Runtime
+
+### 1. Scope / Trigger
+
+- Trigger: starting ZCode through the managed `zcode-acp-server` Adapter with
+  either ZCode's own account or a Vibex Model Provider Profile.
+
+### 2. Contracts
+
+- ZCode provider projection writes the selected provider, endpoint, credential,
+  and model into a workspace-stable private `$HOME/.zcode/v2/config.json`; it
+  never rewrites the user's native ZCode configuration.
+- The projected ACP model id is `providerId\\modelId`. Mode and thought level
+  remain dynamic ACP session options and use the exact values advertised by the
+  Adapter.
+- ZCode Desktop does not add its bundled CLI to `PATH`. If neither Agent nor
+  Profile supplies `ZCODE_BIN`, runtime launch may discover only the documented
+  platform bundle path when that file actually exists. Linux uses
+  `/opt/ZCode/resources/glm/zcode.cjs`, macOS uses the ZCode application bundle,
+  and Windows uses the per-user ZCode installation under `LOCALAPPDATA`.
+- An explicit `ZCODE_BIN` environment value always wins. Missing bundle
+  discovery must not overwrite the bridge's normal PATH-based fallback.
+- `authenticate` may remain unsupported even though `initialize.authMethods`
+  describes ZCode's Agent-managed credential source; Vibex Provider Profiles
+  authenticate through the private projection instead.
+
+### 3. Capability Notes
+
+- Verified `zcode-acp-server@0.11.9` declarations: `session/new/load/list/resume/fork`,
+  prompt/cancel, model/mode/thought configuration, streaming Agent text and
+  reasoning, tools, plans, usage updates, permissions, form elicitation, MCP,
+  Skills/slash commands, file/image context, and a ZCode filesystem extension.
+- Vibex's generic ACP host supports standard filesystem and terminal callbacks,
+  permission and elicitation loops, canonical timeline events, and usage
+  updates. A declaration does not claim every callback occurred in one smoke.
+
+### 4. Tests Required
+
+- Projection tests assert private config shape, secret materialization, selected
+  endpoint/model, and the `providerId\\modelId` runtime id.
+- ACP runtime tests assert bundle discovery returns only an existing file and
+  explicit environment configuration remains authoritative.
+- Real verification must force first-prompt materialization; an initialize-only
+  handshake cannot detect a missing ZCode CLI bundle.
+
 ## Import and Export
 
 Import existing Claude/Codex configuration in read-only mode by default. Imported

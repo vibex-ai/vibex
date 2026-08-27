@@ -10955,6 +10955,16 @@ impl AcpRuntimeClient {
                 command.env(key, value);
             }
         }
+        if agent_id.as_str() == crate::registry::ZCODE_AGENT_ID
+            && !env_overlays.iter().any(|(key, _)| key == "ZCODE_BIN")
+            && std::env::var_os("ZCODE_BIN").is_none()
+            && let Some(zcode_bin) = discover_zcode_cli_bundle()
+        {
+            // ZCode Desktop does not add its bundled CLI to PATH. Without
+            // this projection the managed ACP bridge initializes successfully
+            // but session materialization fails on the first prompt.
+            command.env("ZCODE_BIN", zcode_bin);
+        }
         // Retained for the filesystem host: an agent's native state home is
         // only knowable from the overlay it was launched with.
         let spawn_env_overlays = env_overlays.clone();
@@ -14889,6 +14899,25 @@ async fn resolve_terminal_create_permission(
     Ok(())
 }
 
+fn discover_zcode_cli_bundle() -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    let candidates = [PathBuf::from("/opt/ZCode/resources/glm/zcode.cjs")];
+    #[cfg(target_os = "macos")]
+    let candidates = [PathBuf::from(
+        "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs",
+    )];
+    #[cfg(target_os = "windows")]
+    let candidates = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .map(|root| root.join("Programs/ZCode/resources/glm/zcode.cjs"))
+        .into_iter()
+        .collect::<Vec<_>>();
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    let candidates: [PathBuf; 0] = [];
+
+    candidates.into_iter().find(|candidate| candidate.is_file())
+}
+
 fn agent_probe_env_overlays(config: &AcpProviderConfig) -> Vec<(String, String)> {
     config
         .env
@@ -18264,6 +18293,18 @@ mod tests {
     use super::*;
     use vibex_agent::AgentProvider;
     use vibex_core::{AgentAuthenticationOperation, AgentAuthenticationOperationState};
+
+    #[test]
+    fn zcode_cli_bundle_discovery_is_existing_or_absent() {
+        assert!(discover_zcode_cli_bundle().is_none_or(|path| path.is_file()));
+        #[cfg(target_os = "linux")]
+        if Path::new("/opt/ZCode/resources/glm/zcode.cjs").is_file() {
+            assert_eq!(
+                discover_zcode_cli_bundle().as_deref(),
+                Some(Path::new("/opt/ZCode/resources/glm/zcode.cjs"))
+            );
+        }
+    }
 
     fn test_acp_config(command: &str, args: Vec<String>) -> AcpProviderConfig {
         AcpProviderConfig {
