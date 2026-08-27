@@ -547,6 +547,7 @@ enum ComposerQueueDispatchBehavior {
     AfterCompletion,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ComposerRuntimeMenuView {
     Agent,
@@ -3870,6 +3871,7 @@ pub struct VibexWorkbench {
     new_session_runtime_menu_open: bool,
     new_session_runtime_menu_view: ComposerRuntimeMenuView,
     new_session_runtime_menu_auth_source: Option<RuntimeAuthSource>,
+    new_session_runtime_search: Entity<InputState>,
     new_session_composer_geometry: ComposerGeometry,
     new_session_workspace: NewSessionWorkspaceState,
     new_session_workspace_mode_menu_open: bool,
@@ -3923,6 +3925,7 @@ pub struct VibexWorkbench {
     composer_runtime_menu_view: ComposerRuntimeMenuView,
     composer_runtime_menu_agent_id: Option<AgentId>,
     composer_runtime_menu_auth_source: Option<RuntimeAuthSource>,
+    composer_runtime_search: Entity<InputState>,
     runtime_authentication_menu: Option<RuntimeAuthenticationMenuState>,
     composer_geometry: ComposerGeometry,
     runtime_choice_menu_open: Option<String>,
@@ -4143,6 +4146,20 @@ impl VibexWorkbench {
                 "搜尋分支",
             ))
         });
+        let new_session_runtime_search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(locale::text(
+                "Search providers and models",
+                "搜索模型供应商与模型",
+                "搜尋模型供應商與模型",
+            ))
+        });
+        let composer_runtime_search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(locale::text(
+                "Search providers and models",
+                "搜索模型供应商与模型",
+                "搜尋模型供應商與模型",
+            ))
+        });
         let mut agent_subscriptions = vec![
             cx.subscribe_in(
                 &session_search,
@@ -4211,6 +4228,12 @@ impl VibexWorkbench {
                 cx.notify()
             }),
             cx.subscribe(&new_session_base_ref_search, |_, _, _: &InputEvent, cx| {
+                cx.notify()
+            }),
+            cx.subscribe(&new_session_runtime_search, |_, _, _: &InputEvent, cx| {
+                cx.notify()
+            }),
+            cx.subscribe(&composer_runtime_search, |_, _, _: &InputEvent, cx| {
                 cx.notify()
             }),
             cx.subscribe_in(
@@ -4541,6 +4564,7 @@ impl VibexWorkbench {
             new_session_runtime_menu_open: false,
             new_session_runtime_menu_view: ComposerRuntimeMenuView::AuthSource,
             new_session_runtime_menu_auth_source: None,
+            new_session_runtime_search,
             new_session_composer_geometry: ComposerGeometry::default(),
             new_session_workspace,
             new_session_workspace_mode_menu_open: false,
@@ -4594,6 +4618,7 @@ impl VibexWorkbench {
             composer_runtime_menu_view: ComposerRuntimeMenuView::Agent,
             composer_runtime_menu_agent_id: None,
             composer_runtime_menu_auth_source: None,
+            composer_runtime_search,
             runtime_authentication_menu: None,
             composer_geometry: ComposerGeometry::default(),
             runtime_choice_menu_open: None,
@@ -16295,7 +16320,7 @@ impl VibexWorkbench {
             self.runtime_choice_menu_open = None;
             let selection = self.selected_runtime_selection();
             self.composer_runtime_menu_view = if selection.is_some() {
-                ComposerRuntimeMenuView::Model
+                ComposerRuntimeMenuView::AuthSource
             } else {
                 ComposerRuntimeMenuView::Agent
             };
@@ -16333,7 +16358,7 @@ impl VibexWorkbench {
             self.new_session_runtime_menu_view =
                 if let Some(selection) = self.new_session_runtime_selection.as_ref() {
                     self.new_session_runtime_menu_auth_source = Some(selection.auth_source.clone());
-                    ComposerRuntimeMenuView::Model
+                    ComposerRuntimeMenuView::AuthSource
                 } else {
                     self.new_session_runtime_menu_auth_source = None;
                     ComposerRuntimeMenuView::AuthSource
@@ -16536,10 +16561,11 @@ impl VibexWorkbench {
                     }
                     if authenticated {
                         if this.new_session_runtime_menu_open {
-                            this.new_session_runtime_menu_view = ComposerRuntimeMenuView::Model;
+                            this.new_session_runtime_menu_view =
+                                ComposerRuntimeMenuView::AuthSource;
                         }
                         if this.composer_runtime_menu_open {
-                            this.composer_runtime_menu_view = ComposerRuntimeMenuView::Model;
+                            this.composer_runtime_menu_view = ComposerRuntimeMenuView::AuthSource;
                         }
                         this.load_agent_runtime_catalog(cx);
                     }
@@ -16603,10 +16629,11 @@ impl VibexWorkbench {
                     }
                     if verified {
                         if this.new_session_runtime_menu_open {
-                            this.new_session_runtime_menu_view = ComposerRuntimeMenuView::Model;
+                            this.new_session_runtime_menu_view =
+                                ComposerRuntimeMenuView::AuthSource;
                         }
                         if this.composer_runtime_menu_open {
-                            this.composer_runtime_menu_view = ComposerRuntimeMenuView::Model;
+                            this.composer_runtime_menu_view = ComposerRuntimeMenuView::AuthSource;
                         }
                         this.load_agent_runtime_catalog(cx);
                     }
@@ -24380,6 +24407,236 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn render_provider_model_groups(
+        &mut self,
+        agent_id: &AgentId,
+        catalog: &SessionRuntimeOptionCatalog,
+        selected: Option<&SessionRuntimeSelection>,
+        preferred: Option<&SessionRuntimeSelection>,
+        search: Entity<InputState>,
+        new_session: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let query = normalized_session_search_query(search.read(cx).value().as_ref());
+        let mut groups = runtime_auth_sources_for_agent(catalog, agent_id);
+        groups.sort_by_key(|source| !matches!(source.kind, RuntimeAuthSourceKind::AgentAccount));
+        let remembered = &self.ui_state.composer.runtime_selections_by_model;
+        let mut visible_groups = Vec::new();
+
+        for source in groups {
+            let source_label = runtime_auth_source_display_label(&source);
+            let source_matches =
+                runtime_search_matches(&query, [source_label.as_str(), source.label.as_str()]);
+            let choices =
+                runtime_model_choices(catalog, agent_id, &source.source, preferred, remembered)
+                    .into_iter()
+                    .filter(|choice| {
+                        let model_identity = runtime_model_selection_label(&choice.selection.model);
+                        source_matches
+                            || runtime_search_matches(
+                                &query,
+                                [choice.label.as_str(), model_identity.as_str()],
+                            )
+                    })
+                    .collect::<Vec<_>>();
+            if !source_matches && choices.is_empty() {
+                continue;
+            }
+
+            let model_count = runtime_auth_source_model_count(catalog, agent_id, &source.source);
+            let status = runtime_auth_source_status_label(&source, model_count);
+            let can_authenticate = source.kind == RuntimeAuthSourceKind::AgentAccount
+                && !matches!(
+                    source.availability,
+                    RuntimeAuthSourceAvailability::Available
+                        | RuntimeAuthSourceAvailability::Verifying
+                        | RuntimeAuthSourceAvailability::DiscoveringModels
+                );
+            let auth_agent_id = agent_id.clone();
+            let auth_source = source.source.clone();
+            let heading = Button::new(format!(
+                "{}-runtime-provider-heading:{}",
+                if new_session {
+                    "new-session"
+                } else {
+                    "composer"
+                },
+                source.source.id()
+            ))
+            .small()
+            .ghost()
+            .w_full()
+            .h(px(32.0))
+            .flex_none()
+            .px_2()
+            .justify_start()
+            .disabled(!can_authenticate)
+            .child(
+                h_flex()
+                    .size_full()
+                    .min_w_0()
+                    .gap_2()
+                    .child(match source.kind {
+                        RuntimeAuthSourceKind::ProviderProfile => new_session_selector_icon(
+                            "icons/vibex/database.svg",
+                            theme::semantic_color("chart-2", cx.theme().is_dark()),
+                        ),
+                        RuntimeAuthSourceKind::AgentAccount => Icon::new(IconName::User)
+                            .size(px(16.0))
+                            .text_color(theme::semantic_color("chart-3", cx.theme().is_dark()))
+                            .into_any_element(),
+                    })
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_xs()
+                            .font_semibold()
+                            .child(source_label),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(status),
+                    ),
+            )
+            .when(can_authenticate, |button| {
+                button.on_click(cx.listener(move |this, _, _, cx| {
+                    if new_session {
+                        this.navigate_new_session_runtime_menu(
+                            ComposerRuntimeMenuView::Authentication,
+                            Some(auth_source.clone()),
+                            cx,
+                        );
+                    } else {
+                        this.navigate_composer_runtime_menu(
+                            ComposerRuntimeMenuView::Authentication,
+                            Some(auth_agent_id.clone()),
+                            Some(auth_source.clone()),
+                            cx,
+                        );
+                    }
+                    this.load_runtime_authentication_menu(
+                        auth_agent_id.clone(),
+                        auth_source.clone(),
+                        cx,
+                    );
+                }))
+            });
+
+            let rows = choices.into_iter().map(|choice| {
+                let is_selected = selected.is_some_and(|selected| {
+                    choice.selection.agent_id == selected.agent_id
+                        && choice.selection.auth_source == selected.auth_source
+                        && choice.selection.model == selected.model
+                });
+                let selection = choice.selection;
+                let icon = selection
+                    .model_id()
+                    .and_then(|model_id| {
+                        model_brand_icon(
+                            model_id,
+                            px(16.0),
+                            Some(cx.theme().foreground.opacity(0.88)),
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        new_session_selector_icon(
+                            "icons/vibex/sparkles.svg",
+                            theme::semantic_color("chart-2", cx.theme().is_dark()),
+                        )
+                    });
+                Button::new(format!(
+                    "{}-runtime-grouped-model:{}:{}",
+                    if new_session {
+                        "new-session"
+                    } else {
+                        "composer"
+                    },
+                    selection.auth_source.id(),
+                    runtime_model_selection_key(&selection.model)
+                ))
+                .small()
+                .ghost()
+                .w_full()
+                .h(px(40.0))
+                .flex_none()
+                .pl(px(28.0))
+                .pr_2()
+                .justify_start()
+                .selected(is_selected)
+                .rounded(gpui_component::button::ButtonRounded::Size(px(6.0)))
+                .child(
+                    h_flex()
+                        .size_full()
+                        .min_w_0()
+                        .gap_2()
+                        .child(icon)
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .truncate()
+                                .text_sm()
+                                .child(choice.label),
+                        )
+                        .when(is_selected, |this| {
+                            this.child(Icon::new(IconName::Check).size(px(14.0)))
+                        }),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if new_session {
+                        this.choose_new_session_runtime(selection.clone(), window, cx);
+                    } else {
+                        this.choose_runtime_selection(selection.clone(), cx);
+                    }
+                }))
+            });
+            visible_groups.push(v_flex().w_full().child(heading).children(rows));
+        }
+
+        v_flex()
+            .h_full()
+            .min_h_0()
+            .child(
+                div()
+                    .h(px(34.0))
+                    .flex_none()
+                    .mb_1()
+                    .rounded(px(7.0))
+                    .border_1()
+                    .border_color(cx.theme().border.opacity(0.70))
+                    .bg(cx.theme().muted.opacity(0.45))
+                    .child(
+                        Input::new(&search)
+                            .small()
+                            .h_full()
+                            .appearance(false)
+                            .text_xs()
+                            .prefix(
+                                Icon::new(IconName::Search)
+                                    .small()
+                                    .text_color(cx.theme().muted_foreground),
+                            ),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .min_h_0()
+                    .flex_1()
+                    .overflow_y_scrollbar()
+                    .when(visible_groups.is_empty(), |this| {
+                        this.child(runtime_menu_empty_state(cx))
+                    })
+                    .children(visible_groups),
+            )
+            .into_any_element()
+    }
+
     fn render_new_session_runtime_cascade(
         &mut self,
         selection: Option<SessionRuntimeSelection>,
@@ -24475,7 +24732,11 @@ impl VibexWorkbench {
                 .and_then(|state| state.catalog.as_ref())
                 .map(|catalog| catalog.methods.len().saturating_add(2))
                 .unwrap_or(2),
-            _ => auth_source_choices.len(),
+            ComposerRuntimeMenuView::AuthSource | ComposerRuntimeMenuView::Agent => catalog
+                .as_ref()
+                .zip(agent_id.as_ref())
+                .map(|(catalog, agent_id)| runtime_provider_model_menu_row_count(catalog, agent_id))
+                .unwrap_or(0),
         };
         let menu_width = (self.last_visibility.layout.viewport_width as f32 - 32.0)
             .clamp(220.0, COMPOSER_RUNTIME_MENU_WIDTH);
@@ -24525,179 +24786,18 @@ impl VibexWorkbench {
         };
         let menu_content = match menu_view {
             ComposerRuntimeMenuView::AuthSource | ComposerRuntimeMenuView::Agent => {
-                let agent_label = agent_id
-                    .as_ref()
-                    .map(|agent_id| runtime_agent_label(&self.agent_snapshots, agent_id))
-                    .unwrap_or_else(|| no_configuration.to_string());
-                let agent_identity = agent_id
-                    .as_ref()
-                    .map(|agent_id| format!("{agent_id} {agent_label}"))
-                    .unwrap_or_else(|| agent_label.clone());
-                let rows = auth_source_choices
-                    .into_iter()
-                    .map(|source| {
-                        let model_count = catalog.as_ref().map_or(0, |catalog| {
-                            runtime_auth_source_model_count(
-                                catalog,
-                                &source.agent_id,
-                                &source.source,
-                            )
-                        });
-                        let status_label = runtime_auth_source_status_label(&source, model_count);
-                        let source_agent_id = source.agent_id.clone();
-                        let auth_source = source.source.clone();
-                        let can_open_models = source.availability
-                            == RuntimeAuthSourceAvailability::Available
-                            && model_count > 0;
-                        let can_open_authentication = source.kind
-                            == RuntimeAuthSourceKind::AgentAccount
-                            && !matches!(
-                                source.availability,
-                                RuntimeAuthSourceAvailability::Available
-                                    | RuntimeAuthSourceAvailability::Verifying
-                                    | RuntimeAuthSourceAvailability::DiscoveringModels
-                            );
-                        let source_meta_action = can_open_models || can_open_authentication;
-                        let model_auth_source = auth_source.clone();
-                        let authentication_auth_source = auth_source.clone();
-                        let authentication_agent_id = source_agent_id.clone();
-                        let source_icon = match source.kind {
-                            RuntimeAuthSourceKind::ProviderProfile => new_session_selector_icon(
-                                "icons/vibex/database.svg",
-                                theme::semantic_color("chart-2", cx.theme().is_dark()),
-                            ),
-                            RuntimeAuthSourceKind::AgentAccount => Icon::new(IconName::User)
-                                .size(px(16.0))
-                                .text_color(theme::semantic_color("chart-3", cx.theme().is_dark()))
-                                .into_any_element(),
-                        };
-                        Button::new(format!(
-                            "new-session-runtime-auth-source:{}:{}",
-                            source.agent_id,
-                            auth_source.id()
-                        ))
-                        .small()
-                        .ghost()
-                        .w_full()
-                        .h(px(40.0))
-                        .flex_none()
-                        .px_2()
-                        .justify_start()
-                        .rounded(gpui_component::button::ButtonRounded::Size(px(6.0)))
-                        .child(
-                            h_flex()
-                                .size_full()
-                                .min_w_0()
-                                .gap_2()
-                                .child(source_icon)
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .truncate()
-                                        .text_sm()
-                                        .child(runtime_auth_source_display_label(&source)),
-                                )
-                                .child(
-                                    h_flex()
-                                        .w(px(80.0))
-                                        .flex_none()
-                                        .justify_start()
-                                        .gap_1()
-                                        .child(
-                                            div()
-                                                .flex_none()
-                                                .text_xs()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(status_label),
-                                        )
-                                        .child(div().size(px(14.0)).flex_none().when(
-                                            source_meta_action,
-                                            |this| {
-                                                this.child(
-                                                    Icon::new(IconName::ChevronRight)
-                                                        .size(px(14.0))
-                                                        .text_color(cx.theme().muted_foreground),
-                                                )
-                                            },
-                                        )),
-                                ),
-                        )
-                        .when(can_open_models, |button| {
-                            button.on_click(cx.listener(move |this, _, _, cx| {
-                                this.navigate_new_session_runtime_menu(
-                                    ComposerRuntimeMenuView::Model,
-                                    Some(model_auth_source.clone()),
-                                    cx,
-                                )
-                            }))
-                        })
-                        .when(can_open_authentication, |button| {
-                            button.on_click(cx.listener(move |this, _, _, cx| {
-                                this.navigate_new_session_runtime_menu(
-                                    ComposerRuntimeMenuView::Authentication,
-                                    Some(authentication_auth_source.clone()),
-                                    cx,
-                                );
-                                this.load_runtime_authentication_menu(
-                                    authentication_agent_id.clone(),
-                                    authentication_auth_source.clone(),
-                                    cx,
-                                );
-                            }))
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                let edit_agent_id = agent_id.clone();
-                let edit_label = match self.resolved_locale() {
-                    locale::ResolvedLocale::En => format!("Edit {agent_label} configuration"),
-                    locale::ResolvedLocale::ZhCn => format!("编辑 {agent_label} 配置"),
-                    locale::ResolvedLocale::ZhTw => format!("編輯 {agent_label} 設定"),
-                };
-                v_flex()
-                    .h_full()
-                    .min_h_0()
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .h(px(32.0))
-                            .flex_none()
-                            .min_w_0()
-                            .gap_2()
-                            .px_2()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(runtime_agent_icon(&agent_identity))
-                            .child(div().min_w_0().truncate().text_sm().child(agent_label)),
-                    )
-                    .child(separator())
-                    .child(
-                        v_flex()
-                            .min_h_0()
-                            .flex_1()
-                            .overflow_y_scrollbar()
-                            .when(rows.is_empty(), |this| {
-                                this.child(runtime_menu_empty_state(cx))
-                            })
-                            .children(rows),
-                    )
-                    .child(separator())
-                    .child(
-                        h_flex().w_full().flex_none().p_1().child(
-                            Button::new("new-session-runtime-edit-agent-config")
-                                .small()
-                                .ghost()
-                                .w_full()
-                                .justify_start()
-                                .icon(IconName::Settings)
-                                .label(edit_label)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(agent_id) = edit_agent_id.clone() {
-                                        this.open_agent_auth_management(agent_id, cx);
-                                    }
-                                })),
-                        ),
-                    )
-                    .into_any_element()
+                match (catalog.as_ref(), agent_id.as_ref()) {
+                    (Some(catalog), Some(agent_id)) => self.render_provider_model_groups(
+                        agent_id,
+                        catalog,
+                        selection.as_ref(),
+                        preferred_model_selection.as_ref(),
+                        self.new_session_runtime_search.clone(),
+                        true,
+                        cx,
+                    ),
+                    _ => runtime_menu_empty_state(cx),
+                }
             }
             ComposerRuntimeMenuView::Authentication => {
                 match (agent_id.clone(), menu_auth_source.clone()) {
@@ -27292,18 +27392,19 @@ impl VibexWorkbench {
         auth_source_choices
             .sort_by_key(|source| !matches!(source.kind, RuntimeAuthSourceKind::AgentAccount));
         let preferred_model_selection = if desired.agent_id == menu_agent_id {
-            Some(&desired)
+            Some(desired.clone())
         } else {
             self.ui_state
                 .composer
                 .runtime_selections_by_agent
                 .get(&menu_agent_id)
+                .cloned()
         };
         let model_choices = runtime_model_choices(
             &catalog,
             &menu_agent_id,
             &menu_auth_source,
-            preferred_model_selection,
+            preferred_model_selection.as_ref(),
             &self.ui_state.composer.runtime_selections_by_model,
         );
         let menu_width = (self.last_visibility.layout.viewport_width as f32 - 32.0)
@@ -27313,7 +27414,9 @@ impl VibexWorkbench {
         let menu_view = self.composer_runtime_menu_view;
         let menu_row_count = match menu_view {
             ComposerRuntimeMenuView::Agent => agent_choices.len(),
-            ComposerRuntimeMenuView::AuthSource => auth_source_choices.len(),
+            ComposerRuntimeMenuView::AuthSource => {
+                runtime_provider_model_menu_row_count(&catalog, &menu_agent_id)
+            }
             ComposerRuntimeMenuView::Authentication => self
                 .runtime_authentication_menu
                 .as_ref()
@@ -27434,182 +27537,15 @@ impl VibexWorkbench {
                     )
                     .into_any_element()
             }
-            ComposerRuntimeMenuView::AuthSource => {
-                let agent_label = runtime_agent_label(&self.agent_snapshots, &menu_agent_id);
-                let rows = auth_source_choices
-                    .into_iter()
-                    .map(|source| {
-                        let model_count = runtime_auth_source_model_count(
-                            &catalog,
-                            &source.agent_id,
-                            &source.source,
-                        );
-                        let status_label = runtime_auth_source_status_label(&source, model_count);
-                        let agent_id = source.agent_id.clone();
-                        let auth_source = source.source.clone();
-                        let can_open_models = source.availability
-                            == RuntimeAuthSourceAvailability::Available
-                            && model_count > 0;
-                        let can_open_authentication = source.kind
-                            == RuntimeAuthSourceKind::AgentAccount
-                            && !matches!(
-                                source.availability,
-                                RuntimeAuthSourceAvailability::Available
-                                    | RuntimeAuthSourceAvailability::Verifying
-                                    | RuntimeAuthSourceAvailability::DiscoveringModels
-                            );
-                        let source_meta_action = can_open_models || can_open_authentication;
-                        let model_agent_id = agent_id.clone();
-                        let model_auth_source = auth_source.clone();
-                        let authentication_agent_id = agent_id.clone();
-                        let authentication_auth_source = auth_source.clone();
-                        let source_icon = match source.kind {
-                            RuntimeAuthSourceKind::ProviderProfile => new_session_selector_icon(
-                                "icons/vibex/database.svg",
-                                theme::semantic_color("chart-2", cx.theme().is_dark()),
-                            ),
-                            RuntimeAuthSourceKind::AgentAccount => Icon::new(IconName::User)
-                                .size(px(16.0))
-                                .text_color(theme::semantic_color("chart-3", cx.theme().is_dark()))
-                                .into_any_element(),
-                        };
-                        Button::new(format!(
-                            "composer-runtime-auth-source:{}:{}",
-                            agent_id,
-                            auth_source.id()
-                        ))
-                        .small()
-                        .ghost()
-                        .w_full()
-                        .h(px(40.0))
-                        .flex_none()
-                        .px_2()
-                        .justify_start()
-                        .rounded(gpui_component::button::ButtonRounded::Size(px(6.0)))
-                        .child(
-                            h_flex()
-                                .size_full()
-                                .min_w_0()
-                                .gap_2()
-                                .child(source_icon)
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .truncate()
-                                        .text_sm()
-                                        .child(runtime_auth_source_display_label(&source)),
-                                )
-                                .child(
-                                    h_flex()
-                                        .w(px(80.0))
-                                        .flex_none()
-                                        .justify_start()
-                                        .gap_1()
-                                        .child(
-                                            div()
-                                                .flex_none()
-                                                .text_xs()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(status_label),
-                                        )
-                                        .child(div().size(px(14.0)).flex_none().when(
-                                            source_meta_action,
-                                            |this| {
-                                                this.child(
-                                                    Icon::new(IconName::ChevronRight)
-                                                        .size(px(14.0))
-                                                        .text_color(cx.theme().muted_foreground),
-                                                )
-                                            },
-                                        )),
-                                ),
-                        )
-                        .when(can_open_models, |button| {
-                            button.on_click(cx.listener(move |this, _, _, cx| {
-                                this.navigate_composer_runtime_menu(
-                                    ComposerRuntimeMenuView::Model,
-                                    Some(model_agent_id.clone()),
-                                    Some(model_auth_source.clone()),
-                                    cx,
-                                )
-                            }))
-                        })
-                        .when(can_open_authentication, |button| {
-                            button.on_click(cx.listener(move |this, _, _, cx| {
-                                this.navigate_composer_runtime_menu(
-                                    ComposerRuntimeMenuView::Authentication,
-                                    Some(authentication_agent_id.clone()),
-                                    Some(authentication_auth_source.clone()),
-                                    cx,
-                                );
-                                this.load_runtime_authentication_menu(
-                                    authentication_agent_id.clone(),
-                                    authentication_auth_source.clone(),
-                                    cx,
-                                );
-                            }))
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                let edit_agent_id = menu_agent_id.clone();
-                let edit_label = match self.resolved_locale() {
-                    locale::ResolvedLocale::En => format!("Edit {agent_label} configuration"),
-                    locale::ResolvedLocale::ZhCn => format!("编辑 {agent_label} 配置"),
-                    locale::ResolvedLocale::ZhTw => format!("編輯 {agent_label} 設定"),
-                };
-                v_flex()
-                    .h_full()
-                    .min_h_0()
-                    .child(
-                        Button::new("composer-runtime-back-to-agent")
-                            .small()
-                            .ghost()
-                            .w_full()
-                            .h(px(32.0))
-                            .flex_none()
-                            .px_2()
-                            .justify_start()
-                            .text_color(cx.theme().muted_foreground)
-                            .icon(Icon::new(IconName::ArrowLeft).size(px(14.0)))
-                            .label(agent_label)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.navigate_composer_runtime_menu(
-                                    ComposerRuntimeMenuView::Agent,
-                                    None,
-                                    None,
-                                    cx,
-                                )
-                            })),
-                    )
-                    .child(separator())
-                    .child(
-                        v_flex()
-                            .min_h_0()
-                            .flex_1()
-                            .overflow_y_scrollbar()
-                            .when(rows.is_empty(), |this| {
-                                this.child(runtime_menu_empty_state(cx))
-                            })
-                            .children(rows),
-                    )
-                    .child(separator())
-                    .child(
-                        h_flex().w_full().flex_none().p_1().child(
-                            Button::new("composer-runtime-edit-agent-config")
-                                .small()
-                                .ghost()
-                                .w_full()
-                                .justify_start()
-                                .icon(IconName::Settings)
-                                .label(edit_label)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open_agent_auth_management(edit_agent_id.clone(), cx)
-                                })),
-                        ),
-                    )
-                    .into_any_element()
-            }
+            ComposerRuntimeMenuView::AuthSource => self.render_provider_model_groups(
+                &menu_agent_id,
+                &catalog,
+                Some(&desired),
+                preferred_model_selection.as_ref(),
+                self.composer_runtime_search.clone(),
+                false,
+                cx,
+            ),
             ComposerRuntimeMenuView::Authentication => {
                 self.render_runtime_authentication_menu(menu_agent_id, menu_auth_source, false, cx)
             }
@@ -38896,6 +38832,26 @@ fn runtime_model_selection_key(model: &RuntimeModelSelection) -> String {
     }
 }
 
+fn runtime_search_matches<'a>(
+    normalized_query: &str,
+    values: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    normalized_query.is_empty()
+        || values
+            .into_iter()
+            .any(|value| value.to_lowercase().contains(normalized_query))
+}
+
+fn runtime_provider_model_menu_row_count(
+    catalog: &SessionRuntimeOptionCatalog,
+    agent_id: &AgentId,
+) -> usize {
+    runtime_auth_sources_for_agent(catalog, agent_id)
+        .into_iter()
+        .map(|source| 1 + runtime_auth_source_model_count(catalog, agent_id, &source.source))
+        .sum()
+}
+
 fn runtime_auth_source_status_label(
     source: &RuntimeAuthSourceSummary,
     model_count: usize,
@@ -48639,6 +48595,26 @@ mod tests {
     }
 
     #[test]
+    fn runtime_provider_model_search_matches_provider_and_model_names() {
+        assert!(runtime_search_matches(
+            "openai",
+            ["OpenAI Provider", "Claude Sonnet"]
+        ));
+        assert!(runtime_search_matches(
+            "sonnet",
+            ["OpenAI Provider", "Claude Sonnet"]
+        ));
+        assert!(!runtime_search_matches(
+            "gemini",
+            ["OpenAI Provider", "Claude Sonnet"]
+        ));
+        assert!(runtime_search_matches(
+            "",
+            ["OpenAI Provider", "Claude Sonnet"]
+        ));
+    }
+
+    #[test]
     fn runtime_model_choices_restore_only_a_valid_preferred_selection() {
         let option = new_session_runtime_option("codex", "Codex");
         let agent_id = option.selection.agent_id.clone();
@@ -51464,7 +51440,7 @@ mod tests {
     fn composer_runtime_menu_reserves_header_and_model_rows_before_scrolling() {
         assert_eq!(
             composer_runtime_menu_height(ComposerRuntimeMenuView::Agent, 0, 448.0),
-            89.0
+            134.0
         );
         assert_eq!(
             composer_runtime_menu_height(ComposerRuntimeMenuView::AuthSource, 0, 448.0),
@@ -51476,7 +51452,7 @@ mod tests {
         );
         assert_eq!(
             composer_runtime_menu_height(ComposerRuntimeMenuView::Agent, 2, 448.0),
-            129.0
+            174.0
         );
         assert_eq!(
             composer_runtime_menu_height(ComposerRuntimeMenuView::AuthSource, 2, 448.0),
@@ -51837,6 +51813,11 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_new_session_runtime_cascade("))
             .map(|(body, _)| body)
             .expect("runtime authentication renderer should remain inspectable");
+        let grouped_models = source
+            .split_once("    fn render_provider_model_groups(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_new_session_runtime_cascade("))
+            .map(|(body, _)| body)
+            .expect("grouped provider/model renderer should remain inspectable");
         let new_session = source
             .split_once("    fn render_new_session_runtime_cascade(")
             .and_then(|(_, tail)| tail.split_once("\n    fn render_new_session_panel("))
@@ -51849,32 +51830,31 @@ mod tests {
             .expect("current-session runtime cascade should remain inspectable");
 
         assert!(menu_view.contains("Authentication"));
+        assert!(grouped_models.contains("RuntimeAuthSourceKind::AgentAccount"));
+        assert!(grouped_models.contains("sort_by_key"));
+        assert!(
+            grouped_models.contains("!matches!(source.kind, RuntimeAuthSourceKind::AgentAccount)")
+        );
+        assert!(grouped_models.contains("RuntimeAuthSourceAvailability::Verifying"));
+        assert!(grouped_models.contains("RuntimeAuthSourceAvailability::DiscoveringModels"));
+        assert!(grouped_models.contains("ComposerRuntimeMenuView::Authentication"));
+        assert!(grouped_models.contains("load_runtime_authentication_menu("));
+        assert!(grouped_models.contains("Input::new(&search)"));
+        assert!(grouped_models.contains("runtime_model_choices("));
         for cascade in [new_session, current_session] {
-            assert!(cascade.contains("RuntimeAuthSourceKind::AgentAccount"));
-            assert!(cascade.contains("auth_source_choices"));
-            assert!(cascade.contains("sort_by_key"));
-            assert!(
-                cascade.contains("!matches!(source.kind, RuntimeAuthSourceKind::AgentAccount)")
-            );
-            assert!(cascade.contains("RuntimeAuthSourceAvailability::Verifying"));
-            assert!(cascade.contains("RuntimeAuthSourceAvailability::DiscoveringModels"));
+            assert!(cascade.contains("render_provider_model_groups("));
             assert!(cascade.contains("ComposerRuntimeMenuView::Authentication"));
-            assert!(cascade.contains("load_runtime_authentication_menu("));
-            assert!(cascade.contains("edit-agent-config"));
-            assert!(cascade.contains("open_agent_auth_management"));
-            let footer = cascade
-                .find("edit-agent-config")
-                .expect("agent configuration footer should be rendered");
-            assert!(cascade[..footer].rfind("children(rows)").is_some());
         }
         assert!(operations.contains("list_agent_auth_contexts()"));
         assert!(operations.contains("list_agent_auth_methods("));
         assert!(operations.contains("authenticate_agent_context("));
         assert!(operations.contains("verify_agent_auth_context("));
         assert_eq!(
-            operations.matches("ComposerRuntimeMenuView::Model").count(),
+            operations
+                .matches("ComposerRuntimeMenuView::AuthSource")
+                .count(),
             4,
-            "authentication and verification must return both menus to the model layer"
+            "authentication and verification must return both menus to the grouped model layer"
         );
         assert!(
             operations
