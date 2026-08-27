@@ -3015,12 +3015,12 @@ impl AcpSessionAttachment {
         if let Ok(mut state) = self.state.lock() {
             let current_model =
                 extract_current_model_id(update).map(|model| process.product_model_id(&model));
-            let current_mode = extract_current_mode_id(update);
+            let current_mode = extract_current_mode_id_for_agent(update, &process.agent_id);
             let mut models = extract_config_values(model_candidates(update));
             for model in &mut models {
                 model.value = process.product_model_id(&model.value);
             }
-            let modes = extract_config_values(mode_candidates(update));
+            let modes = extract_modes_for_agent(update, &process.agent_id);
             {
                 let discovery =
                     state
@@ -3076,6 +3076,10 @@ impl AcpSessionAttachment {
                 let planner = planner.with_options(options.clone());
                 let previous = state.session_runtime_config_state.clone();
                 let mut next = previous.clone();
+                if process.agent_id.as_str() == PI_AGENT_ID {
+                    next.preferred_mode = None;
+                    next.effective_mode = None;
+                }
                 for value in next.config_values.values_mut() {
                     value.effective = None;
                 }
@@ -13104,7 +13108,7 @@ fn apply_session_state_to_attachment(
 ) {
     state.model_ids = extract_model_ids(response);
     state.current_model_id = extract_current_model_id(response);
-    state.current_mode_id = extract_current_mode_id(response);
+    state.current_mode_id = extract_current_mode_id_for_agent(response, agent_id);
     state.session_config_state = extract_provider_session_config_state(
         response,
         Some(agent_id),
@@ -13323,6 +13327,13 @@ impl AcpRuntimeClient {
             .get(&binding_id)
             .cloned()
             .unwrap_or_default();
+        if process.agent_id.as_str() == PI_AGENT_ID {
+            // Older Pi sessions may have persisted its legacy thinking mode as
+            // a product mode. Drop both halves while rebuilding the attachment
+            // so an existing conversation can converge and continue.
+            runtime_state.preferred_mode = None;
+            runtime_state.effective_mode = None;
+        }
 
         // A new generation starts from the values explicitly reported by the
         // Agent. Never carry an old effective value as if it were confirmed.
@@ -17865,6 +17876,25 @@ fn extract_current_mode_id(response: &Value) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn extract_modes_for_agent(
+    response: &Value,
+    agent_id: &AgentId,
+) -> Vec<ProviderSessionConfigValue> {
+    if agent_id.as_str() == PI_AGENT_ID {
+        Vec::new()
+    } else {
+        extract_config_values(mode_candidates(response))
+    }
+}
+
+fn extract_current_mode_id_for_agent(response: &Value, agent_id: &AgentId) -> Option<String> {
+    if agent_id.as_str() == PI_AGENT_ID {
+        None
+    } else {
+        extract_current_mode_id(response)
+    }
+}
+
 fn extract_provider_session_config_state(
     response: &Value,
     agent_id: Option<&AgentId>,
@@ -17875,16 +17905,17 @@ fn extract_provider_session_config_state(
     // Pi's adapter mirrors thinking levels through legacy ACP `modes` for
     // compatibility. They are reasoning effort, not conversation/approval
     // modes, and must not create a second selector in Vibex.
-    let modes = if agent_id.is_some_and(|agent_id| agent_id.as_str() == PI_AGENT_ID) {
-        Vec::new()
-    } else {
-        extract_config_values(mode_candidates(response))
-    };
+    let modes = agent_id
+        .map(|agent_id| extract_modes_for_agent(response, agent_id))
+        .unwrap_or_else(|| extract_config_values(mode_candidates(response)));
     let options = extract_config_options(response);
     let current_model = extract_current_model_id(response)
         .map(|value| ProviderSessionConfigValue { value, label: None });
-    let current_mode = extract_current_mode_id(response)
-        .map(|value| ProviderSessionConfigValue { value, label: None });
+    let current_mode = match agent_id {
+        Some(agent_id) => extract_current_mode_id_for_agent(response, agent_id),
+        None => extract_current_mode_id(response),
+    }
+    .map(|value| ProviderSessionConfigValue { value, label: None });
 
     if models.is_empty()
         && modes.is_empty()
@@ -20915,6 +20946,7 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
         .unwrap();
 
         assert!(state.modes.is_empty());
+        assert_eq!(state.current_mode, None);
         let probe = agent_session_config_probe_from_state(&state);
         assert_eq!(
             probe
