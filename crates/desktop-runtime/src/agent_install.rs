@@ -2948,10 +2948,9 @@ fn npm_companion_environment(agent_id: &AgentId) -> Option<&'static str> {
     }
 }
 
-fn npm_companion_command_for_registry_id(registry_agent_id: &str) -> Option<&'static str> {
+fn managed_npm_companion_for_registry_id(registry_agent_id: &str) -> Option<&'static str> {
     match registry_agent_id {
         "amp-acp" => Some("amp"),
-        "deepseek-harness-acp" => Some("dsh"),
         "pi-acp" => Some(PI_COMMAND_NAME),
         _ => None,
     }
@@ -4196,17 +4195,13 @@ fn load_installed_agent(root: &Path, expected_fingerprint: &str) -> VibexResult<
             "managed Agent cache did not match the requested distribution",
         ));
     }
-    if matches!(
-        manifest.registry_agent_id.as_str(),
-        "amp-acp" | "deepseek-harness-acp" | "pi-acp"
-    ) && manifest.runtime_version.is_none()
-    {
-        return Err(VibexError::validation(
-            "agent_npm_runtime_version_missing",
-            "managed npm companion version was missing from the installation",
-        ));
-    }
-    if let Some(companion) = npm_companion_command_for_registry_id(&manifest.registry_agent_id) {
+    if let Some(companion) = managed_npm_companion_for_registry_id(&manifest.registry_agent_id) {
+        if manifest.runtime_version.is_none() {
+            return Err(VibexError::validation(
+                "agent_npm_runtime_version_missing",
+                "managed npm companion version was missing from the installation",
+            ));
+        }
         ensure_regular_file(
             root,
             &npm_command_path(root, companion),
@@ -5632,6 +5627,42 @@ mod tests {
         assert!(latest_npm_companion(&agent_id).is_none());
         assert_eq!(npm_companion_command(&agent_id), Some("dsh"));
         assert_eq!(npm_companion_environment(&agent_id), Some("DSH_PATH"));
+        assert!(managed_npm_companion_for_registry_id("deepseek-harness-acp").is_none());
+    }
+
+    #[test]
+    fn deepseek_install_manifest_does_not_require_an_external_harness() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let node = root.join("node");
+        let adapter = root.join("node_modules/@openma/deepseek-harness-acp/dist/bin.js");
+        fs::create_dir_all(adapter.parent().unwrap()).unwrap();
+        fs::write(&node, b"fixture").unwrap();
+        fs::write(&adapter, b"fixture").unwrap();
+        let fingerprint = "deepseek-bundled-runtime";
+        write_json_private(
+            &root.join("vibex-install.json"),
+            &InstallManifest {
+                registry_agent_id: "deepseek-harness-acp".to_string(),
+                version: "0.4.26".to_string(),
+                fingerprint: fingerprint.to_string(),
+                runtime_version: None,
+                runtime_dependencies: BTreeMap::new(),
+                distribution_kind: AgentManagedDistributionKind::Npm,
+                launch: ManifestLaunch::Node {
+                    node: node.to_string_lossy().into_owned(),
+                    script: "node_modules/@openma/deepseek-harness-acp/dist/bin.js".to_string(),
+                    args: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+
+        let installed = load_installed_agent(root, fingerprint).unwrap();
+
+        assert_eq!(installed.command.command, node.to_string_lossy());
+        assert_eq!(installed.command.args, vec![adapter.to_string_lossy()]);
+        assert!(!npm_command_path(root, "dsh").exists());
     }
 
     #[test]

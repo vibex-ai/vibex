@@ -2411,6 +2411,8 @@ Agent commands only. Agent setup owns the separate one-time option probe.
   not separately resolve the large `@deepseek-ai/dsh` dependency graph.
 - The DeepSeek launch path must leave `DSH_PATH` unset when no explicit external
   Harness command was configured so the Adapter can select its private runtime.
+  Installation manifest validation must likewise not require a separate `dsh`
+  executable or companion version for this Adapter-bundled runtime.
 - Adapters that still need a Vibex-managed companion record its version in the
   installation manifest and validate the companion launcher before cache reuse.
 
@@ -2419,6 +2421,7 @@ Agent commands only. Agent setup owns the separate one-time option probe.
 | Condition | Required result |
 | --- | --- |
 | DeepSeek standalone install is requested | Install only `@openma/deepseek-harness-acp`; let its launcher select the bundled private runtime. |
+| DeepSeek manifest has no companion version or managed `.bin/dsh` | Accept it when the Adapter entry point and selected Node runtime are valid; those fields belong only to separately managed companions. |
 | Vibex adds `@deepseek-ai/dsh` to the DeepSeek managed package set | Reject in review: the duplicated graph makes installation network-heavy and can exceed the bounded npm timeout. |
 | A separately managed companion manifest omits or changes `runtime_version` | Installation is unusable and startup repair is required. |
 | Adapter and required companion launcher are present | Reuse the installation without an unnecessary companion network probe. |
@@ -2427,6 +2430,8 @@ Agent commands only. Agent setup owns the separate one-time option probe.
 
 - Installation policy tests assert DeepSeek has no separately managed npm
   companion while Agents that require one retain their normal policy.
+- Manifest loading tests accept DeepSeek with no `runtime_version` and no
+  managed `.bin/dsh`, while retaining those checks for real companions.
 - Launcher tests preserve DeepSeek's `DSH_PATH` integration for explicit
   external Harness overrides without requiring it for managed installation.
 
