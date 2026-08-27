@@ -350,6 +350,11 @@ fn catalog_projection_shape(
                 "OPENAI_API_KEY",
                 "CODEWHALE_MODEL",
             )),
+            "deepseek-harness" => Ok(environment_projection_shape(
+                "DEEPSEEK_BASE_URL",
+                "DEEPSEEK_API_KEY",
+                "DSH_MODEL",
+            )),
             "kimi" => Ok(overlay_projection_shape(
                 ConfigOverlayStrategy::KimiToml,
                 "VIBEX_KIMI_API_KEY",
@@ -654,7 +659,7 @@ fn catalog_interface(
 
 fn conservative_replaceable_shape(agent_id: &str) -> VibexResult<CatalogProjectionShape> {
     let diagnostic = match agent_id {
-        "cline" | "deepseek-harness" | "dimcode" | "minion-code" | "nova" => {
+        "cline" | "dimcode" | "minion-code" | "nova" => {
             "agent_projection_auth_boundary_not_runtime_verified"
         }
         "deepagents" => "agent_projection_environment_contract_not_runtime_verified",
@@ -1620,6 +1625,7 @@ mod tests {
             "copilot",
             "codewhale",
             "crow-cli",
+            "deepseek-harness",
             "dirac",
             "factory-droid",
             "gemini",
@@ -1635,16 +1641,9 @@ mod tests {
             "stakpak",
             "vtcode",
         ];
-        let blocked_projectors = [
-            "cline",
-            "deepagents",
-            "deepseek-harness",
-            "dimcode",
-            "minion-code",
-            "nova",
-        ];
-        assert_eq!(typed_projectors.len(), 18);
-        assert_eq!(blocked_projectors.len(), 6);
+        let blocked_projectors = ["cline", "deepagents", "dimcode", "minion-code", "nova"];
+        assert_eq!(typed_projectors.len(), 19);
+        assert_eq!(blocked_projectors.len(), 5);
 
         for descriptor in descriptors
             .iter()
@@ -1754,6 +1753,7 @@ mod tests {
             "gemini",
             "glm-acp-agent",
             "copilot",
+            "deepseek-harness",
             "qwen-code",
             "zcode",
         ] {

@@ -1550,6 +1550,9 @@ fn private_home_env_key(agent_id: &str) -> Option<&'static str> {
         "copilot" => Some("COPILOT_HOME"),
         "codewhale" => Some("CODEWHALE_HOME"),
         "codex" => Some("CODEX_HOME"),
+        // Keep Harness credentials and product state in Vibex-owned storage
+        // instead of inheriting the user's ~/.dsh configuration.
+        "deepseek-harness" => Some("DSH_HOME"),
         "crow-cli" => None,
         "dirac" => Some("DIRAC_DIR"),
         "factory-droid" => Some("FACTORY_HOME_OVERRIDE"),
@@ -3837,7 +3840,7 @@ mod tests {
         runtime_home_env_key: Option<&'static str>,
     }
 
-    fn typed_projection_expectations() -> [TypedProjectionExpectation; 18] {
+    fn typed_projection_expectations() -> [TypedProjectionExpectation; 19] {
         [
             TypedProjectionExpectation {
                 agent_id: "antigravity",
@@ -3874,6 +3877,15 @@ mod tests {
                 overlay_path: Some("config.yaml"),
                 overlay_format: Some("yaml"),
                 runtime_home_env_key: None,
+            },
+            TypedProjectionExpectation {
+                agent_id: "deepseek-harness",
+                base_url_key: Some("DEEPSEEK_BASE_URL"),
+                secret_env_key: "DEEPSEEK_API_KEY",
+                model_env_key: Some("DSH_MODEL"),
+                overlay_path: None,
+                overlay_format: None,
+                runtime_home_env_key: Some("DSH_HOME"),
             },
             TypedProjectionExpectation {
                 agent_id: "dirac",
@@ -4401,7 +4413,7 @@ mod tests {
     fn all_typed_catalog_projectors_map_provider_env_secret_model_and_private_state() {
         let descriptors = vibex_core::catalog_projection_descriptors().unwrap();
         let expectations = typed_projection_expectations();
-        assert_eq!(expectations.len(), 18);
+        assert_eq!(expectations.len(), 19);
 
         for expected in expectations {
             let descriptor = descriptors

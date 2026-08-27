@@ -3677,9 +3677,10 @@ validated code-owned overlay under the private runtime root.
 ### 1. Scope / Trigger
 
 - Trigger: Config Center creates or updates an ACP Provider Profile for one of
-  these 16 catalog Agents: `copilot`, `codewhale`, `crow-cli`, `dirac`,
-  `factory-droid`, `goose`, `grok`, `hermes`, `kilo`, `kimi`,
-  `mistral-vibe`, `poolside`, `pi`, `qwen-code`, `stakpak`, or `vtcode`.
+  these 17 catalog Agents: `copilot`, `codewhale`, `crow-cli`,
+  `deepseek-harness`, `dirac`, `factory-droid`, `goose`, `grok`, `hermes`,
+  `kilo`, `kimi`, `mistral-vibe`, `poolside`, `pi`, `qwen-code`, `stakpak`, or
+  `vtcode`.
 - Trigger: an explicit Config Center refresh changes the detected Agent
   version, or a session/probe must start with the selected Profile's endpoint,
   API key, model, and Wire API.
@@ -3728,9 +3729,10 @@ ResolvedAgentProviderProjection {
 
 ### 3. Contracts
 
-- The 16 descriptors accept their researched catalog versions and later
+- The 17 descriptors accept their researched catalog versions and later
   semantic versions: Copilot `>=1.0.78`, CodeWhale `>=0.8.55`, crow-cli
-  `>=0.1.23`, Dirac `>=0.4.1`, Factory Droid `>=0.153.1`, Goose `>=1.33.1`,
+  `>=0.1.23`, DeepSeek Harness ACP `>=0.4.15`, Dirac `>=0.4.1`, Factory Droid
+  `>=0.153.1`, Goose `>=1.33.1`,
   Grok `>=0.2.11`, Hermes `>=0.19.0`, Kilo
   `>=7.2.40`, Kimi `>=1.49.0`, Mistral Vibe `>=2.9.3`, Poolside `>=1.0.0`,
   Pi `>=0.0.33`, Qwen Code `>=0.18.4`, Stakpak `>=0.3.80`, and VT Code
@@ -3742,12 +3744,13 @@ ResolvedAgentProviderProjection {
   Pi, and Qwen Code derive the catalog version only when the
   complete `npx`/`uvx` command and argument vector exactly match the pinned
   catalog entry. Ordinary catalog reads remain process-free.
-- The three environment projectors use these process contracts:
+- The four environment projectors use these process contracts:
 
 | Agent | Endpoint / Secret / Model | Additional selection or state |
 | --- | --- | --- |
 | Copilot | `COPILOT_PROVIDER_BASE_URL` / `COPILOT_PROVIDER_API_KEY` / `COPILOT_MODEL` | `COPILOT_HOME` points at the private projection root. |
 | CodeWhale | `CODEWHALE_BASE_URL` / `OPENAI_API_KEY` / `CODEWHALE_MODEL` | `CODEWHALE_PROVIDER=openai`; `CODEWHALE_HOME` is private. |
+| DeepSeek Harness | `DEEPSEEK_BASE_URL` / `DEEPSEEK_API_KEY` / `DSH_MODEL` | The ACP bridge documents all three launch variables; `DSH_HOME` keeps credentials and sessions in Vibex-owned state. |
 | Poolside | `POOLSIDE_STANDALONE_BASE_URL` / `POOLSIDE_API_KEY` / `POOLSIDE_STANDALONE_MODEL` | A trailing `/v1` is removed before launch. |
 
 - The other 13 use code-owned typed overlays; serializers, relative paths,
@@ -3787,7 +3790,7 @@ ResolvedAgentProviderProjection {
   for that Agent before notifying Profile listeners. Profile endpoint, Secret
   reference, model, Wire API, overlay, home-key, or process-argument changes
   alter the fingerprint and mark the old process stale.
-- All 16 descriptors use `RestartAndResume`. A save does not mutate or kill the
+- All 17 descriptors use `RestartAndResume`. A save does not mutate or kill the
   current process in place; the switch coordinator prepares the new projection,
   restores the logical session when supported, commits the new binding, and
   then drains the old runtime.
@@ -3828,14 +3831,14 @@ ResolvedAgentProviderProjection {
 ### 6. Tests Required
 
 - Core `catalog_projection_contracts_are_explicit_and_conservative` asserts all
-  16 ids, catalog-derived `>=` semantic-version compatibility, typed
+  17 ids, catalog-derived `>=` semantic-version compatibility, typed
   provider/model boundaries, `VibexPrivate`, and `RestartAndResume`; the five
   blocked Agents remain conservative.
 - DB `pinned_catalog_commands_supply_exact_versions_only_for_full_command_matches`
   asserts the four fixed-command identities and fail-closed mismatches.
 - Config-switch
   `all_typed_catalog_projectors_map_provider_env_secret_model_and_private_state`
-  parses every JSON/TOML/YAML overlay, checks all 16 endpoint/key/model
+  parses every JSON/TOML/YAML overlay, checks all 17 endpoint/key/model
   projections, Goose/Grok selection, home paths, Crow/Stakpak args, fingerprint
   drift, and Secret redaction. Version-probe tests assert the 12 trusted system
   binary names.
