@@ -118,12 +118,6 @@ if (process.platform === "win32") {
 const AMP_CLI_PACKAGE: &str = "@ampcode/cli";
 const CODEWHALE_CLI_PACKAGE: &str = "codewhale";
 const DEEPSEEK_HARNESS_ACP_PACKAGE: &str = "@openma/deepseek-harness-acp";
-const DEEPSEEK_HARNESS_PACKAGE: &str = "@deepseek-ai/dsh";
-// deepseek-harness-acp currently composes the pre-0.1.1 Harness module graph.
-// Keep its companion exact until the bridge publishes a release that supports
-// the restructured 0.1.1 runtime; installing npm latest would otherwise make
-// npm reject the peer tree (or leave the bridge with missing modules).
-const DEEPSEEK_HARNESS_COMPATIBLE_VERSION: &str = "0.1.0-rc.6";
 const HERMES_CLI_PACKAGE: &str = "hermes-agent";
 const MINION_ACP_RUNTIME_PACKAGE: &str = "agent-client-protocol";
 const MINION_ACP_RUNTIME_VERSION: &str = "0.8.1";
@@ -913,12 +907,9 @@ impl AgentInstallService {
 
     async fn npm_companion_version(
         &self,
-        agent_id: &AgentId,
+        _agent_id: &AgentId,
         package: &str,
     ) -> VibexResult<String> {
-        if let Some(version) = managed_npm_companion_version(agent_id) {
-            return Ok(version.to_string());
-        }
         Ok(self.fetch_latest_npm_metadata(package).await?.version)
     }
 
@@ -2912,15 +2903,7 @@ fn minimum_node_version(agent_id: &AgentId) -> semver::Version {
 fn latest_npm_companion(agent_id: &AgentId) -> Option<&'static str> {
     match agent_id.as_str() {
         "amp-acp" => Some(AMP_CLI_PACKAGE),
-        "deepseek-harness" => Some(DEEPSEEK_HARNESS_PACKAGE),
         "pi" => Some(PI_CODING_AGENT_PACKAGE),
-        _ => None,
-    }
-}
-
-fn managed_npm_companion_version(agent_id: &AgentId) -> Option<&'static str> {
-    match agent_id.as_str() {
-        "deepseek-harness" => Some(DEEPSEEK_HARNESS_COMPATIBLE_VERSION),
         _ => None,
     }
 }
@@ -4345,10 +4328,8 @@ fn managed_companion_installation_is_usable(
     let Some(root) = record.install_root.as_deref().map(Path::new) else {
         return false;
     };
-    let runtime_version_is_valid = read_manifest_runtime_version(root).is_some_and(|version| {
-        managed_npm_companion_version(agent_id).is_none_or(|expected| version == expected)
-            && semver::Version::parse(&version).is_ok()
-    });
+    let runtime_version_is_valid = read_manifest_runtime_version(root)
+        .is_some_and(|version| semver::Version::parse(&version).is_ok());
     let runtime_command_is_valid = npm_companion_command(agent_id).is_some_and(|command| {
         ensure_regular_file(
             root,
@@ -5627,12 +5608,6 @@ mod tests {
     fn latest_npm_companions_are_bound_to_private_adapter_launchers() {
         for (agent, package, command, environment) in [
             ("amp-acp", AMP_CLI_PACKAGE, "amp", "AMP_CLI_PATH"),
-            (
-                "deepseek-harness",
-                DEEPSEEK_HARNESS_PACKAGE,
-                "dsh",
-                "DSH_PATH",
-            ),
             ("pi", PI_CODING_AGENT_PACKAGE, "pi", "PI_ACP_PI_COMMAND"),
         ] {
             let agent_id = AgentId::parse(agent).unwrap();
@@ -5651,18 +5626,12 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_harness_companion_uses_the_bridge_compatible_runtime() {
+    fn deepseek_harness_uses_the_adapters_bundled_runtime() {
         let agent_id = AgentId::parse("deepseek-harness").unwrap();
 
-        assert_eq!(
-            latest_npm_companion(&agent_id),
-            Some(DEEPSEEK_HARNESS_PACKAGE)
-        );
-        assert_eq!(
-            managed_npm_companion_version(&agent_id),
-            Some(DEEPSEEK_HARNESS_COMPATIBLE_VERSION)
-        );
-        assert!(managed_npm_companion_version(&AgentId::parse("pi").unwrap()).is_none());
+        assert!(latest_npm_companion(&agent_id).is_none());
+        assert_eq!(npm_companion_command(&agent_id), Some("dsh"));
+        assert_eq!(npm_companion_environment(&agent_id), Some("DSH_PATH"));
     }
 
     #[test]
@@ -6324,59 +6293,6 @@ printf '%s\n' '{"version":"1.2.3","scripts":["test-package"]}'
         assert!(managed_uvx_runtime_dependencies_are_current(
             &agent_id, &record
         ));
-    }
-
-    #[test]
-    fn deepseek_installations_require_the_bridge_compatible_runtime() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        let node = root.join("node");
-        let adapter = root.join("adapter.cjs");
-        fs::write(&node, b"fixture").unwrap();
-        fs::write(&adapter, b"fixture").unwrap();
-        write_private_file(&npm_command_path(root, "dsh"), b"fixture").unwrap();
-        let agent_id = AgentId::parse("deepseek-harness").unwrap();
-        let record = AgentManagedInstallationRecord {
-            agent_id: agent_id.clone(),
-            registry_agent_id: "deepseek-harness-acp".to_string(),
-            state: AgentManagedInstallState {
-                managed: true,
-                status: AgentManagedInstallStatus::Installed,
-                distribution_kind: Some(AgentManagedDistributionKind::Npm),
-                installed_version: Some("0.4.16".to_string()),
-                available_version: Some("0.4.16".to_string()),
-                last_error_code: None,
-                last_error_message: None,
-                updated_at_ms: Some(1),
-            },
-            command: Some(AgentCommandConfig {
-                command: node.to_string_lossy().into_owned(),
-                args: vec![adapter.to_string_lossy().into_owned()],
-            }),
-            install_root: Some(root.to_string_lossy().into_owned()),
-            updated_at_ms: 1,
-        };
-        let mut manifest = InstallManifest {
-            registry_agent_id: "deepseek-harness-acp".to_string(),
-            version: "0.4.16".to_string(),
-            fingerprint: "fixture".to_string(),
-            runtime_version: Some("0.1.1-rc.1".to_string()),
-            runtime_dependencies: BTreeMap::new(),
-            distribution_kind: AgentManagedDistributionKind::Npm,
-            launch: ManifestLaunch::Node {
-                node: node.to_string_lossy().into_owned(),
-                script: "adapter.cjs".to_string(),
-                args: Vec::new(),
-            },
-        };
-        write_json_private(&root.join("vibex-install.json"), &manifest).unwrap();
-        assert!(!managed_companion_installation_is_usable(
-            &agent_id, &record
-        ));
-
-        manifest.runtime_version = Some(DEEPSEEK_HARNESS_COMPATIBLE_VERSION.to_string());
-        write_json_private(&root.join("vibex-install.json"), &manifest).unwrap();
-        assert!(managed_companion_installation_is_usable(&agent_id, &record));
     }
 
     #[test]
