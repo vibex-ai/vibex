@@ -1243,6 +1243,47 @@ fn codex_terminal_http_status(text: &str) -> Option<u16> {
     (400..=599).contains(&status).then_some(status)
 }
 
+fn provider_access_requires_user_action(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "free usage exceeded",
+        "rate limit exceeded",
+        "rate limit reached",
+        "rate limited",
+        "too many requests",
+        "usage limit reached",
+        "usage limit exceeded",
+        "quota exceeded",
+        "insufficient account balance",
+        "insufficient balance",
+        "insufficient credit",
+        "payment required",
+        "billing limit",
+        "余额不足",
+        "无可用资源包",
+        "请充值",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn rpc_failure_message(error: &Value) -> String {
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown ACP error");
+    let details = error
+        .get("data")
+        .and_then(|data| data.get("details"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|details| !details.is_empty() && *details != message);
+    bounded_session_content(&details.map_or_else(
+        || message.to_string(),
+        |details| format!("{message}: {details}"),
+    ))
+}
+
 fn grok_upstream_capacity_failure(
     agent_id: &AgentId,
     method: &str,
@@ -4246,6 +4287,20 @@ impl AcpProcess {
                     .with_diagnostic("rpcCode", failure.code)
                     .with_diagnostic("rpcMessage", rpc_message)
                     .with_diagnostic("stderrSummary", stderr_summary))
+                } else if method == AcpOperation::SessionPrompt.method()
+                    && provider_access_requires_user_action(&rpc_message)
+                {
+                    Err(VibexError::provider(
+                        "provider_access_unavailable",
+                        "The model provider rejected the request because account usage is unavailable",
+                    )
+                    .with_recovery_hint(
+                        "Recharge or enable a usable resource package for this API key, or switch to another configured provider/model.",
+                    )
+                    .with_diagnostic("method", method)
+                    .with_diagnostic("rpcCode", failure.code)
+                    .with_diagnostic("rpcMessage", rpc_message)
+                    .with_diagnostic("stderrSummary", stderr_summary))
                 } else {
                     // §7.2 error taxonomy: `-32601` is a single-operation
                     // downgrade signal; callers inspect `protocolErrorKind`
@@ -4706,11 +4761,7 @@ impl AcpProcess {
                     .get("code")
                     .map(|code| code.to_string())
                     .unwrap_or_else(|| "unknown".to_string()),
-                message: error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown ACP error")
-                    .to_string(),
+                message: rpc_failure_message(error),
                 data_kind: protocol::classify_rpc_failure_data(error.get("data")),
             })
         } else {
@@ -19208,6 +19259,69 @@ mod tests {
             log_context: RuntimeLogContext::new("test_process"),
             lifecycle_events: Mutex::new(Vec::new()),
         })
+    }
+
+    #[test]
+    fn nested_rpc_details_preserve_and_classify_zcode_balance_failures() {
+        let error = json!({
+            "code": -32603,
+            "message": "Internal error",
+            "data": {
+                "details": "1113 余额不足或无可用资源包,请充值。 (Turn execution failed)"
+            }
+        });
+        let message = rpc_failure_message(&error);
+
+        assert!(message.starts_with("Internal error: 1113"));
+        assert!(provider_access_requires_user_action(&message));
+        assert!(!provider_access_requires_user_action(
+            "Internal error: temporary upstream disconnect"
+        ));
+    }
+
+    #[tokio::test]
+    async fn json_rpc_provider_balance_failures_are_actionable() {
+        let process = test_process(
+            AcpProcessInstanceId::new(),
+            None,
+            None,
+            None,
+            Arc::new(DisabledAcpTerminalHost),
+            false,
+            false,
+        );
+        let (response, receiver) = oneshot::channel();
+        response
+            .send(Err(AcpRpcFailure {
+                code: "-32603".to_string(),
+                message: "Internal error: 1113 余额不足或无可用资源包,请充值。".to_string(),
+                data_kind: protocol::AcpRpcFailureDataKind::Other,
+            }))
+            .unwrap();
+
+        let error = match process
+            .finish_started_request(
+                AcpOperation::SessionPrompt.method(),
+                Duration::from_secs(1),
+                StartedAcpRequest {
+                    id: 1,
+                    prompt_session_id: None,
+                    stderr_sequence: 0,
+                    response: receiver,
+                    registration_release: None,
+                },
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("provider balance failure must not return an ACP response"),
+        };
+
+        assert_eq!(error.code, "provider_access_unavailable");
+        assert!(error.recovery_hint.is_some());
+        assert!(error.diagnostics.iter().any(|diagnostic| {
+            diagnostic.key == "rpcMessage" && diagnostic.value.contains("余额不足")
+        }));
     }
 
     #[tokio::test]

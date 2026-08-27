@@ -374,6 +374,11 @@ environment key and the final ACP authentication decision.
 - `authenticate` may remain unsupported even though `initialize.authMethods`
   describes ZCode's Agent-managed credential source; Vibex Provider Profiles
   authenticate through the private projection instead.
+- ZCode may wrap an upstream model failure as JSON-RPC `-32603` with the generic
+  message `Internal error` while placing the actionable provider text in
+  `error.data.details`. Preserve that bounded nested detail before redaction and
+  classify balance, quota, or resource-package exhaustion as an actionable
+  provider-access failure rather than a generic ACP protocol error.
 
 ### 3. Capability Notes
 
@@ -391,8 +396,11 @@ environment key and the final ACP authentication decision.
   endpoint/model, and the `providerId\\modelId` runtime id.
 - ACP runtime tests assert bundle discovery returns only an existing file and
   explicit environment configuration remains authoritative.
+- ACP error tests assert nested `error.data.details` survives bounded
+  normalization and that ZCode balance/resource-package failures return an
+  actionable provider-access error with a recharge-or-switch recovery hint.
 - Real verification must force first-prompt materialization; an initialize-only
-  handshake cannot detect a missing ZCode CLI bundle.
+  handshake cannot detect a missing ZCode CLI bundle or upstream account quota.
 
 ## Import and Export
 
