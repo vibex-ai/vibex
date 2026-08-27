@@ -385,8 +385,10 @@ impl ProviderConfigService {
             if runtime_config.features.is_empty() {
                 runtime_config.features = default_runtime_config.features.clone();
             }
-            if agent_id.as_str() == "kimi" {
+            if matches!(agent_id.as_str(), "antigravity" | "kimi") {
                 runtime_config.terminal_tools = true;
+            }
+            if agent_id.as_str() == "kimi" {
                 runtime_config.terminal_auth = true;
             }
             runtime_config.models = configured_acp_model_ids(
@@ -4574,11 +4576,12 @@ fn generic_acp_catalog_preset(entry: &AcpAgentCatalogEntry) -> AcpProviderCatalo
             .features
             .retain(|feature| !matches!(feature.as_str(), "mcp" | "mcp_servers"));
     }
-    if entry.id == "kimi" {
-        // Kimi routes its Shell tool through ACP terminal/create and exposes a
-        // first-class terminal login method. Both host capabilities are needed
-        // for the Agent's advertised integration to be usable.
+    if matches!(entry.id, "antigravity" | "kimi") {
+        // Both Agents route shell tools through ACP terminal/* callbacks.
         preset.default_config.terminal_tools = true;
+    }
+    if entry.id == "kimi" {
+        // Kimi additionally exposes a first-class terminal login method.
         preset.default_config.terminal_auth = true;
     }
     preset
@@ -8145,6 +8148,13 @@ mod tests {
             assert_eq!(config.process_strategy, AcpProcessStrategy::PerSession);
             assert_eq!(config.cwd_template.as_deref(), Some("{workspaceRoot}"));
         }
+
+        let antigravity = presets
+            .iter()
+            .find(|preset| preset.preset_id == "antigravity")
+            .unwrap();
+        assert!(antigravity.default_config.terminal_tools);
+        assert!(!antigravity.default_config.terminal_auth);
 
         let auggie = presets
             .iter()

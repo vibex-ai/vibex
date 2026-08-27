@@ -2606,8 +2606,12 @@ agent_discovery_records(
   origin and selects the Profile model through its advertised ACP `model`
   config option. Vibex therefore gives each Antigravity Profile a private
   `GEMINI_HOME`, strips a trailing `/v1` or `/v1beta` from the endpoint before
-  launch, and uses restart-and-resume switching rather than relying on the
-  ignored `GEMINI_MODEL` process variable.
+  launch, explicitly selects the advertised `gemini-api-key` authentication
+  method after `initialize`, enables ACP terminal callbacks for shell tools,
+  and uses restart-and-resume switching rather than relying on the ignored
+  `GEMINI_MODEL` process variable. Antigravity advertises session listing at
+  `sessionCapabilities.list`; the runtime accepts that standard shape as well
+  as the legacy top-level `listSessions` boolean.
 - Bad: a newly supported typed projector persists successfully but disappears
   after refresh because `ProviderProfileRepository::list` still contains only
   `claude`, `codex`, and `opencode`.

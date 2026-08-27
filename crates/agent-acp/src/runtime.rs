@@ -514,6 +514,20 @@ impl AcpDebugLog {
     }
 }
 
+fn provider_backed_auth_method(
+    agent_id: &AgentId,
+    auth_source: &RuntimeAuthSource,
+) -> Option<String> {
+    matches!(auth_source, RuntimeAuthSource::ProviderProfile { .. })
+        .then(|| match agent_id.as_str() {
+            // Antigravity requires an explicit authenticate request to select
+            // API-key auth; merely projecting GEMINI_API_KEY is insufficient.
+            "antigravity" => Some("gemini-api-key".to_string()),
+            _ => None,
+        })
+        .flatten()
+}
+
 fn build_initialize_params(
     read_text_file: bool,
     write_text_file: bool,
@@ -1730,6 +1744,10 @@ pub(crate) struct AcpProcess {
     command_display: String,
     args_display: String,
     startup_model: Option<String>,
+    /// Authentication method selected automatically for provider-backed
+    /// processes. The method is still required by Antigravity even when the
+    /// corresponding API key is already present in the process environment.
+    provider_auth_method: Option<String>,
     outbound: Mutex<Option<mpsc::UnboundedSender<String>>>,
     next_request_id: AtomicU64,
     pending_requests: Mutex<HashMap<u64, PendingTransportResponse>>,
@@ -10974,6 +10992,7 @@ impl AcpRuntimeClient {
             Vec::new()
         };
 
+        let provider_auth_method = provider_backed_auth_method(&agent_id, &auth_source);
         let process = Arc::new(AcpProcess {
             exit_reporter: (purpose == AcpProcessPurpose::Session).then(|| {
                 self.process_registry
@@ -10996,6 +11015,7 @@ impl AcpRuntimeClient {
             command_display: config.command.clone(),
             args_display: redacted_args_summary(&process_args),
             startup_model,
+            provider_auth_method,
             outbound: Mutex::new(Some(outbound_tx)),
             next_request_id: AtomicU64::new(1),
             pending_requests: Mutex::new(HashMap::new()),
@@ -11111,6 +11131,32 @@ impl AcpRuntimeClient {
             )
             .await?;
 
+        if let Some(method_id) = process.provider_auth_method.as_deref() {
+            let advertised = result
+                .get("authMethods")
+                .and_then(Value::as_array)
+                .is_some_and(|methods| {
+                    methods
+                        .iter()
+                        .any(|method| method.get("id").and_then(Value::as_str) == Some(method_id))
+                });
+            if !advertised {
+                return Err(VibexError::capability(
+                    "agent_provider_auth_method_not_advertised",
+                    "ACP agent did not advertise the authentication method required by the Provider Profile",
+                )
+                .with_diagnostic("agentId", process.agent_id.as_str())
+                .with_diagnostic("methodId", method_id));
+            }
+            process
+                .request(
+                    AcpOperation::Authenticate.method(),
+                    protocol::build_authenticate_params(method_id),
+                    ACP_AUTHENTICATION_TIMEOUT,
+                )
+                .await?;
+        }
+
         let protocol_version = result.get("protocolVersion").and_then(Value::as_i64);
         let supports_load_session = result
             .get("agentCapabilities")
@@ -11122,11 +11168,16 @@ impl AcpRuntimeClient {
             .and_then(|capabilities| capabilities.get("sessionCapabilities"))
             .and_then(|capabilities| capabilities.get("resume"))
             .is_some();
-        let supports_list_sessions = result
-            .get("agentCapabilities")
-            .and_then(|capabilities| capabilities.get("listSessions"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let supports_list_sessions = result.get("agentCapabilities").is_some_and(|capabilities| {
+            capabilities
+                .get("listSessions")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || capabilities
+                    .get("sessionCapabilities")
+                    .and_then(|session| session.get("list"))
+                    .is_some()
+        });
         let mcp_capability = |transport: &str| {
             result
                 .get("agentCapabilities")
@@ -18657,6 +18708,25 @@ mod tests {
     use crate::ProcessConfigStatus;
 
     #[test]
+    fn antigravity_provider_profiles_select_api_key_auth() {
+        let antigravity = AgentId::parse("antigravity").unwrap();
+        let profile = RuntimeAuthSource::provider_profile(ProviderProfileId::new());
+        assert_eq!(
+            provider_backed_auth_method(&antigravity, &profile).as_deref(),
+            Some("gemini-api-key")
+        );
+
+        let account = RuntimeAuthSource::AgentAccount {
+            auth_context_id: "agent_auth_context_test".parse().unwrap(),
+        };
+        assert_eq!(provider_backed_auth_method(&antigravity, &account), None);
+        assert_eq!(
+            provider_backed_auth_method(&AgentId::parse("gemini").unwrap(), &profile),
+            None
+        );
+    }
+
+    #[test]
     fn initialize_params_keep_phase_one_capabilities() {
         assert_eq!(
             build_initialize_params(true, true, false, false, false),
@@ -18893,6 +18963,7 @@ mod tests {
             command_display: "mock".to_string(),
             args_display: String::new(),
             startup_model: None,
+            provider_auth_method: None,
             outbound: Mutex::new(outbound),
             next_request_id: AtomicU64::new(1),
             pending_requests: Mutex::new(HashMap::new()),
