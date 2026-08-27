@@ -37,6 +37,13 @@ pub const CODEX_RUNTIME_PACKAGE: &str = "@openai/codex";
 pub const CODEX_RUNTIME_DECLARED_REQUIREMENT: &str = "^0.145.0";
 pub const CODEX_RUNTIME_PIN: &str = "0.146.0";
 pub const CODEX_RUNTIME_INTEGRITY: &str = "sha512-yG3sPWNda/2YAIQIDq9MrrjoCTIQ7rxYM5IasrG3VBcuhCLTkgeg/JzqmJq1V98RE4MJ5jCxDXXQlOjrditFRw==";
+
+pub const ZCODE_AGENT_ID: &str = "zcode";
+pub const ZCODE_ADAPTER_ID: &str = "zcode-acp-server";
+pub const ZCODE_ADAPTER_PACKAGE: &str = "zcode-acp-server";
+pub const ZCODE_ADAPTER_VERSION: &str = "0.11.9";
+pub const ZCODE_ADAPTER_INTEGRITY: &str = "sha512-UluUECcibzyGTH3aoz4b2TwWgxD1PQ/xNTJHCl6WTmcL6wM0+sUOF61uwzMSKQr/XTq6EuQQ3nrOeqqmCVZFOA==";
+pub const ZCODE_CONFIG_ALIAS_VERSION_REQUIREMENT: &str = "=0.11.9";
 pub const NPM_REGISTRY_ORIGIN: &str = "https://registry.npmjs.org";
 
 /// Three-state support value used before runtime negotiation is complete.
@@ -138,6 +145,7 @@ pub enum RestorePolicy {
 pub enum NativeStateHomePolicy {
     ClaudeConfigDirectory,
     StableCodexHome,
+    ZcodeConfigDirectory,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +166,7 @@ pub struct AgentAuthContextCapabilities {
 pub enum TranscriptStrategy {
     ClaudeJsonl,
     CodexRollout,
+    ZcodeSession,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -618,6 +627,7 @@ impl AcpCompatibilityRegistry {
         let mut registry = Self::default();
         registry.register(claude_descriptor()?)?;
         registry.register(codex_descriptor()?)?;
+        registry.register(zcode_descriptor()?)?;
         Ok(registry)
     }
 
@@ -1061,6 +1071,80 @@ fn codex_descriptor() -> VibexResult<AcpAgentCompatibility> {
     })
 }
 
+fn zcode_descriptor() -> VibexResult<AcpAgentCompatibility> {
+    let adapter_id = AcpAdapterId::parse(ZCODE_ADAPTER_ID)?;
+    let exact_version = parse_version(ZCODE_ADAPTER_VERSION, ZCODE_ADAPTER_ID)?;
+    Ok(AcpAgentCompatibility {
+        agent_id: AgentId::parse(ZCODE_AGENT_ID)?,
+        adapter_id,
+        distribution: AcpAdapterDistribution {
+            registry_origin: NPM_REGISTRY_ORIGIN.to_string(),
+            package: ZCODE_ADAPTER_PACKAGE.to_string(),
+            exact_version,
+            integrity: ZCODE_ADAPTER_INTEGRITY.to_string(),
+            bin_name: ZCODE_ADAPTER_ID.to_string(),
+            initialize_agent_name: ZCODE_ADAPTER_PACKAGE.to_string(),
+            node_requirement: parse_requirement(">=22", ZCODE_ADAPTER_ID)?,
+            node_requirement_package: ZCODE_ADAPTER_PACKAGE.to_string(),
+            runtime_dependencies: Vec::new(),
+        },
+        command_variants: vec![CommandVariant {
+            bin_name: ZCODE_ADAPTER_ID.to_string(),
+            args: Vec::new(),
+            // The published bridge is stdio-only and does not expose a version
+            // flag. Managed install identity is verified from package metadata.
+            version_args: Vec::new(),
+        }],
+        // Keep the bridge's optional WebSocket/HTTP remote endpoint disabled;
+        // DesktopRuntime remains the sole remote/session authority.
+        required_launch_env: vec![("ZCODE_ACP_REMOTE".to_string(), "0".to_string())],
+        mcp_forwarding: CompatibilitySupport::supported(
+            "real bridge contract schema v2: zcode-acp-server@0.11.9 forwards stdio MCP descriptors",
+        ),
+        safe_multi_session: CompatibilitySupport::unsupported(
+            "Vibex launches one managed bridge per logical session",
+        ),
+        restore_policy: RestorePolicy::ResumeThenLoadThenNew,
+        operation_support: base_operation_support(),
+        native_state_home_policy: NativeStateHomePolicy::ZcodeConfigDirectory,
+        auth_context: AgentAuthContextCapabilities {
+            credential_env_keys_to_unset: [
+                "ZCODE_MODEL",
+                "ZCODE_BASE_URL",
+                "ANTHROPIC_API_KEY",
+                "ZCODE_ACP_REMOTE_TOKEN",
+                "__VIBEX_PROVIDER_PROJECTION_FINGERPRINT",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+            supports_logout: false,
+            supports_account_hint: false,
+            supports_direct_model_catalog: false,
+            verification_strategy: AgentAuthVerificationStrategy::InitializeThenSessionConfig,
+        },
+        config_option_alias_compatibility: ConfigOptionAliasCompatibility {
+            adapter_version_requirement: parse_requirement(
+                ZCODE_CONFIG_ALIAS_VERSION_REQUIREMENT,
+                ZCODE_ADAPTER_ID,
+            )?,
+            requires_exact_compatibility_identity: true,
+        },
+        config_option_aliases: BTreeMap::from([
+            ("model".to_string(), vec!["model".to_string()]),
+            (
+                "reasoning_effort".to_string(),
+                vec!["thoughtLevel".to_string(), "thought_level".to_string()],
+            ),
+            ("mode".to_string(), vec!["mode".to_string()]),
+        ]),
+        transcript_strategy: TranscriptStrategy::ZcodeSession,
+        event_enricher: AgentEventEnricherKind::Passthrough,
+        known_quirks: Vec::new(),
+        bridge_contract: bridge_contract_cases(),
+    })
+}
+
 /// Session modes and reasoning-effort levels pinned per adapter identity.
 ///
 /// These tables mirror what the exact registry-managed adapter version
@@ -1282,6 +1366,24 @@ mod tests {
                 .as_str(),
             CLAUDE_ADAPTER_ID
         );
+
+        let zcode = registry
+            .for_agent(&AgentId::parse(ZCODE_AGENT_ID).unwrap())
+            .unwrap();
+        assert_eq!(zcode.adapter_id.as_str(), ZCODE_ADAPTER_ID);
+        assert_eq!(
+            zcode.distribution.package_spec(),
+            format!("{ZCODE_ADAPTER_PACKAGE}@{ZCODE_ADAPTER_VERSION}")
+        );
+        assert_eq!(zcode.distribution.integrity, ZCODE_ADAPTER_INTEGRITY);
+        assert_eq!(zcode.command_variants[0].bin_name, ZCODE_ADAPTER_ID);
+        assert!(zcode.command_variants[0].version_args.is_empty());
+        assert_eq!(
+            zcode.required_launch_env,
+            vec![("ZCODE_ACP_REMOTE".to_string(), "0".to_string())]
+        );
+        assert_eq!(zcode.restore_policy, RestorePolicy::ResumeThenLoadThenNew);
+        assert_eq!(zcode.event_enricher, AgentEventEnricherKind::Passthrough);
     }
 
     #[test]

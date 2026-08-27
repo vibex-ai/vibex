@@ -34,6 +34,10 @@ use vibex_db::{
     open_database,
 };
 
+const ZCODE_ACP_PACKAGE: &str = "zcode-acp-server";
+const ZCODE_ACP_VERSION: &str = "0.11.9";
+const ZCODE_MINIMUM_NODE_VERSION: semver::Version = semver::Version::new(22, 0, 0);
+
 const ACP_REGISTRY_URL: &str =
     "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json";
 const NPM_REGISTRY_BASE_URL: &str = "https://registry.npmjs.org";
@@ -817,6 +821,19 @@ impl AgentInstallService {
                 )
                 .await?
             }
+            ManagedCliAgent::Zcode => RegistryEntry {
+                id: agent.registry_id().to_string(),
+                version: ZCODE_ACP_VERSION.to_string(),
+                distribution: RegistryDistribution {
+                    binary: None,
+                    npx: Some(RegistryNpxDistribution {
+                        package: format!("{ZCODE_ACP_PACKAGE}@{ZCODE_ACP_VERSION}"),
+                        args: Vec::new(),
+                    }),
+                    uvx: None,
+                    kiro: None,
+                },
+            },
             ManagedCliAgent::Hermes => {
                 let version = self.fetch_latest_pypi_version(HERMES_CLI_PACKAGE).await?;
                 RegistryEntry {
@@ -2486,6 +2503,7 @@ struct RegistryEntry {
 enum ManagedCliAgent {
     Codewhale,
     DeepSeekHarness,
+    Zcode,
     Hermes,
     Kiro,
 }
@@ -2495,6 +2513,7 @@ impl ManagedCliAgent {
         match agent_id.as_str() {
             "codewhale" => Some(Self::Codewhale),
             "deepseek-harness" => Some(Self::DeepSeekHarness),
+            "zcode" => Some(Self::Zcode),
             "hermes" => Some(Self::Hermes),
             "kiro" => Some(Self::Kiro),
             _ => None,
@@ -2505,6 +2524,7 @@ impl ManagedCliAgent {
         match self {
             Self::Codewhale => "codewhale",
             Self::DeepSeekHarness => "deepseek-harness-acp",
+            Self::Zcode => "zcode-acp-server",
             Self::Hermes => "hermes",
             Self::Kiro => "kiro",
         }
@@ -2884,6 +2904,7 @@ fn minimum_node_version(agent_id: &AgentId) -> semver::Version {
     match agent_id.as_str() {
         "deepseek-harness" => DEEPSEEK_HARNESS_MINIMUM_NODE_VERSION,
         "pi" => PI_MINIMUM_NODE_VERSION,
+        "zcode" => ZCODE_MINIMUM_NODE_VERSION,
         _ => MINIMUM_NODE_VERSION,
     }
 }
@@ -5565,16 +5586,23 @@ mod tests {
             require_registry_id(&AgentId::parse("minion-code").unwrap()).unwrap(),
             "minion-code"
         );
-        for agent_id in ["codewhale", "deepseek-harness", "hermes", "kiro"] {
+        for (agent_id, registry_id) in [
+            ("codewhale", "codewhale"),
+            ("deepseek-harness", "deepseek-harness-acp"),
+            ("zcode", "zcode-acp-server"),
+            ("hermes", "hermes"),
+            ("kiro", "kiro"),
+        ] {
             assert_eq!(
                 require_registry_id(&AgentId::parse(agent_id).unwrap()).unwrap(),
-                if agent_id == "deepseek-harness" {
-                    "deepseek-harness-acp"
-                } else {
-                    agent_id
-                }
+                registry_id
             );
         }
+        assert_eq!(
+            minimum_node_version(&AgentId::parse("zcode").unwrap()),
+            semver::Version::new(22, 0, 0)
+        );
+        assert_eq!(ManagedCliAgent::Zcode.registry_id(), "zcode-acp-server");
     }
 
     #[test]

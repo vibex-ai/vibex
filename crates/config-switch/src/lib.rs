@@ -4478,6 +4478,7 @@ fn bundled_acp_catalog_presets() -> Vec<AcpProviderCatalogPreset> {
         opencode_acp_preset(),
         claude_acp_preset(),
         codex_acp_preset(),
+        zcode_acp_preset(),
     ];
     presets.extend(
         acp_agent_catalog_entries()
@@ -4649,6 +4650,17 @@ fn codex_acp_preset() -> AcpProviderCatalogPreset {
         .map(ToString::to_string)
         .collect();
     preset
+}
+
+fn zcode_acp_preset() -> AcpProviderCatalogPreset {
+    acp_catalog_preset(
+        "zcode-acp-server",
+        "ZCode (ACP)",
+        "ZCode through the fixed zcode-acp-server@0.11.9 Adapter managed by the Compatibility Registry.",
+        "zcode-acp-server",
+        &[],
+        &["local", "acp", "zcode"],
+    )
 }
 
 fn resolve_acp_create_config(
@@ -8110,7 +8122,7 @@ mod tests {
 
         assert_eq!(
             definition_presets.len(),
-            acp_agent_catalog_entries().len() + 3
+            acp_agent_catalog_entries().len() + 4
         );
         assert_eq!(definition_presets, catalog_presets);
     }

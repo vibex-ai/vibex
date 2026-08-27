@@ -369,21 +369,28 @@ impl ManagedAcpAdapterStore {
                 "ACP compatibility descriptor does not have a probe command",
             )
         })?;
-        let mut version_args = installation.command.args.clone();
-        version_args.extend(command_variant.version_args.clone());
-        let adapter_output = run_bounded_output(
-            &installation.command.program,
-            &version_args,
-            &installation.command.current_dir,
-            self.probe_timeout,
-        )
-        .await?;
-        let reported_adapter_version = parse_version_output(&adapter_output).ok_or_else(|| {
-            VibexError::validation(
-                "acp_managed_adapter_version_output_invalid",
-                "Managed ACP adapter version output could not be parsed",
+        let reported_adapter_version = if command_variant.version_args.is_empty() {
+            // Some stdio-only adapters start their protocol loop for every CLI
+            // invocation and intentionally expose no version flag. Their exact
+            // package version and integrity were already verified above.
+            installation.adapter_version.clone()
+        } else {
+            let mut version_args = installation.command.args.clone();
+            version_args.extend(command_variant.version_args.clone());
+            let adapter_output = run_bounded_output(
+                &installation.command.program,
+                &version_args,
+                &installation.command.current_dir,
+                self.probe_timeout,
             )
-        })?;
+            .await?;
+            parse_version_output(&adapter_output).ok_or_else(|| {
+                VibexError::validation(
+                    "acp_managed_adapter_version_output_invalid",
+                    "Managed ACP adapter version output could not be parsed",
+                )
+            })?
+        };
         if reported_adapter_version != descriptor.distribution.exact_version {
             return Err(VibexError::process(
                 "acp_managed_adapter_version_mismatch",

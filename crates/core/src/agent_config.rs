@@ -469,6 +469,7 @@ pub fn acp_registry_agent_id(agent_id: &AgentId) -> Option<&'static str> {
         "antigravity" => return Some("antigravity-acp"),
         "claude" => return Some("claude-acp"),
         "codex" => return Some("codex-acp"),
+        "zcode" => return Some("zcode-acp-server"),
         "deepseek-harness" => return Some("deepseek-harness-acp"),
         "copilot" => return Some("github-copilot-cli"),
         "grok" => return Some("grok-build"),
@@ -550,13 +551,39 @@ pub fn builtin_agent_definitions() -> Vec<AgentDefinition> {
             ],
         },
         AgentDefinition {
+            id: AgentId::parse("zcode").expect("builtin agent ids are valid"),
+            label: "ZCode".to_string(),
+            description: Some(
+                "ZCode connected through the managed zcode-acp-server bridge".to_string(),
+            ),
+            runtime_kind: AgentRuntimeKind::Acp,
+            source_kind: AgentSourceKind::Builtin,
+            default_enabled: false,
+            order_index: 30,
+            command: Some(AgentCommandConfig {
+                command: "zcode-acp-server".to_string(),
+                args: Vec::new(),
+            }),
+            env: BTreeMap::new(),
+            params: serde_json::json!({ "connection": "acp", "preset": "zcode-acp-server" }),
+            modes: vec!["default".to_string()],
+            capability_hints: vec![
+                "agent_messages".to_string(),
+                "tool_calls".to_string(),
+                "permission_requests".to_string(),
+                "slash_commands".to_string(),
+                "skills".to_string(),
+                "mcp".to_string(),
+            ],
+        },
+        AgentDefinition {
             id: AgentId::parse("opencode").expect("builtin agent ids are valid"),
             label: "OpenCode".to_string(),
             description: Some("OpenCode agent connected through ACP".to_string()),
             runtime_kind: AgentRuntimeKind::Acp,
             source_kind: AgentSourceKind::Builtin,
             default_enabled: false,
-            order_index: 30,
+            order_index: 40,
             command: Some(AgentCommandConfig {
                 command: "opencode".to_string(),
                 args: vec!["acp".to_string()],
@@ -576,7 +603,7 @@ pub fn builtin_agent_definitions() -> Vec<AgentDefinition> {
         acp_agent_catalog_entries()
             .iter()
             .enumerate()
-            .map(|(index, entry)| acp_catalog_agent_definition(entry, 40 + index as i64 * 10)),
+            .map(|(index, entry)| acp_catalog_agent_definition(entry, 50 + index as i64 * 10)),
     );
     definitions
 }
@@ -679,6 +706,7 @@ mod tests {
         for (agent_id, command, preset) in [
             ("claude", "claude-agent-acp", "claude-agent-acp"),
             ("codex", "codex-acp", "codex-acp"),
+            ("zcode", "zcode-acp-server", "zcode-acp-server"),
         ] {
             let definition = definitions
                 .iter()
@@ -743,6 +771,7 @@ mod tests {
             "qwen-code",
             "stakpak",
             "vtcode",
+            "zcode",
         ]
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();

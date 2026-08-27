@@ -204,6 +204,8 @@ pub fn default_acp_adapter_id(agent_id: &AgentId) -> AcpAdapterId {
         "claude-agent-acp".to_string()
     } else if value == "codex" {
         "codex-acp".to_string()
+    } else if value == "zcode" {
+        "zcode-acp-server".to_string()
     } else if value == "opencode" {
         "opencode-acp".to_string()
     } else if value.ends_with("-acp") || value.ends_with("-acp-agent") {

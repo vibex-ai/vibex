@@ -1197,6 +1197,13 @@ fn legacy_runtime_identity(
                 BTreeMap::new(),
                 AgentVersionSource::Managed,
             ),
+            ("zcode", Some(version)) => (
+                "zcode-acp-server",
+                Some(version),
+                None,
+                BTreeMap::new(),
+                AgentVersionSource::Managed,
+            ),
             ("claude", None)
                 if looks_managed_adapter_command(command, args, "claude-agent-acp") =>
             {
@@ -1215,6 +1222,15 @@ fn legacy_runtime_identity(
                 BTreeMap::from([("@openai/codex".to_string(), "0.146.0".to_string())]),
                 AgentVersionSource::Managed,
             ),
+            ("zcode", None) if looks_managed_adapter_command(command, args, "zcode-acp-server") => {
+                (
+                    "zcode-acp-server",
+                    Some("0.11.9".to_string()),
+                    None,
+                    BTreeMap::new(),
+                    AgentVersionSource::Managed,
+                )
+            }
             ("opencode", _) if looks_native_agent_command(command, "opencode") => {
                 let detected = latest_agent_version(conn, &profile.agent_id)?;
                 let source = if detected.is_some() {
