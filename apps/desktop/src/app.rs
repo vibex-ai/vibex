@@ -20732,125 +20732,141 @@ impl VibexWorkbench {
                 )
             })
             .child(
-                v_flex()
-                    .id("sidebar-session-list")
+                div()
+                    .id("sidebar-session-list-container")
                     .flex_1()
                     .min_h_0()
-                    // Keep the boundary from the previous project's last
-                    // worktree/session row to the next project row distinct
-                    // from the tighter spacing inside one project.
-                    .gap(px(SIDEBAR_PROJECT_GROUP_GAP))
-                    .track_scroll(&self.sidebar_scroll)
-                    .overflow_y_scroll()
-                    .vertical_scrollbar(&self.sidebar_scroll)
-                    .bg(if root_drop_active {
-                        cx.theme().sidebar_accent.opacity(0.20)
-                    } else {
-                        cx.theme().transparent
-                    })
-                    .on_drop(cx.listener(|this, drag: &SidebarProjectDrag, _, cx| {
-                        this.finish_sidebar_project_drag(&drag.project_id, cx);
-                        cx.stop_propagation();
-                    }))
-                    .on_drop(cx.listener(|this, drag: &SidebarFolderDrag, _, cx| {
-                        this.finish_sidebar_folder_drag(&drag.folder_id, cx);
-                        cx.stop_propagation();
-                    }))
-                    .on_drop(cx.listener(|this, drag: &SidebarSessionDrag, _, cx| {
-                        this.finish_sidebar_session_drag(&drag.workspace_id, &drag.session_id, cx);
-                        cx.stop_propagation();
-                    }))
-                    .on_drop(cx.listener(|this, drag: &SidebarWorkspaceDrag, _, cx| {
-                        this.finish_sidebar_workspace_drag(
-                            &drag.project_id,
-                            &drag.workspace_id,
-                            cx,
-                        );
-                        cx.stop_propagation();
-                    }))
-                    .px_4()
-                    .py_3()
-                    .when(group_elements.is_empty(), |this| {
-                        this.child(
-                            div()
-                                .rounded(px(8.0))
-                                .border_1()
-                                .border_color(cx.theme().sidebar_border.opacity(0.70))
-                                .bg(cx.theme().background.opacity(0.30))
-                                .p_3()
-                                .text_sm()
-                                .text_color(cx.theme().sidebar_foreground.opacity(0.55))
-                                .child(strings.sidebar_no_matching_sessions),
-                        )
-                    })
-                    .children(group_elements)
-                    // Keep root-only drops and the root context menu on a
-                    // sibling hitbox instead of an ancestor of every row.
+                    .relative()
                     .child(
-                        div()
-                            .id("sidebar-root-drop-target")
-                            .w_full()
-                            .flex_1()
-                            .min_h(px(24.0))
-                            .rounded(px(8.0))
+                        v_flex()
+                            .id("sidebar-session-list")
+                            .size_full()
+                            // Keep the boundary from the previous project's last
+                            // worktree/session row to the next project row distinct
+                            // from the tighter spacing inside one project.
+                            .gap(px(SIDEBAR_PROJECT_GROUP_GAP))
+                            .track_scroll(&self.sidebar_scroll)
+                            .overflow_y_scroll()
                             .bg(if root_drop_active {
                                 cx.theme().sidebar_accent.opacity(0.20)
                             } else {
                                 cx.theme().transparent
                             })
-                            .on_drag_move(cx.listener(
-                                |this, event: &DragMoveEvent<SidebarProjectDrag>, _, cx| {
-                                    if !event.bounds.contains(&event.event.position) {
-                                        return;
-                                    }
-                                    let drag = event.drag(cx);
-                                    this.set_sidebar_organization_root_drop_target(
-                                        drag.project_ids
-                                            .iter()
-                                            .cloned()
-                                            .map(SidebarOrganizationItem::Project)
-                                            .collect(),
-                                        SidebarOrganizationScope::Root,
-                                        cx,
-                                    );
-                                },
-                            ))
-                            .on_drag_move(cx.listener(
-                                |this, event: &DragMoveEvent<SidebarFolderDrag>, _, cx| {
-                                    if !event.bounds.contains(&event.event.position) {
-                                        return;
-                                    }
-                                    let drag = event.drag(cx);
-                                    this.set_sidebar_organization_root_drop_target(
-                                        vec![SidebarOrganizationItem::Folder(
-                                            drag.folder_id.clone(),
-                                        )],
-                                        SidebarOrganizationScope::Root,
-                                        cx,
-                                    );
-                                },
-                            ))
-                            .on_drag_move(cx.listener(
-                                |this, event: &DragMoveEvent<SidebarSessionDrag>, _, cx| {
-                                    if !event.bounds.contains(&event.event.position) {
-                                        return;
-                                    }
-                                    let drag = event.drag(cx);
-                                    this.set_sidebar_organization_root_drop_target(
-                                        drag.session_ids
-                                            .iter()
-                                            .cloned()
-                                            .map(SidebarOrganizationItem::Session)
-                                            .collect(),
-                                        SidebarOrganizationScope::Root,
-                                        cx,
-                                    );
-                                },
-                            ))
-                            .context_menu(move |menu, _, cx| {
-                                Self::build_sidebar_root_menu(menu, root_menu_entity.clone(), cx)
-                            }),
-                    ),
+                            .on_drop(cx.listener(|this, drag: &SidebarProjectDrag, _, cx| {
+                                this.finish_sidebar_project_drag(&drag.project_id, cx);
+                                cx.stop_propagation();
+                            }))
+                            .on_drop(cx.listener(|this, drag: &SidebarFolderDrag, _, cx| {
+                                this.finish_sidebar_folder_drag(&drag.folder_id, cx);
+                                cx.stop_propagation();
+                            }))
+                            .on_drop(cx.listener(|this, drag: &SidebarSessionDrag, _, cx| {
+                                this.finish_sidebar_session_drag(
+                                    &drag.workspace_id,
+                                    &drag.session_id,
+                                    cx,
+                                );
+                                cx.stop_propagation();
+                            }))
+                            .on_drop(cx.listener(|this, drag: &SidebarWorkspaceDrag, _, cx| {
+                                this.finish_sidebar_workspace_drag(
+                                    &drag.project_id,
+                                    &drag.workspace_id,
+                                    cx,
+                                );
+                                cx.stop_propagation();
+                            }))
+                            .px_4()
+                            .py_3()
+                            .when(group_elements.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .rounded(px(8.0))
+                                        .border_1()
+                                        .border_color(cx.theme().sidebar_border.opacity(0.70))
+                                        .bg(cx.theme().background.opacity(0.30))
+                                        .p_3()
+                                        .text_sm()
+                                        .text_color(cx.theme().sidebar_foreground.opacity(0.55))
+                                        .child(strings.sidebar_no_matching_sessions),
+                                )
+                            })
+                            .children(group_elements)
+                            // Keep root-only drops and the root context menu on a
+                            // sibling hitbox instead of an ancestor of every row.
+                            .child(
+                                div()
+                                    .id("sidebar-root-drop-target")
+                                    .w_full()
+                                    .flex_1()
+                                    .min_h(px(24.0))
+                                    .rounded(px(8.0))
+                                    .bg(if root_drop_active {
+                                        cx.theme().sidebar_accent.opacity(0.20)
+                                    } else {
+                                        cx.theme().transparent
+                                    })
+                                    .on_drag_move(cx.listener(
+                                        |this, event: &DragMoveEvent<SidebarProjectDrag>, _, cx| {
+                                            if !event.bounds.contains(&event.event.position) {
+                                                return;
+                                            }
+                                            let drag = event.drag(cx);
+                                            this.set_sidebar_organization_root_drop_target(
+                                                drag.project_ids
+                                                    .iter()
+                                                    .cloned()
+                                                    .map(SidebarOrganizationItem::Project)
+                                                    .collect(),
+                                                SidebarOrganizationScope::Root,
+                                                cx,
+                                            );
+                                        },
+                                    ))
+                                    .on_drag_move(cx.listener(
+                                        |this, event: &DragMoveEvent<SidebarFolderDrag>, _, cx| {
+                                            if !event.bounds.contains(&event.event.position) {
+                                                return;
+                                            }
+                                            let drag = event.drag(cx);
+                                            this.set_sidebar_organization_root_drop_target(
+                                                vec![SidebarOrganizationItem::Folder(
+                                                    drag.folder_id.clone(),
+                                                )],
+                                                SidebarOrganizationScope::Root,
+                                                cx,
+                                            );
+                                        },
+                                    ))
+                                    .on_drag_move(cx.listener(
+                                        |this, event: &DragMoveEvent<SidebarSessionDrag>, _, cx| {
+                                            if !event.bounds.contains(&event.event.position) {
+                                                return;
+                                            }
+                                            let drag = event.drag(cx);
+                                            this.set_sidebar_organization_root_drop_target(
+                                                drag.session_ids
+                                                    .iter()
+                                                    .cloned()
+                                                    .map(SidebarOrganizationItem::Session)
+                                                    .collect(),
+                                                SidebarOrganizationScope::Root,
+                                                cx,
+                                            );
+                                        },
+                                    ))
+                                    .context_menu(move |menu, _, cx| {
+                                        Self::build_sidebar_root_menu(
+                                            menu,
+                                            root_menu_entity.clone(),
+                                            cx,
+                                        )
+                                    }),
+                            ),
+                    )
+                    // Keep the scrollbar outside the scrolling node. GPUI applies
+                    // that node's offset to all of its children during prepaint.
+                    .vertical_scrollbar(&self.sidebar_scroll),
             )
             .into_any_element()
     }
@@ -52645,8 +52661,14 @@ mod tests {
         assert!(sidebar.contains("icons/vibex/crosshair.svg"));
         assert!(sidebar.contains(".disabled(self.selected_session_id.is_none())"));
         assert!(sidebar.contains("this.locate_selected_session(window, cx)"));
+        assert!(sidebar.contains(".id(\"sidebar-session-list-container\")"));
         assert!(sidebar.contains(".track_scroll(&self.sidebar_scroll)"));
+        assert!(sidebar.contains("// Keep the scrollbar outside the scrolling node."));
         assert!(sidebar.contains(".vertical_scrollbar(&self.sidebar_scroll)"));
+        assert!(
+            sidebar.find(".track_scroll(&self.sidebar_scroll)")
+                < sidebar.find(".vertical_scrollbar(&self.sidebar_scroll)")
+        );
 
         let more_menu = source
             .split_once("    fn build_sidebar_toolbar_more_menu(")
