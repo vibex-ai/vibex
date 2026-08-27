@@ -257,6 +257,7 @@ pub struct SessionConfigPlanner {
     operation_fallbacks: BTreeMap<AcpOperation, Vec<SessionConfigOperationEvidence>>,
     options: Vec<ProviderSessionConfigOption>,
     reasoning_effort_mode_bridge: bool,
+    antigravity_reasoning_model_bridge: bool,
     extensions: BTreeMap<String, SessionConfigExtension>,
     startup_projections: BTreeSet<String>,
 }
@@ -290,6 +291,7 @@ impl SessionConfigPlanner {
             operation_fallbacks: BTreeMap::new(),
             options,
             reasoning_effort_mode_bridge: false,
+            antigravity_reasoning_model_bridge: false,
             extensions: BTreeMap::new(),
             startup_projections: BTreeSet::new(),
         }
@@ -329,6 +331,14 @@ impl SessionConfigPlanner {
         self
     }
 
+    /// Enables Antigravity's synthetic reasoning control. Antigravity exposes
+    /// thinking depth as a suffix on its model option rather than as a
+    /// separate ACP config option.
+    pub fn with_antigravity_reasoning_model_bridge(mut self) -> Self {
+        self.antigravity_reasoning_model_bridge = true;
+        self
+    }
+
     fn add_reasoning_effort_mode_operation(&mut self) {
         if !self.reasoning_effort_mode_bridge {
             return;
@@ -345,6 +355,9 @@ impl SessionConfigPlanner {
     /// than as one selectable `reasoning_effort` option. Those values still
     /// use ACP's typed `session/set_mode` request on the wire.
     pub fn reasoning_effort_value_is_advertised(&self, value: &str) -> bool {
+        if self.antigravity_reasoning_model_bridge && matches!(value, "low" | "medium" | "high") {
+            return true;
+        }
         if self.reasoning_effort_mode_bridge
             && reasoning_effort_mode_value_is_advertised(&self.options, value)
         {
@@ -478,6 +491,19 @@ impl SessionConfigPlanner {
                 self.plan_model(&field.key, config_option, config_evidence)
             }
             SessionConfigFieldKind::Mode => self.plan_mode(&field.key),
+            SessionConfigFieldKind::ReasoningEffort
+                if self.antigravity_reasoning_model_bridge
+                    && matches!(field.value.as_str(), "low" | "medium" | "high") =>
+            {
+                config_evidence
+                    .map(|evidence| SessionConfigPlan::Live {
+                        operation: AcpOperation::SessionSetConfigOption,
+                        encoding: evidence.encoding,
+                        source: evidence.source,
+                        option_id: Some("model".to_string()),
+                    })
+                    .unwrap_or_else(|| self.restart_or_unavailable(&field.key))
+            }
             SessionConfigFieldKind::ReasoningEffort
                 if self.reasoning_effort_mode_bridge
                     && reasoning_effort_mode_value_is_advertised(&self.options, &field.value) =>

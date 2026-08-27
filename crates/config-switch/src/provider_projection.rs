@@ -2186,13 +2186,10 @@ fn projected_runtime_model_id(
     model: &AgentConfiguredModelBinding,
 ) -> String {
     if descriptor.route.agent_id.as_str() == "antigravity" {
-        // Antigravity's provider-facing Gemini ids omit thinking level, while
-        // its ACP model catalog requires a concrete `-high`, `-medium`, or
-        // `-low` variant. The upstream request strips that level again before
-        // calling the Google Generative API, so map an unqualified Provider
-        // model to the Agent's default high-thinking runtime variant.
-        const THINKING_LEVELS: [&str; 3] = ["-high", "-medium", "-low"];
-        if !THINKING_LEVELS
+        // Antigravity requires a concrete thinking-level model id. Use its
+        // default high variant until an explicit reasoning effort is applied
+        // by the runtime bridge; already-qualified ids remain unchanged.
+        if !["-high", "-medium", "-low"]
             .iter()
             .any(|suffix| model.agent_model_id.ends_with(suffix))
         {
@@ -4303,6 +4300,7 @@ mod tests {
             let expected_model = match expected.agent_id {
                 "pi" => "matrix-provider/agent-model",
                 "hermes" => "custom:agent-model",
+                "antigravity" => "agent-model-high",
                 _ => "agent-model",
             };
             assert_eq!(plan.effective_model.as_deref(), Some(expected_model));
@@ -4877,7 +4875,7 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_maps_provider_models_to_concrete_thinking_variants() {
+    fn antigravity_uses_high_as_the_initial_runtime_variant() {
         let descriptor = vibex_core::catalog_projection_descriptors()
             .unwrap()
             .into_iter()

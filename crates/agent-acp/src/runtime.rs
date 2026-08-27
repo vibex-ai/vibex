@@ -373,6 +373,14 @@ pub(crate) fn startup_model_from_config(
     config: &AcpProviderConfig,
     agent_id: &str,
 ) -> Option<String> {
+    if agent_id == "antigravity" {
+        return config
+            .models
+            .first()
+            .map(|model| model.trim())
+            .filter(|model| !model.is_empty())
+            .map(ToString::to_string);
+    }
     if agent_id != "copilot" {
         return None;
     }
@@ -12067,6 +12075,7 @@ impl AcpRuntimeClient {
                                 &field,
                                 &plan,
                                 option_kind.as_ref(),
+                                next_state.effective_model.as_deref(),
                             )
                             .await;
                         match response {
@@ -12172,15 +12181,31 @@ impl AcpRuntimeClient {
         field: &RuntimeConfigField,
         plan: &SessionConfigPlan,
         option_kind: Option<&ProviderSessionConfigOptionKind>,
+        effective_model: Option<&str>,
     ) -> VibexResult<Value> {
-        let runtime_model_field = (field.kind == SessionConfigFieldKind::Model).then(|| {
+        let runtime_model_field = if field.kind == SessionConfigFieldKind::Model {
             let mut projected = field.clone();
             projected.value = field
                 .value
                 .as_deref()
                 .map(|model| process.runtime_model_id(model));
-            projected
-        });
+            Some(projected)
+        } else if field.kind == SessionConfigFieldKind::ReasoningEffort
+            && process.agent_id.as_str() == "antigravity"
+        {
+            let mut projected = field.clone();
+            projected.kind = SessionConfigFieldKind::Model;
+            projected.key =
+                CanonicalSessionConfigKey::parse("model").expect("canonical model key is valid");
+            projected.value = field.value.as_deref().and_then(|effort| {
+                effective_model
+                    .or(process.startup_model.as_deref())
+                    .map(|model| antigravity_runtime_model_id(model, effort))
+            });
+            Some(projected)
+        } else {
+            None
+        };
         let field = runtime_model_field.as_ref().unwrap_or(field);
         let (method, params) = match plan {
             SessionConfigPlan::Live {
@@ -13116,6 +13141,9 @@ impl AcpRuntimeClient {
         if process.agent_id.as_str() == GROK_AGENT_ID {
             planner = planner.with_reasoning_effort_mode_bridge();
         }
+        if process.agent_id.as_str() == "antigravity" {
+            planner = planner.with_antigravity_reasoning_model_bridge();
+        }
         if config_option_needs_raw_fallback {
             let fallback = SessionConfigOperationEvidence {
                 support: CapabilitySupport::Supported,
@@ -13309,6 +13337,30 @@ enum RuntimeConfigConfirmation {
     Applied(SessionRuntimeConfigState),
     Stale(SessionRuntimeConfigState),
     ReconciliationRequired(SessionRuntimeConfigState),
+}
+
+fn antigravity_model_reasoning_effort(model: &str) -> Option<&'static str> {
+    [("-high", "high"), ("-medium", "medium"), ("-low", "low")]
+        .into_iter()
+        .find_map(|(suffix, effort)| model.ends_with(suffix).then_some(effort))
+}
+
+fn antigravity_runtime_model_id(model: &str, effort: &str) -> String {
+    let model = ["-high", "-medium", "-low"]
+        .iter()
+        .find_map(|suffix| model.strip_suffix(suffix))
+        .unwrap_or(model);
+    format!("{model}-{effort}")
+}
+
+fn antigravity_reasoning_efforts() -> Vec<AgentReasoningEffort> {
+    ["low", "medium", "high"]
+        .into_iter()
+        .map(|value| AgentReasoningEffort {
+            value: value.to_string(),
+            description: Some(value[..1].to_uppercase() + &value[1..]),
+        })
+        .collect()
 }
 
 fn canonical_key_error(error: crate::session_config::CanonicalKeyError) -> VibexError {
@@ -13690,6 +13742,10 @@ fn runtime_config_response_conflict(
     let explicit = match field.kind {
         SessionConfigFieldKind::Model => extract_current_model_id(response),
         SessionConfigFieldKind::Mode => extract_current_mode_id(response),
+        SessionConfigFieldKind::ReasoningEffort if process.agent_id.as_str() == "antigravity" => {
+            extract_current_model_id(response)
+                .and_then(|model| antigravity_model_reasoning_effort(&model).map(str::to_string))
+        }
         SessionConfigFieldKind::ReasoningEffort | SessionConfigFieldKind::Generic => {
             let option_id = match plan {
                 SessionConfigPlan::Live { option_id, .. } => option_id.as_deref(),
@@ -15422,6 +15478,9 @@ async fn runtime_session_probe_from_response(
     if reasoning_efforts.is_empty() {
         reasoning_efforts =
             extract_initialize_reasoning_efforts(initialize, runtime_target_model.as_deref());
+    }
+    if process.agent_id.as_str() == "antigravity" {
+        reasoning_efforts = antigravity_reasoning_efforts();
     }
     let options = model_response_ref
         .filter(|response| response_has_config_options(response))
@@ -18564,6 +18623,29 @@ mod tests {
             .map_err(missing_turn_execution_runtime_requirement_error)
             .unwrap_err();
         assert_eq!(error.code, "turn_execution_runtime_requirement_missing");
+    }
+
+    #[test]
+    fn antigravity_reasoning_effort_selects_a_model_variant() {
+        assert_eq!(
+            antigravity_runtime_model_id("gemini-3.7-flash", "medium"),
+            "gemini-3.7-flash-medium"
+        );
+        assert_eq!(
+            antigravity_runtime_model_id("gemini-3.7-flash-high", "low"),
+            "gemini-3.7-flash-low"
+        );
+        assert_eq!(
+            antigravity_model_reasoning_effort("gemini-3.7-flash-medium"),
+            Some("medium")
+        );
+        assert_eq!(
+            antigravity_reasoning_efforts()
+                .into_iter()
+                .map(|effort| effort.value)
+                .collect::<Vec<_>>(),
+            ["low", "medium", "high"]
+        );
     }
 
     #[test]

@@ -2608,9 +2608,13 @@ agent_discovery_records(
   `GEMINI_HOME`, strips a trailing `/v1` or `/v1beta` from the endpoint before
   launch, explicitly selects the advertised `gemini-api-key` authentication
   method after `initialize`, enables ACP terminal callbacks for shell tools,
-  and maps a Provider-facing model such as `gemini-3.7-flash` to Antigravity's
-  concrete default `gemini-3.7-flash-high` ACP variant (already-qualified
-  `-high`, `-medium`, and `-low` ids remain unchanged). It uses
+  and initially maps a Provider-facing model such as `gemini-3.7-flash` to
+  Antigravity's concrete default `gemini-3.7-flash-high` ACP variant. Vibex
+  exposes `low`, `medium`, and `high` as a synthetic reasoning-effort option;
+  choosing one replaces an existing thinking suffix or appends it to the
+  Provider model before sending Antigravity's `model` config option. Provider
+  model runtime-option probing uses the same authenticated launch and records
+  this synthetic option alongside the Agent's advertised modes. It uses
   restart-and-resume switching rather than relying on the ignored
   `GEMINI_MODEL` process variable. Antigravity advertises session listing at
   `sessionCapabilities.list`; the runtime accepts that standard shape as well
