@@ -2185,6 +2185,20 @@ fn projected_runtime_model_id(
     descriptor: &AgentProviderProjectionDescriptor,
     model: &AgentConfiguredModelBinding,
 ) -> String {
+    if descriptor.route.agent_id.as_str() == "antigravity" {
+        // Antigravity's provider-facing Gemini ids omit thinking level, while
+        // its ACP model catalog requires a concrete `-high`, `-medium`, or
+        // `-low` variant. The upstream request strips that level again before
+        // calling the Google Generative API, so map an unqualified Provider
+        // model to the Agent's default high-thinking runtime variant.
+        const THINKING_LEVELS: [&str; 3] = ["-high", "-medium", "-low"];
+        if !THINKING_LEVELS
+            .iter()
+            .any(|suffix| model.agent_model_id.ends_with(suffix))
+        {
+            return format!("{}-high", model.agent_model_id);
+        }
+    }
     if matches!(
         descriptor.provider_control,
         AgentProviderControl::ManagedConfigOverlay {
@@ -4860,6 +4874,29 @@ mod tests {
                 runtime_model_id
             );
         }
+    }
+
+    #[test]
+    fn antigravity_maps_provider_models_to_concrete_thinking_variants() {
+        let descriptor = vibex_core::catalog_projection_descriptors()
+            .unwrap()
+            .into_iter()
+            .find(|descriptor| descriptor.route.agent_id.as_str() == "antigravity")
+            .unwrap();
+        let (provider, _, binding) = typed_projection_fixture(&descriptor);
+        let mut model = binding.configured_models[0].clone();
+
+        model.agent_model_id = "gemini-3.7-flash".to_string();
+        assert_eq!(
+            projected_runtime_model_id(&provider, &descriptor, &model),
+            "gemini-3.7-flash-high"
+        );
+
+        model.agent_model_id = "gemini-3.7-flash-medium".to_string();
+        assert_eq!(
+            projected_runtime_model_id(&provider, &descriptor, &model),
+            "gemini-3.7-flash-medium"
+        );
     }
 
     #[test]

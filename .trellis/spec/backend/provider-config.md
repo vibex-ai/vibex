@@ -2608,7 +2608,10 @@ agent_discovery_records(
   `GEMINI_HOME`, strips a trailing `/v1` or `/v1beta` from the endpoint before
   launch, explicitly selects the advertised `gemini-api-key` authentication
   method after `initialize`, enables ACP terminal callbacks for shell tools,
-  and uses restart-and-resume switching rather than relying on the ignored
+  and maps a Provider-facing model such as `gemini-3.7-flash` to Antigravity's
+  concrete default `gemini-3.7-flash-high` ACP variant (already-qualified
+  `-high`, `-medium`, and `-low` ids remain unchanged). It uses
+  restart-and-resume switching rather than relying on the ignored
   `GEMINI_MODEL` process variable. Antigravity advertises session listing at
   `sessionCapabilities.list`; the runtime accepts that standard shape as well
   as the legacy top-level `listSessions` boolean.
