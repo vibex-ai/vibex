@@ -676,8 +676,10 @@ pub struct ManagementCenter {
     agent_search: Entity<InputState>,
     custom_agent_id: Entity<InputState>,
     custom_agent_label: Entity<InputState>,
+    custom_agent_description: Entity<InputState>,
     custom_agent_command: Entity<InputState>,
     custom_agent_args: Entity<InputState>,
+    custom_agent_env: Entity<InputState>,
     mcp_search: Entity<InputState>,
     skill_search: Entity<InputState>,
     profile_name: Entity<InputState>,
@@ -719,11 +721,18 @@ impl ManagementCenter {
                 "顯示名稱",
             ))
         });
+        let custom_agent_description = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "What this Agent is used for (optional)",
+                "这个 Agent 的用途（可选）",
+                "這個 Agent 的用途（選填）",
+            ))
+        });
         let custom_agent_command = cx.new(|cx| {
             InputState::new(window, cx).placeholder(management_locale_text(
-                "ACP command",
-                "ACP 命令",
-                "ACP 命令",
+                "Executable, npx, or uvx",
+                "可执行文件、npx 或 uvx",
+                "執行檔、npx 或 uvx",
             ))
         });
         let custom_agent_args = cx.new(|cx| {
@@ -732,6 +741,16 @@ impl ManagementCenter {
                 "以空格分隔参数",
                 "以空格分隔參數",
             ))
+        });
+        let custom_agent_env = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .rows(4)
+                .placeholder(management_locale_text(
+                    "Environment: KEY=value, one per line (optional)",
+                    "环境变量：KEY=value，每行一个（可选）",
+                    "環境變數：KEY=value，每行一個（選填）",
+                ))
         });
         let mcp_search = cx.new(|cx| InputState::new(window, cx).placeholder(copy.search_mcp));
         let skill_search = cx.new(|cx| InputState::new(window, cx).placeholder(copy.search_skills));
@@ -1169,8 +1188,10 @@ impl ManagementCenter {
             agent_search,
             custom_agent_id,
             custom_agent_label,
+            custom_agent_description,
             custom_agent_command,
             custom_agent_args,
+            custom_agent_env,
             mcp_search,
             skill_search,
             profile_name,
@@ -1436,6 +1457,7 @@ impl ManagementCenter {
         if self.selected_agent_id.as_deref() == Some(agent_id.as_str()) {
             return;
         }
+        self.custom_agent_editor_open = false;
         self.selected_agent_id = Some(agent_id);
         self.selected_provider_profile_id = None;
         self.selected_acp_profile_id = None;
@@ -4698,6 +4720,12 @@ impl ManagementCenter {
     fn create_custom_agent(&mut self, cx: &mut Context<Self>) {
         let id = self.custom_agent_id.read(cx).value().trim().to_string();
         let label = self.custom_agent_label.read(cx).value().trim().to_string();
+        let description = self
+            .custom_agent_description
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
         let command = self
             .custom_agent_command
             .read(cx)
@@ -4711,6 +4739,45 @@ impl ManagementCenter {
             .split_whitespace()
             .map(ToString::to_string)
             .collect();
+        let mut env = BTreeMap::new();
+        for line in self.custom_agent_env.read(cx).value().lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                self.error = Some(
+                    management_locale_text(
+                        "Environment variables must use KEY=value, one per line",
+                        "环境变量必须使用 KEY=value 格式，每行一个",
+                        "環境變數必須使用 KEY=value 格式，每行一個",
+                    )
+                    .into(),
+                );
+                cx.notify();
+                return;
+            };
+            let key = key.trim();
+            if key.is_empty()
+                || !key.bytes().enumerate().all(|(index, byte)| {
+                    byte == b'_'
+                        || byte.is_ascii_alphabetic()
+                        || (index > 0 && byte.is_ascii_digit())
+                })
+            {
+                self.error = Some(
+                    management_locale_text(
+                        "Environment variable names may contain letters, digits, and underscores",
+                        "环境变量名只能包含字母、数字和下划线",
+                        "環境變數名稱只能包含字母、數字和底線",
+                    )
+                    .into(),
+                );
+                cx.notify();
+                return;
+            }
+            env.insert(key.to_string(), value.trim().to_string());
+        }
         let Ok(agent_id) = AgentId::parse(id) else {
             self.error = Some(
                 management_locale_text(
@@ -4752,9 +4819,9 @@ impl ManagementCenter {
                     .create_custom_agent(vibex_core::CustomAgentCreateRequest {
                         agent_id,
                         label,
-                        description: None,
+                        description: (!description.is_empty()).then_some(description),
                         command: vibex_core::AgentCommandConfig { command, args },
-                        env: BTreeMap::new(),
+                        env,
                     })?;
                 Ok(management_locale_text(
                     "Custom ACP Agent added",
@@ -7720,64 +7787,74 @@ impl ManagementCenter {
             agent_rows = agent_rows.child(row);
         }
 
+        let add_card = v_flex()
+            .id("management-custom-agent-open")
+            .role(Role::Button)
+            .aria_label(management_locale_text(
+                "Add custom ACP Agent",
+                "添加自定义 ACP Agent",
+                "新增自訂 ACP Agent",
+            ))
+            .focusable()
+            .tab_index(0)
+            .cursor_pointer()
+            .w_full()
+            .h(px(76.0))
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .rounded(px(10.0))
+            .border_1()
+            .border_color(cx.theme().border.opacity(0.70))
+            .bg(if self.custom_agent_editor_open {
+                cx.theme().primary.opacity(0.08)
+            } else {
+                cx.theme().background.opacity(0.70)
+            })
+            .hover(|style| style.bg(cx.theme().accent))
+            .child(
+                div()
+                    .size(px(32.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(16.0))
+                    .bg(cx.theme().primary.opacity(0.10))
+                    .text_color(cx.theme().primary)
+                    .child(Icon::new(IconName::Plus).size(px(18.0))),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .font_medium()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text(
+                        "Add custom ACP Agent",
+                        "添加自定义 ACP Agent",
+                        "新增自訂 ACP Agent",
+                    )),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.custom_agent_editor_open = true;
+                this.selected_agent_id = None;
+                this.selected_provider_profile_id = None;
+                cx.notify();
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "enter" || event.keystroke.key == "space" {
+                    this.custom_agent_editor_open = true;
+                    this.selected_agent_id = None;
+                    this.selected_provider_profile_id = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }));
+
         v_flex()
             .size_full()
             .min_h_0()
             .gap(px(10.0))
-            .child(
-                h_flex()
-                    .w_full()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(management_search_input(&self.agent_search, cx)),
-                    )
-                    .child(
-                        Button::new("management-custom-agent-open")
-                            .small()
-                            .outline()
-                            .icon(IconName::Plus)
-                            .label(management_locale_text("Custom", "自定义", "自訂"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.custom_agent_editor_open = !this.custom_agent_editor_open;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .when(self.custom_agent_editor_open, |panel| {
-                panel.child(
-                    v_flex()
-                        .w_full()
-                        .gap_2()
-                        .rounded(px(8.0))
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .p_2()
-                        .child(div().text_sm().font_medium().child(management_locale_text(
-                            "Add custom ACP Agent",
-                            "添加自定义 ACP Agent",
-                            "新增自訂 ACP Agent",
-                        )))
-                        .child(Input::new(&self.custom_agent_id).small().w_full())
-                        .child(Input::new(&self.custom_agent_label).small().w_full())
-                        .child(Input::new(&self.custom_agent_command).small().w_full())
-                        .child(Input::new(&self.custom_agent_args).small().w_full())
-                        .child(
-                            Button::new("management-custom-agent-save")
-                                .small()
-                                .primary()
-                                .label(management_locale_text(
-                                    "Add Agent",
-                                    "添加 Agent",
-                                    "新增 Agent",
-                                ))
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.create_custom_agent(cx)),
-                                ),
-                        ),
-                )
-            })
+            .child(management_search_input(&self.agent_search, cx))
             .child(
                 div()
                     .id("management-agent-list-scroll")
@@ -7785,7 +7862,7 @@ impl ManagementCenter {
                     .flex_1()
                     .overflow_y_scroll()
                     .pr_1()
-                    .child(agent_rows),
+                    .child(agent_rows.child(add_card)),
             )
             .into_any_element()
     }
@@ -9908,8 +9985,162 @@ impl ManagementCenter {
         )
     }
 
+    fn render_custom_agent_editor(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let pending = self.agent_mutations.values().any(|mutation| {
+            matches!(mutation, ManagementMutation::AgentToggle(action) if action.starts_with("custom:"))
+        });
+        v_flex()
+            .w_full()
+            .max_w(px(720.0))
+            .gap_4()
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xl()
+                            .font_semibold()
+                            .child(management_locale_text(
+                                "Add custom ACP Agent",
+                                "添加自定义 ACP Agent",
+                                "新增自訂 ACP Agent",
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text(
+                                "Register an ACP-compatible executable. Vibex starts it with the command, arguments, and environment below.",
+                                "注册兼容 ACP 的可执行程序。Vibex 将使用下方的命令、参数和环境变量启动它。",
+                                "註冊相容 ACP 的執行檔。Vibex 將使用下方的命令、參數與環境變數啟動它。",
+                            )),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .w_full()
+                    .gap_3()
+                    .rounded(px(10.0))
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().background.opacity(0.70))
+                    .p_4()
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_3()
+                            .child(
+                                div().flex_1().min_w_0().child(management_input_field(
+                                    management_locale_text("Agent ID", "Agent ID", "Agent ID"),
+                                    &self.custom_agent_id,
+                                    false,
+                                    cx,
+                                )),
+                            )
+                            .child(
+                                div().flex_1().min_w_0().child(management_input_field(
+                                    management_locale_text(
+                                        "Display name",
+                                        "显示名称",
+                                        "顯示名稱",
+                                    ),
+                                    &self.custom_agent_label,
+                                    false,
+                                    cx,
+                                )),
+                            ),
+                    )
+                    .child(management_input_field(
+                        management_locale_text("Description", "描述（可选）", "描述（選填）"),
+                        &self.custom_agent_description,
+                        false,
+                        cx,
+                    ))
+                    .child(management_input_field(
+                        management_locale_text("ACP command", "ACP 命令", "ACP 命令"),
+                        &self.custom_agent_command,
+                        false,
+                        cx,
+                    ))
+                    .child(management_input_field(
+                        management_locale_text("Arguments", "启动参数", "啟動參數"),
+                        &self.custom_agent_args,
+                        false,
+                        cx,
+                    ))
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_medium()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(management_locale_text(
+                                        "Environment variables",
+                                        "环境变量（可选）",
+                                        "環境變數（選填）",
+                                    )),
+                            )
+                            .child(
+                                Input::new(&self.custom_agent_env)
+                                    .small()
+                                    .h(px(96.0))
+                                    .w_full(),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(management_locale_text(
+                                        "Use KEY=value, one entry per line. Secrets remain in the desktop runtime configuration.",
+                                        "使用 KEY=value 格式，每行一个。敏感值保存在桌面运行时配置中。",
+                                        "使用 KEY=value 格式，每行一個。敏感值保存在桌面執行階段設定中。",
+                                    )),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("management-custom-agent-cancel")
+                                    .small()
+                                    .ghost()
+                                    .label(management_locale_text("Cancel", "取消", "取消"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.custom_agent_editor_open = false;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("management-custom-agent-save")
+                                    .small()
+                                    .primary()
+                                    .label(management_locale_text(
+                                        "Add Agent",
+                                        "添加 Agent",
+                                        "新增 Agent",
+                                    ))
+                                    .loading(pending)
+                                    .disabled(pending)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.create_custom_agent(cx)
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_providers(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let copy = management_copy();
+        if self.custom_agent_editor_open {
+            return self.render_custom_agent_editor(cx);
+        }
         if self.loading && !self.details_ready {
             return detail_empty_state(
                 management_loading_agents_title(),
@@ -16103,7 +16334,10 @@ fn load_agent_snapshot(runtime: Arc<DesktopRuntime>) -> VibexResult<Vec<AgentSna
         })?
         .agents
         .into_iter()
-        .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
+        .filter(|agent| {
+            agent.source_kind == vibex_core::AgentSourceKind::Custom
+                || vibex_core::is_user_visible_agent(&agent.id)
+        })
         .collect())
 }
 
@@ -16125,7 +16359,10 @@ async fn load_snapshot(
         })?
         .agents
         .into_iter()
-        .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
+        .filter(|agent| {
+            agent.source_kind == vibex_core::AgentSourceKind::Custom
+                || vibex_core::is_user_visible_agent(&agent.id)
+        })
         .collect::<Vec<_>>();
     let mut catalog = provider.list_agent_catalog()?;
     catalog
@@ -17695,7 +17932,7 @@ mod tests {
             .expect("Authentication renderer should remain inspectable");
         let install = source
             .split_once("    fn render_agent_installation_card(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn render_providers("))
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_custom_agent_editor("))
             .map(|(body, _)| body)
             .expect("Installation renderer should remain inspectable");
         let render = source
@@ -17962,6 +18199,44 @@ mod tests {
     }
 
     #[test]
+    fn custom_agent_editor_uses_the_right_detail_panel_and_persists_supported_fields() {
+        let source = include_str!("management.rs");
+        let editor = source
+            .split_once("    fn render_custom_agent_editor(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_providers("))
+            .map(|(body, _)| body)
+            .expect("custom Agent editor should remain inspectable");
+        let create = source
+            .split_once("    fn create_custom_agent(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn set_agent_added("))
+            .map(|(body, _)| body)
+            .expect("custom Agent mutation should remain inspectable");
+        let providers = source
+            .split_once("    fn render_providers(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_mcp("))
+            .map(|(body, _)| body)
+            .expect("Provider renderer should remain inspectable");
+
+        assert!(providers.contains("return self.render_custom_agent_editor(cx);"));
+        for field in [
+            "custom_agent_id",
+            "custom_agent_label",
+            "custom_agent_description",
+            "custom_agent_command",
+            "custom_agent_args",
+            "custom_agent_env",
+        ] {
+            assert!(
+                editor.contains(field),
+                "missing custom Agent field: {field}"
+            );
+        }
+        assert!(create.contains("description: (!description.is_empty()).then_some(description)"));
+        assert!(create.contains("env,"));
+        assert!(create.contains("line.split_once('=')"));
+    }
+
+    #[test]
     fn config_center_snapshot_refreshes_versioned_agents_before_projection_load() {
         let source = include_str!("management.rs");
         let load_snapshot = source
@@ -17973,7 +18248,7 @@ mod tests {
             .find("provider.refresh_detected_agent_versions()?")
             .expect("Config Center snapshot must refresh detected Agent versions");
         let agent_list = load_snapshot
-            .find("let agents = provider.list_agents(AgentListRequest")
+            .find("let agents = provider")
             .expect("Config Center snapshot must load Agent snapshots");
         assert!(
             version_refresh < agent_list,
@@ -18013,6 +18288,9 @@ mod tests {
         assert!(!render_agents.contains("management-agent-select-"));
         assert!(render_agents.contains("agents.sort_by_cached_key(management_agent_sort_key);"));
         assert!(render_agents.contains("management-agent-add-{add_id}"));
+        assert!(render_agents.contains("let add_card = v_flex()"));
+        assert!(render_agents.contains("agent_rows.child(add_card)"));
+        assert!(render_agents.contains("this.custom_agent_editor_open = true;"));
         assert!(!render_agents.contains("management-agent-remove-"));
         assert!(!render_agents.contains("management-agent-catalog-"));
         assert!(render_agents.contains("cx.theme().primary.opacity(0.08)"));
