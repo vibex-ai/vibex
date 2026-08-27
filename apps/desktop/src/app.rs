@@ -16319,11 +16319,7 @@ impl VibexWorkbench {
         if open {
             self.runtime_choice_menu_open = None;
             let selection = self.selected_runtime_selection();
-            self.composer_runtime_menu_view = if selection.is_some() {
-                ComposerRuntimeMenuView::AuthSource
-            } else {
-                ComposerRuntimeMenuView::Agent
-            };
+            self.composer_runtime_menu_view = ComposerRuntimeMenuView::Agent;
             self.composer_runtime_menu_agent_id = selection
                 .as_ref()
                 .map(|selection| selection.agent_id.clone());
@@ -51803,6 +51799,11 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n}"))
             .map(|(body, _)| body)
             .expect("runtime menu view should remain inspectable");
+        let menu_opening = source
+            .split_once("    fn set_composer_runtime_menu_open(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn navigate_composer_runtime_menu("))
+            .map(|(body, _)| body)
+            .expect("runtime menu opening should remain inspectable");
         let operations = source
             .split_once("    fn load_runtime_authentication_menu(")
             .and_then(|(_, tail)| tail.split_once("\n    fn retry_runtime_selection("))
@@ -51830,6 +51831,11 @@ mod tests {
             .expect("current-session runtime cascade should remain inspectable");
 
         assert!(menu_view.contains("Authentication"));
+        assert!(
+            menu_opening
+                .contains("self.composer_runtime_menu_view = ComposerRuntimeMenuView::Agent;"),
+            "opening the current-session selector must start with Agent selection"
+        );
         assert!(grouped_models.contains("RuntimeAuthSourceKind::AgentAccount"));
         assert!(grouped_models.contains("sort_by_key"));
         assert!(
