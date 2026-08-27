@@ -227,6 +227,7 @@ const SIDEBAR_REORDER_ROW_HEIGHT: f32 = 32.0;
 const SIDEBAR_PROJECT_GROUP_GAP: f32 = 12.0;
 const SIDEBAR_PROJECT_REORDER_GAP: f32 = 12.0;
 const SIDEBAR_PROJECT_CONTENT_GAP: f32 = 4.0;
+const SIDEBAR_SESSION_VIEW_INDENT: f32 = 12.0;
 const SIDEBAR_SESSION_REORDER_GAP: f32 = 2.0;
 const SIDEBAR_WORKSPACE_REORDER_GAP: f32 = 5.0;
 const SIDEBAR_WORKSPACE_ROW_HEIGHT: f32 = 44.0;
@@ -22626,7 +22627,9 @@ impl VibexWorkbench {
                         .w_full()
                         .min_w_0()
                         .gap(px(2.0))
-                        .when(!detailed_hierarchy, |this| this.pl_6())
+                        .when(!detailed_hierarchy, |this| {
+                            this.pl(px(SIDEBAR_SESSION_VIEW_INDENT))
+                        })
                         .children(session_elements),
                 )
             });
@@ -49075,6 +49078,20 @@ mod tests {
             .map(|(body, _)| body)
             .expect("project renderer should remain inspectable");
         assert!(project.contains(".gap(px(SIDEBAR_PROJECT_CONTENT_GAP))"));
+    }
+
+    #[test]
+    fn session_view_aligns_session_logos_with_worktree_view() {
+        let source = include_str!("app.rs");
+        let project = source
+            .split_once("    fn render_sidebar_project(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_workspace("))
+            .map(|(body, _)| body)
+            .expect("project renderer should remain inspectable");
+
+        assert!(source.contains("const SIDEBAR_SESSION_VIEW_INDENT: f32 = 12.0;"));
+        assert!(project.contains("this.pl(px(SIDEBAR_SESSION_VIEW_INDENT))"));
+        assert!(!project.contains("this.pl_6()"));
     }
 
     #[test]
