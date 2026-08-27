@@ -3054,7 +3054,11 @@ impl AcpSessionAttachment {
                             next.effective_reasoning_effort = effective.map(|value| value.value);
                         }
                         "mode" => {
-                            next.effective_mode = effective.map(|value| value.value);
+                            next.effective_mode = normalize_reported_effective_mode(
+                                &process.agent_id,
+                                previous.preferred_mode.as_deref(),
+                                effective.map(|value| value.value),
+                            );
                         }
                         _ => {
                             next.config_values
@@ -18262,6 +18266,25 @@ fn runtime_prompt_content(text: &str, attachments: &[ProviderTurnAttachment]) ->
     content
 }
 
+fn normalize_reported_effective_mode(
+    agent_id: &AgentId,
+    preferred_mode: Option<&str>,
+    reported_mode: Option<String>,
+) -> Option<String> {
+    // ZCode's `auto` mode delegates each turn to a concrete internal mode and
+    // reports that transient choice (for example `build`) after the turn. The
+    // ACP config update describes what handled the completed turn, not a user
+    // selection change. Keeping it as the effective durable mode would make
+    // the next prompt fail its `auto` runtime fence before it reaches ZCode.
+    if agent_id.as_str() == crate::registry::ZCODE_AGENT_ID
+        && preferred_mode == Some("auto")
+        && reported_mode.as_deref().is_some_and(|mode| mode != "auto")
+    {
+        return Some("auto".to_string());
+    }
+    reported_mode
+}
+
 fn local_attachment_uri(path: &Path) -> String {
     url::Url::from_file_path(path)
         .map(|uri| uri.to_string())
@@ -18293,6 +18316,45 @@ mod tests {
     use super::*;
     use vibex_agent::AgentProvider;
     use vibex_core::{AgentAuthenticationOperation, AgentAuthenticationOperationState};
+
+    #[test]
+    fn zcode_auto_mode_ignores_transient_concrete_turn_mode() {
+        let zcode = AgentId::parse(crate::registry::ZCODE_AGENT_ID).unwrap();
+        let mut state = SessionRuntimeConfigState {
+            preferred_mode: Some("auto".to_string()),
+            effective_mode: Some("auto".to_string()),
+            applied_activation_generation: Some(1),
+            ..SessionRuntimeConfigState::default()
+        };
+
+        state.effective_mode = normalize_reported_effective_mode(
+            &zcode,
+            state.preferred_mode.as_deref(),
+            Some("build".to_string()),
+        );
+        state.applied_activation_generation = None;
+        state.mark_generation_if_converged(1);
+
+        assert_eq!(state.effective_mode.as_deref(), Some("auto"));
+        assert!(state.is_applied_to_generation(1));
+        assert_eq!(
+            normalize_reported_effective_mode(&zcode, Some("build"), Some("edit".to_string())),
+            Some("edit".to_string())
+        );
+        assert_eq!(
+            normalize_reported_effective_mode(&zcode, Some("auto"), Some("auto".to_string())),
+            Some("auto".to_string())
+        );
+    }
+
+    #[test]
+    fn other_agents_preserve_reported_mode_changes() {
+        let agent = AgentId::parse("mock-agent").unwrap();
+        assert_eq!(
+            normalize_reported_effective_mode(&agent, Some("auto"), Some("build".to_string())),
+            Some("build".to_string())
+        );
+    }
 
     #[test]
     fn zcode_cli_bundle_discovery_is_existing_or_absent() {

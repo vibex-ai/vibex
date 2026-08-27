@@ -356,6 +356,17 @@ let options = catalog.list().await?;
 The successful Agent snapshot provides fast fallback; real sessions calibrate
 only their own Profiles without probing during a catalog read.
 
+### ZCode ACP auto-mode compatibility note
+
+ZCode may execute an explicitly selected `auto` mode turn using a concrete
+internal mode such as `build`, then emit a trailing `config_option_update` whose
+current mode is that concrete turn mode. For the pinned ZCode Adapter, Vibex
+must keep the attachment's effective durable mode as `auto` while `auto` remains
+the preferred mode. Treating the transient concrete value as a user selection
+makes the runtime state non-converged and causes the next durable prompt to fail
+its execution fence with `turn_execution_identity_mismatch`. Explicit non-auto
+mode changes and mode reports from other Agents remain authoritative.
+
 ### CodeBuddy Code ACP compatibility note
 
 CodeBuddy Code 2.137.1 advertises reasoning as the `thought_level` select
