@@ -347,6 +347,7 @@ pub fn is_user_visible_agent(agent_id: &AgentId) -> bool {
             | "kimi"
             | "opencode"
             | "pi"
+            | "zcode"
             | "deepseek-harness"
     )
 }
@@ -936,6 +937,7 @@ mod tests {
             "kimi",
             "opencode",
             "pi",
+            "zcode",
         ]
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
