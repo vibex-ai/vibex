@@ -252,6 +252,9 @@ struct ComposerSubmissionLocator {
 const SIDEBAR_HOVER_PREVIEW_CLOSE_DELAY: Duration = Duration::from_millis(120);
 const SIDEBAR_HOVER_PREVIEW_SUPPRESS_DELAY: Duration = Duration::from_millis(450);
 const NEW_SESSION_PROJECT_MENU_TRANSITION_DURATION: Duration = Duration::from_millis(100);
+const NEW_SESSION_PROJECT_MENU_MAX_HEIGHT: f32 = 360.0;
+const NEW_SESSION_PROJECT_MENU_CHROME_HEIGHT: f32 = 116.0;
+const NEW_SESSION_PROJECT_MENU_ROW_HEIGHT: f32 = 28.0;
 const NEW_SESSION_AGENT_DRAG_HORIZONTAL_SLOP: f32 = 2.0;
 const NEW_SESSION_AGENT_DRAG_VERTICAL_SLOP: f32 = 8.0;
 const NEW_SESSION_COMPACT_SELECTOR_MAX_WIDTH: u32 = 860;
@@ -809,6 +812,12 @@ fn composer_runtime_menu_placement(
 
 fn composer_runtime_choice_menu_height(row_count: usize, max_height: f32) -> f32 {
     (12.0 + COMPOSER_RUNTIME_CHOICE_ROW_HEIGHT * row_count.max(1) as f32).min(max_height)
+}
+
+fn new_session_project_menu_height(row_count: usize) -> f32 {
+    (NEW_SESSION_PROJECT_MENU_CHROME_HEIGHT
+        + NEW_SESSION_PROJECT_MENU_ROW_HEIGHT * row_count.max(1) as f32)
+        .min(NEW_SESSION_PROJECT_MENU_MAX_HEIGHT)
 }
 
 fn composer_suggestion_menu_height(row_count: usize) -> f32 {
@@ -3812,6 +3821,7 @@ pub struct VibexWorkbench {
     new_session_project_search: Entity<InputState>,
     new_session_base_ref_search: Entity<InputState>,
     new_session_project_menu_focus: FocusHandle,
+    new_session_project_trigger_bounds: Option<Bounds<Pixels>>,
     workspaces: Vec<(ProjectRecord, WorkspaceRecord)>,
     sessions: Vec<AgentSession>,
     optimistically_removed_session_ids: BTreeSet<String>,
@@ -4483,6 +4493,7 @@ impl VibexWorkbench {
             new_session_project_search,
             new_session_base_ref_search,
             new_session_project_menu_focus,
+            new_session_project_trigger_bounds: None,
             workspaces: Vec::new(),
             sessions: Vec::new(),
             optimistically_removed_session_ids: BTreeSet::new(),
@@ -25150,6 +25161,7 @@ impl VibexWorkbench {
                 .into_any_element()
             })
             .collect::<Vec<_>>();
+        let project_row_count = project_rows.len();
         let project_results = if project_rows.is_empty() {
             div()
                 .px_2()
@@ -25162,6 +25174,12 @@ impl VibexWorkbench {
             v_flex().children(project_rows).into_any_element()
         };
         let project_menu_open = self.new_session_project_menu_open;
+        let project_menu_placement = composer_runtime_menu_placement(
+            self.new_session_project_trigger_bounds,
+            self.last_visibility.layout.viewport_height as f32,
+            new_session_project_menu_height(project_row_count),
+            NEW_SESSION_PROJECT_MENU_MAX_HEIGHT,
+        );
         let project_search_focused = self
             .new_session_project_search
             .focus_handle(cx)
@@ -25171,7 +25189,7 @@ impl VibexWorkbench {
             .track_focus(&self.new_session_project_menu_focus)
             .w(px(256.0))
             .min_w_0()
-            .max_h(window.viewport_size().height - px(16.0))
+            .max_h(px(project_menu_placement.height))
             .overflow_x_hidden()
             .overflow_y_scrollbar()
             .rounded(px(10.0))
@@ -25274,6 +25292,32 @@ impl VibexWorkbench {
                 .apply(project_menu_panel, "new-session-project-menu-close")
                 .into_any_element()
         };
+        let project_trigger_bounds_entity = cx.weak_entity();
+        let workspace_trigger_content = h_flex()
+            .h_full()
+            .min_w_0()
+            .gap(px(6.0))
+            .text_xs()
+            .font_medium()
+            .on_prepaint(move |bounds, _, cx| {
+                let _ = project_trigger_bounds_entity.update(cx, |this, cx| {
+                    if this.new_session_project_trigger_bounds != Some(bounds) {
+                        this.new_session_project_trigger_bounds = Some(bounds);
+                        if this.new_session_project_menu_open {
+                            cx.notify();
+                        }
+                    }
+                });
+            })
+            .child(Icon::new(IconName::Folder).size(px(16.0)))
+            .child(
+                div()
+                    .max_w(px(176.0))
+                    .min_w_0()
+                    .truncate()
+                    .child(workspace_label),
+            )
+            .child(Icon::new(IconName::ChevronDown).size(px(14.0)));
         let workspace_trigger = Button::new("new-session-workspace-menu")
             .small()
             .ghost()
@@ -25287,32 +25331,23 @@ impl VibexWorkbench {
             .when(project_menu_open, |this| {
                 this.bg(muted_color).text_color(popover_foreground)
             })
-            .child(
-                h_flex()
-                    .min_w_0()
-                    .gap(px(6.0))
-                    .text_xs()
-                    .font_medium()
-                    .child(Icon::new(IconName::Folder).size(px(16.0)))
-                    .child(
-                        div()
-                            .max_w(px(176.0))
-                            .min_w_0()
-                            .truncate()
-                            .child(workspace_label),
-                    )
-                    .child(Icon::new(IconName::ChevronDown).size(px(14.0))),
-            )
+            .child(workspace_trigger_content)
             .disabled(self.agent_action_pending);
         let workspace_button = Popover::new("new-session-project-menu")
             .appearance(false)
-            .anchor(Anchor::TopLeft)
+            .anchor(project_menu_placement.anchor)
             .open(self.new_session_project_menu_mounted)
             .on_open_change(cx.listener(|this, open, window, cx| {
                 this.set_new_session_project_menu_open(*open, window, cx)
             }))
             .trigger(workspace_trigger)
             .child(project_menu_content)
+            .map(|popover| match project_menu_placement.anchor {
+                Anchor::TopLeft | Anchor::TopCenter | Anchor::TopRight => {
+                    popover.top(px(project_menu_placement.trigger_offset))
+                }
+                _ => popover.bottom(px(project_menu_placement.trigger_offset)),
+            })
             .into_any_element();
 
         let can_create_worktree = self.backend.as_ref().is_some_and(|backend| {
@@ -51421,6 +51456,57 @@ mod tests {
         assert_eq!(
             composer_runtime_menu_height(ComposerRuntimeMenuView::Model, 20, 448.0),
             448.0
+        );
+    }
+
+    #[test]
+    fn new_session_project_menu_uses_content_height_until_its_cap() {
+        assert_eq!(new_session_project_menu_height(0), 144.0);
+        assert_eq!(new_session_project_menu_height(3), 200.0);
+        assert_eq!(new_session_project_menu_height(20), 360.0);
+    }
+
+    #[test]
+    fn new_session_project_menu_placement_stays_attached_to_its_trigger() {
+        let near_top = Bounds {
+            origin: gpui::Point {
+                x: px(100.0),
+                y: px(120.0),
+            },
+            size: Size {
+                width: px(224.0),
+                height: px(32.0),
+            },
+        };
+        let near_bottom = Bounds {
+            origin: gpui::Point {
+                x: px(100.0),
+                y: px(760.0),
+            },
+            size: Size {
+                width: px(224.0),
+                height: px(32.0),
+            },
+        };
+        assert_eq!(
+            composer_runtime_menu_placement(
+                Some(near_top),
+                900.0,
+                new_session_project_menu_height(3),
+                NEW_SESSION_PROJECT_MENU_MAX_HEIGHT,
+            )
+            .anchor,
+            Anchor::TopLeft
+        );
+        assert_eq!(
+            composer_runtime_menu_placement(
+                Some(near_bottom),
+                900.0,
+                new_session_project_menu_height(20),
+                NEW_SESSION_PROJECT_MENU_MAX_HEIGHT,
+            )
+            .anchor,
+            Anchor::BottomLeft
         );
     }
 
