@@ -30,6 +30,7 @@ pub const WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE: &str = "aws_bedrock_converse";
 pub const CLAUDE_PROJECTION_DESCRIPTOR_ID: &str = "projection_claude_environment_v1";
 pub const CODEX_PROJECTION_DESCRIPTOR_ID: &str = "projection_codex_stable_home_v1";
 pub const OPENCODE_PROJECTION_DESCRIPTOR_ID: &str = "projection_opencode_inline_provider_v1";
+pub const ZCODE_PROJECTION_DESCRIPTOR_ID: &str = "projection_zcode_private_config_v1";
 
 const CLAUDE_AGENT_ID: &str = "claude";
 const CLAUDE_ADAPTER_ID: &str = "claude-agent-acp";
@@ -44,6 +45,9 @@ const CODEX_RUNTIME_PACKAGE: &str = "@openai/codex";
 const CODEX_RUNTIME_VERSION: &str = "0.146.0";
 const OPENCODE_AGENT_ID: &str = "opencode";
 const OPENCODE_ADAPTER_ID: &str = "opencode-acp";
+const ZCODE_AGENT_ID: &str = "zcode";
+const ZCODE_ADAPTER_ID: &str = "zcode-acp-server";
+pub const ZCODE_ADAPTER_VERSION: &str = "0.11.9";
 /// Automatic provider projection remains available after an Agent upgrade
 /// once the runtime is at least the first verified version for its descriptor.
 pub const OPENCODE_COMPATIBLE_VERSION_REQUIREMENT: &str = ">=1.17.9";
@@ -692,6 +696,7 @@ pub enum ConfigOverlayStrategy {
     QwenCodeJson,
     StakpakToml,
     VtcodeToml,
+    ZcodeJson,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -983,6 +988,7 @@ impl AgentProviderProjectionRegistry {
             claude_projection_descriptor()?,
             codex_projection_descriptor()?,
             opencode_projection_descriptor()?,
+            zcode_projection_descriptor()?,
         ] {
             registry.register(descriptor)?;
         }
@@ -1596,6 +1602,44 @@ fn opencode_projection_descriptor() -> VibexResult<AgentProviderProjectionDescri
             "provider-config/opencode-inline-provider-v1",
             &format!("acp-smoke/opencode-{OPENCODE_LAST_VERIFIED_VERSION}"),
         ),
+    })
+}
+
+fn zcode_projection_descriptor() -> VibexResult<AgentProviderProjectionDescriptor> {
+    Ok(AgentProviderProjectionDescriptor {
+        id: AgentProviderProjectionDescriptorId::parse(ZCODE_PROJECTION_DESCRIPTOR_ID)?,
+        descriptor_version: "1".to_string(),
+        route: route(ZCODE_AGENT_ID, ZCODE_ADAPTER_ID)?,
+        compatibility: AgentVersionCompatibility::Exact {
+            adapter_version: Some(ZCODE_ADAPTER_VERSION.to_string()),
+            agent_version: None,
+            runtime_dependencies: BTreeMap::new(),
+        },
+        provider_control: AgentProviderControl::ManagedConfigOverlay {
+            strategy: ConfigOverlayStrategy::ZcodeJson,
+        },
+        credential_control: AgentCredentialControl::Environment {
+            secret_env_key: "ANTHROPIC_API_KEY".to_string(),
+            accepted_secret_kinds: vec![ProviderSecretKind::ApiKey, ProviderSecretKind::AuthToken],
+        },
+        model_control: AgentModelControl::ManagedConfigOverlay {
+            strategy: ConfigOverlayStrategy::ZcodeJson,
+        },
+        credential_kinds: vec![AgentCredentialKind::ApiKey],
+        model_interfaces: vec![
+            interface(WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, "openai-compatible"),
+            interface(WIRE_PROTOCOL_ANTHROPIC_MESSAGES, "anthropic"),
+        ],
+        runtime_home_strategy: AgentRuntimeHomeStrategy::VibexPrivate,
+        switch_behavior: ProviderSwitchBehavior::RestartAndResume,
+        evidence: ProjectionEvidenceReference {
+            state: ProjectionEvidenceState::Documented,
+            source_reference: Some(
+                "zcode-acp-server@0.11.9/provider-registry-and-runtime-model".to_string(),
+            ),
+            runtime_reference: None,
+            diagnostic_code: Some("agent_projection_runtime_verification_required".to_string()),
+        },
     })
 }
 

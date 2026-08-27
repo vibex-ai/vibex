@@ -1564,6 +1564,11 @@ fn private_home_env_key(agent_id: &str) -> Option<&'static str> {
         "qwen-code" => Some("QWEN_HOME"),
         "stakpak" => None,
         "vtcode" => Some("VTCODE_CONFIG_PATH"),
+        // zcode-acp-server resolves provider state from
+        // $HOME/.zcode/v2/config.json. Point HOME at the stable private
+        // projection root so Provider Profiles never rewrite native ZCode
+        // configuration in the user's real home.
+        "zcode" => Some("HOME"),
         _ => None,
     }
 }
@@ -1828,6 +1833,17 @@ fn build_overlay(
             "vtcode.toml",
             "toml",
             vtcode_overlay(
+                provider,
+                endpoint,
+                model,
+                require_secret_env_key(secret_env_key)?,
+            )?,
+            true,
+        ),
+        ConfigOverlayStrategy::ZcodeJson => (
+            ".zcode/v2/config.json",
+            "json",
+            zcode_overlay(
                 provider,
                 endpoint,
                 model,
@@ -2229,6 +2245,30 @@ fn projected_runtime_model_id(
     if matches!(
         descriptor.provider_control,
         AgentProviderControl::ManagedConfigOverlay {
+            strategy: ConfigOverlayStrategy::ZcodeJson
+        }
+    ) || matches!(
+        descriptor.model_control,
+        AgentModelControl::ManagedConfigOverlay {
+            strategy: ConfigOverlayStrategy::ZcodeJson
+        }
+    ) {
+        // zcode-acp-server uses a bare model id for built-in ZCode plans and
+        // `providerId\\modelId` for projected third-party providers. Vibex
+        // projections are always custom providers, so preserve that ownership
+        // in the ACP model option instead of letting the bridge resolve the id
+        // against an unrelated built-in plan.
+        let provider_id = sanitize_provider_id(
+            provider
+                .vendor_hint
+                .as_deref()
+                .unwrap_or_else(|| provider.id.as_str()),
+        );
+        return format!("{provider_id}\\{}", model.agent_model_id);
+    }
+    if matches!(
+        descriptor.provider_control,
+        AgentProviderControl::ManagedConfigOverlay {
             strategy: ConfigOverlayStrategy::PiModelsJson
         }
     ) || matches!(
@@ -2367,6 +2407,76 @@ fn serialized_yaml(value: serde_json::Value) -> VibexResult<String> {
         .with_diagnostic("format", "yaml")
         .with_diagnostic("error", error.to_string())
     })
+}
+
+fn zcode_overlay(
+    provider: &ModelProviderProfile,
+    endpoint: Option<&ModelProviderEndpoint>,
+    model: Option<&AgentConfiguredModelBinding>,
+    secret_env_key: &str,
+) -> VibexResult<String> {
+    let provider_id = sanitize_provider_id(
+        provider
+            .vendor_hint
+            .as_deref()
+            .unwrap_or_else(|| provider.id.as_str()),
+    );
+    let model_id = projection_model_id(model).unwrap_or("vibex-model");
+    let kind = match projection_wire_protocol(model) {
+        vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => "anthropic",
+        _ => "openai-compatible",
+    };
+    let mut options = serde_json::Map::new();
+    json_string_if_present(
+        &mut options,
+        "baseURL",
+        endpoint.map(|endpoint| endpoint.url.as_str()),
+    );
+    options.insert(
+        "apiKey".to_string(),
+        serde_json::Value::String(overlay_secret_placeholder(secret_env_key)),
+    );
+    options.insert("apiKeyRequired".to_string(), serde_json::Value::Bool(true));
+
+    let capabilities = model.and_then(|binding| {
+        provider
+            .configured_models
+            .iter()
+            .find(|configured| configured.id == binding.provider_model_id)
+            .map(|configured| &configured.capabilities)
+    });
+    let mut model_entry = serde_json::Map::new();
+    model_entry.insert(
+        "name".to_string(),
+        serde_json::Value::String(model_id.to_string()),
+    );
+    if let Some(context) = capabilities.and_then(|value| value.context_tokens) {
+        model_entry.insert(
+            "limit".to_string(),
+            serde_json::json!({ "context": context }),
+        );
+    }
+    if capabilities.and_then(|value| value.reasoning) == Some(true) {
+        model_entry.insert(
+            "reasoning".to_string(),
+            serde_json::json!({ "enabled": true }),
+        );
+    }
+
+    serialized_json(serde_json::json!({
+        "provider": {
+            provider_id: {
+                "name": provider.display_name,
+                "kind": kind,
+                "enabled": true,
+                "source": "custom",
+                "options": options,
+                "models": {
+                    model_id: model_entry,
+                },
+            }
+        }
+    }))
 }
 
 fn crow_cli_overlay(
@@ -3511,6 +3621,50 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn zcode_overlay_projects_private_provider_registry_config() {
+        let (mut provider, _, binding, _) = fixture(ConfigOverlayStrategy::ZcodeJson);
+        provider.endpoints[0].wire_protocol_id =
+            Some(vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string());
+        let mut model = binding.configured_models[0].clone();
+        model.wire_protocol_id = vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string();
+
+        let overlay = zcode_overlay(
+            &provider,
+            provider.endpoints.first(),
+            Some(&model),
+            "ANTHROPIC_API_KEY",
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&overlay).unwrap();
+        let projected = &value["provider"]["fake"];
+
+        assert_eq!(projected["kind"], "anthropic");
+        assert_eq!(projected["enabled"], true);
+        assert_eq!(
+            projected["options"]["baseURL"],
+            "https://user:pass@example.invalid/v1?token=never-preview"
+        );
+        assert_eq!(
+            projected["options"]["apiKey"],
+            overlay_secret_placeholder("ANTHROPIC_API_KEY")
+        );
+        assert!(projected["models"]["model-a"].is_object());
+
+        let mut descriptor = fixture(ConfigOverlayStrategy::ZcodeJson).3;
+        descriptor.route.agent_id = AgentId::parse("zcode").unwrap();
+        descriptor.provider_control = AgentProviderControl::ManagedConfigOverlay {
+            strategy: ConfigOverlayStrategy::ZcodeJson,
+        };
+        descriptor.model_control = AgentModelControl::ManagedConfigOverlay {
+            strategy: ConfigOverlayStrategy::ZcodeJson,
+        };
+        assert_eq!(
+            projected_runtime_model_id(&provider, &descriptor, &model),
+            "fake\\model-a"
+        );
+    }
 
     fn fixture(
         strategy: ConfigOverlayStrategy,

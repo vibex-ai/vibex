@@ -707,13 +707,14 @@ fn catalog_manifest_entry(
     Ok(entry)
 }
 
-/// Returns the complete checked matrix: three builtins plus every catalog id.
+/// Returns the complete checked matrix: four builtins plus every catalog id.
 pub fn agent_provider_rollout_manifest() -> VibexResult<Vec<AgentProviderRolloutManifestEntry>> {
-    let mut entries = Vec::with_capacity(acp_agent_catalog_entries().len() + 3);
+    let mut entries = Vec::with_capacity(acp_agent_catalog_entries().len() + 4);
     for (id, version) in [
         ("claude", "0.64.2"),
         ("codex", "0.146.0"),
         ("opencode", OPENCODE_LAST_VERIFIED_VERSION),
+        ("zcode", crate::provider_projection::ZCODE_ADAPTER_VERSION),
     ] {
         let agent_id = AgentId::parse(id)?;
         entries.push(AgentProviderRolloutManifestEntry {
@@ -723,7 +724,8 @@ pub fn agent_provider_rollout_manifest() -> VibexResult<Vec<AgentProviderRollout
             descriptor_id: AgentProviderProjectionDescriptorId::parse(match id {
                 "claude" => "projection_claude_environment_v1",
                 "codex" => "projection_codex_stable_home_v1",
-                _ => "projection_opencode_inline_provider_v1",
+                "opencode" => "projection_opencode_inline_provider_v1",
+                _ => crate::provider_projection::ZCODE_PROJECTION_DESCRIPTOR_ID,
             })?,
             descriptor_version: "1".to_string(),
             version_policy: if id == "opencode" {
@@ -737,7 +739,14 @@ pub fn agent_provider_rollout_manifest() -> VibexResult<Vec<AgentProviderRollout
             runtime_home_strategy: AgentRuntimeHomeStrategy::VibexPrivate,
             switch_behavior: ProviderSwitchBehavior::RestartAndResume,
             credential_kinds: vec![AgentCredentialKind::ApiKey],
-            model_interfaces: Vec::new(),
+            model_interfaces: if id == "zcode" {
+                vec![
+                    catalog_interface(WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, true, true),
+                    catalog_interface(WIRE_PROTOCOL_ANTHROPIC_MESSAGES, true, true),
+                ]
+            } else {
+                Vec::new()
+            },
             // The platform descriptor is known, but a runtime probe is the
             // only authority allowed to promote a concrete profile to
             // Verified. The rollout manifest therefore starts conservatively.
@@ -777,7 +786,7 @@ pub fn validate_rollout_manifest(entries: &[AgentProviderRolloutManifestEntry]) 
         .iter()
         .map(|entry| entry.agent_id.as_str())
         .collect::<BTreeSet<_>>();
-    let expected_count = acp_agent_catalog_entries().len() + 3;
+    let expected_count = acp_agent_catalog_entries().len() + 4;
     if entries.len() != expected_count || actual.len() != entries.len() {
         return Err(VibexError::conflict(
             "agent_rollout_manifest_coverage_invalid",
@@ -787,7 +796,7 @@ pub fn validate_rollout_manifest(entries: &[AgentProviderRolloutManifestEntry]) 
     let catalog_actual = actual
         .iter()
         .copied()
-        .filter(|id| !matches!(*id, "claude" | "codex" | "opencode"))
+        .filter(|id| !matches!(*id, "claude" | "codex" | "opencode" | "zcode"))
         .collect::<BTreeSet<_>>();
     if catalog_actual != expected_catalog {
         return Err(VibexError::conflict(
@@ -1310,7 +1319,7 @@ mod tests {
     fn manifest_has_exact_catalog_coverage_and_unique_routes() {
         let manifest = agent_provider_rollout_manifest().unwrap();
         validate_rollout_manifest(&manifest).unwrap();
-        assert_eq!(manifest.len(), 36);
+        assert_eq!(manifest.len(), 37);
         assert!(manifest.iter().any(|entry| entry.agent_id.as_str() == "pi"));
         let antigravity = manifest
             .iter()
@@ -1746,6 +1755,7 @@ mod tests {
             "glm-acp-agent",
             "copilot",
             "qwen-code",
+            "zcode",
         ] {
             assert!(
                 supported.contains(&AgentId::parse(agent_id).unwrap()),
