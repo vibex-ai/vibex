@@ -1678,6 +1678,17 @@ fn build_overlay(
             codex_overlay(provider, endpoint, model),
             false,
         ),
+        ConfigOverlayStrategy::DeepseekHarnessSettingsYaml => (
+            "settings.yaml",
+            "yaml",
+            deepseek_harness_overlay(
+                provider,
+                endpoint,
+                model,
+                require_secret_env_key(secret_env_key)?,
+            )?,
+            false,
+        ),
         ConfigOverlayStrategy::OpenCodeInlineProvider => (
             "opencode.json",
             "json",
@@ -2861,6 +2872,86 @@ fn mistral_vibe_overlay(
     }))
 }
 
+fn deepseek_harness_overlay(
+    provider: &ModelProviderProfile,
+    endpoint: Option<&ModelProviderEndpoint>,
+    model: Option<&AgentConfiguredModelBinding>,
+    secret_env_key: &str,
+) -> VibexResult<String> {
+    let model_id = projection_model_id(model).unwrap_or("vibex-model");
+    let provider_id = sanitize_provider_id(
+        provider
+            .vendor_hint
+            .as_deref()
+            .unwrap_or_else(|| provider.id.as_str()),
+    );
+    let configured_model = model.and_then(|binding| {
+        provider.configured_models.iter().find(|configured| {
+            configured.id == binding.provider_model_id || configured.id == binding.agent_model_id
+        })
+    });
+    let capabilities = configured_model.map(|model| &model.capabilities);
+    let context_window = capabilities
+        .and_then(|capabilities| capabilities.context_tokens)
+        .unwrap_or(262_144);
+    let max_tokens = capabilities
+        .and_then(|capabilities| capabilities.output_tokens)
+        .unwrap_or(32_768);
+    let mut model_entry = serde_json::Map::new();
+    model_entry.insert("id".to_string(), serde_json::json!(model_id));
+    if let Some(display_name) = configured_model.and_then(|model| model.display_name.as_deref()) {
+        model_entry.insert("name".to_string(), serde_json::json!(display_name));
+    }
+    model_entry.insert(
+        "contextWindow".to_string(),
+        serde_json::json!(context_window),
+    );
+    model_entry.insert("maxTokens".to_string(), serde_json::json!(max_tokens));
+    let mut input = vec!["text"];
+    if capabilities.and_then(|capabilities| capabilities.image_input) == Some(true) {
+        input.push("image");
+    }
+    model_entry.insert("input".to_string(), serde_json::json!(input));
+    if capabilities.and_then(|capabilities| capabilities.reasoning) == Some(false) {
+        model_entry.insert("reasoningEfforts".to_string(), serde_json::json!(false));
+    }
+
+    let mut route = serde_json::Map::new();
+    route.insert(
+        "displayName".to_string(),
+        serde_json::json!(provider.display_name),
+    );
+    route.insert("apiKeyEnv".to_string(), serde_json::json!(secret_env_key));
+    route.insert(
+        "api".to_string(),
+        serde_json::json!(deepseek_harness_api(model)),
+    );
+    json_string_if_present(
+        &mut route,
+        "baseURL",
+        endpoint.map(|endpoint| endpoint.url.as_str()),
+    );
+    route.insert("models".to_string(), serde_json::json!([model_entry]));
+
+    serialized_yaml(serde_json::json!({
+        "llm-pi-ai": {
+            "providers": {provider_id.clone(): route},
+        },
+        "agent-default-model": {
+            "provider": provider_id,
+            "model": model_id,
+        },
+    }))
+}
+
+fn deepseek_harness_api(model: Option<&AgentConfiguredModelBinding>) -> &'static str {
+    match projection_wire_protocol(model) {
+        vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES => "openai-responses",
+        vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => "anthropic-messages",
+        _ => "openai-completions",
+    }
+}
+
 fn pi_overlay(
     provider: &ModelProviderProfile,
     endpoint: Option<&ModelProviderEndpoint>,
@@ -3626,6 +3717,63 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deepseek_harness_overlay_projects_all_configurable_wire_protocols() {
+        let (mut provider, _, binding, _) =
+            fixture(ConfigOverlayStrategy::DeepseekHarnessSettingsYaml);
+        provider.configured_models[0].display_name = Some("Model A".to_string());
+        provider.configured_models[0].capabilities.context_tokens = Some(200_000);
+        provider.configured_models[0].capabilities.output_tokens = Some(16_384);
+        provider.configured_models[0].capabilities.image_input = Some(true);
+
+        for (protocol, expected_api) in [
+            (
+                vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+                "openai-completions",
+            ),
+            (
+                vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES,
+                "openai-responses",
+            ),
+            (
+                vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
+                "anthropic-messages",
+            ),
+        ] {
+            let mut model = binding.configured_models[0].clone();
+            model.wire_protocol_id = protocol.to_string();
+            let overlay = deepseek_harness_overlay(
+                &provider,
+                provider.endpoints.first(),
+                Some(&model),
+                "VIBEX_DEEPSEEK_HARNESS_API_KEY",
+            )
+            .unwrap();
+            let settings: serde_yaml::Value = serde_yaml::from_str(&overlay).unwrap();
+            let route = &settings["llm-pi-ai"]["providers"]["fake"];
+
+            assert_eq!(route["api"].as_str(), Some(expected_api));
+            assert_eq!(
+                route["apiKeyEnv"].as_str(),
+                Some("VIBEX_DEEPSEEK_HARNESS_API_KEY")
+            );
+            assert_eq!(route["models"][0]["id"].as_str(), Some("model-a"));
+            assert_eq!(route["models"][0]["name"].as_str(), Some("Model A"));
+            assert_eq!(route["models"][0]["contextWindow"].as_u64(), Some(200_000));
+            assert_eq!(route["models"][0]["maxTokens"].as_u64(), Some(16_384));
+            assert_eq!(route["models"][0]["input"][1].as_str(), Some("image"));
+            assert_eq!(
+                settings["agent-default-model"]["provider"].as_str(),
+                Some("fake")
+            );
+            assert_eq!(
+                settings["agent-default-model"]["model"].as_str(),
+                Some("model-a")
+            );
+            assert!(!overlay.contains("secret-value"));
+        }
+    }
+
+    #[test]
     fn zcode_overlay_projects_private_provider_registry_config() {
         let (mut provider, _, binding, _) = fixture(ConfigOverlayStrategy::ZcodeJson);
         provider.endpoints[0].wire_protocol_id =
@@ -3880,11 +4028,11 @@ mod tests {
             },
             TypedProjectionExpectation {
                 agent_id: "deepseek-harness",
-                base_url_key: Some("DEEPSEEK_BASE_URL"),
-                secret_env_key: "DEEPSEEK_API_KEY",
-                model_env_key: Some("DSH_MODEL"),
-                overlay_path: None,
-                overlay_format: None,
+                base_url_key: None,
+                secret_env_key: "VIBEX_DEEPSEEK_HARNESS_API_KEY",
+                model_env_key: None,
+                overlay_path: Some("settings.yaml"),
+                overlay_format: Some("yaml"),
                 runtime_home_env_key: Some("DSH_HOME"),
             },
             TypedProjectionExpectation {

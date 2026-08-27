@@ -350,10 +350,14 @@ fn catalog_projection_shape(
                 "OPENAI_API_KEY",
                 "CODEWHALE_MODEL",
             )),
-            "deepseek-harness" => Ok(environment_projection_shape(
-                "DEEPSEEK_BASE_URL",
-                "DEEPSEEK_API_KEY",
-                "DSH_MODEL",
+            "deepseek-harness" => Ok(overlay_projection_shape(
+                ConfigOverlayStrategy::DeepseekHarnessSettingsYaml,
+                "VIBEX_DEEPSEEK_HARNESS_API_KEY",
+                vec![
+                    catalog_interface(WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, true, true),
+                    catalog_interface(WIRE_PROTOCOL_OPENAI_RESPONSES, true, true),
+                    catalog_interface(WIRE_PROTOCOL_ANTHROPIC_MESSAGES, true, true),
+                ],
             )),
             "kimi" => Ok(overlay_projection_shape(
                 ConfigOverlayStrategy::KimiToml,
@@ -1792,6 +1796,14 @@ mod tests {
             vec![WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI]
         );
         assert_eq!(protocols("grok"), vec![WIRE_PROTOCOL_OPENAI_RESPONSES]);
+        assert_eq!(
+            protocols("deepseek-harness"),
+            vec![
+                WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+                WIRE_PROTOCOL_OPENAI_RESPONSES,
+                WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
+            ]
+        );
         assert_eq!(
             protocols("hermes"),
             vec![

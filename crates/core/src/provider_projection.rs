@@ -678,6 +678,7 @@ impl AgentVersionCompatibility {
 pub enum ConfigOverlayStrategy {
     ClaudeEnvironment,
     CodexStableHome,
+    DeepseekHarnessSettingsYaml,
     OpenCodeInlineProvider,
     GenericEnvironmentDescriptor,
     StructuredJsonOverlay,

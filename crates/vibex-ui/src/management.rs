@@ -1690,6 +1690,31 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_harness_binding_editor_exposes_all_supported_wire_apis() {
+        let descriptor = vibex_core::catalog_projection_descriptors()
+            .unwrap()
+            .into_iter()
+            .find(|descriptor| descriptor.route.agent_id.as_str() == "deepseek-harness")
+            .unwrap();
+        let capability = projection_capability(
+            vec![vibex_core::AgentProjectionFormControl::WireProtocol],
+            descriptor.model_interfaces,
+        );
+        let mut editor = AgentProviderBindingEditorState::default();
+        editor.replace_capability(capability);
+
+        assert_eq!(
+            editor.wire_api_choices(),
+            vec![
+                vibex_core::ProviderModelWireApi::OpenaiChatCompletions,
+                vibex_core::ProviderModelWireApi::OpenaiResponses,
+                vibex_core::ProviderModelWireApi::AnthropicMessages,
+            ]
+        );
+        assert_eq!(editor.supported_wire_apis(), editor.wire_api_choices());
+    }
+
+    #[test]
     fn binding_editor_exposes_google_and_bedrock_direct_interfaces() {
         let capability = projection_capability(
             vec![vibex_core::AgentProjectionFormControl::WireProtocol],

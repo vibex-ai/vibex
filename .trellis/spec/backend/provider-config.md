@@ -322,6 +322,28 @@ commit_profile_or_restore_keychain(previous_values)?;
 The Profile owns the reference and switching context; the Agent owns the exact
 environment key and the final ACP authentication decision.
 
+## Scenario: DeepSeek Harness Multi-Protocol Provider Projection
+
+### 1. Scope / Trigger
+
+- Trigger: starting DeepSeek Harness through `deepseek-harness-acp` with a Vibex Model Provider Profile.
+- The Harness's `llm-pi-ai` route supports OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages; its default DeepSeek environment route must not be mistaken for the complete Agent capability.
+
+### 2. Contracts
+
+- Declare Chat Completions, Responses, and Anthropic Messages as user-selectable model interfaces for DeepSeek Harness.
+- Materialize the selected Profile as a private `$DSH_HOME/settings.yaml` containing one `llm-pi-ai.providers` route and the matching `agent-default-model` selection. Do not reduce the projection to `DEEPSEEK_BASE_URL` / `DEEPSEEK_API_KEY`.
+- Map Vibex wire protocols to Harness API ids exactly: `openai_chat_completions` -> `openai-completions`, `openai_responses` -> `openai-responses`, and `anthropic_messages` -> `anthropic-messages`.
+- Keep the selected credential in a Profile-scoped environment reference named by `apiKeyEnv`; never write its value into `settings.yaml`.
+- Project the selected model's declared display name, context/output limits, and image modality. Use the Harness defaults of 262,144 context tokens, 32,768 output tokens, and text-only input when those capabilities are undeclared.
+- Provider, protocol, endpoint, credential, or model changes remain process-scoped and require restart and resume.
+
+### 3. Tests Required
+
+- Core descriptor tests assert all three protocols are advertised in stable order.
+- Projection tests parse `settings.yaml` for every protocol and assert route/default-model identity, model capabilities, and absence of Secret material.
+- The typed projector matrix asserts the private `settings.yaml`, `DSH_HOME`, and Vibex-scoped credential environment boundary.
+
 ## Scenario: Kimi Code CLI Provider Projection
 
 ### 1. Scope / Trigger
