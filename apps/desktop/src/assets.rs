@@ -481,7 +481,7 @@ const fn themed_agent_asset(path: &'static str) -> BrandAsset {
 const CATALOG_AGENT_BRANDS: &[(&str, BrandAsset)] = &[
     (
         "antigravity",
-        themed_agent_asset("icons/vibex/agents/antigravity.svg"),
+        colored_agent_asset("icons/vibex/agents/antigravity.svg"),
     ),
     (
         "amp-acp",
@@ -795,7 +795,7 @@ fn exact_size_polychrome_svg(path: &'static str, size: Pixels, intrinsic_width: 
 
 fn agent_brand_intrinsic_width(path: &str) -> Option<u16> {
     match path {
-        "icons/vibex/opencode.svg" => Some(16),
+        "icons/vibex/opencode.svg" | "icons/vibex/agents/antigravity.svg" => Some(16),
         "icons/vibex/gemini.svg" => Some(32),
         "icons/vibex/qwen.svg" | "icons/vibex/claude.svg" => Some(256),
         "icons/vibex/agents/crow-cli.svg" | "icons/vibex/agents/kimi.svg" => Some(100),
@@ -911,6 +911,7 @@ mod tests {
         for identity in [
             "Claude Code",
             "Google Gemini",
+            "Google Antigravity",
             "OpenCode",
             "Qwen Code",
             "amp-acp",
