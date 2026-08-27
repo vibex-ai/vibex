@@ -270,10 +270,24 @@ const AGENT_DIALECT_PROFILES: &[AgentDialectProfile] = &[
         .profiled("registers MCP toolsets from ~/.hermes/config.yaml at launch")
         .with_enricher(AgentEventEnricherKind::Hermes)
         .with_mcp_delivery(McpWireDelivery::NativeConfig),
-    // Kimi Code reads `~/.kimi-code/mcp.json`.
+    // Kimi Code 1.49 accepts ACP MCP descriptors directly. Its state root is
+    // selected with KIMI_SHARE_DIR; provider/model configuration is loaded
+    // from that root's config.toml before session/new.
     AgentDialectProfile::generic("kimi")
-        .profiled("reads MCP servers from ~/.kimi-code/mcp.json at launch")
-        .with_mcp_delivery(McpWireDelivery::NativeConfig),
+        .profiled("forwards ACP MCP descriptors and loads provider state from KIMI_SHARE_DIR")
+        .with_credential_scrub(&[
+            "KIMI_SHARE_DIR",
+            "KIMI_CODE_HOME",
+            "KIMI_HOME",
+            "KIMI_BASE_URL",
+            "KIMI_API_KEY",
+            "KIMI_MODEL_BASE_URL",
+            "KIMI_MODEL_API_KEY",
+            "KIMI_MODEL_NAME",
+            "KIMI_MODEL_PROVIDER_TYPE",
+            "OPENAI_BASE_URL",
+            "OPENAI_API_KEY",
+        ]),
     // CodeBuddy virtualizes MCP tool calls behind `DeferExecuteTool`, so the
     // live tool call reports the wrapper instead of the real `mcp__…` tool.
     AgentDialectProfile::generic("codebuddy-code")
@@ -367,7 +381,7 @@ mod tests {
 
     #[test]
     fn native_config_and_dropping_agents_never_forward_wire_servers() {
-        for agent_id in ["grok", "cursor", "hermes", "kimi", "pi", "factory-droid"] {
+        for agent_id in ["grok", "cursor", "hermes", "pi", "factory-droid"] {
             assert!(
                 !agent_dialect_profile(agent_id)
                     .mcp_wire_delivery
@@ -379,11 +393,14 @@ mod tests {
             agent_dialect_profile("hermes").event_enricher,
             AgentEventEnricherKind::Hermes
         );
-        assert!(
-            agent_dialect_profile("gemini")
-                .mcp_wire_delivery
-                .forwards_servers()
-        );
+        for agent_id in ["gemini", "kimi"] {
+            assert!(
+                agent_dialect_profile(agent_id)
+                    .mcp_wire_delivery
+                    .forwards_servers(),
+                "{agent_id} must receive forwarded ACP MCP servers"
+            );
+        }
     }
 
     /// BYOK activates from the presence of `COPILOT_PROVIDER_BASE_URL` alone,
@@ -408,6 +425,25 @@ mod tests {
         // already carries `--acp` and the private home isolates its config.
         assert!(copilot.launch_args.is_empty());
         assert!(copilot.mcp_wire_delivery.forwards_servers());
+    }
+
+    #[test]
+    fn kimi_scrubs_current_and_legacy_provider_state_from_agent_account_launches() {
+        let kimi = agent_dialect_profile("kimi");
+        for key in [
+            "KIMI_SHARE_DIR",
+            "KIMI_CODE_HOME",
+            "KIMI_MODEL_BASE_URL",
+            "KIMI_MODEL_API_KEY",
+            "OPENAI_BASE_URL",
+            "OPENAI_API_KEY",
+        ] {
+            assert!(
+                kimi.credential_env_keys_to_unset.contains(&key),
+                "{key} must not redirect a Kimi agent-account launch"
+            );
+        }
+        assert!(kimi.mcp_wire_delivery.forwards_servers());
     }
 
     #[test]

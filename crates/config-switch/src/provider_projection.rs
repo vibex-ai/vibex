@@ -442,36 +442,91 @@ fn materialize_overlay_secrets(
     {
         return Ok(overlay.content.clone());
     }
-    if overlay.format != "yaml" {
-        return Err(VibexError::capability(
-            "agent_projection_overlay_secret_format_unsupported",
-            "managed overlay Secret materialization is not supported for this format",
-        ));
-    }
-    let mut value =
-        serde_yaml::from_str::<serde_yaml::Value>(&overlay.content).map_err(|error| {
-            VibexError::validation(
-                "agent_projection_overlay_secret_decode_failed",
-                "managed overlay could not be decoded before Secret materialization",
-            )
-            .with_diagnostic("format", overlay.format.as_str())
-            .with_diagnostic("error", error.to_string())
-        })?;
-    for secret in secrets {
-        replace_yaml_scalar(
-            &mut value,
-            &overlay_secret_placeholder(&secret.key),
-            secret.value.expose(),
-        );
-    }
-    let content = serde_yaml::to_string(&value).map_err(|error| {
-        VibexError::validation(
-            "agent_projection_overlay_secret_encode_failed",
-            "managed overlay could not be encoded after Secret materialization",
-        )
-        .with_diagnostic("format", overlay.format.as_str())
-        .with_diagnostic("error", error.to_string())
-    })?;
+    let content = match overlay.format.as_str() {
+        "yaml" => {
+            let mut value =
+                serde_yaml::from_str::<serde_yaml::Value>(&overlay.content).map_err(|error| {
+                    VibexError::validation(
+                        "agent_projection_overlay_secret_decode_failed",
+                        "managed overlay could not be decoded before Secret materialization",
+                    )
+                    .with_diagnostic("format", overlay.format.as_str())
+                    .with_diagnostic("error", error.to_string())
+                })?;
+            for secret in secrets {
+                replace_yaml_scalar(
+                    &mut value,
+                    &overlay_secret_placeholder(&secret.key),
+                    secret.value.expose(),
+                );
+            }
+            serde_yaml::to_string(&value).map_err(|error| {
+                VibexError::validation(
+                    "agent_projection_overlay_secret_encode_failed",
+                    "managed overlay could not be encoded after Secret materialization",
+                )
+                .with_diagnostic("format", overlay.format.as_str())
+                .with_diagnostic("error", error.to_string())
+            })?
+        }
+        "toml" => {
+            let mut value = toml::from_str::<toml::Value>(&overlay.content).map_err(|error| {
+                VibexError::validation(
+                    "agent_projection_overlay_secret_decode_failed",
+                    "managed overlay could not be decoded before Secret materialization",
+                )
+                .with_diagnostic("format", overlay.format.as_str())
+                .with_diagnostic("error", error.to_string())
+            })?;
+            for secret in secrets {
+                replace_toml_scalar(
+                    &mut value,
+                    &overlay_secret_placeholder(&secret.key),
+                    secret.value.expose(),
+                );
+            }
+            toml::to_string(&value).map_err(|error| {
+                VibexError::validation(
+                    "agent_projection_overlay_secret_encode_failed",
+                    "managed overlay could not be encoded after Secret materialization",
+                )
+                .with_diagnostic("format", overlay.format.as_str())
+                .with_diagnostic("error", error.to_string())
+            })?
+        }
+        "json" => {
+            let mut value =
+                serde_json::from_str::<serde_json::Value>(&overlay.content).map_err(|error| {
+                    VibexError::validation(
+                        "agent_projection_overlay_secret_decode_failed",
+                        "managed overlay could not be decoded before Secret materialization",
+                    )
+                    .with_diagnostic("format", overlay.format.as_str())
+                    .with_diagnostic("error", error.to_string())
+                })?;
+            for secret in secrets {
+                replace_json_scalar(
+                    &mut value,
+                    &overlay_secret_placeholder(&secret.key),
+                    secret.value.expose(),
+                );
+            }
+            serde_json::to_string(&value).map_err(|error| {
+                VibexError::validation(
+                    "agent_projection_overlay_secret_encode_failed",
+                    "managed overlay could not be encoded after Secret materialization",
+                )
+                .with_diagnostic("format", overlay.format.as_str())
+                .with_diagnostic("error", error.to_string())
+            })?
+        }
+        _ => {
+            return Err(VibexError::capability(
+                "agent_projection_overlay_secret_format_unsupported",
+                "managed overlay Secret materialization is not supported for this format",
+            ));
+        }
+    };
     if content.contains(OVERLAY_SECRET_PLACEHOLDER_PREFIX) {
         return Err(VibexError::validation(
             "agent_projection_overlay_secret_missing",
@@ -479,6 +534,44 @@ fn materialize_overlay_secrets(
         ));
     }
     Ok(content)
+}
+
+fn replace_json_scalar(value: &mut serde_json::Value, marker: &str, replacement: &str) {
+    match value {
+        serde_json::Value::String(candidate) if candidate == marker => {
+            *candidate = replacement.to_string();
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                replace_json_scalar(value, marker, replacement);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                replace_json_scalar(value, marker, replacement);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn replace_toml_scalar(value: &mut toml::Value, marker: &str, replacement: &str) {
+    match value {
+        toml::Value::String(candidate) if candidate == marker => {
+            *candidate = replacement.to_string();
+        }
+        toml::Value::Array(values) => {
+            for value in values {
+                replace_toml_scalar(value, marker, replacement);
+            }
+        }
+        toml::Value::Table(values) => {
+            for (_, value) in values.iter_mut() {
+                replace_toml_scalar(value, marker, replacement);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn replace_yaml_scalar(value: &mut serde_yaml::Value, marker: &str, replacement: &str) {
@@ -1193,6 +1286,11 @@ fn project_provider_control(
                 secret: false,
             });
             overlays.push(overlay);
+            if *strategy == ConfigOverlayStrategy::KimiToml {
+                overlays.push(kimi_auth_compatibility_overlay(require_secret_env_key(
+                    descriptor_secret_env_key(descriptor),
+                )?));
+            }
         }
         AgentProviderControl::AdvertisedSessionOption { option_ids } => {
             session.push(ProviderBindingMetadata {
@@ -1460,7 +1558,7 @@ fn private_home_env_key(agent_id: &str) -> Option<&'static str> {
         "grok" => Some("GROK_HOME"),
         "hermes" => Some("HERMES_HOME"),
         "kilo" => None,
-        "kimi" => Some("KIMI_CODE_HOME"),
+        "kimi" => Some("KIMI_SHARE_DIR"),
         "mistral-vibe" => Some("VIBE_HOME"),
         "pi" => Some("PI_CODING_AGENT_DIR"),
         "qwen-code" => Some("QWEN_HOME"),
@@ -1527,16 +1625,6 @@ fn apply_agent_projection_defaults(
                 projection_model_id(model)
                     .unwrap_or("vibex-model")
                     .to_string(),
-            );
-        }
-        "kimi" => {
-            let provider_type = match projection_wire_protocol(model) {
-                vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => "anthropic",
-                _ => "openai",
-            };
-            env.insert(
-                "KIMI_MODEL_PROVIDER_TYPE".to_string(),
-                provider_type.to_string(),
             );
         }
         "poolside" => {
@@ -1674,6 +1762,17 @@ fn build_overlay(
             "kilo.json",
             "json",
             kilo_overlay(
+                provider,
+                endpoint,
+                model,
+                require_secret_env_key(secret_env_key)?,
+            )?,
+            true,
+        ),
+        ConfigOverlayStrategy::KimiToml => (
+            "config.toml",
+            "toml",
+            kimi_overlay(
                 provider,
                 endpoint,
                 model,
@@ -2495,6 +2594,99 @@ fn kilo_overlay(
         "provider": {provider_id.clone(): entry},
         "model": format!("{provider_id}/{model_id}"),
     }))
+}
+
+fn kimi_auth_compatibility_overlay(secret_env_key: &str) -> ManagedProjectionOverlay {
+    ManagedProjectionOverlay {
+        relative_path: "credentials/kimi-code.json".to_string(),
+        format: "json".to_string(),
+        content: serde_json::json!({
+            "access_token": overlay_secret_placeholder(secret_env_key),
+            "refresh_token": "",
+            "expires_at": 0,
+            "expires_in": 0,
+        })
+        .to_string(),
+        contains_secret_reference: true,
+    }
+}
+
+fn kimi_overlay(
+    _provider: &ModelProviderProfile,
+    endpoint: Option<&ModelProviderEndpoint>,
+    model: Option<&AgentConfiguredModelBinding>,
+    secret_env_key: &str,
+) -> VibexResult<String> {
+    let model_id = projection_model_id(model).unwrap_or("vibex-model");
+    let provider_type = match projection_wire_protocol(model) {
+        vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => "anthropic",
+        _ => "openai_legacy",
+    };
+    let endpoint = endpoint
+        .map(|endpoint| endpoint.url.as_str())
+        .unwrap_or_default();
+    let secret_placeholder = overlay_secret_placeholder(secret_env_key);
+    let mut root = toml::map::Map::new();
+    root.insert(
+        "default_model".to_string(),
+        toml::Value::String(model_id.to_string()),
+    );
+    root.insert("default_thinking".to_string(), toml::Value::Boolean(false));
+    root.insert(
+        "providers".to_string(),
+        toml::Value::Table(toml::map::Map::from_iter([(
+            "vibex".to_string(),
+            toml::Value::Table(toml::map::Map::from_iter([
+                (
+                    "type".to_string(),
+                    toml::Value::String(provider_type.to_string()),
+                ),
+                (
+                    "base_url".to_string(),
+                    toml::Value::String(endpoint.to_string()),
+                ),
+                (
+                    "api_key".to_string(),
+                    toml::Value::String(secret_placeholder),
+                ),
+            ])),
+        )])),
+    );
+    root.insert(
+        "models".to_string(),
+        toml::Value::Table(toml::map::Map::from_iter([(
+            model_id.to_string(),
+            toml::Value::Table(toml::map::Map::from_iter([
+                (
+                    "provider".to_string(),
+                    toml::Value::String("vibex".to_string()),
+                ),
+                (
+                    "model".to_string(),
+                    toml::Value::String(model_id.to_string()),
+                ),
+                (
+                    "max_context_size".to_string(),
+                    toml::Value::Integer(262_144),
+                ),
+                (
+                    "capabilities".to_string(),
+                    toml::Value::Array(vec![
+                        toml::Value::String("thinking".to_string()),
+                        toml::Value::String("image_in".to_string()),
+                    ]),
+                ),
+            ])),
+        )])),
+    );
+    toml::to_string(&toml::Value::Table(root)).map_err(|error| {
+        VibexError::validation(
+            "agent_projection_overlay_encode_failed",
+            "managed Kimi TOML overlay could not be encoded",
+        )
+        .with_diagnostic("format", "toml")
+        .with_diagnostic("error", error.to_string())
+    })
 }
 
 fn mistral_vibe_overlay(
@@ -3565,12 +3757,12 @@ mod tests {
             },
             TypedProjectionExpectation {
                 agent_id: "kimi",
-                base_url_key: Some("KIMI_MODEL_BASE_URL"),
-                secret_env_key: "KIMI_MODEL_API_KEY",
-                model_env_key: Some("KIMI_MODEL_NAME"),
-                overlay_path: None,
-                overlay_format: None,
-                runtime_home_env_key: Some("KIMI_CODE_HOME"),
+                base_url_key: None,
+                secret_env_key: "VIBEX_KIMI_API_KEY",
+                model_env_key: None,
+                overlay_path: Some("config.toml"),
+                overlay_format: Some("toml"),
+                runtime_home_env_key: Some("KIMI_SHARE_DIR"),
             },
             TypedProjectionExpectation {
                 agent_id: "mistral-vibe",
@@ -3960,6 +4152,69 @@ mod tests {
     }
 
     #[test]
+    fn kimi_projection_materializes_a_private_provider_config_and_auth_compatibility_token() {
+        let descriptors = vibex_core::catalog_projection_descriptors().unwrap();
+        let descriptor = descriptors
+            .iter()
+            .find(|descriptor| descriptor.route.agent_id.as_str() == "kimi")
+            .unwrap();
+        let (provider, runtime, binding) = typed_projection_fixture(descriptor);
+        let mut plan = AgentProviderProjectionEngine::plan(
+            &provider,
+            &runtime,
+            &binding,
+            descriptor,
+            "kimi-projection",
+        )
+        .unwrap();
+        plan.secret_env[0].secret_reference.backend = ProviderSecretBackend::OsKeychain;
+        plan.secret_env[0].secret_reference.setup_state = ProviderSecretSetupState::Available;
+        assert_eq!(plan.overlay_files.len(), 2);
+        assert_eq!(plan.overlay_files[0].relative_path, "config.toml");
+        assert_eq!(
+            plan.overlay_files[1].relative_path,
+            "credentials/kimi-code.json"
+        );
+        let temp = tempdir().unwrap();
+        let secret = plan.secret_env[0].secret_reference.clone();
+        let lookup_key = secret.lookup_key.clone();
+        secrets::store_provider_secret(&lookup_key, TYPED_SECRET_SENTINEL).unwrap();
+        let resolved = AgentProviderProjectionEngine::resolve_and_materialize(
+            &plan,
+            temp.path(),
+            "kimi-projection",
+        )
+        .unwrap();
+        let config = fs::read_to_string(&resolved.overlay_files[0]).unwrap();
+        let config: toml::Value = toml::from_str(&config).unwrap();
+        assert_eq!(config["default_model"].as_str(), Some("agent-model"));
+        assert_eq!(
+            config["providers"]["vibex"]["type"].as_str(),
+            Some("openai_legacy")
+        );
+        assert_eq!(
+            config["providers"]["vibex"]["base_url"].as_str(),
+            Some("https://provider.example.invalid/v1/")
+        );
+        assert_eq!(
+            config["providers"]["vibex"]["api_key"].as_str(),
+            Some(TYPED_SECRET_SENTINEL)
+        );
+        let auth = fs::read_to_string(&resolved.overlay_files[1]).unwrap();
+        let auth: serde_json::Value = serde_json::from_str(&auth).unwrap();
+        assert_eq!(auth["access_token"], TYPED_SECRET_SENTINEL);
+        assert_eq!(auth["expires_at"], 0);
+        assert_eq!(
+            resolved
+                .non_secret_env
+                .get("KIMI_SHARE_DIR")
+                .map(PathBuf::from),
+            Some(resolved.overlay_root.clone())
+        );
+        secrets::delete_provider_secret(&lookup_key).unwrap();
+    }
+
+    #[test]
     fn all_typed_catalog_projectors_map_provider_env_secret_model_and_private_state() {
         let descriptors = vibex_core::catalog_projection_descriptors().unwrap();
         let expectations = typed_projection_expectations();
@@ -4039,7 +4294,9 @@ mod tests {
             assert_eq!(plan.effective_model.as_deref(), Some(expected_model));
             assert_eq!(
                 plan.overlay_files.len(),
-                if expected.overlay_path.is_some() {
+                if expected.agent_id == "kimi" {
+                    2
+                } else if expected.overlay_path.is_some() {
                     1
                 } else {
                     0
@@ -4101,12 +4358,6 @@ mod tests {
                         Some("agent-model")
                     );
                 }
-                "kimi" => assert_eq!(
-                    non_secret_env
-                        .get("KIMI_MODEL_PROVIDER_TYPE")
-                        .map(String::as_str),
-                    Some("openai")
-                ),
                 _ => {}
             }
             if expected.agent_id == "kilo" {

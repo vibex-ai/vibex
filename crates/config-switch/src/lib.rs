@@ -385,6 +385,10 @@ impl ProviderConfigService {
             if runtime_config.features.is_empty() {
                 runtime_config.features = default_runtime_config.features.clone();
             }
+            if agent_id.as_str() == "kimi" {
+                runtime_config.terminal_tools = true;
+                runtime_config.terminal_auth = true;
+            }
             runtime_config.models = configured_acp_model_ids(
                 &profile.configured_models,
                 profile.default_model.as_deref(),
@@ -4569,6 +4573,13 @@ fn generic_acp_catalog_preset(entry: &AcpAgentCatalogEntry) -> AcpProviderCatalo
             .default_config
             .features
             .retain(|feature| !matches!(feature.as_str(), "mcp" | "mcp_servers"));
+    }
+    if entry.id == "kimi" {
+        // Kimi routes its Shell tool through ACP terminal/create and exposes a
+        // first-class terminal login method. Both host capabilities are needed
+        // for the Agent's advertised integration to be usable.
+        preset.default_config.terminal_tools = true;
+        preset.default_config.terminal_auth = true;
     }
     preset
 }

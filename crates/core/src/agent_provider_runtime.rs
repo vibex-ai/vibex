@@ -348,10 +348,9 @@ fn catalog_projection_shape(
                 "OPENAI_API_KEY",
                 "CODEWHALE_MODEL",
             )),
-            "kimi" => Ok(environment_projection_shape_with_interfaces(
-                "KIMI_MODEL_BASE_URL",
-                "KIMI_MODEL_API_KEY",
-                "KIMI_MODEL_NAME",
+            "kimi" => Ok(overlay_projection_shape(
+                ConfigOverlayStrategy::KimiToml,
+                "VIBEX_KIMI_API_KEY",
                 vec![
                     catalog_interface(WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, true, true),
                     catalog_interface(WIRE_PROTOCOL_ANTHROPIC_MESSAGES, true, true),

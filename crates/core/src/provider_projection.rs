@@ -686,6 +686,7 @@ pub enum ConfigOverlayStrategy {
     GrokToml,
     HermesYaml,
     KiloInlineJson,
+    KimiToml,
     MistralVibeToml,
     PiModelsJson,
     QwenCodeJson,

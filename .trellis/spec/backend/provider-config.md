@@ -322,6 +322,33 @@ commit_profile_or_restore_keychain(previous_values)?;
 The Profile owns the reference and switching context; the Agent owns the exact
 environment key and the final ACP authentication decision.
 
+## Scenario: Kimi Code CLI Provider Projection
+
+### 1. Scope / Trigger
+
+- Trigger: starting or resuming Kimi Code CLI through ACP with a Vibex Model Provider Profile.
+- Kimi 1.49 uses `KIMI_SHARE_DIR`, reads `<share>/config.toml`, and checks its persisted Kimi login token before `session/new`, even when an external API key is supplied.
+
+### 2. Contracts
+
+- Materialize an owner-private Kimi runtime root and set `KIMI_SHARE_DIR` to it. `KIMI_CODE_HOME` and the former `KIMI_MODEL_BASE_URL` / `KIMI_MODEL_API_KEY` variables are not Kimi 1.49 configuration boundaries.
+- Write `config.toml` with one `vibex` provider and the selected model. Map OpenAI Chat Completions to `openai_legacy` and Anthropic Messages to `anthropic`.
+- Materialize the selected Profile secret only inside the private config and a private `credentials/kimi-code.json` compatibility token. The compatibility token satisfies Kimi's pre-session auth gate; it does not become a global Agent login or escape the Profile runtime root.
+- Enable ACP terminal tools and terminal authentication for Kimi presets so Shell calls and the advertised login method have a host implementation.
+- Forward enabled MCP descriptors through `session/new.mcpServers`; Kimi 1.49 consumes ACP MCP descriptors directly.
+- Kimi runtime switching is process-scoped: Profile, endpoint, credential, model, or wire-protocol changes require restart and resume.
+
+### 3. Capability Notes
+
+- Verified Kimi 1.49 ACP declarations: session `new/load/list/resume/prompt/cancel`, one `default` mode, model switching, image and embedded-resource prompts, HTTP MCP, streaming message/thought/tool/diff/plan updates, permission requests, ACP filesystem, and ACP terminal operations.
+- `session/fork` is present in the server surface but returns not implemented. Form elicitation and `usage_update` are not emitted by Kimi 1.49. Reasoning effort is represented by Kimi's thinking model variants rather than a separate ACP effort option.
+
+### 4. Tests Required
+
+- Projection tests assert private `config.toml`, private compatibility credentials, selected endpoint/model/protocol, late Secret materialization, and `KIMI_SHARE_DIR`.
+- ACP dialect tests assert Kimi forwards MCP descriptors and scrubs inherited Kimi/OpenAI credential overrides on Agent-account launches.
+- Run the runtime rollout evidence gate after changing the catalog version or projection descriptor.
+
 ## Import and Export
 
 Import existing Claude/Codex configuration in read-only mode by default. Imported
@@ -3650,7 +3677,7 @@ ResolvedAgentProviderProjection {
   semantic versions: Copilot `>=1.0.78`, CodeWhale `>=0.8.55`, crow-cli
   `>=0.1.23`, Dirac `>=0.4.1`, Factory Droid `>=0.153.1`, Goose `>=1.33.1`,
   Grok `>=0.2.11`, Hermes `>=0.19.0`, Kilo
-  `>=7.2.40`, Kimi `>=0.11.0`, Mistral Vibe `>=2.9.3`, Poolside `>=1.0.0`,
+  `>=7.2.40`, Kimi `>=1.49.0`, Mistral Vibe `>=2.9.3`, Poolside `>=1.0.0`,
   Pi `>=0.0.33`, Qwen Code `>=0.18.4`, Stakpak `>=0.3.80`, and VT Code
   `>=0.96.14`. Older, missing, manual, or non-semantic versions never inherit
   these schemas.
@@ -3660,16 +3687,15 @@ ResolvedAgentProviderProjection {
   Pi, and Qwen Code derive the catalog version only when the
   complete `npx`/`uvx` command and argument vector exactly match the pinned
   catalog entry. Ordinary catalog reads remain process-free.
-- The four environment projectors use these process contracts:
+- The three environment projectors use these process contracts:
 
 | Agent | Endpoint / Secret / Model | Additional selection or state |
 | --- | --- | --- |
 | Copilot | `COPILOT_PROVIDER_BASE_URL` / `COPILOT_PROVIDER_API_KEY` / `COPILOT_MODEL` | `COPILOT_HOME` points at the private projection root. |
 | CodeWhale | `CODEWHALE_BASE_URL` / `OPENAI_API_KEY` / `CODEWHALE_MODEL` | `CODEWHALE_PROVIDER=openai`; `CODEWHALE_HOME` is private. |
-| Kimi | `KIMI_MODEL_BASE_URL` / `KIMI_MODEL_API_KEY` / `KIMI_MODEL_NAME` | `KIMI_MODEL_PROVIDER_TYPE` follows the Wire API; `KIMI_CODE_HOME` is private. |
 | Poolside | `POOLSIDE_STANDALONE_BASE_URL` / `POOLSIDE_API_KEY` / `POOLSIDE_STANDALONE_MODEL` | A trailing `/v1` is removed before launch. |
 
-- The other 12 use code-owned typed overlays; serializers, relative paths,
+- The other 13 use code-owned typed overlays; serializers, relative paths,
   Secret environment keys, and selection controls are fixed in code:
 
 | Agent | Overlay and Secret reference | Private selection boundary |
@@ -3681,16 +3707,19 @@ ResolvedAgentProviderProjection {
 | Grok | `config.toml`, `env_key=VIBEX_GROK_API_KEY` | `GROK_HOME`; `[models].default` selects the injected model. |
 | Hermes | `config.yaml`, `key_env=VIBEX_HERMES_API_KEY` | `HERMES_HOME=<projectionRoot>`. |
 | Kilo | `kilo.json`, `{env:VIBEX_KILO_API_KEY}` | The same JSON is supplied through `KILO_CONFIG_CONTENT`. |
+| Kimi | `config.toml` plus `credentials/kimi-code.json`, late-bound `VIBEX_KIMI_API_KEY` | `KIMI_SHARE_DIR=<projectionRoot>`; the private compatibility credential satisfies Kimi's pre-session login gate. |
 | Mistral Vibe | `config.toml`, `api_key_env_var=VIBEX_MISTRAL_VIBE_API_KEY` | `VIBE_HOME=<projectionRoot>`. |
 | Pi | `models.json`, `apiKey=$VIBEX_PI_API_KEY` | `PI_CODING_AGENT_DIR=<projectionRoot>`. |
 | Qwen Code | `settings.json`, `envKey=VIBEX_QWEN_CODE_API_KEY` | `QWEN_HOME=<projectionRoot>`. |
 | Stakpak | `stakpak.toml`, child `OPENAI_API_KEY` | Insert `--profile vibex --config <projectionRoot>/stakpak.toml` before root `acp`. |
 | VT Code | `vtcode.toml`, `api_key_env=VIBEX_VTCODE_API_KEY` | `VTCODE_CONFIG_PATH` is the materialized file path. |
 
-- Overlay content may contain only an environment-key reference, never the
-  resolved API key. Secret lookup occurs once immediately before launch; the
-  value is passed only to the target child. Snapshots and fingerprints retain
-  opaque Secret-reference versions, not values.
+- Planned overlay content may contain only an environment-key reference, never
+  the resolved API key. Secret lookup occurs once immediately before launch.
+  Most Agents receive the value only in the child environment; formats that
+  require an inline credential, including Kimi's private TOML and compatibility
+  credential JSON, receive it only during owner-private materialization.
+  Snapshots and fingerprints retain opaque Secret-reference versions, not values.
 - Overlay roots are deterministic per binding and workspace, owner-only, and
   validated before atomic writes. Environment-only and inline projectors never
   write the user's Agent home. Agent-specific home variables and launch

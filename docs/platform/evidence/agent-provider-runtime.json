@@ -3,9 +3,9 @@
   "status": "passed",
   "claimScope": "manifest_and_contract",
   "realRuntimeVerification": "blocked",
-  "capturedAt": "2026-08-26T18:26:35.867Z",
+  "capturedAt": "2026-08-27T01:18:09.685Z",
   "source": {
-    "captureParentCommit": "e813ebe8ad20e171a1b7031be60c058c18613d24",
+    "captureParentCommit": "6c94fd340eae6a664b7f19a899780b33cb3c0a62",
     "rustToolchain": "rustc-1.97.0",
     "sourceInputRoots": [
       "crates/core/src/acp_catalog.rs",
@@ -53,10 +53,10 @@
       "crates/vibex-ui/Cargo.toml",
       "apps/desktop/Cargo.toml"
     ],
-    "sourceInputTreeSha256": "4c6df3f066eb2fa428ee27ba688e705113910c67bfc9688eb0de700fde1ef454",
+    "sourceInputTreeSha256": "4ab7ba8fa91176f1952358dd72a03c08678635a0c50c50fb57399e7ec695e9dc",
     "bindings": {
-      "catalog": "7fc67eac9f64de6b78b911bfea098bdc12cdbd502f03956faef88cedeab38554",
-      "manifest": "4352bc13e3b87f0ed7a74588d5ed140d9c99c5c3541711bdbb190da5a7d4e8ab",
+      "catalog": "38e8d897562ce0c12e6ec47f6e3a55c5db1f01d99b704f5d912b0b2ee0aa4929",
+      "manifest": "a4a1ec0a20a3743c4a31939481d8f1a4f9108ffd053e947471db29216592286a",
       "probe": "f139fad5dd54217f08b122d4386cf4432600bda3cb4dcfd54ca7532e465cf1b1",
       "database": "1abe4a8df63fc3f909a2297737a0c3408a80cad742a8aff7c3e0accf942b14bb",
       "remote": "b24996d2f1466dbbb89698f524d5631fc3345d3673d6ce63d9f06219025df088",
@@ -67,7 +67,7 @@
     },
     "cargoLockSha256": "1ffad260f0c4d15d53165b2672c9149103ab92cb3dc7796f69216170af364333",
     "packageJsonSha256": "3bf13132c815037285846cd90920224559d666d9c18e15db3c1d694e7a783dfa",
-    "rolloutManifestSha256": "26b6f03163101ef976fbb1d44a919024db4e298b949340aeb3340994ece9766c"
+    "rolloutManifestSha256": "6ad5ed89b85b59736eaf8c1f1a5b79ee21330d8b440acdc244f888bd22d6141c"
   },
   "manifest": {
     "schemaVersion": "agent-provider-runtime-manifest.v1",
@@ -792,13 +792,13 @@
       },
       {
         "agentId": "kimi",
-        "catalogVersion": "0.11.0",
+        "catalogVersion": "1.49.0",
         "adapterId": "kimi-acp",
         "descriptorId": "projection_kimi_runtime_v1",
         "descriptorVersion": "1",
         "versionPolicy": {
           "kind": "detected_semver",
-          "requirement": ">=0.11.0"
+          "requirement": ">=1.49.0"
         },
         "capabilityMode": "replaceable_provider",
         "runtimeHomeStrategy": "vibex_private",
@@ -825,7 +825,7 @@
           }
         ],
         "evidenceState": "documented",
-        "sourceEvidenceReference": "research/acp-agent/kimi@0.11.0",
+        "sourceEvidenceReference": "research/acp-agent/kimi@1.49.0",
         "smokeId": "agent-provider-kimi",
         "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
@@ -2045,7 +2045,7 @@
     {
       "agentId": "kimi",
       "smokeId": "agent-provider-kimi",
-      "catalogVersion": "0.11.0",
+      "catalogVersion": "1.49.0",
       "descriptorId": "projection_kimi_runtime_v1",
       "descriptorVersion": "1",
       "versionPolicy": "detected_semver",
@@ -2074,7 +2074,7 @@
       "providerVerified": false,
       "liveSwitchVerified": false,
       "binaryOnlyVerified": false,
-      "sourceEvidenceReference": "research/acp-agent/kimi@0.11.0",
+      "sourceEvidenceReference": "research/acp-agent/kimi@1.49.0",
       "recordedAt": null
     },
     {

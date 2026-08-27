@@ -260,8 +260,8 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "kimi",
         "Kimi Code CLI",
         "Moonshot AI's open-source terminal coding agent",
-        "0.11.0",
-        "https://github.com/MoonshotAI/kimi-code",
+        "1.49.0",
+        "https://github.com/MoonshotAI/kimi-cli",
         &["kimi", "acp"],
     )
     .with_preset_id("kimi-cli"),
