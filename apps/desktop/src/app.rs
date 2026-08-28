@@ -235,6 +235,9 @@ const SIDEBAR_SESSION_ROW_HEIGHT: f32 = 40.0;
 const SIDEBAR_DRAG_PREVIEW_WIDTH: f32 = 280.0;
 const SIDEBAR_DRAG_HORIZONTAL_SLOP: f32 = 16.0;
 const SIDEBAR_FOLDER_CHILD_INDENT: f32 = 18.0;
+/// Offset from the children container's left edge where the vertical
+/// tree guide line is drawn, aligning with the parent folder icon center.
+const SIDEBAR_FOLDER_TREE_GUIDE_OFFSET: f32 = 7.0;
 const SIDEBAR_FOLDER_DROP_EDGE_HEIGHT: f32 = 8.0;
 const STARTUP_LOADING_INDICATOR_DELAY: Duration = Duration::from_secs(5);
 const STARTUP_LOADING_MIN_DURATION: Duration = Duration::from_secs(1);
@@ -21974,11 +21977,21 @@ impl VibexWorkbench {
             .when(!collapsed && !children.is_empty(), |this| {
                 this.child(
                     v_flex()
+                        .relative()
                         .w_full()
                         .min_w_0()
                         .gap(px(2.0))
                         .pl(px(SIDEBAR_FOLDER_CHILD_INDENT))
-                        .children(children),
+                        .children(children)
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .bottom_0()
+                                .left(px(SIDEBAR_FOLDER_TREE_GUIDE_OFFSET))
+                                .w(px(1.0))
+                                .bg(cx.theme().border.opacity(0.70)),
+                        ),
                 )
             })
             .into_any_element()
