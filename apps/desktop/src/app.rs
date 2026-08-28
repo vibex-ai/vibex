@@ -23291,7 +23291,7 @@ impl VibexWorkbench {
         let row_hover_background = if selected || move_selected {
             row_background
         } else {
-            cx.theme().sidebar_accent.opacity(0.45)
+            sidebar_selected_session_background(cx.theme().sidebar_accent, cx.theme().is_dark())
         };
 
         if renaming {
@@ -23740,7 +23740,13 @@ impl VibexWorkbench {
                                         ),
                                 )
                             })
-                            .child(sidebar_agent_logo(sidebar_agent_id.as_str(), selected, cx))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .opacity(if selected { 1.0 } else { 0.725 })
+                                    .group_hover(&hover_group, |style| style.opacity(1.0))
+                                    .child(sidebar_agent_logo(sidebar_agent_id.as_str(), true, cx)),
+                            )
                             .child(
                                 v_flex().flex_1().min_w_0().child(
                                     div()
@@ -49840,6 +49846,14 @@ mod tests {
         );
         assert!(sidebar_session.contains(".top(px(8.0))"));
         assert!(sidebar_session.contains("cx.theme().sidebar_foreground.opacity(0.56)"));
+        assert!(sidebar_session.contains(
+            "sidebar_selected_session_background(cx.theme().sidebar_accent, cx.theme().is_dark())"
+        ));
+        assert!(sidebar_session.contains(".opacity(if selected { 1.0 } else { 0.725 })"));
+        assert!(sidebar_session.contains(".group_hover(&hover_group, |style| style.opacity(1.0))"));
+        assert!(
+            sidebar_session.contains("sidebar_agent_logo(sidebar_agent_id.as_str(), true, cx)")
+        );
         assert!(sidebar_session.contains(".when(selected, |this| this.font_semibold())"));
         assert!(sidebar_session.contains(".group_hover(&hover_group, |style| {"));
         assert!(sidebar_session.contains("style.text_color(cx.theme().sidebar_foreground)"));
