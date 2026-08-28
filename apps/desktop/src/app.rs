@@ -25277,17 +25277,22 @@ impl VibexWorkbench {
             })
             .collect::<Vec<_>>();
         let project_row_count = project_rows.len();
-        let project_results = if project_rows.is_empty() {
-            div()
-                .px_2()
-                .py_2()
-                .text_xs()
-                .text_color(muted_foreground)
-                .child(strings.new_session_no_projects)
-                .into_any_element()
-        } else {
-            v_flex().children(project_rows).into_any_element()
-        };
+        let project_results = v_flex()
+            .min_h_0()
+            .flex_1()
+            .overflow_y_scrollbar()
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .when(project_rows.is_empty(), |this| {
+                this.child(
+                    div()
+                        .px_2()
+                        .py_2()
+                        .text_xs()
+                        .text_color(muted_foreground)
+                        .child(strings.new_session_no_projects),
+                )
+            })
+            .when(!project_rows.is_empty(), |this| this.children(project_rows));
         let project_menu_open = self.new_session_project_menu_open;
         let project_menu_placement = composer_runtime_menu_placement(
             self.new_session_project_trigger_bounds,
@@ -25304,9 +25309,9 @@ impl VibexWorkbench {
             .track_focus(&self.new_session_project_menu_focus)
             .w(px(256.0))
             .min_w_0()
-            .max_h(px(project_menu_placement.height))
+            .h(px(project_menu_placement.height))
+            .min_h_0()
             .overflow_x_hidden()
-            .overflow_y_scrollbar()
             .rounded(px(10.0))
             .bg(popover_color)
             .text_color(popover_foreground)
