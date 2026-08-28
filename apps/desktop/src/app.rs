@@ -21980,7 +21980,9 @@ impl VibexWorkbench {
                         .relative()
                         .w_full()
                         .min_w_0()
-                        .gap(px(2.0))
+                        // Folder children keep the same rhythm as root-level
+                        // groups so a folder reads like a nested root list.
+                        .gap(px(SIDEBAR_PROJECT_GROUP_GAP))
                         .pl(px(SIDEBAR_FOLDER_CHILD_INDENT))
                         .children(children)
                         .child(
@@ -49273,6 +49275,17 @@ mod tests {
             .map(|(body, _)| body)
             .expect("project renderer should remain inspectable");
         assert!(project.contains(".gap(px(SIDEBAR_PROJECT_CONTENT_GAP))"));
+
+        let folder = source
+            .split_once("    fn render_sidebar_folder(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_project("))
+            .map(|(body, _)| body)
+            .expect("folder renderer should remain inspectable");
+        assert!(
+            folder.contains(
+                ".gap(px(SIDEBAR_PROJECT_GROUP_GAP))\n                        .pl(px(SIDEBAR_FOLDER_CHILD_INDENT))"
+            )
+        );
     }
 
     #[test]
