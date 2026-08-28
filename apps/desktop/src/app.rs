@@ -24489,9 +24489,18 @@ impl VibexWorkbench {
         let remembered = &self.ui_state.composer.runtime_selections_by_model;
         let provider_scroll = self.runtime_provider_scroll.clone();
         let workbench = cx.weak_entity();
+        let agent_identity = self
+            .agent_snapshots
+            .iter()
+            .find(|agent| &agent.id == agent_id)
+            .map(agent_brand_identity);
         let mut visible_groups = Vec::new();
 
         for source in groups {
+            let model_count = runtime_auth_source_model_count(catalog, agent_id, &source.source);
+            if source.kind == RuntimeAuthSourceKind::ProviderProfile && model_count == 0 {
+                continue;
+            }
             let source_label = runtime_auth_source_display_label(&source);
             let source_matches =
                 runtime_search_matches(&query, [source_label.as_str(), source.label.as_str()]);
@@ -24511,7 +24520,6 @@ impl VibexWorkbench {
                 continue;
             }
 
-            let model_count = runtime_auth_source_model_count(catalog, agent_id, &source.source);
             let status = runtime_auth_source_status_label(&source, model_count);
             let can_authenticate = source.kind == RuntimeAuthSourceKind::AgentAccount
                 && !matches!(
@@ -24697,6 +24705,7 @@ impl VibexWorkbench {
             visible_groups.push(v_flex().w_full().child(heading).children(rows));
         }
 
+        let agent_logo = runtime_agent_icon(agent_identity.as_deref().unwrap_or(agent_id.as_str()));
         let agent_back = (!new_session).then(|| {
             Button::new("composer-runtime-provider-back-agent")
                 .xsmall()
@@ -24733,6 +24742,7 @@ impl VibexWorkbench {
                     .gap_1()
                     .mb_1()
                     .children(agent_back)
+                    .when(!new_session, |this| this.child(agent_logo))
                     .child(
                         div()
                             .h_full()
@@ -24771,6 +24781,33 @@ impl VibexWorkbench {
                         this.child(runtime_menu_empty_state(cx))
                     })
                     .children(visible_groups),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .flex_none()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .p_1()
+                    .child(
+                        Button::new(if new_session {
+                            "new-session-runtime-configure-agent"
+                        } else {
+                            "composer-runtime-configure-agent"
+                        })
+                        .small()
+                        .ghost()
+                        .w_full()
+                        .justify_start()
+                        .icon(IconName::Settings)
+                        .label(locale::text("Configure Agent", "配置 Agent", "配置 Agent"))
+                        .on_click(cx.listener({
+                            let agent_id = agent_id.clone();
+                            move |this, _, _, cx| {
+                                this.open_agent_auth_management(agent_id.clone(), cx)
+                            }
+                        })),
+                    ),
             )
             .into_any_element()
     }
@@ -39019,7 +39056,11 @@ fn runtime_provider_model_menu_row_count(
 ) -> usize {
     runtime_auth_sources_for_agent(catalog, agent_id)
         .into_iter()
-        .map(|source| 1 + runtime_auth_source_model_count(catalog, agent_id, &source.source))
+        .filter_map(|source| {
+            let model_count = runtime_auth_source_model_count(catalog, agent_id, &source.source);
+            (source.kind == RuntimeAuthSourceKind::AgentAccount || model_count > 0)
+                .then_some(1 + model_count)
+        })
         .sum()
 }
 
@@ -52003,6 +52044,10 @@ mod tests {
         assert_eq!(auth_sources.len(), 1);
         assert_eq!(
             runtime_auth_source_model_count(&catalog, &agent.id, &auth_sources[0].source),
+            0
+        );
+        assert_eq!(
+            runtime_provider_model_menu_row_count(&catalog, &agent.id),
             0
         );
         assert!(
