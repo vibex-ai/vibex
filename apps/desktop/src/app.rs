@@ -24595,9 +24595,59 @@ impl VibexWorkbench {
             visible_groups.push(v_flex().w_full().child(heading).children(rows));
         }
 
+        let agent_back = (!new_session).then(|| {
+            let agent_label = runtime_agent_label(&self.agent_snapshots, agent_id);
+            let agent_identity = self
+                .agent_snapshots
+                .iter()
+                .find(|agent| &agent.id == agent_id)
+                .map(agent_brand_identity)
+                .unwrap_or_else(|| format!("{} {agent_label}", agent_id.as_str()));
+            Button::new("composer-runtime-provider-back-agent")
+                .xsmall()
+                .ghost()
+                .h(px(28.0))
+                .max_w(px(180.0))
+                .min_w_0()
+                .flex_none()
+                .px_1()
+                .tooltip(locale::text(
+                    "Back to Agent selection",
+                    "返回 Agent 选择",
+                    "返回 Agent 選擇",
+                ))
+                .text_color(cx.theme().muted_foreground)
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .gap(px(5.0))
+                        .child(Icon::new(IconName::ArrowLeft).size(px(14.0)))
+                        .child(runtime_agent_icon(&agent_identity))
+                        .child(div().min_w_0().truncate().child(agent_label)),
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.navigate_composer_runtime_menu(
+                        ComposerRuntimeMenuView::Agent,
+                        None,
+                        None,
+                        cx,
+                    )
+                }))
+        });
+
         v_flex()
             .h_full()
             .min_h_0()
+            .children(agent_back.map(|button| {
+                h_flex()
+                    .w_full()
+                    .h(px(34.0))
+                    .flex_none()
+                    .items_center()
+                    .px_1()
+                    .mb_1()
+                    .child(button)
+            }))
             .child(
                 div()
                     .h(px(34.0))
@@ -51852,6 +51902,10 @@ mod tests {
         assert!(grouped_models.contains("load_runtime_authentication_menu("));
         assert!(grouped_models.contains("Input::new(&search)"));
         assert!(grouped_models.contains("runtime_model_choices("));
+        assert!(grouped_models.contains("composer-runtime-provider-back-agent"));
+        assert!(grouped_models.contains("IconName::ArrowLeft"));
+        assert!(grouped_models.contains("runtime_agent_icon(&agent_identity)"));
+        assert!(grouped_models.contains("ComposerRuntimeMenuView::Agent"));
         for cascade in [new_session, current_session] {
             assert!(cascade.contains("render_provider_model_groups("));
             assert!(cascade.contains("ComposerRuntimeMenuView::Authentication"));
