@@ -189,8 +189,7 @@ const SIDEBAR_ICON_TITLE_GAP: f32 = 4.0;
 const SIDEBAR_PROJECT_ICON_SLOT_SIZE: f32 = 30.0;
 const SIDEBAR_WORKSPACE_SESSION_INDENT: f32 = 28.0;
 const SIDEBAR_WORKSPACE_SESSION_CARD_OVERHANG: f32 = 8.0;
-const SIDEBAR_TOP_LEVEL_PROJECT_OFFSET: f32 = -8.0;
-const SIDEBAR_NESTED_PROJECT_INDENT: f32 = 8.0;
+const SIDEBAR_ROW_ICON_SLOT_OVERHANG: f32 = -8.0;
 const SIDEBAR_PROJECT_LOGO_IMAGE_SIZE: u32 = 256;
 const SIDEBAR_PROJECT_LOGO_MAX_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 const SIDEBAR_PROJECT_LOGO_MAX_SOURCE_PIXELS: u64 = 40_000_000;
@@ -235,8 +234,7 @@ const SIDEBAR_WORKSPACE_ROW_HEIGHT: f32 = 44.0;
 const SIDEBAR_SESSION_ROW_HEIGHT: f32 = 40.0;
 const SIDEBAR_DRAG_PREVIEW_WIDTH: f32 = 280.0;
 const SIDEBAR_DRAG_HORIZONTAL_SLOP: f32 = 16.0;
-const SIDEBAR_ROOT_FOLDER_CHILD_INDENT: f32 = 18.0;
-const SIDEBAR_NESTED_FOLDER_CHILD_INDENT: f32 = 34.0;
+const SIDEBAR_FOLDER_CHILD_INDENT: f32 = 18.0;
 const SIDEBAR_FOLDER_DROP_EDGE_HEIGHT: f32 = 8.0;
 const STARTUP_LOADING_INDICATOR_DELAY: Duration = Duration::from_secs(5);
 const STARTUP_LOADING_MIN_DURATION: Duration = Duration::from_secs(1);
@@ -21357,7 +21355,6 @@ impl VibexWorkbench {
                         &group,
                         active,
                         reorder_enabled,
-                        depth,
                         strings,
                         cx,
                     ));
@@ -21387,7 +21384,6 @@ impl VibexWorkbench {
                         None,
                         children,
                         reorder_enabled,
-                        depth,
                         cx,
                     ));
                 }
@@ -21465,7 +21461,6 @@ impl VibexWorkbench {
                         Some(project_id.clone()),
                         children,
                         reorder_enabled,
-                        depth,
                         cx,
                     ));
                 }
@@ -21550,7 +21545,6 @@ impl VibexWorkbench {
                         Some(project_id.clone()),
                         children,
                         reorder_enabled,
-                        depth,
                         cx,
                     ));
                 }
@@ -21583,7 +21577,6 @@ impl VibexWorkbench {
         project_id: Option<String>,
         children: Vec<AnyElement>,
         reorder_enabled: bool,
-        depth: usize,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some((folder_name, auto_archive_after_days)) = self
@@ -21618,15 +21611,9 @@ impl VibexWorkbench {
         let context_hover_entity = cx.weak_entity();
         let menu_folder_id = folder_id.clone();
         let menu_folder_name = folder_name.clone();
-        let root_level_folder = project_id.is_none() && depth == 0;
         let menu_project_id = project_id;
         let menu_workspace_id = context_workspace_id.clone();
         let menu_entity = cx.weak_entity();
-        let child_indent = px(if root_level_folder {
-            SIDEBAR_ROOT_FOLDER_CHILD_INDENT
-        } else {
-            SIDEBAR_NESTED_FOLDER_CHILD_INDENT
-        });
         let rename_error = renaming
             .then(|| self.sidebar_rename_error.clone())
             .flatten();
@@ -21657,12 +21644,7 @@ impl VibexWorkbench {
             .id(format!("sidebar-folder-row-{folder_id}"))
             .group(hover_group.clone())
             .relative()
-            .when(root_level_folder, |this| {
-                this.left(px(SIDEBAR_TOP_LEVEL_PROJECT_OFFSET))
-            })
-            .when(!root_level_folder, |this| {
-                this.left(px(SIDEBAR_NESTED_PROJECT_INDENT))
-            })
+            .left(px(SIDEBAR_ROW_ICON_SLOT_OVERHANG))
             .h(px(32.0))
             .min_h(px(32.0))
             .w_full()
@@ -21995,7 +21977,7 @@ impl VibexWorkbench {
                         .w_full()
                         .min_w_0()
                         .gap(px(2.0))
-                        .pl(child_indent)
+                        .pl(px(SIDEBAR_FOLDER_CHILD_INDENT))
                         .children(children),
                 )
             })
@@ -22202,7 +22184,6 @@ impl VibexWorkbench {
         group: &SidebarProjectProjection,
         active: bool,
         reorder_enabled: bool,
-        depth: usize,
         strings: Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -22348,9 +22329,7 @@ impl VibexWorkbench {
             .id(format!("sidebar-project-row-{project_id_string}"))
             .group(hover_group.clone())
             .relative()
-            .when(depth == 0, |this| {
-                this.left(px(SIDEBAR_TOP_LEVEL_PROJECT_OFFSET))
-            })
+            .left(px(SIDEBAR_ROW_ICON_SLOT_OVERHANG))
             .h(px(32.0))
             .min_h(px(32.0))
             .w_full()
@@ -22480,14 +22459,7 @@ impl VibexWorkbench {
                     .items_center()
                     .gap(px(SIDEBAR_ICON_TITLE_GAP))
                     .when(self.sidebar_batch_mode, |this| this.pl(px(28.0)).pr_2())
-                    .when(!self.sidebar_batch_mode, |this| {
-                        this.pl(px(if depth == 0 {
-                            0.0
-                        } else {
-                            SIDEBAR_NESTED_PROJECT_INDENT
-                        }))
-                        .pr(px(92.0))
-                    })
+                    .when(!self.sidebar_batch_mode, |this| this.pr(px(92.0)))
                     .text_color(if active {
                         cx.theme().sidebar_foreground
                     } else {
@@ -22626,7 +22598,6 @@ impl VibexWorkbench {
                         workspace,
                         reorder_enabled,
                         strings,
-                        depth,
                         cx,
                     ));
                 }
@@ -22776,7 +22747,6 @@ impl VibexWorkbench {
         projection: &SidebarWorkspaceProjection,
         reorder_enabled: bool,
         strings: Strings,
-        depth: usize,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let workspace = projection.workspace.clone();
@@ -22813,11 +22783,7 @@ impl VibexWorkbench {
         let project_for_folder = workspace.project_id.clone();
         let hover_group: SharedString = format!("sidebar-workspace-{workspace_id}").into();
         let tooltip_branch = branch.clone();
-        let workspace_offset = if depth == 0 {
-            SIDEBAR_TOP_LEVEL_PROJECT_OFFSET
-        } else {
-            SIDEBAR_NESTED_PROJECT_INDENT
-        };
+        let workspace_offset = SIDEBAR_ROW_ICON_SLOT_OVERHANG;
         let workspace_title_color = if selected {
             cx.theme().sidebar_foreground
         } else {
@@ -49254,20 +49220,14 @@ mod tests {
             .map(|(body, _)| body)
             .expect("project row should remain inspectable");
         assert!(project_row.contains(".text_base()"));
-        assert!(source.contains("const SIDEBAR_TOP_LEVEL_PROJECT_OFFSET: f32 = -8.0;"));
-        assert!(source.contains("const SIDEBAR_NESTED_PROJECT_INDENT: f32 = 8.0;"));
-        assert!(project_row.contains(
-            ".when(depth == 0, |this| {\n                this.left(px(SIDEBAR_TOP_LEVEL_PROJECT_OFFSET))"
-        ));
+        assert!(source.contains("const SIDEBAR_ROW_ICON_SLOT_OVERHANG: f32 = -8.0;"));
+        assert!(project_row.contains(".left(px(SIDEBAR_ROW_ICON_SLOT_OVERHANG))"));
         let folder = source
             .split_once("    fn render_sidebar_folder(")
             .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_project("))
             .map(|(body, _)| body)
             .expect("folder renderer should remain inspectable");
-        assert!(folder.contains("let root_level_folder = project_id.is_none() && depth == 0;"));
-        assert!(folder.contains(
-            ".when(root_level_folder, |this| {\n                this.left(px(SIDEBAR_TOP_LEVEL_PROJECT_OFFSET))"
-        ));
+        assert!(folder.contains(".left(px(SIDEBAR_ROW_ICON_SLOT_OVERHANG))"));
         assert!(folder.contains(".gap(px(4.0))\n                    .pl_0()"));
         assert!(folder.contains(".size(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))"));
         assert!(folder.contains(".size(px(SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE))"));
@@ -49278,7 +49238,7 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_session("))
             .map(|(body, _)| body)
             .expect("workspace renderer should remain inspectable");
-        assert!(workspace.contains("let workspace_offset = if depth == 0"));
+        assert!(workspace.contains("let workspace_offset = SIDEBAR_ROW_ICON_SLOT_OVERHANG;"));
         assert!(workspace.contains(".left(px(workspace_offset))"));
     }
 
@@ -49445,8 +49405,7 @@ mod tests {
         assert!(folder.contains("SidebarSessionDrag"));
         assert!(folder.contains("SidebarOrganizationDropPosition::Into"));
         assert!(folder.contains(".aria_expanded(!collapsed)"));
-        assert!(folder.contains("SIDEBAR_ROOT_FOLDER_CHILD_INDENT"));
-        assert!(folder.contains("SIDEBAR_NESTED_FOLDER_CHILD_INDENT"));
+        assert!(folder.contains("SIDEBAR_FOLDER_CHILD_INDENT"));
         assert!(source.contains("sidebar_icon(\"icons/vibex/boxes.svg\")"));
         assert!(source.contains("finish_sidebar_rename_on_blur"));
         assert!(creation.contains("self.sidebar_state.collapsed_ids.remove(&project_id)"));
@@ -54064,13 +54023,13 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_project("))
             .map(|(body, _)| body)
             .expect("sidebar folder renderer should remain inspectable");
-        assert!(folder.contains(".gap(px(if root_level_folder { 4.0 } else { 8.0 }))"));
+        assert!(folder.contains(".gap(px(4.0))\n                    .pl_0()"));
         assert!(folder.contains(".size(px(12.0))"));
         assert!(folder.contains(".size(px(14.0))"));
         assert!(folder.contains(".size(px(SIDEBAR_LOGO_DISPLAY_SIZE))"));
         assert!(folder.contains(".size(px(SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE))"));
         assert!(folder.contains(".size(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))"));
-        assert!(folder.contains(".pl(px(SIDEBAR_WORKSPACE_SESSION_CARD_OVERHANG))"));
+        assert!(folder.contains(".pl(px(SIDEBAR_FOLDER_CHILD_INDENT))"));
         assert!(folder.contains(".child(\n                        h_flex()"));
     }
 
