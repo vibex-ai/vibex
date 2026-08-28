@@ -233,7 +233,7 @@ const SIDEBAR_WORKSPACE_ROW_HEIGHT: f32 = 44.0;
 const SIDEBAR_SESSION_ROW_HEIGHT: f32 = 40.0;
 const SIDEBAR_DRAG_PREVIEW_WIDTH: f32 = 280.0;
 const SIDEBAR_DRAG_HORIZONTAL_SLOP: f32 = 16.0;
-const SIDEBAR_ORGANIZATION_INDENT: f32 = 20.0;
+const SIDEBAR_ORGANIZATION_INDENT: f32 = 18.0;
 const SIDEBAR_ORGANIZATION_MIN_INDENT: f32 = 4.0;
 const SIDEBAR_FOLDER_DROP_EDGE_HEIGHT: f32 = 8.0;
 const STARTUP_LOADING_INDICATOR_DELAY: Duration = Duration::from_secs(5);
@@ -21844,7 +21844,7 @@ impl VibexWorkbench {
                             .when(!renaming, |this| {
                                 this.child(
                                     div()
-                                        .flex_1()
+                                        .when(!root_level_folder, |this| this.flex_1())
                                         .min_w_0()
                                         .truncate()
                                         .text_sm()
@@ -21878,6 +21878,7 @@ impl VibexWorkbench {
                                             .size(px(12.0)),
                                         ),
                                 )
+                                .when(!renaming, |this| this.child(div().flex_1()))
                             })
                             .when(!renaming && reorder_enabled, |this| {
                                 this.child(
@@ -49145,6 +49146,7 @@ mod tests {
         assert!(folder.contains(
             ".when(root_level_folder, |this| {\n                                this.child(\n                                    div()\n                                        .size(px(SIDEBAR_LOGO_DISPLAY_SIZE))"
         ));
+        assert!(folder.contains(".when(!renaming, |this| this.child(div().flex_1()))"));
         let workspace = source
             .split_once("    fn render_sidebar_workspace(")
             .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_session("))
@@ -49318,6 +49320,7 @@ mod tests {
         assert!(folder.contains("SidebarOrganizationDropPosition::Into"));
         assert!(folder.contains(".aria_expanded(!collapsed)"));
         assert!(folder.contains("SIDEBAR_ORGANIZATION_INDENT"));
+        assert!(source.contains("const SIDEBAR_ORGANIZATION_INDENT: f32 = 18.0;"));
         assert!(source.contains("sidebar_icon(\"icons/vibex/boxes.svg\")"));
         assert!(source.contains("finish_sidebar_rename_on_blur"));
         assert!(creation.contains("self.sidebar_state.collapsed_ids.remove(&project_id)"));
