@@ -25335,7 +25335,6 @@ impl VibexWorkbench {
             .min_h_0()
             .flex_1()
             .overflow_y_scrollbar()
-            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .when(project_rows.is_empty(), |this| {
                 this.child(
                     div()
@@ -25366,6 +25365,7 @@ impl VibexWorkbench {
             .h(px(project_menu_placement.height))
             .min_h_0()
             .overflow_x_hidden()
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .rounded(px(10.0))
             .bg(popover_color)
             .text_color(popover_foreground)
