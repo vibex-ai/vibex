@@ -4065,6 +4065,7 @@ impl VibexWorkbench {
         let auto_continue_session_ids = restored_auto_continue_session_ids(&ui_state.session);
         let initial_locale = locale::apply_locale(ui_state.appearance.locale);
         theme::apply_appearance(&ui_state.appearance, Some(window), cx);
+        theme::apply_window_scale(&ui_state.appearance, window);
         Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
         let focus_handle = cx.focus_handle();
         let new_session_project_menu_focus = cx.focus_handle();
@@ -19627,6 +19628,22 @@ impl VibexWorkbench {
             .update(cx, |management, cx| management.sync_locale(window, cx));
     }
 
+    fn adjust_window_scale(&mut self, delta: i16, window: &mut Window, cx: &mut Context<Self>) {
+        self.ui_state.appearance.window_scale_percent = adjust_u16(
+            self.ui_state.appearance.window_scale_percent,
+            delta,
+            75,
+            200,
+        );
+        theme::apply_window_scale(&self.ui_state.appearance, window);
+        self.timeline_measured_turn_heights.clear();
+        self.timeline_pending_turn_heights.clear();
+        self.timeline_estimated_turn_heights.clear();
+        self.rebuild_timeline_sizes();
+        self.queue_ui_state();
+        cx.notify();
+    }
+
     fn set_interface_font_family(
         &mut self,
         family: Option<String>,
@@ -19896,6 +19913,7 @@ impl VibexWorkbench {
             right_rail.set_mode(right_rail_mode, cx)
         });
         theme::apply_appearance(&self.ui_state.appearance, Some(window), cx);
+        theme::apply_window_scale(&self.ui_state.appearance, window);
         locale::apply_locale(self.ui_state.appearance.locale);
         self.sync_locale_dependents(window, cx);
         crate::system_tray::update_locale(self.resolved_locale(), cx);
@@ -40501,6 +40519,10 @@ fn settings_section_for_query(query: &str) -> Option<SettingsSection> {
         "appearance",
         "theme",
         "font",
+        "scale",
+        "zoom",
+        "缩放",
+        "縮放",
         "contrast",
         "motion",
         "外观",
@@ -40677,6 +40699,12 @@ fn settings_search_candidates(strings: Strings) -> Vec<SettingsSearchCandidate> 
             strings.theme,
             strings.theme_description,
             &["theme", "dark", "light", "主题", "主題"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Appearance,
+            strings.window_scale,
+            strings.window_scale_description,
+            &["window scale", "zoom", "scale", "窗口缩放", "視窗縮放"],
         ),
         settings_search_candidate(
             SettingsSection::Appearance,
@@ -41782,6 +41810,13 @@ impl FoundationSettings {
         cx.notify();
     }
 
+    fn adjust_window_scale(&mut self, delta: i16, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self
+            .workbench
+            .update(cx, |this, cx| this.adjust_window_scale(delta, window, cx));
+        cx.notify();
+    }
+
     fn adjust_interface_font(
         &mut self,
         size_delta: i16,
@@ -42736,6 +42771,26 @@ impl FoundationSettings {
                     strings.theme,
                     strings.theme_description,
                     theme_control,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    strings.window_scale,
+                    strings.window_scale_description,
+                    settings_number_stepper(
+                        "window-scale",
+                        appearance.window_scale_percent,
+                        Some("%"),
+                        75,
+                        200,
+                        cx.listener(|this, _, window, cx| {
+                            this.adjust_window_scale(-10, window, cx)
+                        }),
+                        cx.listener(|this, _, window, cx| this.adjust_window_scale(10, window, cx)),
+                        strings.decrease_window_scale,
+                        strings.increase_window_scale,
+                        cx,
+                    ),
                     stacked,
                     cx,
                 ),

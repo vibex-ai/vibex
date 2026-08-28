@@ -118,6 +118,10 @@ pub fn apply_appearance(appearance: &AppearanceUiState, window: Option<&mut Wind
     apply_code_font_weight(appearance.code_font.weight, cx);
 }
 
+pub fn apply_window_scale(appearance: &AppearanceUiState, window: &mut Window) {
+    window.set_rem_size(px(16.0 * f32::from(appearance.window_scale_percent) / 100.0));
+}
+
 pub(crate) fn semantic_color(name: &str, dark: bool) -> Hsla {
     let token = semantic_token(name, dark)
         .unwrap_or_else(|| panic!("missing generated GPUI semantic token: {name}"));

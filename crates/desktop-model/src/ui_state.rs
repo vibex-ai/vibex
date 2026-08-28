@@ -239,6 +239,8 @@ impl FontSetting {
 pub struct AppearanceUiState {
     pub theme: ThemeMode,
     pub locale: LocaleMode,
+    #[serde(default = "default_window_scale_percent")]
+    pub window_scale_percent: u16,
     pub interface_font: FontSetting,
     pub code_font: FontSetting,
     pub reduced_motion: bool,
@@ -250,6 +252,7 @@ impl Default for AppearanceUiState {
         Self {
             theme: ThemeMode::System,
             locale: LocaleMode::System,
+            window_scale_percent: default_window_scale_percent(),
             interface_font: FontSetting::interface_default(),
             code_font: FontSetting::code_default(),
             reduced_motion: false,
@@ -565,6 +568,10 @@ impl Default for DesktopUiStateV1 {
     }
 }
 
+const fn default_window_scale_percent() -> u16 {
+    100
+}
+
 impl DesktopUiStateV1 {
     pub fn normalize(&mut self) -> Result<(), UiStateError> {
         if self.schema_version != DESKTOP_UI_STATE_SCHEMA_VERSION {
@@ -572,6 +579,7 @@ impl DesktopUiStateV1 {
         }
         self.source_app_version = bounded_required(&self.source_app_version, 80)
             .ok_or(UiStateError::Validation("source app version is empty"))?;
+        self.appearance.window_scale_percent = self.appearance.window_scale_percent.clamp(75, 200);
         self.appearance.interface_font.normalize(12);
         self.appearance.code_font.normalize(10);
         self.workbench.active_tab =
@@ -1369,12 +1377,14 @@ mod tests {
     #[test]
     fn state_normalizes_fonts_layout_ids_and_split_sizes() {
         let mut state = DesktopUiStateV1::default();
+        state.appearance.window_scale_percent = 250;
         state.appearance.interface_font.size = 99;
         state.appearance.code_font.weight = 1;
         state.workbench.sidebar_width = f32::NAN;
         state.sidebar.session_order = vec![" session_a ".into(), "session_a".into()];
         state.preview.split_sizes = vec![2.0, 2.0];
         state.normalize().unwrap();
+        assert_eq!(state.appearance.window_scale_percent, 200);
         assert_eq!(state.appearance.interface_font.size, 24);
         assert_eq!(state.appearance.code_font.weight, 100);
         assert_eq!(state.workbench.sidebar_width, 320.0);
