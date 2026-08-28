@@ -233,8 +233,8 @@ const SIDEBAR_WORKSPACE_ROW_HEIGHT: f32 = 44.0;
 const SIDEBAR_SESSION_ROW_HEIGHT: f32 = 40.0;
 const SIDEBAR_DRAG_PREVIEW_WIDTH: f32 = 280.0;
 const SIDEBAR_DRAG_HORIZONTAL_SLOP: f32 = 16.0;
-const SIDEBAR_ORGANIZATION_INDENT: f32 = 18.0;
-const SIDEBAR_ORGANIZATION_MIN_INDENT: f32 = 4.0;
+const SIDEBAR_ROOT_FOLDER_CHILD_INDENT: f32 = 18.0;
+const SIDEBAR_NESTED_FOLDER_CHILD_INDENT: f32 = 34.0;
 const SIDEBAR_FOLDER_DROP_EDGE_HEIGHT: f32 = 8.0;
 const STARTUP_LOADING_INDICATOR_DELAY: Duration = Duration::from_secs(5);
 const STARTUP_LOADING_MIN_DURATION: Duration = Duration::from_secs(1);
@@ -21541,9 +21541,11 @@ impl VibexWorkbench {
         let menu_project_id = project_id;
         let menu_workspace_id = context_workspace_id.clone();
         let menu_entity = cx.weak_entity();
-        let child_indent = px((SIDEBAR_ORGANIZATION_INDENT
-            - depth as f32 * SIDEBAR_ORGANIZATION_MIN_INDENT)
-            .max(SIDEBAR_ORGANIZATION_MIN_INDENT));
+        let child_indent = px(if root_level_folder {
+            SIDEBAR_ROOT_FOLDER_CHILD_INDENT
+        } else {
+            SIDEBAR_NESTED_FOLDER_CHILD_INDENT
+        });
         let rename_error = renaming
             .then(|| self.sidebar_rename_error.clone())
             .flatten();
@@ -21576,6 +21578,9 @@ impl VibexWorkbench {
             .relative()
             .when(root_level_folder, |this| {
                 this.left(px(SIDEBAR_TOP_LEVEL_PROJECT_OFFSET))
+            })
+            .when(!root_level_folder, |this| {
+                this.left(px(SIDEBAR_NESTED_PROJECT_INDENT))
             })
             .h(px(32.0))
             .min_h(px(32.0))
@@ -21771,50 +21776,31 @@ impl VibexWorkbench {
                     .size_full()
                     .min_w_0()
                     .items_center()
-                    .gap(px(if root_level_folder { 4.0 } else { 8.0 }))
-                    .when(root_level_folder, |this| {
-                        this.pl_0().child(
-                            div()
-                                .size(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(
-                                    Icon::new(if collapsed {
-                                        IconName::Folder
+                    .gap(px(4.0))
+                    .pl_0()
+                    .child(
+                        div()
+                            .size(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                Icon::new(if collapsed {
+                                    IconName::Folder
+                                } else {
+                                    IconName::FolderOpen
+                                })
+                                .size(px(SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE))
+                                .text_color(
+                                    if auto_archive_after_days.is_some() {
+                                        cx.theme().success
                                     } else {
-                                        IconName::FolderOpen
-                                    })
-                                    .size(px(SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE))
-                                    .text_color(
-                                        if auto_archive_after_days.is_some() {
-                                            cx.theme().success
-                                        } else {
-                                            cx.theme().sidebar_foreground.opacity(0.72)
-                                        },
-                                    ),
+                                        cx.theme().sidebar_foreground.opacity(0.72)
+                                    },
                                 ),
-                        )
-                    })
-                    .when(!root_level_folder, |this| {
-                        this.pl(px(SIDEBAR_WORKSPACE_SESSION_CARD_OVERHANG)).child(
-                            div()
-                                .size(px(SIDEBAR_LOGO_DISPLAY_SIZE))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(
-                                    Icon::new(if collapsed {
-                                        IconName::ChevronRight
-                                    } else {
-                                        IconName::ChevronDown
-                                    })
-                                    .size(px(12.0)),
-                                ),
-                        )
-                    })
+                            ),
+                    )
                     .pr_1()
                     .text_color(cx.theme().sidebar_foreground.opacity(0.78))
                     .child(
@@ -21822,29 +21808,10 @@ impl VibexWorkbench {
                             .min_w_0()
                             .flex_1()
                             .items_center()
-                            .gap(px(if root_level_folder { 4.0 } else { 6.0 }))
-                            .when(!root_level_folder, |this| {
-                                this.child(
-                                    Icon::new(if collapsed {
-                                        IconName::Folder
-                                    } else {
-                                        IconName::FolderOpen
-                                    })
-                                    .size(px(14.0))
-                                    .flex_none()
-                                    .text_color(
-                                        if auto_archive_after_days.is_some() {
-                                            cx.theme().success
-                                        } else {
-                                            cx.theme().sidebar_foreground.opacity(0.72)
-                                        },
-                                    ),
-                                )
-                            })
+                            .gap(px(4.0))
                             .when(!renaming, |this| {
                                 this.child(
                                     div()
-                                        .when(!root_level_folder, |this| this.flex_1())
                                         .min_w_0()
                                         .truncate()
                                         .text_sm()
@@ -21861,25 +21828,23 @@ impl VibexWorkbench {
                                         .min_w_0(),
                                 )
                             })
-                            .when(root_level_folder, |this| {
-                                this.child(
-                                    div()
-                                        .size(px(SIDEBAR_LOGO_DISPLAY_SIZE))
-                                        .flex_none()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(
-                                            Icon::new(if collapsed {
-                                                IconName::ChevronRight
-                                            } else {
-                                                IconName::ChevronDown
-                                            })
-                                            .size(px(12.0)),
-                                        ),
-                                )
-                                .when(!renaming, |this| this.child(div().flex_1()))
-                            })
+                            .child(
+                                div()
+                                    .size(px(SIDEBAR_LOGO_DISPLAY_SIZE))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        Icon::new(if collapsed {
+                                            IconName::ChevronRight
+                                        } else {
+                                            IconName::ChevronDown
+                                        })
+                                        .size(px(12.0)),
+                                    ),
+                            )
+                            .when(!renaming, |this| this.child(div().flex_1()))
                             .when(!renaming && reorder_enabled, |this| {
                                 this.child(
                                     div()
@@ -49138,14 +49103,10 @@ mod tests {
         assert!(folder.contains(
             ".when(root_level_folder, |this| {\n                this.left(px(SIDEBAR_TOP_LEVEL_PROJECT_OFFSET))"
         ));
-        assert!(folder.contains(
-            ".when(root_level_folder, |this| {\n                        this.pl_0().child("
-        ));
+        assert!(folder.contains(".gap(px(4.0))\n                    .pl_0()"));
         assert!(folder.contains(".size(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))"));
         assert!(folder.contains(".size(px(SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE))"));
-        assert!(folder.contains(
-            ".when(root_level_folder, |this| {\n                                this.child(\n                                    div()\n                                        .size(px(SIDEBAR_LOGO_DISPLAY_SIZE))"
-        ));
+        assert!(folder.contains(".size(px(SIDEBAR_LOGO_DISPLAY_SIZE))"));
         assert!(folder.contains(".when(!renaming, |this| this.child(div().flex_1()))"));
         let workspace = source
             .split_once("    fn render_sidebar_workspace(")
@@ -49319,8 +49280,8 @@ mod tests {
         assert!(folder.contains("SidebarSessionDrag"));
         assert!(folder.contains("SidebarOrganizationDropPosition::Into"));
         assert!(folder.contains(".aria_expanded(!collapsed)"));
-        assert!(folder.contains("SIDEBAR_ORGANIZATION_INDENT"));
-        assert!(source.contains("const SIDEBAR_ORGANIZATION_INDENT: f32 = 18.0;"));
+        assert!(folder.contains("SIDEBAR_ROOT_FOLDER_CHILD_INDENT"));
+        assert!(folder.contains("SIDEBAR_NESTED_FOLDER_CHILD_INDENT"));
         assert!(source.contains("sidebar_icon(\"icons/vibex/boxes.svg\")"));
         assert!(source.contains("finish_sidebar_rename_on_blur"));
         assert!(creation.contains("self.sidebar_state.collapsed_ids.remove(&project_id)"));
