@@ -4065,7 +4065,6 @@ impl VibexWorkbench {
         let auto_continue_session_ids = restored_auto_continue_session_ids(&ui_state.session);
         let initial_locale = locale::apply_locale(ui_state.appearance.locale);
         theme::apply_appearance(&ui_state.appearance, Some(window), cx);
-        theme::apply_window_scale(&ui_state.appearance, window);
         Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
         let focus_handle = cx.focus_handle();
         let new_session_project_menu_focus = cx.focus_handle();
@@ -19635,7 +19634,7 @@ impl VibexWorkbench {
             75,
             200,
         );
-        theme::apply_window_scale(&self.ui_state.appearance, window);
+        theme::apply_appearance(&self.ui_state.appearance, Some(window), cx);
         self.timeline_measured_turn_heights.clear();
         self.timeline_pending_turn_heights.clear();
         self.timeline_estimated_turn_heights.clear();
@@ -19697,7 +19696,10 @@ impl VibexWorkbench {
             100,
             900,
         );
-        Theme::global_mut(cx).font_size = px(self.ui_state.appearance.interface_font.size as f32);
+        Theme::global_mut(cx).font_size = theme::scaled_font_size(
+            self.ui_state.appearance.interface_font.size,
+            self.ui_state.appearance.window_scale_percent,
+        );
         apply_code_font_weight(self.ui_state.appearance.code_font.weight, cx);
         self.timeline_measured_turn_heights.clear();
         self.timeline_pending_turn_heights.clear();
@@ -19716,7 +19718,10 @@ impl VibexWorkbench {
             100,
             900,
         );
-        Theme::global_mut(cx).mono_font_size = px(self.ui_state.appearance.code_font.size as f32);
+        Theme::global_mut(cx).mono_font_size = theme::scaled_font_size(
+            self.ui_state.appearance.code_font.size,
+            self.ui_state.appearance.window_scale_percent,
+        );
         apply_code_font_weight(self.ui_state.appearance.code_font.weight, cx);
         self.timeline_measured_turn_heights.clear();
         self.timeline_pending_turn_heights.clear();
@@ -19913,7 +19918,6 @@ impl VibexWorkbench {
             right_rail.set_mode(right_rail_mode, cx)
         });
         theme::apply_appearance(&self.ui_state.appearance, Some(window), cx);
-        theme::apply_window_scale(&self.ui_state.appearance, window);
         locale::apply_locale(self.ui_state.appearance.locale);
         self.sync_locale_dependents(window, cx);
         crate::system_tray::update_locale(self.resolved_locale(), cx);

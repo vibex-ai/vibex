@@ -86,7 +86,10 @@ pub fn apply_appearance(appearance: &AppearanceUiState, window: Option<&mut Wind
         .unwrap_or(INTERFACE_TYPOGRAPHY.family)
         .to_string()
         .into();
-    theme.font_size = px(appearance.interface_font.size as f32);
+    theme.font_size = scaled_font_size(
+        appearance.interface_font.size,
+        appearance.window_scale_percent,
+    );
     theme.mono_font_family = appearance
         .code_font
         .family
@@ -94,7 +97,8 @@ pub fn apply_appearance(appearance: &AppearanceUiState, window: Option<&mut Wind
         .unwrap_or(shared_code_font_family())
         .to_string()
         .into();
-    theme.mono_font_size = px(appearance.code_font.size as f32);
+    theme.mono_font_size =
+        scaled_font_size(appearance.code_font.size, appearance.window_scale_percent);
     theme.radius = px(RADII.control_px);
     theme.radius_lg = px(RADII.large_px);
     theme.shadow = SHADOWS_ENABLED;
@@ -118,8 +122,8 @@ pub fn apply_appearance(appearance: &AppearanceUiState, window: Option<&mut Wind
     apply_code_font_weight(appearance.code_font.weight, cx);
 }
 
-pub fn apply_window_scale(appearance: &AppearanceUiState, window: &mut Window) {
-    window.set_rem_size(px(16.0 * f32::from(appearance.window_scale_percent) / 100.0));
+pub fn scaled_font_size(size: u16, window_scale_percent: u16) -> gpui::Pixels {
+    px(f32::from(size) * f32::from(window_scale_percent) / 100.0)
 }
 
 pub(crate) fn semantic_color(name: &str, dark: bool) -> Hsla {
@@ -139,6 +143,13 @@ pub fn semantic_token(name: &str, dark: bool) -> Option<GpuiColorToken> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_scale_applies_to_interface_and_code_metrics() {
+        assert_eq!(scaled_font_size(14, 100), px(14.0));
+        assert_eq!(scaled_font_size(14, 150), px(21.0));
+        assert_eq!(scaled_font_size(13, 75), px(9.75));
+    }
 
     #[test]
     fn generated_tokens_keep_shared_source_identity_and_core_semantics() {
