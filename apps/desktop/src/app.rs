@@ -50720,7 +50720,7 @@ mod tests {
         assert!(composer.contains("this.flex_1().min_h_0()"));
         assert!(composer.contains("ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT"));
         assert!(composer.contains("ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT"));
-        assert!(composer.contains(".h(px(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT))"));
+        assert!(composer.contains(".min_h(px(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT))"));
         assert!(composer.contains(".when(self.composer_expanded, |this| this.pt_4())"));
         let fullscreen_button = composer
             .find("toggle-composer-expanded")
@@ -54130,7 +54130,9 @@ mod tests {
         assert!(!row.contains(".border_l_1()"));
         assert!(!workspace.contains("workspace_kind"));
         assert!(!workspace.contains("Current Checkout"));
-        assert!(!workspace.contains("workspace.root_path"));
+        // The unread-completion identity match legitimately reads
+        // `workspace.root_path`, so only the visual row is checked here.
+        assert!(!row.contains("workspace.root_path"));
 
         let project = source
             .split_once("    fn render_sidebar_project(")
