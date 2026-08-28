@@ -3925,6 +3925,8 @@ pub struct VibexWorkbench {
     composer_runtime_menu_agent_id: Option<AgentId>,
     composer_runtime_menu_auth_source: Option<RuntimeAuthSource>,
     composer_runtime_search: Entity<InputState>,
+    runtime_provider_scroll: ScrollHandle,
+    runtime_provider_scroll_to_selection: bool,
     runtime_authentication_menu: Option<RuntimeAuthenticationMenuState>,
     composer_geometry: ComposerGeometry,
     runtime_choice_menu_open: Option<String>,
@@ -4618,6 +4620,8 @@ impl VibexWorkbench {
             composer_runtime_menu_agent_id: None,
             composer_runtime_menu_auth_source: None,
             composer_runtime_search,
+            runtime_provider_scroll: ScrollHandle::new(),
+            runtime_provider_scroll_to_selection: false,
             runtime_authentication_menu: None,
             composer_geometry: ComposerGeometry::default(),
             runtime_choice_menu_open: None,
@@ -16317,8 +16321,11 @@ impl VibexWorkbench {
         self.composer_runtime_menu_open = open;
         if open {
             self.runtime_choice_menu_open = None;
+            self.runtime_provider_scroll_to_selection = true;
             let selection = self.selected_runtime_selection();
-            self.composer_runtime_menu_view = ComposerRuntimeMenuView::Agent;
+            // Reopen at the selected provider/model group so an active session
+            // does not make the user repeat the Agent selection step.
+            self.composer_runtime_menu_view = ComposerRuntimeMenuView::AuthSource;
             self.composer_runtime_menu_agent_id = selection
                 .as_ref()
                 .map(|selection| selection.agent_id.clone());
@@ -16328,6 +16335,7 @@ impl VibexWorkbench {
         } else {
             self.composer_runtime_menu_agent_id = None;
             self.composer_runtime_menu_auth_source = None;
+            self.runtime_provider_scroll_to_selection = false;
         }
         cx.notify();
     }
@@ -16350,6 +16358,7 @@ impl VibexWorkbench {
         self.new_session_runtime_menu_open = open;
         if open {
             self.runtime_choice_menu_open = None;
+            self.runtime_provider_scroll_to_selection = true;
             self.new_session_runtime_menu_view =
                 if let Some(selection) = self.new_session_runtime_selection.as_ref() {
                     self.new_session_runtime_menu_auth_source = Some(selection.auth_source.clone());
@@ -16360,6 +16369,7 @@ impl VibexWorkbench {
                 };
         } else {
             self.new_session_runtime_menu_auth_source = None;
+            self.runtime_provider_scroll_to_selection = false;
         }
         cx.notify();
     }
@@ -24447,6 +24457,8 @@ impl VibexWorkbench {
         let mut groups = runtime_auth_sources_for_agent(catalog, agent_id);
         groups.sort_by_key(|source| !matches!(source.kind, RuntimeAuthSourceKind::AgentAccount));
         let remembered = &self.ui_state.composer.runtime_selections_by_model;
+        let provider_scroll = self.runtime_provider_scroll.clone();
+        let workbench = cx.weak_entity();
         let mut visible_groups = Vec::new();
 
         for source in groups {
@@ -24519,6 +24531,7 @@ impl VibexWorkbench {
                             .truncate()
                             .text_xs()
                             .font_semibold()
+                            .text_color(cx.theme().foreground.opacity(0.84))
                             .child(source_label),
                     )
                     .child(
@@ -24559,7 +24572,12 @@ impl VibexWorkbench {
                         && choice.selection.auth_source == selected.auth_source
                         && choice.selection.model == selected.model
                 });
+                let selected_anchor =
+                    is_selected.then(|| ScrollAnchor::for_handle(provider_scroll.clone()));
+                let reveal_anchor = selected_anchor.clone();
+                let reveal_workbench = workbench.clone();
                 let selection = choice.selection;
+                let click_selection = selection.clone();
                 let icon = selection
                     .model_id()
                     .and_then(|model_id| {
@@ -24575,7 +24593,7 @@ impl VibexWorkbench {
                             theme::semantic_color("chart-2", cx.theme().is_dark()),
                         )
                     });
-                Button::new(format!(
+                let button = Button::new(format!(
                     "{}-runtime-grouped-model:{}:{}",
                     if new_session {
                         "new-session"
@@ -24615,45 +24633,54 @@ impl VibexWorkbench {
                 )
                 .on_click(cx.listener(move |this, _, window, cx| {
                     if new_session {
-                        this.choose_new_session_runtime(selection.clone(), window, cx);
+                        this.choose_new_session_runtime(click_selection.clone(), window, cx);
                     } else {
-                        this.choose_runtime_selection(selection.clone(), cx);
+                        this.choose_runtime_selection(click_selection.clone(), cx);
                     }
-                }))
+                }));
+                div()
+                    .id(format!(
+                        "{}-runtime-grouped-model-anchor:{}:{}",
+                        if new_session {
+                            "new-session"
+                        } else {
+                            "composer"
+                        },
+                        selection.auth_source.id(),
+                        runtime_model_selection_key(&selection.model)
+                    ))
+                    .anchor_scroll(selected_anchor)
+                    .on_prepaint(move |_, window, cx| {
+                        if let Some(anchor) = reveal_anchor.as_ref() {
+                            let should_reveal = reveal_workbench
+                                .update(cx, |this, _| {
+                                    std::mem::take(&mut this.runtime_provider_scroll_to_selection)
+                                })
+                                .unwrap_or(false);
+                            if should_reveal {
+                                anchor.scroll_to(window, cx);
+                            }
+                        }
+                    })
+                    .child(button)
             });
             visible_groups.push(v_flex().w_full().child(heading).children(rows));
         }
 
         let agent_back = (!new_session).then(|| {
-            let agent_label = runtime_agent_label(&self.agent_snapshots, agent_id);
-            let agent_identity = self
-                .agent_snapshots
-                .iter()
-                .find(|agent| &agent.id == agent_id)
-                .map(agent_brand_identity)
-                .unwrap_or_else(|| format!("{} {agent_label}", agent_id.as_str()));
             Button::new("composer-runtime-provider-back-agent")
                 .xsmall()
                 .ghost()
-                .h(px(28.0))
-                .max_w(px(180.0))
-                .min_w_0()
+                .compact()
+                .size(px(28.0))
                 .flex_none()
-                .px_1()
                 .tooltip(locale::text(
                     "Back to Agent selection",
                     "返回 Agent 选择",
                     "返回 Agent 選擇",
                 ))
                 .text_color(cx.theme().muted_foreground)
-                .child(
-                    h_flex()
-                        .min_w_0()
-                        .gap(px(5.0))
-                        .child(Icon::new(IconName::ArrowLeft).size(px(14.0)))
-                        .child(runtime_agent_icon(&agent_identity))
-                        .child(div().min_w_0().truncate().child(agent_label)),
-                )
+                .icon(Icon::new(IconName::ArrowLeft).size(px(14.0)))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.navigate_composer_runtime_menu(
                         ComposerRuntimeMenuView::Agent,
@@ -24705,8 +24732,10 @@ impl VibexWorkbench {
             )
             .child(
                 v_flex()
+                    .id("runtime-provider-model-scroll")
                     .min_h_0()
                     .flex_1()
+                    .track_scroll(&provider_scroll)
                     .overflow_y_scrollbar()
                     .when(visible_groups.is_empty(), |this| {
                         this.child(runtime_menu_empty_state(cx))
@@ -51962,8 +51991,13 @@ mod tests {
         assert!(menu_view.contains("Authentication"));
         assert!(
             menu_opening
+                .contains("self.composer_runtime_menu_view = ComposerRuntimeMenuView::AuthSource;"),
+            "opening the current-session selector must restore the selected provider/model layer"
+        );
+        assert!(
+            !menu_opening
                 .contains("self.composer_runtime_menu_view = ComposerRuntimeMenuView::Agent;"),
-            "opening the current-session selector must start with Agent selection"
+            "opening the current-session selector must not reset to Agent selection"
         );
         assert!(grouped_models.contains("RuntimeAuthSourceKind::AgentAccount"));
         assert!(grouped_models.contains("sort_by_key"));
@@ -51979,7 +52013,12 @@ mod tests {
         assert!(grouped_models.contains("composer-runtime-provider-back-agent"));
         assert!(grouped_models.contains(".children(agent_back)"));
         assert!(grouped_models.contains("IconName::ArrowLeft"));
-        assert!(grouped_models.contains("runtime_agent_icon(&agent_identity)"));
+        assert!(grouped_models.contains(".compact()"));
+        assert!(grouped_models.contains(".size(px(28.0))"));
+        assert!(grouped_models.contains(".text_color(cx.theme().foreground.opacity(0.84))"));
+        assert!(grouped_models.contains(".track_scroll(&provider_scroll)"));
+        assert!(grouped_models.contains(".anchor_scroll(selected_anchor)"));
+        assert!(menu_opening.contains("runtime_provider_scroll_to_selection = true;"));
         assert!(grouped_models.contains("ComposerRuntimeMenuView::Agent"));
         for cascade in [new_session, current_session] {
             assert!(cascade.contains("render_provider_model_groups("));
