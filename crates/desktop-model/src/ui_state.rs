@@ -8,7 +8,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use vibex_core::{AgentId, SessionRuntimeSelection};
 
-use crate::{NewSessionLocation, SidebarHierarchyMode, SidebarOrganizationState};
+use crate::{
+    AgentSortStrategy, NewSessionLocation, SidebarHierarchyMode, SidebarOrganizationState,
+};
 
 pub const DESKTOP_UI_STATE_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_UI_STATE_WRITE_DELAY_MS: u64 = 200;
@@ -540,6 +542,8 @@ pub struct DesktopUiStateV1 {
     #[serde(default)]
     pub agent_tab_order: Vec<String>,
     #[serde(default)]
+    pub agent_sort_strategy: AgentSortStrategy,
+    #[serde(default)]
     pub plugin_order_migrated: bool,
     pub migration: UiStateMigration,
 }
@@ -562,6 +566,7 @@ impl Default for DesktopUiStateV1 {
             composer: ComposerUiState::default(),
             terminal_tab_titles: BTreeMap::new(),
             agent_tab_order: Vec::new(),
+            agent_sort_strategy: AgentSortStrategy::default(),
             plugin_order_migrated: false,
             migration: UiStateMigration::default(),
         }
@@ -1567,6 +1572,7 @@ mod tests {
             TerminalPreferencesUiState::default()
         );
         assert!(decoded.keyboard.shortcuts.is_empty());
+        assert_eq!(decoded.agent_sort_strategy, AgentSortStrategy::Alphabetical);
 
         let mut state = decoded;
         state.workbench.remember_layout = false;
@@ -1579,6 +1585,7 @@ mod tests {
         state.desktop_behavior.last_update_prompted_version = Some(" 0.2.0 ".into());
         state.composer.queue_send_mode = ComposerQueueSendMode::Manual;
         state.composer.message_send_key = MessageSendKey::CommandEnter;
+        state.agent_sort_strategy = AgentSortStrategy::UsageFrequency;
         state.terminal_preferences.shell = Some(" /bin/zsh ".into());
         state.terminal_preferences.working_directory = TerminalWorkingDirectory::ProjectRoot;
         state
@@ -1615,6 +1622,10 @@ mod tests {
         assert_eq!(
             round_trip.composer.message_send_key,
             MessageSendKey::CommandEnter
+        );
+        assert_eq!(
+            round_trip.agent_sort_strategy,
+            AgentSortStrategy::UsageFrequency
         );
         assert_eq!(
             round_trip.terminal_preferences.shell.as_deref(),

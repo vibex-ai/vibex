@@ -47,8 +47,9 @@ use vibex_core::{
     VibexResult, WorkspaceMode, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
-    AutomationGraphDraft, ManagementNavigation, ManagementSection, PairingContextProjection,
-    ProviderCenterSnapshot, RecoveryOperationState, RedactedDiagnosticProjection,
+    AgentOrderEntry, AgentOrdering, AutomationGraphDraft, ManagementNavigation, ManagementSection,
+    PairingContextProjection, ProviderCenterSnapshot, RecoveryOperationState,
+    RedactedDiagnosticProjection, ordered_agent_ids,
 };
 use vibex_desktop_runtime::{
     DesktopRuntime, ManagementHandle, RuntimeOptionProbeResult, validate_external_open_url,
@@ -584,6 +585,7 @@ pub struct ManagementCenter {
     runtime: Option<Arc<DesktopRuntime>>,
     navigation: ManagementNavigation,
     snapshot: ProviderCenterSnapshot,
+    agent_ordering: AgentOrdering,
     provider_profiles: Vec<vibex_core::ProviderProfile>,
     model_provider_agent_ids: BTreeSet<String>,
     acp_configs: Vec<(String, vibex_core::AcpProviderConfig)>,
@@ -1096,6 +1098,7 @@ impl ManagementCenter {
             runtime: None,
             navigation: ManagementNavigation::default(),
             snapshot: ProviderCenterSnapshot::default(),
+            agent_ordering: AgentOrdering::default(),
             provider_profiles: Vec::new(),
             model_provider_agent_ids: BTreeSet::new(),
             acp_configs: Vec::new(),
@@ -1217,6 +1220,15 @@ impl ManagementCenter {
             backup_path,
             restore_target,
             _subscriptions: subscriptions,
+        }
+    }
+
+    /// Adopt the shared Agent ordering maintained by the workbench so the
+    /// Agent sidebar matches the new-session selector.
+    pub fn set_agent_ordering(&mut self, ordering: AgentOrdering, cx: &mut Context<Self>) {
+        if self.agent_ordering != ordering {
+            self.agent_ordering = ordering;
+            cx.notify();
         }
     }
 
@@ -7572,7 +7584,24 @@ impl ManagementCenter {
             .filter(|agent| management_agent_matches_search(agent, &query))
             .cloned()
             .collect::<Vec<_>>();
-        agents.sort_by_cached_key(management_agent_sort_key);
+        let agent_order_entries = agents
+            .iter()
+            .map(|agent| AgentOrderEntry {
+                id: agent.id.as_str().to_string(),
+                label: agent.label.clone(),
+            })
+            .collect::<Vec<_>>();
+        let shared_agent_order = ordered_agent_ids(&agent_order_entries, &self.agent_ordering);
+        agents.sort_by_cached_key(|agent| {
+            (
+                management_agent_group(agent),
+                shared_agent_order
+                    .iter()
+                    .position(|id| id == agent.id.as_str())
+                    .unwrap_or(usize::MAX),
+                agent.id.as_str().to_string(),
+            )
+        });
         let mut agent_rows = v_flex().w_full().gap(px(6.0));
         if agents.is_empty() {
             let (title, description) = if self.loading && self.snapshot.agents.is_empty() {
@@ -15134,19 +15163,16 @@ fn management_agent_matches_search(agent: &AgentSnapshotEntry, query: &str) -> b
         .contains(query)
 }
 
-fn management_agent_sort_key(agent: &AgentSnapshotEntry) -> (u8, String, String) {
-    let group = if !agent.added {
+/// Sidebar grouping: enabled agents first, then added-but-disabled, then
+/// not-added catalog agents. Within a group the shared Agent ordering applies.
+fn management_agent_group(agent: &AgentSnapshotEntry) -> u8 {
+    if !agent.added {
         2
     } else if agent.enabled {
         0
     } else {
         1
-    };
-    (
-        group,
-        agent.label.to_lowercase(),
-        agent.id.as_str().to_string(),
-    )
+    }
 }
 
 fn agent_install_url(agent: &AgentSnapshotEntry) -> Option<&str> {
@@ -16798,6 +16824,7 @@ fn empty_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vibex_desktop_model::AgentSortStrategy;
 
     #[test]
     fn management_drafts_only_change_for_input_value_changes() {
@@ -18286,7 +18313,10 @@ mod tests {
         assert!(render_agents.contains("management-agent-row-{id}"));
         assert!(render_agents.contains("this.select_management_agent(row_select_id.clone(), cx);"));
         assert!(!render_agents.contains("management-agent-select-"));
-        assert!(render_agents.contains("agents.sort_by_cached_key(management_agent_sort_key);"));
+        assert!(
+            render_agents.contains("ordered_agent_ids(&agent_order_entries, &self.agent_ordering)")
+        );
+        assert!(render_agents.contains("management_agent_group(agent)"));
         assert!(render_agents.contains("management-agent-add-{add_id}"));
         assert!(render_agents.contains("let add_card = v_flex()"));
         assert!(render_agents.contains("agent_rows.child(add_card)"));
@@ -18343,7 +18373,24 @@ mod tests {
             agent.enabled = enabled;
         }
 
-        agents.sort_by_cached_key(management_agent_sort_key);
+        let order_entries = agents
+            .iter()
+            .map(|agent| AgentOrderEntry {
+                id: agent.id.as_str().to_string(),
+                label: agent.label.clone(),
+            })
+            .collect::<Vec<_>>();
+        let shared_order = ordered_agent_ids(&order_entries, &AgentOrdering::default());
+        agents.sort_by_cached_key(|agent| {
+            (
+                management_agent_group(agent),
+                shared_order
+                    .iter()
+                    .position(|id| id == agent.id.as_str())
+                    .unwrap_or(usize::MAX),
+                agent.id.as_str().to_string(),
+            )
+        });
 
         assert_eq!(
             agents
@@ -18351,6 +18398,77 @@ mod tests {
                 .map(|agent| agent.label.as_str())
                 .collect::<Vec<_>>(),
             vec!["alpha", "Zulu", "beta", "Delta", "Aardvark"]
+        );
+    }
+
+    #[test]
+    fn agent_sidebar_follows_shared_usage_and_manual_ordering_within_groups() {
+        let definitions = vibex_core::builtin_agent_definitions();
+        let mut agents = definitions
+            .iter()
+            .take(3)
+            .map(|definition| AgentSnapshotEntry::from_definition(definition, None, None))
+            .collect::<Vec<_>>();
+        for (agent, (label, added, enabled)) in agents.iter_mut().zip([
+            ("Alpha", true, true),
+            ("Beta", true, true),
+            ("Gamma", true, true),
+        ]) {
+            agent.label = label.to_string();
+            agent.added = added;
+            agent.enabled = enabled;
+        }
+        let first_id = agents[0].id.as_str().to_string();
+        let second_id = agents[1].id.as_str().to_string();
+        let third_id = agents[2].id.as_str().to_string();
+
+        let sort =
+            |strategy: AgentSortStrategy, usage: BTreeMap<String, u64>, manual: Vec<String>| {
+                let entries = agents
+                    .iter()
+                    .map(|agent| AgentOrderEntry {
+                        id: agent.id.as_str().to_string(),
+                        label: agent.label.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let shared_order = ordered_agent_ids(
+                    &entries,
+                    &AgentOrdering::new(strategy, manual).with_usage_counts(usage),
+                );
+                let mut agents = agents.clone();
+                agents.sort_by_cached_key(|agent| {
+                    (
+                        management_agent_group(agent),
+                        shared_order
+                            .iter()
+                            .position(|id| id == agent.id.as_str())
+                            .unwrap_or(usize::MAX),
+                        agent.id.as_str().to_string(),
+                    )
+                });
+                agents
+                    .iter()
+                    .map(|agent| agent.id.as_str().to_string())
+                    .collect::<Vec<_>>()
+            };
+
+        // Usage frequency puts the most used agent first.
+        let mut usage = BTreeMap::new();
+        usage.insert(third_id.clone(), 5);
+        usage.insert(first_id.clone(), 2);
+        assert_eq!(
+            sort(AgentSortStrategy::UsageFrequency, usage, Vec::new()),
+            vec![third_id.clone(), first_id.clone(), second_id.clone()]
+        );
+
+        // A manual drag order wins over the strategy.
+        assert_eq!(
+            sort(
+                AgentSortStrategy::Alphabetical,
+                BTreeMap::new(),
+                vec![second_id.clone(), first_id.clone()]
+            ),
+            vec![second_id, first_id, third_id]
         );
     }
 

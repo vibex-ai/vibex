@@ -97,24 +97,26 @@ use vibex_core::{
     latest_timeline_turn_ended_normally, managed_worktree_name_slug, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
-    AgentPlanProjection, AppearanceUiState, ComposerAttachment, ComposerQueueSendMode,
-    ComposerSuggestionSelection, ComposerTrigger, DesktopBehaviorUiState, DesktopUiStateV1,
-    GitSelectionKey, GitWorkbenchMode, LocaleMode, MessageSendKey, NavigationHistory,
-    NewSessionLocation, NewSessionProjectTicket, NewSessionSubmissionStage,
-    NewSessionWorkspaceState, RUNTIME_SELECTION_PREFERENCE_LIMIT, RuntimeCascadeChoice,
-    RuntimeCascadeProjection, SIDEBAR_AUTO_ARCHIVE_MAX_DAYS, SessionContentWidthMode,
-    SessionUiState, SidebarHierarchyMode, SidebarMutationRejection, SidebarOrganizationItem,
-    SidebarOrganizationScope, SidebarOrganizationView, SidebarProjectAppearance,
-    SidebarProjectLogo, SidebarProjectLogoColor, SidebarProjectProjection, SidebarState,
-    SidebarWorkspaceProjection, StartupDestination, TerminalWorkingDirectory,
-    ThemeMode as ModelThemeMode, ThrottledUiStateWriter, TimelineConversationTurn,
-    TimelineFollowState, TimelineModel, TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
-    UiStateStore, UnifiedDiffLineKind, WorkbenchRoute, WorkspaceContextProjection,
-    WorktreeLifecycleDisplayState, active_collaborations, composer_trigger_at, current_agent_plan,
-    custom_worktree_path_is_absolute, parse_unified_diff,
-    sidebar_project_custom_logo_file_is_valid, sidebar_project_items,
-    sidebar_project_items_for_workspace, sidebar_project_projections_with_workspace_order,
-    sidebar_root_items, timeline_agent_message_count_after_sequence, timeline_conversation_turns,
+    AgentOrderEntry, AgentOrdering, AgentPlanProjection, AgentSortStrategy, AppearanceUiState,
+    ComposerAttachment, ComposerQueueSendMode, ComposerSuggestionSelection, ComposerTrigger,
+    DesktopBehaviorUiState, DesktopUiStateV1, GitSelectionKey, GitWorkbenchMode, LocaleMode,
+    MessageSendKey, NavigationHistory, NewSessionLocation, NewSessionProjectTicket,
+    NewSessionSubmissionStage, NewSessionWorkspaceState, RUNTIME_SELECTION_PREFERENCE_LIMIT,
+    RuntimeCascadeChoice, RuntimeCascadeProjection, SIDEBAR_AUTO_ARCHIVE_MAX_DAYS,
+    SessionContentWidthMode, SessionUiState, SidebarHierarchyMode, SidebarMutationRejection,
+    SidebarOrganizationItem, SidebarOrganizationScope, SidebarOrganizationView,
+    SidebarProjectAppearance, SidebarProjectLogo, SidebarProjectLogoColor,
+    SidebarProjectProjection, SidebarState, SidebarWorkspaceProjection, StartupDestination,
+    TerminalWorkingDirectory, ThemeMode as ModelThemeMode, ThrottledUiStateWriter,
+    TimelineConversationTurn, TimelineFollowState, TimelineModel, TimelineProcessActivityGroup,
+    TimelineRow, TimelineRowKind, UiStateStore, UnifiedDiffLineKind, WorkbenchRoute,
+    WorkspaceContextProjection, WorktreeLifecycleDisplayState, active_collaborations,
+    complete_string_order, composer_trigger_at, current_agent_plan,
+    custom_worktree_path_is_absolute, move_string_relative, move_strings_relative,
+    ordered_agent_ids, parse_unified_diff, sidebar_project_custom_logo_file_is_valid,
+    sidebar_project_items, sidebar_project_items_for_workspace,
+    sidebar_project_projections_with_workspace_order, sidebar_root_items,
+    timeline_agent_message_count_after_sequence, timeline_conversation_turns,
 };
 use vibex_desktop_runtime::{
     DesktopEvent, DesktopRuntime, DesktopRuntimeConfig, DesktopRuntimeFacade, PREVIEW_APP_ID,
@@ -1002,6 +1004,7 @@ fn clear_remembered_workbench_layout(state: &mut DesktopUiStateV1) {
     state.composer.terminal_ids.clear();
     state.terminal_tab_titles.clear();
     state.agent_tab_order.clear();
+    state.agent_sort_strategy = AgentSortStrategy::default();
 }
 
 fn apply_layout_memory_preference(state: &mut DesktopUiStateV1) {
@@ -5646,6 +5649,9 @@ impl VibexWorkbench {
                                 .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
                                 .collect();
                             this.sessions = sessions;
+                            if this.ui_state.workbench.active_tab == "management" {
+                                this.sync_management_agent_ordering(cx);
+                            }
                             // Rehydrate both project defaults and explicit
                             // session overrides for every authoritative row.
                             // `restored_auto_continue_session_ids` only knows
@@ -8463,17 +8469,19 @@ impl VibexWorkbench {
         after: bool,
         cx: &mut Context<Self>,
     ) {
-        let mut agents = self
+        let entries = self
             .agent_snapshots
             .iter()
             .filter(|agent| is_new_session_agent_available(agent))
+            .map(|agent| AgentOrderEntry {
+                id: agent.id.as_str().to_string(),
+                label: agent.label.clone(),
+            })
             .collect::<Vec<_>>();
-        agents.sort_by_key(|agent| agent.order_index);
-        let ids = agents
-            .into_iter()
-            .map(|agent| agent.id.as_str().to_string())
-            .collect::<Vec<_>>();
-        complete_string_order(&mut self.ui_state.agent_tab_order, ids);
+        // Complete against the order the user currently sees so a single drag
+        // keeps the relative position of every other agent.
+        let visible_ids = ordered_agent_ids(&entries, &self.agent_ordering());
+        complete_string_order(&mut self.ui_state.agent_tab_order, visible_ids);
         if move_string_relative(
             &mut self.ui_state.agent_tab_order,
             moving_id,
@@ -8482,7 +8490,46 @@ impl VibexWorkbench {
         ) {
             self.queue_ui_state();
         }
+        self.sync_management_agent_ordering(cx);
         cx.notify();
+    }
+
+    /// Ordering inputs shared by the new-session Agent selector and the
+    /// Management Center Agent sidebar.
+    fn agent_ordering(&self) -> AgentOrdering {
+        AgentOrdering::new(
+            self.ui_state.agent_sort_strategy,
+            self.ui_state.agent_tab_order.clone(),
+        )
+        .with_usage_counts(self.agent_usage_counts())
+    }
+
+    fn agent_usage_counts(&self) -> BTreeMap<String, u64> {
+        let mut counts = BTreeMap::new();
+        for session in &self.sessions {
+            if session.deleted_at_ms.is_some() {
+                continue;
+            }
+            *counts
+                .entry(session.agent_id.as_str().to_string())
+                .or_insert(0) += 1;
+        }
+        counts
+    }
+
+    fn set_agent_sort_strategy(&mut self, strategy: AgentSortStrategy, cx: &mut Context<Self>) {
+        self.ui_state.agent_sort_strategy = strategy;
+        self.ui_state.agent_tab_order.clear();
+        self.queue_ui_state();
+        self.sync_management_agent_ordering(cx);
+        cx.notify();
+    }
+
+    fn sync_management_agent_ordering(&mut self, cx: &mut Context<Self>) {
+        let ordering = self.agent_ordering();
+        self.management_view.update(cx, |management, cx| {
+            management.set_agent_ordering(ordering, cx)
+        });
     }
 
     fn stash_current_agent_session_view(&mut self) {
@@ -18593,6 +18640,7 @@ impl VibexWorkbench {
                     management.set_runtime(runtime.clone(), cx)
                 });
             }
+            self.sync_management_agent_ordering(cx);
             self.sync_management_pairing_context(cx);
         } else if self.ui_state.workbench.active_tab == "usage" {
             let session_filter = self.usage_session_filter.clone();
@@ -19415,6 +19463,7 @@ impl VibexWorkbench {
                 management.set_runtime(runtime.clone(), cx)
             });
         }
+        self.sync_management_agent_ordering(cx);
         self.sync_management_pairing_context(cx);
         self.push_current_navigation_entry();
         cx.notify();
@@ -25090,17 +25139,19 @@ impl VibexWorkbench {
             .filter(|agent| is_new_session_agent_available(agent))
             .cloned()
             .collect::<Vec<_>>();
-        agent_choices.sort_by_key(|agent| agent.order_index);
-        let mut agent_order = self.ui_state.agent_tab_order.clone();
-        complete_string_order(
-            &mut agent_order,
-            agent_choices
+        let agent_ordering = self.agent_ordering();
+        let ordered_agent_choice_ids = ordered_agent_ids(
+            &agent_choices
                 .iter()
-                .map(|agent| agent.id.as_str().to_string())
-                .collect(),
+                .map(|agent| AgentOrderEntry {
+                    id: agent.id.as_str().to_string(),
+                    label: agent.label.clone(),
+                })
+                .collect::<Vec<_>>(),
+            &agent_ordering,
         );
         agent_choices.sort_by_key(|agent| {
-            agent_order
+            ordered_agent_choice_ids
                 .iter()
                 .position(|id| id == agent.id.as_str())
                 .unwrap_or(usize::MAX)
@@ -25319,6 +25370,71 @@ impl VibexWorkbench {
                 })
                 .collect::<Vec<_>>()
         };
+
+        let agent_sort_entity = cx.weak_entity();
+        let agent_sort_manual_active = self
+            .ui_state
+            .agent_tab_order
+            .iter()
+            .any(|id| ordered_agent_choice_ids.contains(id));
+        let agent_sort_strategy = self.ui_state.agent_sort_strategy;
+        let alphabetical_entity = agent_sort_entity.clone();
+        let frequency_entity = agent_sort_entity;
+        let agent_sort_control = Button::new("new-session-agent-sort")
+            .xsmall()
+            .ghost()
+            .compact()
+            .size(px(28.0))
+            .flex_none()
+            .tooltip(locale::text("Sort agents", "Agent 排序", "Agent 排序"))
+            .icon(IconName::SortAscending)
+            .disabled(self.agent_action_pending)
+            .dropdown_menu(move |menu, _, _| {
+                let alphabetical_entity = alphabetical_entity.clone();
+                let frequency_entity = frequency_entity.clone();
+                menu.item(
+                    PopupMenuItem::new(locale::text("Sort by name", "按名称排序", "按名稱排序"))
+                        .icon(sidebar_icon("icons/vibex/list-checks.svg"))
+                        .checked(
+                            !agent_sort_manual_active
+                                && agent_sort_strategy == AgentSortStrategy::Alphabetical,
+                        )
+                        .on_click(move |_, _, cx| {
+                            let _ = alphabetical_entity.update(cx, |this, cx| {
+                                this.set_agent_sort_strategy(AgentSortStrategy::Alphabetical, cx)
+                            });
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new(locale::text(
+                        "Sort by usage",
+                        "按使用频率排序",
+                        "按使用頻率排序",
+                    ))
+                    .icon(sidebar_icon("icons/vibex/activity.svg"))
+                    .checked(
+                        !agent_sort_manual_active
+                            && agent_sort_strategy == AgentSortStrategy::UsageFrequency,
+                    )
+                    .on_click(move |_, _, cx| {
+                        let _ = frequency_entity.update(cx, |this, cx| {
+                            this.set_agent_sort_strategy(AgentSortStrategy::UsageFrequency, cx)
+                        });
+                    }),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new(locale::text(
+                        "Custom order (drag to adjust)",
+                        "自定义排序（拖动调整）",
+                        "自訂排序（拖動調整）",
+                    ))
+                    .icon(sidebar_icon("icons/vibex/grip-vertical.svg"))
+                    .checked(agent_sort_manual_active)
+                    .disabled(true),
+                )
+            })
+            .anchor(Anchor::TopRight);
 
         let active_project_id = self.new_session_workspace.project_id.clone();
         let workspace_label = active_project_id
@@ -26268,19 +26384,29 @@ impl VibexWorkbench {
                             .gap_3()
                             .child(
                                 h_flex()
-                                    .id("new-session-agent-tabs")
                                     .w_full()
                                     .h(px(49.0))
                                     .flex_none()
                                     .min_w_0()
                                     .gap_1()
-                                    .overflow_x_scroll()
                                     .rounded(px(28.0))
                                     .border_1()
                                     .border_color(cx.theme().border.opacity(0.60))
                                     .bg(muted_color.opacity(0.70))
                                     .p(px(6.0))
-                                    .children(agent_tabs),
+                                    .child(
+                                        h_flex()
+                                            .id("new-session-agent-tabs")
+                                            .flex_1()
+                                            .min_w_0()
+                                            .h_full()
+                                            .gap_1()
+                                            .overflow_x_scroll()
+                                            .children(agent_tabs),
+                                    )
+                                    .when(has_agent_choices, |this| {
+                                        this.child(agent_sort_control)
+                                    }),
                             )
                             .when(!has_agent_choices, |this| {
                                 this.child(
@@ -36893,55 +37019,6 @@ fn workbench_route(
         selected_git_path: ui_state.workbench.selected_git_path.clone(),
         selected_terminal_id: ui_state.terminal.selected_terminal_id.clone(),
     }
-}
-
-fn complete_string_order(order: &mut Vec<String>, ids: Vec<String>) {
-    let valid = ids.iter().cloned().collect::<BTreeSet<_>>();
-    let mut seen = BTreeSet::new();
-    order.retain(|id| valid.contains(id) && seen.insert(id.clone()));
-    order.extend(ids.into_iter().filter(|id| seen.insert(id.clone())));
-}
-
-fn move_string_relative(
-    order: &mut Vec<String>,
-    moving_id: &str,
-    target_id: &str,
-    after: bool,
-) -> bool {
-    move_strings_relative(
-        order,
-        std::slice::from_ref(&moving_id.to_string()),
-        target_id,
-        after,
-    )
-}
-
-fn move_strings_relative(
-    order: &mut Vec<String>,
-    moving_ids: &[String],
-    target_id: &str,
-    after: bool,
-) -> bool {
-    let moving_set = moving_ids.iter().cloned().collect::<BTreeSet<_>>();
-    if moving_ids.is_empty()
-        || moving_set.len() != moving_ids.len()
-        || moving_set.contains(target_id)
-        || moving_ids
-            .iter()
-            .any(|moving_id| !order.contains(moving_id))
-    {
-        return false;
-    }
-    let original = order.clone();
-    let moving = moving_ids.to_vec();
-    order.retain(|id| !moving_set.contains(id));
-    let Some(target_index) = order.iter().position(|id| id == target_id) else {
-        *order = original;
-        return false;
-    };
-    let insertion_index = target_index + usize::from(after);
-    order.splice(insertion_index..insertion_index, moving);
-    *order != original
 }
 
 #[cfg(test)]

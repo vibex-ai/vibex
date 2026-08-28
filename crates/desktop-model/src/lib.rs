@@ -3,6 +3,7 @@
 //! This crate deliberately has no GPUI, Tauri, Tokio, database, or native
 //! surface dependency. Callers inject time and identifiers at reducer edges.
 
+mod agent_ordering;
 mod agent_workbench;
 mod composer;
 mod content_preview;
@@ -23,6 +24,7 @@ mod timeline;
 mod ui_state;
 mod worktree_session;
 
+pub use agent_ordering::*;
 pub use agent_workbench::*;
 pub use composer::*;
 pub use content_preview::*;
