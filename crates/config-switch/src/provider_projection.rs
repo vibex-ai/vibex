@@ -1683,6 +1683,7 @@ fn build_overlay(
             "yaml",
             deepseek_harness_overlay(
                 provider,
+                binding,
                 endpoint,
                 model,
                 require_secret_env_key(secret_env_key)?,
@@ -1721,6 +1722,7 @@ fn build_overlay(
             "yaml",
             crow_cli_overlay(
                 provider,
+                binding,
                 endpoint,
                 model,
                 require_secret_env_key(secret_env_key)?,
@@ -1738,6 +1740,7 @@ fn build_overlay(
             "json",
             factory_droid_overlay(
                 provider,
+                binding,
                 endpoint,
                 model,
                 require_secret_env_key(secret_env_key)?,
@@ -1749,6 +1752,7 @@ fn build_overlay(
             "json",
             goose_overlay(
                 provider,
+                binding,
                 endpoint,
                 model,
                 require_secret_env_key(secret_env_key)?,
@@ -1760,6 +1764,7 @@ fn build_overlay(
             "toml",
             grok_overlay(
                 provider,
+                binding,
                 endpoint,
                 model,
                 require_secret_env_key(secret_env_key)?,
@@ -1771,6 +1776,7 @@ fn build_overlay(
             "yaml",
             hermes_overlay(
                 provider,
+                binding,
                 endpoint,
                 model,
                 require_secret_env_key(secret_env_key)?,
@@ -1782,6 +1788,7 @@ fn build_overlay(
             "json",
             kilo_overlay(
                 provider,
+                binding,
                 endpoint,
                 model,
                 require_secret_env_key(secret_env_key)?,
@@ -1793,6 +1800,7 @@ fn build_overlay(
             "toml",
             kimi_overlay(
                 provider,
+                binding,
                 endpoint,
                 model,
                 require_secret_env_key(secret_env_key)?,
@@ -1804,6 +1812,7 @@ fn build_overlay(
             "toml",
             mistral_vibe_overlay(
                 provider,
+                binding,
                 endpoint,
                 model,
                 require_secret_env_key(secret_env_key)?,
@@ -1815,6 +1824,7 @@ fn build_overlay(
             "json",
             pi_overlay(
                 provider,
+                binding,
                 endpoint,
                 model,
                 require_secret_env_key(secret_env_key)?,
@@ -1826,6 +1836,7 @@ fn build_overlay(
             "json",
             qwen_code_overlay(
                 provider,
+                binding,
                 endpoint,
                 model,
                 require_secret_env_key(secret_env_key)?,
@@ -1859,6 +1870,7 @@ fn build_overlay(
             "json",
             zcode_overlay(
                 provider,
+                binding,
                 endpoint,
                 model,
                 require_secret_env_key(secret_env_key)?,
@@ -2423,42 +2435,59 @@ fn serialized_yaml(value: serde_json::Value) -> VibexResult<String> {
     })
 }
 
-fn zcode_overlay(
-    provider: &ModelProviderProfile,
-    endpoint: Option<&ModelProviderEndpoint>,
-    model: Option<&AgentConfiguredModelBinding>,
-    secret_env_key: &str,
-) -> VibexResult<String> {
-    let provider_id = sanitize_provider_id(
-        provider
-            .vendor_hint
-            .as_deref()
-            .unwrap_or_else(|| provider.id.as_str()),
-    );
-    let model_id = projection_model_id(model).unwrap_or("vibex-model");
-    let kind = match projection_wire_protocol(model) {
+/// Enabled model bindings served by a managed overlay's provider entry.
+///
+/// Managed overlays describe one provider entry with one API kind, so only
+/// bindings whose wire protocol maps to the selected model's kind join the
+/// projected model registry. The selected model always leads the group so
+/// defaults and serialized ordering stay deterministic; with no selected
+/// model every enabled binding is served. Bindings on other wire protocols
+/// keep the previous behavior: the Agent only receives the selected default
+/// model.
+fn overlay_model_group<'a>(
+    binding: &'a AgentModelProviderBinding,
+    selected: Option<&'a AgentConfiguredModelBinding>,
+    kind_of: impl Fn(&AgentConfiguredModelBinding) -> &'static str,
+) -> Vec<&'a AgentConfiguredModelBinding> {
+    let mut models: Vec<&AgentConfiguredModelBinding> = binding
+        .configured_models
+        .iter()
+        .filter(|model| model.enabled)
+        .collect();
+    let Some(selected) = selected else {
+        return models;
+    };
+    let selected_kind = kind_of(selected);
+    models
+        .retain(|model| model.id == selected.id || kind_of(model) == selected_kind);
+    models.sort_by_key(|model| model.id != selected.id);
+    models
+}
+
+fn zcode_provider_kind(model: &AgentConfiguredModelBinding) -> &'static str {
+    match model.wire_protocol_id.as_str() {
         vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => "anthropic",
         _ => "openai-compatible",
-    };
-    let mut options = serde_json::Map::new();
-    json_string_if_present(
-        &mut options,
-        "baseURL",
-        endpoint.map(|endpoint| endpoint.url.as_str()),
-    );
-    options.insert(
-        "apiKey".to_string(),
-        serde_json::Value::String(overlay_secret_placeholder(secret_env_key)),
-    );
-    options.insert("apiKeyRequired".to_string(), serde_json::Value::Bool(true));
+    }
+}
 
-    let capabilities = model.and_then(|binding| {
-        provider
-            .configured_models
-            .iter()
-            .find(|configured| configured.id == binding.provider_model_id)
-            .map(|configured| &configured.capabilities)
-    });
+fn kimi_provider_type(model: &AgentConfiguredModelBinding) -> &'static str {
+    match model.wire_protocol_id.as_str() {
+        vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => "anthropic",
+        _ => "openai_legacy",
+    }
+}
+
+fn zcode_model_entry(
+    provider: &ModelProviderProfile,
+    model: &AgentConfiguredModelBinding,
+    model_id: &str,
+) -> serde_json::Value {
+    let capabilities = provider
+        .configured_models
+        .iter()
+        .find(|configured| configured.id == model.provider_model_id)
+        .map(|configured| &configured.capabilities);
     let mut model_entry = serde_json::Map::new();
     model_entry.insert(
         "name".to_string(),
@@ -2476,6 +2505,57 @@ fn zcode_overlay(
             serde_json::json!({ "enabled": true }),
         );
     }
+    serde_json::Value::Object(model_entry)
+}
+
+fn zcode_overlay(
+    provider: &ModelProviderProfile,
+    binding: &AgentModelProviderBinding,
+    endpoint: Option<&ModelProviderEndpoint>,
+    model: Option<&AgentConfiguredModelBinding>,
+    secret_env_key: &str,
+) -> VibexResult<String> {
+    let provider_id = sanitize_provider_id(
+        provider
+            .vendor_hint
+            .as_deref()
+            .unwrap_or_else(|| provider.id.as_str()),
+    );
+    let model_id = projection_model_id(model).unwrap_or("vibex-model");
+    let kind = model
+        .map(zcode_provider_kind)
+        .unwrap_or("openai-compatible");
+    let mut options = serde_json::Map::new();
+    json_string_if_present(
+        &mut options,
+        "baseURL",
+        endpoint.map(|endpoint| endpoint.url.as_str()),
+    );
+    options.insert(
+        "apiKey".to_string(),
+        serde_json::Value::String(overlay_secret_placeholder(secret_env_key)),
+    );
+    options.insert("apiKeyRequired".to_string(), serde_json::Value::Bool(true));
+
+    // Project every enabled binding on the selected model's wire protocol so
+    // the Agent recognizes any of them when a session switches models, not
+    // just the profile default.
+    let group = overlay_model_group(binding, model, zcode_provider_kind);
+    let mut models = serde_json::Map::new();
+    if group.is_empty() {
+        models.insert(
+            model_id.to_string(),
+            serde_json::json!({ "name": model_id }),
+        );
+    } else {
+        for model_binding in group {
+            let model_id = projection_model_id(Some(model_binding)).unwrap_or("vibex-model");
+            models.insert(
+                model_id.to_string(),
+                zcode_model_entry(provider, model_binding, model_id),
+            );
+        }
+    }
 
     serialized_json(serde_json::json!({
         "provider": {
@@ -2485,9 +2565,7 @@ fn zcode_overlay(
                 "enabled": true,
                 "source": "custom",
                 "options": options,
-                "models": {
-                    model_id: model_entry,
-                },
+                "models": models,
             }
         }
     }))
@@ -2495,6 +2573,7 @@ fn zcode_overlay(
 
 fn crow_cli_overlay(
     provider: &ModelProviderProfile,
+    binding: &AgentModelProviderBinding,
     endpoint: Option<&ModelProviderEndpoint>,
     model: Option<&AgentConfiguredModelBinding>,
     secret_env_key: &str,
@@ -2522,11 +2601,22 @@ fn crow_cli_overlay(
         serde_json::Value::Object(provider_config),
     );
     let model_id = projection_model_id(model).unwrap_or("vibex-model");
+    let group = overlay_model_group(binding, model, |_| "openai-chat-completions");
     let mut models = serde_json::Map::new();
-    models.insert(
-        model_id.to_string(),
-        serde_json::json!({"provider": provider_id, "model": model_id}),
-    );
+    if group.is_empty() {
+        models.insert(
+            model_id.to_string(),
+            serde_json::json!({"provider": provider_id, "model": model_id}),
+        );
+    } else {
+        for model_binding in group {
+            let model_id = projection_model_id(Some(model_binding)).unwrap_or("vibex-model");
+            models.insert(
+                model_id.to_string(),
+                serde_json::json!({"provider": provider_id, "model": model_id}),
+            );
+        }
+    }
     serialized_yaml(serde_json::json!({
         "providers": providers,
         "models": models,
@@ -2551,18 +2641,54 @@ fn dirac_overlay(
 
 fn factory_droid_overlay(
     provider: &ModelProviderProfile,
+    binding: &AgentModelProviderBinding,
     endpoint: Option<&ModelProviderEndpoint>,
     model: Option<&AgentConfiguredModelBinding>,
     secret_env_key: &str,
 ) -> VibexResult<String> {
     let model_id = projection_model_id(model).unwrap_or("vibex-model");
-    let custom_id = sanitize_provider_id(&format!(
-        "vibex-{}-{model_id}",
-        provider
-            .vendor_hint
-            .as_deref()
-            .unwrap_or_else(|| provider.id.as_str())
-    ));
+    let vendor = provider
+        .vendor_hint
+        .as_deref()
+        .unwrap_or_else(|| provider.id.as_str());
+    let selected_custom_id = sanitize_provider_id(&format!("vibex-{}-{model_id}", vendor));
+    let group =
+        overlay_model_group(binding, model, |model| factory_droid_provider_kind(Some(model)));
+    let mut custom_models = Vec::with_capacity(group.len().max(1));
+    if group.is_empty() {
+        custom_models.push(factory_droid_custom_model(
+            vendor,
+            model,
+            model_id,
+            endpoint,
+            secret_env_key,
+        ));
+    } else {
+        for model_binding in group {
+            let model_id = projection_model_id(Some(model_binding)).unwrap_or("vibex-model");
+            custom_models.push(factory_droid_custom_model(
+                vendor,
+                Some(model_binding),
+                model_id,
+                endpoint,
+                secret_env_key,
+            ));
+        }
+    }
+    serialized_json(serde_json::json!({
+        "customModels": custom_models,
+        "model": format!("custom:{selected_custom_id}"),
+    }))
+}
+
+fn factory_droid_custom_model(
+    vendor: &str,
+    model: Option<&AgentConfiguredModelBinding>,
+    model_id: &str,
+    endpoint: Option<&ModelProviderEndpoint>,
+    secret_env_key: &str,
+) -> serde_json::Value {
+    let custom_id = sanitize_provider_id(&format!("vibex-{vendor}-{model_id}"));
     let mut custom = serde_json::Map::new();
     custom.insert("id".to_string(), serde_json::json!(custom_id));
     custom.insert("model".to_string(), serde_json::json!(model_id));
@@ -2579,14 +2705,12 @@ fn factory_droid_overlay(
         "apiKey".to_string(),
         serde_json::json!(format!("${{{secret_env_key}}}")),
     );
-    serialized_json(serde_json::json!({
-        "customModels": [custom],
-        "model": format!("custom:{custom_id}"),
-    }))
+    serde_json::Value::Object(custom)
 }
 
 fn goose_overlay(
     provider: &ModelProviderProfile,
+    binding: &AgentModelProviderBinding,
     endpoint: Option<&ModelProviderEndpoint>,
     model: Option<&AgentConfiguredModelBinding>,
     secret_env_key: &str,
@@ -2606,25 +2730,35 @@ fn goose_overlay(
         "base_url",
         endpoint.map(|endpoint| endpoint.url.as_str()),
     );
-    root.insert(
-        "models".to_string(),
-        serde_json::json!([{
-            "name": model_id,
-            "context_limit": 128000,
-        }]),
-    );
+    let group = overlay_model_group(binding, model, |_| "openai-chat-completions");
+    let mut models = Vec::with_capacity(group.len().max(1));
+    if group.is_empty() {
+        models.push(goose_model_entry(model_id));
+    } else {
+        for model_binding in group {
+            let model_id = projection_model_id(Some(model_binding)).unwrap_or("vibex-model");
+            models.push(goose_model_entry(model_id));
+        }
+    }
+    root.insert("models".to_string(), serde_json::Value::Array(models));
     root.insert("supports_streaming".to_string(), serde_json::json!(true));
     root.insert("requires_auth".to_string(), serde_json::json!(true));
     serialized_json(serde_json::Value::Object(root))
 }
 
-fn grok_overlay(
+fn goose_model_entry(model_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": model_id,
+        "context_limit": 128000,
+    })
+}
+
+fn grok_model_config(
     provider: &ModelProviderProfile,
+    model_id: &str,
     endpoint: Option<&ModelProviderEndpoint>,
-    model: Option<&AgentConfiguredModelBinding>,
     secret_env_key: &str,
-) -> VibexResult<String> {
-    let model_id = projection_model_id(model).unwrap_or("vibex-model");
+) -> serde_json::Value {
     let mut config = serde_json::Map::new();
     config.insert("model".to_string(), serde_json::json!(model_id));
     json_string_if_present(
@@ -2635,8 +2769,35 @@ fn grok_overlay(
     config.insert("name".to_string(), serde_json::json!(provider.display_name));
     config.insert("env_key".to_string(), serde_json::json!(secret_env_key));
     config.insert("api_backend".to_string(), serde_json::json!("responses"));
+    serde_json::Value::Object(config)
+}
+
+fn grok_overlay(
+    provider: &ModelProviderProfile,
+    binding: &AgentModelProviderBinding,
+    endpoint: Option<&ModelProviderEndpoint>,
+    model: Option<&AgentConfiguredModelBinding>,
+    secret_env_key: &str,
+) -> VibexResult<String> {
+    let model_id = projection_model_id(model).unwrap_or("vibex-model");
+    let group = overlay_model_group(binding, model, |_| "openai-responses");
+    let mut model_table = serde_json::Map::new();
+    if group.is_empty() {
+        model_table.insert(
+            model_id.to_string(),
+            grok_model_config(provider, model_id, endpoint, secret_env_key),
+        );
+    } else {
+        for model_binding in group {
+            let model_id = projection_model_id(Some(model_binding)).unwrap_or("vibex-model");
+            model_table.insert(
+                model_id.to_string(),
+                grok_model_config(provider, model_id, endpoint, secret_env_key),
+            );
+        }
+    }
     serialized_toml(serde_json::json!({
-        "model": {model_id: config},
+        "model": serde_json::Value::Object(model_table),
         "models": {"default": model_id},
     }))
 }
@@ -2652,6 +2813,7 @@ fn goose_provider_id(provider: &ModelProviderProfile) -> String {
 
 fn hermes_overlay(
     provider: &ModelProviderProfile,
+    binding: &AgentModelProviderBinding,
     endpoint: Option<&ModelProviderEndpoint>,
     model: Option<&AgentConfiguredModelBinding>,
     secret_env_key: &str,
@@ -2677,10 +2839,23 @@ fn hermes_overlay(
         "api_mode",
         Some(hermes_api_mode(model)),
     );
-    provider_config.insert(
-        "models".to_string(),
-        serde_json::json!({model_id: {"context_length": 128000}}),
-    );
+    let group = overlay_model_group(binding, model, |model| hermes_api_mode(Some(model)));
+    let mut models = serde_json::Map::new();
+    if group.is_empty() {
+        models.insert(
+            model_id.to_string(),
+            serde_json::json!({"context_length": 128000}),
+        );
+    } else {
+        for model_binding in group {
+            let model_id = projection_model_id(Some(model_binding)).unwrap_or("vibex-model");
+            models.insert(
+                model_id.to_string(),
+                serde_json::json!({"context_length": 128000}),
+            );
+        }
+    }
+    provider_config.insert("models".to_string(), serde_json::Value::Object(models));
     serialized_yaml(serde_json::json!({
         "custom_providers": [provider_config],
         "model": {"provider": provider_id, "default": model_id},
@@ -2689,6 +2864,7 @@ fn hermes_overlay(
 
 fn kilo_overlay(
     provider: &ModelProviderProfile,
+    binding: &AgentModelProviderBinding,
     endpoint: Option<&ModelProviderEndpoint>,
     model: Option<&AgentConfiguredModelBinding>,
     secret_env_key: &str,
@@ -2720,14 +2896,29 @@ fn kilo_overlay(
         "api",
         endpoint.map(|endpoint| endpoint.url.as_str()),
     );
+    let model_provider = serde_json::Value::Object(model_provider);
+    let group = overlay_model_group(binding, model, |_| "openai-chat-completions");
     let mut models = serde_json::Map::new();
-    models.insert(
-        model_id.to_string(),
-        serde_json::json!({
-            "name": model_id,
-            "provider": model_provider,
-        }),
-    );
+    if group.is_empty() {
+        models.insert(
+            model_id.to_string(),
+            serde_json::json!({
+                "name": model_id,
+                "provider": model_provider.clone(),
+            }),
+        );
+    } else {
+        for model_binding in group {
+            let model_id = projection_model_id(Some(model_binding)).unwrap_or("vibex-model");
+            models.insert(
+                model_id.to_string(),
+                serde_json::json!({
+                    "name": model_id,
+                    "provider": model_provider.clone(),
+                }),
+            );
+        }
+    }
     let mut entry = serde_json::Map::new();
     entry.insert("name".to_string(), serde_json::json!(provider.display_name));
     entry.insert("options".to_string(), serde_json::Value::Object(options));
@@ -2753,17 +2944,41 @@ fn kimi_auth_compatibility_overlay(secret_env_key: &str) -> ManagedProjectionOve
     }
 }
 
+fn kimi_model_entry(model_id: &str) -> toml::Value {
+    toml::Value::Table(toml::map::Map::from_iter([
+        (
+            "provider".to_string(),
+            toml::Value::String("vibex".to_string()),
+        ),
+        (
+            "model".to_string(),
+            toml::Value::String(model_id.to_string()),
+        ),
+        (
+            "max_context_size".to_string(),
+            toml::Value::Integer(262_144),
+        ),
+        (
+            "capabilities".to_string(),
+            toml::Value::Array(vec![
+                toml::Value::String("thinking".to_string()),
+                toml::Value::String("image_in".to_string()),
+            ]),
+        ),
+    ]))
+}
+
 fn kimi_overlay(
     _provider: &ModelProviderProfile,
+    binding: &AgentModelProviderBinding,
     endpoint: Option<&ModelProviderEndpoint>,
     model: Option<&AgentConfiguredModelBinding>,
     secret_env_key: &str,
 ) -> VibexResult<String> {
     let model_id = projection_model_id(model).unwrap_or("vibex-model");
-    let provider_type = match projection_wire_protocol(model) {
-        vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => "anthropic",
-        _ => "openai_legacy",
-    };
+    let provider_type = model
+        .map(kimi_provider_type)
+        .unwrap_or("openai_legacy");
     let endpoint = endpoint
         .map(|endpoint| endpoint.url.as_str())
         .unwrap_or_default();
@@ -2794,33 +3009,17 @@ fn kimi_overlay(
             ])),
         )])),
     );
-    root.insert(
-        "models".to_string(),
-        toml::Value::Table(toml::map::Map::from_iter([(
-            model_id.to_string(),
-            toml::Value::Table(toml::map::Map::from_iter([
-                (
-                    "provider".to_string(),
-                    toml::Value::String("vibex".to_string()),
-                ),
-                (
-                    "model".to_string(),
-                    toml::Value::String(model_id.to_string()),
-                ),
-                (
-                    "max_context_size".to_string(),
-                    toml::Value::Integer(262_144),
-                ),
-                (
-                    "capabilities".to_string(),
-                    toml::Value::Array(vec![
-                        toml::Value::String("thinking".to_string()),
-                        toml::Value::String("image_in".to_string()),
-                    ]),
-                ),
-            ])),
-        )])),
-    );
+    let group = overlay_model_group(binding, model, kimi_provider_type);
+    let mut models = toml::map::Map::new();
+    if group.is_empty() {
+        models.insert(model_id.to_string(), kimi_model_entry(model_id));
+    } else {
+        for model_binding in group {
+            let model_id = projection_model_id(Some(model_binding)).unwrap_or("vibex-model");
+            models.insert(model_id.to_string(), kimi_model_entry(model_id));
+        }
+    }
+    root.insert("models".to_string(), toml::Value::Table(models));
     toml::to_string(&toml::Value::Table(root)).map_err(|error| {
         VibexError::validation(
             "agent_projection_overlay_encode_failed",
@@ -2833,6 +3032,7 @@ fn kimi_overlay(
 
 fn mistral_vibe_overlay(
     provider: &ModelProviderProfile,
+    binding: &AgentModelProviderBinding,
     endpoint: Option<&ModelProviderEndpoint>,
     model: Option<&AgentConfiguredModelBinding>,
     secret_env_key: &str,
@@ -2860,34 +3060,40 @@ fn mistral_vibe_overlay(
         serde_json::json!(mistral_vibe_api_style(model)),
     );
     provider_config.insert("backend".to_string(), serde_json::json!("generic"));
-    let model_config = serde_json::json!({
-        "name": model_id,
-        "provider": provider_id,
-        "alias": model_id,
-    });
+    let group =
+        overlay_model_group(binding, model, |model| mistral_vibe_api_style(Some(model)));
+    let mut models = Vec::with_capacity(group.len().max(1));
+    if group.is_empty() {
+        models.push(mistral_vibe_model_entry(&provider_id, model_id));
+    } else {
+        for model_binding in group {
+            let model_id = projection_model_id(Some(model_binding)).unwrap_or("vibex-model");
+            models.push(mistral_vibe_model_entry(&provider_id, model_id));
+        }
+    }
     serialized_toml(serde_json::json!({
         "active_model": model_id,
         "providers": [provider_config],
-        "models": [model_config],
+        "models": models,
     }))
 }
 
-fn deepseek_harness_overlay(
+fn mistral_vibe_model_entry(provider_id: &str, model_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": model_id,
+        "provider": provider_id,
+        "alias": model_id,
+    })
+}
+
+fn deepseek_harness_model_entry(
     provider: &ModelProviderProfile,
-    endpoint: Option<&ModelProviderEndpoint>,
     model: Option<&AgentConfiguredModelBinding>,
-    secret_env_key: &str,
-) -> VibexResult<String> {
-    let model_id = projection_model_id(model).unwrap_or("vibex-model");
-    let provider_id = sanitize_provider_id(
-        provider
-            .vendor_hint
-            .as_deref()
-            .unwrap_or_else(|| provider.id.as_str()),
-    );
-    let configured_model = model.and_then(|binding| {
+    model_id: &str,
+) -> serde_json::Value {
+    let configured_model = model.and_then(|model| {
         provider.configured_models.iter().find(|configured| {
-            configured.id == binding.provider_model_id || configured.id == binding.agent_model_id
+            configured.id == model.provider_model_id || configured.id == model.agent_model_id
         })
     });
     let capabilities = configured_model.map(|model| &model.capabilities);
@@ -2915,6 +3121,36 @@ fn deepseek_harness_overlay(
     if capabilities.and_then(|capabilities| capabilities.reasoning) == Some(false) {
         model_entry.insert("reasoningEfforts".to_string(), serde_json::json!(false));
     }
+    serde_json::Value::Object(model_entry)
+}
+
+fn deepseek_harness_overlay(
+    provider: &ModelProviderProfile,
+    binding: &AgentModelProviderBinding,
+    endpoint: Option<&ModelProviderEndpoint>,
+    model: Option<&AgentConfiguredModelBinding>,
+    secret_env_key: &str,
+) -> VibexResult<String> {
+    let model_id = projection_model_id(model).unwrap_or("vibex-model");
+    let provider_id = sanitize_provider_id(
+        provider
+            .vendor_hint
+            .as_deref()
+            .unwrap_or_else(|| provider.id.as_str()),
+    );
+    let group =
+        overlay_model_group(binding, model, |model| deepseek_harness_api(Some(model)));
+    let model_entries: Vec<serde_json::Value> = if group.is_empty() {
+        vec![deepseek_harness_model_entry(provider, model, model_id)]
+    } else {
+        group
+            .iter()
+            .map(|model_binding| {
+                let model_id = projection_model_id(Some(model_binding)).unwrap_or("vibex-model");
+                deepseek_harness_model_entry(provider, Some(model_binding), model_id)
+            })
+            .collect()
+    };
 
     let mut route = serde_json::Map::new();
     route.insert(
@@ -2931,7 +3167,7 @@ fn deepseek_harness_overlay(
         "baseURL",
         endpoint.map(|endpoint| endpoint.url.as_str()),
     );
-    route.insert("models".to_string(), serde_json::json!([model_entry]));
+    route.insert("models".to_string(), serde_json::Value::Array(model_entries));
 
     serialized_yaml(serde_json::json!({
         "llm-pi-ai": {
@@ -2952,8 +3188,30 @@ fn deepseek_harness_api(model: Option<&AgentConfiguredModelBinding>) -> &'static
     }
 }
 
+fn pi_model_registry_entry(
+    provider: &ModelProviderProfile,
+    model: Option<&AgentConfiguredModelBinding>,
+    model_id: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": model_id,
+        "name": model_id,
+        "reasoning": pi_model_reasoning(provider, model),
+        "input": ["text"],
+        "contextWindow": 128000,
+        "maxTokens": 16384,
+        "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+        },
+    })
+}
+
 fn pi_overlay(
     provider: &ModelProviderProfile,
+    binding: &AgentModelProviderBinding,
     endpoint: Option<&ModelProviderEndpoint>,
     model: Option<&AgentConfiguredModelBinding>,
     secret_env_key: &str,
@@ -2976,23 +3234,20 @@ fn pi_overlay(
         serde_json::json!(format!("${secret_env_key}")),
     );
     entry.insert("api".to_string(), serde_json::json!(pi_api_kind(model)));
-    entry.insert(
-        "models".to_string(),
-        serde_json::json!([{
-            "id": model_id,
-            "name": model_id,
-            "reasoning": pi_model_reasoning(provider, model),
-            "input": ["text"],
-            "contextWindow": 128000,
-            "maxTokens": 16384,
-            "cost": {
-                "input": 0,
-                "output": 0,
-                "cacheRead": 0,
-                "cacheWrite": 0,
-            },
-        }]),
-    );
+
+    let group = overlay_model_group(binding, model, |model| pi_api_kind(Some(model)));
+    let models: Vec<serde_json::Value> = if group.is_empty() {
+        vec![pi_model_registry_entry(provider, model, model_id)]
+    } else {
+        group
+            .iter()
+            .map(|model_binding| {
+                let model_id = projection_model_id(Some(model_binding)).unwrap_or("vibex-model");
+                pi_model_registry_entry(provider, Some(model_binding), model_id)
+            })
+            .collect()
+    };
+    entry.insert("models".to_string(), serde_json::Value::Array(models));
     serialized_json(serde_json::json!({
         "providers": {provider_id: entry},
     }))
@@ -3012,13 +3267,11 @@ fn pi_model_reasoning(
         .unwrap_or(false)
 }
 
-fn qwen_code_overlay(
-    _provider: &ModelProviderProfile,
+fn qwen_code_model_entry(
+    model_id: &str,
     endpoint: Option<&ModelProviderEndpoint>,
-    model: Option<&AgentConfiguredModelBinding>,
     secret_env_key: &str,
-) -> VibexResult<String> {
-    let model_id = projection_model_id(model).unwrap_or("vibex-model");
+) -> serde_json::Value {
     let mut entry = serde_json::Map::new();
     entry.insert("id".to_string(), serde_json::json!(model_id));
     entry.insert("name".to_string(), serde_json::json!(model_id));
@@ -3028,8 +3281,29 @@ fn qwen_code_overlay(
         endpoint.map(|endpoint| endpoint.url.as_str()),
     );
     entry.insert("envKey".to_string(), serde_json::json!(secret_env_key));
+    serde_json::Value::Object(entry)
+}
+
+fn qwen_code_overlay(
+    _provider: &ModelProviderProfile,
+    binding: &AgentModelProviderBinding,
+    endpoint: Option<&ModelProviderEndpoint>,
+    model: Option<&AgentConfiguredModelBinding>,
+    secret_env_key: &str,
+) -> VibexResult<String> {
+    let model_id = projection_model_id(model).unwrap_or("vibex-model");
+    let group = overlay_model_group(binding, model, |_| "openai-chat-completions");
+    let mut model_providers = Vec::with_capacity(group.len().max(1));
+    if group.is_empty() {
+        model_providers.push(qwen_code_model_entry(model_id, endpoint, secret_env_key));
+    } else {
+        for model_binding in group {
+            let model_id = projection_model_id(Some(model_binding)).unwrap_or("vibex-model");
+            model_providers.push(qwen_code_model_entry(model_id, endpoint, secret_env_key));
+        }
+    }
     serialized_json(serde_json::json!({
-        "modelProviders": {"openai": [entry]},
+        "modelProviders": {"openai": model_providers},
         "security": {"auth": {"selectedType": "openai"}},
         "model": {"name": model_id},
     }))

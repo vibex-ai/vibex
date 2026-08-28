@@ -356,6 +356,53 @@ pub fn active_collaborations(items: &[TimelineItem]) -> Vec<ActiveCollaborationP
     active
 }
 
+/// Concatenates the trailing run of streaming reasoning deltas. Agents emit
+/// thought chunks as individual timeline items, so the in-flight status is the
+/// accumulated run rather than the most recent fragment; joining the deltas
+/// keeps the pending indicator stable while a thinking stream grows.
+fn accumulated_streaming_reasoning(items: &[&TimelineItem]) -> Option<String> {
+    let mut chunks: Vec<&str> = Vec::new();
+    for item in items.iter().rev() {
+        match &item.payload {
+            TimelinePayload::Reasoning(reasoning) if !reasoning.is_final => {
+                chunks.push(&reasoning.text);
+            }
+            _ => break,
+        }
+    }
+    let accumulated = chunks
+        .into_iter()
+        .rev()
+        .collect::<String>()
+        .trim()
+        .to_string();
+    (!accumulated.is_empty()).then(|| {
+        tail_chars(&accumulated, LIVE_REASONING_STATUS_MAX_CHARS).to_string()
+    })
+}
+
+/// Upper bound for the accumulated streaming reasoning kept in `live_status`.
+/// The turn projection serializes to clients, so the tail window keeps
+/// unbounded thinking streams from ballooning payloads while preserving the
+/// newest text a reader following the stream would want to see.
+const LIVE_REASONING_STATUS_MAX_CHARS: usize = 4000;
+
+/// Returns the trailing `max_chars` characters of `value` without splitting a
+/// UTF-8 character boundary.
+fn tail_chars(value: &str, max_chars: usize) -> &str {
+    if max_chars == 0 {
+        return "";
+    }
+    let mut seen = 0usize;
+    for (byte_index, _) in value.char_indices().rev() {
+        seen += 1;
+        if seen == max_chars {
+            return &value[byte_index..];
+        }
+    }
+    value
+}
+
 pub fn timeline_conversation_turns(
     items: &[TimelineItem],
     session_state: Option<AgentSessionState>,
@@ -420,18 +467,7 @@ pub fn timeline_conversation_turns(
                     row.streaming = false;
                 }
             }
-            let live_status = turn
-                .response_items
-                .iter()
-                .rev()
-                .find_map(|item| match &item.payload {
-                    TimelinePayload::Reasoning(reasoning) if !reasoning.is_final => {
-                        Some(reasoning.text.trim())
-                    }
-                    _ => None,
-                })
-                .filter(|status| !status.is_empty())
-                .map(str::to_string);
+            let live_status = accumulated_streaming_reasoning(&turn.response_items);
             let final_agent_item_ids = turn
                 .response_items
                 .iter()
@@ -1875,9 +1911,11 @@ mod tests {
 
         let active = timeline_conversation_turns(&items, Some(AgentSessionState::Running), false);
         assert_eq!(active.len(), 1);
+        // Consecutive thought deltas accumulate instead of flashing the latest
+        // fragment; the run stops at the tool call boundary.
         assert_eq!(
             active[0].live_status.as_deref(),
-            Some("persistence strategy")
+            Some("Evaluating persistence strategy")
         );
         assert_eq!(active[0].process_rows.len(), 1);
         assert_eq!(active[0].process_rows[0].kind, TimelineRowKind::ToolCall);
@@ -1895,6 +1933,101 @@ mod tests {
         assert!(completed[0].live_status.is_none());
         assert_eq!(completed[0].process_rows.len(), 1);
         assert_eq!(completed[0].process_rows[0].kind, TimelineRowKind::ToolCall);
+    }
+
+    #[test]
+    fn live_status_accumulates_only_the_trailing_streaming_run() {
+        // The reasoning before the tool call is finished history, so only the
+        // deltas after it join the live status.
+        let items = [
+            item(
+                1,
+                None,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "Investigate".into(),
+                    attachments: Vec::new(),
+                }),
+            ),
+            item(
+                2,
+                None,
+                TimelinePayload::Reasoning(ReasoningPayload {
+                    text: "Earlier segment".into(),
+                    is_final: false,
+                }),
+            ),
+            item(
+                3,
+                None,
+                TimelinePayload::ToolCall(ToolCallPayload {
+                    tool_call_id: "tool_read".into(),
+                    tool_name: "read".into(),
+                    status: ToolCallStatus::Completed,
+                    summary: "Read files".into(),
+                    input_summary: None,
+                    output_summary: None,
+                    raw_extension: None,
+                }),
+            ),
+            item(
+                4,
+                None,
+                TimelinePayload::Reasoning(ReasoningPayload {
+                    text: "Fresh ".into(),
+                    is_final: false,
+                }),
+            ),
+            item(
+                5,
+                None,
+                TimelinePayload::Reasoning(ReasoningPayload {
+                    text: "segment".into(),
+                    is_final: false,
+                }),
+            ),
+        ];
+
+        let turns = timeline_conversation_turns(&items, Some(AgentSessionState::Running), false);
+        assert_eq!(
+            turns[0].live_status.as_deref(),
+            Some("Fresh segment")
+        );
+    }
+
+    #[test]
+    fn live_status_keeps_a_bounded_tail_of_long_streams() {
+        let long_prefix = "x".repeat(LIVE_REASONING_STATUS_MAX_CHARS + 64);
+        let items = [
+            item(
+                1,
+                None,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "Think long".into(),
+                    attachments: Vec::new(),
+                }),
+            ),
+            item(
+                2,
+                None,
+                TimelinePayload::Reasoning(ReasoningPayload {
+                    text: long_prefix,
+                    is_final: false,
+                }),
+            ),
+            item(
+                3,
+                None,
+                TimelinePayload::Reasoning(ReasoningPayload {
+                    text: "最新思考".into(),
+                    is_final: false,
+                }),
+            ),
+        ];
+
+        let turns = timeline_conversation_turns(&items, Some(AgentSessionState::Running), false);
+        let status = turns[0].live_status.as_deref().expect("live status");
+        assert_eq!(status.chars().count(), LIVE_REASONING_STATUS_MAX_CHARS);
+        assert!(status.ends_with("最新思考"));
     }
 
     #[test]
