@@ -24638,35 +24638,39 @@ impl VibexWorkbench {
         v_flex()
             .h_full()
             .min_h_0()
-            .children(agent_back.map(|button| {
+            .child(
                 h_flex()
                     .w_full()
                     .h(px(34.0))
                     .flex_none()
                     .items_center()
-                    .px_1()
+                    .gap_1()
                     .mb_1()
-                    .child(button)
-            }))
-            .child(
-                div()
-                    .h(px(34.0))
-                    .flex_none()
-                    .mb_1()
-                    .rounded(px(7.0))
-                    .border_1()
-                    .border_color(cx.theme().border.opacity(0.70))
-                    .bg(cx.theme().muted.opacity(0.45))
+                    .children(agent_back)
                     .child(
-                        Input::new(&search)
-                            .small()
+                        div()
                             .h_full()
-                            .appearance(false)
-                            .text_xs()
-                            .prefix(
-                                Icon::new(IconName::Search)
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .rounded(px(7.0))
+                            .border_1()
+                            .border_color(cx.theme().border.opacity(0.70))
+                            .bg(cx.theme().muted.opacity(0.45))
+                            .child(
+                                Input::new(&search)
                                     .small()
-                                    .text_color(cx.theme().muted_foreground),
+                                    .w_full()
+                                    .appearance(false)
+                                    .text_xs()
+                                    .prefix(
+                                        h_flex().h_full().items_center().child(
+                                            Icon::new(IconName::Search)
+                                                .small()
+                                                .text_color(cx.theme().muted_foreground),
+                                        ),
+                                    ),
                             ),
                     ),
             )
@@ -51903,6 +51907,7 @@ mod tests {
         assert!(grouped_models.contains("Input::new(&search)"));
         assert!(grouped_models.contains("runtime_model_choices("));
         assert!(grouped_models.contains("composer-runtime-provider-back-agent"));
+        assert!(grouped_models.contains(".children(agent_back)"));
         assert!(grouped_models.contains("IconName::ArrowLeft"));
         assert!(grouped_models.contains("runtime_agent_icon(&agent_identity)"));
         assert!(grouped_models.contains("ComposerRuntimeMenuView::Agent"));
