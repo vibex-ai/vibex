@@ -19418,7 +19418,13 @@ impl VibexWorkbench {
             right_rail_activity_button("activity-terminal", Icon::new(IconName::SquareTerminal))
                 .tooltip(locale::text("New terminal", "新建终端", "新增終端機"))
                 .on_click(cx.listener(|this, _, window, cx| {
-                    this.create_preview_terminal(window.window_handle(), None, None, cx)
+                    let terminal_preview_open = this.code_preview_visible
+                        && this.code_workbench.read(cx).active_preview_is_terminal();
+                    if terminal_preview_open {
+                        this.toggle_preview(cx);
+                    } else {
+                        this.create_preview_terminal(window.window_handle(), None, None, cx);
+                    }
                 }))
                 .into_any_element();
         let activities = if git_available {

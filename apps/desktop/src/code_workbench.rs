@@ -3525,6 +3525,13 @@ impl CodeWorkbench {
         self.open_terminal_in_pane(terminal_id, None, window, cx);
     }
 
+    pub(crate) fn active_preview_is_terminal(&self) -> bool {
+        self.preview
+            .active_tab_id(&self.preview.focused_pane_id)
+            .and_then(|tab_id| self.preview.tabs.get(tab_id))
+            .is_some_and(|tab| matches!(&tab.target, PreviewTarget::Terminal { .. }))
+    }
+
     pub fn open_terminal_in_pane(
         &mut self,
         terminal_id: TerminalId,
