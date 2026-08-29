@@ -24797,13 +24797,13 @@ impl VibexWorkbench {
             visible_groups.push(v_flex().w_full().child(heading).children(rows));
         }
 
-        let agent_logo = runtime_agent_icon(agent_identity.as_deref().unwrap_or(agent_id.as_str()));
         let agent_back = (!new_session).then(|| {
             Button::new("composer-runtime-provider-back-agent")
                 .xsmall()
                 .ghost()
                 .compact()
-                .size(px(28.0))
+                .h(px(28.0))
+                .px_1()
                 .flex_none()
                 .tooltip(locale::text(
                     "Back to Agent selection",
@@ -24811,7 +24811,15 @@ impl VibexWorkbench {
                     "返回 Agent 選擇",
                 ))
                 .text_color(cx.theme().muted_foreground)
-                .icon(Icon::new(IconName::ArrowLeft).size(px(14.0)))
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap(px(5.0))
+                        .child(Icon::new(IconName::ArrowLeft).size(px(14.0)))
+                        .child(runtime_agent_icon(
+                            agent_identity.as_deref().unwrap_or(agent_id.as_str()),
+                        )),
+                )
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.navigate_composer_runtime_menu(
                         ComposerRuntimeMenuView::Agent,
@@ -52363,7 +52371,8 @@ mod tests {
         assert!(grouped_models.contains(".children(agent_back)"));
         assert!(grouped_models.contains("IconName::ArrowLeft"));
         assert!(grouped_models.contains(".compact()"));
-        assert!(grouped_models.contains(".size(px(28.0))"));
+        assert!(grouped_models.contains(".h(px(28.0))"));
+        assert!(grouped_models.contains(".child(runtime_agent_icon("));
         assert!(grouped_models.contains(".text_color(cx.theme().foreground.opacity(0.84))"));
         assert!(grouped_models.contains(".track_scroll(&provider_scroll)"));
         assert!(grouped_models.contains(".anchor_scroll(selected_anchor)"));
