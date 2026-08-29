@@ -24842,7 +24842,6 @@ impl VibexWorkbench {
                     .gap_1()
                     .mb_1()
                     .children(agent_back)
-                    .when(!new_session, |this| this.child(agent_logo))
                     .child(
                         div()
                             .h_full()
