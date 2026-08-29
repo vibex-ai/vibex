@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::rc::Rc;
@@ -20,7 +20,7 @@ use ::gpui::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use gpui_component::{
     ActiveTheme as _, Disableable as _, IconName, Selectable as _, Sizable as _, StyledExt as _,
-    WindowExt as _,
+    TITLE_BAR_HEIGHT, WindowExt as _,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
@@ -30,7 +30,7 @@ use gpui_component::{
     progress::Progress,
     scroll::ScrollableElement as _,
     spinner::Spinner,
-    v_flex,
+    v_flex, window_paddings,
 };
 use ropey::Rope;
 
@@ -65,6 +65,7 @@ const DATA_IMAGE_MAX_RGBA_BYTES: u64 = 64 * 1024 * 1024;
 const ARTIFACT_MAX_RASTER_PIXELS: f32 = 16.0 * 1024.0 * 1024.0;
 const DIAGRAM_VIEWPORT_MAX_HEIGHT: f32 = 640.0;
 const DIAGRAM_FULLSCREEN_MARGIN: f32 = 24.0;
+const DIAGRAM_FULLSCREEN_CHROME_HEIGHT: f32 = 72.0;
 
 pub type MarkdownResourceHandler = Arc<dyn Fn(ResolvedResource, &mut Window, &mut App) + 'static>;
 type MarkdownInlineClickHandler = Rc<dyn Fn(&mut Window, &mut App) + 'static>;
@@ -3229,23 +3230,64 @@ impl MarkdownViewState {
             return;
         }
         let viewport = window.viewport_size();
-        let width = (f32::from(viewport.width) - DIAGRAM_FULLSCREEN_MARGIN).max(240.0);
-        let height = (f32::from(viewport.height) - DIAGRAM_FULLSCREEN_MARGIN).max(180.0);
+        let paddings = window_paddings(window);
+        let available_width = (f32::from(viewport.width - paddings.left - paddings.right)).max(1.0);
+        let available_height =
+            (f32::from(viewport.height - paddings.top - paddings.bottom)).max(1.0);
+        let top_margin = f32::from(TITLE_BAR_HEIGHT) + DIAGRAM_FULLSCREEN_MARGIN / 2.0;
+        let bottom_margin = DIAGRAM_FULLSCREEN_MARGIN / 2.0;
+        let width = (available_width - DIAGRAM_FULLSCREEN_MARGIN).max(1.0);
+        let height = (available_height - top_margin - bottom_margin).max(1.0);
         let scroll = ScrollHandle::new();
         let dialog_id = self.view_id.clone();
+        let close_button_id = format!(
+            "markdown-diagram-fullscreen-close:{dialog_id}:{}",
+            node_id.0
+        );
+        let close_requested = Rc::new(Cell::new(false));
         window.open_dialog(cx, move |dialog, _, _| {
+            let close_on_mouse_down = close_requested.clone();
+            let close_on_click = close_requested.clone();
             dialog
-                .title("Diagram")
+                .title(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .child("Diagram")
+                        .child(
+                            Button::new(close_button_id.clone())
+                                .xsmall()
+                                .ghost()
+                                .compact()
+                                .icon(IconName::Close)
+                                .tooltip("Close full screen")
+                                .debug_selector(|| "markdown-diagram-fullscreen-close".to_string())
+                                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                    if !close_on_mouse_down.replace(true) {
+                                        window.close_dialog(cx);
+                                    }
+                                    cx.stop_propagation();
+                                })
+                                .on_click(move |_, window, cx| {
+                                    if !close_on_click.replace(true) {
+                                        window.close_dialog(cx);
+                                    }
+                                }),
+                        ),
+                )
+                .margin_top(px(top_margin))
                 .w(px(width))
                 .max_w(px(width))
                 .h(px(height))
-                .close_button(true)
+                .close_button(false)
+                .overlay_closable(false)
                 .child(diagram_viewport(
                     format!("markdown-diagram-fullscreen:{dialog_id}:{}", node_id.0),
                     image.clone(),
                     artifact.clone(),
                     scroll.clone(),
-                    (height - 64.0).max(120.0),
+                    (height - DIAGRAM_FULLSCREEN_CHROME_HEIGHT).max(1.0),
                 ))
         });
     }
@@ -3428,6 +3470,8 @@ fn diagram_viewport(
     scroll: ScrollHandle,
     viewport_height: f32,
 ) -> AnyElement {
+    let id = id.into();
+    let debug_id = id.to_string();
     let pan_start = Rc::new(RefCell::new(None::<Point<Pixels>>));
     let wheel_scroll = scroll.clone();
     let drag_scroll = scroll.clone();
@@ -3440,6 +3484,7 @@ fn diagram_viewport(
 
     div()
         .id(id)
+        .debug_selector(move || format!("markdown-diagram-viewport:{debug_id}"))
         .w_full()
         .h(px(viewport_height))
         .min_w_0()
@@ -3724,10 +3769,10 @@ mod tests {
         InteractiveElement as _, Modifiers, MouseButton, ScrollDelta,
         StatefulInteractiveElement as _, TestAppContext, VisualTestContext,
     };
-    use gpui_component::{ElementExt as _, Theme, ThemeMode};
+    use gpui_component::{ElementExt as _, Root, Theme, ThemeMode};
 
     use super::*;
-    use crate::MarkdownSurface;
+    use crate::{MarkdownSurface, SvgViewBox};
 
     struct MarkdownLayoutProbe {
         input: MarkdownInput,
@@ -3752,6 +3797,44 @@ mod tests {
         input: MarkdownInput,
         state: Entity<MarkdownViewState>,
         parent_scroll: ScrollHandle,
+    }
+
+    struct MarkdownFullscreenDialogProbe {
+        state: Entity<MarkdownViewState>,
+        background_clicked: Rc<Cell<bool>>,
+    }
+
+    impl MarkdownFullscreenDialogProbe {
+        fn new(cx: &mut Context<Self>) -> Self {
+            Self {
+                state: cx.new(|cx| {
+                    MarkdownViewState::new(
+                        "fullscreen-dialog-probe".into(),
+                        MarkdownInput::new("", "", 1),
+                        None,
+                        MarkdownViewOptions::default(),
+                        cx,
+                    )
+                }),
+                background_clicked: Rc::new(Cell::new(false)),
+            }
+        }
+    }
+
+    fn fullscreen_probe_artifact() -> Arc<SvgArtifact> {
+        Arc::new(SvgArtifact {
+            bytes: Arc::<[u8]>::from(Vec::<u8>::new()),
+            width_px: 320.0,
+            height_px: 180.0,
+            view_box: SvgViewBox {
+                min_x: 0.0,
+                min_y: 0.0,
+                width: 320.0,
+                height: 180.0,
+            },
+            baseline_offset_px: None,
+            element_count: 1,
+        })
     }
 
     impl MarkdownSelectionProbe {
@@ -3863,6 +3946,23 @@ mod tests {
                         .child(markdown)
                         .child(div().h(px(800.0)).flex_none()),
                 )
+        }
+    }
+
+    impl Render for MarkdownFullscreenDialogProbe {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let background_clicked = self.background_clicked.clone();
+            let dialog_layer = Root::render_dialog_layer(window, cx);
+            div()
+                .id("fullscreen-dialog-probe-root")
+                .size_full()
+                .child(
+                    Button::new("fullscreen-dialog-probe-background")
+                        .label("Background")
+                        .debug_selector(|| "fullscreen-dialog-probe-background".to_string())
+                        .on_click(move |_, _, _| background_clicked.set(true)),
+                )
+                .children(dialog_layer)
         }
     }
 
@@ -4750,6 +4850,102 @@ mod tests {
         );
         assert_eq!(artifact_viewport_height(f32::NAN), 1.0);
         assert_eq!(artifact_viewport_height(-10.0), 1.0);
+    }
+
+    #[::gpui::test]
+    fn fullscreen_diagram_dialog_can_be_closed_and_release_modal_input(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(MarkdownFullscreenDialogProbe::new);
+            Root::new(view, window, cx)
+        });
+        let probe = root.read_with(cx, |root, _| {
+            root.view()
+                .clone()
+                .downcast::<MarkdownFullscreenDialogProbe>()
+                .expect("fullscreen probe view")
+        });
+        let state = probe.read_with(cx, |probe, _| probe.state.clone());
+
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                state.open_artifact_fullscreen(
+                    NodeId(1),
+                    ArtifactKind::Mermaid,
+                    Arc::new(RenderImage::new(Vec::<image::Frame>::new())),
+                    fullscreen_probe_artifact(),
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let viewport = cx
+            .debug_bounds(
+                "markdown-diagram-viewport:markdown-diagram-fullscreen:fullscreen-dialog-probe:1",
+            )
+            .expect("fullscreen diagram viewport bounds");
+        let close = cx
+            .debug_bounds("markdown-diagram-fullscreen-close")
+            .expect("dialog close bounds");
+        let window_size = cx.update(|window, _| window.viewport_size());
+        assert!(viewport.size.width > px(0.0));
+        assert!(viewport.size.height > px(0.0));
+        assert!(viewport.left() >= px(0.0));
+        assert!(viewport.right() <= window_size.width);
+        assert!(viewport.top() >= px(0.0));
+        assert!(viewport.bottom() <= window_size.height);
+        assert!(
+            close.top() >= TITLE_BAR_HEIGHT,
+            "fullscreen close control must remain below the title bar"
+        );
+        assert!(
+            close.bottom() <= viewport.top(),
+            "fullscreen close control must remain above the panning viewport"
+        );
+
+        cx.simulate_click(close.center(), Modifiers::default());
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let background = cx
+            .debug_bounds("fullscreen-dialog-probe-background")
+            .expect("background button bounds");
+        cx.simulate_click(background.center(), Modifiers::default());
+        assert!(probe.read_with(cx, |probe, _| probe.background_clicked.get()));
+
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                state.open_artifact_fullscreen(
+                    NodeId(1),
+                    ArtifactKind::Mermaid,
+                    Arc::new(RenderImage::new(Vec::<image::Frame>::new())),
+                    fullscreen_probe_artifact(),
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.simulate_keystrokes("escape");
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
     }
 
     #[test]
