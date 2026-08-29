@@ -5325,6 +5325,7 @@ impl VibexWorkbench {
         let Some(runtime) = self.runtime.clone() else {
             return;
         };
+        self.set_settings_operation_note(None, cx);
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             runtime.app_update().check(CheckReason::Manual).await
         });
@@ -5334,8 +5335,10 @@ impl VibexWorkbench {
                 let _ = entity.update(cx, |this, cx| {
                     this.update_action_task = None;
                     if let Err(error) = outcome {
-                        this.persistence_note =
-                            Some(format!("Update check task stopped unexpectedly: {error}"));
+                        this.set_settings_operation_note(
+                            Some(format!("Update check task stopped unexpectedly: {error}")),
+                            cx,
+                        );
                     }
                     cx.notify();
                 });
@@ -5347,6 +5350,7 @@ impl VibexWorkbench {
         let Some(runtime) = self.runtime.clone() else {
             return;
         };
+        self.set_settings_operation_note(None, cx);
         let runner =
             gpui_tokio::Tokio::spawn(cx, async move { runtime.app_update().download().await });
         self.update_action_task = Some(cx.spawn(
@@ -5355,9 +5359,12 @@ impl VibexWorkbench {
                 let _ = entity.update(cx, |this, cx| {
                     this.update_action_task = None;
                     if let Err(error) = outcome {
-                        this.persistence_note = Some(format!(
-                            "Update download task stopped unexpectedly: {error}"
-                        ));
+                        this.set_settings_operation_note(
+                            Some(format!(
+                                "Update download task stopped unexpectedly: {error}"
+                            )),
+                            cx,
+                        );
                     }
                     cx.notify();
                 });
@@ -5369,6 +5376,7 @@ impl VibexWorkbench {
         let Some(runtime) = self.runtime.clone() else {
             return;
         };
+        self.set_settings_operation_note(None, cx);
         let runner =
             gpui_tokio::Tokio::spawn(cx, async move { runtime.app_update().install().await });
         self.update_action_task = Some(cx.spawn(
@@ -19882,11 +19890,11 @@ impl VibexWorkbench {
         match vibex_desktop_runtime::network_proxy::configure(&next) {
             Ok(normalized) => {
                 self.ui_state.network_proxy = normalized;
-                self.persistence_note = None;
                 self.queue_ui_state();
+                self.set_settings_operation_note(None, cx);
             }
             Err(error) => {
-                self.persistence_note = Some(localize_network_proxy_error(&error));
+                self.set_settings_operation_note(Some(localize_network_proxy_error(&error)), cx);
             }
         }
         cx.notify();
@@ -19900,14 +19908,21 @@ impl VibexWorkbench {
         match vibex_desktop_runtime::network_proxy::configure(&next) {
             Ok(normalized) => {
                 self.ui_state.network_proxy = normalized;
-                self.persistence_note = None;
                 self.queue_ui_state();
+                self.set_settings_operation_note(None, cx);
             }
             Err(error) => {
-                self.persistence_note = Some(localize_network_proxy_error(&error));
+                self.set_settings_operation_note(Some(localize_network_proxy_error(&error)), cx);
             }
         }
         cx.notify();
+    }
+
+    fn set_settings_operation_note(&mut self, note: Option<String>, cx: &mut Context<Self>) {
+        self.settings_view.update(cx, |settings, cx| {
+            settings.operation_note = note;
+            cx.notify();
+        });
     }
 
     fn set_terminal_shell(&mut self, shell: String, cx: &mut Context<Self>) {
@@ -19991,9 +20006,12 @@ impl VibexWorkbench {
             .unwrap_or("com.vibex.desktop");
         let launch_at_login = snapshot.desktop_behavior.launch_at_login;
         if let Err(error) = set_launch_at_login(launch_at_login, application_id) {
-            self.persistence_note = Some(format!("{}: {}", error.code, error.message));
+            self.set_settings_operation_note(
+                Some(format!("{}: {}", error.code, error.message)),
+                cx,
+            );
         } else {
-            self.persistence_note = None;
+            self.set_settings_operation_note(None, cx);
         }
 
         let auto_continue_default_project_ids = snapshot.session.auto_continue_project_ids.clone();
@@ -20092,6 +20110,10 @@ impl VibexWorkbench {
             }
             if !window.has_active_dialog(cx) {
                 self.settings_open = false;
+                self.settings_view.update(cx, |settings, cx| {
+                    settings.operation_note = None;
+                    cx.notify();
+                });
             }
             cx.notify();
         } else {
@@ -20106,6 +20128,7 @@ impl VibexWorkbench {
         self.settings_snapshot = Some(self.ui_state.clone());
         self.settings_view.update(cx, |settings, cx| {
             settings.active_section = SettingsSection::General;
+            settings.operation_note = None;
             settings.search_selected_index = 0;
             settings
                 .search
@@ -20163,6 +20186,10 @@ impl VibexWorkbench {
                     let _ = on_close.update(cx, |this, cx| {
                         this.settings_open = false;
                         this.settings_snapshot = None;
+                        this.settings_view.update(cx, |settings, cx| {
+                            settings.operation_note = None;
+                            cx.notify();
+                        });
                         cx.notify();
                     });
                 })
@@ -20177,6 +20204,7 @@ impl VibexWorkbench {
         }
         self.settings_view.update(cx, |settings, cx| {
             settings.active_section = SettingsSection::About;
+            settings.operation_note = None;
             cx.notify();
         });
         cx.notify();
@@ -41711,6 +41739,7 @@ impl FoundationSettings {
                 settings_render_context,
                 storage_usage_state: SettingsStorageUsageState::Unloaded,
                 storage_usage_task: None,
+                operation_note: None,
                 active_section: SettingsSection::General,
             }
         })
@@ -42254,24 +42283,28 @@ impl FoundationSettings {
     }
 
     fn set_launch_at_login(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        let _ = self.workbench.update(cx, |this, cx| {
-            let application_id = this
-                .config
-                .as_ref()
-                .map(|config| config.application_id.as_str())
-                .unwrap_or("com.vibex.desktop");
-            match set_launch_at_login(enabled, application_id) {
-                Ok(()) => {
-                    this.ui_state.desktop_behavior.launch_at_login = enabled;
-                    this.queue_ui_state();
-                    this.persistence_note = None;
-                }
-                Err(error) => {
-                    this.persistence_note = Some(format!("{}: {}", error.code, error.message));
-                }
-            }
-            cx.notify();
-        });
+        let note = self
+            .workbench
+            .update(cx, |this, cx| {
+                let application_id = this
+                    .config
+                    .as_ref()
+                    .map(|config| config.application_id.as_str())
+                    .unwrap_or("com.vibex.desktop");
+                let note = match set_launch_at_login(enabled, application_id) {
+                    Ok(()) => {
+                        this.ui_state.desktop_behavior.launch_at_login = enabled;
+                        this.queue_ui_state();
+                        None
+                    }
+                    Err(error) => Some(format!("{}: {}", error.code, error.message)),
+                };
+                cx.notify();
+                note
+            })
+            .ok()
+            .flatten();
+        self.operation_note = note;
         cx.notify();
     }
 
@@ -42408,10 +42441,7 @@ impl FoundationSettings {
                 let valid = default.is_some()
                     && (keystroke.is_empty() || shortcut_is_valid(&keystroke))
                     && !conflicts;
-                if !valid {
-                    this.persistence_note =
-                        Some("Shortcut is invalid or already in use".to_string());
-                } else {
+                if valid {
                     if keystroke.is_empty() {
                         this.ui_state.keyboard.shortcuts.remove(&action);
                     } else {
@@ -42424,12 +42454,19 @@ impl FoundationSettings {
                         effective_shortcut(&this.ui_state.keyboard.shortcuts, &action);
                     rebind_foundation_action(cx, &action, old_effective.as_deref(), new_effective);
                     this.queue_ui_state();
-                    this.persistence_note = None;
                 }
                 cx.notify();
                 valid
             })
             .unwrap_or(false);
+        self.operation_note = (!applied).then(|| {
+            locale::text(
+                "Shortcut is invalid or already in use",
+                "快捷键无效或已被占用",
+                "快速鍵無效或已被占用",
+            )
+            .to_string()
+        });
         cx.notify();
         applied
     }
@@ -42531,22 +42568,22 @@ impl FoundationSettings {
                 .on_ok(move |_, _, cx| {
                     let value = input.read(cx).value().trim().to_string();
                     if value.is_empty() || std::path::Path::new(&value).is_file() {
-                        let _ =
-                            apply.update(cx, |settings, cx| settings.set_terminal_shell(value, cx));
+                        let _ = apply.update(cx, |settings, cx| {
+                            settings.set_terminal_shell(value, cx);
+                            settings.operation_note = None;
+                            cx.notify();
+                        });
                         true
                     } else {
                         let _ = apply.update(cx, |settings, cx| {
-                            let _ = settings.workbench.update(cx, |this, cx| {
-                                this.persistence_note = Some(
-                                    locale::text(
-                                        "Shell path does not exist",
-                                        "Shell 路径不存在",
-                                        "Shell 路徑不存在",
-                                    )
-                                    .to_string(),
-                                );
-                                cx.notify();
-                            });
+                            settings.operation_note = Some(
+                                locale::text(
+                                    "Shell path does not exist",
+                                    "Shell 路径不存在",
+                                    "Shell 路徑不存在",
+                                )
+                                .to_string(),
+                            );
                             cx.notify();
                         });
                         false
