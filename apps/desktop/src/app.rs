@@ -2970,6 +2970,145 @@ fn timeline_turn_duration_end(turn_complete: bool, ended_at_ms: Option<i64>) -> 
     turn_complete.then_some(ended_at_ms).flatten()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentGenerationPhase {
+    Preparing,
+    Thinking,
+    CallingTool,
+    Generating,
+    WaitingForApproval,
+}
+
+#[derive(Debug)]
+struct AgentGenerationStats {
+    turn_id: String,
+    started_at_ms: i64,
+    output_token_baseline: Option<u64>,
+    last_generated_tokens: Option<u64>,
+    last_token_sample_at: Instant,
+    tokens_per_second: Option<f32>,
+}
+
+impl AgentGenerationStats {
+    fn new(turn_id: String, started_at_ms: i64, output_token_baseline: Option<u64>) -> Self {
+        Self {
+            turn_id,
+            started_at_ms,
+            output_token_baseline,
+            last_generated_tokens: None,
+            last_token_sample_at: Instant::now(),
+            tokens_per_second: None,
+        }
+    }
+}
+
+fn agent_generation_phase(turn: &TimelineConversationTurn) -> AgentGenerationPhase {
+    if turn.pending_permission {
+        return AgentGenerationPhase::WaitingForApproval;
+    }
+
+    let latest_streaming_row = turn
+        .conclusion_row
+        .iter()
+        .chain(turn.process_rows.iter().rev())
+        .find(|row| row.streaming);
+    match latest_streaming_row.map(|row| row.kind) {
+        Some(TimelineRowKind::AgentMessage) => AgentGenerationPhase::Generating,
+        Some(
+            TimelineRowKind::ToolCall
+            | TimelineRowKind::Command
+            | TimelineRowKind::FileOperation
+            | TimelineRowKind::WebSearch
+            | TimelineRowKind::Collaboration
+            | TimelineRowKind::ImageGeneration,
+        ) => AgentGenerationPhase::CallingTool,
+        Some(TimelineRowKind::Reasoning) => AgentGenerationPhase::Thinking,
+        Some(_) | None if turn.live_status.is_some() => AgentGenerationPhase::Thinking,
+        Some(_) | None => AgentGenerationPhase::Preparing,
+    }
+}
+
+fn agent_generation_phase_label(
+    phase: AgentGenerationPhase,
+    locale: locale::ResolvedLocale,
+) -> &'static str {
+    match (phase, locale) {
+        (AgentGenerationPhase::Preparing, locale::ResolvedLocale::En) => "Preparing",
+        (AgentGenerationPhase::Preparing, locale::ResolvedLocale::ZhCn) => "准备中",
+        (AgentGenerationPhase::Preparing, locale::ResolvedLocale::ZhTw) => "準備中",
+        (AgentGenerationPhase::Thinking, locale::ResolvedLocale::En) => "Thinking",
+        (AgentGenerationPhase::Thinking, locale::ResolvedLocale::ZhCn) => "思考中",
+        (AgentGenerationPhase::Thinking, locale::ResolvedLocale::ZhTw) => "思考中",
+        (AgentGenerationPhase::CallingTool, locale::ResolvedLocale::En) => "Calling tool",
+        (AgentGenerationPhase::CallingTool, locale::ResolvedLocale::ZhCn) => "调用工具",
+        (AgentGenerationPhase::CallingTool, locale::ResolvedLocale::ZhTw) => "呼叫工具",
+        (AgentGenerationPhase::Generating, locale::ResolvedLocale::En) => "Generating",
+        (AgentGenerationPhase::Generating, locale::ResolvedLocale::ZhCn) => "生成中",
+        (AgentGenerationPhase::Generating, locale::ResolvedLocale::ZhTw) => "生成中",
+        (AgentGenerationPhase::WaitingForApproval, locale::ResolvedLocale::En) => {
+            "Waiting for approval"
+        }
+        (AgentGenerationPhase::WaitingForApproval, locale::ResolvedLocale::ZhCn) => "等待确认",
+        (AgentGenerationPhase::WaitingForApproval, locale::ResolvedLocale::ZhTw) => "等待確認",
+    }
+}
+
+fn agent_generation_tool_call_count(turn: &TimelineConversationTurn) -> usize {
+    turn.process_rows
+        .iter()
+        .filter(|row| {
+            matches!(
+                row.kind,
+                TimelineRowKind::ToolCall
+                    | TimelineRowKind::Command
+                    | TimelineRowKind::FileOperation
+                    | TimelineRowKind::WebSearch
+                    | TimelineRowKind::Collaboration
+                    | TimelineRowKind::ImageGeneration
+            )
+        })
+        .count()
+}
+
+fn estimated_agent_output_tokens(turn: &TimelineConversationTurn) -> Option<u64> {
+    let output_chars = turn
+        .process_rows
+        .iter()
+        .chain(turn.conclusion_row.iter())
+        .filter(|row| row.kind == TimelineRowKind::AgentMessage)
+        .map(|row| row.body.chars().count())
+        .sum::<usize>();
+    (output_chars > 0).then_some((output_chars as u64).saturating_add(3) / 4)
+}
+
+fn agent_generation_output_tokens(
+    turn: &TimelineConversationTurn,
+    output_tokens: Option<u64>,
+    output_token_baseline: Option<u64>,
+) -> Option<u64> {
+    let reported = match (output_tokens, output_token_baseline) {
+        (Some(current), Some(baseline)) => {
+            current.checked_sub(baseline).filter(|tokens| *tokens > 0)
+        }
+        (Some(current), None) if current > 0 => Some(current),
+        _ => None,
+    };
+    reported.or_else(|| estimated_agent_output_tokens(turn))
+}
+
+fn agent_generation_token_rate(
+    previous_tokens: Option<u64>,
+    current_tokens: Option<u64>,
+    elapsed: Duration,
+) -> Option<f32> {
+    let (Some(previous), Some(current)) = (previous_tokens, current_tokens) else {
+        return None;
+    };
+    let elapsed_seconds = elapsed.as_secs_f32();
+    (current > previous && elapsed_seconds > 0.0)
+        .then_some((current - previous) as f32 / elapsed_seconds)
+}
+
 fn timeline_session_state_for_render(
     selected_session_id: Option<&VibexSessionId>,
     timeline_session_id: Option<&VibexSessionId>,
@@ -3925,6 +4064,7 @@ pub struct VibexWorkbench {
     runtime_selection_cancellations_in_flight: BTreeSet<String>,
     runtime_preference_write_fence: RuntimePreferenceWriteFence,
     token_usage: Option<AgentTokenUsage>,
+    agent_generation_stats: Option<AgentGenerationStats>,
     composer_runtime_menu_open: bool,
     composer_runtime_menu_view: ComposerRuntimeMenuView,
     composer_runtime_menu_agent_id: Option<AgentId>,
@@ -4629,6 +4769,7 @@ impl VibexWorkbench {
             runtime_selection_cancellations_in_flight: BTreeSet::new(),
             runtime_preference_write_fence: RuntimePreferenceWriteFence::default(),
             token_usage: None,
+            agent_generation_stats: None,
             composer_runtime_menu_open: false,
             composer_runtime_menu_view: ComposerRuntimeMenuView::Agent,
             composer_runtime_menu_agent_id: None,
@@ -6256,6 +6397,9 @@ impl VibexWorkbench {
         }
         if self.selected_session_id.as_ref() == Some(session_id) {
             self.agent_turn_pending = pending;
+            if !pending {
+                self.agent_generation_stats = None;
+            }
         }
     }
 
@@ -8737,6 +8881,135 @@ impl VibexWorkbench {
         true
     }
 
+    fn sync_agent_generation_stats(&mut self, turn: &TimelineConversationTurn) {
+        let now = Instant::now();
+        let output_tokens = self
+            .token_usage
+            .as_ref()
+            .and_then(|usage| usage.output_tokens);
+        let should_reset = self
+            .agent_generation_stats
+            .as_ref()
+            .is_none_or(|stats| stats.turn_id != turn.id);
+        if should_reset {
+            self.agent_generation_stats = Some(AgentGenerationStats::new(
+                turn.id.clone(),
+                turn.started_at_ms,
+                output_tokens,
+            ));
+        }
+
+        let Some(stats) = self.agent_generation_stats.as_mut() else {
+            return;
+        };
+        let generated_tokens =
+            agent_generation_output_tokens(turn, output_tokens, stats.output_token_baseline);
+        if generated_tokens == stats.last_generated_tokens {
+            return;
+        }
+        if let Some(rate) = agent_generation_token_rate(
+            stats.last_generated_tokens,
+            generated_tokens,
+            now.saturating_duration_since(stats.last_token_sample_at),
+        ) {
+            stats.tokens_per_second = Some(rate);
+        }
+        stats.last_generated_tokens = generated_tokens;
+        stats.last_token_sample_at = now;
+    }
+
+    fn render_agent_generation_status(
+        &mut self,
+        session_running: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !session_running {
+            self.agent_generation_stats = None;
+            return None;
+        }
+        let Some(turn) = self
+            .conversation_turns_cache
+            .iter()
+            .rev()
+            .find(|turn| !turn.complete)
+            .cloned()
+        else {
+            self.agent_generation_stats = None;
+            return None;
+        };
+        self.sync_agent_generation_stats(&turn);
+        let stats = self.agent_generation_stats.as_ref()?;
+        let locale = self.resolved_locale();
+        let phase = agent_generation_phase(&turn);
+        let phase_label = agent_generation_phase_label(phase, locale);
+        let duration = format_compact_duration(stats.started_at_ms, None);
+        let tool_count = agent_generation_tool_call_count(&turn);
+        let agent_id = self
+            .selected_runtime_selection()
+            .map(|selection| selection.agent_id)
+            .or_else(|| {
+                self.selected_session()
+                    .map(|session| session.agent_id.clone())
+            })?;
+        let agent_label = runtime_agent_label(&self.agent_snapshots, &agent_id);
+        let agent_identity = self
+            .agent_snapshots
+            .iter()
+            .find(|agent| agent.id == agent_id)
+            .map(agent_brand_identity)
+            .unwrap_or_else(|| agent_id.to_string());
+        let muted_foreground = cx.theme().muted_foreground;
+        let separator = || {
+            div()
+                .flex_none()
+                .text_color(muted_foreground.opacity(0.72))
+                .child("·")
+        };
+        let tool_label = match locale {
+            locale::ResolvedLocale::En => format!("{tool_count} tool calls"),
+            locale::ResolvedLocale::ZhCn => format!("{tool_count} 次工具调用"),
+            locale::ResolvedLocale::ZhTw => format!("{tool_count} 次工具呼叫"),
+        };
+        let tokens_per_second = stats
+            .tokens_per_second
+            .map(|speed| format!("{speed:.1} t/s"));
+        Some(
+            h_flex()
+                .id("agent-generation-status")
+                .w_full()
+                .h(px(24.0))
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .gap(px(6.0))
+                .text_xs()
+                .text_color(muted_foreground)
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "agent-generation-logo:{}",
+                            turn.id
+                        )))
+                        .size(px(16.0))
+                        .flex_none()
+                        .child(runtime_agent_icon(&agent_identity))
+                        .tooltip(move |window, cx| {
+                            Tooltip::new(agent_label.clone()).build(window, cx)
+                        }),
+                )
+                .child(phase_label)
+                .child(separator())
+                .child(duration)
+                .when(tool_count > 0, |this| {
+                    this.child(separator()).child(tool_label)
+                })
+                .when_some(tokens_per_second, |this, speed| {
+                    this.child(separator()).child(speed)
+                })
+                .into_any_element(),
+        )
+    }
+
     fn selected_runtime_selection(&self) -> Option<SessionRuntimeSelection> {
         let session_id = self.selected_session_id.as_ref()?;
         self.optimistic_runtime_selections
@@ -9173,6 +9446,7 @@ impl VibexWorkbench {
         self.timeline_bottom_control_mounted = false;
         self.timeline_bottom_control_close_task = None;
         self.timeline_duration_tick_task = None;
+        self.agent_generation_stats = None;
         self.timeline_scrollbar_interaction_active = false;
         self.composer_terminals.clear();
         self.selected_composer_terminal_id = None;
@@ -34179,6 +34453,7 @@ impl VibexWorkbench {
         );
         let auto_continue_toggle_session_id = self.selected_session_id.clone();
         let session_running = agent_turn_is_active(self.agent_turn_pending, session_state);
+        let generation_status = self.render_agent_generation_status(session_running, cx);
         let runtime_projection = selected_runtime.as_ref().and_then(|selection| {
             self.runtime_catalog.as_ref().map(|catalog| {
                 (
@@ -34458,6 +34733,15 @@ impl VibexWorkbench {
                     })
                     .min_w_0()
                     .when(self.composer_expanded, |this| this.flex_1().min_h_0())
+                    .when_some(generation_status, |this, status| {
+                        this.child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .pb_2()
+                                .child(status),
+                        )
+                    })
                     .when_some(composer_collaboration, |this, collaboration| {
                         this.child(
                             div()
@@ -50494,6 +50778,114 @@ mod tests {
     }
 
     #[test]
+    fn agent_generation_status_projects_phase_tools_and_token_rate() {
+        let row = |id: &str, kind: TimelineRowKind, streaming: bool, body: &str| TimelineRow {
+            id: id.to_string(),
+            kind,
+            item_ids: vec![id.to_string()],
+            turn_id: Some("turn:generation".to_string()),
+            turn_item_count: 0,
+            turn_failed: false,
+            turn_pending_permission: false,
+            conclusion: kind == TimelineRowKind::AgentMessage,
+            first_sequence: 1,
+            last_sequence: 1,
+            title: String::new(),
+            body: body.to_string(),
+            streaming,
+            collapsible: false,
+            pending_permission: false,
+            failed: false,
+            runtime_attribution: None,
+            file_path: None,
+        };
+        let turn = |process_rows: Vec<TimelineRow>,
+                    conclusion_row: Option<TimelineRow>,
+                    live_status: Option<&str>,
+                    pending_permission: bool| TimelineConversationTurn {
+            id: "turn:generation".to_string(),
+            user_row: None,
+            process_rows,
+            process_activity_groups: Vec::new(),
+            process_activity_groups_with_commands: Vec::new(),
+            process_activity_groups_with_file_operations: Vec::new(),
+            process_activity_groups_with_commands_and_file_operations: Vec::new(),
+            live_status: live_status.map(str::to_string),
+            conclusion_row,
+            runtime_attribution: None,
+            complete: false,
+            failed: false,
+            pending_permission,
+            item_count: 0,
+            started_at_ms: 1_000,
+            ended_at_ms: None,
+        };
+
+        assert_eq!(
+            agent_generation_phase(&turn(
+                vec![row("tool", TimelineRowKind::ToolCall, true, "")],
+                None,
+                None,
+                false,
+            )),
+            AgentGenerationPhase::CallingTool
+        );
+        assert_eq!(
+            agent_generation_phase(&turn(
+                vec![],
+                Some(row("answer", TimelineRowKind::AgentMessage, true, "answer")),
+                None,
+                false,
+            )),
+            AgentGenerationPhase::Generating
+        );
+        assert_eq!(
+            agent_generation_phase(&turn(vec![], None, Some("thinking"), false)),
+            AgentGenerationPhase::Thinking
+        );
+        assert_eq!(
+            agent_generation_phase(&turn(vec![], None, None, true)),
+            AgentGenerationPhase::WaitingForApproval
+        );
+        assert_eq!(
+            agent_generation_phase(&turn(vec![], None, None, false)),
+            AgentGenerationPhase::Preparing
+        );
+
+        let activity_turn = turn(
+            vec![
+                row("tool", TimelineRowKind::ToolCall, false, ""),
+                row("command", TimelineRowKind::Command, false, ""),
+                row("reasoning", TimelineRowKind::Reasoning, true, ""),
+            ],
+            None,
+            None,
+            false,
+        );
+        assert_eq!(agent_generation_tool_call_count(&activity_turn), 2);
+
+        let output_turn = turn(
+            vec![row("answer", TimelineRowKind::AgentMessage, true, "hello")],
+            None,
+            None,
+            false,
+        );
+        assert_eq!(estimated_agent_output_tokens(&output_turn), Some(2));
+        assert_eq!(
+            agent_generation_output_tokens(&output_turn, Some(12), Some(10)),
+            Some(2)
+        );
+        assert_eq!(
+            agent_generation_token_rate(Some(10), Some(30), Duration::from_secs(2)),
+            Some(10.0)
+        );
+        assert_eq!(
+            agent_generation_token_rate(Some(30), Some(30), Duration::from_secs(2)),
+            None
+        );
+    }
+
+    #[test]
     fn timeline_bottom_follow_uses_the_latest_layout_extent() {
         let source = include_str!("app.rs");
         let method = source
@@ -51241,9 +51633,9 @@ mod tests {
             .find(".when_some(generation_status, |this, status|")
             .expect("the live generation status should remain attached to the composer");
         assert!(generation_status_position < plan_position);
-        assert!(composer.contains("agent-generation-status"));
-        assert!(composer.contains("when(tool_count > 0"));
-        assert!(composer.contains("when_some(tokens_per_second"));
+        assert!(source.contains("agent-generation-status"));
+        assert!(source.contains("when(tool_count > 0"));
+        assert!(source.contains("when_some(tokens_per_second"));
 
         let plan = source
             .split_once("    fn render_composer_plan(")
