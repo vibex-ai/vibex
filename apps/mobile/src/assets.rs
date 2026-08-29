@@ -14,6 +14,7 @@ const WQY_MICROHEI: &[u8] = include_bytes!("../assets/fonts/wqy-microhei/wqy-mic
 
 const ICONS: &[&str] = &[
     "brand/logo.svg",
+    "icons/vibex-mark.svg",
     "icons/menu.svg",
     "icons/plus.svg",
     "icons/circle-plus.svg",
@@ -122,6 +123,9 @@ impl AssetSource for MobileAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         let bytes: Option<&'static [u8]> = match path {
             "brand/logo.svg" => Some(include_bytes!("../assets/brand/logo.svg")),
+            "icons/vibex-mark.svg" => {
+                Some(include_bytes!("../../desktop/assets/icons/vibex-mark.svg"))
+            }
             "icons/menu.svg" => Some(include_bytes!("../assets/icons/menu.svg")),
             "icons/plus.svg" => Some(include_bytes!("../assets/icons/plus.svg")),
             "icons/circle-plus.svg" => Some(include_bytes!("../assets/icons/circle-plus.svg")),

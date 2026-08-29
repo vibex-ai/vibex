@@ -569,7 +569,7 @@ fn push_project_children(
             project_id,
             None,
             true,
-            true,
+            !detailed_hierarchy,
             &session_ids,
             &input.view.pinned_session_ids,
             parent_folder_id,
@@ -1180,6 +1180,55 @@ mod tests {
         assert_eq!(rows[1].child_count, 1);
         assert_eq!(rows[2].kind, SidebarRowKind::Session);
         assert_eq!(rows[2].depth, 2);
+    }
+
+    #[test]
+    fn detailed_rows_keep_workspace_folders_out_of_the_project_root() {
+        let mut view = SidebarOrganizationView {
+            hierarchy_mode: SidebarHierarchyMode::Detailed,
+            ..SidebarOrganizationView::default()
+        };
+        assert!(view.organization.create_folder_with_workspace(
+            "folder-archive",
+            "Auto archive",
+            Some("project_project".to_string()),
+            Some("workspace_project".to_string()),
+            None,
+        ));
+        let projects = vec![SidebarProject {
+            id: "project_project".to_string(),
+            label: "vibex".to_string(),
+        }];
+        let workspaces = vec![SidebarWorkspace {
+            id: "workspace_project".to_string(),
+            project_id: "project_project".to_string(),
+            label: "project".to_string(),
+            detail: "/tmp/project".to_string(),
+            branch: Some("main".to_string()),
+            mode: WorkspaceMode::CurrentCheckout,
+            collapsed: false,
+        }];
+        let sessions = vec![session("session-a", "project", "Hello")];
+        let rows = sidebar_rows(SidebarRowInput {
+            view: &view,
+            projects: &projects,
+            workspaces: &workspaces,
+            sessions: &sessions,
+            selected_session_id: None,
+            query: "",
+        });
+
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.kind, row.label.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (SidebarRowKind::Project, "vibex"),
+                (SidebarRowKind::Workspace, "main"),
+                (SidebarRowKind::Folder, "Auto archive"),
+                (SidebarRowKind::Session, "Hello"),
+            ]
+        );
     }
 
     #[test]

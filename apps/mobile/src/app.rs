@@ -7972,19 +7972,26 @@ impl MobileApp {
                             .min_w_0()
                             .flex()
                             .items_center()
+                            .gap(px(1.0))
+                            .text_size(px(17.0))
+                            .font_weight(FontWeight::SEMIBOLD)
                             .child(
                                 svg()
-                                    .path("brand/logo.svg")
-                                    .size(px(22.0))
+                                    .path("icons/vibex-mark.svg")
+                                    .size(px(20.0))
+                                    .mt(px(1.0))
+                                    .relative()
+                                    .top(px(-2.0))
                                     .flex_shrink_0()
                                     .text_color(theme::sidebar_text_primary()),
                             )
                             .child(
                                 div()
-                                    .text_size(px(17.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::sidebar_text_primary())
-                                    .child("ibex"),
+                                    .flex()
+                                    .children("ibex".chars().map(|character| {
+                                        div().flex_none().child(character.to_string())
+                                    }))
+                                    .text_color(theme::sidebar_text_primary()),
                             ),
                     )
                     .child(
