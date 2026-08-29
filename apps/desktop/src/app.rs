@@ -24830,7 +24830,7 @@ impl VibexWorkbench {
                 .xsmall()
                 .ghost()
                 .compact()
-                .h(px(28.0))
+                .h(px(34.0))
                 .px_1()
                 .flex_none()
                 .tooltip(locale::text(
@@ -52407,7 +52407,7 @@ mod tests {
         assert!(grouped_models.contains(".children(agent_back)"));
         assert!(grouped_models.contains("IconName::ArrowLeft"));
         assert!(grouped_models.contains(".compact()"));
-        assert!(grouped_models.contains(".h(px(28.0))"));
+        assert!(grouped_models.contains(".h(px(34.0))"));
         assert!(grouped_models.contains(".child(runtime_agent_icon("));
         assert!(grouped_models.contains(".text_color(cx.theme().foreground.opacity(0.84))"));
         assert!(grouped_models.contains(".track_scroll(&provider_scroll)"));
