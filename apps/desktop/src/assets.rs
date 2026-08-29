@@ -196,6 +196,13 @@ const VIBEX_ASSETS: &[(&str, &[u8])] = &[
         )),
     ),
     (
+        "icons/vibex/clock.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/clock.svg"
+        )),
+    ),
+    (
         "icons/vibex/boxes.svg",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),

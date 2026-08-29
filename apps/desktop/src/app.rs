@@ -29955,34 +29955,18 @@ impl VibexWorkbench {
                 }
             }
             if let Some(conclusion_row) = timeline_turn_conclusion_row(turn) {
-                let mut conclusion_extras = Vec::new();
-                if let Some(file_changes) = file_changes.take() {
-                    conclusion_extras.push(file_changes);
-                }
-                if let Some(answer_metadata) = self.render_agent_answer_metadata(
+                let content_before_actions = file_changes.take();
+                let answer_metadata = self.render_agent_answer_metadata(
                     turn,
                     conclusion_row,
                     execution_attribution.as_ref(),
                     cx,
-                ) {
-                    conclusion_extras.push(answer_metadata);
-                }
-                let content_before_actions = match conclusion_extras.len() {
-                    0 => None,
-                    1 => conclusion_extras.pop(),
-                    _ => Some(
-                        v_flex()
-                            .w_full()
-                            .min_w_0()
-                            .gap_2()
-                            .children(conclusion_extras)
-                            .into_any_element(),
-                    ),
-                };
+                );
                 response = response.child(self.render_timeline_row(
                     conclusion_row,
                     true,
                     content_before_actions,
+                    answer_metadata,
                     window,
                     cx,
                 ));
@@ -30585,7 +30569,8 @@ impl VibexWorkbench {
                             Tooltip::new(tooltip_label.clone()).build(window, cx)
                         }),
                 )
-                .child(div().min_w_0().flex_1().truncate().child(runtime_label))
+                .child(div().min_w_0().truncate().child(runtime_label))
+                .child(Icon::default().path("icons/vibex/clock.svg").size(px(14.0)))
                 .child(div().flex_none().child(duration))
                 .into_any_element(),
         )
@@ -30644,6 +30629,7 @@ impl VibexWorkbench {
                     &turn.process_rows[row_index],
                     false,
                     None,
+                    None,
                     window,
                     cx,
                 ));
@@ -30694,6 +30680,7 @@ impl VibexWorkbench {
         row: &TimelineRow,
         conversation_conclusion: bool,
         content_before_actions: Option<AnyElement>,
+        answer_metadata: Option<AnyElement>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -30701,6 +30688,7 @@ impl VibexWorkbench {
         // lines. Structured commands use cards only when the session preference
         // enables their enhanced display.
         let mut content_before_actions = content_before_actions;
+        let mut answer_metadata = answer_metadata;
         let element = match row.kind {
             TimelineRowKind::UserMessage => {
                 self.render_user_message_row(row, None, false, false, window, cx)
@@ -30709,6 +30697,7 @@ impl VibexWorkbench {
                 row,
                 conversation_conclusion,
                 content_before_actions.take(),
+                answer_metadata.take(),
                 cx,
             ),
             TimelineRowKind::Reasoning | TimelineRowKind::Plan => {
@@ -30998,9 +30987,7 @@ impl VibexWorkbench {
                     height += 30.0;
                 }
                 if conclusion && !row.streaming {
-                    // Answer metadata stays visible above the hover actions.
-                    height += 24.0;
-                    // action icon row
+                    // Answer metadata and hover actions share one footer row.
                     height += 32.0;
                 }
                 height
@@ -31588,6 +31575,7 @@ impl VibexWorkbench {
         row: &TimelineRow,
         conversation_conclusion: bool,
         content_before_actions: Option<AnyElement>,
+        answer_metadata: Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let search_query = self
@@ -31664,8 +31652,6 @@ impl VibexWorkbench {
                             .ml_1()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .opacity(0.0)
-                            .group_hover(hover_group.clone(), |style| style.opacity(1.0))
                             .child(format_timeline_hover_time(timestamp, locale))
                             .into_any_element()
                     }),
@@ -31674,6 +31660,7 @@ impl VibexWorkbench {
         } else {
             Vec::new()
         };
+        let show_answer_footer = answer_metadata.is_some() || show_answer_actions;
         v_flex()
             .id(row.id.clone())
             .w_full()
@@ -31689,13 +31676,29 @@ impl VibexWorkbench {
             .when_some(content_before_actions, |this, content| {
                 this.child(div().w_full().min_w_0().mt_2().child(content))
             })
-            .when(show_answer_actions, |this| {
+            .when(show_answer_footer, |this| {
                 this.child(
                     h_flex()
+                        .w_full()
+                        .min_w_0()
                         .items_center()
-                        .gap_1()
+                        .justify_between()
+                        .gap_2()
                         .mt_1()
-                        .children(answer_actions),
+                        .when_some(answer_metadata, |this, metadata| {
+                            this.child(div().min_w_0().flex_1().child(metadata))
+                        })
+                        .when(show_answer_actions, |this| {
+                            this.child(
+                                h_flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .gap_1()
+                                    .opacity(0.0)
+                                    .group_hover(hover_group.clone(), |style| style.opacity(1.0))
+                                    .children(answer_actions),
+                            )
+                        }),
                 )
             })
             .into_any_element()
@@ -55387,6 +55390,43 @@ mod tests {
         assert!(renderer.contains(".opacity(0.0)"));
         assert!(renderer.contains(".group_hover(runtime_hover_group, |style|"));
         assert!(renderer.contains("style.opacity(1.0)"));
+    }
+
+    #[test]
+    fn completed_agent_answers_keep_metadata_visible_and_actions_hover_only() {
+        let source = include_str!("app.rs");
+        let turn_renderer = source
+            .split_once("    fn render_timeline_turn(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn timeline_turn_execution_attribution("))
+            .map(|(body, _)| body)
+            .expect("timeline turn renderer should remain inspectable");
+        assert!(turn_renderer.contains("render_agent_answer_metadata("));
+        assert!(turn_renderer.contains("strings.agent_expand_process"));
+        assert!(turn_renderer.contains("strings.agent_collapse_process"));
+        assert!(!turn_renderer.contains("strings.agent_worked_for"));
+
+        let answer_renderer = source
+            .split_once("    fn render_agent_message_row(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_thought_process_row("))
+            .map(|(body, _)| body)
+            .expect("agent answer renderer should remain inspectable");
+        assert!(answer_renderer.contains("content_before_actions"));
+        assert!(answer_renderer.contains("answer_metadata"));
+        assert!(answer_renderer.contains(".justify_between()"));
+        assert!(answer_renderer.contains(".when_some(answer_metadata"));
+        assert!(answer_renderer.contains(".opacity(0.0)"));
+        assert!(answer_renderer.contains(".group_hover(hover_group.clone()"));
+
+        let metadata_renderer = source
+            .split_once("    fn render_agent_answer_metadata(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_timeline_process_rows("))
+            .map(|(body, _)| body)
+            .expect("answer metadata renderer should remain inspectable");
+        assert!(metadata_renderer.contains("runtime_agent_icon"));
+        assert!(metadata_renderer.contains("auth_source_label"));
+        assert!(metadata_renderer.contains("model_label"));
+        assert!(metadata_renderer.contains("format_compact_duration"));
+        assert!(metadata_renderer.contains("icons/vibex/clock.svg"));
     }
 
     #[gpui::test]
