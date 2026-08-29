@@ -3093,7 +3093,13 @@ impl AcpSessionAttachment {
                     let effective = option.current_value.clone();
                     match key.as_str() {
                         crate::session_config::CANONICAL_MODEL => {
-                            next.effective_model = effective.map(|value| value.value);
+                            // The option reports the Agent runtime model id.
+                            // Everything downstream — convergence, the durable
+                            // binding and the turn execution fence — compares
+                            // product ids, so project it here exactly like the
+                            // discovered model catalog above.
+                            next.effective_model =
+                                effective.map(|value| process.product_model_id(&value.value));
                         }
                         crate::session_config::CANONICAL_REASONING_EFFORT => {
                             next.effective_reasoning_effort = effective.map(|value| value.value);
@@ -28248,6 +28254,152 @@ for line in sys.stdin:
 
         let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
         client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    /// An Agent that re-advertises its own model inside a
+    /// `config_option_update` reports the runtime model id. Storing it as the
+    /// effective model without the product projection diverged the attachment
+    /// from its committed binding, so every later fenced turn failed with
+    /// `turn_execution_identity_mismatch` and the session could never recover.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn config_option_update_projects_reported_model_to_product_ids() {
+        const SECRET_ENV: &str = "VIBEX_TEST_CONFIG_OPTION_PROJECTION_KEY";
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "config-option-model-projection",
+            Some(AgentId::parse("hermes").unwrap()),
+        ) else {
+            return;
+        };
+        let service = fixture.service();
+        let mut config = service
+            .get_acp_profile_config(fixture.profile_id.clone())
+            .unwrap();
+        config.models = vec!["mock/model-1".to_string(), "mock/model-2".to_string()];
+        let conn = open_database(&fixture.db_path).unwrap();
+        persist_managed_runtime(&conn, "hermes", "hermes-acp", "0.19.0", &config);
+        vibex_db::ProviderSecretReferenceRepository::replace_for_profile(
+            &conn,
+            &fixture.profile_id,
+            &[vibex_core::ProviderSecretReference {
+                id: RequestId::new(),
+                provider_profile_id: fixture.profile_id.clone(),
+                secret_kind: vibex_core::ProviderSecretKind::ApiKey,
+                backend: ProviderSecretBackend::Environment,
+                setup_state: vibex_core::ProviderSecretSetupState::Available,
+                lookup_key: SECRET_ENV.to_string(),
+                display_label: "VIBEX_HERMES_API_KEY".to_string(),
+                redacted_hint: "test environment".to_string(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            }],
+        )
+        .unwrap();
+        drop(conn);
+        unsafe {
+            std::env::set_var(SECRET_ENV, "config-option-projection-secret");
+        }
+        service
+            .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                provider_profile_id: fixture.profile_id.clone(),
+                config,
+            })
+            .unwrap();
+        fixture.set_model_prefix("custom:");
+
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: Some("mock/model-1".to_string()),
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let attachment = client.current_attachment(&session_id).unwrap();
+        let generation = attachment.fence().activation_generation as i64;
+        let payload = attachment.payload();
+        assert_eq!(
+            payload.process().product_model_id("custom:mock/model-1"),
+            "mock/model-1",
+            "the fixture must exercise a runtime id that differs from the product id"
+        );
+        let committed = payload.runtime_config_state();
+        assert_eq!(committed.effective_model.as_deref(), Some("mock/model-1"));
+        assert!(committed.is_applied_to_generation(generation));
+
+        // The Agent re-advertises its whole configuration mid-session. The
+        // model option carries the runtime id and the update has no separate
+        // `models` block, exactly like ZCode's post-turn `config_option_update`.
+        payload.replace_config_options(&json!({
+            "configOptions": [
+                {
+                    "id": "model",
+                    "category": "model",
+                    "label": "Model",
+                    "type": "select",
+                    "currentValue": "custom:mock/model-1",
+                    "options": [
+                        { "value": "custom:mock/model-1", "label": "Model 1" },
+                        { "value": "custom:mock/model-2", "label": "Model 2" }
+                    ]
+                },
+                {
+                    "id": "mode",
+                    "category": "mode",
+                    "label": "Mode",
+                    "type": "select",
+                    "currentValue": "build",
+                    "options": [
+                        { "value": "build", "label": "Build" },
+                        { "value": "review", "label": "Review" }
+                    ]
+                },
+                {
+                    "id": "reasoning_effort",
+                    "label": "Reasoning effort",
+                    "type": "select",
+                    "currentValue": "medium",
+                    "options": [
+                        { "value": "low", "label": "Low" },
+                        { "value": "medium", "label": "Medium" },
+                        { "value": "high", "label": "High" }
+                    ]
+                },
+                {
+                    "id": "autoApply",
+                    "label": "Auto apply",
+                    "type": "boolean",
+                    "currentValue": true,
+                    "defaultValue": false
+                }
+            ]
+        }));
+
+        let updated = payload.runtime_config_state();
+        assert_eq!(
+            updated.effective_model.as_deref(),
+            Some("mock/model-1"),
+            "the reported runtime model id must be projected back to its product id"
+        );
+        assert_eq!(updated.preferred_model.as_deref(), Some("mock/model-1"));
+        assert!(
+            updated.is_applied_to_generation(generation),
+            "a re-advertised unchanged model must keep the attachment converged: {updated:#?}"
+        );
+        assert_eq!(
+            payload.state.lock().unwrap().current_model_id.as_deref(),
+            Some("mock/model-1")
+        );
+
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        client.close_session(&binding).await.unwrap();
+        unsafe {
+            std::env::remove_var(SECRET_ENV);
+        }
         fixture.cleanup();
     }
 

@@ -136,8 +136,9 @@ use vibex_ui::{
 };
 
 use crate::actions::{
-    NavigateBack, NavigateForward, OpenConversationFind, OpenSettings, RetryRuntime,
+    NavigateBack, NavigateForward, OpenConversationFind, OpenSettings, RedoImageEdit, RetryRuntime,
     SaveActiveFile, ToggleComposerMode, TogglePreview, ToggleRightRail, ToggleSidebar,
+    UndoImageEdit,
 };
 use crate::assets::{agent_brand_icon, agent_brand_logo, model_brand_icon, window_icon};
 use crate::code_workbench::{
@@ -12807,6 +12808,45 @@ impl VibexWorkbench {
         }
     }
 
+    /// The undo/redo chords stay shared with the text input, so the image editor only claims them
+    /// while the overlay is in editing mode and its caption field does not hold focus.
+    fn attachment_edit_shortcuts_active(&self, window: &Window, cx: &App) -> bool {
+        self.attachment_image_preview
+            .as_ref()
+            .is_some_and(|preview| preview.editing)
+            && !self
+                .image_editor_text_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+    }
+
+    fn on_undo_image_edit(
+        &mut self,
+        _: &UndoImageEdit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.attachment_edit_shortcuts_active(window, cx) {
+            cx.propagate();
+            return;
+        }
+        self.undo_attachment_edit(cx);
+    }
+
+    fn on_redo_image_edit(
+        &mut self,
+        _: &RedoImageEdit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.attachment_edit_shortcuts_active(window, cx) {
+            cx.propagate();
+            return;
+        }
+        self.redo_attachment_edit(cx);
+    }
+
     fn select_attachment_edit_tool(&mut self, tool: ImageEditTool, cx: &mut Context<Self>) {
         let Some(preview) = self.attachment_image_preview.as_mut() else {
             return;
@@ -20092,15 +20132,18 @@ impl VibexWorkbench {
         let session = self.ui_state.session.clone();
         let terminal_preferences = self.ui_state.terminal_preferences.clone();
         let network_proxy = self.ui_state.network_proxy.clone();
-        self.settings_view.update(cx, |settings, cx| {
-            settings.sync_controls(
-                &appearance,
-                &session,
-                &terminal_preferences,
-                &network_proxy,
-                window,
-                cx,
-            )
+        let settings_view = self.settings_view.clone();
+        window.defer(cx, move |window, cx| {
+            settings_view.update(cx, |settings, cx| {
+                settings.sync_controls(
+                    &appearance,
+                    &session,
+                    &terminal_preferences,
+                    &network_proxy,
+                    window,
+                    cx,
+                )
+            });
         });
         self.rebuild_timeline_sizes();
         if self.ui_state.desktop_behavior.show_update_prompts {
@@ -40699,7 +40742,20 @@ const FOUNDATION_SHORTCUTS: &[(&str, &str)] = &[
     ("save_active_file", "cmd-s"),
     ("navigate_back", "alt-left"),
     ("navigate_forward", "alt-right"),
+    ("undo_image_edit", UNDO_IMAGE_EDIT_SHORTCUT),
+    ("redo_image_edit", REDO_IMAGE_EDIT_SHORTCUT),
 ];
+
+// The image editor mirrors the text-input undo/redo chords so muscle memory carries over, and the
+// text input itself binds `cmd-z` on macOS while every other platform binds `ctrl-z`.
+#[cfg(target_os = "macos")]
+const UNDO_IMAGE_EDIT_SHORTCUT: &str = "cmd-z";
+#[cfg(not(target_os = "macos"))]
+const UNDO_IMAGE_EDIT_SHORTCUT: &str = "ctrl-z";
+#[cfg(target_os = "macos")]
+const REDO_IMAGE_EDIT_SHORTCUT: &str = "cmd-shift-z";
+#[cfg(not(target_os = "macos"))]
+const REDO_IMAGE_EDIT_SHORTCUT: &str = "ctrl-shift-z";
 
 fn shortcut_action_label(action: &str) -> &'static str {
     match action {
@@ -40717,6 +40773,8 @@ fn shortcut_action_label(action: &str) -> &'static str {
         "save_active_file" => "Save active file",
         "navigate_back" => "Navigate back",
         "navigate_forward" => "Navigate forward",
+        "undo_image_edit" => locale::text("Undo image edit", "撤销图片编辑", "復原圖片編輯"),
+        "redo_image_edit" => locale::text("Redo image edit", "重做图片编辑", "重做圖片編輯"),
         _ => "Shortcut",
     }
 }
@@ -40729,6 +40787,9 @@ fn shortcut_action_group(action: &str) -> &'static str {
         "retry_runtime" => "Runtime",
         "save_active_file" => "Editor",
         "navigate_back" | "navigate_forward" => "Navigation",
+        "undo_image_edit" | "redo_image_edit" => {
+            locale::text("Image editor", "图片编辑器", "圖片編輯器")
+        }
         _ => "Vibex",
     }
 }
@@ -44850,6 +44911,8 @@ impl Render for VibexWorkbench {
             .on_action(cx.listener(Self::on_save_active_file))
             .on_action(cx.listener(Self::on_navigate_back))
             .on_action(cx.listener(Self::on_navigate_forward))
+            .on_action(cx.listener(Self::on_undo_image_edit))
+            .on_action(cx.listener(Self::on_redo_image_edit))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 let modifiers = event.keystroke.modifiers;
                 if event.keystroke.key.eq_ignore_ascii_case("f")
@@ -45001,6 +45064,8 @@ fn bind_action(bindings: &mut Vec<KeyBinding>, keystroke: &str, action: &str, un
         "navigate_forward" | "vibex::NavigateForward" => {
             push!(NavigateForward, "vibex::NavigateForward")
         }
+        "undo_image_edit" | "vibex::UndoImageEdit" => push!(UndoImageEdit, "vibex::UndoImageEdit"),
+        "redo_image_edit" | "vibex::RedoImageEdit" => push!(RedoImageEdit, "vibex::RedoImageEdit"),
         _ => {}
     }
 }
@@ -45017,6 +45082,8 @@ fn action_name(action: &str) -> &'static str {
         "save_active_file" => "vibex::SaveActiveFile",
         "navigate_back" => "vibex::NavigateBack",
         "navigate_forward" => "vibex::NavigateForward",
+        "undo_image_edit" => "vibex::UndoImageEdit",
+        "redo_image_edit" => "vibex::RedoImageEdit",
         _ => "vibex::NoAction",
     }
 }
@@ -53036,6 +53103,56 @@ mod tests {
         assert!(editor.contains("redo-attachment-edit"));
         assert!(editor.contains("cancel-attachment-edit"));
         assert!(editor.contains("finish-attachment-edit"));
+    }
+
+    #[test]
+    fn image_edit_shortcuts_bind_undo_and_redo_without_stealing_text_input_chords() {
+        assert!(shortcut_is_valid(UNDO_IMAGE_EDIT_SHORTCUT));
+        assert!(shortcut_is_valid(REDO_IMAGE_EDIT_SHORTCUT));
+
+        let mut keystrokes: Vec<&str> = FOUNDATION_SHORTCUTS.iter().map(|(_, key)| *key).collect();
+        let total = keystrokes.len();
+        keystrokes.sort_unstable();
+        keystrokes.dedup();
+        assert_eq!(
+            keystrokes.len(),
+            total,
+            "foundation shortcut defaults must stay conflict free"
+        );
+
+        for action in ["undo_image_edit", "redo_image_edit"] {
+            assert!(
+                FOUNDATION_SHORTCUTS.iter().any(|(name, _)| *name == action),
+                "{action} must be remappable from the shortcuts settings page"
+            );
+            assert_ne!(action_name(action), "vibex::NoAction");
+            assert_ne!(shortcut_action_label(action), "Shortcut");
+            assert_ne!(shortcut_action_group(action), "Vibex");
+            let mut bindings = Vec::new();
+            bind_action(&mut bindings, "ctrl-z", action, false);
+            assert_eq!(bindings.len(), 1, "{action} must resolve to a key binding");
+        }
+
+        let source = include_str!("app.rs");
+        let workbench = source
+            .split_once(".id(\"vibex-foundation\")")
+            .and_then(|(_, tail)| tail.split_once(".capture_key_down("))
+            .map(|(body, _)| body)
+            .expect("workbench action handlers should remain inspectable");
+        assert!(workbench.contains(".on_action(cx.listener(Self::on_undo_image_edit))"));
+        assert!(workbench.contains(".on_action(cx.listener(Self::on_redo_image_edit))"));
+
+        let handlers = source
+            .split_once("    fn attachment_edit_shortcuts_active(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn select_attachment_edit_tool("))
+            .map(|(body, _)| body)
+            .expect("image edit shortcut handlers should remain inspectable");
+        assert!(handlers.contains("is_focused(window)"));
+        assert_eq!(
+            handlers.matches("cx.propagate();").count(),
+            2,
+            "undo and redo must both fall through when the image editor is not active"
+        );
     }
 
     #[test]

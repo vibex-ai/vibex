@@ -376,9 +376,8 @@ fn accumulated_streaming_reasoning(items: &[&TimelineItem]) -> Option<String> {
         .collect::<String>()
         .trim()
         .to_string();
-    (!accumulated.is_empty()).then(|| {
-        tail_chars(&accumulated, LIVE_REASONING_STATUS_MAX_CHARS).to_string()
-    })
+    (!accumulated.is_empty())
+        .then(|| tail_chars(&accumulated, LIVE_REASONING_STATUS_MAX_CHARS).to_string())
 }
 
 /// Upper bound for the accumulated streaming reasoning kept in `live_status`.
@@ -1988,10 +1987,7 @@ mod tests {
         ];
 
         let turns = timeline_conversation_turns(&items, Some(AgentSessionState::Running), false);
-        assert_eq!(
-            turns[0].live_status.as_deref(),
-            Some("Fresh segment")
-        );
+        assert_eq!(turns[0].live_status.as_deref(), Some("Fresh segment"));
     }
 
     #[test]

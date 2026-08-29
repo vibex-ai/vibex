@@ -2458,8 +2458,7 @@ fn overlay_model_group<'a>(
         return models;
     };
     let selected_kind = kind_of(selected);
-    models
-        .retain(|model| model.id == selected.id || kind_of(model) == selected_kind);
+    models.retain(|model| model.id == selected.id || kind_of(model) == selected_kind);
     models.sort_by_key(|model| model.id != selected.id);
     models
 }
@@ -2652,8 +2651,9 @@ fn factory_droid_overlay(
         .as_deref()
         .unwrap_or_else(|| provider.id.as_str());
     let selected_custom_id = sanitize_provider_id(&format!("vibex-{}-{model_id}", vendor));
-    let group =
-        overlay_model_group(binding, model, |model| factory_droid_provider_kind(Some(model)));
+    let group = overlay_model_group(binding, model, |model| {
+        factory_droid_provider_kind(Some(model))
+    });
     let mut custom_models = Vec::with_capacity(group.len().max(1));
     if group.is_empty() {
         custom_models.push(factory_droid_custom_model(
@@ -2976,9 +2976,7 @@ fn kimi_overlay(
     secret_env_key: &str,
 ) -> VibexResult<String> {
     let model_id = projection_model_id(model).unwrap_or("vibex-model");
-    let provider_type = model
-        .map(kimi_provider_type)
-        .unwrap_or("openai_legacy");
+    let provider_type = model.map(kimi_provider_type).unwrap_or("openai_legacy");
     let endpoint = endpoint
         .map(|endpoint| endpoint.url.as_str())
         .unwrap_or_default();
@@ -3060,8 +3058,7 @@ fn mistral_vibe_overlay(
         serde_json::json!(mistral_vibe_api_style(model)),
     );
     provider_config.insert("backend".to_string(), serde_json::json!("generic"));
-    let group =
-        overlay_model_group(binding, model, |model| mistral_vibe_api_style(Some(model)));
+    let group = overlay_model_group(binding, model, |model| mistral_vibe_api_style(Some(model)));
     let mut models = Vec::with_capacity(group.len().max(1));
     if group.is_empty() {
         models.push(mistral_vibe_model_entry(&provider_id, model_id));
@@ -3138,8 +3135,7 @@ fn deepseek_harness_overlay(
             .as_deref()
             .unwrap_or_else(|| provider.id.as_str()),
     );
-    let group =
-        overlay_model_group(binding, model, |model| deepseek_harness_api(Some(model)));
+    let group = overlay_model_group(binding, model, |model| deepseek_harness_api(Some(model)));
     let model_entries: Vec<serde_json::Value> = if group.is_empty() {
         vec![deepseek_harness_model_entry(provider, model, model_id)]
     } else {
@@ -3167,7 +3163,10 @@ fn deepseek_harness_overlay(
         "baseURL",
         endpoint.map(|endpoint| endpoint.url.as_str()),
     );
-    route.insert("models".to_string(), serde_json::Value::Array(model_entries));
+    route.insert(
+        "models".to_string(),
+        serde_json::Value::Array(model_entries),
+    );
 
     serialized_yaml(serde_json::json!({
         "llm-pi-ai": {

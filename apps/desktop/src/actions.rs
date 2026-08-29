@@ -39,3 +39,11 @@ pub struct NavigateBack;
 #[derive(Action, Clone, PartialEq)]
 #[action(namespace = vibex, no_json)]
 pub struct NavigateForward;
+
+#[derive(Action, Clone, PartialEq)]
+#[action(namespace = vibex, no_json)]
+pub struct UndoImageEdit;
+
+#[derive(Action, Clone, PartialEq)]
+#[action(namespace = vibex, no_json)]
+pub struct RedoImageEdit;
