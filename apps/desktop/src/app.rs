@@ -22991,7 +22991,7 @@ impl VibexWorkbench {
                         .top_1()
                         .h(px(24.0))
                         .items_center()
-                        .gap(px(SIDEBAR_SESSION_CONTENT_GAP))
+                        .gap(px(2.0))
                         .invisible()
                         .group_hover(&hover_group, |style| style.visible())
                         .on_click(|_, _, cx| cx.stop_propagation())
@@ -23203,7 +23203,7 @@ impl VibexWorkbench {
                     v_flex()
                         .w_full()
                         .min_w_0()
-                        .gap(px(2.0))
+                        .gap(px(SIDEBAR_SESSION_CONTENT_GAP))
                         .when(!detailed_hierarchy, |this| {
                             this.pl(px(SIDEBAR_SESSION_VIEW_INDENT))
                         })
@@ -50097,6 +50097,14 @@ mod tests {
             .map(|(body, _)| body)
             .expect("project renderer should remain inspectable");
         assert!(project.contains(".gap(px(SIDEBAR_PROJECT_CONTENT_GAP))"));
+        assert!(project.contains(".gap(px(SIDEBAR_SESSION_CONTENT_GAP))"));
+
+        let workspace = source
+            .split_once("    fn render_sidebar_workspace(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_session("))
+            .map(|(body, _)| body)
+            .expect("workspace renderer should remain inspectable");
+        assert!(workspace.contains(".gap(px(SIDEBAR_SESSION_CONTENT_GAP))"));
 
         let folder = source
             .split_once("    fn render_sidebar_folder(")
