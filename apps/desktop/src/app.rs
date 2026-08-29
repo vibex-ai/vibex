@@ -31999,6 +31999,7 @@ impl VibexWorkbench {
     ) -> AnyElement {
         let tooltip = self.strings().agent_collapse_process;
         let toggle_id = row_id.clone();
+        let connector_color = cx.theme().muted_foreground.opacity(0.46);
         let mut text = v_flex().min_w_0().flex_1().child(
             h_flex()
                 .min_w_0()
@@ -32031,14 +32032,7 @@ impl VibexWorkbench {
                             .size(px(14.0))
                             .text_color(cx.theme().muted_foreground),
                     )
-                    .child(
-                        div()
-                            .mt(px(2.0))
-                            .w(px(1.0))
-                            .flex_1()
-                            .border_l_1()
-                            .border_color(cx.theme().border.opacity(0.78)),
-                    ),
+                    .child(div().mt(px(2.0)).w(px(1.0)).flex_1().bg(connector_color)),
             )
             .child(text)
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -48018,6 +48012,12 @@ mod tests {
         measured_width: Rc<Cell<f32>>,
     }
 
+    struct ReasoningConnectorLayoutProbe {
+        connector_top: Rc<Cell<f32>>,
+        connector_bottom: Rc<Cell<f32>>,
+        content_bottom: Rc<Cell<f32>>,
+    }
+
     impl Render for ReasoningFirstLineLayoutProbe {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let measured_width = self.measured_width.clone();
@@ -48038,6 +48038,46 @@ mod tests {
                         .max_w_full()
                         .flex_shrink(1.0)
                         .whitespace_normal(),
+                    ),
+            )
+        }
+    }
+
+    impl Render for ReasoningConnectorLayoutProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let connector_top = self.connector_top.clone();
+            let connector_bottom = self.connector_bottom.clone();
+            let content_bottom = self.content_bottom.clone();
+            div().w(px(640.0)).h(px(110.0)).child(
+                h_flex()
+                    .w_full()
+                    .h_full()
+                    .items_stretch()
+                    .child(
+                        v_flex()
+                            .w(px(16.0))
+                            .flex_none()
+                            .items_center()
+                            .child(div().w(px(14.0)).h(px(14.0)))
+                            .child(
+                                div()
+                                    .mt(px(2.0))
+                                    .w(px(1.0))
+                                    .flex_1()
+                                    .bg(rgb(0xff_ffff))
+                                    .on_prepaint(move |bounds, _, _| {
+                                        connector_top.set(f32::from(bounds.origin.y));
+                                        connector_bottom.set(f32::from(bounds.bottom()));
+                                    }),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .child(div().w_full().h_full().on_prepaint(move |bounds, _, _| {
+                                content_bottom.set(f32::from(bounds.bottom()));
+                            })),
                     ),
             )
         }
@@ -56209,6 +56249,39 @@ mod tests {
             observed_width.get() < 640.0,
             "intrinsic reasoning line width: {}",
             observed_width.get()
+        );
+    }
+
+    #[gpui::test]
+    fn reasoning_connector_reaches_the_expanded_row_bottom(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let connector_top = Rc::new(Cell::new(0.0));
+        let connector_bottom = Rc::new(Cell::new(0.0));
+        let content_bottom = Rc::new(Cell::new(0.0));
+        let observed_connector_top = connector_top.clone();
+        let observed_connector_bottom = connector_bottom.clone();
+        let observed_content_bottom = content_bottom.clone();
+        let (_, cx) = cx.add_window_view(|_, _| ReasoningConnectorLayoutProbe {
+            connector_top,
+            connector_bottom,
+            content_bottom,
+        });
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        assert!(
+            observed_connector_bottom.get() - observed_connector_top.get() > 80.0,
+            "reasoning connector height: {}",
+            observed_connector_bottom.get() - observed_connector_top.get()
+        );
+        assert!(
+            (observed_connector_bottom.get() - observed_content_bottom.get()).abs() <= 1.0,
+            "connector bottom: {}, content bottom: {}",
+            observed_connector_bottom.get(),
+            observed_content_bottom.get()
         );
     }
 
