@@ -5385,8 +5385,10 @@ impl VibexWorkbench {
                 let _ = entity.update(cx, |this, cx| {
                     this.update_action_task = None;
                     if let Err(error) = outcome {
-                        this.persistence_note =
-                            Some(format!("Update install task stopped unexpectedly: {error}"));
+                        this.set_settings_operation_note(
+                            Some(format!("Update install task stopped unexpectedly: {error}")),
+                            cx,
+                        );
                     }
                     cx.notify();
                 });
@@ -5401,7 +5403,10 @@ impl VibexWorkbench {
         match runtime.app_update().restart() {
             Ok(()) => cx.quit(),
             Err(error) => {
-                self.persistence_note = Some(format!("{}: {}", error.code, error.message));
+                self.set_settings_operation_note(
+                    Some(format!("{}: {}", error.code, error.message)),
+                    cx,
+                );
                 cx.notify();
             }
         }
@@ -19919,9 +19924,14 @@ impl VibexWorkbench {
     }
 
     fn set_settings_operation_note(&mut self, note: Option<String>, cx: &mut Context<Self>) {
-        self.settings_view.update(cx, |settings, cx| {
-            settings.operation_note = note;
-            cx.notify();
+        // Settings callbacks can be running inside FoundationSettings::update. Defer the
+        // sibling entity update until the current GPUI update finishes to avoid re-entrancy.
+        let settings_view = self.settings_view.clone();
+        cx.defer(move |cx| {
+            settings_view.update(cx, |settings, cx| {
+                settings.operation_note = note;
+                cx.notify();
+            });
         });
     }
 
@@ -20038,7 +20048,7 @@ impl VibexWorkbench {
             match vibex_desktop_runtime::network_proxy::configure(&snapshot.network_proxy) {
                 Ok(settings) => settings,
                 Err(error) => {
-                    self.persistence_note = Some(locale::localize_ui_message(&error));
+                    self.set_settings_operation_note(Some(locale::localize_ui_message(&error)), cx);
                     NetworkProxyUiState::default()
                 }
             };
@@ -41567,6 +41577,7 @@ struct FoundationSettings {
     settings_render_context: SettingsRenderContext,
     storage_usage_state: SettingsStorageUsageState,
     storage_usage_task: Option<Task<()>>,
+    operation_note: Option<String>,
     active_section: SettingsSection,
 }
 
@@ -44473,6 +44484,22 @@ impl Render for FoundationSettings {
             .relative()
             .w_full()
             .min_w_0()
+            .when_some(self.operation_note.clone(), |this, note| {
+                this.child(
+                    div()
+                        .mb_4()
+                        .px_3()
+                        .py_2()
+                        .rounded(px(6.0))
+                        .bg(theme::semantic_color("warning", cx.theme().is_dark()).opacity(0.12))
+                        .text_xs()
+                        .text_color(theme::semantic_color(
+                            "warning-foreground",
+                            cx.theme().is_dark(),
+                        ))
+                        .child(locale::localize_ui_message(&note)),
+                )
+            })
             .child(page)
             .when(has_changes, |this| {
                 this.child(
