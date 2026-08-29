@@ -3130,18 +3130,6 @@ fn timeline_turn_process_expanded(
     explicit_expansion.unwrap_or(!turn.complete && timeline_turn_conclusion_row(turn).is_none())
 }
 
-fn timeline_expansion_state(
-    expansions: &mut BTreeMap<String, bool>,
-    row_id: &str,
-    default_expanded: bool,
-) -> bool {
-    // A live tool changes status several times; its first layout must not
-    // implicitly change expansion later and invalidate the virtual row height.
-    *expansions
-        .entry(row_id.to_string())
-        .or_insert(default_expanded)
-}
-
 fn timeline_turn_conclusion_row(turn: &TimelineConversationTurn) -> Option<&TimelineRow> {
     turn.conclusion_row
         .as_ref()
@@ -10271,7 +10259,6 @@ impl VibexWorkbench {
         if self.timeline_row_sizes.len() != turns.len() {
             return self.rebuild_timeline_sizes();
         }
-        self.seed_timeline_tool_expansions(&turn);
         self.timeline_measured_turn_heights.remove(&turn.id);
         let process_expansion = self.timeline_process_expansion.get(&turn.id).copied();
         let signature = self.timeline_turn_estimate_signature(&turn, process_expansion);
@@ -10392,7 +10379,6 @@ impl VibexWorkbench {
     /// Height estimation walks every row body, so the result is memoized per
     /// turn and only recomputed when the turn's content or expansion changes.
     fn estimated_timeline_turn_height_cached(&mut self, turn: &TimelineConversationTurn) -> f32 {
-        self.seed_timeline_tool_expansions(turn);
         let process_expansion = self.timeline_process_expansion.get(&turn.id).copied();
         let signature = self.timeline_turn_estimate_signature(turn, process_expansion);
         if let Some((cached_signature, height)) = self.timeline_estimated_turn_heights.get(&turn.id)
@@ -10488,56 +10474,6 @@ impl VibexWorkbench {
                 .hash(&mut hasher);
         }
         hasher.finish()
-    }
-
-    fn seed_timeline_tool_expansions(&mut self, turn: &TimelineConversationTurn) {
-        let rows = turn
-            .user_row
-            .iter()
-            .chain(turn.process_rows.iter())
-            .chain(turn.conclusion_row.iter())
-            .filter(|row| {
-                matches!(
-                    row.kind,
-                    TimelineRowKind::Command | TimelineRowKind::ImageGeneration
-                )
-            })
-            .map(|row| {
-                let default_expanded = match row.kind {
-                    TimelineRowKind::Command => self
-                        .timeline_row_latest_item(row)
-                        .and_then(|item| match &item.payload {
-                            vibex_core::TimelinePayload::Command(command) => {
-                                Some(command.status == vibex_core::CommandStatus::Started)
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or(false),
-                    TimelineRowKind::ImageGeneration => self
-                        .timeline_row_latest_item(row)
-                        .and_then(|item| match &item.payload {
-                            vibex_core::TimelinePayload::ImageGeneration(image) => Some(
-                                matches!(
-                                    image.status,
-                                    vibex_core::ToolCallStatus::Started
-                                        | vibex_core::ToolCallStatus::Progress
-                                ) || image.image_reference.is_some(),
-                            ),
-                            _ => None,
-                        })
-                        .unwrap_or(false),
-                    _ => false,
-                };
-                (row.id.clone(), default_expanded)
-            })
-            .collect::<Vec<_>>();
-        for (row_id, default_expanded) in rows {
-            timeline_expansion_state(
-                &mut self.timeline_command_expansion,
-                &row_id,
-                default_expanded,
-            );
-        }
     }
 
     fn record_timeline_turn_height(
@@ -29807,7 +29743,6 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let strings = self.strings();
-        self.seed_timeline_tool_expansions(turn);
         let runtime_hover_group: SharedString = format!("timeline-runtime-{}", turn.id).into();
         let execution_attribution = self.timeline_turn_execution_attribution(turn);
         let runtime_attribution = if let Some(attribution) = execution_attribution.as_ref() {
@@ -46995,29 +46930,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_card_expansion_does_not_change_when_status_updates() {
-        let mut expansions = BTreeMap::new();
-
-        assert!(timeline_expansion_state(&mut expansions, "command:1", true));
-        assert!(timeline_expansion_state(
-            &mut expansions,
-            "command:1",
-            false
-        ));
-
-        assert!(!timeline_expansion_state(
-            &mut expansions,
-            "command:2",
-            false
-        ));
-        assert!(!timeline_expansion_state(
-            &mut expansions,
-            "command:2",
-            true
-        ));
-    }
-
-    #[test]
     fn agent_progress_labels_have_one_ascii_ellipsis() {
         assert_eq!(
             agent_progress_label("Planning targeted guide extraction", "Thinking..."),
@@ -51106,6 +51018,16 @@ mod tests {
         assert!(command_card.contains("agent_waiting_confirmation"));
         assert!(command_card.contains("!waiting_for_confirmation"));
         assert!(command_card.contains("render_permission_request_panel"));
+        assert!(command_card.contains(".unwrap_or(false)"));
+        assert!(!command_card.contains(".unwrap_or(command.status"));
+
+        let image_card = source
+            .split_once("    fn render_image_generation_card(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_error_row("))
+            .map(|(body, _)| body)
+            .expect("image renderer should remain inspectable");
+        assert!(image_card.contains(".unwrap_or(false)"));
+        assert!(!image_card.contains(".unwrap_or(in_progress || image.image_reference.is_some())"));
 
         let turn = source
             .split_once("    fn render_timeline_turn(")
