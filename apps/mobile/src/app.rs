@@ -52,7 +52,7 @@ use crate::pairing::{MobileCredentialBundle, claim_pairing_link, claim_zero_conf
 use crate::sidebar::{
     SidebarCard, SidebarCardEdge, SidebarDropPosition, SidebarDropTarget, SidebarProject,
     SidebarRow, SidebarRowInput, SidebarRowKind, SidebarWorkspace, ancestors_of, drop_target,
-    folder_guides, press_is_on_grip, row_at_position, sidebar_rows, workspace_cards,
+    folder_guides, press_is_on_trailing_actions, row_at_position, sidebar_rows, workspace_cards,
 };
 use crate::storage::CredentialStorage;
 use crate::workbench::{MobileWorkbench, WorkbenchSurface};
@@ -160,15 +160,19 @@ enum SidebarNamePrompt {
     },
 }
 
-/// A row being moved with the finger. Android reports a touch pan as a scroll
-/// anchored at the press point, so a drag is a pan that started on a row's grip
-/// column instead of its body.
+/// A row being moved with the finger after the long-press delay has elapsed.
 #[derive(Debug, Clone, PartialEq)]
 struct SidebarDrag {
     index: usize,
     row: SidebarRow,
-    pointer_y: f32,
     target: Option<SidebarDropTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SidebarDragCandidate {
+    index: usize,
+    row: SidebarRow,
+    motion: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,7 +354,7 @@ pub struct MobileApp {
     sidebar_selected_workspace_id: Option<String>,
     sidebar_sync_busy: bool,
     sidebar_drag: Option<SidebarDrag>,
-    sidebar_drag_candidate: Option<(usize, SidebarRow)>,
+    sidebar_drag_candidate: Option<SidebarDragCandidate>,
     sidebar_drag_long_press: Option<Task<()>>,
     sidebar_batch_mode: bool,
     /// Top edge and right edge of the row list in window space, recorded during
@@ -2577,12 +2581,11 @@ impl MobileApp {
         cx.notify();
     }
 
-    /// Non-workspace rows begin moving from the trailing grip column. A
-    /// Worktree deliberately has no grip, so it arms a long-press move on the
-    /// row body instead.
-    fn begin_sidebar_drag(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) -> bool {
-        if self.sidebar_search_open {
-            return false;
+    /// Arms a long-press move for the row body. Trailing buttons remain normal
+    /// tap targets and never start a drag underneath themselves.
+    fn begin_sidebar_drag(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        if self.sidebar_search_open || self.sidebar_batch_mode {
+            return;
         }
         let (list_top, list_right) = self.sidebar_list_frame.get();
         let rows = self.mobile_sidebar_rows(self.sidebar_search_input.read(cx).text());
@@ -2594,11 +2597,11 @@ impl MobileApp {
             theme::SIDEBAR_ROW_HEIGHT,
         );
         if position < 0.0 {
-            return false;
+            return;
         }
         let index = position.floor() as usize;
         let Some(row) = rows.get(index).cloned() else {
-            return false;
+            return;
         };
         let can_organize = self.backend.as_ref().is_some_and(|backend| {
             backend
@@ -2607,67 +2610,48 @@ impl MobileApp {
                 .supports(BackendOperation::AgentSidebarOrganizationMutate)
         });
         if !can_organize {
-            return false;
+            return;
         }
-        if row.kind != SidebarRowKind::Workspace
-            && !press_is_on_grip(
-                f32::from(event.position.x),
-                list_right,
-                theme::SIDEBAR_GRIP_WIDTH,
-            )
-        {
-            return false;
+        if press_is_on_trailing_actions(
+            f32::from(event.position.x),
+            list_right,
+            self.sidebar_drag_action_width(&row),
+        ) {
+            return;
         }
-        if row.kind == SidebarRowKind::Workspace
-            && press_is_on_grip(
-                f32::from(event.position.x),
-                list_right,
-                theme::SIDEBAR_GRIP_WIDTH,
-            )
-        {
-            // The workspace menu occupies this edge. It is not a drag
-            // affordance, and holding it must not start a move underneath.
-            return false;
-        }
-        if row.kind != SidebarRowKind::Workspace {
-            self.sidebar_drag = Some(SidebarDrag {
-                index,
-                row,
-                pointer_y: f32::from(event.position.y),
-                target: None,
-            });
-            cx.notify();
-            return true;
-        }
-        self.sidebar_drag_candidate = Some((index, row));
+        self.sidebar_drag_candidate = Some(SidebarDragCandidate {
+            index,
+            row,
+            motion: 0.0,
+        });
         let entity = cx.weak_entity();
         self.sidebar_drag_long_press = Some(cx.spawn(async move |_, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(380))
                 .await;
             let _ = entity.update(cx, |this, cx| {
-                if let Some((candidate_index, candidate_row)) = this.sidebar_drag_candidate.take() {
+                if let Some(candidate) = this.sidebar_drag_candidate.take() {
                     this.sidebar_drag = Some(SidebarDrag {
-                        index: candidate_index,
-                        row: candidate_row,
-                        pointer_y: 0.0,
+                        index: candidate.index,
+                        row: candidate.row,
                         target: None,
                     });
                     cx.notify();
                 }
             });
         }));
-        false
     }
 
     fn advance_sidebar_drag(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
         let Some(drag) = self.sidebar_drag.as_ref() else {
-            if self.sidebar_drag_candidate.is_some()
+            if let Some(candidate) = self.sidebar_drag_candidate.as_mut()
                 && let ScrollDelta::Pixels(delta) = event.delta
-                && (f32::from(delta.x).abs() + f32::from(delta.y).abs()) > 10.0
             {
-                self.sidebar_drag_candidate = None;
-                self.sidebar_drag_long_press = None;
+                candidate.motion += f32::from(delta.x).hypot(f32::from(delta.y));
+                if candidate.motion > 10.0 {
+                    self.sidebar_drag_candidate = None;
+                    self.sidebar_drag_long_press = None;
+                }
             }
             return;
         };
@@ -2702,7 +2686,6 @@ impl MobileApp {
             target = None;
         }
         if let Some(drag) = self.sidebar_drag.as_mut() {
-            drag.pointer_y = pointer_y;
             drag.target = target;
         }
         cx.notify();
@@ -4055,9 +4038,8 @@ impl MobileApp {
         self.start_drawer_snap(target, Some(window), cx);
     }
 
-    /// Touch pans over the row list. A pan that started on a row's grip moves
-    /// that row; anything else stays a list scroll, which the drawer must not
-    /// mistake for a horizontal page swipe.
+    /// Touch pans over the row list. Holding a row body arms movement; ordinary
+    /// pans remain list scrolling and never become horizontal page swipes.
     fn sidebar_list_pan(
         &mut self,
         event: &ScrollWheelEvent,
@@ -4065,11 +4047,7 @@ impl MobileApp {
         cx: &mut Context<Self>,
     ) {
         match event.touch_phase {
-            TouchPhase::Started => {
-                if self.begin_sidebar_drag(event, cx) {
-                    cx.stop_propagation();
-                }
-            }
+            TouchPhase::Started => self.begin_sidebar_drag(event, cx),
             TouchPhase::Moved => {
                 if self.sidebar_drag.is_some() {
                     self.advance_sidebar_drag(event, cx);
@@ -7178,7 +7156,7 @@ impl MobileApp {
             .into_any_element()
     }
 
-    /// Width the trailing affordance column takes from a row body.
+    /// Width the trailing menu column takes from a row body.
     fn sidebar_actions_width(&self, row: &SidebarRow) -> f32 {
         let can_organize = self.backend.as_ref().is_some_and(|backend| {
             backend
@@ -7186,9 +7164,25 @@ impl MobileApp {
                 .agent
                 .supports(BackendOperation::AgentSidebarOrganizationMutate)
         });
-        let columns = usize::from(self.sidebar_row_shows_menu(row, can_organize))
-            + usize::from(row.kind != SidebarRowKind::Workspace && can_organize);
-        columns as f32 * theme::SIDEBAR_GRIP_WIDTH
+        if self.sidebar_row_shows_menu(row, can_organize) {
+            theme::SIDEBAR_ACTION_WIDTH
+        } else {
+            0.0
+        }
+    }
+
+    /// The menu and inline create button are explicit tap targets, so a long
+    /// press within them must not arm row movement.
+    fn sidebar_drag_action_width(&self, row: &SidebarRow) -> f32 {
+        self.sidebar_actions_width(row)
+            + if matches!(
+                row.kind,
+                SidebarRowKind::Project | SidebarRowKind::Workspace
+            ) {
+                theme::SIDEBAR_LIST_PADDING + theme::SIDEBAR_ICON_SLOT
+            } else {
+                0.0
+            }
     }
 
     fn sidebar_row_shows_menu(&self, row: &SidebarRow, can_organize: bool) -> bool {
@@ -7208,9 +7202,8 @@ impl MobileApp {
         }
     }
 
-    /// The trailing column keeps menu and drag affordances separate. Worktree
-    /// rows intentionally expose only their menu; their move gesture is a
-    /// long press on the row body.
+    /// The trailing column contains only the row menu. Moving is initiated by
+    /// a long press on the row body.
     fn render_sidebar_actions(&self, row: &SidebarRow, cx: &mut Context<Self>) -> gpui::AnyElement {
         let can_organize = self.backend.as_ref().is_some_and(|backend| {
             backend
@@ -7219,30 +7212,24 @@ impl MobileApp {
                 .supports(BackendOperation::AgentSidebarOrganizationMutate)
         });
         let show_menu = self.sidebar_row_shows_menu(row, can_organize);
-        let show_grip = row.kind != SidebarRowKind::Workspace && can_organize;
-        if !show_menu && !show_grip {
+        if !show_menu {
             return div().into_any_element();
         }
         let menu_row = row.clone();
-        let mut actions = div()
+        div()
             .id(format!("mobile-sidebar-actions-{}", row.id()))
             .absolute()
             .top_0()
             .bottom_0()
             .right_0()
-            .w(px(if show_menu && show_grip {
-                theme::SIDEBAR_GRIP_WIDTH * 2.0
-            } else {
-                theme::SIDEBAR_GRIP_WIDTH
-            }))
+            .w(px(theme::SIDEBAR_ACTION_WIDTH))
             .flex()
             .items_center()
-            .justify_end();
-        if show_menu {
-            actions = actions.child(
+            .justify_end()
+            .child(
                 div()
                     .id(format!("mobile-sidebar-menu-{}", row.id()))
-                    .size(px(theme::SIDEBAR_GRIP_WIDTH))
+                    .size(px(theme::SIDEBAR_ACTION_WIDTH))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -7264,27 +7251,8 @@ impl MobileApp {
                             .size(px(16.0))
                             .text_color(theme::sidebar_text_muted()),
                     ),
-            );
-        }
-        if show_grip {
-            actions = actions.child(
-                div()
-                    .id(format!("mobile-sidebar-grip-{}", row.id()))
-                    .size(px(theme::SIDEBAR_GRIP_WIDTH))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(
-                        svg()
-                            .path("icons/grip-vertical.svg")
-                            .size(px(15.0))
-                            .text_color(theme::sidebar_text_muted()),
-                    ),
-            );
-        }
-        actions.into_any_element()
+            )
+            .into_any_element()
     }
 
     /// The leading slot every project, folder, and worktree row starts with.
@@ -7412,9 +7380,6 @@ impl MobileApp {
             .flex()
             .items_center()
             .gap(px(theme::SIDEBAR_ICON_TITLE_GAP))
-            .when(row.selected, |project| {
-                project.bg(theme::sidebar_selected_bg())
-            })
             .cursor_pointer()
             .active(|style| style.bg(theme::row_pressed_bg()))
             // The whole row is the expander, the way the desktop's is; the phone
@@ -7555,11 +7520,6 @@ impl MobileApp {
             .flex()
             .items_center()
             .gap(px(theme::SIDEBAR_ICON_TITLE_GAP))
-            // The card around an expanded worktree carries the focus border, so
-            // the row itself only ever carries the fill.
-            .when(workspace_selected, |workspace| {
-                workspace.bg(theme::sidebar_selected_bg())
-            })
             .cursor_pointer()
             .active(|style| style.bg(theme::row_pressed_bg()))
             .on_mouse_up(
@@ -7973,12 +7933,12 @@ impl MobileApp {
                             .flex()
                             .items_center()
                             .gap(px(1.0))
-                            .text_size(px(17.0))
+                            .text_size(px(15.0))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(
                                 svg()
                                     .path("icons/vibex-mark.svg")
-                                    .size(px(20.0))
+                                    .size(px(18.0))
                                     .mt(px(1.0))
                                     .relative()
                                     .top(px(-2.0))

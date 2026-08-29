@@ -928,11 +928,10 @@ pub fn drop_target(
     Some(SidebarDropTarget { index, position })
 }
 
-/// Whether the drag started on the row's grip column rather than its body.
-/// Android delivers a touch pan as a scroll anchored at the press point, so the
-/// grip is what separates "move this row" from "scroll the list".
-pub fn press_is_on_grip(pointer_x: f32, list_right: f32, grip_width: f32) -> bool {
-    pointer_x >= list_right - grip_width
+/// Whether the press landed on trailing row controls rather than the row body.
+/// Those controls keep their tap behavior while the body owns long-press moves.
+pub fn press_is_on_trailing_actions(pointer_x: f32, list_right: f32, actions_width: f32) -> bool {
+    actions_width > 0.0 && pointer_x >= list_right - actions_width
 }
 
 /// Ancestor folder ids of a row, so a folder cannot be dropped into itself.
@@ -1514,9 +1513,10 @@ mod tests {
     }
 
     #[test]
-    fn only_the_grip_column_starts_a_move() {
-        assert!(press_is_on_grip(360.0, 380.0, 32.0));
-        assert!(!press_is_on_grip(200.0, 380.0, 32.0));
+    fn trailing_actions_are_excluded_from_row_long_press() {
+        assert!(press_is_on_trailing_actions(360.0, 380.0, 32.0));
+        assert!(!press_is_on_trailing_actions(200.0, 380.0, 32.0));
+        assert!(!press_is_on_trailing_actions(380.0, 380.0, 0.0));
     }
 
     #[test]
