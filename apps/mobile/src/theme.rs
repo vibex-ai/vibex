@@ -33,7 +33,14 @@ pub const ACCENT_DIM: u32 = 0x71717b;
 pub const ACCENT_PURPLE: u32 = 0xc678dd;
 
 pub const SIDEBAR_BG: u32 = 0x18181b;
-pub const SIDEBAR_SELECTED_BG: u32 = 0x27272a;
+/// The desktop fills a selected row with `sidebar_accent` lightened by 24%;
+/// this is that value flattened for the phone's fixed dark palette.
+pub const SIDEBAR_SELECTED_BG: u32 = 0x303034;
+/// Border of an expanded worktree card that owns the selection
+/// (`sidebar_accent` lightened by 46% on the desktop).
+pub const SIDEBAR_CARD_FOCUS_BORDER: u32 = 0x39393d;
+/// Fill behind a session's state chip (the desktop's `secondary`).
+pub const SIDEBAR_CHIP_BG: u32 = 0x27272a;
 pub const SIDEBAR_TEXT_PRIMARY: u32 = 0xfafafa;
 pub const SIDEBAR_TEXT_SECONDARY: u32 = 0xd4d4d8;
 pub const SIDEBAR_TEXT_MUTED: u32 = 0x9f9fa9;
@@ -62,6 +69,13 @@ pub const FONT_CAPTION: f32 = 11.0;
 /// workspace paths, row counts).
 pub const FONT_MICRO: f32 = 10.0;
 
+// The sidebar tree runs on the desktop's own type scale (`text_base`,
+// `text_sm`, `text_xs`) rather than the phone's denser one, so a project tree
+// reads the same on both shells.
+pub const FONT_SIDEBAR_TITLE: f32 = 16.0;
+pub const FONT_SIDEBAR_ROW: f32 = 14.0;
+pub const FONT_SIDEBAR_META: f32 = 12.0;
+
 pub const ICON_MD: f32 = 18.0;
 pub const ICON_SM: f32 = 16.0;
 pub const ICON_STATUS: f32 = 6.0;
@@ -86,6 +100,55 @@ pub const RADIUS_CONTROL: f32 = 6.0;
 
 pub const DRAWER_ROW_HEIGHT: f32 = 52.0;
 pub const SIDEBAR_ROW_HEIGHT: f32 = 44.0;
+
+// ---------------------------------------------------------------------------
+// Sidebar tree geometry
+//
+// These mirror the desktop's `SIDEBAR_*` constants in `apps/desktop/src/app.rs`
+// so the phone renders the same project tree: same icon slots, same indents,
+// same folder guides, same worktree card. Only the row height is the phone's
+// own, because every desktop row is a hover target while every phone row is a
+// touch target.
+// ---------------------------------------------------------------------------
+
+/// Horizontal padding of the row list (the desktop's `px_4`).
+pub const SIDEBAR_LIST_PADDING: f32 = 16.0;
+/// Leading slot that carries a project logo, a folder mark, or a worktree
+/// status dot.
+pub const SIDEBAR_ICON_SLOT: f32 = 30.0;
+/// The slot hangs left of the list padding so its glyph optically aligns with
+/// the section heading above the list.
+pub const SIDEBAR_ICON_SLOT_OVERHANG: f32 = 8.0;
+/// Gap between the leading slot and the row title.
+pub const SIDEBAR_ICON_TITLE_GAP: f32 = 4.0;
+/// Indent of a project's own sessions in the compact hierarchy.
+pub const SIDEBAR_PROJECT_SESSION_INDENT: f32 = 12.0;
+/// Indent of the sessions inside a worktree card.
+pub const SIDEBAR_WORKSPACE_SESSION_INDENT: f32 = 20.0;
+/// Indent of the rows filed inside a folder.
+pub const SIDEBAR_FOLDER_CHILD_INDENT: f32 = 18.0;
+/// Where a folder draws the guide line down its child column.
+pub const SIDEBAR_FOLDER_GUIDE_OFFSET: f32 = 7.0;
+/// A session row starts its content past the card overhang instead of hanging
+/// into it the way project and worktree rows do.
+pub const SIDEBAR_SESSION_CONTENT_INSET: f32 = 8.0;
+/// Trailing metadata column of a session row (time, chip, status).
+pub const SIDEBAR_SESSION_META_WIDTH: f32 = 76.0;
+/// Corner radius of a row's fill.
+pub const SIDEBAR_ROW_RADIUS: f32 = 8.0;
+/// Corner radius of the worktree card that wraps a worktree and its sessions.
+pub const SIDEBAR_CARD_RADIUS: f32 = 10.0;
+/// Right inset of the worktree card (the desktop's `pr(4)`).
+pub const SIDEBAR_CARD_INSET: f32 = 4.0;
+/// Agent mark on a session row.
+pub const SIDEBAR_AGENT_LOGO_SIZE: f32 = 14.0;
+/// Project and folder marks.
+pub const SIDEBAR_PROJECT_LOGO_SIZE: f32 = 16.0;
+/// Worktree and session status dot.
+pub const SIDEBAR_STATUS_DOT: f32 = 8.0;
+/// Unread-completion dot, which is deliberately smaller than a status dot.
+pub const SIDEBAR_UNREAD_DOT: f32 = 7.0;
+
 /// Indent per tree level, matching the desktop's nested sidebar spacing.
 pub const SIDEBAR_INDENT: f32 = 14.0;
 /// Width of one trailing sidebar affordance column. Project/session/folder
@@ -176,6 +239,30 @@ pub fn sidebar_text_secondary() -> Hsla {
 
 pub fn sidebar_text_muted() -> Hsla {
     rgb(SIDEBAR_TEXT_MUTED).into()
+}
+
+/// The desktop's sidebar builds its contrast ladder by fading one foreground
+/// colour rather than by swapping palette entries. Rows that copy a desktop
+/// opacity go through here so the two trees land on the same shade.
+pub fn sidebar_foreground(alpha: f32) -> Hsla {
+    let mut color: Hsla = rgb(SIDEBAR_TEXT_PRIMARY).into();
+    color.a = alpha;
+    color
+}
+
+pub fn sidebar_card_focus_border() -> Hsla {
+    rgb(SIDEBAR_CARD_FOCUS_BORDER).into()
+}
+
+pub fn sidebar_chip_bg() -> Hsla {
+    rgb(SIDEBAR_CHIP_BG).into()
+}
+
+/// Guide line down a folder's child column.
+pub fn sidebar_tree_guide() -> Hsla {
+    let mut color: Hsla = rgb(BORDER_DEFAULT).into();
+    color.a = 0.70;
+    color
 }
 
 pub fn backdrop(opacity: f32) -> Hsla {

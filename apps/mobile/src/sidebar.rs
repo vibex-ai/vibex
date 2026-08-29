@@ -14,6 +14,8 @@ use vibex_desktop_model::{
     sidebar_project_items_for_workspace, sidebar_root_items,
 };
 
+use crate::theme;
+
 /// Folders may nest, but a runaway parent chain must not build an unbounded
 /// row list; the Desktop applies the same ceiling when it renders.
 const MAX_FOLDER_DEPTH: usize = 32;
@@ -26,11 +28,16 @@ pub enum SidebarRowKind {
     Session,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SidebarRow {
     pub item: SidebarOrganizationItem,
     pub kind: SidebarRowKind,
     pub depth: usize,
+    /// Horizontal offset the Desktop would give this row, in pixels. The
+    /// Desktop nests real containers whose padding differs per level, so a
+    /// depth multiplier cannot reproduce it; carrying the resolved offset keeps
+    /// the two trees aligned column for column.
+    pub indent: f32,
     pub label: String,
     /// Scope the row lives in: `None` at the sidebar root, otherwise the
     /// project subtree. A move may not cross scopes.
@@ -227,6 +234,29 @@ fn workspace_status(
     (state, unread)
 }
 
+/// Detailed hierarchy is useful only when a project has Git-backed workspace
+/// identity. Remote workspace summaries expose that identity as a branch; a
+/// managed Vibex worktree remains Git-backed even while its branch snapshot is
+/// still loading. This mirrors the desktop's per-project fallback instead of
+/// applying the global mode to every project indiscriminately.
+fn project_uses_detailed_hierarchy(
+    hierarchy_mode: SidebarHierarchyMode,
+    workspaces: &[&SidebarWorkspace],
+) -> bool {
+    hierarchy_mode == SidebarHierarchyMode::Detailed
+        && workspaces.iter().any(|workspace| {
+            workspace.mode == WorkspaceMode::VibexWorktree || workspace.branch.is_some()
+        })
+}
+
+fn workspace_branch_name(branch: &str) -> &str {
+    branch
+        .rsplit_once('/')
+        .map(|(_, name)| name)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(branch)
+}
+
 /// Flattens the Desktop's tree into rows. A non-empty query expands everything
 /// and drops projects with no surviving session, matching the Desktop.
 pub fn sidebar_rows(input: SidebarRowInput<'_>) -> Vec<SidebarRow> {
@@ -348,6 +378,7 @@ pub fn sidebar_rows(input: SidebarRowInput<'_>) -> Vec<SidebarRow> {
         &query,
         None,
         0,
+        0.0,
     );
     rows
 }
@@ -365,6 +396,7 @@ fn push_root_children(
     query: &str,
     parent_folder_id: Option<&str>,
     depth: usize,
+    indent: f32,
 ) {
     if depth > MAX_FOLDER_DEPTH {
         return;
@@ -379,6 +411,11 @@ fn push_root_children(
                 let Some(label) = project_labels.get(&project_id) else {
                     continue;
                 };
+                let project_workspaces = workspaces_by_project
+                    .get(&project_id)
+                    .map_or(&[][..], Vec::as_slice);
+                let detailed_hierarchy =
+                    project_uses_detailed_hierarchy(input.view.hierarchy_mode, project_workspaces);
                 let collapsed = input.view.collapsed_project_ids.contains(&project_id);
                 let selected = input.selected_session_id.is_some_and(|selected| {
                     sessions_by_project
@@ -391,6 +428,7 @@ fn push_root_children(
                     item: SidebarOrganizationItem::Project(project_id.clone()),
                     kind: SidebarRowKind::Project,
                     depth,
+                    indent,
                     label: label.clone(),
                     project_id: None,
                     workspace_id: None,
@@ -410,6 +448,14 @@ fn push_root_children(
                 if collapsed && query.is_empty() {
                     continue;
                 }
+                // A project's own column is indented in the compact tree; the
+                // detailed tree hands that column to the worktree card instead
+                // and keeps its children flush with the project row.
+                let child_indent = if !detailed_hierarchy {
+                    indent + theme::SIDEBAR_PROJECT_SESSION_INDENT
+                } else {
+                    indent
+                };
                 push_project_children(
                     rows,
                     input,
@@ -421,6 +467,7 @@ fn push_root_children(
                     query,
                     None,
                     depth + 1,
+                    child_indent,
                     true,
                 );
             }
@@ -433,6 +480,7 @@ fn push_root_children(
                     item: SidebarOrganizationItem::Folder(folder_id.clone()),
                     kind: SidebarRowKind::Folder,
                     depth,
+                    indent,
                     label: folder.name.clone(),
                     project_id: None,
                     workspace_id: folder.workspace_id.clone(),
@@ -461,6 +509,7 @@ fn push_root_children(
                     query,
                     Some(&folder_id),
                     depth + 1,
+                    indent + theme::SIDEBAR_FOLDER_CHILD_INDENT,
                 );
             }
             SidebarOrganizationItem::Session(_) => {}
@@ -480,6 +529,7 @@ fn push_project_children(
     query: &str,
     parent_folder_id: Option<&str>,
     depth: usize,
+    indent: f32,
     render_workspaces: bool,
 ) {
     if depth > MAX_FOLDER_DEPTH {
@@ -489,7 +539,12 @@ fn push_project_children(
         .get(project_id)
         .cloned()
         .unwrap_or_default();
-    let compact = input.view.hierarchy_mode == SidebarHierarchyMode::Compact;
+    let project_workspaces = workspaces_by_project
+        .get(project_id)
+        .map_or(&[][..], Vec::as_slice);
+    let detailed_hierarchy =
+        project_uses_detailed_hierarchy(input.view.hierarchy_mode, project_workspaces);
+    let compact = !detailed_hierarchy;
     let project_sessions = if compact {
         project_sessions
     } else {
@@ -530,7 +585,7 @@ fn push_project_children(
                 else {
                     continue;
                 };
-                rows.push(session_row(input, project_id, session, depth));
+                rows.push(session_row(input, project_id, session, depth, indent));
             }
             SidebarOrganizationItem::Folder(folder_id) => {
                 let Some(folder) = organization.folder(&folder_id) else {
@@ -541,6 +596,7 @@ fn push_project_children(
                     item: SidebarOrganizationItem::Folder(folder_id.clone()),
                     kind: SidebarRowKind::Folder,
                     depth,
+                    indent,
                     label: folder.name.clone(),
                     project_id: Some(project_id.to_string()),
                     workspace_id: folder.workspace_id.clone(),
@@ -568,6 +624,7 @@ fn push_project_children(
                     query,
                     Some(&folder_id),
                     depth + 1,
+                    indent + theme::SIDEBAR_FOLDER_CHILD_INDENT,
                     false,
                 );
             }
@@ -575,7 +632,7 @@ fn push_project_children(
         }
     }
 
-    if !render_workspaces || input.view.hierarchy_mode == SidebarHierarchyMode::Compact {
+    if !render_workspaces || !detailed_hierarchy {
         return;
     }
     let workspace_ids = workspaces_by_project
@@ -633,12 +690,19 @@ fn push_project_children(
             item: SidebarOrganizationItem::Project(workspace.id.clone()),
             kind: SidebarRowKind::Workspace,
             depth,
+            indent,
             label: input
                 .view
                 .worktree_titles
                 .get(&workspace.id)
                 .cloned()
-                .or_else(|| workspace.branch.clone())
+                .or_else(|| {
+                    workspace
+                        .branch
+                        .as_deref()
+                        .map(workspace_branch_name)
+                        .map(str::to_string)
+                })
                 .unwrap_or_else(|| workspace.label.clone()),
             project_id: Some(project_id.to_string()),
             workspace_id: Some(workspace.id.clone()),
@@ -673,6 +737,7 @@ fn push_project_children(
             query,
             None,
             depth + 1,
+            indent + theme::SIDEBAR_WORKSPACE_SESSION_INDENT,
         );
     }
 }
@@ -689,6 +754,7 @@ fn push_workspace_children(
     query: &str,
     parent_folder_id: Option<&str>,
     depth: usize,
+    indent: f32,
 ) {
     if depth > MAX_FOLDER_DEPTH {
         return;
@@ -715,7 +781,7 @@ fn push_workspace_children(
                 else {
                     continue;
                 };
-                rows.push(session_row(input, project_id, session, depth));
+                rows.push(session_row(input, project_id, session, depth, indent));
             }
             SidebarOrganizationItem::Folder(folder_id) => {
                 let Some(folder) = organization.folder(&folder_id) else {
@@ -726,6 +792,7 @@ fn push_workspace_children(
                     item: SidebarOrganizationItem::Folder(folder_id.clone()),
                     kind: SidebarRowKind::Folder,
                     depth,
+                    indent,
                     label: folder.name.clone(),
                     project_id: Some(project_id.to_string()),
                     workspace_id: Some(workspace_id.to_string()),
@@ -753,6 +820,7 @@ fn push_workspace_children(
                     query,
                     Some(&folder_id),
                     depth + 1,
+                    indent + theme::SIDEBAR_FOLDER_CHILD_INDENT,
                 );
             }
             SidebarOrganizationItem::Project(_) => {}
@@ -765,12 +833,14 @@ fn session_row(
     project_id: &str,
     session: &AgentSession,
     depth: usize,
+    indent: f32,
 ) -> SidebarRow {
     let session_id = session.id.as_str().to_string();
     SidebarRow {
         item: SidebarOrganizationItem::Session(session_id.clone()),
         kind: SidebarRowKind::Session,
         depth,
+        indent,
         label: session.title.clone(),
         project_id: Some(project_id.to_string()),
         workspace_id: Some(session.workspace_id.as_str().to_string()),
@@ -883,6 +953,93 @@ pub fn ancestors_of(rows: &[SidebarRow], index: usize) -> BTreeSet<String> {
     ancestors
 }
 
+/// Guide lines a row sits behind, as x offsets. The Desktop draws one down the
+/// child column of every open folder; a flat row list has to re-derive them
+/// from its ancestors, one line per enclosing folder.
+pub fn folder_guides(rows: &[SidebarRow], index: usize) -> Vec<f32> {
+    let Some(row) = rows.get(index) else {
+        return Vec::new();
+    };
+    let mut guides = Vec::new();
+    let mut depth = row.depth;
+    for candidate in rows[..index].iter().rev() {
+        if candidate.depth < depth {
+            depth = candidate.depth;
+            if candidate.kind == SidebarRowKind::Folder {
+                guides.push(candidate.indent + theme::SIDEBAR_FOLDER_GUIDE_OFFSET);
+            }
+        }
+    }
+    guides
+}
+
+/// Where a row falls inside the card the Desktop wraps around a worktree and
+/// the sessions filed under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarCardEdge {
+    /// The worktree row itself, with children below it.
+    Top,
+    Middle,
+    Bottom,
+}
+
+/// One row's slice of a worktree card.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SidebarCard {
+    pub workspace_id: String,
+    /// Indent of the worktree row that opened the card, so every slice draws
+    /// its border down the same column.
+    pub indent: f32,
+    pub edge: SidebarCardEdge,
+}
+
+/// The worktree card each row belongs to. A collapsed or empty worktree gets no
+/// card, matching the Desktop, which only draws one once the worktree has a
+/// child column to enclose.
+pub fn workspace_cards(rows: &[SidebarRow]) -> Vec<Option<SidebarCard>> {
+    let mut cards = vec![None; rows.len()];
+    for (index, row) in rows.iter().enumerate() {
+        if row.kind != SidebarRowKind::Workspace {
+            continue;
+        }
+        let Some(workspace_id) = row.workspace_id.clone() else {
+            continue;
+        };
+        let last_child = rows
+            .iter()
+            .enumerate()
+            .skip(index + 1)
+            .take_while(|(_, candidate)| candidate.depth > row.depth)
+            .map(|(child_index, _)| child_index)
+            .last();
+        let Some(last_child) = last_child else {
+            continue;
+        };
+        cards[index] = Some(SidebarCard {
+            workspace_id: workspace_id.clone(),
+            indent: row.indent,
+            edge: SidebarCardEdge::Top,
+        });
+        for (child_index, card) in cards
+            .iter_mut()
+            .enumerate()
+            .take(last_child + 1)
+            .skip(index + 1)
+        {
+            *card = Some(SidebarCard {
+                workspace_id: workspace_id.clone(),
+                indent: row.indent,
+                edge: if child_index == last_child {
+                    SidebarCardEdge::Bottom
+                } else {
+                    SidebarCardEdge::Middle
+                },
+            });
+        }
+    }
+    cards
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -920,6 +1077,7 @@ mod tests {
             item,
             kind,
             depth,
+            indent: depth as f32 * theme::SIDEBAR_FOLDER_CHILD_INDENT,
             label: id.to_string(),
             project_id: None,
             workspace_id: None,
@@ -1017,11 +1175,44 @@ mod tests {
         assert_eq!(rows[0].child_count, 1);
         assert_eq!(rows[1].kind, SidebarRowKind::Workspace);
         assert_eq!(rows[1].id(), "workspace_project");
-        assert_eq!(rows[1].label, "feature/mobile-sidebar");
+        assert_eq!(rows[1].label, "mobile-sidebar");
         assert_eq!(rows[1].detail.as_deref(), Some("feature/mobile-sidebar"));
         assert_eq!(rows[1].child_count, 1);
         assert_eq!(rows[2].kind, SidebarRowKind::Session);
         assert_eq!(rows[2].depth, 2);
+    }
+
+    #[test]
+    fn detailed_mode_falls_back_to_compact_for_a_non_git_project() {
+        let mut view = SidebarOrganizationView::default();
+        view.hierarchy_mode = SidebarHierarchyMode::Detailed;
+        let projects = vec![SidebarProject {
+            id: "project_project".to_string(),
+            label: "plain-folder".to_string(),
+        }];
+        let workspaces = vec![SidebarWorkspace {
+            id: "workspace_project".to_string(),
+            project_id: "project_project".to_string(),
+            label: "plain-folder".to_string(),
+            detail: "/tmp/plain-folder".to_string(),
+            branch: None,
+            mode: WorkspaceMode::CurrentCheckout,
+            collapsed: false,
+        }];
+        let sessions = vec![session("session-a", "project", "Hello")];
+        let rows = sidebar_rows(SidebarRowInput {
+            view: &view,
+            projects: &projects,
+            workspaces: &workspaces,
+            sessions: &sessions,
+            selected_session_id: None,
+            query: "",
+        });
+        assert_eq!(
+            rows.iter().map(|row| row.kind).collect::<Vec<_>>(),
+            vec![SidebarRowKind::Project, SidebarRowKind::Session]
+        );
+        assert_eq!(rows[1].indent, theme::SIDEBAR_PROJECT_SESSION_INDENT);
     }
 
     #[test]
@@ -1277,5 +1468,98 @@ mod tests {
     fn only_the_grip_column_starts_a_move() {
         assert!(press_is_on_grip(360.0, 380.0, 32.0));
         assert!(!press_is_on_grip(200.0, 380.0, 32.0));
+    }
+
+    #[test]
+    fn indents_follow_the_desktop_columns_rather_than_the_row_depth() {
+        let mut view = SidebarOrganizationView::default();
+        view.hierarchy_mode = SidebarHierarchyMode::Detailed;
+        let projects = vec![SidebarProject {
+            id: "project_project".to_string(),
+            label: "vibex".to_string(),
+        }];
+        let workspaces = vec![SidebarWorkspace {
+            id: "workspace_project".to_string(),
+            project_id: "project_project".to_string(),
+            label: "project".to_string(),
+            detail: "/tmp/project".to_string(),
+            branch: Some("main".to_string()),
+            mode: WorkspaceMode::CurrentCheckout,
+            collapsed: false,
+        }];
+        let sessions = vec![session("session-a", "project", "Hello")];
+        let rows = sidebar_rows(SidebarRowInput {
+            view: &view,
+            projects: &projects,
+            workspaces: &workspaces,
+            sessions: &sessions,
+            selected_session_id: None,
+            query: "",
+        });
+        // A worktree keeps the project's own column; only its sessions step in.
+        assert_eq!(rows[0].indent, 0.0);
+        assert_eq!(rows[1].indent, 0.0);
+        assert_eq!(rows[2].indent, theme::SIDEBAR_WORKSPACE_SESSION_INDENT);
+
+        view.hierarchy_mode = SidebarHierarchyMode::Compact;
+        let rows = sidebar_rows(SidebarRowInput {
+            view: &view,
+            projects: &projects,
+            workspaces: &workspaces,
+            sessions: &sessions,
+            selected_session_id: None,
+            query: "",
+        });
+        assert_eq!(rows[1].indent, theme::SIDEBAR_PROJECT_SESSION_INDENT);
+    }
+
+    #[test]
+    fn a_row_sits_behind_one_guide_per_enclosing_folder() {
+        let rows = vec![
+            row(SidebarRowKind::Project, "project", 0),
+            row(SidebarRowKind::Folder, "outer", 1),
+            row(SidebarRowKind::Folder, "inner", 2),
+            row(SidebarRowKind::Session, "session", 3),
+        ];
+        assert!(folder_guides(&rows, 0).is_empty());
+        assert_eq!(
+            folder_guides(&rows, 3),
+            vec![
+                rows[2].indent + theme::SIDEBAR_FOLDER_GUIDE_OFFSET,
+                rows[1].indent + theme::SIDEBAR_FOLDER_GUIDE_OFFSET,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_worktree_card_spans_its_sessions_and_skips_an_empty_worktree() {
+        let mut rows = vec![
+            row(SidebarRowKind::Project, "project", 0),
+            row(SidebarRowKind::Workspace, "workspace", 1),
+            row(SidebarRowKind::Session, "session-a", 2),
+            row(SidebarRowKind::Session, "session-b", 2),
+            row(SidebarRowKind::Workspace, "empty", 1),
+        ];
+        rows[1].workspace_id = Some("workspace".to_string());
+        rows[4].workspace_id = Some("empty".to_string());
+        let cards = workspace_cards(&rows);
+        assert_eq!(cards[0], None);
+        assert_eq!(
+            cards[1].as_ref().map(|card| card.edge),
+            Some(SidebarCardEdge::Top)
+        );
+        assert_eq!(
+            cards[2].as_ref().map(|card| card.edge),
+            Some(SidebarCardEdge::Middle)
+        );
+        assert_eq!(
+            cards[3].as_ref().map(|card| card.edge),
+            Some(SidebarCardEdge::Bottom)
+        );
+        assert_eq!(
+            cards[3].as_ref().map(|card| card.workspace_id.as_str()),
+            Some("workspace")
+        );
+        assert_eq!(cards[4], None);
     }
 }

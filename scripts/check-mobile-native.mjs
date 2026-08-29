@@ -104,7 +104,11 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     "android_tls_platform_verifier_init_order_invalid"
   );
   assert(entry.includes("scanner::initialize_android(&android_app)"), "android_qr_scanner_init_missing");
-  assert(entry.includes("gpui_platform::application()"), "native_gpui_application_missing");
+  assert(
+    entry.includes("gpui_platform::application()") ||
+      entry.includes("gpui::Application::with_platform(platform)"),
+    "native_gpui_application_missing"
+  );
   assert(entry.includes('target_os = "ios"'), "ios_rust_entry_missing");
   assert(entry.includes("assets::load_fonts(cx)"), "native_mobile_font_loading_missing");
   assert(input.includes("self.focus_handle.focus(window, cx)"), "native_text_input_focus_missing");
@@ -125,7 +129,9 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   assert(android.includes("android.permission.CAMERA"), "android_camera_permission_missing");
   assert(android.includes("PairingQrScannerActivity"), "android_qr_scanner_activity_missing");
   assert(
-    /android:name="\.PairingQrScannerActivity"[\s\S]*?android:exported="false"/.test(android),
+    /<activity\b(?=[^>]*android:name="\.PairingQrScannerActivity")(?=[^>]*android:exported="false")[^>]*>/.test(
+      android
+    ),
     "android_qr_scanner_activity_exported"
   );
   assert(androidScanner.includes('System.loadLibrary("vibex_mobile")'), "android_qr_scanner_native_library_classloader_load_missing");
@@ -339,7 +345,7 @@ function runSelfTest() {
   );
   expectRejected(
     "crates/vibex-remote-client/src/transport.rs",
-    "remote_http_client()?.post(endpoint)",
+    "remote_http_client_for_url(&url)?",
     "reqwest::Client::new().post(endpoint)",
     "native_mobile_checker_self_test_accepted_http_client_bypass"
   );

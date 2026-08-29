@@ -50,9 +50,9 @@ use crate::input::{
 use crate::lifecycle::MobileLifecycleEvent;
 use crate::pairing::{MobileCredentialBundle, claim_pairing_link, claim_zero_config_lan_pairing};
 use crate::sidebar::{
-    SidebarDropPosition, SidebarDropTarget, SidebarProject, SidebarRow, SidebarRowInput,
-    SidebarRowKind, SidebarWorkspace, ancestors_of, drop_target, press_is_on_grip, row_at_position,
-    sidebar_rows,
+    SidebarCard, SidebarCardEdge, SidebarDropPosition, SidebarDropTarget, SidebarProject,
+    SidebarRow, SidebarRowInput, SidebarRowKind, SidebarWorkspace, ancestors_of, drop_target,
+    folder_guides, press_is_on_grip, row_at_position, sidebar_rows, workspace_cards,
 };
 use crate::storage::CredentialStorage;
 use crate::workbench::{MobileWorkbench, WorkbenchSurface};
@@ -137,7 +137,7 @@ enum RuntimeOptionsTarget {
 
 /// Touch shells cannot rely on hover, so the sidebar keeps only the most-used
 /// action on the row itself and moves the rest behind this sheet.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct SidebarRowMenu {
     row: SidebarRow,
 }
@@ -7092,6 +7092,8 @@ impl MobileApp {
         &self,
         index: usize,
         row: &SidebarRow,
+        guides: &[f32],
+        card: Option<&SidebarCard>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let dragging = self
@@ -7104,13 +7106,18 @@ impl MobileApp {
             .and_then(|drag| drag.target.as_ref())
             .filter(|target| target.index == index)
             .map(|target| target.position);
-        let indent = theme::SPACING_MD + row.depth as f32 * theme::SIDEBAR_INDENT;
         let body = match row.kind {
-            SidebarRowKind::Folder => self.render_sidebar_folder_row(row, indent, cx),
-            SidebarRowKind::Project => self.render_sidebar_project_row(row, indent, cx),
-            SidebarRowKind::Workspace => self.render_sidebar_workspace_row(row, indent, cx),
-            SidebarRowKind::Session => self.render_sidebar_session_row(row, indent, cx),
+            SidebarRowKind::Folder => self.render_sidebar_folder_row(row, cx),
+            SidebarRowKind::Project => self.render_sidebar_project_row(row, cx),
+            SidebarRowKind::Workspace => self.render_sidebar_workspace_row(row, cx),
+            SidebarRowKind::Session => self.render_sidebar_session_row(row, cx),
         };
+        // The desktop draws the card border once, around a real container. A
+        // flat row list has to draw it a slice at a time, so each row paints the
+        // sides and only the ends paint a cap.
+        let card = card.filter(|card| {
+            self.sidebar_selected_workspace_id.as_deref() == Some(card.workspace_id.as_str())
+        });
         div()
             .relative()
             .h(px(theme::SIDEBAR_ROW_HEIGHT))
@@ -7119,23 +7126,86 @@ impl MobileApp {
             .when(drop == Some(SidebarDropPosition::Into), |row| {
                 row.bg(theme::sidebar_drop_bg())
             })
+            .children(guides.iter().map(|offset| {
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(theme::SIDEBAR_LIST_PADDING + offset))
+                    .w(px(1.0))
+                    .bg(theme::sidebar_tree_guide())
+            }))
             .child(body)
+            .when_some(card, |element, card| {
+                element.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(px(theme::SIDEBAR_LIST_PADDING + card.indent
+                            - theme::SIDEBAR_ICON_SLOT_OVERHANG))
+                        .right(px(theme::SIDEBAR_LIST_PADDING + theme::SIDEBAR_CARD_INSET))
+                        .border_l_1()
+                        .border_r_1()
+                        .border_color(theme::sidebar_card_focus_border())
+                        .when(card.edge == SidebarCardEdge::Top, |card| {
+                            card.border_t_1()
+                                .rounded_tl(px(theme::SIDEBAR_CARD_RADIUS))
+                                .rounded_tr(px(theme::SIDEBAR_CARD_RADIUS))
+                        })
+                        .when(card.edge == SidebarCardEdge::Bottom, |card| {
+                            card.border_b_1()
+                                .rounded_bl(px(theme::SIDEBAR_CARD_RADIUS))
+                                .rounded_br(px(theme::SIDEBAR_CARD_RADIUS))
+                        }),
+                )
+            })
             // The insertion line reads the same way the desktop's does.
-            .when_some(drop, |row, position| {
+            .when_some(drop, |element, position| {
                 let line = div()
                     .absolute()
-                    .left(px(indent))
-                    .right(px(theme::SPACING_SM))
+                    .left(px(theme::SIDEBAR_LIST_PADDING + row.indent))
+                    .right(px(theme::SIDEBAR_LIST_PADDING))
                     .h(px(2.0))
                     .bg(rgb(theme::ACCENT_BLUE));
                 match position {
-                    SidebarDropPosition::Before => row.child(line.top_0()),
-                    SidebarDropPosition::After => row.child(line.bottom_0()),
-                    SidebarDropPosition::Into => row,
+                    SidebarDropPosition::Before => element.child(line.top_0()),
+                    SidebarDropPosition::After => element.child(line.bottom_0()),
+                    SidebarDropPosition::Into => element,
                 }
             })
             .child(self.render_sidebar_actions(row, cx))
             .into_any_element()
+    }
+
+    /// Width the trailing affordance column takes from a row body.
+    fn sidebar_actions_width(&self, row: &SidebarRow) -> f32 {
+        let can_organize = self.backend.as_ref().is_some_and(|backend| {
+            backend
+                .capability_snapshot()
+                .agent
+                .supports(BackendOperation::AgentSidebarOrganizationMutate)
+        });
+        let columns = usize::from(self.sidebar_row_shows_menu(row, can_organize))
+            + usize::from(row.kind != SidebarRowKind::Workspace && can_organize);
+        columns as f32 * theme::SIDEBAR_GRIP_WIDTH
+    }
+
+    fn sidebar_row_shows_menu(&self, row: &SidebarRow, can_organize: bool) -> bool {
+        match row.kind {
+            SidebarRowKind::Session => true,
+            SidebarRowKind::Folder => can_organize,
+            SidebarRowKind::Project => can_organize,
+            SidebarRowKind::Workspace => {
+                can_organize
+                    && row.workspace_id.as_deref().is_some_and(|workspace_id| {
+                        self.workspaces.iter().any(|workspace| {
+                            workspace.id.as_str() == workspace_id
+                                && workspace.mode == WorkspaceMode::VibexWorktree
+                        })
+                    })
+            }
+        }
     }
 
     /// The trailing column keeps menu and drag affordances separate. Worktree
@@ -7148,22 +7218,7 @@ impl MobileApp {
                 .agent
                 .supports(BackendOperation::AgentSidebarOrganizationMutate)
         });
-        let show_menu = match row.kind {
-            SidebarRowKind::Session => true,
-            SidebarRowKind::Folder | SidebarRowKind::Workspace => can_organize,
-            SidebarRowKind::Project => false,
-        };
-        let show_menu = if row.kind == SidebarRowKind::Workspace {
-            can_organize
-                && row.workspace_id.as_deref().is_some_and(|workspace_id| {
-                    self.workspaces.iter().any(|workspace| {
-                        workspace.id.as_str() == workspace_id
-                            && workspace.mode == WorkspaceMode::VibexWorktree
-                    })
-                })
-        } else {
-            show_menu
-        };
+        let show_menu = self.sidebar_row_shows_menu(row, can_organize);
         let show_grip = row.kind != SidebarRowKind::Workspace && can_organize;
         if !show_menu && !show_grip {
             return div().into_any_element();
@@ -7232,59 +7287,94 @@ impl MobileApp {
         actions.into_any_element()
     }
 
+    /// The leading slot every project, folder, and worktree row starts with.
+    fn sidebar_icon_slot(icon: gpui::AnyElement) -> gpui::Div {
+        div()
+            .size(px(theme::SIDEBAR_ICON_SLOT))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(icon)
+    }
+
     fn render_sidebar_folder_row(
         &self,
         row: &SidebarRow,
-        indent: f32,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let folder_id = row.id().to_string();
+        // A folder that auto-archives is marked by colour on the desktop, which
+        // is the only cue that the folder acts on its own.
+        let auto_archives = self
+            .sidebar_view
+            .organization
+            .folder(&folder_id)
+            .is_some_and(|folder| folder.auto_archive_after_days.is_some());
         div()
             .id(format!("mobile-folder-row-{folder_id}"))
             .h_full()
-            .mx(px(theme::SPACING_SM))
-            .pl(px(indent))
-            .pr(px(theme::SIDEBAR_GRIP_WIDTH * 2.0))
-            .rounded(px(theme::RADIUS_CONTROL))
+            .relative()
+            .left(px(-theme::SIDEBAR_ICON_SLOT_OVERHANG))
+            .mx(px(theme::SIDEBAR_LIST_PADDING))
+            .pl(px(row.indent))
+            .pr(px(self.sidebar_actions_width(row)))
+            .rounded(px(theme::SIDEBAR_ROW_RADIUS))
             .flex()
             .items_center()
-            .gap(px(theme::SPACING_XS))
+            .gap(px(theme::SIDEBAR_ICON_TITLE_GAP))
             .cursor_pointer()
             .active(|style| style.bg(theme::row_pressed_bg()))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| this.toggle_folder(folder_id.clone(), cx)),
             )
-            // Only folders carry the expander column; a project row toggles by
-            // its whole row, the way the desktop does it.
-            .child(
+            .child(Self::sidebar_icon_slot(
                 svg()
                     .path(if row.collapsed {
-                        "icons/chevron-right.svg"
+                        "icons/folder.svg"
                     } else {
-                        "icons/chevron-down.svg"
+                        "icons/folder-open.svg"
                     })
-                    .size(px(12.0))
-                    .flex_shrink_0()
-                    .text_color(theme::sidebar_text_muted()),
-            )
-            .child(
-                svg()
-                    .path("icons/folder.svg")
-                    .size(px(15.0))
-                    .flex_shrink_0()
-                    .text_color(theme::sidebar_text_secondary()),
-            )
+                    .size(px(theme::SIDEBAR_PROJECT_LOGO_SIZE))
+                    .text_color(if auto_archives {
+                        rgb(theme::ACCENT_GREEN).into()
+                    } else {
+                        theme::sidebar_foreground(0.72)
+                    })
+                    .into_any_element(),
+            ))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .text_size(px(theme::FONT_BODY))
-                    .text_color(theme::sidebar_text_primary())
-                    .child(row.label.clone()),
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SIDEBAR_ICON_TITLE_GAP))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(px(theme::FONT_SIDEBAR_ROW))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::sidebar_foreground(0.78))
+                            .child(row.label.clone()),
+                    )
+                    // The expander trails the name here, exactly as on the
+                    // desktop, so a folder never lines up with a project logo.
+                    .child(
+                        svg()
+                            .path(if row.collapsed {
+                                "icons/chevron-right.svg"
+                            } else {
+                                "icons/chevron-down.svg"
+                            })
+                            .size(px(12.0))
+                            .flex_shrink_0()
+                            .text_color(theme::sidebar_foreground(0.78)),
+                    ),
             )
             .into_any_element()
     }
@@ -7292,7 +7382,6 @@ impl MobileApp {
     fn render_sidebar_project_row(
         &self,
         row: &SidebarRow,
-        indent: f32,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let project_id = row.id().to_string();
@@ -7314,81 +7403,78 @@ impl MobileApp {
         div()
             .id(format!("mobile-project-row-{project_id}"))
             .h_full()
-            .mx(px(theme::SPACING_SM))
-            .pl(px(indent))
-            .pr(px(theme::SIDEBAR_GRIP_WIDTH * 2.0))
-            .rounded(px(theme::RADIUS_CONTROL))
+            .relative()
+            .left(px(-theme::SIDEBAR_ICON_SLOT_OVERHANG))
+            .mx(px(theme::SIDEBAR_LIST_PADDING))
+            .pl(px(row.indent))
+            .pr(px(self.sidebar_actions_width(row)))
+            .rounded(px(theme::SIDEBAR_ROW_RADIUS))
             .flex()
             .items_center()
-            .gap(px(theme::SPACING_SM))
+            .gap(px(theme::SIDEBAR_ICON_TITLE_GAP))
             .when(row.selected, |project| {
                 project.bg(theme::sidebar_selected_bg())
             })
             .cursor_pointer()
             .active(|style| style.bg(theme::row_pressed_bg()))
+            // The whole row is the expander, the way the desktop's is; the phone
+            // simply has no hover state to reveal a separate chevron button.
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| this.toggle_project(project_id.clone(), cx)),
             )
-            .child(
+            .child(Self::sidebar_icon_slot(
                 svg()
-                    .path(if row.collapsed {
-                        "icons/chevron-right.svg"
-                    } else {
-                        "icons/chevron-down.svg"
-                    })
-                    .size(px(12.0))
-                    .flex_shrink_0()
-                    .text_color(theme::sidebar_text_muted()),
-            )
-            .child(
-                div()
-                    .w(px(30.0))
-                    .h(px(30.0))
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        svg()
-                            .path(project_icon_path)
-                            .size(px(18.0))
-                            .text_color(project_icon_color),
-                    ),
-            )
+                    .path(project_icon_path)
+                    .size(px(theme::SIDEBAR_PROJECT_LOGO_SIZE))
+                    .text_color(project_icon_color)
+                    .into_any_element(),
+            ))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .text_size(px(theme::FONT_BODY))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme::sidebar_text_primary())
-                    .child(row.label.clone()),
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SIDEBAR_ICON_TITLE_GAP))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(px(theme::FONT_SIDEBAR_TITLE))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(if row.selected {
+                                theme::sidebar_foreground(1.0)
+                            } else {
+                                theme::sidebar_foreground(0.78)
+                            })
+                            .child(row.label.clone()),
+                    )
+                    // The badge counts worktrees in both hierarchies, so it sits
+                    // against the name rather than at the row's trailing edge.
+                    .child(
+                        div()
+                            .size(px(20.0))
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(theme::FONT_SIDEBAR_META))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::sidebar_text_muted())
+                            .bg(theme::bg_card_dim())
+                            .child(row.child_count.to_string()),
+                    ),
             )
-            .when(row.child_count > 0, |project| {
-                project.child(
-                    div()
-                        .size(px(20.0))
-                        .flex_shrink_0()
-                        .rounded_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(theme::FONT_MICRO))
-                        .text_color(theme::sidebar_text_muted())
-                        .bg(theme::bg_card_dim())
-                        .child(row.child_count.to_string()),
-                )
-            })
             // Always visible: a phone has no hover state to reveal it.
             .child(
                 div()
                     .id(format!("mobile-project-new-session-{}", row.id()))
                     .aria_label(locale::common("New session"))
-                    .size(px(30.0))
+                    .size(px(theme::SIDEBAR_ICON_SLOT))
                     .flex_shrink_0()
                     .rounded(px(theme::RADIUS_CONTROL))
                     .flex()
@@ -7424,7 +7510,6 @@ impl MobileApp {
     fn render_sidebar_workspace_row(
         &self,
         row: &SidebarRow,
-        indent: f32,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let Some(workspace_id) = row.workspace_id.clone() else {
@@ -7446,25 +7531,7 @@ impl MobileApp {
         });
         let workspace_selected = row.selected
             || self.sidebar_selected_workspace_id.as_deref() == Some(workspace_id.as_str());
-        let status_color = sidebar_workspace_status_color(row.state);
-        let status_indicator = if matches!(
-            row.state,
-            Some(AgentSessionState::Running | AgentSessionState::Initializing)
-        ) {
-            svg()
-                .path("icons/refresh.svg")
-                .size(px(theme::ICON_STATUS + 2.0))
-                .flex_shrink_0()
-                .text_color(rgb(status_color))
-                .into_any_element()
-        } else {
-            div()
-                .size(px(theme::ICON_STATUS))
-                .flex_shrink_0()
-                .rounded_full()
-                .bg(rgb(status_color))
-                .into_any_element()
-        };
+        let status_indicator = sidebar_workspace_status_indicator(row.state);
         let detail = row.detail.clone().unwrap_or_else(|| {
             format!(
                 "{} · {}",
@@ -7479,19 +7546,19 @@ impl MobileApp {
         div()
             .id(format!("mobile-workspace-row-{workspace_id}"))
             .h_full()
-            .mx(px(theme::SPACING_SM))
-            .pl(px(indent))
-            .pr(px(theme::SIDEBAR_GRIP_WIDTH))
-            .rounded(px(theme::RADIUS_CONTROL))
+            .relative()
+            .left(px(-theme::SIDEBAR_ICON_SLOT_OVERHANG))
+            .mx(px(theme::SIDEBAR_LIST_PADDING))
+            .pl(px(row.indent))
+            .pr(px(self.sidebar_actions_width(row)))
+            .rounded(px(theme::SIDEBAR_ROW_RADIUS))
             .flex()
             .items_center()
-            .gap(px(theme::SPACING_XS))
+            .gap(px(theme::SIDEBAR_ICON_TITLE_GAP))
+            // The card around an expanded worktree carries the focus border, so
+            // the row itself only ever carries the fill.
             .when(workspace_selected, |workspace| {
-                workspace
-                    .bg(theme::sidebar_selected_bg())
-                    .when(!row.collapsed, |workspace| {
-                        workspace.border_1().border_color(rgb(theme::ACCENT_BLUE))
-                    })
+                workspace.bg(theme::sidebar_selected_bg())
             })
             .cursor_pointer()
             .active(|style| style.bg(theme::row_pressed_bg()))
@@ -7499,25 +7566,16 @@ impl MobileApp {
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| this.toggle_workspace(toggle_id.clone(), cx)),
             )
-            .child(
-                svg()
-                    .path(if row.collapsed {
-                        "icons/chevron-right.svg"
-                    } else {
-                        "icons/chevron-down.svg"
-                    })
-                    .size(px(12.0))
-                    .flex_shrink_0()
-                    .text_color(theme::sidebar_text_muted()),
-            )
+            // The status mark hangs at the top of the slot because the row runs
+            // two lines; centring it would drift off the title it belongs to.
             .child(
                 div()
-                    .w(px(30.0))
-                    .h(px(30.0))
+                    .size(px(theme::SIDEBAR_ICON_SLOT))
                     .flex_shrink_0()
                     .flex()
-                    .items_center()
+                    .items_start()
                     .justify_center()
+                    .pt(px(4.0))
                     .child(status_indicator),
             )
             .child(
@@ -7533,9 +7591,13 @@ impl MobileApp {
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
-                            .text_size(px(theme::FONT_BODY))
+                            .text_size(px(theme::FONT_SIDEBAR_TITLE))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::sidebar_text_primary())
+                            .text_color(if workspace_selected {
+                                theme::sidebar_foreground(1.0)
+                            } else {
+                                theme::sidebar_foreground(0.72)
+                            })
                             .child(row.label.clone()),
                     )
                     .child(
@@ -7544,30 +7606,16 @@ impl MobileApp {
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
-                            .text_size(px(theme::FONT_MICRO))
-                            .text_color(theme::sidebar_text_muted())
+                            .text_size(px(theme::FONT_SIDEBAR_META))
+                            .text_color(theme::sidebar_foreground(0.48))
                             .child(detail),
                     ),
             )
-            .when(row.child_count > 0, |workspace| {
-                workspace.child(
-                    div()
-                        .size(px(20.0))
-                        .flex_shrink_0()
-                        .rounded_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(theme::FONT_MICRO))
-                        .text_color(theme::sidebar_text_muted())
-                        .bg(theme::bg_card_dim())
-                        .child(row.child_count.to_string()),
-                )
-            })
             .child(
                 div()
                     .id(format!("mobile-workspace-new-session-{workspace_id}"))
-                    .size(px(30.0))
+                    .aria_label(locale::common("New session"))
+                    .size(px(theme::SIDEBAR_ICON_SLOT))
                     .flex_shrink_0()
                     .rounded(px(theme::RADIUS_CONTROL))
                     .flex()
@@ -7599,7 +7647,6 @@ impl MobileApp {
     fn render_sidebar_session_row(
         &self,
         row: &SidebarRow,
-        indent: f32,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let Some(session_id) = row.session_id.clone() else {
@@ -7610,53 +7657,38 @@ impl MobileApp {
             return div().into_any_element();
         };
         let session_state = row.state.unwrap_or(session.state);
-        let status = match session_state {
-            AgentSessionState::Running | AgentSessionState::Initializing if row.auto_continue => {
-                theme::ACCENT_GREEN
-            }
-            AgentSessionState::Running => theme::ACCENT_BLUE,
-            AgentSessionState::NeedsInput => theme::ACCENT_YELLOW,
-            AgentSessionState::Error => theme::ACCENT_RED,
-            AgentSessionState::Initializing => theme::ACCENT_BLUE,
-            AgentSessionState::Idle => theme::ACCENT_DIM,
-            AgentSessionState::Archived | AgentSessionState::Closed => theme::ACCENT_DIM,
-        };
-        let state_label = sidebar_session_state_label(session_state);
-        let show_status = !row.pinned
-            && matches!(
-                session_state,
-                AgentSessionState::Running
-                    | AgentSessionState::Initializing
-                    | AgentSessionState::NeedsInput
-                    | AgentSessionState::Error
-            );
-        let show_time = !row.pinned
-            && !row.unread
-            && state_label.is_none()
-            && !matches!(
-                session_state,
-                AgentSessionState::Running
-                    | AgentSessionState::Initializing
-                    | AgentSessionState::NeedsInput
-                    | AgentSessionState::Error
-            );
+        let generating = session_state == AgentSessionState::Running;
+        let needs_approval = session_state == AgentSessionState::NeedsInput;
+        let has_error = session_state == AgentSessionState::Error;
+        // An error states itself with its own dot, so it never also spends the
+        // chip; that is the desktop's rule for this column.
+        let state_label = (!has_error)
+            .then(|| sidebar_session_state_label(session_state))
+            .flatten();
         let is_selected = row.selected
             || self
                 .sidebar_state
                 .selected_ids
                 .contains(session_id.as_str());
+        let show_status = !row.pinned
+            && !needs_approval
+            && !row.unread
+            && !has_error
+            && session_state != AgentSessionState::Idle;
         let open_session_id = session_id.clone();
         let batch_session_id = session_id.clone();
         div()
             .id(format!("mobile-session-row-{}", row.id()))
             .h_full()
-            .mx(px(theme::SPACING_SM))
-            .pl(px(indent))
-            .pr(px(theme::SIDEBAR_GRIP_WIDTH * 2.0))
-            .rounded(px(theme::RADIUS_CONTROL))
+            .mx(px(theme::SIDEBAR_LIST_PADDING))
+            // A session row starts past the card overhang rather than hanging
+            // into it, so its agent mark clears a worktree's status column.
+            .pl(px(row.indent + theme::SIDEBAR_SESSION_CONTENT_INSET))
+            .pr(px(self.sidebar_actions_width(row)))
+            .rounded(px(theme::SIDEBAR_ROW_RADIUS))
             .flex()
             .items_center()
-            .gap(px(7.0))
+            .gap(px(theme::SPACING_SM))
             .when(is_selected, |row| row.bg(theme::sidebar_selected_bg()))
             .cursor_pointer()
             .active(|style| style.bg(theme::row_pressed_bg()))
@@ -7676,22 +7708,22 @@ impl MobileApp {
                     row.child(
                         svg()
                             .path("icons/git-branch.svg")
-                            .size(px(13.0))
+                            .size(px(12.0))
                             .flex_shrink_0()
-                            .text_color(theme::sidebar_text_muted()),
+                            .text_color(theme::sidebar_foreground(0.78)),
                     )
                 },
             )
             .child(
                 svg()
                     .path(agent_icon_path(&session.agent_id.to_string()))
-                    .size(px(16.0))
+                    .size(px(theme::SIDEBAR_AGENT_LOGO_SIZE))
                     .flex_shrink_0()
-                    .text_color(if is_selected {
-                        theme::text_primary()
+                    .text_color(theme::sidebar_foreground(if is_selected {
+                        0.80
                     } else {
-                        theme::sidebar_text_muted()
-                    }),
+                        0.58
+                    })),
             )
             .child(
                 div()
@@ -7700,73 +7732,92 @@ impl MobileApp {
                     .overflow_hidden()
                     .text_ellipsis()
                     .whitespace_nowrap()
-                    .text_size(px(theme::FONT_BODY))
+                    .text_size(px(theme::FONT_SIDEBAR_ROW))
+                    .when(is_selected, |title| title.font_weight(FontWeight::SEMIBOLD))
                     .text_color(if is_selected {
-                        theme::text_primary()
+                        theme::sidebar_foreground(1.0)
                     } else {
-                        theme::sidebar_text_secondary()
+                        theme::sidebar_foreground(0.56)
                     })
                     .child(row.label.clone()),
             )
             .child(
                 div()
-                    .w(px(96.0))
+                    .w(px(theme::SIDEBAR_SESSION_META_WIDTH))
                     .flex_shrink_0()
                     .flex()
                     .items_center()
                     .justify_end()
-                    .gap(px(5.0))
+                    .gap(px(6.0))
+                    .text_size(px(theme::FONT_SIDEBAR_ROW))
+                    .text_color(theme::sidebar_foreground(0.48))
                     .when(row.pinned, |right| {
                         right.child(
                             svg()
                                 .path("icons/pin.svg")
-                                .size(px(11.0))
+                                .size(px(14.0))
+                                .flex_shrink_0()
                                 .text_color(rgb(theme::ACCENT_YELLOW)),
                         )
+                    })
+                    .when(show_status, |right| {
+                        right.child(sidebar_session_status_indicator(
+                            session_state,
+                            row.auto_continue,
+                        ))
+                    })
+                    .when(!row.pinned && needs_approval, |right| {
+                        right.child(
+                            svg()
+                                .path("icons/triangle-alert.svg")
+                                .size(px(14.0))
+                                .flex_shrink_0()
+                                .text_color(rgb(theme::ACCENT_YELLOW)),
+                        )
+                    })
+                    .when(!row.pinned && !needs_approval && !generating, |right| {
+                        right
+                            .when_some(state_label, |right, label| {
+                                right.child(
+                                    div()
+                                        .h(px(16.0))
+                                        .flex_shrink_0()
+                                        .rounded(px(4.0))
+                                        .px(px(6.0))
+                                        .flex()
+                                        .items_center()
+                                        .text_size(px(theme::FONT_SIDEBAR_META))
+                                        .bg(theme::sidebar_chip_bg())
+                                        .text_color(theme::sidebar_text_muted())
+                                        .child(label),
+                                )
+                            })
+                            .when(
+                                state_label.is_none() && !row.unread && !has_error,
+                                |right| {
+                                    right.child(
+                                        div()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .child(session_sidebar_time_label(
+                                                session.last_message_at_ms,
+                                            )),
+                                    )
+                                },
+                            )
                     })
                     .when(row.unread, |right| {
                         right.child(
                             div()
-                                .size(px(7.0))
+                                .size(px(theme::SIDEBAR_UNREAD_DOT))
+                                .flex_shrink_0()
                                 .rounded_full()
-                                .bg(rgb(theme::ACCENT_BLUE)),
+                                .bg(theme::sidebar_foreground(1.0)),
                         )
                     })
-                    .when(show_status, |right| {
-                        right.child(
-                            div()
-                                .size(px(theme::ICON_STATUS))
-                                .rounded_full()
-                                .bg(rgb(status)),
-                        )
-                    })
-                    .when_some(
-                        (!row.pinned).then_some(state_label).flatten(),
-                        |right, label| {
-                            right.child(
-                                div()
-                                    .max_w(px(48.0))
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .text_size(px(theme::FONT_MICRO))
-                                    .text_color(theme::sidebar_text_muted())
-                                    .child(label),
-                            )
-                        },
-                    )
-                    .when(show_time, |right| {
-                        right.child(
-                            div()
-                                .w(px(52.0))
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .text_right()
-                                .text_size(px(theme::FONT_MICRO))
-                                .text_color(theme::sidebar_text_muted())
-                                .child(session_sidebar_time_label(session.last_message_at_ms)),
-                        )
+                    .when(has_error, |right| {
+                        right.child(sidebar_status_dot(rgb(theme::ACCENT_RED).into()))
                     }),
             )
             .into_any_element()
@@ -7866,6 +7917,7 @@ impl MobileApp {
                 .supports(BackendOperation::WorkspaceOpen)
         });
         let rows_for_list = rows.clone();
+        let cards_for_list = workspace_cards(&rows);
         let has_search_query = !search_query.trim().is_empty();
         let has_sidebar_items = !sessions.is_empty() || !self.workspace_summaries.is_empty();
         let project_ids = self
@@ -8427,7 +8479,14 @@ impl MobileApp {
                                             range
                                                 .filter_map(|index| {
                                                     rows_for_list.get(index).map(|row| {
-                                                        this.render_sidebar_row(index, row, cx)
+                                                        let guides =
+                                                            folder_guides(&rows_for_list, index);
+                                                        let card = cards_for_list
+                                                            .get(index)
+                                                            .and_then(Option::as_ref);
+                                                        this.render_sidebar_row(
+                                                            index, row, &guides, card, cx,
+                                                        )
                                                     })
                                                 })
                                                 .collect::<Vec<_>>()
@@ -10175,6 +10234,56 @@ fn sidebar_workspace_status_color(state: Option<AgentSessionState>) -> u32 {
         Some(AgentSessionState::Error) => theme::ACCENT_RED,
         Some(AgentSessionState::Idle) => theme::ACCENT_GREEN,
         Some(AgentSessionState::Archived | AgentSessionState::Closed) | None => theme::ACCENT_DIM,
+    }
+}
+
+fn sidebar_status_dot(color: gpui::Hsla) -> gpui::AnyElement {
+    div()
+        .size(px(theme::SIDEBAR_STATUS_DOT))
+        .flex_shrink_0()
+        .rounded_full()
+        .bg(color)
+        .into_any_element()
+}
+
+fn sidebar_workspace_status_indicator(state: Option<AgentSessionState>) -> gpui::AnyElement {
+    let color = rgb(sidebar_workspace_status_color(state));
+    match state {
+        Some(AgentSessionState::Running | AgentSessionState::Initializing) => svg()
+            .path("icons/refresh.svg")
+            .size(px(theme::SIDEBAR_STATUS_DOT + 2.0))
+            .flex_shrink_0()
+            .text_color(color)
+            .into_any_element(),
+        Some(
+            AgentSessionState::NeedsInput | AgentSessionState::Error | AgentSessionState::Idle,
+        )
+        | Some(AgentSessionState::Archived | AgentSessionState::Closed)
+        | None => sidebar_status_dot(color.into()),
+    }
+}
+
+fn sidebar_session_status_indicator(
+    state: AgentSessionState,
+    auto_continue_enabled: bool,
+) -> gpui::AnyElement {
+    match state {
+        AgentSessionState::Running | AgentSessionState::Initializing => svg()
+            .path("icons/refresh.svg")
+            .size(px(theme::SIDEBAR_STATUS_DOT + 2.0))
+            .flex_shrink_0()
+            .text_color(rgb(if auto_continue_enabled {
+                theme::ACCENT_GREEN
+            } else {
+                theme::ACCENT_BLUE
+            }))
+            .into_any_element(),
+        AgentSessionState::NeedsInput => sidebar_status_dot(rgb(theme::ACCENT_YELLOW).into()),
+        AgentSessionState::Error => sidebar_status_dot(rgb(theme::ACCENT_RED).into()),
+        AgentSessionState::Archived | AgentSessionState::Closed => {
+            sidebar_status_dot(theme::sidebar_foreground(0.35))
+        }
+        AgentSessionState::Idle => sidebar_status_dot(theme::sidebar_foreground(0.78)),
     }
 }
 

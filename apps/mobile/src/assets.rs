@@ -37,6 +37,8 @@ const ICONS: &[&str] = &[
     "icons/crosshair.svg",
     "icons/grip-vertical.svg",
     "icons/folder.svg",
+    "icons/folder-open.svg",
+    "icons/triangle-alert.svg",
     "icons/git-branch.svg",
     "icons/image.svg",
     "icons/boxes.svg",
@@ -149,6 +151,10 @@ impl AssetSource for MobileAssets {
             "icons/crosshair.svg" => Some(include_bytes!("../assets/icons/crosshair.svg")),
             "icons/grip-vertical.svg" => Some(include_bytes!("../assets/icons/grip-vertical.svg")),
             "icons/folder.svg" => Some(include_bytes!("../assets/icons/folder.svg")),
+            "icons/folder-open.svg" => Some(include_bytes!("../assets/icons/folder-open.svg")),
+            "icons/triangle-alert.svg" => {
+                Some(include_bytes!("../assets/icons/triangle-alert.svg"))
+            }
             "icons/git-branch.svg" => {
                 Some(include_bytes!("../../desktop/assets/icons/git-branch.svg"))
             }
