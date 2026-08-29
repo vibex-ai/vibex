@@ -40162,7 +40162,7 @@
     },
     {
       "type": "file",
-      "bom-ref": "asset:vibex-desktop-reviewed-icons:aed10ac6c8f49e43",
+      "bom-ref": "asset:vibex-desktop-reviewed-icons:3467f8919e5f677f",
       "name": "Vibex Desktop GPUI reviewed icon bundle",
       "version": "0.1.0-rc.1",
       "licenses": [
@@ -40173,7 +40173,7 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "aed10ac6c8f49e433c9bcd55ecb35d9a3d0f44db9f82464d675220357ce1e269"
+          "content": "3467f8919e5f677fc9c3b1232bf9f18574ce792e74fe604ea86532d80951f001"
         }
       ],
       "externalReferences": [
@@ -40193,7 +40193,7 @@
         },
         {
           "name": "vibex:file-count",
-          "value": "101"
+          "value": "183"
         },
         {
           "name": "vibex:selected-license",
@@ -40326,7 +40326,7 @@
     },
     {
       "type": "file",
-      "bom-ref": "asset:vibex-mobile-native-icons:2f960264f6103d8d",
+      "bom-ref": "asset:vibex-mobile-native-icons:6983b0fd27078851",
       "name": "Vibex native mobile Lucide controls",
       "version": "0.1.0-rc.1",
       "licenses": [
@@ -40337,7 +40337,7 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "2f960264f6103d8dc32fda8cab2fb40e8bf582e2c3c1159a9c568cbfe95da69c"
+          "content": "6983b0fd270788511904836df5cfc2e082ae44613accc767c4dc82e2464d68e7"
         }
       ],
       "externalReferences": [
@@ -40357,7 +40357,7 @@
         },
         {
           "name": "vibex:file-count",
-          "value": "7"
+          "value": "26"
         },
         {
           "name": "vibex:selected-license",
@@ -40671,7 +40671,7 @@
       "dependsOn": []
     },
     {
-      "ref": "asset:vibex-desktop-reviewed-icons:aed10ac6c8f49e43",
+      "ref": "asset:vibex-desktop-reviewed-icons:3467f8919e5f677f",
       "dependsOn": []
     },
     {
@@ -40683,7 +40683,7 @@
       "dependsOn": []
     },
     {
-      "ref": "asset:vibex-mobile-native-icons:2f960264f6103d8d",
+      "ref": "asset:vibex-mobile-native-icons:6983b0fd27078851",
       "dependsOn": []
     },
     {
@@ -48048,6 +48048,7 @@
         "cargo:sha2@0.10.9:c19b7c6f923b580a",
         "cargo:tokio@1.52.3:c19b7c6f923b580a",
         "cargo:tracing@0.1.44:c19b7c6f923b580a",
+        "cargo:vibex-config-switch@0.1.0-rc.1:15ba9694989d1411",
         "cargo:vibex-core@0.1.0-rc.1:a1f32ad3e304847a",
         "cargo:vibex-db@0.1.0-rc.1:b0d5d96e1f6cacc2"
       ]
@@ -48130,6 +48131,7 @@
         "cargo:serde@1.0.228:c19b7c6f923b580a",
         "cargo:serde_json@1.0.150:c19b7c6f923b580a",
         "cargo:sha2@0.10.9:c19b7c6f923b580a",
+        "cargo:similar@3.1.1:c19b7c6f923b580a",
         "cargo:thiserror@2.0.18:c19b7c6f923b580a",
         "cargo:uuid@1.23.3:c19b7c6f923b580a"
       ]
@@ -48202,7 +48204,7 @@
       "ref": "cargo:vibex-desktop@0.1.0-rc.1:8be20e5fa4f9b6f0",
       "dependsOn": [
         "asset:vibex-desktop-application-icons:9ae646c05c9fa1f7",
-        "asset:vibex-desktop-reviewed-icons:aed10ac6c8f49e43",
+        "asset:vibex-desktop-reviewed-icons:3467f8919e5f677f",
         "cargo:base64@0.22.1:c19b7c6f923b580a",
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
         "cargo:embed-resource@3.0.9:c19b7c6f923b580a",
@@ -48215,12 +48217,15 @@
         "cargo:image@0.25.10:c19b7c6f923b580a",
         "cargo:pdfium-render@0.9.3:c19b7c6f923b580a",
         "cargo:qrcode@0.14.1:c19b7c6f923b580a",
+        "cargo:resvg@0.46.0:c19b7c6f923b580a",
         "cargo:rfd@0.17.2:c19b7c6f923b580a",
         "cargo:serde@1.0.228:c19b7c6f923b580a",
         "cargo:serde_json@1.0.150:c19b7c6f923b580a",
         "cargo:sha2@0.10.9:c19b7c6f923b580a",
         "cargo:similar@3.1.1:c19b7c6f923b580a",
+        "cargo:sys-locale@0.3.2:c19b7c6f923b580a",
         "cargo:tokio@1.52.3:c19b7c6f923b580a",
+        "cargo:tracing@0.1.44:c19b7c6f923b580a",
         "cargo:tray-icon@0.24.2:c19b7c6f923b580a",
         "cargo:url@2.5.8:c19b7c6f923b580a",
         "cargo:vibex-agent-acp@0.1.0-rc.1:a2bd4049efbf7469",
@@ -48267,6 +48272,7 @@
       "ref": "cargo:vibex-fs@0.1.0-rc.1:9fbf48bd55955db3",
       "dependsOn": [
         "cargo:ignore@0.4.26:c19b7c6f923b580a",
+        "cargo:regex@1.12.4:c19b7c6f923b580a",
         "cargo:serde@1.0.228:c19b7c6f923b580a",
         "cargo:serde_json@1.0.150:c19b7c6f923b580a",
         "cargo:sha2@0.10.9:c19b7c6f923b580a",
@@ -48362,6 +48368,7 @@
       "ref": "cargo:vibex-terminal@0.1.0-rc.1:73363de7836b4dd0",
       "dependsOn": [
         "cargo:alacritty_terminal@0.26.0:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:serde@1.0.228:c19b7c6f923b580a",
         "cargo:serde_json@1.0.150:c19b7c6f923b580a",
         "cargo:sha2@0.10.9:c19b7c6f923b580a",
@@ -48375,7 +48382,7 @@
       "dependsOn": [
         "asset:vibex-mobile-application-icons:b690a33c976cf781",
         "asset:vibex-mobile-brand-marks:84a77e160e305979",
-        "asset:vibex-mobile-native-icons:2f960264f6103d8d",
+        "asset:vibex-mobile-native-icons:6983b0fd27078851",
         "cargo:serde@1.0.228:c19b7c6f923b580a",
         "cargo:vibex-backend@0.1.0-rc.1:14559522eff35735",
         "cargo:vibex-core@0.1.0-rc.1:a1f32ad3e304847a",

@@ -171,15 +171,15 @@
       "extensions": [
         ".svg"
       ],
-      "expectedFileCount": 101,
-      "treeSha256": "aed10ac6c8f49e433c9bcd55ecb35d9a3d0f44db9f82464d675220357ce1e269",
+      "expectedFileCount": 183,
+      "treeSha256": "3467f8919e5f677fc9c3b1232bf9f18574ce792e74fe604ea86532d80951f001",
       "licenseExpression": "AGPL-3.0-or-later AND ISC AND MIT AND CC0-1.0 AND LicenseRef-Third-Party-Brand-Marks",
       "source": "https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/icons",
-      "licenseEvidence": "52 Lucide SVGs (ISC); 15 SVG Logos and 3 Simple Icons SVGs (CC0-1.0); 1 Material Icon Theme and 1 VSCode Icons SVG (MIT); 1 Vibex mark (AGPL-3.0-or-later); 28 Agent brand SVGs from the Agent Client Protocol registry and official vendor sources (third-party brand marks). Brand names and marks remain the property of their respective owners.",
+      "licenseEvidence": "73 Lucide SVGs (ISC); 15 SVG Logos and 3 Simple Icons SVGs (CC0-1.0); 1 Material Icon Theme and 1 VSCode Icons SVG (MIT); 1 Vibex mark (AGPL-3.0-or-later); 30 Agent brand SVGs from the Agent Client Protocol registry and official vendor sources; 59 OpenRouter model/provider brand SVGs vectorized from the OpenRouter model catalog and linked provider marks (third-party brand marks). Brand names and marks remain the property of their respective owners.",
       "sourceComponents": [
         {
           "name": "Lucide",
-          "fileCount": 52,
+          "fileCount": 73,
           "licenseExpression": "ISC",
           "source": "https://github.com/lucide-icons/lucide"
         },
@@ -215,9 +215,15 @@
         },
         {
           "name": "Agent brand marks",
-          "fileCount": 28,
+          "fileCount": 30,
           "licenseExpression": "LicenseRef-Third-Party-Brand-Marks",
           "source": "https://agentclientprotocol.com/get-started/registry#available-agents"
+        },
+        {
+          "name": "OpenRouter model and provider brand marks",
+          "fileCount": 59,
+          "licenseExpression": "LicenseRef-Third-Party-Brand-Marks",
+          "source": "https://openrouter.ai/models"
         }
       ]
     },
@@ -274,8 +280,8 @@
       "extensions": [
         ".svg"
       ],
-      "expectedFileCount": 7,
-      "treeSha256": "2f960264f6103d8dc32fda8cab2fb40e8bf582e2c3c1159a9c568cbfe95da69c",
+      "expectedFileCount": 26,
+      "treeSha256": "6983b0fd270788511904836df5cfc2e082ae44613accc767c4dc82e2464d68e7",
       "licenseExpression": "ISC",
       "source": "https://github.com/lucide-icons/lucide",
       "licenseEvidence": "The native mobile toolbar controls are derived from Lucide SVG paths and redistributed under the Lucide ISC license."
