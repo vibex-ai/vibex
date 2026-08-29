@@ -25,6 +25,9 @@ pub enum SidebarRowKind {
     Folder,
     Project,
     Workspace,
+    /// Presentation-only child for an expanded workspace with nothing visible
+    /// beneath it. It must never become a sidebar organization item.
+    EmptyWorkspace,
     Session,
 }
 
@@ -62,7 +65,10 @@ pub struct SidebarRow {
 
 impl SidebarRow {
     pub fn id(&self) -> &str {
-        if self.kind == SidebarRowKind::Workspace {
+        if matches!(
+            self.kind,
+            SidebarRowKind::Workspace | SidebarRowKind::EmptyWorkspace
+        ) {
             self.workspace_id.as_deref().unwrap_or_default()
         } else {
             self.item.id()
@@ -726,6 +732,7 @@ fn push_project_children(
         if workspace.collapsed && query.is_empty() {
             continue;
         }
+        let child_start = rows.len();
         push_workspace_children(
             rows,
             input,
@@ -739,6 +746,14 @@ fn push_project_children(
             depth + 1,
             indent + theme::SIDEBAR_WORKSPACE_SESSION_INDENT,
         );
+        if rows.len() == child_start && query.is_empty() {
+            rows.push(empty_workspace_row(
+                project_id,
+                &workspace.id,
+                depth + 1,
+                indent + theme::SIDEBAR_WORKSPACE_SESSION_INDENT,
+            ));
+        }
     }
 }
 
@@ -861,6 +876,35 @@ fn session_row(
     }
 }
 
+fn empty_workspace_row(
+    project_id: &str,
+    workspace_id: &str,
+    depth: usize,
+    indent: f32,
+) -> SidebarRow {
+    SidebarRow {
+        // Workspaces do not exist in the shared organization item enum. This
+        // mirrors the workspace row's local-only placeholder without allowing
+        // the empty state to be moved or mutated.
+        item: SidebarOrganizationItem::Project(workspace_id.to_string()),
+        kind: SidebarRowKind::EmptyWorkspace,
+        depth,
+        indent,
+        label: String::new(),
+        project_id: Some(project_id.to_string()),
+        workspace_id: Some(workspace_id.to_string()),
+        detail: None,
+        child_count: 0,
+        collapsed: false,
+        pinned: false,
+        selected: false,
+        state: None,
+        session_id: None,
+        unread: false,
+        auto_continue: false,
+    }
+}
+
 /// Session ids mapped to their project, as the mutation validator expects.
 pub fn session_projects(sessions: &[AgentSession]) -> BTreeMap<String, String> {
     sessions
@@ -914,6 +958,13 @@ pub fn drop_target(
     let index = (clamped.floor() as usize).min(last);
     let fraction = clamped - index as f32;
     if index == dragged_index {
+        return None;
+    }
+    if rows
+        .get(dragged_index)
+        .is_some_and(|row| row.kind == SidebarRowKind::EmptyWorkspace)
+        || rows[index].kind == SidebarRowKind::EmptyWorkspace
+    {
         return None;
     }
     let position = if rows[index].kind == SidebarRowKind::Folder
@@ -992,9 +1043,9 @@ pub struct SidebarCard {
     pub edge: SidebarCardEdge,
 }
 
-/// The worktree card each row belongs to. A collapsed or empty worktree gets no
-/// card, matching the Desktop, which only draws one once the worktree has a
-/// child column to enclose.
+/// The worktree card each row belongs to. An expanded empty worktree projects a
+/// placeholder child so it receives the same card treatment as one with
+/// sessions.
 pub fn workspace_cards(rows: &[SidebarRow]) -> Vec<Option<SidebarCard>> {
     let mut cards = vec![None; rows.len()];
     for (index, row) in rows.iter().enumerate() {
@@ -1070,6 +1121,7 @@ mod tests {
             SidebarRowKind::Folder => SidebarOrganizationItem::Folder(id.to_string()),
             SidebarRowKind::Project => SidebarOrganizationItem::Project(id.to_string()),
             SidebarRowKind::Workspace => SidebarOrganizationItem::Project(id.to_string()),
+            SidebarRowKind::EmptyWorkspace => SidebarOrganizationItem::Project(id.to_string()),
             SidebarRowKind::Session => SidebarOrganizationItem::Session(id.to_string()),
         };
         SidebarRow {
@@ -1179,6 +1231,65 @@ mod tests {
         assert_eq!(rows[1].child_count, 1);
         assert_eq!(rows[2].kind, SidebarRowKind::Session);
         assert_eq!(rows[2].depth, 2);
+    }
+
+    #[test]
+    fn an_expanded_empty_worktree_has_a_placeholder_inside_its_card() {
+        let mut view = SidebarOrganizationView::default();
+        view.hierarchy_mode = SidebarHierarchyMode::Detailed;
+        let projects = vec![SidebarProject {
+            id: "project_project".to_string(),
+            label: "vibex".to_string(),
+        }];
+        let workspaces = vec![SidebarWorkspace {
+            id: "workspace_project".to_string(),
+            project_id: "project_project".to_string(),
+            label: "project".to_string(),
+            detail: "/tmp/project".to_string(),
+            branch: Some("main".to_string()),
+            mode: WorkspaceMode::CurrentCheckout,
+            collapsed: false,
+        }];
+        let rows = sidebar_rows(SidebarRowInput {
+            view: &view,
+            projects: &projects,
+            workspaces: &workspaces,
+            sessions: &[],
+            selected_session_id: None,
+            query: "",
+        });
+        assert_eq!(
+            rows.iter().map(|row| row.kind).collect::<Vec<_>>(),
+            vec![
+                SidebarRowKind::Project,
+                SidebarRowKind::Workspace,
+                SidebarRowKind::EmptyWorkspace,
+            ]
+        );
+        assert_eq!(rows[2].depth, 2);
+        assert_eq!(rows[2].indent, theme::SIDEBAR_WORKSPACE_SESSION_INDENT);
+        let cards = workspace_cards(&rows);
+        assert_eq!(
+            cards[1].as_ref().map(|card| card.edge),
+            Some(SidebarCardEdge::Top)
+        );
+        assert_eq!(
+            cards[2].as_ref().map(|card| card.edge),
+            Some(SidebarCardEdge::Bottom)
+        );
+
+        let filtered_rows = sidebar_rows(SidebarRowInput {
+            view: &view,
+            projects: &projects,
+            workspaces: &workspaces,
+            sessions: &[],
+            selected_session_id: None,
+            query: "main",
+        });
+        assert_eq!(
+            filtered_rows.iter().map(|row| row.kind).collect::<Vec<_>>(),
+            vec![SidebarRowKind::Project, SidebarRowKind::Workspace]
+        );
     }
 
     #[test]
@@ -1581,16 +1692,18 @@ mod tests {
     }
 
     #[test]
-    fn a_worktree_card_spans_its_sessions_and_skips_an_empty_worktree() {
+    fn a_worktree_card_spans_its_sessions_and_an_empty_placeholder() {
         let mut rows = vec![
             row(SidebarRowKind::Project, "project", 0),
             row(SidebarRowKind::Workspace, "workspace", 1),
             row(SidebarRowKind::Session, "session-a", 2),
             row(SidebarRowKind::Session, "session-b", 2),
             row(SidebarRowKind::Workspace, "empty", 1),
+            row(SidebarRowKind::EmptyWorkspace, "empty", 2),
         ];
         rows[1].workspace_id = Some("workspace".to_string());
         rows[4].workspace_id = Some("empty".to_string());
+        rows[5].workspace_id = Some("empty".to_string());
         let cards = workspace_cards(&rows);
         assert_eq!(cards[0], None);
         assert_eq!(
@@ -1609,6 +1722,22 @@ mod tests {
             cards[3].as_ref().map(|card| card.workspace_id.as_str()),
             Some("workspace")
         );
-        assert_eq!(cards[4], None);
+        assert_eq!(
+            cards[4].as_ref().map(|card| card.edge),
+            Some(SidebarCardEdge::Top)
+        );
+        assert_eq!(
+            cards[5].as_ref().map(|card| card.edge),
+            Some(SidebarCardEdge::Bottom)
+        );
+    }
+
+    #[test]
+    fn an_empty_workspace_placeholder_is_not_a_drag_target() {
+        let rows = vec![
+            row(SidebarRowKind::Session, "dragged", 1),
+            row(SidebarRowKind::EmptyWorkspace, "empty", 1),
+        ];
+        assert_eq!(drop_target(&rows, 0, 1.5), None);
     }
 }

@@ -2603,6 +2603,9 @@ impl MobileApp {
         let Some(row) = rows.get(index).cloned() else {
             return;
         };
+        if row.kind == SidebarRowKind::EmptyWorkspace {
+            return;
+        }
         let can_organize = self.backend.as_ref().is_some_and(|backend| {
             backend
                 .capability_snapshot()
@@ -2664,7 +2667,9 @@ impl MobileApp {
         let mut target = drop_target(&rows, index, position);
         if let Some(candidate) = target.as_ref() {
             let candidate_row = &rows[candidate.index];
-            if rows[index].kind == SidebarRowKind::Workspace {
+            if candidate_row.kind == SidebarRowKind::EmptyWorkspace {
+                target = None;
+            } else if rows[index].kind == SidebarRowKind::Workspace {
                 // Worktrees reorder only among siblings in their project. They
                 // are never organization items, so a folder/session target is
                 // not a legal drop and there is no "into" operation here.
@@ -2706,6 +2711,11 @@ impl MobileApp {
         let Some(anchor) = rows.get(target.index) else {
             return;
         };
+        if drag.row.kind == SidebarRowKind::EmptyWorkspace
+            || anchor.kind == SidebarRowKind::EmptyWorkspace
+        {
+            return;
+        }
         if drag.row.kind == SidebarRowKind::Workspace {
             let (Some(workspace_id), Some(project_id), Some(anchor_workspace_id)) = (
                 drag.row.workspace_id.clone(),
@@ -5169,6 +5179,7 @@ impl MobileApp {
                     );
                 }
             }
+            SidebarRowKind::EmptyWorkspace => return div().into_any_element(),
         }
 
         div()
@@ -7088,6 +7099,7 @@ impl MobileApp {
             SidebarRowKind::Folder => self.render_sidebar_folder_row(row, cx),
             SidebarRowKind::Project => self.render_sidebar_project_row(row, cx),
             SidebarRowKind::Workspace => self.render_sidebar_workspace_row(row, cx),
+            SidebarRowKind::EmptyWorkspace => self.render_sidebar_empty_workspace_row(row),
             SidebarRowKind::Session => self.render_sidebar_session_row(row, cx),
         };
         // The desktop draws the card border once, around a real container. A
@@ -7122,7 +7134,7 @@ impl MobileApp {
                         .bottom_0()
                         .left(px(theme::SIDEBAR_LIST_PADDING + card.indent
                             - theme::SIDEBAR_ICON_SLOT_OVERHANG))
-                        .right(px(theme::SIDEBAR_LIST_PADDING + theme::SIDEBAR_CARD_INSET))
+                        .right(px(theme::SIDEBAR_CARD_INSET))
                         .border_l_1()
                         .border_r_1()
                         .border_color(theme::sidebar_card_focus_border())
@@ -7199,6 +7211,7 @@ impl MobileApp {
                         })
                     })
             }
+            SidebarRowKind::EmptyWorkspace => false,
         }
     }
 
@@ -7552,7 +7565,6 @@ impl MobileApp {
                             .text_ellipsis()
                             .whitespace_nowrap()
                             .text_size(px(theme::FONT_SIDEBAR_TITLE))
-                            .font_weight(FontWeight::SEMIBOLD)
                             .text_color(if workspace_selected {
                                 theme::sidebar_foreground(1.0)
                             } else {
@@ -7601,6 +7613,27 @@ impl MobileApp {
                             .text_color(theme::sidebar_text_muted()),
                     ),
             )
+            .into_any_element()
+    }
+
+    fn render_sidebar_empty_workspace_row(&self, row: &SidebarRow) -> gpui::AnyElement {
+        div()
+            .id(format!("mobile-empty-workspace-row-{}", row.id()))
+            .h_full()
+            .mx(px(theme::SIDEBAR_LIST_PADDING))
+            .pl(px(row.indent + theme::SIDEBAR_SESSION_CONTENT_INSET))
+            .flex()
+            .items_center()
+            .gap(px(theme::SPACING_SM))
+            .text_size(px(theme::FONT_SIDEBAR_ROW))
+            .text_color(theme::sidebar_foreground(0.45))
+            .child(
+                svg()
+                    .path("icons/message-square.svg")
+                    .size(px(14.0))
+                    .flex_shrink_0(),
+            )
+            .child(locale::text("No sessions", "暂无会话", "暫無會話"))
             .into_any_element()
     }
 
