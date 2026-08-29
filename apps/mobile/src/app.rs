@@ -364,6 +364,8 @@ pub struct MobileApp {
     sidebar_selected_workspace_id: Option<String>,
     session_sync_busy: bool,
     session_sync_queued: bool,
+    workspace_sync_busy: bool,
+    workspace_sync_queued: bool,
     sidebar_sync_busy: bool,
     sidebar_sync_queued: bool,
     sidebar_drag: Option<SidebarDrag>,
@@ -489,6 +491,8 @@ impl MobileApp {
             sidebar_selected_workspace_id: None,
             session_sync_busy: false,
             session_sync_queued: false,
+            workspace_sync_busy: false,
+            workspace_sync_queued: false,
             sidebar_sync_busy: false,
             sidebar_sync_queued: false,
             sidebar_drag: None,
@@ -885,6 +889,8 @@ impl MobileApp {
                         }
                         if sidebar_needs_refresh {
                             this.refresh_sessions(cx);
+                            this.refresh_workspaces(cx);
+                            this.refresh_sidebar_organization(cx);
                         }
                         cx.notify();
                         decision == Some(AgentEventDecision::NeedsAuthoritativeRefetch)
@@ -1688,13 +1694,19 @@ impl MobileApp {
     }
 
     fn refresh_workspaces(&mut self, cx: &mut Context<Self>) {
+        if self.workspace_sync_busy {
+            self.workspace_sync_queued = true;
+            return;
+        }
         let Some(backend) = self.backend.clone() else {
             return;
         };
+        self.workspace_sync_busy = true;
         let runner = gpui_tokio::Tokio::spawn(cx, async move { backend.list_workspaces().await });
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
             let _ = entity.update(cx, |this, cx| {
+                this.workspace_sync_busy = false;
                 match outcome {
                     Ok(summaries) => {
                         this.workspace_summaries = summaries.clone();
@@ -1727,6 +1739,10 @@ impl MobileApp {
                         }
                     }
                     Err(error) => this.error = Some(error),
+                }
+                if this.workspace_sync_queued {
+                    this.workspace_sync_queued = false;
+                    this.refresh_workspaces(cx);
                 }
                 cx.notify();
             });
@@ -2889,6 +2905,8 @@ impl MobileApp {
         self.sidebar_selected_workspace_id = None;
         self.session_sync_busy = false;
         self.session_sync_queued = false;
+        self.workspace_sync_busy = false;
+        self.workspace_sync_queued = false;
         self.sidebar_sync_busy = false;
         self.sidebar_sync_queued = false;
         self.sidebar_drag = None;
@@ -10700,6 +10718,27 @@ mod tests {
             },
             observed_live: false,
         }));
+    }
+
+    #[test]
+    fn sidebar_invalidation_refreshes_each_authoritative_projection() {
+        let source = include_str!("app.rs");
+        let stream = source
+            .split_once("    fn start_event_stream(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn stop_connection_tasks("))
+            .map(|(body, _)| body)
+            .expect("mobile event stream should remain inspectable");
+        assert!(stream.contains("this.refresh_sessions(cx);"));
+        assert!(stream.contains("this.refresh_workspaces(cx);"));
+        assert!(stream.contains("this.refresh_sidebar_organization(cx);"));
+
+        let workspaces = source
+            .split_once("    fn refresh_workspaces(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn ensure_workbench("))
+            .map(|(body, _)| body)
+            .expect("workspace refresh should remain inspectable");
+        assert!(workspaces.contains("workspace_sync_busy"));
+        assert!(workspaces.contains("workspace_sync_queued"));
     }
 
     #[test]

@@ -4227,7 +4227,7 @@ fn dispatch_text(inner: &Shared<TransportInner>, text: &str) {
 }
 
 fn is_projection_invalidation_channel(channel: &str) -> bool {
-    matches!(channel, "file" | "git" | "provider" | "device")
+    matches!(channel, "file" | "git" | "provider" | "device" | "sidebar")
 }
 
 fn projection_invalidation_channel(event: &RemoteTransportEvent) -> Option<&str> {
@@ -5588,11 +5588,13 @@ mod tests {
         dispatch("agent_session", 1);
         dispatch("file", 1);
         dispatch("file", 3);
+        dispatch("sidebar", 2);
+        dispatch("sidebar", 4);
         dispatch("git", 7);
 
         assert!(!transport.inner.sync.lock().unwrap().is_paused());
         let queued = transport.inner.events.lock().unwrap();
-        assert_eq!(queued.len(), 3);
+        assert_eq!(queued.len(), 4);
         let channels = queued
             .iter()
             .filter_map(|event| match event {
@@ -5604,7 +5606,12 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             channels,
-            vec![("agent_session", 1), ("file", 3), ("git", 7)]
+            vec![
+                ("agent_session", 1),
+                ("file", 3),
+                ("sidebar", 4),
+                ("git", 7)
+            ]
         );
     }
 

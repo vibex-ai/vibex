@@ -5347,6 +5347,8 @@ impl VibexWorkbench {
                 let active = entity
                     .update(cx, |this, cx| {
                         if this.apply_sidebar_scheduled_archives(unix_timestamp_ms()) {
+                            this.invalidate_sidebar_projection_cache();
+                            this.publish_sidebar_invalidation();
                             cx.notify();
                         }
                     })
@@ -6065,12 +6067,17 @@ impl VibexWorkbench {
                     this.workspace_context_task = None;
                     match outcome {
                         Ok(Ok((summaries, contexts))) => {
-                            this.workspaces = summaries
+                            let workspaces = summaries
                                 .into_iter()
                                 .map(|summary| (summary.project, summary.workspace))
                                 .collect();
+                            let workspaces_changed = this.workspaces != workspaces;
+                            this.workspaces = workspaces;
                             this.workspace_contexts = contexts;
                             this.reconcile_sidebar_state();
+                            if workspaces_changed {
+                                this.publish_sidebar_invalidation();
+                            }
                         }
                         Ok(Err(error)) => {
                             this.runtime_note = Some(format!(
@@ -6350,7 +6357,6 @@ impl VibexWorkbench {
             .sidebar
             .organization
             .reconcile(&ordered_project_ids, &ordered_session_projects);
-        self.apply_sidebar_scheduled_archives(unix_timestamp_ms());
         self.sidebar_move_selected_items.retain(|item| match item {
             SidebarOrganizationItem::Project(id) => valid_project_ids.contains(id),
             SidebarOrganizationItem::Session(id) => valid_session_ids.contains(id),
@@ -6376,7 +6382,11 @@ impl VibexWorkbench {
             self.sidebar_rename_target = None;
             self.sidebar_rename_error = None;
         }
+        let archives_changed = self.apply_sidebar_scheduled_archives(unix_timestamp_ms());
         self.invalidate_sidebar_projection_cache();
+        if archives_changed {
+            self.publish_sidebar_invalidation();
+        }
     }
 
     fn apply_sidebar_scheduled_archives(&mut self, now_ms: i64) -> bool {
@@ -6399,6 +6409,11 @@ impl VibexWorkbench {
         {
             return;
         }
+        let snapshot_changed = self
+            .sessions
+            .iter()
+            .find(|existing| existing.id == session.id)
+            .is_none_or(|existing| existing != &session);
         let auto_continue_enabled = self
             .ui_state
             .session
@@ -6431,6 +6446,9 @@ impl VibexWorkbench {
             }
             self.sessions.insert(0, session);
         }
+        if snapshot_changed {
+            self.invalidate_sidebar_projection_cache();
+        }
     }
 
     fn session_turn_pending(&self, session_id: &VibexSessionId) -> bool {
@@ -6439,6 +6457,9 @@ impl VibexWorkbench {
     }
 
     fn set_session_turn_pending(&mut self, session_id: &VibexSessionId, pending: bool) {
+        let was_pending = self
+            .pending_agent_turn_session_ids
+            .contains(session_id.as_str());
         if pending {
             self.pending_agent_turn_session_ids
                 .insert(session_id.as_str().to_string());
@@ -6457,6 +6478,10 @@ impl VibexWorkbench {
             if !pending {
                 self.agent_generation_stats = None;
             }
+        }
+        if was_pending != pending {
+            self.invalidate_sidebar_projection_cache();
+            self.publish_sidebar_invalidation();
         }
     }
 
@@ -6496,6 +6521,7 @@ impl VibexWorkbench {
         self.ui_state.session.auto_continue_project_ids =
             self.auto_continue_default_project_ids.clone();
         self.queue_ui_state();
+        self.publish_sidebar_invalidation();
         cx.notify();
     }
 
@@ -6658,6 +6684,7 @@ impl VibexWorkbench {
             .auto_continue_session_overrides
             .insert(session_id.as_str().to_string(), enabled);
         self.queue_ui_state();
+        self.publish_sidebar_invalidation();
         cx.notify();
     }
 
@@ -7703,6 +7730,7 @@ impl VibexWorkbench {
                         this.upsert_session_snapshot(session.clone());
                         this.set_session_turn_pending(&session.id, true);
                         this.reconcile_sidebar_state();
+                        this.publish_sidebar_invalidation();
                         this.select_session_with_history(session.id.clone(), false, cx);
                         this.refresh_workspace_contexts(cx);
                         cx.notify();
@@ -7720,6 +7748,7 @@ impl VibexWorkbench {
                             let session_id = session.id.clone();
                             this.upsert_session_snapshot(session);
                             this.reconcile_sidebar_state();
+                            this.publish_sidebar_invalidation();
                             if this.selected_session_id.as_ref() == Some(&session_id) {
                                 this.refresh_selected_agent_timeline(cx);
                             }
@@ -7755,6 +7784,7 @@ impl VibexWorkbench {
         }
         self.collapsed_project_restore = None;
         self.queue_agent_ui_state();
+        self.publish_sidebar_invalidation();
         cx.notify();
     }
 
@@ -7766,6 +7796,7 @@ impl VibexWorkbench {
         }
         self.collapsed_project_restore = None;
         self.queue_agent_ui_state();
+        self.publish_sidebar_invalidation();
         cx.notify();
     }
 
@@ -7802,6 +7833,7 @@ impl VibexWorkbench {
                 .insert(workspace_id);
         }
         self.queue_ui_state();
+        self.publish_sidebar_invalidation();
         cx.notify();
     }
 
@@ -8188,6 +8220,7 @@ impl VibexWorkbench {
         if move_string_relative(order, moving_id, target_id, after) {
             self.queue_ui_state();
             self.invalidate_sidebar_projection_cache();
+            self.publish_sidebar_invalidation();
             cx.notify();
         }
     }
@@ -8669,13 +8702,15 @@ impl VibexWorkbench {
             .map(|group| group.project.id.as_str().to_string())
             .collect::<Vec<_>>();
         complete_string_order(&mut self.ui_state.sidebar.project_order, ids);
-        if move_strings_relative(
+        let changed = move_strings_relative(
             &mut self.ui_state.sidebar.project_order,
             moving_ids,
             target_id,
             after,
-        ) {
+        );
+        if changed {
             self.queue_ui_state();
+            self.publish_sidebar_invalidation();
         }
         self.invalidate_sidebar_projection_cache();
         cx.notify();
@@ -9499,7 +9534,9 @@ impl VibexWorkbench {
         self.clear_sidebar_move_selection();
         self.new_session_open = false;
         self.new_session_error = None;
-        mark_agent_session_read(&mut self.unread_agent_completion_session_ids, &session_id);
+        if mark_agent_session_read(&mut self.unread_agent_completion_session_ids, &session_id) {
+            self.publish_sidebar_invalidation();
+        }
         let Some(runtime) = self.runtime.clone() else {
             return;
         };
@@ -10042,6 +10079,7 @@ impl VibexWorkbench {
                                         this.upsert_session_snapshot(session);
                                         this.reconcile_sidebar_state();
                                         this.sync_auto_continue_for_session(&session_id, cx);
+                                        this.publish_sidebar_invalidation();
                                     }
                                     if selected_projection_changed {
                                         this.refresh_last_timeline_size();
@@ -10123,6 +10161,9 @@ impl VibexWorkbench {
             self.selected_session_id.as_ref(),
             &events,
         );
+        if sidebar_changed || unread_changed {
+            self.publish_sidebar_invalidation();
+        }
         let Some(selected_session_id) = self.selected_session_id.clone() else {
             return unread_changed || sidebar_changed;
         };
@@ -11802,6 +11843,7 @@ impl VibexWorkbench {
                 if let Ok((_, Some(session))) = &outcome {
                     this.upsert_session_snapshot(session.clone());
                     this.reconcile_sidebar_state();
+                    this.publish_sidebar_invalidation();
                 }
                 if completed {
                     this.composer_submission_locators
@@ -15011,13 +15053,14 @@ impl VibexWorkbench {
                 let outcome = runner.await;
                 let _ = entity.update_in(cx, |this, window, cx| {
                     if let Ok(Ok(session)) = &outcome {
-                        if !turn_was_locally_pending {
-                            this.set_session_turn_pending(&interrupted_session_id, false);
-                        }
                         if let Some(session) = session {
                             this.upsert_session_snapshot(session.clone());
                         }
                         this.reconcile_sidebar_state();
+                        if !turn_was_locally_pending {
+                            this.set_session_turn_pending(&interrupted_session_id, false);
+                        }
+                        this.publish_sidebar_invalidation();
                         this.sync_auto_continue_for_session(&interrupted_session_id, cx);
                     }
                     if this.session_generation != generation
@@ -15144,6 +15187,7 @@ impl VibexWorkbench {
                     }
                     this.set_session_turn_pending(&continued_session_id, false);
                     this.sync_auto_continue_for_session(&continued_session_id, cx);
+                    this.publish_sidebar_invalidation();
                     if matches!(&outcome, Ok((Ok(_), _)))
                         && this
                             .composer_queue
@@ -15248,6 +15292,7 @@ impl VibexWorkbench {
                         let _ = entity.update_in(cx, |this, window, cx| {
                             this.upsert_session_snapshot(session);
                             this.reconcile_sidebar_state();
+                            this.publish_sidebar_invalidation();
                             let source_still_selected = this.session_generation == generation
                                 && this.selected_session_id.as_ref()
                                     == Some(&selected_source_session_id);
@@ -15284,6 +15329,7 @@ impl VibexWorkbench {
                             let session_id = session.id.clone();
                             this.upsert_session_snapshot(session);
                             this.reconcile_sidebar_state();
+                            this.publish_sidebar_invalidation();
                             if this.selected_session_id.as_ref() == Some(&session_id) {
                                 let generation = this.session_generation;
                                 this.load_agent_session_projection(
@@ -15315,6 +15361,7 @@ impl VibexWorkbench {
                             if let Some(session) = persisted_session {
                                 this.upsert_session_snapshot(session);
                                 this.reconcile_sidebar_state();
+                                this.publish_sidebar_invalidation();
                             }
                             if announced_session_id.as_ref().is_some_and(|session_id| {
                                 this.selected_session_id.as_ref() == Some(session_id)
@@ -15534,6 +15581,7 @@ impl VibexWorkbench {
                             if let Some(session) = session {
                                 this.upsert_session_snapshot(session);
                                 this.reconcile_sidebar_state();
+                                this.publish_sidebar_invalidation();
                             }
                             if let Err(error) = result {
                                 this.agent_error =
@@ -15676,6 +15724,7 @@ impl VibexWorkbench {
         });
         self.upsert_session_snapshot(session);
         self.reconcile_sidebar_state();
+        self.publish_sidebar_invalidation();
         self.optimistic_runtime_selections
             .insert(session_id.as_str().to_string(), selection);
         if has_initial_message {
@@ -15712,6 +15761,7 @@ impl VibexWorkbench {
         session.workspace_mode = workspace.mode;
         session.updated_at_ms = workspace.updated_at_ms;
         self.invalidate_sidebar_projection_cache();
+        self.publish_sidebar_invalidation();
     }
 
     fn fail_pending_new_session(
@@ -16029,6 +16079,7 @@ impl VibexWorkbench {
             self.new_session_workspace.preference = NewSessionLocation::CurrentCheckout;
         }
         self.queue_ui_state();
+        self.publish_sidebar_invalidation();
         cx.notify();
     }
 
@@ -16705,6 +16756,7 @@ impl VibexWorkbench {
                             this.runtime_note = Some(note);
                         }
                         this.reconcile_sidebar_state();
+                        this.publish_sidebar_invalidation();
                         this.refresh_workspace_contexts(cx);
                         let has_queued_messages = this
                             .composer_queue
@@ -17352,6 +17404,7 @@ impl VibexWorkbench {
             self.queue_agent_ui_state();
         }
         self.queue_ui_state();
+        self.publish_sidebar_invalidation();
         self.begin_sidebar_folder_rename(folder_id, window, cx);
     }
 
@@ -17377,6 +17430,7 @@ impl VibexWorkbench {
         }
         self.clear_sidebar_context_menu_target(cx);
         self.queue_ui_state();
+        self.publish_sidebar_invalidation();
         cx.notify();
     }
 
@@ -17397,6 +17451,7 @@ impl VibexWorkbench {
         self.queue_ui_state();
         self.apply_sidebar_scheduled_archives(unix_timestamp_ms());
         self.invalidate_sidebar_projection_cache();
+        self.publish_sidebar_invalidation();
         cx.notify();
     }
 
@@ -17476,6 +17531,7 @@ impl VibexWorkbench {
             .is_some()
         {
             self.queue_ui_state();
+            self.publish_sidebar_invalidation();
             cx.notify();
         }
     }
@@ -17578,6 +17634,7 @@ impl VibexWorkbench {
                 self.sidebar_rename_error = None;
                 if changed {
                     self.queue_ui_state();
+                    self.publish_sidebar_invalidation();
                 }
                 cx.notify();
             }
@@ -17646,6 +17703,7 @@ impl VibexWorkbench {
                             {
                                 *session = updated;
                                 this.invalidate_sidebar_projection_cache();
+                                this.publish_sidebar_invalidation();
                             }
                             if this.sidebar_rename_target
                                 == Some(SidebarRenameTarget::Session(renamed_session_id.clone()))
@@ -17892,6 +17950,7 @@ impl VibexWorkbench {
             self.clear_suggestions();
         }
         self.reconcile_sidebar_state();
+        self.publish_sidebar_invalidation();
     }
 
     fn confirm_delete_project(
@@ -18083,6 +18142,7 @@ impl VibexWorkbench {
                 .worktree_titles
                 .insert(workspace_key, title);
             self.queue_ui_state();
+            self.publish_sidebar_invalidation();
             cx.notify();
             return;
         }
@@ -18128,6 +18188,7 @@ impl VibexWorkbench {
                                 .worktree_titles
                                 .insert(workspace_id.as_str().to_string(), title);
                             this.queue_ui_state();
+                            this.publish_sidebar_invalidation();
                             this.refresh_workspace_contexts(cx);
                         }
                         Ok(Err(error)) => {
@@ -18286,6 +18347,7 @@ impl VibexWorkbench {
         }
         self.queue_ui_state();
         self.reconcile_sidebar_state();
+        self.publish_sidebar_invalidation();
         let Some(backend) = self.backend.clone() else {
             self.pending_worktree_deletion_ids.remove(&workspace_key);
             cx.notify();
@@ -18857,6 +18919,7 @@ impl VibexWorkbench {
         }
         self.invalidate_sidebar_projection_cache();
         self.queue_agent_ui_state();
+        self.publish_sidebar_invalidation();
         cx.notify();
     }
 
@@ -18872,6 +18935,7 @@ impl VibexWorkbench {
             &project_ids,
         );
         self.queue_agent_ui_state();
+        self.publish_sidebar_invalidation();
         cx.notify();
     }
 
@@ -18914,6 +18978,7 @@ impl VibexWorkbench {
         if revealed {
             self.collapsed_project_restore = None;
             self.queue_agent_ui_state();
+            self.publish_sidebar_invalidation();
         }
         let selected_session_scroll_anchor = self.selected_session_scroll_anchor.clone();
         let sidebar_scroll = self.sidebar_scroll.clone();
@@ -18941,6 +19006,7 @@ impl VibexWorkbench {
             SidebarHierarchyMode::Detailed => SidebarHierarchyMode::Compact,
         };
         self.queue_ui_state();
+        self.publish_sidebar_invalidation();
         cx.notify();
     }
 
@@ -19452,6 +19518,7 @@ impl VibexWorkbench {
                 .insert(project_id, appearance);
         }
         self.queue_ui_state();
+        self.publish_sidebar_invalidation();
         cx.notify();
     }
 
@@ -20387,6 +20454,7 @@ impl VibexWorkbench {
     fn set_sidebar_hierarchy_mode(&mut self, mode: SidebarHierarchyMode, cx: &mut Context<Self>) {
         self.ui_state.sidebar.hierarchy_mode = mode;
         self.queue_ui_state();
+        self.publish_sidebar_invalidation();
         cx.notify();
     }
 
@@ -50852,6 +50920,35 @@ mod tests {
         assert!(order.contains("self.publish_sidebar_invalidation();"));
         assert!(drop.contains("self.publish_sidebar_invalidation();"));
         assert!(source.contains("this.publish_sidebar_invalidation();"));
+    }
+
+    #[test]
+    fn session_snapshot_invalidation_follows_sidebar_reconciliation() {
+        let source = include_str!("app.rs");
+        let upsert = source
+            .split_once("    fn upsert_session_snapshot(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn session_turn_pending("))
+            .map(|(body, _)| body)
+            .expect("session snapshot helper should remain inspectable");
+        assert!(!upsert.contains("publish_sidebar_invalidation"));
+
+        let dispatch = source
+            .split_once("    fn dispatch_composer_message(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn maybe_dispatch_next_composer_queue_message(")
+            })
+            .map(|(body, _)| body)
+            .expect("composer dispatch should remain inspectable");
+        let snapshot = dispatch
+            .find("this.upsert_session_snapshot(session.clone());")
+            .expect("completion should reconcile the authoritative snapshot");
+        let reconcile = dispatch
+            .find("this.reconcile_sidebar_state();")
+            .expect("completion should reconcile sidebar state");
+        let publish = dispatch
+            .find("this.publish_sidebar_invalidation();")
+            .expect("completion should notify remote sidebar clients");
+        assert!(snapshot < reconcile && reconcile < publish);
     }
 
     #[test]
