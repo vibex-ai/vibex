@@ -70,7 +70,7 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["al
 ed25519-dalek = "2"
 futures-util = { version = "0.3", features = ["sink"] }
 futures-channel = "0.3"
-reqwest = { version = "0.13.4", features = ["json", "stream"] }
+reqwest = { version = "0.13.4", features = ["json", "stream", "socks"] }
 rcgen = { version = "0.14.9", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 fs2 = "0.4.3"

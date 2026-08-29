@@ -100,12 +100,12 @@ use vibex_desktop_model::{
     AgentOrderEntry, AgentOrdering, AgentPlanProjection, AgentSortStrategy, AppearanceUiState,
     ComposerAttachment, ComposerQueueSendMode, ComposerSuggestionSelection, ComposerTrigger,
     DesktopBehaviorUiState, DesktopUiStateV1, GitSelectionKey, GitWorkbenchMode, LocaleMode,
-    MessageSendKey, NavigationHistory, NewSessionLocation, NewSessionProjectTicket,
-    NewSessionSubmissionStage, NewSessionWorkspaceState, RUNTIME_SELECTION_PREFERENCE_LIMIT,
-    RuntimeCascadeChoice, RuntimeCascadeProjection, SIDEBAR_AUTO_ARCHIVE_MAX_DAYS,
-    SessionContentWidthMode, SessionUiState, SidebarHierarchyMode, SidebarMutationRejection,
-    SidebarOrganizationItem, SidebarOrganizationScope, SidebarOrganizationView,
-    SidebarProjectAppearance, SidebarProjectLogo, SidebarProjectLogoColor,
+    MessageSendKey, NavigationHistory, NetworkProxyUiState, NewSessionLocation,
+    NewSessionProjectTicket, NewSessionSubmissionStage, NewSessionWorkspaceState,
+    RUNTIME_SELECTION_PREFERENCE_LIMIT, RuntimeCascadeChoice, RuntimeCascadeProjection,
+    SIDEBAR_AUTO_ARCHIVE_MAX_DAYS, SessionContentWidthMode, SessionUiState, SidebarHierarchyMode,
+    SidebarMutationRejection, SidebarOrganizationItem, SidebarOrganizationScope,
+    SidebarOrganizationView, SidebarProjectAppearance, SidebarProjectLogo, SidebarProjectLogoColor,
     SidebarProjectProjection, SidebarState, SidebarWorkspaceProjection, StartupDestination,
     TerminalWorkingDirectory, ThemeMode as ModelThemeMode, ThrottledUiStateWriter,
     TimelineConversationTurn, TimelineFollowState, TimelineModel, TimelineProcessActivityGroup,
@@ -4070,6 +4070,15 @@ impl VibexWorkbench {
         let auto_continue_default_project_ids = ui_state.session.auto_continue_project_ids.clone();
         let auto_continue_session_ids = restored_auto_continue_session_ids(&ui_state.session);
         let initial_locale = locale::apply_locale(ui_state.appearance.locale);
+        match vibex_desktop_runtime::network_proxy::initialize(&ui_state.network_proxy) {
+            Ok(normalized) => ui_state.network_proxy = normalized,
+            Err(error) => {
+                eprintln!(
+                    "vibex-network-proxy: ignored invalid saved proxy configuration: {error}"
+                );
+                ui_state.network_proxy = NetworkProxyUiState::default();
+            }
+        }
         theme::apply_appearance(&ui_state.appearance, Some(window), cx);
         Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
         let focus_handle = cx.focus_handle();
@@ -5154,6 +5163,23 @@ impl VibexWorkbench {
     fn apply_loaded_ui_state(&mut self, mut state: DesktopUiStateV1, cx: &mut Context<Self>) {
         apply_layout_memory_preference(&mut state);
         normalize_empty_preview_visibility(&mut state);
+        match vibex_desktop_runtime::network_proxy::initialize(&state.network_proxy) {
+            Ok(normalized) => state.network_proxy = normalized,
+            Err(error) => {
+                self.persistence_note = Some(
+                    locale::text(
+                        "Saved network proxy settings were invalid and have been disabled.",
+                        "已保存的网络代理设置无效，已禁用。",
+                        "已儲存的網路代理設定無效，已停用。",
+                    )
+                    .to_string(),
+                );
+                eprintln!(
+                    "vibex-network-proxy: ignored invalid loaded proxy configuration: {error}"
+                );
+                state.network_proxy = NetworkProxyUiState::default();
+            }
+        }
         let auto_continue_default_project_ids = state.session.auto_continue_project_ids.clone();
         let auto_continue_session_ids = restored_auto_continue_session_ids(&state.session);
         let selected_session_id = state
@@ -19848,6 +19874,42 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    fn set_network_proxy_url(&mut self, value: String, cx: &mut Context<Self>) {
+        let next = NetworkProxyUiState {
+            enabled: self.ui_state.network_proxy.enabled,
+            proxy_url: (!value.trim().is_empty()).then_some(value.trim().to_string()),
+        };
+        match vibex_desktop_runtime::network_proxy::configure(&next) {
+            Ok(normalized) => {
+                self.ui_state.network_proxy = normalized;
+                self.persistence_note = None;
+                self.queue_ui_state();
+            }
+            Err(error) => {
+                self.persistence_note = Some(localize_network_proxy_error(&error));
+            }
+        }
+        cx.notify();
+    }
+
+    fn set_network_proxy_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let next = NetworkProxyUiState {
+            enabled,
+            proxy_url: self.ui_state.network_proxy.proxy_url.clone(),
+        };
+        match vibex_desktop_runtime::network_proxy::configure(&next) {
+            Ok(normalized) => {
+                self.ui_state.network_proxy = normalized;
+                self.persistence_note = None;
+                self.queue_ui_state();
+            }
+            Err(error) => {
+                self.persistence_note = Some(localize_network_proxy_error(&error));
+            }
+        }
+        cx.notify();
+    }
+
     fn set_terminal_shell(&mut self, shell: String, cx: &mut Context<Self>) {
         self.ui_state.terminal_preferences.shell = (!shell.is_empty()).then_some(shell);
         self.queue_ui_state();
@@ -19954,7 +20016,17 @@ impl VibexWorkbench {
         let right_rail_mode =
             right_rail_mode_from_activity_id(snapshot.right_rail.selected_activity_id.as_deref());
 
+        let restored_proxy =
+            match vibex_desktop_runtime::network_proxy::configure(&snapshot.network_proxy) {
+                Ok(settings) => settings,
+                Err(error) => {
+                    self.persistence_note = Some(locale::localize_ui_message(&error));
+                    NetworkProxyUiState::default()
+                }
+            };
+
         self.ui_state = snapshot;
+        self.ui_state.network_proxy = restored_proxy;
         self.auto_continue_default_project_ids = auto_continue_default_project_ids;
         self.auto_continue_session_ids = auto_continue_session_ids;
         self.sidebar_state.row_order = self.ui_state.sidebar.session_order.clone();
@@ -19991,8 +20063,16 @@ impl VibexWorkbench {
         let appearance = self.ui_state.appearance.clone();
         let session = self.ui_state.session.clone();
         let terminal_preferences = self.ui_state.terminal_preferences.clone();
+        let network_proxy = self.ui_state.network_proxy.clone();
         self.settings_view.update(cx, |settings, cx| {
-            settings.sync_controls(&appearance, &session, &terminal_preferences, window, cx)
+            settings.sync_controls(
+                &appearance,
+                &session,
+                &terminal_preferences,
+                &network_proxy,
+                window,
+                cx,
+            )
         });
         self.rebuild_timeline_sizes();
         if self.ui_state.desktop_behavior.show_update_prompts {
@@ -35587,6 +35667,26 @@ impl VibexWorkbench {
     }
 }
 
+fn localize_network_proxy_error(error: &str) -> String {
+    match error {
+        "proxy address is required when the proxy is enabled" => locale::text(
+            "Enter a proxy address to enable the network proxy.",
+            "启用网络代理前请输入代理地址。",
+            "啟用網路代理前請輸入代理位址。",
+        )
+        .to_string(),
+        "proxy address is empty or too long"
+        | "proxy address is invalid"
+        | "proxy address is not supported by the HTTP client" => locale::text(
+            "Enter a valid http(s) or socks5 proxy address.",
+            "请输入有效的 http(s) 或 socks5 代理地址。",
+            "請輸入有效的 http(s) 或 socks5 代理位址。",
+        )
+        .to_string(),
+        _ => error.to_string(),
+    }
+}
+
 fn timeline_row_preview_text(row: &TimelineRow) -> Option<&str> {
     let body = row.body.trim();
     if !body.is_empty() {
@@ -40770,6 +40870,14 @@ fn settings_search_candidates(strings: Strings) -> Vec<SettingsSearchCandidate> 
         ),
         settings_search_candidate(
             SettingsSection::General,
+            strings.network_proxy,
+            strings.network_proxy_description,
+            &[
+                "proxy", "network", "http", "https", "socks", "代理", "网络", "網路",
+            ],
+        ),
+        settings_search_candidate(
+            SettingsSection::General,
             locale::text("Startup", "启动行为", "啟動行為"),
             locale::text(
                 "Choose what opens after the local runtime is ready.",
@@ -41417,6 +41525,7 @@ struct FoundationSettings {
     code_fonts: Entity<SelectState<Vec<FontChoice>>>,
     session_content_widths: Entity<SelectState<Vec<SessionContentWidthChoice>>>,
     terminal_shells: Entity<SelectState<Vec<ShellChoice>>>,
+    proxy_input: Entity<InputState>,
     search: Entity<InputState>,
     search_selected_index: usize,
     search_scroll: ScrollHandle,
@@ -41475,6 +41584,11 @@ impl FoundationSettings {
         let terminal_shells = cx.new(|cx| {
             SelectState::new(shell_choices, terminal_shell_selected, window, cx).searchable(true)
         });
+        let proxy_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(ui_state.network_proxy.proxy_url.clone().unwrap_or_default())
+                .placeholder(strings.network_proxy_placeholder)
+        });
         let search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(locale::text(
                 "Search settings",
@@ -41493,6 +41607,21 @@ impl FoundationSettings {
                         cx.notify();
                     }
                     InputEvent::PressEnter { .. } | InputEvent::Focus | InputEvent::Blur => {}
+                },
+            )
+            .detach();
+            let proxy_workbench = workbench.clone();
+            let proxy_input_for_commit = proxy_input.clone();
+            cx.subscribe(
+                &proxy_input,
+                move |_: &mut FoundationSettings, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                        let value = proxy_input_for_commit.read(cx).value().to_string();
+                        let _ = proxy_workbench.update(cx, |workbench, cx| {
+                            workbench.set_network_proxy_url(value, cx);
+                        });
+                        cx.notify();
+                    }
                 },
             )
             .detach();
@@ -41568,6 +41697,7 @@ impl FoundationSettings {
                 code_fonts,
                 session_content_widths,
                 terminal_shells,
+                proxy_input,
                 search,
                 search_selected_index: 0,
                 search_scroll: ScrollHandle::new(),
@@ -41875,6 +42005,12 @@ impl FoundationSettings {
             .unwrap_or_default()
     }
 
+    fn network_proxy(&self, cx: &App) -> NetworkProxyUiState {
+        self.workbench
+            .read_with(cx, |this, _| this.ui_state.network_proxy.clone())
+            .unwrap_or_default()
+    }
+
     fn keyboard_shortcuts(&self, cx: &App) -> BTreeMap<String, String> {
         self.workbench
             .read_with(cx, |this, _| this.ui_state.keyboard.shortcuts.clone())
@@ -41896,6 +42032,7 @@ impl FoundationSettings {
         appearance: &vibex_desktop_model::AppearanceUiState,
         session: &SessionUiState,
         terminal_preferences: &vibex_desktop_model::TerminalPreferencesUiState,
+        network_proxy: &NetworkProxyUiState,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -41928,6 +42065,14 @@ impl FoundationSettings {
             select.set_items(session_content_width_choices, window, cx);
             select.set_selected_value(&session.content_width, window, cx)
         });
+        self.proxy_input.update(cx, |input, cx| {
+            input.set_placeholder(strings.network_proxy_placeholder, window, cx);
+            input.set_value(
+                network_proxy.proxy_url.clone().unwrap_or_default(),
+                window,
+                cx,
+            );
+        });
         cx.notify();
     }
 
@@ -41948,7 +42093,15 @@ impl FoundationSettings {
                 let appearance = this.appearance(cx);
                 let session = this.session(cx);
                 let terminal_preferences = this.terminal_preferences(cx);
-                this.sync_controls(&appearance, &session, &terminal_preferences, window, cx);
+                let network_proxy = this.network_proxy(cx);
+                this.sync_controls(
+                    &appearance,
+                    &session,
+                    &terminal_preferences,
+                    &network_proxy,
+                    window,
+                    cx,
+                );
             });
         });
         cx.notify();
@@ -42005,6 +42158,13 @@ impl FoundationSettings {
         let _ = self
             .workbench
             .update(cx, |this, cx| this.set_close_to_tray(enabled, cx));
+        cx.notify();
+    }
+
+    fn set_network_proxy_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let _ = self
+            .workbench
+            .update(cx, |this, cx| this.set_network_proxy_enabled(enabled, cx));
         cx.notify();
     }
 
@@ -42607,6 +42767,7 @@ impl FoundationSettings {
     fn render_general_page(
         &self,
         desktop_behavior: &DesktopBehaviorUiState,
+        network_proxy: &NetworkProxyUiState,
         stacked: bool,
         strings: Strings,
         cx: &mut Context<Self>,
@@ -42629,6 +42790,47 @@ impl FoundationSettings {
             .checked(desktop_behavior.close_to_tray)
             .tooltip(strings.close_to_tray)
             .on_click(cx.listener(|this, enabled, _, cx| this.set_close_to_tray(*enabled, cx)));
+        let proxy_value = self.proxy_input.read(cx).value().to_string();
+        let proxy_error = network_proxy.enabled.then(|| {
+            if proxy_value.trim().is_empty() {
+                strings.network_proxy_required
+            } else if vibex_desktop_runtime::network_proxy::normalize_proxy_url(&proxy_value)
+                .is_err()
+            {
+                strings.network_proxy_invalid
+            } else {
+                ""
+            }
+        });
+        let proxy_control = v_flex()
+            .items_end()
+            .gap_1()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Switch::new("network-proxy-enabled")
+                            .small()
+                            .checked(network_proxy.enabled)
+                            .tooltip(strings.network_proxy_enabled)
+                            .on_click(cx.listener(|this, enabled, _, cx| {
+                                this.set_network_proxy_enabled(*enabled, cx)
+                            })),
+                    )
+                    .child(Input::new(&self.proxy_input).w(px(260.0)).h(px(32.0))),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(strings.network_proxy_hint),
+            )
+            .when_some(
+                proxy_error.filter(|error| !error.is_empty()),
+                |this, error| {
+                    this.child(div().text_xs().text_color(cx.theme().danger).child(error))
+                },
+            );
         let startup_new_session =
             desktop_behavior.startup_destination == StartupDestination::NewSession;
         let startup_control = h_flex()
@@ -42705,6 +42907,13 @@ impl FoundationSettings {
                     strings.close_to_tray,
                     strings.close_to_tray_description,
                     close_to_tray_switch,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    strings.network_proxy,
+                    strings.network_proxy_description,
+                    proxy_control,
                     stacked,
                     cx,
                 ),
@@ -44179,6 +44388,7 @@ impl Render for FoundationSettings {
         let appearance = self.appearance(cx);
         let session = self.session(cx);
         let desktop_behavior = self.desktop_behavior(cx);
+        let network_proxy = self.network_proxy(cx);
         let workbench = self.workbench_state(cx);
         let terminal = self.terminal_preferences(cx);
         let strings = locale::strings(locale::resolve_locale(
@@ -44194,9 +44404,13 @@ impl Render for FoundationSettings {
             .take();
         let navigation = self.render_navigation(vertical_tabs, strings, cx);
         let page = match self.active_section {
-            SettingsSection::General => {
-                self.render_general_page(&desktop_behavior, stacked_rows, strings, cx)
-            }
+            SettingsSection::General => self.render_general_page(
+                &desktop_behavior,
+                &network_proxy,
+                stacked_rows,
+                strings,
+                cx,
+            ),
             SettingsSection::Appearance => {
                 self.render_appearance_page(&appearance, stacked_rows, strings, cx)
             }
@@ -44472,8 +44686,16 @@ impl Render for VibexWorkbench {
             self.sync_locale_dependents(window, cx);
             let session = self.ui_state.session.clone();
             let terminal_preferences = self.ui_state.terminal_preferences.clone();
+            let network_proxy = self.ui_state.network_proxy.clone();
             self.settings_view.update(cx, |settings, cx| {
-                settings.sync_controls(&appearance, &session, &terminal_preferences, window, cx)
+                settings.sync_controls(
+                    &appearance,
+                    &session,
+                    &terminal_preferences,
+                    &network_proxy,
+                    window,
+                    cx,
+                )
             });
         }
         if self.open_settings_on_start {

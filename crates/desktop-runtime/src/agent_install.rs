@@ -164,7 +164,6 @@ pub struct AgentInstallService {
     config_service: ProviderConfigService,
     node_runtime_options: AgentNodeRuntimeOptions,
     uv_runtime_options: AgentUvRuntimeOptions,
-    client: Client,
     operation_locks: Arc<Mutex<BTreeMap<String, Weak<Mutex<()>>>>>,
 }
 
@@ -213,7 +212,30 @@ impl AgentInstallService {
                 "managed Agent root must be an absolute path without parent traversal",
             ));
         }
-        let client = Client::builder()
+        Self::build_http_client()?;
+        let service = Self {
+            db_path,
+            root,
+            config_service,
+            node_runtime_options,
+            uv_runtime_options,
+            operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
+        };
+        service.recover_interrupted_operations()?;
+        Ok(service)
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn http_client(&self) -> VibexResult<Client> {
+        Self::build_http_client()
+    }
+
+    fn build_http_client() -> VibexResult<Client> {
+        crate::network_proxy::async_client_builder()
+            .unwrap_or_else(|_| Client::builder())
             .connect_timeout(Duration::from_secs(15))
             .timeout(HTTP_TIMEOUT)
             .redirect(Policy::custom(|attempt| {
@@ -238,22 +260,7 @@ impl AgentInstallService {
                     "managed Agent HTTP client could not be initialized",
                 )
                 .with_diagnostic("error", error.to_string())
-            })?;
-        let service = Self {
-            db_path,
-            root,
-            config_service,
-            node_runtime_options,
-            uv_runtime_options,
-            client,
-            operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
-        };
-        service.recover_interrupted_operations()?;
-        Ok(service)
-    }
-
-    pub fn root(&self) -> &Path {
-        &self.root
+            })
     }
 
     pub async fn install(&self, agent_id: AgentId) -> VibexResult<AgentManagedInstallState> {
@@ -1783,7 +1790,7 @@ impl AgentInstallService {
 
     async fn fetch_limited(&self, url: &str, max_bytes: usize) -> VibexResult<Vec<u8>> {
         validate_https_url(url, "download")?;
-        let response = self.client.get(url).send().await.map_err(|error| {
+        let response = self.http_client()?.get(url).send().await.map_err(|error| {
             VibexError::process("agent_download_failed", "Agent download request failed")
                 .with_diagnostic("error", error.to_string())
         })?;
@@ -1861,7 +1868,7 @@ impl AgentInstallService {
             remove_path(&cached).map_err(|error| error.with_diagnostic("cacheKind", "download"))?;
         }
 
-        let response = self.client.get(url).send().await.map_err(|error| {
+        let response = self.http_client()?.get(url).send().await.map_err(|error| {
             VibexError::process("agent_download_failed", "Agent archive download failed")
                 .with_diagnostic("error", error.to_string())
         })?;

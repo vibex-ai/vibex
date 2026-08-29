@@ -641,7 +641,8 @@ impl Default for WebPkiDirectPublicationProbe {
 
 impl Default for HttpDirectPublicationProbe {
     fn default() -> Self {
-        let system_proxy_client = reqwest::Client::builder()
+        let system_proxy_client = crate::network_proxy::async_client_builder()
+            .unwrap_or_else(|_| reqwest::Client::builder())
             .timeout(DIRECT_PROBE_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -669,8 +670,17 @@ impl DirectPublicationProbe for HttpDirectPublicationProbe {
         let origin = normalize_https_origin(origin)?;
         let url = format!("{origin}/api/v2/info");
         let client = match proxy_policy {
-            DirectProbeProxyPolicy::System => &self.system_proxy_client,
-            DirectProbeProxyPolicy::Bypass => self.direct_client.as_ref().ok_or_else(|| {
+            DirectProbeProxyPolicy::System => crate::network_proxy::async_client_builder()
+                .ok()
+                .and_then(|builder| {
+                    builder
+                        .timeout(DIRECT_PROBE_TIMEOUT)
+                        .redirect(reqwest::redirect::Policy::none())
+                        .build()
+                        .ok()
+                })
+                .unwrap_or_else(|| self.system_proxy_client.clone()),
+            DirectProbeProxyPolicy::Bypass => self.direct_client.clone().ok_or_else(|| {
                 VibexError::process(
                     "remote_direct_probe_client_unavailable",
                     "the proxy-bypassing Direct probe client could not be initialized",
@@ -892,7 +902,8 @@ pub struct HttpRelayPublicationProbe {
 
 impl Default for HttpRelayPublicationProbe {
     fn default() -> Self {
-        let client = reqwest::Client::builder()
+        let client = crate::network_proxy::async_client_builder()
+            .unwrap_or_else(|_| reqwest::Client::builder())
             .timeout(DIRECT_PROBE_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -905,8 +916,17 @@ impl Default for HttpRelayPublicationProbe {
 impl RelayPublicationProbe for HttpRelayPublicationProbe {
     async fn probe(&self, origin: &str) -> VibexResult<RelayPublicationInfo> {
         let origin = normalize_https_origin(origin)?;
-        let response = self
-            .client
+        let client = crate::network_proxy::async_client_builder()
+            .ok()
+            .and_then(|builder| {
+                builder
+                    .timeout(DIRECT_PROBE_TIMEOUT)
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .ok()
+            });
+        let client = client.as_ref().unwrap_or(&self.client);
+        let response = client
             .get(format!("{origin}/api/info"))
             .send()
             .await

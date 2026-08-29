@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -247,6 +248,30 @@ pub struct AppearanceUiState {
     pub code_font: FontSetting,
     pub reduced_motion: bool,
     pub high_contrast: bool,
+}
+
+/// Local outbound network proxy preference for the desktop runtime.
+///
+/// The URL is normalized and validated by the native runtime before it is
+/// applied to process environment or HTTP clients. Keeping this as a local
+/// UI preference avoids syncing device-specific network credentials remotely.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkProxyUiState {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+}
+
+impl fmt::Debug for NetworkProxyUiState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NetworkProxyUiState")
+            .field("enabled", &self.enabled)
+            .field("proxy_url", &self.proxy_url.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 impl Default for AppearanceUiState {
@@ -522,6 +547,8 @@ pub struct DesktopUiStateV1 {
     pub schema_version: u32,
     pub source_app_version: String,
     pub appearance: AppearanceUiState,
+    #[serde(default)]
+    pub network_proxy: NetworkProxyUiState,
     pub workbench: WorkbenchUiState,
     pub sidebar: SidebarUiState,
     pub preview: PreviewUiState,
@@ -554,6 +581,7 @@ impl Default for DesktopUiStateV1 {
             schema_version: DESKTOP_UI_STATE_SCHEMA_VERSION,
             source_app_version: env!("CARGO_PKG_VERSION").to_string(),
             appearance: AppearanceUiState::default(),
+            network_proxy: NetworkProxyUiState::default(),
             workbench: WorkbenchUiState::default(),
             sidebar: SidebarUiState::default(),
             preview: PreviewUiState::default(),
@@ -587,6 +615,7 @@ impl DesktopUiStateV1 {
         self.appearance.window_scale_percent = self.appearance.window_scale_percent.clamp(75, 200);
         self.appearance.interface_font.normalize(12);
         self.appearance.code_font.normalize(10);
+        self.network_proxy.proxy_url = bounded_optional(self.network_proxy.proxy_url.take(), 2_048);
         self.workbench.active_tab =
             bounded_required(&self.workbench.active_tab, 80).unwrap_or_else(|| "agent".to_string());
         self.workbench.selected_workspace_id =
@@ -1515,6 +1544,7 @@ mod tests {
     #[test]
     fn new_settings_preferences_are_backward_compatible_and_round_trip() {
         let mut legacy = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("networkProxy");
         legacy
             .as_object_mut()
             .unwrap()

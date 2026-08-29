@@ -10,6 +10,7 @@ mod fixture;
 mod home_lock;
 mod lan_pairing;
 mod management;
+pub mod network_proxy;
 mod relay;
 mod remote_connectivity;
 mod sidebar_organization;
