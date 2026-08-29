@@ -165,6 +165,8 @@ mod tests {
         assert_eq!(semantic_token("background", false).unwrap().hex, "#ffffff");
         assert_eq!(semantic_token("foreground", true).unwrap().hex, "#fafafa");
         assert_eq!(semantic_token("border", true).unwrap().alpha, 0.1);
+        assert!(semantic_token("warning-foreground", false).is_some());
+        assert!(semantic_token("warning-foreground", true).is_some());
         assert!(LIGHT_TOKENS.len() >= 40);
         assert_eq!(LIGHT_TOKENS.len(), DARK_TOKENS.len());
     }

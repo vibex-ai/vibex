@@ -33,7 +33,7 @@ pub const TOKEN_SCHEMA_VERSION: &str = "vibex-design-tokens.v1";
 pub const TOKEN_PRODUCT_VISUAL_SOURCE: &str = "apps/desktop";
 pub const TOKEN_SOURCE_PATH: &str = "crates/vibex-ui/theme/tokens.json";
 pub const TOKEN_SOURCE_SHA256: &str =
-    "1c76451daf1b28b2d784dcb8eac41372d666bdc3253848d20aec83dd23690808";
+    "7e0e2440891bde3e06298cf56527fa16c592aed364eaea450203ae17e2a30571";
 pub const GPUI_REVISION: &str = "53b7efce1ead525b8898cda74ccd2d7e0987d2d8";
 pub const GPUI_COMPONENT_REVISION: &str = "031555662e99a1b5a549990b47f246d475b8288a";
 
@@ -188,6 +188,13 @@ pub const LIGHT_TOKENS: &[GpuiColorToken] = &[
         oklch: "0.721 0.181 75.02",
         hex: "#e59000",
         rgb: 0xe59000,
+        alpha: 1.0,
+    },
+    GpuiColorToken {
+        name: "warning-foreground",
+        oklch: "0.21 0.006 285.885",
+        hex: "#18181b",
+        rgb: 0x18181b,
         alpha: 1.0,
     },
     GpuiColorToken {
@@ -646,6 +653,13 @@ pub const DARK_TOKENS: &[GpuiColorToken] = &[
         oklch: "0.792 0.184 86.047",
         hex: "#efb000",
         rgb: 0xefb000,
+        alpha: 1.0,
+    },
+    GpuiColorToken {
+        name: "warning-foreground",
+        oklch: "0.21 0.006 285.885",
+        hex: "#18181b",
+        rgb: 0x18181b,
         alpha: 1.0,
     },
     GpuiColorToken {
