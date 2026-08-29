@@ -29858,24 +29858,30 @@ impl VibexWorkbench {
         let process_collapsible = turn.complete
             || (timeline_turn_conclusion_row(turn).is_some() && !turn.process_rows.is_empty());
         let process_toggle_id = turn.id.clone();
+        let agent_identity = execution_attribution
+            .as_ref()
+            .map(|attribution| self.agent_identity_for_label(&attribution.agent_label))
+            .or_else(|| {
+                turn.runtime_attribution.as_deref().and_then(|attribution| {
+                    attribution
+                        .split(" · ")
+                        .next()
+                        .filter(|label| !label.is_empty())
+                        .map(str::to_owned)
+                })
+            });
+        let render_header_agent_icon = |identity: &String| {
+            div()
+                .size(px(16.0))
+                .flex_none()
+                .child(runtime_agent_icon(identity))
+                .into_any_element()
+        };
         let duration = format_compact_duration(
             turn.started_at_ms,
             timeline_turn_duration_end(turn.complete, turn.ended_at_ms),
         );
-        // Keep the process open while work is in progress, then expose its
-        // collapse toggle as soon as conclusion streaming starts.
-        let header_label = if process_collapsible {
-            if process_expanded {
-                strings.agent_collapse_process.to_string()
-            } else {
-                strings.agent_expand_process.to_string()
-            }
-        } else {
-            format!(
-                "{} {duration}",
-                locale::text("Working for", "已工作", "已工作")
-            )
-        };
+        let header_label = format!("{} {duration}", strings.agent_worked_for);
         let mut content = v_flex()
             .id(turn.id.clone())
             .w_full()
@@ -29922,6 +29928,9 @@ impl VibexWorkbench {
                     .cursor_pointer()
                     .text_color(cx.theme().muted_foreground)
                     .hover(|style| style.text_color(cx.theme().foreground))
+                    .when_some(agent_identity.as_ref(), |this, identity| {
+                        this.child(render_header_agent_icon(identity))
+                    })
                     .child(header_label)
                     .child(
                         Icon::new(if process_expanded {
@@ -29953,6 +29962,9 @@ impl VibexWorkbench {
                     .gap(px(6.0))
                     .py_1()
                     .text_color(cx.theme().muted_foreground)
+                    .when_some(agent_identity.as_ref(), |this, identity| {
+                        this.child(render_header_agent_icon(identity))
+                    })
                     .child(header_label)
                     .into_any_element()
             };
@@ -30555,6 +30567,14 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
+    fn agent_identity_for_label(&self, agent_label: &str) -> String {
+        self.agent_snapshots
+            .iter()
+            .find(|agent| agent.label == agent_label)
+            .map(agent_brand_identity)
+            .unwrap_or_else(|| agent_label.to_string())
+    }
+
     fn render_agent_answer_metadata(
         &self,
         turn: &TimelineConversationTurn,
@@ -30567,12 +30587,7 @@ impl VibexWorkbench {
             return None;
         }
         let attribution = attribution?;
-        let agent_identity = self
-            .agent_snapshots
-            .iter()
-            .find(|agent| agent.label == attribution.agent_label)
-            .map(agent_brand_identity)
-            .unwrap_or_else(|| attribution.agent_label.clone());
+        let agent_identity = self.agent_identity_for_label(&attribution.agent_label);
         let muted_foreground = cx.theme().muted_foreground;
         let runtime_label = format!(
             "{} · {}",
@@ -31024,7 +31039,7 @@ impl VibexWorkbench {
                 }
                 if conclusion && !row.streaming {
                     // Answer metadata and hover actions share one footer row.
-                    height += 32.0;
+                    height += 36.0;
                 }
                 height
             }
@@ -31720,7 +31735,7 @@ impl VibexWorkbench {
                         .items_center()
                         .justify_between()
                         .gap_2()
-                        .mt_1()
+                        .mt_2()
                         .when_some(answer_metadata, |this, metadata| {
                             this.child(div().min_w_0().flex_1().child(metadata))
                         })
@@ -55556,9 +55571,11 @@ mod tests {
             .map(|(body, _)| body)
             .expect("timeline turn renderer should remain inspectable");
         assert!(turn_renderer.contains("render_agent_answer_metadata("));
+        assert!(turn_renderer.contains("self.agent_identity_for_label"));
+        assert!(turn_renderer.contains("runtime_agent_icon(identity)"));
+        assert!(turn_renderer.contains("format!(\"{} {duration}\", strings.agent_worked_for)"));
         assert!(turn_renderer.contains("strings.agent_expand_process"));
         assert!(turn_renderer.contains("strings.agent_collapse_process"));
-        assert!(!turn_renderer.contains("strings.agent_worked_for"));
 
         let answer_renderer = source
             .split_once("    fn render_agent_message_row(")
@@ -55569,6 +55586,7 @@ mod tests {
         assert!(answer_renderer.contains("answer_metadata"));
         assert!(answer_renderer.contains(".justify_between()"));
         assert!(answer_renderer.contains(".when_some(answer_metadata"));
+        assert!(answer_renderer.contains(".mt_2()"));
         assert!(answer_renderer.contains(".opacity(0.0)"));
         assert!(answer_renderer.contains(".group_hover(hover_group.clone()"));
 
