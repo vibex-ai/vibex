@@ -22114,6 +22114,14 @@ impl VibexWorkbench {
             return Empty.into_any_element();
         };
         let folder_item = SidebarOrganizationItem::Folder(folder_id.clone());
+        // Root-level folders share the project column; nested folders retain their tree indent.
+        let root_level_folder = folder_scope == SidebarOrganizationScope::Root
+            && self
+                .ui_state
+                .sidebar
+                .organization
+                .parent_of(&folder_item)
+                .is_none();
         let drop_position = self.sidebar_organization_drop_position(&folder_item);
         let active_folder_drag = self
             .sidebar_folder_drag_state
@@ -22332,23 +22340,31 @@ impl VibexWorkbench {
                     .size_full()
                     .min_w_0()
                     .items_center()
-                    .gap(px(4.0))
-                    .pl(px(16.0))
+                    .gap(px(SIDEBAR_ICON_TITLE_GAP))
+                    .when(!root_level_folder, |this| this.pl(px(16.0)))
                     .child(
-                        Icon::new(if collapsed {
-                            IconName::Folder
-                        } else {
-                            IconName::FolderOpen
-                        })
-                        .size(px(SIDEBAR_LOGO_DISPLAY_SIZE))
-                        .flex_none()
-                        .text_color(
-                            if auto_archive_after_days.is_some() {
-                                cx.theme().success
-                            } else {
-                                cx.theme().sidebar_foreground.opacity(0.72)
-                            },
-                        ),
+                        h_flex()
+                            .flex_none()
+                            .when(root_level_folder, |this| {
+                                this.size(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))
+                                    .items_center()
+                                    .justify_center()
+                            })
+                            .child(
+                                Icon::new(if collapsed {
+                                    IconName::Folder
+                                } else {
+                                    IconName::FolderOpen
+                                })
+                                .size(px(SIDEBAR_LOGO_DISPLAY_SIZE))
+                                .text_color(
+                                    if auto_archive_after_days.is_some() {
+                                        cx.theme().success
+                                    } else {
+                                        cx.theme().sidebar_foreground.opacity(0.72)
+                                    },
+                                ),
+                            ),
                     )
                     .pr_1()
                     .text_color(cx.theme().sidebar_foreground.opacity(0.78))
@@ -50074,9 +50090,15 @@ mod tests {
             .map(|(body, _)| body)
             .expect("folder renderer should remain inspectable");
         assert!(folder.contains(".left(px(SIDEBAR_ROW_ICON_SLOT_OVERHANG))"));
-        assert!(folder.contains(".gap(px(4.0))\n                    .pl(px(16.0))"));
+        assert!(
+            folder
+                .contains("let root_level_folder = folder_scope == SidebarOrganizationScope::Root")
+        );
+        assert!(folder.contains("parent_of(&folder_item)\n                .is_none()"));
+        assert!(folder.contains(".gap(px(SIDEBAR_ICON_TITLE_GAP))"));
+        assert!(folder.contains(".when(!root_level_folder, |this| this.pl(px(16.0)))"));
+        assert!(folder.contains(".when(root_level_folder, |this| {\n                                this.size(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))"));
         assert!(folder.contains(".size(px(SIDEBAR_LOGO_DISPLAY_SIZE))"));
-        assert!(!folder.contains(".size(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))"));
         assert!(!folder.contains(".size(px(SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE))"));
         assert!(folder.contains(".when(!renaming, |this| this.child(div().flex_1()))"));
         let workspace = source
@@ -55188,12 +55210,13 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_project("))
             .map(|(body, _)| body)
             .expect("sidebar folder renderer should remain inspectable");
-        assert!(folder.contains(".gap(px(4.0))\n                    .pl(px(16.0))"));
+        assert!(folder.contains(".gap(px(SIDEBAR_ICON_TITLE_GAP))"));
+        assert!(folder.contains(".when(!root_level_folder, |this| this.pl(px(16.0)))"));
+        assert!(folder.contains(".when(root_level_folder, |this| {\n                                this.size(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))"));
         assert!(folder.contains(".size(px(12.0))"));
         assert!(folder.contains(".size(px(14.0))"));
         assert!(folder.contains(".size(px(SIDEBAR_LOGO_DISPLAY_SIZE))"));
         assert!(!folder.contains(".size(px(SIDEBAR_PROJECT_LOGO_DISPLAY_SIZE))"));
-        assert!(!folder.contains(".size(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))"));
         assert!(folder.contains(".pl(px(SIDEBAR_FOLDER_CHILD_INDENT))"));
         assert!(folder.contains(".child(\n                        h_flex()"));
     }
