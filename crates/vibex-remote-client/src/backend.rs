@@ -497,6 +497,7 @@ fn projection_for_domain(domain: &str) -> Option<vibex_backend::BackendProjectio
     match domain {
         "file" => Some(BackendProjection::Files),
         "git" => Some(BackendProjection::Git),
+        "sidebar" => Some(BackendProjection::Sidebar),
         "provider" | "device" => Some(BackendProjection::Management),
         _ => None,
     }
@@ -3053,6 +3054,27 @@ mod tests {
         });
 
         assert_eq!(mapped, BackendEvent::Notification(notification));
+    }
+
+    #[test]
+    fn sidebar_event_maps_to_the_sidebar_projection() {
+        let mapped = map_remote_event(RemoteInboundEvent {
+            event: RemoteEventV2 {
+                event_id: EventId::new(),
+                channel: "sidebar".to_string(),
+                generation: 1,
+                sequence: 1,
+                correlation_id: None,
+                payload: None,
+                emitted_at_ms: unix_timestamp_ms(),
+            },
+            decision: SyncDecision::Apply,
+        });
+
+        assert_eq!(
+            mapped,
+            BackendEvent::ProjectionInvalidated(vibex_backend::BackendProjection::Sidebar)
+        );
     }
 
     #[test]

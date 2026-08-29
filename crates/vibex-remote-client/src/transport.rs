@@ -1126,6 +1126,7 @@ impl TransportInner {
         let mut sync = DomainSyncEngine::new(config.event_queue_capacity);
         sync.register_domains([
             "agent_session",
+            "sidebar",
             "terminal",
             "file",
             "git",
@@ -1647,6 +1648,7 @@ impl DirectWebSocketTransport {
                 topics: vec![
                     "agent_session".to_string(),
                     "agent_notification".to_string(),
+                    "sidebar".to_string(),
                     "terminal".to_string(),
                     "file".to_string(),
                     "git".to_string(),
@@ -2408,6 +2410,7 @@ impl RelayE2eeTransport {
                 topics: vec![
                     "agent_session".to_string(),
                     "agent_notification".to_string(),
+                    "sidebar".to_string(),
                     "terminal".to_string(),
                     "file".to_string(),
                     "git".to_string(),

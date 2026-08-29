@@ -14,8 +14,8 @@ use gpui::{
     list, prelude::*, px, rgb, svg, uniform_list,
 };
 use vibex_backend::{
-    AgentBackend as _, BackendError, BackendEvent, BackendFuture, BackendOperation, BackendResult,
-    MutationRequest, WorkspaceBackend as _, WorkspaceSummary,
+    AgentBackend as _, BackendError, BackendEvent, BackendFuture, BackendOperation,
+    BackendProjection, BackendResult, MutationRequest, WorkspaceBackend as _, WorkspaceSummary,
 };
 use vibex_core::{
     AgentSessionState, ContinueAgentTurnRequest, CreateAgentSessionRequest, ElicitationFieldKind,
@@ -81,6 +81,16 @@ fn should_present_agent_notification(
     target_session_id: &VibexSessionId,
 ) -> bool {
     app_backgrounded || workbench_open || selected_session_id != Some(target_session_id)
+}
+
+fn sidebar_refresh_required(event: &BackendEvent) -> bool {
+    match event {
+        BackendEvent::ProjectionInvalidated(BackendProjection::Sidebar) => true,
+        BackendEvent::Lagged { refetch, .. } => {
+            refetch.projection == Some(BackendProjection::Sidebar)
+        }
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -352,7 +362,10 @@ pub struct MobileApp {
     /// user arranged there rather than a second, divergent ordering.
     sidebar_view: SidebarOrganizationView,
     sidebar_selected_workspace_id: Option<String>,
+    session_sync_busy: bool,
+    session_sync_queued: bool,
     sidebar_sync_busy: bool,
+    sidebar_sync_queued: bool,
     sidebar_drag: Option<SidebarDrag>,
     sidebar_drag_candidate: Option<SidebarDragCandidate>,
     sidebar_drag_long_press: Option<Task<()>>,
@@ -474,7 +487,10 @@ impl MobileApp {
             }),
             sidebar_view: SidebarOrganizationView::default(),
             sidebar_selected_workspace_id: None,
+            session_sync_busy: false,
+            session_sync_queued: false,
             sidebar_sync_busy: false,
+            sidebar_sync_queued: false,
             sidebar_drag: None,
             sidebar_drag_candidate: None,
             sidebar_drag_long_press: None,
@@ -823,6 +839,7 @@ impl MobileApp {
             while let Some(event) = receiver.next().await {
                 let needs_refetch = entity
                     .update(cx, |this, cx| {
+                        let sidebar_needs_refresh = sidebar_refresh_required(&event);
                         if let BackendEvent::Notification(notification) = &event {
                             let selected = this.controller.as_ref().and_then(|controller| {
                                 controller.state.selected_session_id.as_ref()
@@ -865,6 +882,9 @@ impl MobileApp {
                                 );
                             }
                             _ => {}
+                        }
+                        if sidebar_needs_refresh {
+                            this.refresh_sessions(cx);
                         }
                         cx.notify();
                         decision == Some(AgentEventDecision::NeedsAuthoritativeRefetch)
@@ -1211,6 +1231,10 @@ impl MobileApp {
     }
 
     fn refresh_sessions(&mut self, cx: &mut Context<Self>) {
+        if self.session_sync_busy {
+            self.session_sync_queued = true;
+            return;
+        }
         let capabilities = self
             .backend
             .as_ref()
@@ -1221,12 +1245,14 @@ impl MobileApp {
         if let Some(capabilities) = capabilities {
             controller.set_capabilities(capabilities);
         }
+        self.session_sync_busy = true;
         controller.begin_sessions_refresh();
         let future = controller.list_sessions(false);
         let runner = gpui_tokio::Tokio::spawn(cx, future);
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
             let _ = entity.update(cx, |this, cx| {
+                this.session_sync_busy = false;
                 let selected = this
                     .controller
                     .as_ref()
@@ -1247,6 +1273,10 @@ impl MobileApp {
                     && let Some(session_id) = first
                 {
                     this.open_session(session_id, cx);
+                }
+                if this.session_sync_queued {
+                    this.session_sync_queued = false;
+                    this.refresh_sessions(cx);
                 }
                 cx.notify();
             });
@@ -2381,12 +2411,15 @@ impl MobileApp {
         let Some(backend) = self.backend.clone() else {
             return;
         };
-        if self.sidebar_sync_busy
-            || !backend
-                .capability_snapshot()
-                .agent
-                .supports(BackendOperation::AgentSidebarOrganizationRead)
+        if !backend
+            .capability_snapshot()
+            .agent
+            .supports(BackendOperation::AgentSidebarOrganizationRead)
         {
+            return;
+        }
+        if self.sidebar_sync_busy {
+            self.sidebar_sync_queued = true;
             return;
         }
         self.sidebar_sync_busy = true;
@@ -2401,6 +2434,10 @@ impl MobileApp {
                 // surfacing an error it cannot act on.
                 if let Ok(snapshot) = outcome {
                     this.sidebar_view = SidebarOrganizationView::from_remote(&snapshot);
+                }
+                if this.sidebar_sync_queued {
+                    this.sidebar_sync_queued = false;
+                    this.refresh_sidebar_organization(cx);
                 }
                 cx.notify();
             });
@@ -2850,6 +2887,10 @@ impl MobileApp {
         // must not leave the previous desktop's folders on screen.
         self.sidebar_view = SidebarOrganizationView::default();
         self.sidebar_selected_workspace_id = None;
+        self.session_sync_busy = false;
+        self.session_sync_queued = false;
+        self.sidebar_sync_busy = false;
+        self.sidebar_sync_queued = false;
         self.sidebar_drag = None;
         self.sidebar_drag_candidate = None;
         self.sidebar_drag_long_press = None;
@@ -10615,6 +10656,28 @@ mod tests {
             Some(&selected),
             &other,
         ));
+    }
+
+    #[test]
+    fn sidebar_invalidation_requests_an_authoritative_refresh() {
+        assert!(sidebar_refresh_required(
+            &BackendEvent::ProjectionInvalidated(BackendProjection::Sidebar)
+        ));
+        assert!(!sidebar_refresh_required(
+            &BackendEvent::ProjectionInvalidated(BackendProjection::Management)
+        ));
+        assert!(sidebar_refresh_required(&BackendEvent::Lagged {
+            stream: vibex_backend::BackendEventStream::Fanout,
+            skipped: 0,
+            refetch: vibex_backend::BackendRefetch {
+                session_id: None,
+                timeline: false,
+                runtime: false,
+                runtime_selection: false,
+                projection: Some(BackendProjection::Sidebar),
+            },
+            observed_live: false,
+        }));
     }
 
     #[test]

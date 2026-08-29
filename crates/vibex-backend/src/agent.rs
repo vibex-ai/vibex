@@ -28,6 +28,7 @@ pub enum BackendEventStream {
 pub enum BackendProjection {
     Files,
     Git,
+    Sidebar,
     Management,
     Usage,
 }

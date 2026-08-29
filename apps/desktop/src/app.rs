@@ -5223,6 +5223,19 @@ impl VibexWorkbench {
         view
     }
 
+    fn publish_sidebar_invalidation(&self) {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return;
+        };
+        if let Err(error) = runtime.remote().gateway().publish_sidebar_invalidation() {
+            tracing::warn!(
+                target: "vibex_desktop",
+                error_code = %error.code,
+                "Remote sidebar projection invalidation failed"
+            );
+        }
+    }
+
     fn serve_sidebar_organization(
         &mut self,
         request: SidebarOrganizationRequest,
@@ -5269,6 +5282,7 @@ impl VibexWorkbench {
                             self.queue_ui_state();
                         }
                         self.invalidate_sidebar_projection_cache();
+                        self.publish_sidebar_invalidation();
                         cx.notify();
                         let snapshot = self.sidebar_organization_view().to_remote();
                         request.respond(Ok(snapshot));
@@ -5878,6 +5892,7 @@ impl VibexWorkbench {
                                 this.composer_queue_manual_session_ids.clear();
                             }
                             this.reconcile_sidebar_state();
+                            this.publish_sidebar_invalidation();
                             this.refresh_workspace_contexts(cx);
                             if this.reconcile_new_session_runtime_selection()
                                 && this.new_session_open
@@ -7858,6 +7873,7 @@ impl VibexWorkbench {
             if changed {
                 self.queue_ui_state();
                 self.invalidate_sidebar_projection_cache();
+                self.publish_sidebar_invalidation();
             }
             cx.notify();
             return true;
@@ -7953,6 +7969,7 @@ impl VibexWorkbench {
         if organization_changed || legacy_order_changed {
             self.queue_ui_state();
             self.invalidate_sidebar_projection_cache();
+            self.publish_sidebar_invalidation();
         }
         cx.notify();
         true
@@ -8635,13 +8652,15 @@ impl VibexWorkbench {
             .map(|(session_id, _)| session_id)
             .collect::<Vec<_>>();
         complete_string_order(&mut self.sidebar_state.row_order, ids);
-        if move_strings_relative(
+        let changed = move_strings_relative(
             &mut self.sidebar_state.row_order,
             moving_ids,
             target_id,
             after,
-        ) {
+        );
+        if changed {
             self.queue_agent_ui_state();
+            self.publish_sidebar_invalidation();
         }
         self.invalidate_sidebar_projection_cache();
         cx.notify();
@@ -16541,6 +16560,7 @@ impl VibexWorkbench {
                                 this.set_session_turn_pending(&session_id, true);
                             }
                             this.reconcile_sidebar_state();
+                            this.publish_sidebar_invalidation();
                             let created_session_id = session_id.clone();
                             let turn_generation = if this.session_generation == generation
                                 && this.selected_session_id.as_ref() == Some(&session_id)
@@ -50273,6 +50293,28 @@ mod tests {
         assert!(drag.contains(".flat_map(|group| &group.workspaces)"));
         assert!(drop.contains("ordered_sidebar_session_projects()"));
         assert!(drop.contains("if organization_changed || legacy_order_changed"));
+    }
+
+    #[test]
+    fn sidebar_session_changes_publish_remote_invalidations() {
+        let source = include_str!("app.rs");
+        let order = source
+            .split_once("    fn move_session_order_relative(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn move_new_session_agent_order_relative(")
+            })
+            .map(|(body, _)| body)
+            .expect("session reorder should remain inspectable");
+        let drop = source
+            .split_once("    fn apply_sidebar_organization_drop(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn sidebar_organization_drop_position("))
+            .map(|(body, _)| body)
+            .expect("organization drop should remain inspectable");
+
+        assert!(source.contains("fn publish_sidebar_invalidation(&self)"));
+        assert!(order.contains("self.publish_sidebar_invalidation();"));
+        assert!(drop.contains("self.publish_sidebar_invalidation();"));
+        assert!(source.contains("this.publish_sidebar_invalidation();"));
     }
 
     #[test]

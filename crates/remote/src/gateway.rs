@@ -490,6 +490,17 @@ impl RemoteGateway {
         )
     }
 
+    /// The Desktop shell owns sidebar ordering and placement. Connected clients
+    /// refetch that projection after this notification rather than treating the
+    /// event itself as a second source of sidebar state.
+    pub fn publish_sidebar_invalidation(&self) -> VibexResult<()> {
+        self.inner.domain_events.publish(
+            "sidebar",
+            self.inner.session_epoch.load(Ordering::Acquire),
+            None,
+        )
+    }
+
     /// Replace the validated Gateway configuration while the listener is
     /// stopped.  A running epoch owns an immutable router snapshot; callers
     /// must stop/restart explicitly when they need a new listener config.
@@ -3450,7 +3461,7 @@ fn spawn_domain_events(
                     let active = subscriptions
                         .lock()
                         .map(|topics| {
-                            ["file", "git", "provider", "device"]
+                            ["file", "git", "sidebar", "provider", "device"]
                                 .into_iter()
                                 .filter(|topic| {
                                     topics.contains(*topic)
@@ -3496,7 +3507,9 @@ fn subscription_topic_permitted(
     topic: &str,
 ) -> bool {
     let action = match topic {
-        "agent_session" | "agent_notification" | "runtime" => RemoteActionClass::ReadAgentSession,
+        "agent_session" | "agent_notification" | "runtime" | "sidebar" => {
+            RemoteActionClass::ReadAgentSession
+        }
         "terminal" | "file" | "git" => RemoteActionClass::ReadProject,
         "provider" => RemoteActionClass::ReadProviderSettings,
         "device" => RemoteActionClass::ReadDeviceManagement,
@@ -3508,6 +3521,7 @@ fn subscription_topic_permitted(
 fn domain_event_permitted(permission_level: RemoteDevicePermissionLevel, channel: &str) -> bool {
     let action = match channel {
         "file" | "git" => RemoteActionClass::ReadProject,
+        "sidebar" => RemoteActionClass::ReadAgentSession,
         "provider" => RemoteActionClass::ReadProviderSettings,
         "device" => RemoteActionClass::ReadDeviceManagement,
         _ => return false,
@@ -4904,10 +4918,11 @@ fn gateway_features(state: &GatewayState) -> Vec<String> {
     features
 }
 
-fn gateway_topics() -> [&'static str; 8] {
+fn gateway_topics() -> [&'static str; 9] {
     [
         "agent_session",
         "agent_notification",
+        "sidebar",
         "terminal",
         "git",
         "file",
@@ -5166,6 +5181,7 @@ mod tests {
         );
         assert!(accepted.topics.contains(&"agent_session".to_string()));
         assert!(accepted.topics.contains(&"agent_notification".to_string()));
+        assert!(accepted.topics.contains(&"sidebar".to_string()));
         assert!(accepted.topics.contains(&"file".to_string()));
         assert!(accepted.topics.contains(&"provider".to_string()));
         assert!(!accepted.topics.contains(&"device".to_string()));

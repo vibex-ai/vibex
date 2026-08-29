@@ -29,6 +29,7 @@ tray-icon.workspace = true
 base64.workspace = true
 chrono = "0.4.45"
 tokio.workspace = true
+tracing.workspace = true
 url.workspace = true
 rfd = { version = "0.17.2", default-features = false, features = ["wayland", "xdg-portal"] }
 vibex-agent = { path = "../../crates/agent" }
