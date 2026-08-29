@@ -435,6 +435,8 @@ pub struct ComposerUiState {
 pub struct SessionUiState {
     pub content_width: SessionContentWidthMode,
     pub turn_preview_rail: bool,
+    #[serde(default = "default_show_agent_generation_status")]
+    pub show_agent_generation_status: bool,
     #[serde(default = "default_enhanced_command_execution_display")]
     pub enhanced_command_execution_display: bool,
     #[serde(default = "default_enhanced_file_operation_display")]
@@ -450,6 +452,7 @@ impl Default for SessionUiState {
         Self {
             content_width: SessionContentWidthMode::Standard,
             turn_preview_rail: true,
+            show_agent_generation_status: true,
             enhanced_command_execution_display: false,
             enhanced_file_operation_display: true,
             auto_continue_project_ids: BTreeSet::new(),
@@ -460,6 +463,10 @@ impl Default for SessionUiState {
 
 const fn default_enhanced_command_execution_display() -> bool {
     false
+}
+
+const fn default_show_agent_generation_status() -> bool {
+    true
 }
 
 const fn default_enhanced_file_operation_display() -> bool {
@@ -1501,6 +1508,7 @@ mod tests {
 
     #[test]
     fn session_display_preferences_are_backward_compatible() {
+        assert!(SessionUiState::default().show_agent_generation_status);
         assert!(SessionUiState::default().enhanced_file_operation_display);
 
         let mut value = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
@@ -1508,6 +1516,7 @@ mod tests {
             .get_mut("session")
             .and_then(serde_json::Value::as_object_mut)
             .unwrap();
+        session.remove("showAgentGenerationStatus");
         session.remove("enhancedCommandExecutionDisplay");
         session.remove("enhancedFileOperationDisplay");
         session.remove("autoContinueProjectIds");
@@ -1515,6 +1524,7 @@ mod tests {
 
         let decoded = decode_and_migrate(&serde_json::to_vec(&value).unwrap()).unwrap();
 
+        assert!(decoded.session.show_agent_generation_status);
         assert!(!decoded.session.enhanced_command_execution_display);
         assert!(decoded.session.enhanced_file_operation_display);
         assert!(decoded.session.auto_continue_project_ids.is_empty());

@@ -228,6 +228,7 @@ const SIDEBAR_REORDER_ROW_HEIGHT: f32 = 32.0;
 const SIDEBAR_PROJECT_GROUP_GAP: f32 = 12.0;
 const SIDEBAR_PROJECT_REORDER_GAP: f32 = 12.0;
 const SIDEBAR_PROJECT_CONTENT_GAP: f32 = 4.0;
+const SIDEBAR_SESSION_CONTENT_GAP: f32 = 2.0;
 const SIDEBAR_SESSION_VIEW_INDENT: f32 = 12.0;
 const SIDEBAR_SESSION_REORDER_GAP: f32 = 2.0;
 const SIDEBAR_WORKSPACE_REORDER_GAP: f32 = 5.0;
@@ -8942,7 +8943,7 @@ impl VibexWorkbench {
         session_running: bool,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if !session_running {
+        if !self.ui_state.session.show_agent_generation_status || !session_running {
             self.agent_generation_stats = None;
             return None;
         }
@@ -20215,6 +20216,15 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    fn set_show_agent_generation_status(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.ui_state.session.show_agent_generation_status = enabled;
+        if !enabled {
+            self.agent_generation_stats = None;
+        }
+        self.queue_ui_state();
+        cx.notify();
+    }
+
     fn set_close_to_tray(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.ui_state.desktop_behavior.close_to_tray = enabled;
         self.queue_ui_state();
@@ -22434,9 +22444,9 @@ impl VibexWorkbench {
                         .relative()
                         .w_full()
                         .min_w_0()
-                        // Folder children keep the same rhythm as root-level
-                        // groups so a folder reads like a nested root list.
-                        .gap(px(SIDEBAR_PROJECT_GROUP_GAP))
+                        // Keep session rows inside folders aligned with the
+                        // session list directly under their project.
+                        .gap(px(SIDEBAR_SESSION_CONTENT_GAP))
                         .pl(px(SIDEBAR_FOLDER_CHILD_INDENT))
                         .children(children)
                         .child(
@@ -22981,7 +22991,7 @@ impl VibexWorkbench {
                         .top_1()
                         .h(px(24.0))
                         .items_center()
-                        .gap(px(2.0))
+                        .gap(px(SIDEBAR_SESSION_CONTENT_GAP))
                         .invisible()
                         .group_hover(&hover_group, |style| style.visible())
                         .on_click(|_, _, cx| cx.stop_propagation())
@@ -23638,7 +23648,7 @@ impl VibexWorkbench {
                 v_flex()
                     .w_full()
                     .min_w_0()
-                    .gap(px(2.0))
+                    .gap(px(SIDEBAR_SESSION_CONTENT_GAP))
                     .pl(px(
                         SIDEBAR_WORKSPACE_SESSION_INDENT - SIDEBAR_WORKSPACE_SESSION_CARD_OVERHANG
                     ))
@@ -41497,6 +41507,19 @@ fn settings_search_candidates(strings: Strings) -> Vec<SettingsSearchCandidate> 
         ),
         settings_search_candidate(
             SettingsSection::Session,
+            strings.show_agent_generation_status,
+            strings.show_agent_generation_status_description,
+            &[
+                "generation status",
+                "agent status",
+                "token speed",
+                "生成状态",
+                "生成狀態",
+                "token",
+            ],
+        ),
+        settings_search_candidate(
+            SettingsSection::Session,
             strings.session_content_width,
             strings.session_content_width_description,
             &["content width", "conversation width", "宽度", "寬度"],
@@ -42622,6 +42645,13 @@ impl FoundationSettings {
     fn set_enhanced_file_operation_display(&mut self, enabled: bool, cx: &mut Context<Self>) {
         let _ = self.workbench.update(cx, |this, cx| {
             this.set_enhanced_file_operation_display(enabled, cx)
+        });
+        cx.notify();
+    }
+
+    fn set_show_agent_generation_status(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.set_show_agent_generation_status(enabled, cx)
         });
         cx.notify();
     }
@@ -43768,6 +43798,13 @@ impl FoundationSettings {
                 .on_click(cx.listener(|this, enabled, _, cx| {
                     this.set_session_turn_preview_rail(*enabled, cx)
                 }));
+        let show_agent_generation_status_switch = Switch::new("show-agent-generation-status")
+            .small()
+            .checked(session.show_agent_generation_status)
+            .tooltip(strings.show_agent_generation_status)
+            .on_click(cx.listener(|this, enabled, _, cx| {
+                this.set_show_agent_generation_status(*enabled, cx)
+            }));
         let session_content_width_select = div().h(px(28.0)).w(px(144.0)).child(
             Select::new(&self.session_content_widths)
                 .small()
@@ -43905,6 +43942,13 @@ impl FoundationSettings {
                     strings.session_turn_preview_rail,
                     strings.session_turn_preview_rail_description,
                     turn_preview_rail_switch,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    strings.show_agent_generation_status,
+                    strings.show_agent_generation_status_description,
+                    show_agent_generation_status_switch,
                     stacked,
                     cx,
                 ),
@@ -50044,6 +50088,7 @@ mod tests {
             .expect("agent sidebar renderer should remain inspectable");
         assert!(source.contains("const SIDEBAR_PROJECT_GROUP_GAP: f32 = 12.0;"));
         assert!(source.contains("const SIDEBAR_PROJECT_CONTENT_GAP: f32 = 4.0;"));
+        assert!(source.contains("const SIDEBAR_SESSION_CONTENT_GAP: f32 = 2.0;"));
         assert!(sidebar.contains(".gap(px(SIDEBAR_PROJECT_GROUP_GAP))"));
 
         let project = source
@@ -50060,7 +50105,7 @@ mod tests {
             .expect("folder renderer should remain inspectable");
         assert!(
             folder.contains(
-                ".gap(px(SIDEBAR_PROJECT_GROUP_GAP))\n                        .pl(px(SIDEBAR_FOLDER_CHILD_INDENT))"
+                ".gap(px(SIDEBAR_SESSION_CONTENT_GAP))\n                        .pl(px(SIDEBAR_FOLDER_CHILD_INDENT))"
             )
         );
     }
@@ -54195,11 +54240,21 @@ mod tests {
             .map(|(body, _)| body)
             .expect("session settings should remain inspectable");
         assert!(session.contains("session_turn_preview_rail"));
+        assert!(session.contains("show_agent_generation_status"));
+        assert!(session.contains("set_show_agent_generation_status"));
         assert!(session.contains("session_content_width"));
         assert!(session.contains("enhanced_command_execution_display"));
         assert!(session.contains("set_enhanced_command_execution_display"));
         assert!(session.contains("enhanced_file_operation_display"));
         assert!(session.contains("set_enhanced_file_operation_display"));
+
+        let generation_status = source
+            .split_once("    fn render_agent_generation_status(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn selected_runtime_selection("))
+            .map(|(body, _)| body)
+            .expect("agent generation status renderer should remain inspectable");
+        assert!(generation_status.contains("show_agent_generation_status"));
+        assert!(generation_status.contains("self.agent_generation_stats = None"));
     }
 
     #[test]
