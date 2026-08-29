@@ -39,8 +39,6 @@ pub const SIDEBAR_SELECTED_BG: u32 = 0x303034;
 /// Border of an expanded worktree card that owns the selection
 /// (`sidebar_accent` lightened by 46% on the desktop).
 pub const SIDEBAR_CARD_FOCUS_BORDER: u32 = 0x39393d;
-/// Fill behind a session's state chip (the desktop's `secondary`).
-pub const SIDEBAR_CHIP_BG: u32 = 0x27272a;
 pub const SIDEBAR_TEXT_PRIMARY: u32 = 0xfafafa;
 pub const SIDEBAR_TEXT_SECONDARY: u32 = 0xd4d4d8;
 pub const SIDEBAR_TEXT_MUTED: u32 = 0x9f9fa9;
@@ -131,8 +129,8 @@ pub const SIDEBAR_FOLDER_GUIDE_OFFSET: f32 = 7.0;
 /// A session row starts its content past the card overhang instead of hanging
 /// into it the way project and worktree rows do.
 pub const SIDEBAR_SESSION_CONTENT_INSET: f32 = 8.0;
-/// Trailing metadata column of a session row (time, chip, status).
-pub const SIDEBAR_SESSION_META_WIDTH: f32 = 76.0;
+/// Trailing metadata column of a session row (time and status).
+pub const SIDEBAR_SESSION_META_WIDTH: f32 = 56.0;
 /// Corner radius of a row's fill.
 pub const SIDEBAR_ROW_RADIUS: f32 = 8.0;
 /// Corner radius of the worktree card that wraps a worktree and its sessions.
@@ -145,6 +143,8 @@ pub const SIDEBAR_AGENT_LOGO_SIZE: f32 = 14.0;
 pub const SIDEBAR_PROJECT_LOGO_SIZE: f32 = 16.0;
 /// Worktree and session status dot.
 pub const SIDEBAR_STATUS_DOT: f32 = 8.0;
+/// Desktop's compact spinner size for an active workspace or session.
+pub const SIDEBAR_STATUS_ICON_SIZE: f32 = 12.0;
 /// Unread-completion dot, which is deliberately smaller than a status dot.
 pub const SIDEBAR_UNREAD_DOT: f32 = 7.0;
 
@@ -250,10 +250,6 @@ pub fn sidebar_foreground(alpha: f32) -> Hsla {
 
 pub fn sidebar_card_focus_border() -> Hsla {
     rgb(SIDEBAR_CARD_FOCUS_BORDER).into()
-}
-
-pub fn sidebar_chip_bg() -> Hsla {
-    rgb(SIDEBAR_CHIP_BG).into()
 }
 
 /// Guide line down a folder's child column.

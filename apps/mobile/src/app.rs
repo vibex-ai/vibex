@@ -10,8 +10,8 @@ use gpui::{
     Animation, AnimationExt as _, App, AppContext as _, Context, ElementId, Entity, Focusable,
     FontWeight, IntoElement, KeyBinding, ListAlignment, ListState, MouseButton, MouseUpEvent,
     ParentElement as _, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, Styled as _, Task,
-    TouchPhase, UniformListScrollHandle, WeakEntity, Window, div, ease_in_out, ease_out_quint,
-    list, prelude::*, px, rgb, svg, uniform_list,
+    TouchPhase, Transformation, UniformListScrollHandle, WeakEntity, Window, div, ease_in_out,
+    ease_out_quint, list, percentage, prelude::*, px, rgb, svg, uniform_list,
 };
 use vibex_backend::{
     AgentBackend as _, BackendError, BackendEvent, BackendFuture, BackendOperation,
@@ -7148,13 +7148,16 @@ impl MobileApp {
                         .selected_ids
                         .contains(session_id.as_str())
                 }));
-        let session_fill_left = if inside_workspace_card {
-            theme::SIDEBAR_LIST_PADDING + row.indent - theme::SIDEBAR_ICON_SLOT_OVERHANG
-        } else {
-            theme::SIDEBAR_LIST_PADDING
-        };
+        let session_fill_left = theme::SIDEBAR_LIST_PADDING + row.indent
+            - if inside_workspace_card {
+                theme::SIDEBAR_ICON_SLOT_OVERHANG
+            } else {
+                0.0
+            };
         let body = match row.kind {
-            SidebarRowKind::Folder => self.render_sidebar_folder_row(row, cx),
+            SidebarRowKind::Folder => {
+                self.render_sidebar_folder_row(row, inside_workspace_card, cx)
+            }
             SidebarRowKind::Project => self.render_sidebar_project_row(row, cx),
             SidebarRowKind::Workspace => self.render_sidebar_workspace_row(row, cx),
             SidebarRowKind::EmptyWorkspace => self.render_sidebar_empty_workspace_row(row),
@@ -7354,6 +7357,7 @@ impl MobileApp {
     fn render_sidebar_folder_row(
         &self,
         row: &SidebarRow,
+        inside_workspace_card: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let folder_id = row.id().to_string();
@@ -7364,25 +7368,33 @@ impl MobileApp {
             .organization
             .folder(&folder_id)
             .is_some_and(|folder| folder.auto_archive_after_days.is_some());
-        div()
-            .id(format!("mobile-folder-row-{folder_id}"))
-            .h_full()
-            .relative()
-            .left(px(-theme::SIDEBAR_ICON_SLOT_OVERHANG))
-            .mx(px(theme::SIDEBAR_LIST_PADDING))
-            .pl(px(row.indent))
-            .pr(px(self.sidebar_actions_width(row)))
-            .rounded(px(theme::SIDEBAR_ROW_RADIUS))
-            .flex()
-            .items_center()
-            .gap(px(theme::SIDEBAR_ICON_TITLE_GAP))
-            .cursor_pointer()
-            .active(|style| style.bg(theme::row_pressed_bg()))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| this.toggle_folder(folder_id.clone(), cx)),
-            )
-            .child(Self::sidebar_icon_slot(
+        let project_scoped = row.project_id.is_some();
+        let folder_icon_inset = if inside_workspace_card {
+            theme::SIDEBAR_SESSION_CONTENT_INSET
+        } else {
+            theme::SIDEBAR_LIST_PADDING
+        };
+        let folder_icon = if project_scoped {
+            div()
+                .pl(px(folder_icon_inset))
+                .flex_shrink_0()
+                .child(
+                    svg()
+                        .path(if row.collapsed {
+                            "icons/folder.svg"
+                        } else {
+                            "icons/folder-open.svg"
+                        })
+                        .size(px(theme::SIDEBAR_AGENT_LOGO_SIZE))
+                        .text_color(if auto_archives {
+                            rgb(theme::ACCENT_GREEN).into()
+                        } else {
+                            theme::sidebar_foreground(0.72)
+                        }),
+                )
+                .into_any_element()
+        } else {
+            Self::sidebar_icon_slot(
                 svg()
                     .path(if row.collapsed {
                         "icons/folder.svg"
@@ -7396,7 +7408,32 @@ impl MobileApp {
                         theme::sidebar_foreground(0.72)
                     })
                     .into_any_element(),
-            ))
+            )
+            .into_any_element()
+        };
+        div()
+            .id(format!("mobile-folder-row-{folder_id}"))
+            .h_full()
+            .relative()
+            .left(px(-theme::SIDEBAR_ICON_SLOT_OVERHANG))
+            .mx(px(theme::SIDEBAR_LIST_PADDING))
+            .pl(px(row.indent))
+            .pr(px(self.sidebar_actions_width(row)))
+            .rounded(px(theme::SIDEBAR_ROW_RADIUS))
+            .flex()
+            .items_center()
+            .gap(px(if project_scoped {
+                theme::SPACING_SM
+            } else {
+                theme::SIDEBAR_ICON_TITLE_GAP
+            }))
+            .cursor_pointer()
+            .active(|style| style.bg(theme::row_pressed_bg()))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| this.toggle_folder(folder_id.clone(), cx)),
+            )
+            .child(folder_icon)
             .child(
                 div()
                     .flex_1()
@@ -7728,14 +7765,12 @@ impl MobileApp {
             return div().into_any_element();
         };
         let session_state = row.state.unwrap_or(session.state);
-        let generating = session_state == AgentSessionState::Running;
+        let generating = matches!(
+            session_state,
+            AgentSessionState::Running | AgentSessionState::Initializing
+        );
         let needs_approval = session_state == AgentSessionState::NeedsInput;
         let has_error = session_state == AgentSessionState::Error;
-        // An error states itself with its own dot, so it never also spends the
-        // chip; that is the desktop's rule for this column.
-        let state_label = (!has_error)
-            .then(|| sidebar_session_state_label(session_state))
-            .flatten();
         let show_status = !row.pinned
             && !needs_approval
             && !row.unread
@@ -7758,14 +7793,12 @@ impl MobileApp {
             .h_full()
             .ml(px(theme::SIDEBAR_LIST_PADDING))
             .mr(px(row_right_margin))
-            // A session row starts past the card overhang rather than hanging
-            // into it, so its agent mark clears a worktree's status column.
             .pl(px(row.indent + theme::SIDEBAR_SESSION_CONTENT_INSET))
             .pr(px(self.sidebar_actions_width(row)))
             .rounded(px(theme::SIDEBAR_ROW_RADIUS))
             .flex()
             .items_center()
-            .gap(px(theme::SPACING_SM))
+            .gap(px(theme::SIDEBAR_ICON_TITLE_GAP))
             .cursor_pointer()
             .active(|style| style.bg(theme::row_pressed_bg()))
             .on_mouse_up(
@@ -7778,44 +7811,40 @@ impl MobileApp {
                     }
                 }),
             )
-            .when(
-                session.workspace_mode == WorkspaceMode::VibexWorktree,
-                |row| {
-                    row.child(
-                        svg()
-                            .path("icons/git-branch.svg")
-                            .size(px(12.0))
-                            .flex_shrink_0()
-                            .text_color(theme::sidebar_foreground(0.78)),
-                    )
-                },
-            )
-            .child(
-                svg()
-                    .path(agent_icon_path(&session.agent_id.to_string()))
-                    .size(px(theme::SIDEBAR_AGENT_LOGO_SIZE))
-                    .flex_shrink_0()
-                    .text_color(theme::sidebar_foreground(if is_selected {
-                        0.80
-                    } else {
-                        0.58
-                    })),
-            )
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .text_size(px(theme::FONT_SIDEBAR_ROW))
-                    .when(is_selected, |title| title.font_weight(FontWeight::SEMIBOLD))
-                    .text_color(if is_selected {
-                        theme::sidebar_foreground(1.0)
-                    } else {
-                        theme::sidebar_foreground(0.56)
-                    })
-                    .child(row.label.clone()),
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_SM))
+                    .child(
+                        svg()
+                            .path(agent_icon_path(&session.agent_id.to_string()))
+                            .size(px(theme::SIDEBAR_AGENT_LOGO_SIZE))
+                            .flex_shrink_0()
+                            .text_color(theme::sidebar_foreground(if is_selected {
+                                0.80
+                            } else {
+                                0.58
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(px(theme::FONT_SIDEBAR_ROW))
+                            .when(is_selected, |title| title.font_weight(FontWeight::SEMIBOLD))
+                            .text_color(if is_selected {
+                                theme::sidebar_foreground(1.0)
+                            } else {
+                                theme::sidebar_foreground(0.56)
+                            })
+                            .child(row.label.clone()),
+                    ),
             )
             .child(
                 div()
@@ -7825,7 +7854,7 @@ impl MobileApp {
                     .items_center()
                     .justify_end()
                     .gap(px(6.0))
-                    .text_size(px(theme::FONT_SIDEBAR_ROW))
+                    .text_size(px(theme::FONT_SIDEBAR_META))
                     .text_color(theme::sidebar_foreground(0.48))
                     .when(row.pinned, |right| {
                         right.child(
@@ -7851,45 +7880,30 @@ impl MobileApp {
                                 .text_color(rgb(theme::ACCENT_YELLOW)),
                         )
                     })
-                    .when(!row.pinned && !needs_approval && !generating, |right| {
-                        right
-                            .when_some(state_label, |right, label| {
-                                right.child(
-                                    div()
-                                        .h(px(16.0))
-                                        .flex_shrink_0()
-                                        .rounded(px(4.0))
-                                        .px(px(6.0))
-                                        .flex()
-                                        .items_center()
-                                        .text_size(px(theme::FONT_SIDEBAR_META))
-                                        .bg(theme::sidebar_chip_bg())
-                                        .text_color(theme::sidebar_text_muted())
-                                        .child(label),
-                                )
-                            })
-                            .when(
-                                state_label.is_none() && !row.unread && !has_error,
-                                |right| {
-                                    right.child(
-                                        div()
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .whitespace_nowrap()
-                                            .child(session_sidebar_time_label(
-                                                session.last_message_at_ms,
-                                            )),
-                                    )
-                                },
+                    .when(
+                        !row.pinned
+                            && !needs_approval
+                            && !generating
+                            && !row.unread
+                            && !has_error
+                            && session_state == AgentSessionState::Idle,
+                        |right| {
+                            right.child(
+                                div()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .child(session_sidebar_time_label(session.last_message_at_ms)),
                             )
-                    })
+                        },
+                    )
                     .when(row.unread, |right| {
                         right.child(
                             div()
                                 .size(px(theme::SIDEBAR_UNREAD_DOT))
                                 .flex_shrink_0()
                                 .rounded_full()
-                                .bg(theme::sidebar_foreground(1.0)),
+                                .bg(rgb(theme::ACCENT_BLUE)),
                         )
                     })
                     .when(has_error, |right| {
@@ -8035,6 +8049,8 @@ impl MobileApp {
                 div()
                     .h(px(theme::DRAWER_HEADER_HEIGHT))
                     .flex_shrink_0()
+                    .border_b_1()
+                    .border_color(theme::border_default())
                     .px(px(theme::SPACING_MD))
                     .flex()
                     .items_center()
@@ -8587,7 +8603,7 @@ impl MobileApp {
                 div()
                     .flex_shrink_0()
                     .border_t_1()
-                    .border_color(theme::border_subtle())
+                    .border_color(theme::border_default())
                     .p(px(theme::SPACING_SM))
                     .flex()
                     .items_center()
@@ -10329,15 +10345,28 @@ fn sidebar_status_dot(color: gpui::Hsla) -> gpui::AnyElement {
         .into_any_element()
 }
 
+fn sidebar_running_indicator(color: gpui::Hsla) -> gpui::AnyElement {
+    svg()
+        .path("icons/loader-circle.svg")
+        .size(px(theme::SIDEBAR_STATUS_ICON_SIZE))
+        .flex_shrink_0()
+        .text_color(color)
+        .with_animation(
+            "mobile-sidebar-running-status",
+            Animation::new(Duration::from_millis(800))
+                .repeat()
+                .with_easing(ease_in_out),
+            |this, delta| this.with_transformation(Transformation::rotate(percentage(delta))),
+        )
+        .into_any_element()
+}
+
 fn sidebar_workspace_status_indicator(state: Option<AgentSessionState>) -> gpui::AnyElement {
     let color = rgb(sidebar_workspace_status_color(state));
     match state {
-        Some(AgentSessionState::Running | AgentSessionState::Initializing) => svg()
-            .path("icons/refresh.svg")
-            .size(px(theme::SIDEBAR_STATUS_DOT + 2.0))
-            .flex_shrink_0()
-            .text_color(color)
-            .into_any_element(),
+        Some(AgentSessionState::Running | AgentSessionState::Initializing) => {
+            sidebar_running_indicator(color.into())
+        }
         Some(
             AgentSessionState::NeedsInput | AgentSessionState::Error | AgentSessionState::Idle,
         )
@@ -10351,32 +10380,20 @@ fn sidebar_session_status_indicator(
     auto_continue_enabled: bool,
 ) -> gpui::AnyElement {
     match state {
-        AgentSessionState::Running | AgentSessionState::Initializing => svg()
-            .path("icons/refresh.svg")
-            .size(px(theme::SIDEBAR_STATUS_DOT + 2.0))
-            .flex_shrink_0()
-            .text_color(rgb(if auto_continue_enabled {
+        AgentSessionState::Running | AgentSessionState::Initializing => sidebar_running_indicator(
+            rgb(if auto_continue_enabled {
                 theme::ACCENT_GREEN
             } else {
                 theme::ACCENT_BLUE
-            }))
-            .into_any_element(),
+            })
+            .into(),
+        ),
         AgentSessionState::NeedsInput => sidebar_status_dot(rgb(theme::ACCENT_YELLOW).into()),
         AgentSessionState::Error => sidebar_status_dot(rgb(theme::ACCENT_RED).into()),
         AgentSessionState::Archived | AgentSessionState::Closed => {
             sidebar_status_dot(theme::sidebar_foreground(0.35))
         }
         AgentSessionState::Idle => sidebar_status_dot(theme::sidebar_foreground(0.78)),
-    }
-}
-
-fn sidebar_session_state_label(state: AgentSessionState) -> Option<&'static str> {
-    match state {
-        AgentSessionState::Initializing => Some(locale::text("Starting", "启动中", "啟動中")),
-        AgentSessionState::NeedsInput => Some(locale::text("Needs input", "待输入", "等待輸入")),
-        AgentSessionState::Error => Some(locale::common("Error")),
-        AgentSessionState::Archived => Some(locale::common("Archived")),
-        AgentSessionState::Running | AgentSessionState::Idle | AgentSessionState::Closed => None,
     }
 }
 

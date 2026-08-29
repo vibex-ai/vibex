@@ -121,7 +121,7 @@ fn ordered_ids(ids: &[String], preferred: &[String]) -> Vec<String> {
     let mut ordered = ids.to_vec();
     ordered.sort_by_key(|id| {
         (
-            positions.get(id.as_str()).is_none(),
+            !positions.contains_key(id.as_str()),
             positions.get(id.as_str()).copied().unwrap_or(usize::MAX),
             id.clone(),
         )
@@ -143,7 +143,7 @@ fn ordered_sessions<'a>(
     sessions.sort_by_key(|session| {
         (
             !view.pinned_session_ids.contains(session.id.as_str()),
-            positions.get(session.id.as_str()).is_none(),
+            positions.contains_key(session.id.as_str()),
             positions
                 .get(session.id.as_str())
                 .copied()
@@ -153,56 +153,6 @@ fn ordered_sessions<'a>(
         )
     });
     sessions
-}
-
-fn reorder_session_items(
-    items: Vec<SidebarOrganizationItem>,
-    view: &SidebarOrganizationView,
-) -> Vec<SidebarOrganizationItem> {
-    let session_ids = items
-        .iter()
-        .filter_map(|item| match item {
-            SidebarOrganizationItem::Session(id) => Some(id.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let ordered = ordered_ids(&session_ids, &view.session_order);
-    let mut next = ordered.into_iter();
-    items
-        .into_iter()
-        .map(|item| match item {
-            SidebarOrganizationItem::Session(_) => next
-                .next()
-                .map(SidebarOrganizationItem::Session)
-                .unwrap_or(item),
-            item => item,
-        })
-        .collect()
-}
-
-fn reorder_project_items(
-    items: Vec<SidebarOrganizationItem>,
-    project_order: &[String],
-) -> Vec<SidebarOrganizationItem> {
-    let ids = items
-        .iter()
-        .filter_map(|item| match item {
-            SidebarOrganizationItem::Project(id) => Some(id.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let ordered = ordered_ids(&ids, project_order);
-    let mut next = ordered.into_iter();
-    items
-        .into_iter()
-        .map(|item| match item {
-            SidebarOrganizationItem::Project(_) => next
-                .next()
-                .map(SidebarOrganizationItem::Project)
-                .unwrap_or(item),
-            item => item,
-        })
-        .collect()
 }
 
 fn workspace_status(
@@ -407,10 +357,7 @@ fn push_root_children(
     if depth > MAX_FOLDER_DEPTH {
         return;
     }
-    let root_items = reorder_project_items(
-        sidebar_root_items(organization, project_ids, parent_folder_id),
-        &input.view.project_order,
-    );
+    let root_items = sidebar_root_items(organization, project_ids, parent_folder_id);
     for item in root_items {
         match item {
             SidebarOrganizationItem::Project(project_id) => {
@@ -569,18 +516,15 @@ fn push_project_children(
         .filter(|session| session_matches(session, query))
         .map(|session| session.id.as_str().to_string())
         .collect::<Vec<_>>();
-    let project_items = reorder_session_items(
-        sidebar_project_items_for_workspace(
-            organization,
-            project_id,
-            None,
-            true,
-            !detailed_hierarchy,
-            &session_ids,
-            &input.view.pinned_session_ids,
-            parent_folder_id,
-        ),
-        input.view,
+    let project_items = sidebar_project_items_for_workspace(
+        organization,
+        project_id,
+        None,
+        true,
+        !detailed_hierarchy,
+        &session_ids,
+        &input.view.pinned_session_ids,
+        parent_folder_id,
     );
     for item in project_items {
         match item {
@@ -774,18 +718,15 @@ fn push_workspace_children(
     if depth > MAX_FOLDER_DEPTH {
         return;
     }
-    let workspace_items = reorder_session_items(
-        sidebar_project_items_for_workspace(
-            organization,
-            project_id,
-            Some(workspace_id),
-            false,
-            false,
-            session_ids,
-            &input.view.pinned_session_ids,
-            parent_folder_id,
-        ),
-        input.view,
+    let workspace_items = sidebar_project_items_for_workspace(
+        organization,
+        project_id,
+        Some(workspace_id),
+        false,
+        false,
+        session_ids,
+        &input.view.pinned_session_ids,
+        parent_folder_id,
     );
     for item in workspace_items {
         match item {
@@ -1164,6 +1105,90 @@ mod tests {
         assert_eq!(rows[0].kind, SidebarRowKind::Project);
         assert_eq!(rows[1].kind, SidebarRowKind::Session);
         assert_eq!(rows[1].depth, 1);
+    }
+
+    #[test]
+    fn organization_placement_order_wins_over_global_session_order() {
+        let mut view = SidebarOrganizationView::default();
+        view.session_order = vec![
+            "session_c".to_string(),
+            "session_b".to_string(),
+            "session_a".to_string(),
+        ];
+        view.organization.placements = vec![
+            vibex_desktop_model::SidebarOrganizationPlacement {
+                item: SidebarOrganizationItem::Session("session_b".to_string()),
+                parent_folder_id: None,
+            },
+            vibex_desktop_model::SidebarOrganizationPlacement {
+                item: SidebarOrganizationItem::Session("session_a".to_string()),
+                parent_folder_id: None,
+            },
+        ];
+        let projects = vec![SidebarProject {
+            id: "project_project".to_string(),
+            label: "vibex".to_string(),
+        }];
+        let sessions = vec![
+            session("a", "project", "A"),
+            session("b", "project", "B"),
+            session("c", "project", "C"),
+        ];
+        let rows = sidebar_rows(SidebarRowInput {
+            view: &view,
+            projects: &projects,
+            workspaces: &[],
+            sessions: &sessions,
+            selected_session_id: None,
+            query: "",
+        });
+
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind == SidebarRowKind::Session)
+                .map(|row| row.id().to_string())
+                .collect::<Vec<_>>(),
+            vec![
+                "session_b".to_string(),
+                "session_a".to_string(),
+                "session_c".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn unplaced_sessions_follow_desktop_new_session_order() {
+        let mut view = SidebarOrganizationView::default();
+        view.session_order = vec!["session_b".to_string(), "session_a".to_string()];
+        let projects = vec![SidebarProject {
+            id: "project_project".to_string(),
+            label: "vibex".to_string(),
+        }];
+        let sessions = vec![
+            session("a", "project", "A"),
+            session("b", "project", "B"),
+            session("c", "project", "C"),
+        ];
+        let rows = sidebar_rows(SidebarRowInput {
+            view: &view,
+            projects: &projects,
+            workspaces: &[],
+            sessions: &sessions,
+            selected_session_id: None,
+            query: "",
+        });
+
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind == SidebarRowKind::Session)
+                .map(|row| row.id().to_string())
+                .collect::<Vec<_>>(),
+            vec![
+                "session_c".to_string(),
+                "session_b".to_string(),
+                "session_a".to_string(),
+            ]
+        );
     }
 
     #[test]
