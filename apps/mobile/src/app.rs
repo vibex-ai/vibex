@@ -7566,7 +7566,9 @@ impl MobileApp {
                     .rounded(px(theme::RADIUS_CONTROL))
                     .flex()
                     .items_center()
-                    .justify_center()
+                    // Keep the glyph on the same right edge as session
+                    // status/time metadata; the full slot remains tappable.
+                    .justify_end()
                     .when(can_create_session, |button| {
                         button
                             .cursor_pointer()
@@ -7701,7 +7703,9 @@ impl MobileApp {
                     .rounded(px(theme::RADIUS_CONTROL))
                     .flex()
                     .items_center()
-                    .justify_center()
+                    // Keep project and worktree actions on the session
+                    // metadata column's right edge.
+                    .justify_end()
                     .cursor_pointer()
                     .when(!can_create_session, |button| button.opacity(0.38))
                     .active(|style| style.bg(theme::row_pressed_bg()))
@@ -8146,8 +8150,8 @@ impl MobileApp {
                             .on_mouse_up(MouseButton::Left, cx.listener(Self::close_drawer))
                             .child(
                                 svg()
-                                    .path("icons/log-out.svg")
-                                    .size(px(17.0))
+                                    .path("icons/chevron-right.svg")
+                                    .size(px(18.0))
                                     .text_color(theme::sidebar_text_muted()),
                             ),
                     ),

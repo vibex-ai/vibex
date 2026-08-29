@@ -129,8 +129,9 @@ pub const SIDEBAR_FOLDER_GUIDE_OFFSET: f32 = 7.0;
 /// A session row starts its content past the card overhang instead of hanging
 /// into it the way project and worktree rows do.
 pub const SIDEBAR_SESSION_CONTENT_INSET: f32 = 8.0;
-/// Trailing metadata column of a session row (time and status).
-pub const SIDEBAR_SESSION_META_WIDTH: f32 = 56.0;
+/// Trailing metadata column of a session row (time and status). Keeping it
+/// compact leaves more room for the session title.
+pub const SIDEBAR_SESSION_META_WIDTH: f32 = 48.0;
 /// Corner radius of a row's fill.
 pub const SIDEBAR_ROW_RADIUS: f32 = 8.0;
 /// Corner radius of the worktree card that wraps a worktree and its sessions.
