@@ -140,7 +140,7 @@ use crate::actions::{
     SaveActiveFile, ToggleComposerMode, TogglePreview, ToggleRightRail, ToggleSidebar,
     UndoImageEdit,
 };
-use crate::assets::{agent_brand_icon, agent_brand_logo, model_brand_icon, window_icon};
+use crate::assets::{agent_brand_icon, model_brand_icon, window_icon};
 use crate::code_workbench::{
     CodeRightRail, CodeWorkbench, CodeWorkbenchEvent, CodeWorkbenchPersistedState, RightRailMode,
 };
@@ -29497,22 +29497,29 @@ impl VibexWorkbench {
         let strings = self.strings();
         self.seed_timeline_tool_expansions(turn);
         let runtime_hover_group: SharedString = format!("timeline-runtime-{}", turn.id).into();
-        let (agent_attribution, runtime_attribution) = if let Some(attribution) =
-            self.timeline_turn_execution_attribution(turn)
-        {
-            let (agent, runtime) = self.render_timeline_runtime_header(&turn.id, attribution, cx);
-            (Some(agent), Some(runtime))
+        let execution_attribution = self.timeline_turn_execution_attribution(turn);
+        let runtime_attribution = if let Some(attribution) = execution_attribution.as_ref() {
+            Some(self.render_timeline_runtime_header(&turn.id, attribution.clone(), cx))
         } else {
             let runtime = turn.runtime_attribution.as_ref().map(|attribution| {
+                let runtime_label = attribution
+                    .split(" · ")
+                    .skip(1)
+                    .collect::<Vec<_>>()
+                    .join(" · ");
                 div()
                     .min_w_0()
                     .truncate()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground.opacity(0.80))
-                    .child(attribution.clone())
+                    .child(if runtime_label.is_empty() {
+                        attribution.clone()
+                    } else {
+                        runtime_label
+                    })
                     .into_any_element()
             });
-            (None, runtime)
+            runtime
         };
         let process_expanded = timeline_turn_process_expanded(
             turn,
@@ -29527,8 +29534,12 @@ impl VibexWorkbench {
         );
         // Keep the process open while work is in progress, then expose its
         // collapse toggle as soon as conclusion streaming starts.
-        let header_label = if turn.complete {
-            format!("{} {duration}", strings.agent_worked_for)
+        let header_label = if process_collapsible {
+            if process_expanded {
+                strings.agent_collapse_process.to_string()
+            } else {
+                strings.agent_expand_process.to_string()
+            }
         } else {
             format!(
                 "{} {duration}",
@@ -29581,9 +29592,6 @@ impl VibexWorkbench {
                     .cursor_pointer()
                     .text_color(cx.theme().muted_foreground)
                     .hover(|style| style.text_color(cx.theme().foreground))
-                    .when_some(agent_attribution, |this, attribution| {
-                        this.child(attribution)
-                    })
                     .child(header_label)
                     .child(
                         Icon::new(if process_expanded {
@@ -29615,9 +29623,6 @@ impl VibexWorkbench {
                     .gap(px(6.0))
                     .py_1()
                     .text_color(cx.theme().muted_foreground)
-                    .when_some(agent_attribution, |this, attribution| {
-                        this.child(attribution)
-                    })
                     .child(header_label)
                     .into_any_element()
             };
@@ -29656,10 +29661,34 @@ impl VibexWorkbench {
                 }
             }
             if let Some(conclusion_row) = timeline_turn_conclusion_row(turn) {
+                let mut conclusion_extras = Vec::new();
+                if let Some(file_changes) = file_changes.take() {
+                    conclusion_extras.push(file_changes);
+                }
+                if let Some(answer_metadata) = self.render_agent_answer_metadata(
+                    turn,
+                    conclusion_row,
+                    execution_attribution.as_ref(),
+                    cx,
+                ) {
+                    conclusion_extras.push(answer_metadata);
+                }
+                let content_before_actions = match conclusion_extras.len() {
+                    0 => None,
+                    1 => conclusion_extras.pop(),
+                    _ => Some(
+                        v_flex()
+                            .w_full()
+                            .min_w_0()
+                            .gap_2()
+                            .children(conclusion_extras)
+                            .into_any_element(),
+                    ),
+                };
                 response = response.child(self.render_timeline_row(
                     conclusion_row,
                     true,
-                    file_changes.take(),
+                    content_before_actions,
                     window,
                     cx,
                 ));
@@ -30196,51 +30225,76 @@ impl VibexWorkbench {
         turn_id: &str,
         attribution: vibex_core::TurnExecutionAttributionView,
         cx: &App,
-    ) -> (AnyElement, AnyElement) {
+    ) -> AnyElement {
+        let text_color = cx.theme().muted_foreground.opacity(0.80);
+        let runtime_label = format!(
+            "{} · {}",
+            attribution.auth_source_label, attribution.model_label
+        );
+        div()
+            .id(SharedString::from(format!("turn-runtime:{turn_id}")))
+            .min_w_0()
+            .truncate()
+            .text_xs()
+            .text_color(text_color)
+            .child(runtime_label)
+            .into_any_element()
+    }
+
+    fn render_agent_answer_metadata(
+        &self,
+        turn: &TimelineConversationTurn,
+        row: &TimelineRow,
+        attribution: Option<&vibex_core::TurnExecutionAttributionView>,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        if !turn.complete || row.kind != TimelineRowKind::AgentMessage || row.body.trim().is_empty()
+        {
+            return None;
+        }
+        let attribution = attribution?;
         let agent_identity = self
             .agent_snapshots
             .iter()
             .find(|agent| agent.label == attribution.agent_label)
             .map(agent_brand_identity)
             .unwrap_or_else(|| attribution.agent_label.clone());
-        let text_color = cx.theme().muted_foreground.opacity(0.80);
+        let muted_foreground = cx.theme().muted_foreground;
         let runtime_label = format!(
             "{} · {}",
             attribution.auth_source_label, attribution.model_label
         );
-        let agent_label = attribution.agent_label;
-
-        let agent = if let Some(logo) =
-            agent_brand_logo(&agent_identity, px(14.0), Some(text_color))
-        {
-            let tooltip_label = agent_label.clone();
-            div()
-                .id(SharedString::from(format!("turn-agent-logo:{turn_id}")))
-                .relative()
-                .top(px(2.0))
-                .size(px(14.0))
-                .flex_none()
-                .child(logo)
-                .tooltip(move |window, cx| Tooltip::new(tooltip_label.clone()).build(window, cx))
-                .into_any_element()
-        } else {
-            div()
+        let duration = format_compact_duration(
+            turn.started_at_ms,
+            timeline_turn_duration_end(turn.complete, turn.ended_at_ms),
+        );
+        let tooltip_label = attribution.agent_label.clone();
+        Some(
+            h_flex()
+                .id(SharedString::from(format!(
+                    "agent-answer-metadata:{}",
+                    row.id
+                )))
+                .w_full()
                 .min_w_0()
-                .max_w(px(120.0))
-                .truncate()
+                .items_center()
+                .gap_2()
                 .text_xs()
-                .text_color(text_color)
-                .child(agent_label)
-                .into_any_element()
-        };
-        let runtime = div()
-            .min_w_0()
-            .truncate()
-            .text_xs()
-            .text_color(text_color)
-            .child(runtime_label)
-            .into_any_element();
-        (agent, runtime)
+                .text_color(muted_foreground)
+                .child(
+                    div()
+                        .id(SharedString::from(format!("agent-answer-logo:{}", row.id)))
+                        .size(px(16.0))
+                        .flex_none()
+                        .child(runtime_agent_icon(&agent_identity))
+                        .tooltip(move |window, cx| {
+                            Tooltip::new(tooltip_label.clone()).build(window, cx)
+                        }),
+                )
+                .child(div().min_w_0().flex_1().truncate().child(runtime_label))
+                .child(div().flex_none().child(duration))
+                .into_any_element(),
+        )
     }
 
     fn render_timeline_process_rows(
@@ -30650,6 +30704,8 @@ impl VibexWorkbench {
                     height += 30.0;
                 }
                 if conclusion && !row.streaming {
+                    // Answer metadata stays visible above the hover actions.
+                    height += 24.0;
                     // action icon row
                     height += 32.0;
                 }
@@ -51181,6 +51237,13 @@ mod tests {
             .find(".when_some(composer_queue, |this, queue|")
             .expect("the queued messages should remain attached to the composer");
         assert!(plan_position < queue_position);
+        let generation_status_position = composer
+            .find(".when_some(generation_status, |this, status|")
+            .expect("the live generation status should remain attached to the composer");
+        assert!(generation_status_position < plan_position);
+        assert!(composer.contains("agent-generation-status"));
+        assert!(composer.contains("when(tool_count > 0"));
+        assert!(composer.contains("when_some(tokens_per_second"));
 
         let plan = source
             .split_once("    fn render_composer_plan(")
