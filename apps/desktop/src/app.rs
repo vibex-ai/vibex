@@ -28174,6 +28174,7 @@ impl VibexWorkbench {
                         let auth_source_count =
                             runtime_auth_sources_for_agent(&catalog, &agent.id).len();
                         let identity = agent_brand_identity(&agent);
+                        let selected = agent.id == desired.agent_id;
                         let agent_id = agent.id;
                         Button::new(format!("composer-runtime-agent:{agent_id}"))
                             .small()
@@ -28183,6 +28184,7 @@ impl VibexWorkbench {
                             .flex_none()
                             .px_2()
                             .justify_start()
+                            .selected(selected)
                             .rounded(gpui_component::button::ButtonRounded::Size(px(6.0)))
                             .child(
                                 h_flex()
@@ -28198,6 +28200,12 @@ impl VibexWorkbench {
                                             .text_sm()
                                             .child(agent.label),
                                     )
+                                    .when(selected, |this| {
+                                        this.child(new_session_selector_icon(
+                                            "icons/vibex/crosshair.svg",
+                                            cx.theme().primary,
+                                        ))
+                                    })
                                     .child(
                                         div()
                                             .flex_none()
@@ -53001,6 +53009,9 @@ mod tests {
         assert!(grouped_models.contains(".anchor_scroll(selected_anchor)"));
         assert!(menu_opening.contains("runtime_provider_scroll_to_selection = true;"));
         assert!(grouped_models.contains("ComposerRuntimeMenuView::Agent"));
+        assert!(current_session.contains("let selected = agent.id == desired.agent_id;"));
+        assert!(current_session.contains(".selected(selected)"));
+        assert!(current_session.contains("icons/vibex/crosshair.svg"));
         for cascade in [new_session, current_session] {
             assert!(cascade.contains("render_provider_model_groups("));
             assert!(cascade.contains("ComposerRuntimeMenuView::Authentication"));
