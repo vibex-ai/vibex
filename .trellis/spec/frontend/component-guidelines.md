@@ -93,6 +93,27 @@ GPUI fixture because compile-only and model tests do not execute `Button::render
 The Code Workbench source contract additionally rejects a direct hover override on
 its preview-tab add button.
 
+### GPUI Entity update reentrancy
+
+An entity update callback must not synchronously update the same entity through
+another handle. GPUI panics when an `Entity::update` for `FoundationSettings`
+(or any other view) is re-entered, including when a sibling workbench callback
+publishes a result back to that view. Defer the cross-entity update until the
+current effect cycle completes:
+
+```rust
+let settings = self.settings_view.clone();
+cx.defer(move |cx| {
+    let _ = settings.update(cx, |settings, cx| {
+        settings.operation_note = note;
+        cx.notify();
+    });
+});
+```
+
+Keep local state mutations inside the active callback; only the hand-off to a
+currently-updating entity needs to be deferred.
+
 ### GPUI Post-Mutation Scroll Timing
 
 When a GPUI action changes text or other content whose layout determines a scroll
