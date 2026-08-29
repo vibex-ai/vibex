@@ -69,12 +69,11 @@ pub const FONT_CAPTION: f32 = 11.0;
 /// workspace paths, row counts).
 pub const FONT_MICRO: f32 = 10.0;
 
-// The sidebar tree runs on the desktop's own type scale (`text_base`,
-// `text_sm`, `text_xs`) rather than the phone's denser one, so a project tree
-// reads the same on both shells.
-pub const FONT_SIDEBAR_TITLE: f32 = 16.0;
-pub const FONT_SIDEBAR_ROW: f32 = 14.0;
-pub const FONT_SIDEBAR_META: f32 = 12.0;
+// The sidebar preserves the desktop hierarchy at one denser mobile type step
+// so a full project tree remains scannable on a phone.
+pub const FONT_SIDEBAR_TITLE: f32 = 15.0;
+pub const FONT_SIDEBAR_ROW: f32 = 13.0;
+pub const FONT_SIDEBAR_META: f32 = 11.0;
 
 pub const ICON_MD: f32 = 18.0;
 pub const ICON_SM: f32 = 16.0;

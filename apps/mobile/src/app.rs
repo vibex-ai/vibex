@@ -7095,19 +7095,35 @@ impl MobileApp {
             .and_then(|drag| drag.target.as_ref())
             .filter(|target| target.index == index)
             .map(|target| target.position);
+        let workspace_card = card;
+        let inside_workspace_card = workspace_card.is_some();
+        let card = workspace_card.filter(|card| {
+            self.sidebar_selected_workspace_id.as_deref() == Some(card.workspace_id.as_str())
+        });
+        let session_selected = row.kind == SidebarRowKind::Session
+            && (row.selected
+                || row.session_id.as_ref().is_some_and(|session_id| {
+                    self.sidebar_state
+                        .selected_ids
+                        .contains(session_id.as_str())
+                }));
+        let session_fill_left = if inside_workspace_card {
+            theme::SIDEBAR_LIST_PADDING + row.indent - theme::SIDEBAR_ICON_SLOT_OVERHANG
+        } else {
+            theme::SIDEBAR_LIST_PADDING
+        };
         let body = match row.kind {
             SidebarRowKind::Folder => self.render_sidebar_folder_row(row, cx),
             SidebarRowKind::Project => self.render_sidebar_project_row(row, cx),
             SidebarRowKind::Workspace => self.render_sidebar_workspace_row(row, cx),
             SidebarRowKind::EmptyWorkspace => self.render_sidebar_empty_workspace_row(row),
-            SidebarRowKind::Session => self.render_sidebar_session_row(row, cx),
+            SidebarRowKind::Session => {
+                self.render_sidebar_session_row(row, session_selected, inside_workspace_card, cx)
+            }
         };
         // The desktop draws the card border once, around a real container. A
         // flat row list has to draw it a slice at a time, so each row paints the
         // sides and only the ends paint a cap.
-        let card = card.filter(|card| {
-            self.sidebar_selected_workspace_id.as_deref() == Some(card.workspace_id.as_str())
-        });
         div()
             .relative()
             .h(px(theme::SIDEBAR_ROW_HEIGHT))
@@ -7125,6 +7141,21 @@ impl MobileApp {
                     .w(px(1.0))
                     .bg(theme::sidebar_tree_guide())
             }))
+            // A desktop session fills the complete worktree child column,
+            // including its action slot. Paint the compact equivalent at the
+            // wrapper level so the separate mobile menu remains inside it.
+            .when(session_selected, |element| {
+                element.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(px(session_fill_left))
+                        .right(px(theme::SIDEBAR_CARD_INSET))
+                        .rounded(px(theme::SIDEBAR_ROW_RADIUS))
+                        .bg(theme::sidebar_selected_bg()),
+                )
+            })
             .child(body)
             .when_some(card, |element, card| {
                 element.child(
@@ -7177,7 +7208,7 @@ impl MobileApp {
                 .supports(BackendOperation::AgentSidebarOrganizationMutate)
         });
         if self.sidebar_row_shows_menu(row, can_organize) {
-            theme::SIDEBAR_ACTION_WIDTH
+            theme::SIDEBAR_ACTION_WIDTH + theme::SIDEBAR_CARD_INSET
         } else {
             0.0
         }
@@ -7234,7 +7265,7 @@ impl MobileApp {
             .absolute()
             .top_0()
             .bottom_0()
-            .right_0()
+            .right(px(theme::SIDEBAR_CARD_INSET))
             .w(px(theme::SIDEBAR_ACTION_WIDTH))
             .flex()
             .items_center()
@@ -7619,9 +7650,12 @@ impl MobileApp {
     fn render_sidebar_empty_workspace_row(&self, row: &SidebarRow) -> gpui::AnyElement {
         div()
             .id(format!("mobile-empty-workspace-row-{}", row.id()))
+            .relative()
+            .left(px(-theme::SIDEBAR_ICON_SLOT_OVERHANG))
             .h_full()
-            .mx(px(theme::SIDEBAR_LIST_PADDING))
-            .pl(px(row.indent + theme::SIDEBAR_SESSION_CONTENT_INSET))
+            .ml(px(theme::SIDEBAR_LIST_PADDING))
+            .mr(px(theme::SIDEBAR_CARD_INSET))
+            .pl(px(row.indent))
             .flex()
             .items_center()
             .gap(px(theme::SPACING_SM))
@@ -7631,7 +7665,8 @@ impl MobileApp {
                 svg()
                     .path("icons/message-square.svg")
                     .size(px(14.0))
-                    .flex_shrink_0(),
+                    .flex_shrink_0()
+                    .text_color(theme::sidebar_foreground(0.45)),
             )
             .child(locale::text("No sessions", "暂无会话", "暫無會話"))
             .into_any_element()
@@ -7640,6 +7675,8 @@ impl MobileApp {
     fn render_sidebar_session_row(
         &self,
         row: &SidebarRow,
+        is_selected: bool,
+        inside_workspace_card: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let Some(session_id) = row.session_id.clone() else {
@@ -7658,11 +7695,6 @@ impl MobileApp {
         let state_label = (!has_error)
             .then(|| sidebar_session_state_label(session_state))
             .flatten();
-        let is_selected = row.selected
-            || self
-                .sidebar_state
-                .selected_ids
-                .contains(session_id.as_str());
         let show_status = !row.pinned
             && !needs_approval
             && !row.unread
@@ -7670,10 +7702,21 @@ impl MobileApp {
             && session_state != AgentSessionState::Idle;
         let open_session_id = session_id.clone();
         let batch_session_id = session_id.clone();
+        let (row_offset, row_right_margin) = if inside_workspace_card {
+            (
+                -theme::SIDEBAR_ICON_SLOT_OVERHANG,
+                theme::SIDEBAR_CARD_INSET,
+            )
+        } else {
+            (0.0, theme::SIDEBAR_LIST_PADDING)
+        };
         div()
             .id(format!("mobile-session-row-{}", row.id()))
+            .relative()
+            .left(px(row_offset))
             .h_full()
-            .mx(px(theme::SIDEBAR_LIST_PADDING))
+            .ml(px(theme::SIDEBAR_LIST_PADDING))
+            .mr(px(row_right_margin))
             // A session row starts past the card overhang rather than hanging
             // into it, so its agent mark clears a worktree's status column.
             .pl(px(row.indent + theme::SIDEBAR_SESSION_CONTENT_INSET))
@@ -7682,7 +7725,6 @@ impl MobileApp {
             .flex()
             .items_center()
             .gap(px(theme::SPACING_SM))
-            .when(is_selected, |row| row.bg(theme::sidebar_selected_bg()))
             .cursor_pointer()
             .active(|style| style.bg(theme::row_pressed_bg()))
             .on_mouse_up(
