@@ -90,6 +90,20 @@ pub enum MessageSendKey {
     CommandEnter,
 }
 
+/// Controls where in a session the currently generated reasoning is shown.
+///
+/// The default keeps the existing compact experience: only the latest
+/// in-flight reasoning is shown at the bottom of the turn. Timeline mode keeps
+/// each reasoning run in its original position while still treating the
+/// trailing run as live content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningDisplayMode {
+    #[default]
+    LatestAtBottom,
+    Timeline,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalWorkingDirectory {
@@ -435,6 +449,10 @@ pub struct ComposerUiState {
 pub struct SessionUiState {
     pub content_width: SessionContentWidthMode,
     pub turn_preview_rail: bool,
+    #[serde(default)]
+    pub reasoning_display_mode: ReasoningDisplayMode,
+    #[serde(default)]
+    pub reasoning_expanded_by_default: bool,
     #[serde(default = "default_show_agent_generation_status")]
     pub show_agent_generation_status: bool,
     #[serde(default = "default_enhanced_command_execution_display")]
@@ -452,6 +470,8 @@ impl Default for SessionUiState {
         Self {
             content_width: SessionContentWidthMode::Standard,
             turn_preview_rail: true,
+            reasoning_display_mode: ReasoningDisplayMode::LatestAtBottom,
+            reasoning_expanded_by_default: false,
             show_agent_generation_status: true,
             enhanced_command_execution_display: false,
             enhanced_file_operation_display: true,
@@ -1510,6 +1530,11 @@ mod tests {
     fn session_display_preferences_are_backward_compatible() {
         assert!(SessionUiState::default().show_agent_generation_status);
         assert!(SessionUiState::default().enhanced_file_operation_display);
+        assert_eq!(
+            SessionUiState::default().reasoning_display_mode,
+            ReasoningDisplayMode::LatestAtBottom
+        );
+        assert!(!SessionUiState::default().reasoning_expanded_by_default);
 
         let mut value = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
         let session = value
@@ -1519,6 +1544,8 @@ mod tests {
         session.remove("showAgentGenerationStatus");
         session.remove("enhancedCommandExecutionDisplay");
         session.remove("enhancedFileOperationDisplay");
+        session.remove("reasoningDisplayMode");
+        session.remove("reasoningExpandedByDefault");
         session.remove("autoContinueProjectIds");
         session.remove("autoContinueSessionOverrides");
 
@@ -1527,6 +1554,11 @@ mod tests {
         assert!(decoded.session.show_agent_generation_status);
         assert!(!decoded.session.enhanced_command_execution_display);
         assert!(decoded.session.enhanced_file_operation_display);
+        assert_eq!(
+            decoded.session.reasoning_display_mode,
+            ReasoningDisplayMode::LatestAtBottom
+        );
+        assert!(!decoded.session.reasoning_expanded_by_default);
         assert!(decoded.session.auto_continue_project_ids.is_empty());
         assert!(decoded.session.auto_continue_session_overrides.is_empty());
     }

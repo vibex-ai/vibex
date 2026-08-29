@@ -119,6 +119,20 @@ impl TimelineModel {
         crate::timeline_conversation_turns(&self.items, session_state, pending_turn_active)
     }
 
+    pub fn conversation_turns_with_reasoning_mode(
+        &self,
+        session_state: Option<AgentSessionState>,
+        pending_turn_active: bool,
+        reasoning_display_mode: crate::ReasoningDisplayMode,
+    ) -> Vec<crate::TimelineConversationTurn> {
+        crate::timeline_conversation_turns_with_reasoning_mode(
+            &self.items,
+            session_state,
+            pending_turn_active,
+            reasoning_display_mode,
+        )
+    }
+
     pub fn pending_permission_ids(&self) -> BTreeSet<String> {
         let mut pending = BTreeSet::new();
         for item in &self.items {

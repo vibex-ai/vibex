@@ -102,21 +102,22 @@ use vibex_desktop_model::{
     DesktopBehaviorUiState, DesktopUiStateV1, GitSelectionKey, GitWorkbenchMode, LocaleMode,
     MessageSendKey, NavigationHistory, NetworkProxyUiState, NewSessionLocation,
     NewSessionProjectTicket, NewSessionSubmissionStage, NewSessionWorkspaceState,
-    RUNTIME_SELECTION_PREFERENCE_LIMIT, RuntimeCascadeChoice, RuntimeCascadeProjection,
-    SIDEBAR_AUTO_ARCHIVE_MAX_DAYS, SessionContentWidthMode, SessionUiState, SidebarHierarchyMode,
-    SidebarMutationRejection, SidebarOrganizationItem, SidebarOrganizationScope,
-    SidebarOrganizationView, SidebarProjectAppearance, SidebarProjectLogo, SidebarProjectLogoColor,
-    SidebarProjectProjection, SidebarState, SidebarWorkspaceProjection, StartupDestination,
-    TerminalWorkingDirectory, ThemeMode as ModelThemeMode, ThrottledUiStateWriter,
-    TimelineConversationTurn, TimelineFollowState, TimelineModel, TimelineProcessActivityGroup,
-    TimelineRow, TimelineRowKind, UiStateStore, UnifiedDiffLineKind, WorkbenchRoute,
-    WorkspaceContextProjection, WorktreeLifecycleDisplayState, active_collaborations,
-    complete_string_order, composer_trigger_at, current_agent_plan,
-    custom_worktree_path_is_absolute, move_string_relative, move_strings_relative,
-    ordered_agent_ids, parse_unified_diff, sidebar_project_custom_logo_file_is_valid,
-    sidebar_project_items, sidebar_project_items_for_workspace,
-    sidebar_project_projections_with_workspace_order, sidebar_root_items,
-    timeline_agent_message_count_after_sequence, timeline_conversation_turns,
+    RUNTIME_SELECTION_PREFERENCE_LIMIT, ReasoningDisplayMode, RuntimeCascadeChoice,
+    RuntimeCascadeProjection, SIDEBAR_AUTO_ARCHIVE_MAX_DAYS, SessionContentWidthMode,
+    SessionUiState, SidebarHierarchyMode, SidebarMutationRejection, SidebarOrganizationItem,
+    SidebarOrganizationScope, SidebarOrganizationView, SidebarProjectAppearance,
+    SidebarProjectLogo, SidebarProjectLogoColor, SidebarProjectProjection, SidebarState,
+    SidebarWorkspaceProjection, StartupDestination, TerminalWorkingDirectory,
+    ThemeMode as ModelThemeMode, ThrottledUiStateWriter, TimelineConversationTurn,
+    TimelineFollowState, TimelineModel, TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
+    UiStateStore, UnifiedDiffLineKind, WorkbenchRoute, WorkspaceContextProjection,
+    WorktreeLifecycleDisplayState, active_collaborations, complete_string_order,
+    composer_trigger_at, current_agent_plan, custom_worktree_path_is_absolute,
+    move_string_relative, move_strings_relative, ordered_agent_ids, parse_unified_diff,
+    sidebar_project_custom_logo_file_is_valid, sidebar_project_items,
+    sidebar_project_items_for_workspace, sidebar_project_projections_with_workspace_order,
+    sidebar_root_items, timeline_agent_message_count_after_sequence, timeline_conversation_turns,
+    timeline_conversation_turns_with_reasoning_mode,
 };
 use vibex_desktop_runtime::{
     DesktopEvent, DesktopRuntime, DesktopRuntimeConfig, DesktopRuntimeFacade, PREVIEW_APP_ID,
@@ -272,7 +273,7 @@ const TIMELINE_MARKDOWN_SOURCE_CACHE_LIMIT: usize = 32;
 const TIMELINE_MARKDOWN_SOURCE_CACHE_BYTES: usize = 2 * 1024 * 1024;
 const TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 const TIMELINE_STREAMING_MARKDOWN_REFRESH_BYTES: usize = 8 * 1024;
-const AGENT_THINKING_SCROLL_DURATION: Duration = Duration::from_secs(12);
+const AGENT_THINKING_SHIMMER_DURATION: Duration = Duration::from_secs(12);
 const SHIMMER_SCAN_PASSES: f32 = 10.0;
 const AGENT_THINKING_LABEL_MAX_CHARS: usize = 48;
 const TIMELINE_TOOL_PROJECTION_CACHE_LIMIT: usize = 128;
@@ -2054,6 +2055,7 @@ struct AgentSessionViewCacheEntry {
     streaming_row_state: Option<StreamingRowStateCache>,
     content_width: SessionContentWidthMode,
     collapsed_timeline_rows: BTreeSet<String>,
+    reasoning_expansion: BTreeMap<String, bool>,
     timeline_process_expansion: BTreeMap<String, bool>,
     timeline_command_expansion: BTreeMap<String, bool>,
     timeline_file_changes_expansion: BTreeMap<String, bool>,
@@ -2086,6 +2088,12 @@ impl AgentSessionViewCacheEntry {
             .saturating_add(
                 self.collapsed_timeline_rows
                     .iter()
+                    .map(String::len)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.reasoning_expansion
+                    .keys()
                     .map(String::len)
                     .sum::<usize>(),
             )
@@ -2454,6 +2462,7 @@ struct ConversationTurnsCacheKey {
     agent_turn_pending: bool,
     pending_edit: Option<(VibexSessionId, i64, i64)>,
     optimistic_message: Option<(VibexSessionId, String, i64)>,
+    reasoning_display_mode: ReasoningDisplayMode,
 }
 
 fn conversation_turn_start_index(
@@ -2492,6 +2501,7 @@ fn refresh_conversation_turns_cache_incrementally(
 ) -> bool {
     if previous_key.session_id != next_key.session_id
         || next_key.session_id != timeline.session_id
+        || previous_key.reasoning_display_mode != next_key.reasoning_display_mode
         || previous_key.pending_edit.is_some()
         || next_key.pending_edit.is_some()
         || previous_key.optimistic_message.is_some()
@@ -2524,10 +2534,11 @@ fn refresh_conversation_turns_cache_incrementally(
     else {
         return false;
     };
-    let suffix = timeline_conversation_turns(
+    let suffix = timeline_conversation_turns_with_reasoning_mode(
         &timeline.items[start_index..],
         next_key.session_state,
         next_key.agent_turn_pending,
+        next_key.reasoning_display_mode,
     );
     let Some(first_suffix) = suffix.first() else {
         return false;
@@ -4113,6 +4124,7 @@ pub struct VibexWorkbench {
     new_session_command_entry: Option<AgentCommandEntry>,
     collapsed_timeline_rows: BTreeSet<String>,
     timeline_process_expansion: BTreeMap<String, bool>,
+    reasoning_expansion: BTreeMap<String, bool>,
     timeline_file_changes_expansion: BTreeMap<String, bool>,
     turn_changes_undo_statuses: BTreeMap<String, TurnChangesUndoStatus>,
     composer_attachments: Vec<InlineComposerAttachment>,
@@ -4818,6 +4830,7 @@ impl VibexWorkbench {
             new_session_command_entry: None,
             collapsed_timeline_rows: BTreeSet::new(),
             timeline_process_expansion: BTreeMap::new(),
+            reasoning_expansion: BTreeMap::new(),
             timeline_file_changes_expansion: BTreeMap::new(),
             turn_changes_undo_statuses: BTreeMap::new(),
             composer_attachments: Vec::new(),
@@ -8804,6 +8817,7 @@ impl VibexWorkbench {
             streaming_row_state: self.streaming_row_state.take(),
             content_width: self.ui_state.session.content_width,
             collapsed_timeline_rows: std::mem::take(&mut self.collapsed_timeline_rows),
+            reasoning_expansion: std::mem::take(&mut self.reasoning_expansion),
             timeline_process_expansion: std::mem::take(&mut self.timeline_process_expansion),
             timeline_command_expansion: std::mem::take(&mut self.timeline_command_expansion),
             timeline_file_changes_expansion: std::mem::take(
@@ -8900,6 +8914,7 @@ impl VibexWorkbench {
         self.conversation_turns_summary = entry.conversation_turns_summary;
         self.streaming_row_state = entry.streaming_row_state;
         self.collapsed_timeline_rows = entry.collapsed_timeline_rows;
+        self.reasoning_expansion = entry.reasoning_expansion;
         self.timeline_process_expansion = entry.timeline_process_expansion;
         self.timeline_command_expansion = entry.timeline_command_expansion;
         self.timeline_file_changes_expansion = entry.timeline_file_changes_expansion;
@@ -9386,7 +9401,12 @@ impl VibexWorkbench {
             .as_ref()
             .and_then(|edit| edit.projected_items(&self.timeline))
         {
-            return timeline_conversation_turns(&items, Some(AgentSessionState::Running), true);
+            return timeline_conversation_turns_with_reasoning_mode(
+                &items,
+                Some(AgentSessionState::Running),
+                true,
+                self.ui_state.session.reasoning_display_mode,
+            );
         }
         if let Some(items) = self
             .selected_session_id
@@ -9394,14 +9414,18 @@ impl VibexWorkbench {
             .and_then(|session_id| self.optimistic_user_messages.get(session_id.as_str()))
             .and_then(|message| message.projected_items(&self.timeline))
         {
-            return timeline_conversation_turns(
+            return timeline_conversation_turns_with_reasoning_mode(
                 &items,
                 self.selected_agent_session_state(),
                 self.agent_turn_pending,
+                self.ui_state.session.reasoning_display_mode,
             );
         }
-        self.timeline
-            .conversation_turns(self.selected_agent_session_state(), self.agent_turn_pending)
+        self.timeline.conversation_turns_with_reasoning_mode(
+            self.selected_agent_session_state(),
+            self.agent_turn_pending,
+            self.ui_state.session.reasoning_display_mode,
+        )
     }
 
     fn current_conversation_turns_cache_key(&self) -> ConversationTurnsCacheKey {
@@ -9421,6 +9445,7 @@ impl VibexWorkbench {
                 .as_ref()
                 .and_then(|session_id| self.optimistic_user_messages.get(session_id.as_str()))
                 .map(OptimisticUserMessage::cache_key),
+            reasoning_display_mode: self.ui_state.session.reasoning_display_mode,
         }
     }
 
@@ -9558,6 +9583,7 @@ impl VibexWorkbench {
             self.timeline_row_sizes = Rc::new(Vec::new());
             self.invalidate_timeline_render_caches();
             self.collapsed_timeline_rows.clear();
+            self.reasoning_expansion.clear();
             self.timeline_process_expansion.clear();
             self.timeline_command_expansion.clear();
             self.timeline_file_changes_expansion.clear();
@@ -10485,6 +10511,18 @@ impl VibexWorkbench {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         turn.complete.hash(&mut hasher);
         process_expansion.hash(&mut hasher);
+        self.ui_state
+            .session
+            .reasoning_display_mode
+            .hash(&mut hasher);
+        self.ui_state
+            .session
+            .reasoning_expanded_by_default
+            .hash(&mut hasher);
+        self.reasoning_expansion
+            .get(&format!("reasoning-live:{}", turn.id))
+            .copied()
+            .hash(&mut hasher);
         self.timeline_file_changes_expansion
             .get(&turn.id)
             .copied()
@@ -10510,7 +10548,12 @@ impl VibexWorkbench {
             row.title.len().hash(&mut hasher);
             row.pending_permission.hash(&mut hasher);
             row.failed.hash(&mut hasher);
+            row.streaming.hash(&mut hasher);
             row.file_path.is_some().hash(&mut hasher);
+            self.reasoning_expansion
+                .get(&row.id)
+                .copied()
+                .hash(&mut hasher);
             self.timeline_command_expansion
                 .get(&row.id)
                 .copied()
@@ -20219,6 +20262,30 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    fn set_reasoning_display_mode(&mut self, mode: ReasoningDisplayMode, cx: &mut Context<Self>) {
+        if self.ui_state.session.reasoning_display_mode == mode {
+            return;
+        }
+        self.ui_state.session.reasoning_display_mode = mode;
+        self.reasoning_expansion.clear();
+        self.invalidate_timeline_render_caches();
+        self.rebuild_timeline_sizes();
+        self.queue_ui_state();
+        cx.notify();
+    }
+
+    fn set_reasoning_expanded_by_default(&mut self, expanded: bool, cx: &mut Context<Self>) {
+        if self.ui_state.session.reasoning_expanded_by_default == expanded {
+            return;
+        }
+        self.ui_state.session.reasoning_expanded_by_default = expanded;
+        self.reasoning_expansion.clear();
+        self.invalidate_timeline_layout_measurements();
+        self.rebuild_timeline_sizes();
+        self.queue_ui_state();
+        cx.notify();
+    }
+
     fn set_enhanced_command_execution_display(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.ui_state.session.enhanced_command_execution_display = enabled;
         self.invalidate_timeline_layout_measurements();
@@ -29842,6 +29909,7 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let strings = self.strings();
+        let reasoning_display_mode = self.ui_state.session.reasoning_display_mode;
         let runtime_hover_group: SharedString = format!("timeline-runtime-{}", turn.id).into();
         let execution_attribution = self.timeline_turn_execution_attribution(turn);
         let runtime_attribution = if let Some(attribution) = execution_attribution.as_ref() {
@@ -30034,23 +30102,35 @@ impl VibexWorkbench {
                     window,
                     cx,
                 ));
-            } else if !turn.complete {
-                let pending_label = if turn.pending_permission {
-                    strings.agent_waiting_confirmation.to_string()
+            } else if !turn.complete
+                && !(reasoning_display_mode == ReasoningDisplayMode::Timeline
+                    && turn
+                        .process_rows
+                        .iter()
+                        .any(|row| row.kind == TimelineRowKind::Reasoning && row.streaming))
+            {
+                if reasoning_display_mode == ReasoningDisplayMode::LatestAtBottom
+                    && let Some(reasoning) = turn.live_status.as_deref()
+                {
+                    response = response.child(self.render_live_reasoning(turn, reasoning, cx));
                 } else {
-                    turn.live_status
-                        .as_deref()
-                        .unwrap_or(strings.agent_pending_response)
-                        .to_string()
-                };
-                let pending_tooltip =
-                    agent_progress_tooltip(&pending_label, strings.agent_pending_response);
-                response = response.child(render_agent_thinking_indicator(
-                    &turn.id,
-                    &agent_progress_label(&pending_label, strings.agent_pending_response),
-                    &pending_tooltip,
-                    cx,
-                ));
+                    let pending_label = if turn.pending_permission {
+                        strings.agent_waiting_confirmation.to_string()
+                    } else {
+                        turn.live_status
+                            .as_deref()
+                            .unwrap_or(strings.agent_pending_response)
+                            .to_string()
+                    };
+                    let pending_tooltip =
+                        agent_progress_tooltip(&pending_label, strings.agent_pending_response);
+                    response = response.child(render_agent_thinking_indicator(
+                        &turn.id,
+                        &agent_progress_label(&pending_label, strings.agent_pending_response),
+                        &pending_tooltip,
+                        cx,
+                    ));
+                }
             }
             content = content.child(response);
         }
@@ -31059,7 +31139,16 @@ impl VibexWorkbench {
                 }
                 height
             }
-            TimelineRowKind::Reasoning | TimelineRowKind::Plan => {
+            TimelineRowKind::Reasoning => {
+                if row.body.is_empty() {
+                    4.0
+                } else if self.reasoning_row_expanded(&row.id) {
+                    estimated_markdown_body_height(&row.body, 72) + 4.0
+                } else {
+                    28.0
+                }
+            }
+            TimelineRowKind::Plan => {
                 if row.body.is_empty() {
                     4.0
                 } else {
@@ -31338,7 +31427,31 @@ impl VibexWorkbench {
             if let Some(conclusion_row) = timeline_turn_conclusion_row(turn) {
                 height += self.estimated_timeline_row_height_projected(conclusion_row, true) + 12.0;
             } else if !turn.complete {
-                height += 34.0;
+                let timeline_has_live_reasoning = self.ui_state.session.reasoning_display_mode
+                    == ReasoningDisplayMode::Timeline
+                    && turn
+                        .process_rows
+                        .iter()
+                        .any(|row| row.kind == TimelineRowKind::Reasoning && row.streaming);
+                if !timeline_has_live_reasoning {
+                    let live_reasoning_height = turn
+                        .live_status
+                        .as_deref()
+                        .filter(|_| {
+                            self.ui_state.session.reasoning_display_mode
+                                == ReasoningDisplayMode::LatestAtBottom
+                        })
+                        .map(|body| {
+                            let key = format!("reasoning-live:{}", turn.id);
+                            if self.reasoning_row_expanded(&key) {
+                                estimated_markdown_body_height(body, 72) + 4.0
+                            } else {
+                                28.0
+                            }
+                        })
+                        .unwrap_or(34.0);
+                    height += live_reasoning_height;
+                }
             }
         }
         if turn.complete {
@@ -31771,13 +31884,203 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
+    fn reasoning_row_expanded(&self, row_id: &str) -> bool {
+        self.reasoning_expansion
+            .get(row_id)
+            .copied()
+            .unwrap_or(self.ui_state.session.reasoning_expanded_by_default)
+    }
+
+    fn toggle_reasoning_expansion(
+        &mut self,
+        row_id: String,
+        turn_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let expanded = self.reasoning_row_expanded(&row_id);
+        self.reasoning_expansion.insert(row_id, !expanded);
+        if let Some(turn_id) = turn_id {
+            self.invalidate_timeline_turn_measurement(&turn_id);
+        }
+        self.rebuild_timeline_sizes();
+        cx.notify();
+    }
+
+    fn render_live_reasoning(
+        &mut self,
+        turn: &TimelineConversationTurn,
+        body: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let row_id = format!("reasoning-live:{}", turn.id);
+        let expanded = self.reasoning_row_expanded(&row_id);
+        let plain = agent_markdown_summary(body).0;
+        let preview = reasoning_preview_text(&plain);
+        let has_more = plain.chars().count() > AGENT_THINKING_LABEL_MAX_CHARS;
+        let tooltip = if expanded {
+            self.strings().agent_collapse_process
+        } else {
+            self.strings().agent_expand_process
+        };
+        let turn_id = turn.id.clone();
+        let content = if expanded {
+            let markdown_view = MarkdownView::new(
+                format!("thought:{row_id}"),
+                MarkdownInput::new(
+                    Arc::<str>::from(body),
+                    "",
+                    u64::try_from(body.len()).unwrap_or_default(),
+                ),
+            )
+            .presentation(MarkdownPresentation::Thought)
+            .streaming(true)
+            .allow_http_images(true)
+            .scroll_handle(self.timeline_scroll.base_handle().clone());
+            div()
+                .w_full()
+                .min_w_0()
+                .text_color(cx.theme().muted_foreground)
+                .child(markdown_view)
+                .into_any_element()
+        } else {
+            render_agent_thinking_indicator(&row_id, &preview, plain.trim(), cx)
+        };
+        let toggle_id = row_id.clone();
+        let mut container = h_flex()
+            .id(row_id.clone())
+            .w_full()
+            .min_w_0()
+            .items_start()
+            .gap_2()
+            .child(div().min_w_0().flex_1().child(content));
+        if has_more || expanded {
+            container = container
+                .cursor_pointer()
+                .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
+                .child(
+                    Icon::new(if expanded {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size(px(14.0))
+                    .flex_none(),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_reasoning_expansion(toggle_id.clone(), Some(turn_id.clone()), cx)
+                }));
+        }
+        container.into_any_element()
+    }
+
+    fn render_reasoning_markdown(
+        &mut self,
+        row: &TimelineRow,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let search_query = self
+            .session_search_highlight_query_for_rows(std::slice::from_ref(row))
+            .map(str::to_string);
+        let (markdown_source, markdown_sequence) = self.timeline_markdown_source(row);
+        let markdown_entity = cx.weak_entity();
+        let markdown_view = MarkdownView::new(
+            format!("thought:{}", row.id),
+            MarkdownInput::new(
+                markdown_source,
+                "",
+                u64::try_from(markdown_sequence).unwrap_or_default(),
+            )
+            .surface(MarkdownSurface::Agent),
+        )
+        .presentation(MarkdownPresentation::Thought)
+        .streaming(row.streaming)
+        .allow_http_images(true)
+        .scroll_handle(self.timeline_scroll.base_handle().clone())
+        .search_query(search_query)
+        .on_open_resource(move |resource, window, cx| {
+            let _ = markdown_entity.update(cx, |this, cx| {
+                this.open_markdown_resource(resource, window, cx)
+            });
+        });
+        div()
+            .w_full()
+            .min_w_0()
+            .text_color(cx.theme().muted_foreground)
+            .child(markdown_view)
+            .into_any_element()
+    }
+
+    fn render_reasoning_row(&mut self, row: &TimelineRow, cx: &mut Context<Self>) -> AnyElement {
+        if row.body.trim().is_empty() {
+            return div().id(row.id.clone()).into_any_element();
+        }
+        let row_id = row.id.clone();
+        let turn_id = row.turn_id.clone();
+        let expanded = self.reasoning_row_expanded(&row_id);
+        let plain = agent_markdown_summary(&row.body).0;
+        let preview = reasoning_preview_text(&plain);
+        let has_more = plain.chars().count() > AGENT_THINKING_LABEL_MAX_CHARS;
+        let disclosure_visible = has_more || expanded;
+        let content = if expanded {
+            self.render_reasoning_markdown(row, cx)
+        } else if row.streaming {
+            render_agent_thinking_indicator(&row_id, &preview, plain.trim(), cx)
+        } else {
+            div()
+                .id(format!("reasoning-preview:{row_id}"))
+                .min_w_0()
+                .flex_1()
+                .truncate()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(preview)
+                .into_any_element()
+        };
+        let tooltip = if expanded {
+            self.strings().agent_collapse_process
+        } else {
+            self.strings().agent_expand_process
+        };
+        let toggle_id = row_id.clone();
+        let toggle_turn_id = turn_id.clone();
+        let mut container = h_flex()
+            .id(format!("reasoning-row:{row_id}"))
+            .w_full()
+            .min_w_0()
+            .items_start()
+            .gap_2()
+            .text_color(cx.theme().muted_foreground)
+            .child(div().min_w_0().flex_1().child(content));
+        if disclosure_visible {
+            container = container
+                .cursor_pointer()
+                .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
+                .child(
+                    Icon::new(if expanded {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size(px(14.0))
+                    .flex_none(),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_reasoning_expansion(toggle_id.clone(), toggle_turn_id.clone(), cx)
+                }));
+        }
+        container.into_any_element()
+    }
+
     fn render_thought_process_row(
         &mut self,
         row: &TimelineRow,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // Codex-parity: reasoning/plan summaries render as plain muted markdown
-        // paragraphs in the flow — no icon, label, or container.
+        if row.kind == TimelineRowKind::Reasoning {
+            return self.render_reasoning_row(row, cx);
+        }
+        // Plans retain the compact muted markdown presentation used by the
+        // existing process timeline.
         if row.body.is_empty() {
             return div().id(row.id.clone()).into_any_element();
         }
@@ -31809,8 +32112,6 @@ impl VibexWorkbench {
             .id(row.id.clone())
             .w_full()
             .min_w_0()
-            .max_h(px(288.0))
-            .overflow_y_scrollbar()
             .text_color(cx.theme().muted_foreground)
             .child(markdown_view)
             .into_any_element()
@@ -37365,6 +37666,11 @@ fn truncate_agent_thinking_label(label: &str) -> String {
         + "..."
 }
 
+fn reasoning_preview_text(label: &str) -> String {
+    let normalized = label.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_agent_thinking_label(normalized.trim())
+}
+
 fn render_agent_thinking_indicator(
     turn_id: &str,
     label: &str,
@@ -37373,7 +37679,7 @@ fn render_agent_thinking_indicator(
 ) -> AnyElement {
     let base = cx.theme().muted_foreground.opacity(0.75);
     let glow = cx.theme().foreground;
-    let label = truncate_agent_thinking_label(label);
+    let label = label.to_string();
     let character_count = label.chars().count();
     let tooltip = tooltip.to_string();
     let element_id = format!("agent-thinking-{turn_id}");
@@ -37394,7 +37700,7 @@ fn render_agent_thinking_indicator(
                 .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
                 .with_animation(
                     animation_id,
-                    Animation::new(AGENT_THINKING_SCROLL_DURATION).repeat(),
+                    Animation::new(AGENT_THINKING_SHIMMER_DURATION).repeat(),
                     move |this, delta| {
                         let scan_position = shimmer_scan_position(delta, 0.0, 1.0);
                         this.child(h_flex().flex_none().whitespace_nowrap().children(
@@ -41575,6 +41881,34 @@ fn settings_search_candidates(strings: Strings) -> Vec<SettingsSearchCandidate> 
         ),
         settings_search_candidate(
             SettingsSection::Session,
+            strings.reasoning_display_mode,
+            strings.reasoning_display_mode_description,
+            &[
+                "reasoning",
+                "thinking",
+                "timeline",
+                "推理",
+                "思考",
+                "时间线",
+                "時間線",
+            ],
+        ),
+        settings_search_candidate(
+            SettingsSection::Session,
+            strings.reasoning_expanded_by_default,
+            strings.reasoning_expanded_by_default_description,
+            &[
+                "reasoning",
+                "thinking",
+                "expand",
+                "推理",
+                "思考",
+                "展开",
+                "展開",
+            ],
+        ),
+        settings_search_candidate(
+            SettingsSection::Session,
             strings.enhanced_command_execution_display,
             strings.enhanced_command_execution_display_description,
             &["command", "execution", "tool", "命令", "指令"],
@@ -42024,6 +42358,24 @@ impl SearchableListItem for SessionContentWidthChoice {
 }
 
 #[derive(Clone)]
+struct ReasoningDisplayChoice {
+    label: SharedString,
+    mode: ReasoningDisplayMode,
+}
+
+impl SearchableListItem for ReasoningDisplayChoice {
+    type Value = ReasoningDisplayMode;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.mode
+    }
+}
+
+#[derive(Clone)]
 struct FontChoice {
     label: SharedString,
     family: Option<String>,
@@ -42066,6 +42418,7 @@ struct FoundationSettings {
     interface_fonts: Entity<SelectState<Vec<FontChoice>>>,
     code_fonts: Entity<SelectState<Vec<FontChoice>>>,
     session_content_widths: Entity<SelectState<Vec<SessionContentWidthChoice>>>,
+    reasoning_display_modes: Entity<SelectState<Vec<ReasoningDisplayChoice>>>,
     terminal_shells: Entity<SelectState<Vec<ShellChoice>>>,
     proxy_input: Entity<InputState>,
     search: Entity<InputState>,
@@ -42094,6 +42447,7 @@ impl FoundationSettings {
         let interface_choices = font_choices(&families, strings.system_ui);
         let code_choices = font_choices(&families, strings.system_monospace);
         let session_content_width_choices = session_content_width_choices(strings);
+        let reasoning_display_choices = reasoning_display_choices(strings);
         let shell_choices = shell_choices();
         let language_selected =
             selected_locale_index(&language_choices, ui_state.appearance.locale);
@@ -42106,6 +42460,10 @@ impl FoundationSettings {
         let session_content_width_selected = selected_session_content_width_index(
             &session_content_width_choices,
             ui_state.session.content_width,
+        );
+        let reasoning_display_selected = selected_reasoning_display_index(
+            &reasoning_display_choices,
+            ui_state.session.reasoning_display_mode,
         );
         let terminal_shell_selected =
             selected_shell_index(&shell_choices, &ui_state.terminal_preferences.shell);
@@ -42120,6 +42478,14 @@ impl FoundationSettings {
             SelectState::new(
                 session_content_width_choices,
                 session_content_width_selected,
+                window,
+                cx,
+            )
+        });
+        let reasoning_display_modes = cx.new(|cx| {
+            SelectState::new(
+                reasoning_display_choices,
+                reasoning_display_selected,
                 window,
                 cx,
             )
@@ -42220,6 +42586,20 @@ impl FoundationSettings {
             .detach();
             let terminal_workbench = workbench.clone();
             cx.subscribe(
+                &reasoning_display_modes,
+                move |this: &mut FoundationSettings,
+                      _,
+                      event: &SelectEvent<Vec<ReasoningDisplayChoice>>,
+                      cx| {
+                    let SelectEvent::Confirm(mode) = event;
+                    if let Some(mode) = *mode {
+                        this.set_reasoning_display_mode(mode, cx);
+                    }
+                    cx.notify();
+                },
+            )
+            .detach();
+            cx.subscribe(
                 &terminal_shells,
                 move |_: &mut FoundationSettings, _, event: &SelectEvent<Vec<ShellChoice>>, cx| {
                     let SelectEvent::Confirm(path) = event;
@@ -42239,6 +42619,7 @@ impl FoundationSettings {
                 interface_fonts,
                 code_fonts,
                 session_content_widths,
+                reasoning_display_modes,
                 terminal_shells,
                 proxy_input,
                 search,
@@ -42680,6 +43061,20 @@ impl FoundationSettings {
     fn set_session_turn_preview_rail(&mut self, enabled: bool, cx: &mut Context<Self>) {
         let _ = self.workbench.update(cx, |this, cx| {
             this.set_session_turn_preview_rail(enabled, cx)
+        });
+        cx.notify();
+    }
+
+    fn set_reasoning_display_mode(&mut self, mode: ReasoningDisplayMode, cx: &mut Context<Self>) {
+        let _ = self
+            .workbench
+            .update(cx, |this, cx| this.set_reasoning_display_mode(mode, cx));
+        cx.notify();
+    }
+
+    fn set_reasoning_expanded_by_default(&mut self, expanded: bool, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.set_reasoning_expanded_by_default(expanded, cx)
         });
         cx.notify();
     }
@@ -43864,6 +44259,26 @@ impl FoundationSettings {
                 .text_xs()
                 .placeholder(strings.session_content_width_standard),
         );
+        let reasoning_display_select = div()
+            .h(px(28.0))
+            .when(stacked, |this| this.w_full())
+            .when(!stacked, |this| this.w(px(180.0)))
+            .child(
+                Select::new(&self.reasoning_display_modes)
+                    .small()
+                    .h(px(28.0))
+                    .rounded(px(8.0))
+                    .border_color(input)
+                    .bg(input_background)
+                    .text_xs(),
+            );
+        let reasoning_expanded_by_default_switch = Switch::new("reasoning-expanded-by-default")
+            .small()
+            .checked(session.reasoning_expanded_by_default)
+            .tooltip(strings.reasoning_expanded_by_default)
+            .on_click(cx.listener(|this, enabled, _, cx| {
+                this.set_reasoning_expanded_by_default(*enabled, cx)
+            }));
         let enhanced_command_execution_switch = Switch::new("enhanced-command-execution-display")
             .small()
             .checked(session.enhanced_command_execution_display)
@@ -44005,6 +44420,20 @@ impl FoundationSettings {
                     strings.session_content_width,
                     strings.session_content_width_description,
                     session_content_width_select,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    strings.reasoning_display_mode,
+                    strings.reasoning_display_mode_description,
+                    reasoning_display_select,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    strings.reasoning_expanded_by_default,
+                    strings.reasoning_expanded_by_default_description,
+                    reasoning_expanded_by_default_switch,
                     stacked,
                     cx,
                 ),
@@ -45129,6 +45558,29 @@ fn selected_session_content_width_index(
         .map(|row| IndexPath::default().row(row))
 }
 
+fn reasoning_display_choices(strings: Strings) -> Vec<ReasoningDisplayChoice> {
+    vec![
+        ReasoningDisplayChoice {
+            label: strings.reasoning_display_latest.into(),
+            mode: ReasoningDisplayMode::LatestAtBottom,
+        },
+        ReasoningDisplayChoice {
+            label: strings.reasoning_display_timeline.into(),
+            mode: ReasoningDisplayMode::Timeline,
+        },
+    ]
+}
+
+fn selected_reasoning_display_index(
+    choices: &[ReasoningDisplayChoice],
+    selected: ReasoningDisplayMode,
+) -> Option<IndexPath> {
+    choices
+        .iter()
+        .position(|choice| choice.mode == selected)
+        .map(|row| IndexPath::default().row(row))
+}
+
 fn selected_locale_index(choices: &[LocaleChoice], selected: LocaleMode) -> Option<IndexPath> {
     choices
         .iter()
@@ -45233,7 +45685,7 @@ fn startup_loading_wordmark(show_shimmer: bool, cx: &App) -> AnyElement {
     container
         .with_animation(
             "startup-wordmark-shimmer",
-            Animation::new(AGENT_THINKING_SCROLL_DURATION).repeat(),
+            Animation::new(AGENT_THINKING_SHIMMER_DURATION).repeat(),
             move |this, delta| this.child(wordmark(Some(shimmer_scan_position(delta, 0.0, 1.0)))),
         )
         .into_any_element()
@@ -46647,6 +47099,7 @@ mod tests {
             agent_turn_pending: false,
             pending_edit: None,
             optimistic_message: None,
+            reasoning_display_mode: ReasoningDisplayMode::LatestAtBottom,
         };
         let session_id = timeline.session_id.clone().unwrap();
         let item = timeline_item_with_payload(
@@ -46673,6 +47126,7 @@ mod tests {
             agent_turn_pending: false,
             pending_edit: None,
             optimistic_message: None,
+            reasoning_display_mode: ReasoningDisplayMode::LatestAtBottom,
         };
 
         assert!(refresh_conversation_turns_cache_incrementally(

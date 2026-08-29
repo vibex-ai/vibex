@@ -7,7 +7,7 @@ use vibex_core::{
     TimelinePayload, VibexSessionId,
 };
 
-use crate::SidebarState;
+use crate::{ReasoningDisplayMode, SidebarState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -376,36 +376,31 @@ fn accumulated_streaming_reasoning(items: &[&TimelineItem]) -> Option<String> {
         .collect::<String>()
         .trim()
         .to_string();
-    (!accumulated.is_empty())
-        .then(|| tail_chars(&accumulated, LIVE_REASONING_STATUS_MAX_CHARS).to_string())
-}
-
-/// Upper bound for the accumulated streaming reasoning kept in `live_status`.
-/// The turn projection serializes to clients, so the tail window keeps
-/// unbounded thinking streams from ballooning payloads while preserving the
-/// newest text a reader following the stream would want to see.
-const LIVE_REASONING_STATUS_MAX_CHARS: usize = 4000;
-
-/// Returns the trailing `max_chars` characters of `value` without splitting a
-/// UTF-8 character boundary.
-fn tail_chars(value: &str, max_chars: usize) -> &str {
-    if max_chars == 0 {
-        return "";
-    }
-    let mut seen = 0usize;
-    for (byte_index, _) in value.char_indices().rev() {
-        seen += 1;
-        if seen == max_chars {
-            return &value[byte_index..];
-        }
-    }
-    value
+    (!accumulated.is_empty()).then_some(accumulated)
 }
 
 pub fn timeline_conversation_turns(
     items: &[TimelineItem],
     session_state: Option<AgentSessionState>,
     pending_turn_active: bool,
+) -> Vec<TimelineConversationTurn> {
+    timeline_conversation_turns_with_reasoning_mode(
+        items,
+        session_state,
+        pending_turn_active,
+        ReasoningDisplayMode::LatestAtBottom,
+    )
+}
+
+/// Projects conversation turns with an explicit reasoning presentation mode.
+/// The legacy `timeline_conversation_turns` adapter intentionally retains the
+/// compact bottom-indicator behavior for callers that do not have a UI
+/// preference available (including the native mobile client).
+pub fn timeline_conversation_turns_with_reasoning_mode(
+    items: &[TimelineItem],
+    session_state: Option<AgentSessionState>,
+    pending_turn_active: bool,
+    reasoning_display_mode: ReasoningDisplayMode,
 ) -> Vec<TimelineConversationTurn> {
     let visible_items = items
         .iter()
@@ -467,14 +462,44 @@ pub fn timeline_conversation_turns(
                 }
             }
             let live_status = accumulated_streaming_reasoning(&turn.response_items);
+            let trailing_reasoning_item_ids = turn
+                .response_items
+                .iter()
+                .rev()
+                .take_while(|item| {
+                    matches!(
+                        &item.payload,
+                        TimelinePayload::Reasoning(reasoning) if !reasoning.is_final
+                    )
+                })
+                .map(|item| item.id.to_string())
+                .collect::<BTreeSet<_>>();
             let final_agent_item_ids = turn
                 .response_items
                 .iter()
                 .filter(|item| is_final_agent_message(item))
                 .map(|item| item.id.to_string())
                 .collect::<BTreeSet<_>>();
+            let has_terminal_response = turn
+                .response_items
+                .iter()
+                .any(|item| is_final_agent_message(item) || is_turn_boundary_error(item));
+            let complete = has_terminal_response || provider_finished_for_turn;
+            if reasoning_display_mode == ReasoningDisplayMode::Timeline {
+                for row in &mut turn_rows {
+                    if row.kind == TimelineRowKind::Reasoning {
+                        row.streaming = !complete
+                            && row
+                                .item_ids
+                                .iter()
+                                .any(|item_id| trailing_reasoning_item_ids.contains(item_id));
+                    }
+                }
+            }
             turn_rows.retain(|row| {
-                !(row.kind == TimelineRowKind::Reasoning && row.streaming)
+                !(reasoning_display_mode == ReasoningDisplayMode::LatestAtBottom
+                    && row.kind == TimelineRowKind::Reasoning
+                    && row.streaming)
                     && row.kind != TimelineRowKind::PermissionResolution
                     && row.kind != TimelineRowKind::ElicitationResolution
                     && !matches!(
@@ -501,11 +526,6 @@ pub fn timeline_conversation_turns(
                 timeline_process_activity_groups_with_file_operations(&turn_rows);
             let process_activity_groups_with_commands_and_file_operations =
                 timeline_process_activity_groups_with_commands_and_file_operations(&turn_rows);
-            let has_terminal_response = turn
-                .response_items
-                .iter()
-                .any(|item| is_final_agent_message(item) || is_turn_boundary_error(item));
-            let complete = has_terminal_response || provider_finished_for_turn;
             let live_status = (!complete).then_some(live_status).flatten();
             let started_at_ms = turn
                 .user_item
@@ -1991,8 +2011,100 @@ mod tests {
     }
 
     #[test]
-    fn live_status_keeps_a_bounded_tail_of_long_streams() {
-        let long_prefix = "x".repeat(LIVE_REASONING_STATUS_MAX_CHARS + 64);
+    fn timeline_reasoning_mode_keeps_history_and_marks_only_the_trailing_run_live() {
+        let items = [
+            item(
+                1,
+                None,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "Investigate".into(),
+                    attachments: Vec::new(),
+                }),
+            ),
+            item(
+                2,
+                None,
+                TimelinePayload::Reasoning(ReasoningPayload {
+                    text: "First thought ".into(),
+                    is_final: false,
+                }),
+            ),
+            item(
+                3,
+                None,
+                TimelinePayload::Reasoning(ReasoningPayload {
+                    text: "run".into(),
+                    is_final: false,
+                }),
+            ),
+            item(
+                4,
+                None,
+                TimelinePayload::ToolCall(ToolCallPayload {
+                    tool_call_id: "tool_read".into(),
+                    tool_name: "read".into(),
+                    status: ToolCallStatus::Completed,
+                    summary: "Read files".into(),
+                    input_summary: None,
+                    output_summary: None,
+                    raw_extension: None,
+                }),
+            ),
+            item(
+                5,
+                None,
+                TimelinePayload::Reasoning(ReasoningPayload {
+                    text: "Second thought".into(),
+                    is_final: false,
+                }),
+            ),
+        ];
+
+        let turns = timeline_conversation_turns_with_reasoning_mode(
+            &items,
+            Some(AgentSessionState::Running),
+            false,
+            ReasoningDisplayMode::Timeline,
+        );
+        let rows = &turns[0].process_rows;
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].kind, TimelineRowKind::Reasoning);
+        assert!(!rows[0].streaming);
+        assert_eq!(rows[0].body, "First thought run");
+        assert_eq!(rows[1].kind, TimelineRowKind::ToolCall);
+        assert_eq!(rows[2].kind, TimelineRowKind::Reasoning);
+        assert!(rows[2].streaming);
+        assert_eq!(turns[0].live_status.as_deref(), Some("Second thought"));
+
+        let mut after_event = items.to_vec();
+        after_event.push(item(
+            6,
+            None,
+            TimelinePayload::ToolCall(ToolCallPayload {
+                tool_call_id: "tool_write".into(),
+                tool_name: "write".into(),
+                status: ToolCallStatus::Started,
+                summary: "Write files".into(),
+                input_summary: None,
+                output_summary: None,
+                raw_extension: None,
+            }),
+        ));
+        let turns = timeline_conversation_turns_with_reasoning_mode(
+            &after_event,
+            Some(AgentSessionState::Running),
+            false,
+            ReasoningDisplayMode::Timeline,
+        );
+        let rows = &turns[0].process_rows;
+        assert_eq!(rows[2].kind, TimelineRowKind::Reasoning);
+        assert!(!rows[2].streaming);
+        assert!(turns[0].live_status.is_none());
+    }
+
+    #[test]
+    fn live_status_keeps_the_complete_long_stream() {
+        let long_prefix = "x".repeat(4_064);
         let items = [
             item(
                 1,
@@ -2022,7 +2134,8 @@ mod tests {
 
         let turns = timeline_conversation_turns(&items, Some(AgentSessionState::Running), false);
         let status = turns[0].live_status.as_deref().expect("live status");
-        assert_eq!(status.chars().count(), LIVE_REASONING_STATUS_MAX_CHARS);
+        assert_eq!(status.chars().count(), 4_064 + "最新思考".chars().count());
+        assert!(status.starts_with('x'));
         assert!(status.ends_with("最新思考"));
     }
 
