@@ -3071,6 +3071,46 @@ fn agent_generation_tool_call_count(turn: &TimelineConversationTurn) -> usize {
         .count()
 }
 
+fn agent_generation_compaction_count(
+    turn: &TimelineConversationTurn,
+    timeline_items: &[TimelineItem],
+) -> usize {
+    let Some((start_sequence, projected_end_sequence)) = timeline_turn_sequence_range(turn) else {
+        return 0;
+    };
+    let end_sequence = if turn.complete {
+        projected_end_sequence
+    } else {
+        timeline_items
+            .last()
+            .map_or(projected_end_sequence, |item| {
+                projected_end_sequence.max(item.sequence)
+            })
+    };
+    timeline_items
+        .iter()
+        .filter(|item| {
+            item.sequence >= start_sequence
+                && item.sequence <= end_sequence
+                && matches!(
+                    &item.payload,
+                    TimelinePayload::SystemNotice(notice) if notice.is_context_compaction()
+                )
+        })
+        .count()
+}
+
+fn turn_file_changes_line_counts(summary: &TurnFileChangesSummary) -> Option<(usize, usize)> {
+    summary
+        .files
+        .iter()
+        .any(|file| file.has_line_counts)
+        .then_some((
+            summary.files.iter().map(|file| file.added_lines).sum(),
+            summary.files.iter().map(|file| file.removed_lines).sum(),
+        ))
+}
+
 fn estimated_agent_output_tokens(turn: &TimelineConversationTurn) -> Option<u64> {
     let output_chars = turn
         .process_rows
@@ -8946,12 +8986,25 @@ impl VibexWorkbench {
             return None;
         };
         self.sync_agent_generation_stats(&turn);
-        let stats = self.agent_generation_stats.as_ref()?;
+        let (started_at_ms, tokens_per_second) = self
+            .agent_generation_stats
+            .as_ref()
+            .map(|stats| (stats.started_at_ms, stats.tokens_per_second))?;
         let locale = self.resolved_locale();
         let phase = agent_generation_phase(&turn);
         let phase_label = agent_generation_phase_label(phase, locale);
-        let duration = format_compact_duration(stats.started_at_ms, None);
+        let duration = format_compact_duration(started_at_ms, None);
         let tool_count = agent_generation_tool_call_count(&turn);
+        let compaction_count = agent_generation_compaction_count(&turn, &self.timeline.items);
+        let mut file_changes = self.agent_turn_file_changes_cached(&turn).as_ref().clone();
+        if let Some(session) = self.selected_session().cloned()
+            && let Some(status) = self.code_workbench.read(cx).git_status()
+            && status.workspace_id == session.workspace_id
+        {
+            apply_git_status_to_turn_file_changes(&mut file_changes, status);
+        }
+        let (added_lines, removed_lines) =
+            turn_file_changes_line_counts(&file_changes).unwrap_or_default();
         let agent_id = self
             .selected_runtime_selection()
             .map(|selection| selection.agent_id)
@@ -8978,9 +9031,19 @@ impl VibexWorkbench {
             locale::ResolvedLocale::ZhCn => format!("{tool_count} 次工具调用"),
             locale::ResolvedLocale::ZhTw => format!("{tool_count} 次工具呼叫"),
         };
-        let tokens_per_second = stats
-            .tokens_per_second
-            .map(|speed| format!("{speed:.1} t/s"));
+        let compaction_label = match locale {
+            locale::ResolvedLocale::En => format!(
+                "{compaction_count} {}",
+                if compaction_count == 1 {
+                    "compaction"
+                } else {
+                    "compactions"
+                }
+            ),
+            locale::ResolvedLocale::ZhCn => format!("{compaction_count} 次压缩"),
+            locale::ResolvedLocale::ZhTw => format!("{compaction_count} 次壓縮"),
+        };
+        let tokens_per_second = tokens_per_second.map(|speed| format!("{speed:.1} t/s"));
         Some(
             h_flex()
                 .id("agent-generation-status")
@@ -9010,6 +9073,26 @@ impl VibexWorkbench {
                 .child(duration)
                 .when(tool_count > 0, |this| {
                     this.child(separator()).child(tool_label)
+                })
+                .when(added_lines > 0 || removed_lines > 0, |this| {
+                    this.child(separator())
+                        .when(added_lines > 0, |this| {
+                            this.child(
+                                div()
+                                    .text_color(cx.theme().success)
+                                    .child(format!("+{added_lines}")),
+                            )
+                        })
+                        .when(removed_lines > 0, |this| {
+                            this.child(
+                                div()
+                                    .text_color(cx.theme().danger)
+                                    .child(format!("-{removed_lines}")),
+                            )
+                        })
+                })
+                .when(compaction_count > 0, |this| {
+                    this.child(separator()).child(compaction_label)
                 })
                 .when_some(tokens_per_second, |this, speed| {
                     this.child(separator()).child(speed)
@@ -50882,6 +50965,80 @@ mod tests {
         );
         assert_eq!(agent_generation_tool_call_count(&activity_turn), 2);
 
+        let compaction_turn = turn(
+            vec![row(
+                "reasoning",
+                TimelineRowKind::Reasoning,
+                true,
+                "Working",
+            )],
+            None,
+            None,
+            false,
+        );
+        let compaction_session_id = VibexSessionId::parse("session_generation_compaction").unwrap();
+        let compaction_items = vec![
+            timeline_item_with_payload(
+                &compaction_session_id,
+                2,
+                TimelineSource::Provider,
+                TimelinePayload::SystemNotice(vibex_core::SystemNoticePayload {
+                    level: vibex_core::SystemNoticeLevel::Info,
+                    message: "*Context compacted".into(),
+                }),
+            ),
+            timeline_item_with_payload(
+                &compaction_session_id,
+                3,
+                TimelineSource::Provider,
+                TimelinePayload::SystemNotice(vibex_core::SystemNoticePayload {
+                    level: vibex_core::SystemNoticeLevel::Info,
+                    message: "ACP agent switched to mode default".into(),
+                }),
+            ),
+            timeline_item_with_payload(
+                &compaction_session_id,
+                4,
+                TimelineSource::Provider,
+                TimelinePayload::SystemNotice(vibex_core::SystemNoticePayload {
+                    level: vibex_core::SystemNoticeLevel::Info,
+                    message: "Context window compacted.".into(),
+                }),
+            ),
+        ];
+        assert_eq!(
+            agent_generation_compaction_count(&compaction_turn, &compaction_items),
+            2
+        );
+
+        let file_summary = TurnFileChangesSummary {
+            files: vec![
+                TurnFileChange {
+                    display_path: "src/lib.rs".into(),
+                    actionable_path: Some("src/lib.rs".into()),
+                    review_path: None,
+                    review_staged: false,
+                    added_lines: 8,
+                    removed_lines: 3,
+                    has_line_counts: true,
+                },
+                TurnFileChange {
+                    display_path: "src/main.rs".into(),
+                    actionable_path: Some("src/main.rs".into()),
+                    review_path: None,
+                    review_staged: false,
+                    added_lines: 2,
+                    removed_lines: 0,
+                    has_line_counts: true,
+                },
+            ],
+        };
+        assert_eq!(turn_file_changes_line_counts(&file_summary), Some((10, 3)));
+        assert_eq!(
+            turn_file_changes_line_counts(&TurnFileChangesSummary::default()),
+            None
+        );
+
         let output_turn = turn(
             vec![row("answer", TimelineRowKind::AgentMessage, true, "hello")],
             None,
@@ -51663,6 +51820,8 @@ mod tests {
         assert!(generation_status_position < plan_position);
         assert!(source.contains("agent-generation-status"));
         assert!(source.contains("when(tool_count > 0"));
+        assert!(source.contains("when(added_lines > 0 || removed_lines > 0"));
+        assert!(source.contains("agent_generation_compaction_count"));
         assert!(source.contains("when_some(tokens_per_second"));
 
         let plan = source

@@ -766,6 +766,26 @@ pub struct SystemNoticePayload {
     pub message: String,
 }
 
+impl SystemNoticePayload {
+    /// Returns whether this notice records a provider-neutral context compaction.
+    ///
+    /// ACP currently surfaces compaction as a bounded system notice rather than
+    /// a dedicated wire event, so adapters normalize the common notice wording
+    /// here before consumers project it into metrics or UI.
+    pub fn is_context_compaction(&self) -> bool {
+        let normalized = self
+            .message
+            .trim()
+            .trim_start_matches(['*', '-'])
+            .trim()
+            .trim_end_matches(['.', ':'])
+            .trim();
+        normalized.eq_ignore_ascii_case("context compacted")
+            || normalized.eq_ignore_ascii_case("context window compacted")
+            || normalized.eq_ignore_ascii_case("context compaction")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TimelineErrorPayload {
@@ -1015,6 +1035,18 @@ mod tests {
             latest_timeline_turn_ended_normally(&[final_message, trailing_delta]),
             Some(false)
         );
+    }
+
+    #[test]
+    fn system_notice_identifies_context_compaction() {
+        let notice = |message: &str| SystemNoticePayload {
+            level: SystemNoticeLevel::Info,
+            message: message.into(),
+        };
+
+        assert!(notice("*Context compacted").is_context_compaction());
+        assert!(notice("Context window compacted.").is_context_compaction());
+        assert!(!notice("ACP agent switched to mode default").is_context_compaction());
     }
 
     fn sample_turn_attribution() -> TurnExecutionAttribution {
