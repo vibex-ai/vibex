@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::rc::Rc;
@@ -19,6 +20,7 @@ use ::gpui::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use gpui_component::{
     ActiveTheme as _, Disableable as _, IconName, Selectable as _, Sizable as _, StyledExt as _,
+    WindowExt as _,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
@@ -61,6 +63,8 @@ const DATA_IMAGE_DECODED_BYTES: usize = 8 * 1024 * 1024;
 const DATA_IMAGE_MAX_DIMENSION: u32 = 16_384;
 const DATA_IMAGE_MAX_RGBA_BYTES: u64 = 64 * 1024 * 1024;
 const ARTIFACT_MAX_RASTER_PIXELS: f32 = 16.0 * 1024.0 * 1024.0;
+const DIAGRAM_VIEWPORT_MAX_HEIGHT: f32 = 640.0;
+const DIAGRAM_FULLSCREEN_MARGIN: f32 = 24.0;
 
 pub type MarkdownResourceHandler = Arc<dyn Fn(ResolvedResource, &mut Window, &mut App) + 'static>;
 type MarkdownInlineClickHandler = Rc<dyn Fn(&mut Window, &mut App) + 'static>;
@@ -635,6 +639,7 @@ pub struct MarkdownViewState {
     live_nodes: BTreeSet<NodeId>,
     details_open: BTreeMap<NodeId, bool>,
     diagram_source: BTreeSet<NodeId>,
+    diagram_scrolls: BTreeMap<NodeId, ScrollHandle>,
     table_scrolls: BTreeMap<NodeId, ScrollHandle>,
     outline_open: bool,
     anchors: BTreeMap<NodeId, ScrollAnchor>,
@@ -695,6 +700,7 @@ impl MarkdownViewState {
             live_nodes: BTreeSet::new(),
             details_open: BTreeMap::new(),
             diagram_source: BTreeSet::new(),
+            diagram_scrolls: BTreeMap::new(),
             table_scrolls: BTreeMap::new(),
             outline_open: false,
             anchors: BTreeMap::new(),
@@ -832,6 +838,8 @@ impl MarkdownViewState {
         initialize_details(&self.document.blocks, &mut self.details_open);
         self.diagram_source
             .retain(|node_id| self.live_nodes.contains(node_id));
+        self.diagram_scrolls
+            .retain(|node_id, _| self.live_nodes.contains(node_id));
         self.table_scrolls
             .retain(|node_id, _| self.live_nodes.contains(node_id));
         self.artifact_states
@@ -3063,6 +3071,12 @@ impl MarkdownViewState {
             Some(ArtifactDisplayState::Loading { .. }) => BodyState::Loading,
             None => BodyState::Missing,
         };
+        let fullscreen_artifact = match self.artifact_states.get(&node_id) {
+            Some(ArtifactDisplayState::Ready {
+                image, artifact, ..
+            }) => Some((image.clone(), artifact.clone())),
+            _ => None,
+        };
         let body = if source_mode {
             self.artifact_source_body(source, cx)
         } else {
@@ -3085,11 +3099,15 @@ impl MarkdownViewState {
                             .object_fit(ObjectFit::Contain)
                             .into_any_element()
                     } else {
-                        img(ImageSource::Render(image))
-                            .max_w_full()
-                            .max_h(px(640.0))
-                            .object_fit(ObjectFit::Contain)
-                            .into_any_element()
+                        let scroll = self.diagram_scrolls.entry(node_id).or_default().clone();
+                        let viewport_height = artifact_viewport_height(artifact.height_px);
+                        diagram_viewport(
+                            format!("markdown-diagram:{}:{}", self.view_id, node_id.0),
+                            image,
+                            artifact,
+                            scroll,
+                            viewport_height,
+                        )
                     }
                 }
                 BodyState::Failed(message) => v_flex()
@@ -3130,7 +3148,7 @@ impl MarkdownViewState {
                     .when(
                         matches!(kind, ArtifactKind::Mermaid | ArtifactKind::PlantUml),
                         |this| {
-                            this.child(
+                            let this = this.child(
                                 Button::new(format!("markdown-artifact-mode:{}", node_id.0))
                                     .xsmall()
                                     .ghost()
@@ -3149,7 +3167,35 @@ impl MarkdownViewState {
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.toggle_diagram_source(toggle_id, cx)
                                     })),
-                            )
+                            );
+                            if let Some((image, artifact)) = fullscreen_artifact.clone() {
+                                this.child(
+                                    Button::new(format!(
+                                        "markdown-artifact-fullscreen:{}",
+                                        node_id.0
+                                    ))
+                                    .xsmall()
+                                    .ghost()
+                                    .compact()
+                                    .icon(IconName::Maximize)
+                                    .tooltip("Open diagram full screen")
+                                    .disabled(source_mode)
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
+                                            this.open_artifact_fullscreen(
+                                                node_id,
+                                                kind,
+                                                image.clone(),
+                                                artifact.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        },
+                                    )),
+                                )
+                            } else {
+                                this
+                            }
                         },
                     )
                     .child(
@@ -3164,15 +3210,44 @@ impl MarkdownViewState {
                             }),
                     ),
             )
-            .child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .overflow_x_scrollbar()
-                    .p_3()
-                    .child(body),
-            )
+            .child(div().w_full().min_w_0().p_3().child(body))
             .into_any_element()
+    }
+
+    fn open_artifact_fullscreen(
+        &mut self,
+        node_id: NodeId,
+        kind: ArtifactKind,
+        image: Arc<RenderImage>,
+        artifact: Arc<SvgArtifact>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(kind, ArtifactKind::Mermaid | ArtifactKind::PlantUml)
+            || window.has_active_dialog(cx)
+        {
+            return;
+        }
+        let viewport = window.viewport_size();
+        let width = (f32::from(viewport.width) - DIAGRAM_FULLSCREEN_MARGIN).max(240.0);
+        let height = (f32::from(viewport.height) - DIAGRAM_FULLSCREEN_MARGIN).max(180.0);
+        let scroll = ScrollHandle::new();
+        let dialog_id = self.view_id.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("Diagram")
+                .w(px(width))
+                .max_w(px(width))
+                .h(px(height))
+                .close_button(true)
+                .child(diagram_viewport(
+                    format!("markdown-diagram-fullscreen:{dialog_id}:{}", node_id.0),
+                    image.clone(),
+                    artifact.clone(),
+                    scroll.clone(),
+                    (height - 64.0).max(120.0),
+                ))
+        });
     }
 
     fn artifact_source_body(&mut self, source: &str, cx: &mut Context<Self>) -> AnyElement {
@@ -3181,6 +3256,7 @@ impl MarkdownViewState {
         div()
             .w_full()
             .min_w_0()
+            .overflow_x_scrollbar()
             .font_family(cx.theme().mono_font_family.clone())
             .text_size(cx.theme().mono_font_size)
             .font_weight(code_font_weight(cx))
@@ -3334,6 +3410,93 @@ impl MarkdownViewState {
             }))
             .into_any_element()
     }
+}
+
+fn artifact_viewport_height(artifact_height: f32) -> f32 {
+    let height = if artifact_height.is_finite() && artifact_height > 0.0 {
+        artifact_height
+    } else {
+        1.0
+    };
+    height.clamp(1.0, DIAGRAM_VIEWPORT_MAX_HEIGHT)
+}
+
+fn diagram_viewport(
+    id: impl Into<ElementId>,
+    image: Arc<RenderImage>,
+    artifact: Arc<SvgArtifact>,
+    scroll: ScrollHandle,
+    viewport_height: f32,
+) -> AnyElement {
+    let pan_start = Rc::new(RefCell::new(None::<Point<Pixels>>));
+    let wheel_scroll = scroll.clone();
+    let drag_scroll = scroll.clone();
+    let drag_start = pan_start.clone();
+    let drag_move = pan_start.clone();
+    let drag_end = pan_start.clone();
+    let drag_cancel = pan_start.clone();
+    let image_width = artifact.width_px.max(1.0);
+    let image_height = artifact.height_px.max(1.0);
+
+    div()
+        .id(id)
+        .w_full()
+        .h(px(viewport_height))
+        .min_w_0()
+        .relative()
+        .track_scroll(&scroll)
+        .overflow_scroll()
+        .on_scroll_wheel(move |_, _, cx| {
+            let max = wheel_scroll.max_offset();
+            if max.x > px(0.0) || max.y > px(0.0) {
+                cx.stop_propagation();
+            }
+        })
+        .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+            *drag_start.borrow_mut() = Some(event.position);
+            window.prevent_default();
+            cx.stop_propagation();
+        })
+        .on_mouse_move(move |event, window, cx| {
+            if !event.dragging() {
+                return;
+            }
+            let Some(previous) = *drag_move.borrow() else {
+                return;
+            };
+            let offset = drag_scroll.offset();
+            let max = drag_scroll.max_offset();
+            let delta_x = f32::from(event.position.x - previous.x);
+            let delta_y = f32::from(event.position.y - previous.y);
+            let next = point(
+                px((f32::from(offset.x) + delta_x).clamp(-f32::from(max.x), 0.0)),
+                px((f32::from(offset.y) + delta_y).clamp(-f32::from(max.y), 0.0)),
+            );
+            drag_scroll.set_offset(next);
+            *drag_move.borrow_mut() = Some(event.position);
+            window.prevent_default();
+            cx.stop_propagation();
+        })
+        .on_mouse_up(MouseButton::Left, move |_, window, cx| {
+            *drag_end.borrow_mut() = None;
+            window.prevent_default();
+            cx.stop_propagation();
+        })
+        .on_mouse_up_out(MouseButton::Left, move |_, window, cx| {
+            *drag_cancel.borrow_mut() = None;
+            window.prevent_default();
+            cx.stop_propagation();
+        })
+        .child(
+            img(ImageSource::Render(image))
+                .w(px(image_width))
+                .h(px(image_height))
+                .flex_none()
+                .object_fit(ObjectFit::Contain),
+        )
+        .horizontal_scrollbar(&scroll)
+        .vertical_scrollbar(&scroll)
+        .into_any_element()
 }
 
 fn bounded_raster_dimensions(bytes: &[u8], format: ::image::ImageFormat) -> bool {
@@ -4576,6 +4739,17 @@ mod tests {
         assert_eq!(normalize_code_language("C#"), "csharp");
         assert_eq!(normalize_code_language("jsx title=demo"), "javascript");
         assert_eq!(normalize_code_language("unknown"), "unknown");
+    }
+
+    #[test]
+    fn diagram_viewport_height_is_bounded_to_a_scrollable_range() {
+        assert_eq!(artifact_viewport_height(480.0), 480.0);
+        assert_eq!(
+            artifact_viewport_height(2_000.0),
+            DIAGRAM_VIEWPORT_MAX_HEIGHT
+        );
+        assert_eq!(artifact_viewport_height(f32::NAN), 1.0);
+        assert_eq!(artifact_viewport_height(-10.0), 1.0);
     }
 
     #[test]
