@@ -31963,6 +31963,90 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    fn reasoning_markdown_view(
+        &mut self,
+        id: impl Into<ElementId>,
+        source: Arc<str>,
+        sequence: u64,
+        streaming: bool,
+        search_query: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> MarkdownView {
+        let markdown_entity = cx.weak_entity();
+        MarkdownView::new(
+            id,
+            MarkdownInput::new(source, "", sequence).surface(MarkdownSurface::Agent),
+        )
+        .presentation(MarkdownPresentation::Thought)
+        .streaming(streaming)
+        .allow_http_images(true)
+        .scroll_handle(self.timeline_scroll.base_handle().clone())
+        .search_query(search_query)
+        .on_open_resource(move |resource, window, cx| {
+            let _ = markdown_entity.update(cx, |this, cx| {
+                this.open_markdown_resource(resource, window, cx)
+            });
+        })
+    }
+
+    fn render_expanded_reasoning_layout(
+        &mut self,
+        row_id: String,
+        turn_id: Option<String>,
+        first_line: AnyElement,
+        remaining: Option<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let tooltip = self.strings().agent_collapse_process;
+        let toggle_id = row_id.clone();
+        let mut text = v_flex().min_w_0().flex_1().child(
+            h_flex()
+                .min_w_0()
+                .items_start()
+                .gap_1()
+                .child(first_line)
+                .child(Icon::new(IconName::ChevronDown).size(px(14.0)).flex_none()),
+        );
+        if let Some(remaining) = remaining {
+            text = text.child(remaining);
+        }
+
+        h_flex()
+            .id(row_id)
+            .w_full()
+            .min_w_0()
+            .items_stretch()
+            .gap_2()
+            .cursor_pointer()
+            .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
+            .child(
+                v_flex()
+                    .w(px(16.0))
+                    .flex_none()
+                    .items_center()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        Icon::default()
+                            .path("icons/vibex/brain.svg")
+                            .size(px(14.0))
+                            .text_color(cx.theme().muted_foreground),
+                    )
+                    .child(
+                        div()
+                            .mt(px(2.0))
+                            .w(px(1.0))
+                            .flex_1()
+                            .border_l_1()
+                            .border_color(cx.theme().border.opacity(0.78)),
+                    ),
+            )
+            .child(text)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_reasoning_expansion(toggle_id.clone(), turn_id.clone(), cx)
+            }))
+            .into_any_element()
+    }
+
     fn render_live_reasoning(
         &mut self,
         turn: &TimelineConversationTurn,
@@ -31974,34 +32058,48 @@ impl VibexWorkbench {
         let plain = agent_markdown_summary(body).0;
         let preview = reasoning_preview_text(&plain);
         let has_more = plain.chars().count() > AGENT_THINKING_LABEL_MAX_CHARS;
-        let tooltip = if expanded {
-            self.strings().agent_collapse_process
-        } else {
-            self.strings().agent_expand_process
-        };
+        let tooltip = self.strings().agent_expand_process;
         let turn_id = turn.id.clone();
-        let content = if expanded {
-            let markdown_view = MarkdownView::new(
-                format!("thought:{row_id}"),
-                MarkdownInput::new(
-                    Arc::<str>::from(body),
-                    "",
+        if expanded {
+            let (first_line_source, remaining_source) = reasoning_source_parts(body);
+            let first_line = self
+                .reasoning_markdown_view(
+                    format!("thought:{row_id}:first-line"),
+                    Arc::<str>::from(first_line_source),
                     u64::try_from(body.len()).unwrap_or_default(),
-                ),
-            )
-            .presentation(MarkdownPresentation::Thought)
-            .streaming(true)
-            .allow_http_images(true)
-            .scroll_handle(self.timeline_scroll.base_handle().clone());
-            div()
+                    true,
+                    None,
+                    cx,
+                )
+                .w_auto()
+                .min_w_0()
+                .max_w_full()
+                .flex_shrink(1.0)
+                .whitespace_normal()
+                .into_any_element();
+            let remaining = remaining_source.map(|source| {
+                self.reasoning_markdown_view(
+                    format!("thought:{row_id}:remaining"),
+                    Arc::<str>::from(source),
+                    u64::try_from(body.len()).unwrap_or_default(),
+                    true,
+                    None,
+                    cx,
+                )
                 .w_full()
                 .min_w_0()
                 .text_color(cx.theme().muted_foreground)
-                .child(markdown_view)
                 .into_any_element()
-        } else {
-            render_agent_thinking_indicator(&row_id, &preview, plain.trim(), cx)
-        };
+            });
+            return self.render_expanded_reasoning_layout(
+                row_id,
+                Some(turn_id),
+                first_line,
+                remaining,
+                cx,
+            );
+        }
+        let content = render_agent_thinking_indicator(&row_id, &preview, plain.trim(), cx);
         let toggle_id = row_id.clone();
         let mut container = h_flex()
             .id(row_id.clone())
@@ -32010,61 +32108,16 @@ impl VibexWorkbench {
             .items_start()
             .gap_2()
             .child(div().min_w_0().flex_1().child(content));
-        if has_more || expanded {
+        if has_more {
             container = container
                 .cursor_pointer()
                 .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
-                .child(
-                    Icon::new(if expanded {
-                        IconName::ChevronDown
-                    } else {
-                        IconName::ChevronRight
-                    })
-                    .size(px(14.0))
-                    .flex_none(),
-                )
+                .child(Icon::new(IconName::ChevronRight).size(px(14.0)).flex_none())
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.toggle_reasoning_expansion(toggle_id.clone(), Some(turn_id.clone()), cx)
                 }));
         }
         container.into_any_element()
-    }
-
-    fn render_reasoning_markdown(
-        &mut self,
-        row: &TimelineRow,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let search_query = self
-            .session_search_highlight_query_for_rows(std::slice::from_ref(row))
-            .map(str::to_string);
-        let (markdown_source, markdown_sequence) = self.timeline_markdown_source(row);
-        let markdown_entity = cx.weak_entity();
-        let markdown_view = MarkdownView::new(
-            format!("thought:{}", row.id),
-            MarkdownInput::new(
-                markdown_source,
-                "",
-                u64::try_from(markdown_sequence).unwrap_or_default(),
-            )
-            .surface(MarkdownSurface::Agent),
-        )
-        .presentation(MarkdownPresentation::Thought)
-        .streaming(row.streaming)
-        .allow_http_images(true)
-        .scroll_handle(self.timeline_scroll.base_handle().clone())
-        .search_query(search_query)
-        .on_open_resource(move |resource, window, cx| {
-            let _ = markdown_entity.update(cx, |this, cx| {
-                this.open_markdown_resource(resource, window, cx)
-            });
-        });
-        div()
-            .w_full()
-            .min_w_0()
-            .text_color(cx.theme().muted_foreground)
-            .child(markdown_view)
-            .into_any_element()
     }
 
     fn render_reasoning_row(&mut self, row: &TimelineRow, cx: &mut Context<Self>) -> AnyElement {
@@ -32077,10 +32130,46 @@ impl VibexWorkbench {
         let plain = agent_markdown_summary(&row.body).0;
         let preview = reasoning_preview_text(&plain);
         let has_more = plain.chars().count() > AGENT_THINKING_LABEL_MAX_CHARS;
-        let disclosure_visible = has_more || expanded;
-        let content = if expanded {
-            self.render_reasoning_markdown(row, cx)
-        } else if row.streaming {
+        let disclosure_visible = has_more;
+        if expanded {
+            let search_query = self
+                .session_search_highlight_query_for_rows(std::slice::from_ref(row))
+                .map(str::to_string);
+            let (markdown_source, markdown_sequence) = self.timeline_markdown_source(row);
+            let (first_line_source, remaining_source) = reasoning_source_parts(&markdown_source);
+            let first_line = self
+                .reasoning_markdown_view(
+                    format!("thought:{}:first-line", row.id),
+                    Arc::<str>::from(first_line_source),
+                    u64::try_from(markdown_sequence).unwrap_or_default(),
+                    row.streaming,
+                    search_query.clone(),
+                    cx,
+                )
+                .w_auto()
+                .min_w_0()
+                .max_w_full()
+                .flex_shrink(1.0)
+                .whitespace_normal()
+                .into_any_element();
+            let remaining = remaining_source.map(|source| {
+                self.reasoning_markdown_view(
+                    format!("thought:{}:remaining", row.id),
+                    Arc::<str>::from(source),
+                    u64::try_from(markdown_sequence).unwrap_or_default(),
+                    row.streaming,
+                    search_query,
+                    cx,
+                )
+                .w_full()
+                .min_w_0()
+                .text_color(cx.theme().muted_foreground)
+                .into_any_element()
+            });
+            return self
+                .render_expanded_reasoning_layout(row_id, turn_id, first_line, remaining, cx);
+        }
+        let content = if row.streaming {
             render_agent_thinking_indicator(&row_id, &preview, plain.trim(), cx)
         } else {
             div()
@@ -32093,11 +32182,7 @@ impl VibexWorkbench {
                 .child(preview)
                 .into_any_element()
         };
-        let tooltip = if expanded {
-            self.strings().agent_collapse_process
-        } else {
-            self.strings().agent_expand_process
-        };
+        let tooltip = self.strings().agent_expand_process;
         let toggle_id = row_id.clone();
         let toggle_turn_id = turn_id.clone();
         let mut container = h_flex()
@@ -32112,15 +32197,7 @@ impl VibexWorkbench {
             container = container
                 .cursor_pointer()
                 .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
-                .child(
-                    Icon::new(if expanded {
-                        IconName::ChevronDown
-                    } else {
-                        IconName::ChevronRight
-                    })
-                    .size(px(14.0))
-                    .flex_none(),
-                )
+                .child(Icon::new(IconName::ChevronRight).size(px(14.0)).flex_none())
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.toggle_reasoning_expansion(toggle_id.clone(), toggle_turn_id.clone(), cx)
                 }));
@@ -37728,6 +37805,19 @@ fn reasoning_preview_text(label: &str) -> String {
     truncate_agent_thinking_label(normalized.trim())
 }
 
+fn reasoning_source_parts(source: &str) -> (&str, Option<&str>) {
+    let source = source.trim_start_matches(['\r', '\n']);
+    let Some((first_line, remaining)) = source.split_once('\n') else {
+        return (source.trim_end_matches('\r'), None);
+    };
+    let first_line = first_line.trim_end_matches('\r');
+    let remaining = remaining.trim_start_matches(['\r', '\n']);
+    (
+        first_line,
+        (!remaining.trim().is_empty()).then_some(remaining),
+    )
+}
+
 fn render_agent_thinking_indicator(
     turn_id: &str,
     label: &str,
@@ -37736,7 +37826,7 @@ fn render_agent_thinking_indicator(
 ) -> AnyElement {
     let base = cx.theme().muted_foreground.opacity(0.75);
     let glow = cx.theme().foreground;
-    let label = label.to_string();
+    let label = truncate_agent_thinking_label(label);
     let character_count = label.chars().count();
     let tooltip = tooltip.to_string();
     let element_id = format!("agent-thinking-{turn_id}");
@@ -47605,6 +47695,22 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_source_parts_keep_the_first_line_for_the_disclosure_control() {
+        assert_eq!(
+            reasoning_source_parts("  First thought\r\n\r\nSecond thought"),
+            ("  First thought", Some("Second thought")),
+        );
+        assert_eq!(
+            reasoning_source_parts("\n\nOnly thought\r"),
+            ("Only thought", None)
+        );
+        assert_eq!(
+            reasoning_source_parts("Single thought"),
+            ("Single thought", None)
+        );
+    }
+
+    #[test]
     fn shimmer_scan_reaches_each_glyph_and_falls_back_to_the_base_color() {
         let base = Hsla {
             h: 0.0,
@@ -47906,6 +48012,35 @@ mod tests {
     struct LongMarkdownLayoutProbe {
         body: String,
         measured_height: Rc<Cell<f32>>,
+    }
+
+    struct ReasoningFirstLineLayoutProbe {
+        measured_width: Rc<Cell<f32>>,
+    }
+
+    impl Render for ReasoningFirstLineLayoutProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let measured_width = self.measured_width.clone();
+            h_flex().w(px(640.0)).child(
+                div()
+                    .on_prepaint(move |bounds, _, _| {
+                        measured_width.set(f32::from(bounds.size.width));
+                    })
+                    .child(
+                        MarkdownView::new(
+                            "reasoning-first-line-layout-probe",
+                            MarkdownInput::new("Planning model naming and asset mapping", "", 1)
+                                .surface(MarkdownSurface::Agent),
+                        )
+                        .presentation(MarkdownPresentation::Thought)
+                        .w_auto()
+                        .min_w_0()
+                        .max_w_full()
+                        .flex_shrink(1.0)
+                        .whitespace_normal(),
+                    ),
+            )
+        }
     }
 
     struct AgentFileDiffScrollProbe {
@@ -56056,6 +56191,25 @@ mod tests {
         // Detail pre blocks stay bounded by their 160px max height.
         assert_eq!(estimated_pre_block_height(&"line\n".repeat(40)), 160.0);
         assert_eq!(estimated_pre_block_height("one line"), 36.0);
+    }
+
+    #[gpui::test]
+    fn reasoning_first_line_keeps_intrinsic_width_for_disclosure_control(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let measured_width = Rc::new(Cell::new(0.0));
+        let observed_width = measured_width.clone();
+        let (_, cx) = cx.add_window_view(|_, _| ReasoningFirstLineLayoutProbe { measured_width });
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        assert!(
+            observed_width.get() < 640.0,
+            "intrinsic reasoning line width: {}",
+            observed_width.get()
+        );
     }
 
     #[test]
