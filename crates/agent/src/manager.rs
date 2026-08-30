@@ -878,7 +878,7 @@ impl AgentManager {
 
     pub async fn list_sessions(&self, include_archived: bool) -> VibexResult<Vec<AgentSession>> {
         let conn = self.open_migrated()?;
-        SessionRepository::list(&conn, include_archived)
+        SessionRepository::list_root_sessions(&conn, include_archived)
     }
 
     pub async fn get_session(&self, session_id: &VibexSessionId) -> VibexResult<AgentSession> {
@@ -1034,7 +1034,7 @@ impl AgentManager {
                 // Deferred creation persists the logical session before it
                 // starts runtime materialization. Remove that known id on any
                 // synchronous failure so the failed delegation is not paired
-                // with an unreachable sidebar session.
+                // with an unreachable child-session view.
                 let _ = self.delete_session(&child_session_id).await;
                 let _ = self.update_agent_delegation_status(
                     &delegation.id,
@@ -1057,7 +1057,7 @@ impl AgentManager {
             else {
                 // The lifecycle lock normally rules this out. If durable state
                 // changed outside this process, remove the unlinked child rather
-                // than leaving an orphaned session in the workspace sidebar.
+                // than leaving an orphaned internal child session.
                 drop(conn);
                 let _ = self.delete_session(&child.id).await;
                 drop(lifecycle_guard);
@@ -2257,7 +2257,7 @@ impl AgentManager {
                 &request.text,
                 &default_title,
             ) {
-                self.publish_session_update(updated);
+                self.publish_root_session_update(&conn, updated);
             }
             Some(appended_user)
         } else {
@@ -3107,19 +3107,48 @@ impl AgentManager {
 
         let conn = self.open_migrated()?;
         let session = SessionRepository::update_title(&conn, &request.session_id, title)?;
-        self.publish_session_update(session.clone());
+        self.publish_root_session_update(&conn, session.clone());
         Ok(session)
     }
 
     pub async fn delete_session(&self, session_id: &VibexSessionId) -> VibexResult<()> {
-        let conn = self.open_migrated()?;
-        let session = SessionRepository::get(&conn, session_id)?;
-        let runtime = session
-            .as_ref()
-            .and_then(|session| self.runtime_for_close(&conn, session));
-        SessionRepository::delete(&conn, session_id)?;
-        drop(conn);
-        self.close_provider_session(runtime).await;
+        let runtimes = {
+            let mut conn = self.open_migrated()?;
+            let transaction = conn.transaction().map_err(|error| {
+                VibexError::storage(
+                    "session_delete_transaction_failed",
+                    "failed to begin Agent session deletion transaction",
+                )
+                .with_diagnostic("error", error.to_string())
+            })?;
+            let mut session_ids =
+                AgentDelegationRepository::descendant_session_ids(&transaction, session_id)?;
+            session_ids.push(session_id.clone());
+
+            let mut runtimes = Vec::new();
+            for candidate_id in &session_ids {
+                let Some(session) = SessionRepository::get(&transaction, candidate_id)? else {
+                    continue;
+                };
+                if let Some(runtime) = self.runtime_for_close(&transaction, &session) {
+                    runtimes.push(runtime);
+                }
+            }
+            for candidate_id in &session_ids {
+                SessionRepository::delete(&transaction, candidate_id)?;
+            }
+            transaction.commit().map_err(|error| {
+                VibexError::storage(
+                    "session_delete_commit_failed",
+                    "failed to commit Agent session deletion",
+                )
+                .with_diagnostic("error", error.to_string())
+            })?;
+            runtimes
+        };
+        for runtime in runtimes {
+            self.close_provider_session(Some(runtime)).await;
+        }
         Ok(())
     }
 
@@ -4017,8 +4046,16 @@ impl AgentManager {
         Ok(item)
     }
 
-    fn publish_session_update(&self, session: AgentSession) {
-        let _ = self.session_events.send(session);
+    fn publish_root_session_update(&self, conn: &DbConnection, session: AgentSession) {
+        // Session update subscribers own root-session navigation. Child panels
+        // follow their timeline stream, so failing closed here prevents a
+        // delegated child from being reinserted into a sidebar by a late event.
+        if matches!(
+            SessionRepository::is_delegated_child(conn, &session.id),
+            Ok(false)
+        ) {
+            let _ = self.session_events.send(session);
+        }
     }
 
     fn apply_auto_session_title(
@@ -4030,7 +4067,7 @@ impl AgentManager {
         let Some(session) = SessionRepository::refresh_auto_title(&conn, session_id, title)? else {
             return Ok(false);
         };
-        self.publish_session_update(session);
+        self.publish_root_session_update(&conn, session);
         Ok(true)
     }
 
@@ -7226,6 +7263,105 @@ mod tests {
         cleanup_db(&db_path);
     }
 
+    #[tokio::test]
+    async fn delegated_sessions_stay_out_of_root_lists_and_delete_with_their_parent() {
+        let db_path = temp_db_path("delegation-session-ownership");
+        let workspace_root = temp_workspace_path("delegation-session-ownership");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let manager = AgentManager::new(&db_path).unwrap();
+        let mut conn = manager.open_migrated().unwrap();
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let agent_id = AgentId::parse("claude").unwrap();
+        let parent = insert_session(
+            &conn,
+            "Parent",
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            agent_id.clone(),
+            AgentSessionState::Idle,
+        );
+        let child = insert_session(
+            &conn,
+            "Child",
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            agent_id.clone(),
+            AgentSessionState::Idle,
+        );
+        let grandchild = insert_session(
+            &conn,
+            "Grandchild",
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            agent_id.clone(),
+            AgentSessionState::Idle,
+        );
+        let unrelated = insert_session(
+            &conn,
+            "Unrelated",
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            agent_id,
+            AgentSessionState::Idle,
+        );
+        attach_delegated_child(&mut conn, &parent, &child, "parent-child");
+        attach_delegated_child(&mut conn, &child, &grandchild, "child-grandchild");
+        drop(conn);
+
+        let listed = manager.list_sessions(false).await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().any(|session| session.id == parent.id));
+        assert!(listed.iter().any(|session| session.id == unrelated.id));
+        assert!(!listed.iter().any(|session| session.id == child.id));
+        assert!(!listed.iter().any(|session| session.id == grandchild.id));
+
+        let mut updates = manager.subscribe_session_updates();
+        manager
+            .rename_session(RenameAgentSessionRequest {
+                session_id: child.id.clone(),
+                title: "Renamed child".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(updates.try_recv().is_err());
+        manager
+            .rename_session(RenameAgentSessionRequest {
+                session_id: parent.id.clone(),
+                title: "Renamed parent".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(updates.try_recv().unwrap().id, parent.id);
+
+        manager.delete_session(&parent.id).await.unwrap();
+        let conn = manager.open_migrated().unwrap();
+        assert!(SessionRepository::get(&conn, &parent.id).unwrap().is_none());
+        assert!(SessionRepository::get(&conn, &child.id).unwrap().is_none());
+        assert!(
+            SessionRepository::get(&conn, &grandchild.id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            SessionRepository::get(&conn, &unrelated.id)
+                .unwrap()
+                .as_ref()
+                .map(|session| &session.id),
+            Some(&unrelated.id)
+        );
+        assert_eq!(SessionRepository::list(&conn, false).unwrap().len(), 1);
+        drop(conn);
+
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
     #[test]
     fn restart_reconciliation_marks_unlinked_delegations_failed() {
         let db_path = temp_db_path("delegation-reconcile");
@@ -7317,6 +7453,42 @@ mod tests {
         };
         SessionRepository::insert(conn, &session).unwrap();
         session
+    }
+
+    fn attach_delegated_child(
+        conn: &mut DbConnection,
+        parent: &AgentSession,
+        child: &AgentSession,
+        idempotency_key: &str,
+    ) {
+        let now = unix_timestamp_ms();
+        let delegation = AgentDelegation {
+            id: AgentDelegationId::new(),
+            parent_session_id: parent.id.clone(),
+            parent_timeline_item_id: None,
+            child_session_id: None,
+            idempotency_key: idempotency_key.to_string(),
+            title: child.title.clone(),
+            task_summary: "Delegate work".to_string(),
+            requested_agent_id: None,
+            effective_agent_id: Some(parent.agent_id.clone()),
+            status: AgentDelegationStatus::Starting,
+            result_summary: None,
+            error_code: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+            started_at_ms: Some(now),
+            completed_at_ms: None,
+        };
+        AgentDelegationRepository::reserve_or_get(conn, &delegation, 8).unwrap();
+        AgentDelegationRepository::attach_claimed_child_session(
+            conn,
+            &delegation.id,
+            &child.id,
+            &parent.agent_id,
+        )
+        .unwrap()
+        .unwrap();
     }
 
     fn temp_db_path(label: &str) -> PathBuf {

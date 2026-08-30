@@ -986,6 +986,15 @@ async fn fetch_authoritative_timeline(
     }
 }
 
+async fn fetch_child_agent_session_snapshot(
+    runtime: Arc<DesktopRuntime>,
+    session_id: VibexSessionId,
+) -> vibex_core::VibexResult<(AgentSession, Vec<vibex_core::TimelineItem>)> {
+    let session = runtime.agent().manager().get_session(&session_id).await?;
+    let items = fetch_authoritative_timeline(runtime, session_id).await?;
+    Ok((session, items))
+}
+
 fn normalize_empty_preview_visibility(state: &mut DesktopUiStateV1) {
     if state.preview.layout.tabs.is_empty() {
         state.workbench.preview_visible = false;
@@ -1967,6 +1976,7 @@ struct TimelineItemIndex {
 }
 
 struct ChildAgentTimelineState {
+    session: Option<AgentSession>,
     timeline: TimelineModel,
     loaded: bool,
     loading: bool,
@@ -1979,6 +1989,7 @@ impl ChildAgentTimelineState {
         let mut timeline = TimelineModel::default();
         timeline.replace_authoritative(session_id, std::iter::empty());
         Self {
+            session: None,
             timeline,
             loaded: false,
             loading: false,
@@ -9591,6 +9602,18 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    fn clear_child_agent_context(&mut self) {
+        self.child_agent_timelines.clear();
+        self.child_agent_expanded_delegations.clear();
+        self.child_agent_tabs.clear();
+        self.child_agent_active_tab = None;
+        if self.child_agent_panel_active {
+            self.child_agent_panel_active = false;
+            self.ui_state.workbench.right_rail_visible = false;
+            self.right_rail_overlay_open = false;
+        }
+    }
+
     fn select_session_with_history(
         &mut self,
         session_id: VibexSessionId,
@@ -9647,15 +9670,7 @@ impl VibexWorkbench {
             // Child tabs and expanded previews are scoped to the parent
             // session currently shown in the center timeline. Do not leave a
             // previous parent's child session visible after navigation.
-            self.child_agent_timelines.clear();
-            self.child_agent_expanded_delegations.clear();
-            self.child_agent_tabs.clear();
-            self.child_agent_active_tab = None;
-            if self.child_agent_panel_active {
-                self.child_agent_panel_active = false;
-                self.ui_state.workbench.right_rail_visible = false;
-                self.right_rail_overlay_open = false;
-            }
+            self.clear_child_agent_context();
         }
         self.stash_current_agent_session_view();
         self.session_generation = self.session_generation.saturating_add(1);
@@ -9860,11 +9875,7 @@ impl VibexWorkbench {
         self.child_agent_timelines
             .get(session_id.as_str())
             .map(|state| {
-                let session_state = self
-                    .sessions
-                    .iter()
-                    .find(|session| session.id == *session_id)
-                    .map(|session| session.state);
+                let session_state = state.session.as_ref().map(|session| session.state);
                 ChildAgentTimelineSnapshot {
                     loading: state.loading,
                     loaded: state.loaded,
@@ -9920,7 +9931,7 @@ impl VibexWorkbench {
         };
         let request_session_id = session_id.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            fetch_authoritative_timeline(runtime, request_session_id).await
+            fetch_child_agent_session_snapshot(runtime, request_session_id).await
         });
         cx.spawn(
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
@@ -9934,7 +9945,7 @@ impl VibexWorkbench {
                     }
                     state.loading = false;
                     match outcome {
-                        Ok(Ok(items)) => {
+                        Ok(Ok((session, items))) => {
                             let fetched_end_sequence = items.last().map(|item| item.sequence);
                             let live_tail = state
                                 .timeline
@@ -9949,6 +9960,7 @@ impl VibexWorkbench {
                             state
                                 .timeline
                                 .replace_authoritative(session_id.clone(), items);
+                            state.session = Some(session);
                             for item in live_tail {
                                 state.timeline.apply_live(TimelineLiveEvent {
                                     session_id: session_id.clone(),
@@ -18263,6 +18275,7 @@ impl VibexWorkbench {
             // must be invalidated in the same transaction. Otherwise the
             // removed session's timeline remains rendered until the
             // authoritative overview refresh completes.
+            self.clear_child_agent_context();
             self.session_generation = self.session_generation.saturating_add(1);
             self.selected_session_id = None;
             self.timeline = TimelineModel::default();
@@ -31345,9 +31358,9 @@ impl VibexWorkbench {
     }
 
     fn child_agent_session_label(&self, session_id: &VibexSessionId) -> String {
-        self.sessions
-            .iter()
-            .find(|session| session.id == *session_id)
+        self.child_agent_timelines
+            .get(session_id.as_str())
+            .and_then(|state| state.session.as_ref())
             .map(|session| session.title.clone())
             .filter(|title| !title.trim().is_empty())
             .unwrap_or_else(|| {
@@ -50690,6 +50703,41 @@ mod tests {
         assert!(completion.contains("if should_reconcile {"));
         assert!(!completion.contains("this.agent_action_pending = false;"));
         assert!(completion.contains("this.load_agent_overview(cx);"));
+    }
+
+    #[test]
+    fn child_agent_panels_keep_internal_session_snapshots_outside_the_sidebar() {
+        let source = include_str!("app.rs");
+        let child_state = source
+            .split_once("struct ChildAgentTimelineState {")
+            .and_then(|(_, tail)| tail.split_once("\n}\n\nimpl ChildAgentTimelineState"))
+            .map(|(body, _)| body)
+            .expect("child Agent state should remain inspectable");
+        assert!(child_state.contains("session: Option<AgentSession>"));
+
+        let child_loader = source
+            .split_once("    fn ensure_child_agent_timeline(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn apply_child_agent_timeline_events("))
+            .map(|(body, _)| body)
+            .expect("child Agent loader should remain inspectable");
+        assert!(child_loader.contains("fetch_child_agent_session_snapshot("));
+        assert!(child_loader.contains("state.session = Some(session);"));
+
+        let child_label = source
+            .split_once("    fn child_agent_session_label(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_agent_delegation_card("))
+            .map(|(body, _)| body)
+            .expect("child Agent tab label should remain inspectable");
+        assert!(child_label.contains("self.child_agent_timelines"));
+        assert!(child_label.contains("state.session.as_ref()"));
+        assert!(!child_label.contains("self.sessions"));
+
+        let optimistic_delete = source
+            .split_once("    fn optimistically_remove_sessions(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn confirm_delete_project("))
+            .map(|(body, _)| body)
+            .expect("optimistic deletion should remain inspectable");
+        assert!(optimistic_delete.contains("self.clear_child_agent_context();"));
     }
 
     #[test]

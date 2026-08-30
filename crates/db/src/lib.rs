@@ -2624,8 +2624,56 @@ impl SessionRepository {
         ))
     }
 
+    /// Lists every durable session, including product-managed child sessions.
+    /// Runtime recovery and workspace safety checks need this complete view.
     pub fn list(conn: &Connection, include_archived: bool) -> VibexResult<Vec<AgentSession>> {
-        let sql = if include_archived {
+        Self::list_with_visibility(conn, include_archived, false)
+    }
+
+    /// Lists sessions that can be shown as top-level conversations. A child
+    /// session remains addressable by id for its parent timeline and child
+    /// panel, but never becomes a separate sidebar row.
+    pub fn list_root_sessions(
+        conn: &Connection,
+        include_archived: bool,
+    ) -> VibexResult<Vec<AgentSession>> {
+        Self::list_with_visibility(conn, include_archived, true)
+    }
+
+    pub fn is_delegated_child(conn: &Connection, session_id: &VibexSessionId) -> VibexResult<bool> {
+        conn.query_row(
+            "
+            SELECT EXISTS(
+                SELECT 1
+                FROM agent_delegations
+                WHERE child_session_id = ?1
+            )
+            ",
+            params![session_id.as_str()],
+            |row| row.get::<_, i64>(0).map(|value| value != 0),
+        )
+        .map_err(storage_err(
+            "session_child_lookup_failed",
+            "failed to determine whether Agent session is delegated",
+        ))
+    }
+
+    fn list_with_visibility(
+        conn: &Connection,
+        include_archived: bool,
+        roots_only: bool,
+    ) -> VibexResult<Vec<AgentSession>> {
+        let archived_filter = (!include_archived).then_some("AND archived_at_ms IS NULL");
+        let child_filter = roots_only.then_some(
+            "
+            AND NOT EXISTS (
+                SELECT 1
+                FROM agent_delegations
+                WHERE agent_delegations.child_session_id = agent_sessions.session_id
+            )
+            ",
+        );
+        let sql = format!(
             "
             SELECT session_id, title, project_id, workspace_id, workspace_root,
                 workspace_mode, state,
@@ -2640,27 +2688,14 @@ impl SessionRepository {
                 archived_at_ms, deleted_at_ms, current_agent_id
             FROM agent_sessions
             WHERE deleted_at_ms IS NULL
+            {}
+            {}
             ORDER BY last_message_at_ms DESC, session_id DESC
-            "
-        } else {
-            "
-            SELECT session_id, title, project_id, workspace_id, workspace_root,
-                workspace_mode, state,
-                permission_mode, ask_on_risk, bypass_all_permissions,
-                created_at_ms, updated_at_ms,
-                COALESCE(
-                    (SELECT MAX(timestamp_ms)
-                     FROM agent_timeline_items
-                     WHERE agent_timeline_items.session_id = agent_sessions.session_id),
-                    created_at_ms
-                ) AS last_message_at_ms,
-                archived_at_ms, deleted_at_ms, current_agent_id
-            FROM agent_sessions
-            WHERE deleted_at_ms IS NULL AND archived_at_ms IS NULL
-            ORDER BY last_message_at_ms DESC, session_id DESC
-            "
-        };
-        let mut stmt = conn.prepare(sql).map_err(storage_err(
+            ",
+            archived_filter.unwrap_or_default(),
+            child_filter.unwrap_or_default(),
+        );
+        let mut stmt = conn.prepare(&sql).map_err(storage_err(
             "session_list_failed",
             "failed to list sessions",
         ))?;
@@ -3176,6 +3211,82 @@ impl AgentDelegationRepository {
         Err(VibexError::storage(
             "agent_delegation_ancestry_invalid",
             "Agent delegation ancestry exceeds the supported depth",
+        ))
+    }
+
+    /// Resolves a managed child-session tree in deletion order. The root is
+    /// intentionally omitted; callers delete it after every descendant.
+    pub fn descendant_session_ids(
+        conn: &Connection,
+        parent_session_id: &VibexSessionId,
+    ) -> VibexResult<Vec<VibexSessionId>> {
+        const MAX_TRAVERSAL_DEPTH: usize = 32;
+
+        let mut seen = BTreeSet::from([parent_session_id.as_str().to_string()]);
+        let mut frontier = vec![parent_session_id.clone()];
+        let mut descendants = Vec::new();
+
+        for _ in 0..MAX_TRAVERSAL_DEPTH {
+            if frontier.is_empty() {
+                descendants.reverse();
+                return Ok(descendants);
+            }
+
+            let mut next = Vec::new();
+            for parent_id in frontier {
+                let child_ids = {
+                    let mut statement = conn
+                        .prepare(
+                            "
+                            SELECT child_session_id
+                            FROM agent_delegations
+                            WHERE parent_session_id = ?1
+                              AND child_session_id IS NOT NULL
+                            ORDER BY child_session_id ASC
+                            ",
+                        )
+                        .map_err(storage_err(
+                            "agent_delegation_descendant_lookup_failed",
+                            "failed to prepare Agent delegation descendant lookup",
+                        ))?;
+                    let rows = statement
+                        .query_map(params![parent_id.as_str()], |row| row.get::<_, String>(0))
+                        .map_err(storage_err(
+                            "agent_delegation_descendant_lookup_failed",
+                            "failed to list Agent delegation descendants",
+                        ))?;
+                    let mut child_ids = Vec::new();
+                    for row in rows {
+                        let child_id = row.map_err(storage_err(
+                            "agent_delegation_descendant_decode_failed",
+                            "failed to decode Agent delegation child session",
+                        ))?;
+                        child_ids.push(VibexSessionId::parse(child_id)?);
+                    }
+                    child_ids
+                };
+
+                for child_id in child_ids {
+                    if !seen.insert(child_id.as_str().to_string()) {
+                        return Err(VibexError::storage(
+                            "agent_delegation_hierarchy_invalid",
+                            "Agent delegation hierarchy contains a duplicate or cycle",
+                        ));
+                    }
+                    descendants.push(child_id.clone());
+                    next.push(child_id);
+                }
+            }
+            if next.is_empty() {
+                descendants.reverse();
+                return Ok(descendants);
+            }
+            frontier = next;
+        }
+
+        Err(VibexError::storage(
+            "agent_delegation_hierarchy_invalid",
+            "Agent delegation hierarchy exceeds the supported depth",
         ))
     }
 
@@ -13309,6 +13420,106 @@ mod tests {
             )
             .unwrap()
             .is_none()
+        );
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn root_session_list_excludes_delegated_descendants() {
+        let temp = temp_db_path("agent-delegation-root-list");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let (_project, workspace) = WorkspaceRepository::ensure(
+            &conn,
+            "/tmp/vibex-agent-delegation-root-list",
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let now = unix_timestamp_ms();
+        let agent_id = AgentId::parse("codex").unwrap();
+        let insert_session = |conn: &Connection, title: &str| {
+            let session = AgentSession {
+                id: VibexSessionId::new(),
+                title: title.to_string(),
+                project_id: workspace.project_id.clone(),
+                workspace_id: workspace.id.clone(),
+                workspace_root: workspace.root_path.clone(),
+                workspace_mode: workspace.mode,
+                agent_id: agent_id.clone(),
+                state: AgentSessionState::Idle,
+                safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+                created_at_ms: now,
+                updated_at_ms: now,
+                last_message_at_ms: now,
+                archived_at_ms: None,
+                deleted_at_ms: None,
+            };
+            SessionRepository::insert(conn, &session).unwrap();
+            session
+        };
+        let parent = insert_session(&conn, "Parent");
+        let child = insert_session(&conn, "Child");
+        let grandchild = insert_session(&conn, "Grandchild");
+        let unrelated = insert_session(&conn, "Unrelated");
+
+        let attach_child = |conn: &mut Connection,
+                            parent: &AgentSession,
+                            child: &AgentSession,
+                            idempotency_key: &str| {
+            let delegation = AgentDelegation {
+                id: AgentDelegationId::new(),
+                parent_session_id: parent.id.clone(),
+                parent_timeline_item_id: None,
+                child_session_id: None,
+                idempotency_key: idempotency_key.to_string(),
+                title: child.title.clone(),
+                task_summary: "Delegate work".to_string(),
+                requested_agent_id: None,
+                effective_agent_id: Some(agent_id.clone()),
+                status: AgentDelegationStatus::Starting,
+                result_summary: None,
+                error_code: None,
+                created_at_ms: now,
+                updated_at_ms: now,
+                started_at_ms: Some(now),
+                completed_at_ms: None,
+            };
+            AgentDelegationRepository::reserve_or_get(conn, &delegation, 8).unwrap();
+            AgentDelegationRepository::attach_claimed_child_session(
+                conn,
+                &delegation.id,
+                &child.id,
+                &agent_id,
+            )
+            .unwrap()
+            .unwrap();
+        };
+        attach_child(&mut conn, &parent, &child, "parent-child");
+        attach_child(&mut conn, &child, &grandchild, "child-grandchild");
+
+        let root_ids = SessionRepository::list_root_sessions(&conn, false)
+            .unwrap()
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            root_ids,
+            BTreeSet::from([parent.id.clone(), unrelated.id.clone()])
+        );
+        assert_eq!(
+            SessionRepository::list_root_sessions(&conn, true)
+                .unwrap()
+                .into_iter()
+                .map(|session| session.id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([parent.id.clone(), unrelated.id.clone()])
+        );
+        assert_eq!(SessionRepository::list(&conn, false).unwrap().len(), 4);
+        assert_eq!(
+            AgentDelegationRepository::descendant_session_ids(&conn, &parent.id).unwrap(),
+            vec![grandchild.id, child.id]
         );
 
         cleanup_db(temp);
