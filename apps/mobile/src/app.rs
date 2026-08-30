@@ -7261,7 +7261,7 @@ impl MobileApp {
             .into_any_element()
     }
 
-    /// Width the trailing menu column takes from a row body.
+    /// Width used to keep the trailing menu hitbox out of row long-press math.
     fn sidebar_actions_width(&self, row: &SidebarRow) -> f32 {
         let can_organize = self.backend.as_ref().is_some_and(|backend| {
             backend
@@ -7273,6 +7273,35 @@ impl MobileApp {
             theme::SIDEBAR_ACTION_WIDTH + theme::SIDEBAR_CARD_INSET
         } else {
             0.0
+        }
+    }
+
+    /// The menu is absolutely positioned on the full row wrapper, while each
+    /// row body has its own margins and icon overhang. Reserve only the inset
+    /// needed to keep inline metadata immediately beside the menu glyph.
+    fn sidebar_row_content_inset(&self, row: &SidebarRow, inside_workspace_card: bool) -> f32 {
+        let can_organize = self.backend.as_ref().is_some_and(|backend| {
+            backend
+                .capability_snapshot()
+                .agent
+                .supports(BackendOperation::AgentSidebarOrganizationMutate)
+        });
+        if !self.sidebar_row_shows_menu(row, can_organize) {
+            return 0.0;
+        }
+
+        match row.kind {
+            SidebarRowKind::Session => {
+                if inside_workspace_card {
+                    theme::SIDEBAR_LIST_PADDING + theme::SIDEBAR_CARD_INSET
+                } else {
+                    theme::SIDEBAR_LIST_PADDING
+                }
+            }
+            SidebarRowKind::Folder | SidebarRowKind::Project | SidebarRowKind::Workspace => {
+                theme::SIDEBAR_ACTION_CONTENT_INSET
+            }
+            SidebarRowKind::EmptyWorkspace => 0.0,
         }
     }
 
@@ -7436,7 +7465,9 @@ impl MobileApp {
             .left(px(-theme::SIDEBAR_ICON_SLOT_OVERHANG))
             .mx(px(theme::SIDEBAR_LIST_PADDING))
             .pl(px(row.indent))
-            .pr(px(self.sidebar_actions_width(row)))
+            .pr(px(
+                self.sidebar_row_content_inset(row, inside_workspace_card)
+            ))
             .rounded(px(theme::SIDEBAR_ROW_RADIUS))
             .flex()
             .items_center()
@@ -7515,7 +7546,7 @@ impl MobileApp {
             .left(px(-theme::SIDEBAR_ICON_SLOT_OVERHANG))
             .mx(px(theme::SIDEBAR_LIST_PADDING))
             .pl(px(row.indent))
-            .pr(px(self.sidebar_actions_width(row)))
+            .pr(px(self.sidebar_row_content_inset(row, false)))
             .rounded(px(theme::SIDEBAR_ROW_RADIUS))
             .flex()
             .items_center()
@@ -7657,7 +7688,7 @@ impl MobileApp {
             .left(px(-theme::SIDEBAR_ICON_SLOT_OVERHANG))
             .mx(px(theme::SIDEBAR_LIST_PADDING))
             .pl(px(row.indent))
-            .pr(px(self.sidebar_actions_width(row)))
+            .pr(px(self.sidebar_row_content_inset(row, false)))
             .rounded(px(theme::SIDEBAR_ROW_RADIUS))
             .flex()
             .items_center()
@@ -7816,7 +7847,9 @@ impl MobileApp {
             .ml(px(theme::SIDEBAR_LIST_PADDING))
             .mr(px(row_right_margin))
             .pl(px(row.indent + theme::SIDEBAR_SESSION_CONTENT_INSET))
-            .pr(px(self.sidebar_actions_width(row)))
+            .pr(px(
+                self.sidebar_row_content_inset(row, inside_workspace_card)
+            ))
             .rounded(px(theme::SIDEBAR_ROW_RADIUS))
             .flex()
             .items_center()
@@ -8041,6 +8074,22 @@ impl MobileApp {
             && project_ids
                 .iter()
                 .all(|project_id| self.sidebar_view.collapsed_project_ids.contains(project_id));
+        // The control switches to the other hierarchy, so show the mark for
+        // the destination view instead of the ambiguous double-chevron glyph.
+        let (hierarchy_icon, hierarchy_label) = match self.sidebar_view.hierarchy_mode {
+            SidebarHierarchyMode::Compact => (
+                "icons/folder-open.svg",
+                locale::text(
+                    "Switch to workspace view",
+                    "切换为工作区视图",
+                    "切換為工作區視圖",
+                ),
+            ),
+            SidebarHierarchyMode::Detailed => (
+                "icons/message-square.svg",
+                locale::text("Switch to session view", "切换为会话视图", "切換為會話視圖"),
+            ),
+        };
         let all_sidebar_session_ids = sessions
             .iter()
             .filter(|session| session.deleted_at_ms.is_none())
@@ -8205,11 +8254,7 @@ impl MobileApp {
                                     .child(
                                         div()
                                             .id("mobile-drawer-hierarchy-mode")
-                                            .aria_label(locale::text(
-                                                "Switch sidebar hierarchy",
-                                                "切换侧栏层级",
-                                                "切換側欄層級",
-                                            ))
+                                            .aria_label(hierarchy_label)
                                             .size(px(32.0))
                                             .rounded(px(theme::RADIUS_CONTROL))
                                             .flex()
@@ -8223,14 +8268,7 @@ impl MobileApp {
                                             )
                                             .child(
                                                 svg()
-                                                    .path(match self.sidebar_view.hierarchy_mode {
-                                                        SidebarHierarchyMode::Compact => {
-                                                            "icons/chevrons-right-left.svg"
-                                                        }
-                                                        SidebarHierarchyMode::Detailed => {
-                                                            "icons/chevrons-left-right.svg"
-                                                        }
-                                                    })
+                                                    .path(hierarchy_icon)
                                                     .size(px(16.0))
                                                     .text_color(theme::sidebar_text_secondary()),
                                             ),

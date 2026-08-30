@@ -154,6 +154,9 @@ pub const SIDEBAR_INDENT: f32 = 14.0;
 /// Width of the trailing sidebar menu column. Row movement uses a long press on
 /// the body, so no separate drag affordance is reserved.
 pub const SIDEBAR_ACTION_WIDTH: f32 = 34.0;
+/// The menu is layered over the row wrapper, so row content needs only the
+/// small visual inset before its icon rather than the whole menu hitbox width.
+pub const SIDEBAR_ACTION_CONTENT_INSET: f32 = 8.0;
 pub const DRAWER_ACTION_HEIGHT: f32 = 40.0;
 pub const DRAWER_SECTION_HEIGHT: f32 = 40.0;
 pub const DRAWER_DRAG_THRESHOLD: f32 = 6.0;
