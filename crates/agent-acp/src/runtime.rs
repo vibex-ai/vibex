@@ -3101,6 +3101,24 @@ impl AcpSessionAttachment {
         }
     }
 
+    fn emit_pi_retry_exhausted(&self) {
+        if self.process().agent_id.as_str() != PI_AGENT_ID {
+            return;
+        }
+        let exhausted = self.state.lock().ok().and_then(|state| {
+            let turn = state.active_turn.as_ref()?;
+            let signal = turn.retry_progress.get(&RetryKind::ModelRequest)?;
+            Some(AcpRetrySignal {
+                phase: RetryPhase::Exhausted,
+                delay_ms: None,
+                ..signal.clone()
+            })
+        });
+        if let Some(signal) = exhausted {
+            self.emit_retry_signal(signal);
+        }
+    }
+
     fn record_codex_terminal_http_error(&self, text: &str) -> bool {
         let Some(http_status) = codex_terminal_http_status(text) else {
             return false;
@@ -3975,14 +3993,12 @@ impl AcpSessionAttachment {
                             return;
                         }
                         if text.trim() == "Retry finished, resuming." {
-                            self.emit_retry_signal(AcpRetrySignal {
-                                kind: RetryKind::ModelRequest,
-                                phase: RetryPhase::Recovered,
-                                attempt: None,
-                                max_attempts: None,
-                                delay_ms: None,
-                                reason: None,
-                            });
+                            // pi-acp 0.0.33 drops the `success` field from
+                            // Pi's `auto_retry_end` event and emits this same
+                            // marker for both successful and exhausted retries.
+                            // Wait for actual model/tool progress to prove
+                            // recovery; an unresolved retry is classified at
+                            // prompt settlement below.
                             return;
                         }
                     }
@@ -17156,6 +17172,7 @@ impl AcpClient for AcpRuntimeClient {
             process.publish_attachment_payload(&payload);
         }
         payload.emit_codex_retry_exhausted();
+        payload.emit_pi_retry_exhausted();
         if !has_pending_permissions
             && !user_initiated_stop
             && let Some(error) = payload.terminal_turn_error()
@@ -19540,6 +19557,166 @@ mod tests {
         ] {
             assert_eq!(parse_pi_retry_announcement(invalid), None, "{invalid}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pi_retry_exhaustion_is_inferred_when_adapter_drops_outcome() {
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "pi-retry-exhausted",
+            Some(AgentId::parse(PI_AGENT_ID).unwrap()),
+        ) else {
+            return;
+        };
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        let payload = client.current_attachment(&session_id).unwrap().payload();
+
+        payload.begin_turn(TurnSink::Buffer(Vec::new())).unwrap();
+        payload.handle_session_update(&json!({
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                    "type": "text",
+                    "text": "Retrying (attempt 3/3, waiting 8s)..."
+                }
+            }
+        }));
+        // pi-acp emits this marker for both success and failure, so it must not
+        // settle the retry state by itself.
+        payload.handle_session_update(&json!({
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "Retry finished, resuming."}
+            }
+        }));
+        payload.emit_pi_retry_exhausted();
+
+        let error = payload
+            .terminal_turn_error()
+            .expect("an unresolved Pi retry should fail the turn");
+        assert_eq!(error.code, ACP_RETRY_EXHAUSTED_ERROR_CODE);
+        assert_eq!(
+            error
+                .diagnostics
+                .iter()
+                .find(|item| item.key == "attempt")
+                .map(|item| item.value.as_str()),
+            Some("3")
+        );
+        let events = payload.finish_turn(false).unwrap();
+        let retry_events = events
+            .iter()
+            .filter_map(|event| match event {
+                AcpEvent::Retry {
+                    phase,
+                    attempt,
+                    max_attempts,
+                    ..
+                } => Some((*phase, *attempt, *max_attempts)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(retry_events.iter().any(|(phase, attempt, max_attempts)| {
+            *phase == RetryPhase::Started && *attempt == Some(3) && *max_attempts == Some(3)
+        }));
+        assert!(retry_events.iter().any(|(phase, attempt, max_attempts)| {
+            *phase == RetryPhase::Exhausted && *attempt == Some(3) && *max_attempts == Some(3)
+        }));
+        assert!(
+            retry_events
+                .iter()
+                .all(|(phase, _, _)| *phase != RetryPhase::Recovered)
+        );
+        assert!(!events.iter().any(|event| {
+            matches!(
+                event,
+                AcpEvent::AssistantDelta { text_delta, .. }
+                    if text_delta == "Retry finished, resuming."
+            )
+        }));
+
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pi_retry_marker_recovers_after_following_model_output() {
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "pi-retry-recovered",
+            Some(AgentId::parse(PI_AGENT_ID).unwrap()),
+        ) else {
+            return;
+        };
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        let payload = client.current_attachment(&session_id).unwrap().payload();
+
+        payload.begin_turn(TurnSink::Buffer(Vec::new())).unwrap();
+        payload.handle_session_update(&json!({
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                    "type": "text",
+                    "text": "Retrying (attempt 3/3, waiting 8s)..."
+                }
+            }
+        }));
+        payload.handle_session_update(&json!({
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "Retry finished, resuming."}
+            }
+        }));
+        payload.handle_session_update(&json!({
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "Recovered answer"}
+            }
+        }));
+        assert!(payload.terminal_turn_error().is_none());
+        let events = payload.finish_turn(false).unwrap();
+        let retry_events = events
+            .iter()
+            .filter_map(|event| match event {
+                AcpEvent::Retry { phase, .. } => Some(*phase),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(retry_events.contains(&RetryPhase::Started));
+        assert!(retry_events.contains(&RetryPhase::Recovered));
+        assert!(!retry_events.contains(&RetryPhase::Exhausted));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AcpEvent::AssistantDelta { text_delta, .. }
+                    if text_delta == "Recovered answer"
+            )
+        }));
+
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
     }
 
     #[test]
