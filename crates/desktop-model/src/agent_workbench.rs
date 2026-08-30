@@ -447,7 +447,7 @@ pub fn timeline_conversation_turns(
 /// Projects conversation turns with an explicit reasoning presentation mode.
 /// The legacy `timeline_conversation_turns` adapter intentionally retains the
 /// compact bottom-indicator behavior for callers that do not have a UI
-/// preference available (including the native mobile client).
+/// preference available.
 pub fn timeline_conversation_turns_with_reasoning_mode(
     items: &[TimelineItem],
     session_state: Option<AgentSessionState>,

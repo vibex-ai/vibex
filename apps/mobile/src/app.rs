@@ -30,9 +30,10 @@ use vibex_core::{
     WorkspaceRecord, agent_session_turn_requires_continuation, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
-    NewSessionLocation, RuntimeCascadeChoice, RuntimeCascadeProjection, SidebarHierarchyMode,
-    SidebarOrganizationItem, SidebarOrganizationView, SidebarProjectLogo, SidebarProjectLogoColor,
-    SidebarState, TimelineConversationTurn, TimelineRow, TimelineRowKind,
+    NewSessionLocation, ReasoningDisplayMode, RuntimeCascadeChoice, RuntimeCascadeProjection,
+    SidebarHierarchyMode, SidebarOrganizationItem, SidebarOrganizationView, SidebarProjectLogo,
+    SidebarProjectLogoColor, SidebarState, TimelineConversationTurn, TimelineProcessActivityGroup,
+    TimelineRow, TimelineRowKind,
 };
 use vibex_remote_client::{
     RemoteConnectionState, RemoteLifecycleSignal, WebRemoteBackend, ZeroConfigLanPairingSession,
@@ -61,6 +62,10 @@ use crate::{locale, markdown, notifications, scanner, theme};
 const TIMELINE_NEAR_BOTTOM_PX: f32 = 96.0;
 const TIMELINE_LIST_OVERDRAW_PX: f32 = 800.0;
 const TIMELINE_TURN_ESTIMATED_HEIGHT_PX: f32 = 180.0;
+/// The compact session surface follows the desktop timeline ordering and
+/// keeps reasoning rows in their authored position instead of using the old
+/// bottom-only compatibility projection.
+const MOBILE_REASONING_DISPLAY_MODE: ReasoningDisplayMode = ReasoningDisplayMode::Timeline;
 const RESUME_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const RESUME_RECOVERY_POLL_ATTEMPTS: usize = 600;
 const RUNTIME_FEATURE_VALUE_LIMIT: usize = 256;
@@ -321,7 +326,8 @@ pub struct MobileApp {
     drawer_snap: Option<DrawerSnap>,
     drawer_animation_id: u64,
     drawer_snap_task: Option<Task<()>>,
-    expanded_process: BTreeSet<String>,
+    expanded_process: BTreeMap<String, bool>,
+    expanded_timeline_rows: BTreeSet<String>,
     expanded_approval: BTreeSet<String>,
     workspaces: Vec<WorkspaceRecord>,
     workspace_summaries: Vec<WorkspaceSummary>,
@@ -437,7 +443,8 @@ impl MobileApp {
             drawer_snap: None,
             drawer_animation_id: 0,
             drawer_snap_task: None,
-            expanded_process: BTreeSet::new(),
+            expanded_process: BTreeMap::new(),
+            expanded_timeline_rows: BTreeSet::new(),
             expanded_approval: BTreeSet::new(),
             workspaces: Vec::new(),
             workspace_summaries: Vec::new(),
@@ -2390,6 +2397,7 @@ impl MobileApp {
         let runner = gpui_tokio::Tokio::spawn(cx, future);
         self.reset_drawers();
         self.expanded_process.clear();
+        self.expanded_timeline_rows.clear();
         self.expanded_approval.clear();
         self.timeline_turns = Arc::new(Vec::new());
         self.timeline_list.reset(0);
@@ -3954,12 +3962,35 @@ impl MobileApp {
         }
     }
 
-    fn toggle_process(&mut self, id: String, cx: &mut Context<Self>) {
-        if !self.expanded_process.insert(id.clone()) {
-            self.expanded_process.remove(&id);
-        }
+    fn timeline_process_expanded(&self, turn: &TimelineConversationTurn) -> bool {
+        self.expanded_process
+            .get(&turn.id)
+            .copied()
+            .unwrap_or_else(|| {
+                !turn.complete
+                    && turn
+                        .conclusion_row
+                        .as_ref()
+                        .is_none_or(|row| row.body.trim().is_empty())
+            })
+    }
+
+    fn toggle_process(&mut self, id: String, expanded: bool, cx: &mut Context<Self>) {
+        self.expanded_process.insert(id, !expanded);
         // Expanded process rows change a turn's measured height. Re-measure the
         // virtual list immediately so the following turns keep their anchors.
+        self.timeline_list.remeasure();
+        cx.notify();
+    }
+
+    fn timeline_row_expanded(&self, id: &str) -> bool {
+        self.expanded_timeline_rows.contains(id)
+    }
+
+    fn toggle_timeline_row(&mut self, id: String, cx: &mut Context<Self>) {
+        if !self.expanded_timeline_rows.insert(id.clone()) {
+            self.expanded_timeline_rows.remove(&id);
+        }
         self.timeline_list.remeasure();
         cx.notify();
     }
@@ -3995,7 +4026,12 @@ impl MobileApp {
         let turns = self
             .controller
             .as_ref()
-            .map(|controller| controller.state.conversation_turns())
+            .map(|controller| match MOBILE_REASONING_DISPLAY_MODE {
+                ReasoningDisplayMode::LatestAtBottom => controller.state.conversation_turns(),
+                ReasoningDisplayMode::Timeline => controller
+                    .state
+                    .conversation_turns_with_reasoning_mode(MOBILE_REASONING_DISPLAY_MODE),
+            })
             .unwrap_or_default();
         self.sync_timeline_list(turns.len());
         self.timeline_turns = Arc::new(turns);
@@ -4740,16 +4776,6 @@ impl MobileApp {
             controller.state.timeline_status.phase == AsyncPhase::Loading
         });
         let turns = self.timeline_turns.clone();
-        let approvals = self
-            .controller
-            .as_ref()
-            .map(|controller| controller.state.approval_surfaces(ShellKind::Compact))
-            .unwrap_or_default();
-        let elicitations = self
-            .controller
-            .as_ref()
-            .map(|controller| controller.state.elicitation_surfaces(ShellKind::Compact))
-            .unwrap_or_default();
         let no_selected_session = self
             .controller
             .as_ref()
@@ -4839,13 +4865,19 @@ impl MobileApp {
                                 timeline.child(
                                     list(
                                         self.timeline_list.clone(),
-                                        cx.processor(move |this, index, _window, cx| {
+                                        cx.processor(move |this, index, window, cx| {
                                             turns_for_list
                                                 .get(index)
                                                 .map(|turn| {
                                                     div()
                                                         .pb(px(theme::SPACING_XL))
-                                                        .child(this.render_turn(turn, cx))
+                                                        .child(this.render_turn(
+                                                            turn,
+                                                            index == 0,
+                                                            index + 1 == turns_for_list.len(),
+                                                            window,
+                                                            cx,
+                                                        ))
                                                         .into_any_element()
                                                 })
                                                 .unwrap_or_else(|| div().into_any_element())
@@ -4869,12 +4901,6 @@ impl MobileApp {
                                 .text_color(rgb(theme::ACCENT_YELLOW))
                                 .child(notice.clone()),
                         )
-                    })
-                    .when_some(approvals.first(), |workspace, approval| {
-                        workspace.child(self.render_approval(approval, cx))
-                    })
-                    .when_some(elicitations.first(), |workspace, elicitation| {
-                        workspace.child(self.render_elicitation(elicitation, cx))
                     })
                     .child(self.render_composer(running, state, &turns, cx)),
             )
@@ -6237,9 +6263,12 @@ impl MobileApp {
     fn render_turn(
         &self,
         turn: &TimelineConversationTurn,
+        is_first: bool,
+        _is_last: bool,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let expanded = self.expanded_process.contains(&turn.id);
+        let expanded = self.timeline_process_expanded(turn);
         let turn_id = turn.id.clone();
         let agent_identity = turn
             .runtime_attribution
@@ -6265,34 +6294,24 @@ impl MobileApp {
             "{} {duration}",
             locale::text("Worked for", "工作了", "工作了")
         );
-        let status_label = timeline_turn_status_label(turn);
-        let status_color = timeline_turn_status_color(turn);
+        let conclusion_row = turn
+            .conclusion_row
+            .as_ref()
+            .filter(|row| !row.body.trim().is_empty());
+        let process_collapsible =
+            turn.complete || (conclusion_row.is_some() && !turn.process_rows.is_empty());
         let has_response =
-            !turn.process_rows.is_empty() || turn.conclusion_row.is_some() || !turn.complete;
+            !turn.process_rows.is_empty() || conclusion_row.is_some() || !turn.complete;
         div()
             .id(format!("timeline-turn:{}", turn.id))
             .w_full()
+            .min_w_0()
             .flex()
             .flex_col()
             .gap_3()
+            .when(!is_first, |turn| turn.pt_2())
             .when_some(turn.user_row.as_ref(), |container, row| {
-                container.child(
-                    div()
-                        .ml_auto()
-                        .w(gpui::relative(0.78))
-                        .max_w(px(520.0))
-                        .rounded(px(theme::RADIUS_CARD))
-                        .bg(theme::bg_card())
-                        .border_1()
-                        .border_color(theme::border_default())
-                        .px_3()
-                        .py_2()
-                        .text_size(px(theme::FONT_HEADING))
-                        .line_height(px(19.0))
-                        .text_color(theme::text_primary())
-                        .whitespace_normal()
-                        .child(row.body.clone()),
-                )
+                container.child(self.render_user_message_row(row))
             })
             .when(has_response, |container| {
                 container.child(
@@ -6308,12 +6327,29 @@ impl MobileApp {
                             .gap_1()
                             .child(
                                 div()
+                                    .id(format!("turn-process:{}", turn.id))
                                     .w_full()
                                     .min_w_0()
+                                    .min_h(px(40.0))
                                     .flex()
                                     .items_center()
                                     .justify_between()
                                     .gap_2()
+                                    .when(process_collapsible, |header| {
+                                        header
+                                            .cursor_pointer()
+                                            .active(|style| style.bg(theme::row_pressed_bg()))
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.toggle_process(
+                                                        turn_id.clone(),
+                                                        expanded,
+                                                        cx,
+                                                    )
+                                                }),
+                                            )
+                                    })
                                     .child(
                                         div()
                                             .min_w_0()
@@ -6339,7 +6375,19 @@ impl MobileApp {
                                                     .child(worked_label.clone()),
                                             ),
                                     )
-                                    .child(timeline_status_badge(status_label, status_color)),
+                                    .when(process_collapsible, |header| {
+                                        header.child(
+                                            svg()
+                                                .path(if expanded {
+                                                    "icons/chevron-down.svg"
+                                                } else {
+                                                    "icons/chevron-right.svg"
+                                                })
+                                                .size(px(theme::ICON_SM))
+                                                .flex_shrink_0()
+                                                .text_color(theme::text_muted()),
+                                        )
+                                    }),
                             )
                             .when_some(runtime_label.clone(), |header, runtime| {
                                 header.child(
@@ -6357,192 +6405,23 @@ impl MobileApp {
                     ),
                 )
             })
-            .when(!turn.process_rows.is_empty(), |container| {
-                container.child(
-                    div()
-                        .id(format!("process:{}", turn.id))
-                        .w_full()
-                        .rounded(px(theme::RADIUS_CARD))
-                        .bg(theme::bg_card_dim())
-                        .border_1()
-                        .border_color(theme::border_subtle())
-                        .child(
-                            div()
-                                .id(format!("process-toggle:{}", turn.id))
-                                .min_h(px(40.0))
-                                .px_3()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .gap_2()
-                                .cursor_pointer()
-                                .active(|style| style.bg(theme::row_pressed_bg()))
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.toggle_process(turn_id.clone(), cx)
-                                    }),
-                                )
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(
-                                            svg()
-                                                .path("icons/activity.svg")
-                                                .size(px(theme::ICON_SM))
-                                                .text_color(theme::text_muted()),
-                                        )
-                                        .child(
-                                            div()
-                                                .min_w_0()
-                                                .overflow_hidden()
-                                                .text_ellipsis()
-                                                .whitespace_nowrap()
-                                                .text_size(px(theme::FONT_CAPTION))
-                                                .text_color(theme::text_secondary())
-                                                .child(turn.live_status.clone().unwrap_or_else(
-                                                    || locale::common("Process").to_string(),
-                                                )),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(
-                                            div()
-                                                .text_size(px(theme::FONT_MICRO))
-                                                .text_color(theme::text_muted())
-                                                .child(format!(
-                                                    "{} {}",
-                                                    turn.process_rows.len(),
-                                                    locale::text("items", "项", "項")
-                                                )),
-                                        )
-                                        .child(
-                                            svg()
-                                                .path(if expanded {
-                                                    "icons/chevron-down.svg"
-                                                } else {
-                                                    "icons/chevron-right.svg"
-                                                })
-                                                .size(px(theme::ICON_SM))
-                                                .text_color(theme::text_muted()),
-                                        ),
-                                ),
-                        )
-                        .when(expanded, |process| {
-                            process.child(
-                                div()
-                                    .border_t_1()
-                                    .border_color(theme::border_subtle())
-                                    .px_3()
-                                    .py_2()
-                                    .ml_3()
-                                    .border_l_1()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .children(
-                                        turn.process_rows
-                                            .iter()
-                                            .map(|row| self.render_process_row(row)),
-                                    ),
-                            )
-                        }),
-                )
+            .when(expanded && !turn.process_rows.is_empty(), |container| {
+                container.children(self.render_timeline_process_rows(turn, cx))
             })
-            .when_some(turn.conclusion_row.as_ref(), |container, row| {
-                let answer_failed = turn.failed || row.failed || row.kind == TimelineRowKind::Error;
-                container.child(
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .when(answer_failed, |answer| {
-                            answer
-                                .rounded(px(theme::RADIUS_CARD))
-                                .border_1()
-                                .border_color(rgb(theme::ACCENT_RED))
-                                .bg(theme::bg_card_dim())
-                                .p_3()
-                        })
-                        .child(
-                            div()
-                                .w_full()
-                                .min_w_0()
-                                .flex()
-                                .items_start()
-                                .gap_2()
-                                .when(answer_failed, |content| {
-                                    content.child(
-                                        svg()
-                                            .path("icons/triangle-alert.svg")
-                                            .size(px(theme::ICON_SM))
-                                            .flex_shrink_0()
-                                            .text_color(rgb(theme::ACCENT_RED)),
-                                    )
-                                })
-                                .child(div().min_w_0().flex_1().child(markdown::render(
-                                    &row.body,
-                                    row.last_sequence.max(0) as u64,
-                                ))),
-                        )
-                        .when(
-                            turn.complete
-                                && row.kind == TimelineRowKind::AgentMessage
-                                && !row.body.trim().is_empty(),
-                            |answer| {
-                                answer.child(
-                                    div()
-                                        .w_full()
-                                        .min_w_0()
-                                        .mt_2()
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .text_size(px(theme::FONT_MICRO))
-                                        .text_color(theme::text_muted())
-                                        .child(
-                                            svg()
-                                                .path(agent_icon)
-                                                .size(px(theme::ICON_SM))
-                                                .flex_shrink_0()
-                                                .text_color(theme::text_muted()),
-                                        )
-                                        .child(
-                                            div()
-                                                .min_w_0()
-                                                .flex_1()
-                                                .overflow_hidden()
-                                                .text_ellipsis()
-                                                .whitespace_nowrap()
-                                                .child(
-                                                    runtime_label
-                                                        .clone()
-                                                        .unwrap_or_else(|| agent_identity.clone()),
-                                                ),
-                                        )
-                                        .child(
-                                            svg()
-                                                .path("icons/clock.svg")
-                                                .size(px(theme::ICON_SM))
-                                                .flex_shrink_0()
-                                                .text_color(theme::text_muted()),
-                                        )
-                                        .child(duration.clone()),
-                                )
-                            },
-                        ),
-                )
+            .when_some(conclusion_row, |container, row| {
+                container.child(self.render_timeline_row(turn, row, true, cx))
             })
+            .when_some(
+                self.render_turn_file_changes_card(turn, cx),
+                |container, card| container.child(card),
+            )
             .when(
-                turn.conclusion_row.is_none() && !turn.complete,
+                conclusion_row.is_none()
+                    && !turn.complete
+                    && !turn
+                        .process_rows
+                        .iter()
+                        .any(|row| row.kind == TimelineRowKind::Reasoning && row.streaming),
                 |container| {
                     container.child(
                         div()
@@ -6589,108 +6468,1233 @@ impl MobileApp {
             .into_any_element()
     }
 
-    fn render_process_row(&self, row: &TimelineRow) -> impl IntoElement {
-        let color = timeline_row_color(row);
-        let icon_path = timeline_row_icon_path(row.kind);
-        let status_label = timeline_row_status_label(row);
-        let show_status = row.failed || row.streaming || row.pending_permission;
+    fn timeline_row_latest_payload(&self, row: &TimelineRow) -> Option<&TimelinePayload> {
+        self.controller
+            .as_ref()?
+            .state
+            .timeline
+            .items
+            .iter()
+            .filter(|item| row.item_ids.iter().any(|id| id == item.id.as_str()))
+            .max_by_key(|item| item.sequence)
+            .map(|item| &item.payload)
+    }
+
+    fn render_timeline_process_rows(
+        &self,
+        turn: &TimelineConversationTurn,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let mut elements = Vec::new();
+        let mut row_index = 0;
+        let mut group_index = 0;
+        let groups = &turn.process_activity_groups;
+
+        while row_index < turn.process_rows.len() {
+            while groups
+                .get(group_index)
+                .is_some_and(|group| group.end_row <= row_index)
+            {
+                group_index += 1;
+            }
+            let group = groups.get(group_index).filter(|group| {
+                group.start_row == row_index
+                    && group.end_row <= turn.process_rows.len()
+                    && group.end_row > group.start_row
+            });
+            if let Some(group) = group {
+                elements.push(self.render_process_activity_group(
+                    group,
+                    &turn.process_rows[group.start_row..group.end_row],
+                    cx,
+                ));
+                row_index = group.end_row;
+                group_index += 1;
+                continue;
+            }
+            elements.push(self.render_timeline_row(turn, &turn.process_rows[row_index], false, cx));
+            row_index += 1;
+        }
+
+        elements
+    }
+
+    fn render_timeline_row(
+        &self,
+        turn: &TimelineConversationTurn,
+        row: &TimelineRow,
+        conversation_conclusion: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        match row.kind {
+            TimelineRowKind::UserMessage => self.render_user_message_row(row).into_any_element(),
+            TimelineRowKind::AgentMessage => {
+                self.render_agent_message_row(turn, row, conversation_conclusion)
+            }
+            TimelineRowKind::Reasoning | TimelineRowKind::Plan => {
+                self.render_thought_process_row(row, cx)
+            }
+            TimelineRowKind::Error => self.render_error_row(row, conversation_conclusion),
+            TimelineRowKind::PermissionRequest => self.render_permission_request_card(row, cx),
+            TimelineRowKind::ElicitationRequest => self.render_elicitation_request_card(row, cx),
+            TimelineRowKind::Command => self.render_command_execution_card(row, cx),
+            TimelineRowKind::FileOperation => self.render_file_operation_card(row, cx),
+            TimelineRowKind::ImageGeneration => self.render_image_generation_card(row, cx),
+            TimelineRowKind::ToolCall
+            | TimelineRowKind::WebSearch
+            | TimelineRowKind::TodoUpdate
+            | TimelineRowKind::Collaboration
+            | TimelineRowKind::Retry => self.render_process_activity_line(row, cx),
+            TimelineRowKind::GitNotice
+            | TimelineRowKind::SystemNotice
+            | TimelineRowKind::PermissionResolution
+            | TimelineRowKind::ElicitationResolution => self.render_fallback_process_row(row),
+        }
+    }
+
+    fn render_user_message_row(&self, row: &TimelineRow) -> impl IntoElement {
         div()
-            .id(format!("process-row:{}", row.id))
+            .id(row.id.clone())
             .w_full()
             .flex()
-            .items_start()
+            .justify_end()
+            .child(
+                div()
+                    .w(gpui::relative(0.78))
+                    .max_w(px(520.0))
+                    .rounded(px(theme::RADIUS_CARD))
+                    .border_1()
+                    .border_color(theme::border_default())
+                    .bg(theme::bg_card())
+                    .px_3()
+                    .py_2()
+                    .text_size(px(theme::FONT_HEADING))
+                    .line_height(px(19.0))
+                    .text_color(theme::text_primary())
+                    .whitespace_normal()
+                    .child(row.body.clone()),
+            )
+    }
+
+    fn render_agent_message_row(
+        &self,
+        turn: &TimelineConversationTurn,
+        row: &TimelineRow,
+        conversation_conclusion: bool,
+    ) -> gpui::AnyElement {
+        div()
+            .id(row.id.clone())
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(markdown::render(&row.body, row.last_sequence.max(0) as u64))
+            .when_some(
+                conversation_conclusion
+                    .then(|| self.render_agent_answer_metadata(turn, row))
+                    .flatten(),
+                |message, metadata| message.child(metadata),
+            )
+            .into_any_element()
+    }
+
+    fn render_agent_answer_metadata(
+        &self,
+        turn: &TimelineConversationTurn,
+        row: &TimelineRow,
+    ) -> Option<gpui::AnyElement> {
+        if !turn.complete || row.kind != TimelineRowKind::AgentMessage || row.body.trim().is_empty()
+        {
+            return None;
+        }
+        let agent_identity = turn
+            .runtime_attribution
+            .as_deref()
+            .and_then(|attribution| attribution.split(" · ").next())
+            .filter(|label| !label.is_empty())
+            .unwrap_or("Vibex")
+            .to_string();
+        let runtime_label = turn
+            .runtime_attribution
+            .as_deref()
+            .map(|attribution| {
+                let label = attribution
+                    .split(" · ")
+                    .skip(1)
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                if label.is_empty() {
+                    attribution.to_string()
+                } else {
+                    label
+                }
+            })
+            .unwrap_or_else(|| agent_identity.clone());
+        let duration = format_compact_duration(
+            turn.started_at_ms,
+            turn.complete.then_some(turn.ended_at_ms).flatten(),
+        );
+        Some(
+            div()
+                .id(format!("agent-answer-metadata:{}", row.id))
+                .w_full()
+                .min_w_0()
+                .mt_1()
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_size(px(theme::FONT_MICRO))
+                .text_color(theme::text_muted())
+                .child(
+                    svg()
+                        .path(agent_icon_path(&agent_identity))
+                        .size(px(theme::ICON_SM))
+                        .flex_shrink_0()
+                        .text_color(theme::text_muted()),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .child(runtime_label),
+                )
+                .child(
+                    svg()
+                        .path("icons/clock.svg")
+                        .size(px(theme::ICON_SM))
+                        .flex_shrink_0()
+                        .text_color(theme::text_muted()),
+                )
+                .child(duration)
+                .into_any_element(),
+        )
+    }
+
+    fn render_thought_process_row(
+        &self,
+        row: &TimelineRow,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        if row.body.trim().is_empty() {
+            return div().id(row.id.clone()).into_any_element();
+        }
+        let expanded = self.timeline_row_expanded(&row.id);
+        let can_expand = row.collapsible;
+        let row_id = row.id.clone();
+        let tone = if row.failed {
+            rgb(theme::ACCENT_RED).into()
+        } else if row.streaming {
+            rgb(theme::ACCENT_PURPLE).into()
+        } else {
+            theme::text_muted()
+        };
+        div()
+            .id(format!("thought:{}", row.id))
+            .w_full()
+            .min_w_0()
+            .border_l_1()
+            .border_color(tone.opacity(0.42))
+            .pl_3()
+            .flex()
+            .flex_col()
             .gap_2()
             .child(
                 div()
-                    .size(px(24.0))
-                    .flex_shrink_0()
-                    .rounded_full()
-                    .bg(theme::bg_card())
+                    .id(format!("thought-header:{}", row.id))
+                    .w_full()
+                    .min_w_0()
+                    .min_h(px(32.0))
                     .flex()
                     .items_center()
-                    .justify_center()
+                    .gap_2()
+                    .when(can_expand, |header| {
+                        header
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.toggle_timeline_row(row_id.clone(), cx)
+                                }),
+                            )
+                    })
                     .child(
                         svg()
-                            .path(icon_path)
-                            .size(px(theme::FONT_BODY))
-                            .text_color(rgb(color)),
+                            .path(timeline_row_icon_path(row.kind))
+                            .size(px(theme::ICON_SM))
+                            .flex_shrink_0()
+                            .text_color(tone),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(px(theme::FONT_CAPTION))
+                            .text_color(theme::text_secondary())
+                            .child(if expanded {
+                                process_title(row)
+                            } else {
+                                timeline_row_preview(&row.body)
+                            }),
+                    )
+                    .when(row.streaming, |header| {
+                        header.child(timeline_status_badge(
+                            timeline_row_status_label(row),
+                            timeline_row_color(row),
+                        ))
+                    })
+                    .when(can_expand, |header| {
+                        header.child(
+                            svg()
+                                .path(if expanded {
+                                    "icons/chevron-down.svg"
+                                } else {
+                                    "icons/chevron-right.svg"
+                                })
+                                .size(px(theme::ICON_SM))
+                                .flex_shrink_0()
+                                .text_color(theme::text_muted()),
+                        )
+                    }),
+            )
+            .when(expanded, |thought| {
+                thought.child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .text_size(px(theme::FONT_CAPTION))
+                        .text_color(theme::text_secondary())
+                        .child(markdown::render(&row.body, row.last_sequence.max(0) as u64)),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_process_activity_group(
+        &self,
+        group: &TimelineProcessActivityGroup,
+        rows: &[TimelineRow],
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(latest_row) = rows.last() else {
+            return div().id(group.id.clone()).into_any_element();
+        };
+        let expanded = self.timeline_row_expanded(&group.id);
+        let group_id = group.id.clone();
+        let summary = timeline_activity_summary(latest_row);
+        div()
+            .id(group.id.clone())
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .id(format!("activity-group:{}", group.id))
+                    .w_full()
+                    .min_w_0()
+                    .min_h(px(32.0))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.toggle_timeline_row(group_id.clone(), cx)
+                        }),
+                    )
+                    .child(
+                        svg()
+                            .path(timeline_row_icon_path(latest_row.kind))
+                            .size(px(theme::ICON_SM))
+                            .flex_shrink_0()
+                            .text_color(rgb(timeline_row_color(latest_row))),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(px(theme::FONT_CAPTION))
+                            .text_color(if latest_row.failed {
+                                rgb(theme::ACCENT_RED).into()
+                            } else {
+                                theme::text_secondary()
+                            })
+                            .child(summary),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(theme::FONT_MICRO))
+                            .text_color(theme::text_muted())
+                            .child(format!("{}", rows.len())),
+                    )
+                    .child(
+                        svg()
+                            .path(if expanded {
+                                "icons/chevron-down.svg"
+                            } else {
+                                "icons/chevron-right.svg"
+                            })
+                            .size(px(theme::ICON_SM))
+                            .flex_shrink_0()
+                            .text_color(theme::text_muted()),
                     ),
+            )
+            .when(expanded, |group| {
+                group.child(
+                    div()
+                        .ml_2()
+                        .border_l_1()
+                        .border_color(theme::border_subtle())
+                        .pl_3()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .children(
+                            rows.iter()
+                                .map(|row| self.render_process_activity_line(row, cx)),
+                        ),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_process_activity_line(
+        &self,
+        row: &TimelineRow,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let has_details = !row.body.trim().is_empty() || row.file_path.is_some();
+        let expanded = has_details && self.timeline_row_expanded(&row.id);
+        let row_id = row.id.clone();
+        let color = timeline_row_color(row);
+        div()
+            .id(format!("activity:{}", row.id))
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .id(format!("activity-header:{}", row.id))
+                    .w_full()
+                    .min_w_0()
+                    .min_h(px(32.0))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .when(has_details, |line| {
+                        line.cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.toggle_timeline_row(row_id.clone(), cx)
+                                }),
+                            )
+                    })
+                    .child(
+                        svg()
+                            .path(timeline_row_icon_path(row.kind))
+                            .size(px(theme::ICON_SM))
+                            .flex_shrink_0()
+                            .text_color(rgb(color)),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(px(theme::FONT_CAPTION))
+                            .text_color(if row.failed {
+                                rgb(theme::ACCENT_RED).into()
+                            } else {
+                                theme::text_secondary()
+                            })
+                            .child(timeline_activity_summary(row)),
+                    )
+                    .when(
+                        row.failed || row.streaming || row.pending_permission,
+                        |line| {
+                            line.child(timeline_status_badge(timeline_row_status_label(row), color))
+                        },
+                    )
+                    .when(has_details, |line| {
+                        line.child(
+                            svg()
+                                .path(if expanded {
+                                    "icons/chevron-down.svg"
+                                } else {
+                                    "icons/chevron-right.svg"
+                                })
+                                .size(px(theme::ICON_SM))
+                                .flex_shrink_0()
+                                .text_color(theme::text_muted()),
+                        )
+                    }),
+            )
+            .when(expanded, |line| {
+                line.child(
+                    div()
+                        .ml(px(24.0))
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .when(!row.body.trim().is_empty(), |details| {
+                            details.child(self.render_timeline_detail(
+                                locale::text("Details", "详情", "詳細資料"),
+                                &row.body,
+                            ))
+                        })
+                        .when_some(row.file_path.as_ref(), |details, path| {
+                            details.child(
+                                self.render_timeline_detail(
+                                    locale::text("File", "文件", "檔案"),
+                                    path,
+                                ),
+                            )
+                        }),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_command_execution_card(
+        &self,
+        row: &TimelineRow,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(TimelinePayload::Command(command)) = self.timeline_row_latest_payload(row) else {
+            return self.render_process_activity_line(row, cx);
+        };
+        let has_details = !command.command.trim().is_empty()
+            || command.cwd.is_some()
+            || command.output_summary.is_some()
+            || command.exit_code.is_some();
+        let expanded = has_details && self.timeline_row_expanded(&row.id);
+        let row_id = row.id.clone();
+        let failed = command.status == vibex_core::CommandStatus::Failed;
+        let title = if command.command.trim().is_empty() {
+            locale::text("Command", "命令", "命令").to_string()
+        } else {
+            command.command.clone()
+        };
+        div()
+            .id(format!("command-card:{}", row.id))
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
+            .rounded(px(theme::RADIUS_CARD))
+            .border_1()
+            .border_color(if failed {
+                rgb(theme::ACCENT_RED).opacity(0.46).into()
+            } else {
+                theme::border_default()
+            })
+            .bg(theme::bg_card_dim())
+            .child(
+                div()
+                    .id(format!("command-card-header:{}", row.id))
+                    .w_full()
+                    .min_w_0()
+                    .min_h(px(40.0))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .when(has_details, |header| {
+                        header
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.toggle_timeline_row(row_id.clone(), cx)
+                                }),
+                            )
+                    })
+                    .child(
+                        svg()
+                            .path("icons/file-terminal.svg")
+                            .size(px(theme::ICON_SM))
+                            .flex_shrink_0()
+                            .text_color(if failed {
+                                rgb(theme::ACCENT_RED)
+                            } else {
+                                rgb(theme::ACCENT_BLUE)
+                            }),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(px(theme::FONT_CAPTION))
+                            .text_color(theme::text_primary())
+                            .child(title),
+                    )
+                    .when(has_details, |header| {
+                        header.child(
+                            svg()
+                                .path(if expanded {
+                                    "icons/chevron-down.svg"
+                                } else {
+                                    "icons/chevron-right.svg"
+                                })
+                                .size(px(theme::ICON_SM))
+                                .flex_shrink_0()
+                                .text_color(theme::text_muted()),
+                        )
+                    })
+                    .child(timeline_status_badge(
+                        timeline_row_status_label(row),
+                        timeline_row_color(row),
+                    )),
+            )
+            .when(expanded, |card| {
+                card.child(
+                    div()
+                        .border_t_1()
+                        .border_color(theme::border_subtle())
+                        .p_3()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .when_some(command.cwd.as_ref(), |details, cwd| {
+                            details.child(self.render_timeline_detail(
+                                locale::text("Working directory", "工作目录", "工作目錄"),
+                                cwd,
+                            ))
+                        })
+                        .child(self.render_timeline_detail(
+                            locale::text("Command", "命令", "命令"),
+                            &format!("$ {}", command.command),
+                        ))
+                        .when_some(command.output_summary.as_ref(), |details, output| {
+                            details.child(self.render_timeline_detail(
+                                locale::text("Output", "输出", "輸出"),
+                                output,
+                            ))
+                        })
+                        .when_some(command.exit_code, |details, exit_code| {
+                            details.child(
+                                div()
+                                    .text_size(px(theme::FONT_CAPTION))
+                                    .text_color(if exit_code == 0 {
+                                        rgb(theme::ACCENT_GREEN)
+                                    } else {
+                                        rgb(theme::ACCENT_RED)
+                                    })
+                                    .child(format!(
+                                        "{}: {exit_code}",
+                                        locale::text("Exit code", "退出码", "結束代碼")
+                                    )),
+                            )
+                        }),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_file_operation_card(
+        &self,
+        row: &TimelineRow,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(TimelinePayload::FileOperation(operation)) = self.timeline_row_latest_payload(row)
+        else {
+            return self.render_process_activity_line(row, cx);
+        };
+        let patch = operation.patch.as_ref().map(|patch| patch.text.as_str());
+        let has_details = !operation.summary.trim().is_empty() || patch.is_some();
+        let expanded = has_details && self.timeline_row_expanded(&row.id);
+        let row_id = row.id.clone();
+        let title = format!(
+            "{} {}",
+            file_operation_verb(operation.operation),
+            operation.path
+        );
+        div()
+            .id(format!("file-operation-card:{}", row.id))
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
+            .rounded(px(theme::RADIUS_CARD))
+            .border_1()
+            .border_color(theme::border_default())
+            .bg(theme::bg_card_dim())
+            .child(
+                div()
+                    .id(format!("file-operation-card-header:{}", row.id))
+                    .w_full()
+                    .min_w_0()
+                    .min_h(px(40.0))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .when(has_details, |header| {
+                        header
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.toggle_timeline_row(row_id.clone(), cx)
+                                }),
+                            )
+                    })
+                    .child(
+                        svg()
+                            .path("icons/file-code.svg")
+                            .size(px(theme::ICON_SM))
+                            .flex_shrink_0()
+                            .text_color(rgb(theme::ACCENT_BLUE)),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(px(theme::FONT_CAPTION))
+                            .text_color(theme::text_primary())
+                            .child(title),
+                    )
+                    .when(has_details, |header| {
+                        header.child(
+                            svg()
+                                .path(if expanded {
+                                    "icons/chevron-down.svg"
+                                } else {
+                                    "icons/chevron-right.svg"
+                                })
+                                .size(px(theme::ICON_SM))
+                                .flex_shrink_0()
+                                .text_color(theme::text_muted()),
+                        )
+                    }),
+            )
+            .when(expanded, |card| {
+                card.child(
+                    div()
+                        .border_t_1()
+                        .border_color(theme::border_subtle())
+                        .p_3()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .when(!operation.summary.trim().is_empty(), |details| {
+                            details.child(self.render_timeline_detail(
+                                locale::text("Summary", "摘要", "摘要"),
+                                &operation.summary,
+                            ))
+                        })
+                        .when_some(patch, |details, patch| {
+                            details.child(self.render_timeline_detail(
+                                locale::text("Changes", "变更", "變更"),
+                                patch,
+                            ))
+                        }),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_image_generation_card(
+        &self,
+        row: &TimelineRow,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(TimelinePayload::ImageGeneration(image)) = self.timeline_row_latest_payload(row)
+        else {
+            return self.render_process_activity_line(row, cx);
+        };
+        let has_details = !image.summary.trim().is_empty() || image.image_reference.is_some();
+        let expanded = has_details && self.timeline_row_expanded(&row.id);
+        let row_id = row.id.clone();
+        let failed = image.status == vibex_core::ToolCallStatus::Failed;
+        let title = if image.summary.trim().is_empty() {
+            locale::text("Image generation", "图片生成", "圖片生成").to_string()
+        } else {
+            image.summary.clone()
+        };
+        div()
+            .id(format!("image-generation-card:{}", row.id))
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
+            .rounded(px(theme::RADIUS_CARD))
+            .border_1()
+            .border_color(if failed {
+                rgb(theme::ACCENT_RED).opacity(0.46).into()
+            } else {
+                theme::border_default()
+            })
+            .bg(theme::bg_card_dim())
+            .child(
+                div()
+                    .id(format!("image-generation-card-header:{}", row.id))
+                    .w_full()
+                    .min_w_0()
+                    .min_h(px(40.0))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .when(has_details, |header| {
+                        header
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.toggle_timeline_row(row_id.clone(), cx)
+                                }),
+                            )
+                    })
+                    .child(
+                        svg()
+                            .path("icons/image.svg")
+                            .size(px(theme::ICON_SM))
+                            .flex_shrink_0()
+                            .text_color(if failed {
+                                rgb(theme::ACCENT_RED)
+                            } else {
+                                rgb(theme::ACCENT_PURPLE)
+                            }),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(px(theme::FONT_CAPTION))
+                            .text_color(theme::text_primary())
+                            .child(title),
+                    )
+                    .when(has_details, |header| {
+                        header.child(
+                            svg()
+                                .path(if expanded {
+                                    "icons/chevron-down.svg"
+                                } else {
+                                    "icons/chevron-right.svg"
+                                })
+                                .size(px(theme::ICON_SM))
+                                .flex_shrink_0()
+                                .text_color(theme::text_muted()),
+                        )
+                    })
+                    .child(timeline_status_badge(
+                        timeline_row_status_label(row),
+                        timeline_row_color(row),
+                    )),
+            )
+            .when(expanded, |card| {
+                card.child(
+                    div()
+                        .border_t_1()
+                        .border_color(theme::border_subtle())
+                        .p_3()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .when(!image.summary.trim().is_empty(), |details| {
+                            details.child(self.render_timeline_detail(
+                                locale::text("Summary", "摘要", "摘要"),
+                                &image.summary,
+                            ))
+                        })
+                        .when_some(image.image_reference.as_ref(), |details, reference| {
+                            details.child(self.render_timeline_detail(
+                                locale::text("Image reference", "图片引用", "圖片參照"),
+                                reference,
+                            ))
+                        }),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_permission_request_card(
+        &self,
+        row: &TimelineRow,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(TimelinePayload::PermissionRequest(request)) =
+            self.timeline_row_latest_payload(row)
+        else {
+            return self.render_fallback_process_row(row);
+        };
+        if request.status != vibex_core::PermissionRequestStatus::Pending {
+            return self.render_fallback_process_row(row);
+        }
+        let approval = self
+            .controller
+            .as_ref()
+            .and_then(|controller| {
+                controller
+                    .state
+                    .approval_surfaces(ShellKind::Compact)
+                    .into_iter()
+                    .find(|approval| approval.request_id == request.id)
+            })
+            .unwrap_or_else(|| {
+                vibex_ui::ApprovalSurfaceModel::from_request(request, ShellKind::Compact)
+            });
+        self.render_approval(&approval, cx).into_any_element()
+    }
+
+    fn render_elicitation_request_card(
+        &self,
+        row: &TimelineRow,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(TimelinePayload::ElicitationRequest(request)) =
+            self.timeline_row_latest_payload(row)
+        else {
+            return self.render_fallback_process_row(row);
+        };
+        if request.status != vibex_core::ElicitationRequestStatus::Pending {
+            return self.render_fallback_process_row(row);
+        }
+        let surface = ElicitationSurfaceModel::from_request(request, ShellKind::Compact);
+        self.render_elicitation(&surface, cx).into_any_element()
+    }
+
+    fn render_error_row(
+        &self,
+        row: &TimelineRow,
+        conversation_conclusion: bool,
+    ) -> gpui::AnyElement {
+        let recoverable = self.timeline_row_latest_payload(row).is_some_and(
+            |payload| matches!(payload, TimelinePayload::Error(error) if error.recoverable),
+        );
+        let color = if recoverable {
+            rgb(theme::ACCENT_YELLOW)
+        } else {
+            rgb(theme::ACCENT_RED)
+        };
+        let message = if row.body.trim().is_empty() {
+            row.title.clone()
+        } else {
+            row.body.clone()
+        };
+        if conversation_conclusion {
+            return div()
+                .id(row.id.clone())
+                .w_full()
+                .min_w_0()
+                .flex()
+                .items_start()
+                .gap_2()
+                .text_size(px(theme::FONT_BODY))
+                .line_height(px(18.0))
+                .text_color(color)
+                .child(
+                    svg()
+                        .path("icons/triangle-alert.svg")
+                        .size(px(theme::ICON_SM))
+                        .flex_shrink_0()
+                        .text_color(color),
+                )
+                .child(div().min_w_0().flex_1().whitespace_normal().child(message))
+                .into_any_element();
+        }
+        div()
+            .id(row.id.clone())
+            .w_full()
+            .min_w_0()
+            .rounded(px(theme::RADIUS_CARD))
+            .border_1()
+            .border_color(color.opacity(0.42))
+            .bg(color.opacity(0.12))
+            .px_3()
+            .py_2()
+            .flex()
+            .items_start()
+            .gap_2()
+            .text_size(px(theme::FONT_CAPTION))
+            .line_height(px(17.0))
+            .text_color(color)
+            .child(
+                svg()
+                    .path("icons/triangle-alert.svg")
+                    .size(px(theme::ICON_SM))
+                    .flex_shrink_0()
+                    .text_color(color),
+            )
+            .child(div().min_w_0().flex_1().whitespace_normal().child(message))
+            .into_any_element()
+    }
+
+    fn render_fallback_process_row(&self, row: &TimelineRow) -> gpui::AnyElement {
+        let summary = if row.body.trim().is_empty() {
+            process_title(row)
+        } else {
+            row.body.clone()
+        };
+        div()
+            .id(format!("notice:{}", row.id))
+            .w_full()
+            .min_w_0()
+            .min_h(px(28.0))
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_size(px(theme::FONT_CAPTION))
+            .text_color(theme::text_muted())
+            .child(
+                svg()
+                    .path(timeline_row_icon_path(row.kind))
+                    .size(px(theme::ICON_SM))
+                    .flex_shrink_0()
+                    .text_color(theme::text_muted()),
             )
             .child(
                 div()
                     .min_w_0()
                     .flex_1()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .flex()
-                            .items_start()
-                            .justify_between()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .text_size(px(theme::FONT_CAPTION))
-                                    .font_weight(if row.streaming || row.failed {
-                                        FontWeight::SEMIBOLD
-                                    } else {
-                                        FontWeight::NORMAL
-                                    })
-                                    .text_color(if row.failed {
-                                        rgb(theme::ACCENT_RED)
-                                    } else {
-                                        rgb(theme::TEXT_SECONDARY)
-                                    })
-                                    .child(process_title(row)),
-                            )
-                            .when(show_status, |line| {
-                                line.child(timeline_status_badge(status_label, color))
-                            }),
-                    )
-                    .when(!row.body.trim().is_empty(), |content| {
-                        content.child(
-                            div()
-                                .w_full()
-                                .text_size(px(theme::FONT_CAPTION))
-                                .line_height(px(16.0))
-                                .text_color(theme::text_muted())
-                                .whitespace_normal()
-                                .child(row.body.clone()),
-                        )
-                    })
-                    .when_some(row.file_path.clone(), |content, path| {
-                        content.child(
-                            div()
-                                .w_full()
-                                .min_w_0()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .text_size(px(theme::FONT_MICRO))
-                                .text_color(theme::text_muted())
-                                .child(
-                                    svg()
-                                        .path("icons/file-text.svg")
-                                        .size(px(theme::FONT_BODY))
-                                        .flex_shrink_0()
-                                        .text_color(rgb(color)),
-                                )
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .whitespace_nowrap()
-                                        .child(path),
-                                ),
-                        )
-                    }),
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .child(summary),
             )
+            .into_any_element()
+    }
+
+    fn render_timeline_detail(&self, label: &str, value: &str) -> gpui::AnyElement {
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_size(px(theme::FONT_MICRO))
+                    .text_color(theme::text_muted())
+                    .child(label.to_string()),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .bg(theme::bg_primary())
+                    .px_2()
+                    .py_1()
+                    .text_size(px(theme::FONT_MICRO))
+                    .line_height(px(16.0))
+                    .text_color(theme::text_secondary())
+                    .whitespace_normal()
+                    .child(bounded_timeline_detail(value)),
+            )
+            .into_any_element()
+    }
+
+    fn render_turn_file_changes_card(
+        &self,
+        turn: &TimelineConversationTurn,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if !turn.complete {
+            return None;
+        }
+        let mut seen_paths = BTreeSet::new();
+        let mut changed_rows = Vec::new();
+        for row in turn.process_rows.iter().rev() {
+            if row.kind != TimelineRowKind::FileOperation {
+                continue;
+            }
+            let changed = match self.timeline_row_latest_payload(row) {
+                Some(TimelinePayload::FileOperation(operation)) => {
+                    operation.operation != vibex_core::FileOperationKind::Read
+                }
+                _ => true,
+            };
+            if !changed {
+                continue;
+            }
+            let path = row.file_path.as_deref().unwrap_or(row.title.as_str());
+            if seen_paths.insert(path.to_string()) {
+                changed_rows.push(row);
+            }
+        }
+        if changed_rows.is_empty() {
+            return None;
+        }
+        changed_rows.reverse();
+        let expansion_id = format!("turn-file-changes:{}", turn.id);
+        let expanded = self.timeline_row_expanded(&expansion_id);
+        let visible_count = if expanded {
+            changed_rows.len()
+        } else {
+            changed_rows.len().min(3)
+        };
+        let hidden_count = changed_rows.len().saturating_sub(visible_count);
+        let expansion_id_for_toggle = expansion_id.clone();
+        Some(
+            div()
+                .id(expansion_id)
+                .w_full()
+                .min_w_0()
+                .overflow_hidden()
+                .rounded(px(theme::RADIUS_CARD))
+                .border_1()
+                .border_color(theme::border_default())
+                .bg(theme::bg_card_dim())
+                .child(
+                    div()
+                        .id(format!("turn-file-changes-header:{}", turn.id))
+                        .w_full()
+                        .min_h(px(40.0))
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .when(changed_rows.len() > 3, |header| {
+                            header
+                                .cursor_pointer()
+                                .active(|style| style.bg(theme::row_pressed_bg()))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.toggle_timeline_row(
+                                            expansion_id_for_toggle.clone(),
+                                            cx,
+                                        )
+                                    }),
+                                )
+                        })
+                        .child(
+                            svg()
+                                .path("icons/file-code.svg")
+                                .size(px(theme::ICON_SM))
+                                .flex_shrink_0()
+                                .text_color(rgb(theme::ACCENT_BLUE)),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .text_size(px(theme::FONT_CAPTION))
+                                .text_color(theme::text_secondary())
+                                .child(format!(
+                                    "{} {}",
+                                    changed_rows.len(),
+                                    locale::text("files changed", "个文件变更", "個檔案變更")
+                                )),
+                        )
+                        .when(changed_rows.len() > 3, |header| {
+                            header.child(
+                                svg()
+                                    .path(if expanded {
+                                        "icons/chevron-down.svg"
+                                    } else {
+                                        "icons/chevron-right.svg"
+                                    })
+                                    .size(px(theme::ICON_SM))
+                                    .flex_shrink_0()
+                                    .text_color(theme::text_muted()),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .border_t_1()
+                        .border_color(theme::border_subtle())
+                        .flex()
+                        .flex_col()
+                        .children(
+                            changed_rows
+                                .iter()
+                                .take(visible_count)
+                                .map(|row| self.render_turn_file_change_row(row)),
+                        )
+                        .when(hidden_count > 0, |rows| {
+                            rows.child(
+                                div()
+                                    .px_3()
+                                    .py_2()
+                                    .text_size(px(theme::FONT_MICRO))
+                                    .text_color(theme::text_muted())
+                                    .child(format!(
+                                        "{} {}",
+                                        locale::text("Show", "显示", "顯示"),
+                                        hidden_count
+                                    )),
+                            )
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_turn_file_change_row(&self, row: &TimelineRow) -> gpui::AnyElement {
+        let title = self
+            .timeline_row_latest_payload(row)
+            .and_then(|payload| match payload {
+                TimelinePayload::FileOperation(operation) => Some(format!(
+                    "{} {}",
+                    file_operation_verb(operation.operation),
+                    operation.path
+                )),
+                _ => None,
+            })
+            .unwrap_or_else(|| process_title(row));
+        div()
+            .w_full()
+            .min_w_0()
+            .min_h(px(34.0))
+            .px_3()
+            .flex()
+            .items_center()
+            .gap_2()
+            .border_b_1()
+            .border_color(theme::border_subtle())
+            .child(
+                svg()
+                    .path("icons/file-code.svg")
+                    .size(px(theme::ICON_SM))
+                    .flex_shrink_0()
+                    .text_color(rgb(theme::ACCENT_BLUE)),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_size(px(theme::FONT_MICRO))
+                    .text_color(theme::text_secondary())
+                    .child(title),
+            )
+            .into_any_element()
     }
 
     fn render_approval(
@@ -6738,9 +7742,9 @@ impl MobileApp {
             locale::common("Always allow"),
         );
         div()
+            .w_full()
+            .min_w_0()
             .flex_shrink_0()
-            .mx_3()
-            .mb_2()
             .rounded(px(theme::RADIUS_CARD))
             .border_1()
             .border_color(rgb(theme::ACCENT_YELLOW))
@@ -7126,9 +8130,9 @@ impl MobileApp {
         let accept_id = request.id.clone();
         let decline_id = request.id.clone();
         div()
+            .w_full()
+            .min_w_0()
             .flex_shrink_0()
-            .mx_3()
-            .mb_2()
             .max_h(px(430.0))
             .rounded(px(theme::RADIUS_CARD))
             .border_1()
@@ -10927,6 +11931,55 @@ fn process_title(row: &TimelineRow) -> String {
     .to_string()
 }
 
+fn timeline_activity_summary(row: &TimelineRow) -> String {
+    if !row.title.trim().is_empty() {
+        return row.title.clone();
+    }
+    if !row.body.trim().is_empty() {
+        return timeline_row_preview(&row.body);
+    }
+    process_title(row)
+}
+
+fn timeline_row_preview(body: &str) -> String {
+    const MAX_CHARS: usize = 96;
+
+    let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= MAX_CHARS {
+        return collapsed;
+    }
+    let mut preview = collapsed
+        .chars()
+        .take(MAX_CHARS.saturating_sub(3))
+        .collect::<String>();
+    preview.push_str("...");
+    preview
+}
+
+fn bounded_timeline_detail(value: &str) -> String {
+    const MAX_CHARS: usize = 2_400;
+
+    if value.chars().count() <= MAX_CHARS {
+        return value.to_string();
+    }
+    let mut bounded = value
+        .chars()
+        .take(MAX_CHARS.saturating_sub(3))
+        .collect::<String>();
+    bounded.push_str("...");
+    bounded
+}
+
+fn file_operation_verb(operation: vibex_core::FileOperationKind) -> &'static str {
+    match operation {
+        vibex_core::FileOperationKind::Read => locale::text("Reading", "读取", "讀取"),
+        vibex_core::FileOperationKind::Write => locale::text("Writing", "写入", "寫入"),
+        vibex_core::FileOperationKind::Edit => locale::text("Editing", "编辑", "編輯"),
+        vibex_core::FileOperationKind::Delete => locale::text("Deleting", "删除", "刪除"),
+        vibex_core::FileOperationKind::Move => locale::text("Moving", "移动", "移動"),
+    }
+}
+
 fn format_compact_duration(started_at_ms: i64, ended_at_ms: Option<i64>) -> String {
     let duration_ms = ended_at_ms
         .unwrap_or_else(unix_timestamp_ms)
@@ -10942,30 +11995,6 @@ fn format_compact_duration(started_at_ms: i64, ended_at_ms: Option<i64>) -> Stri
         format!("{minutes}m {seconds}s")
     } else {
         format!("{seconds}s")
-    }
-}
-
-fn timeline_turn_status_label(turn: &TimelineConversationTurn) -> String {
-    if turn.failed {
-        locale::text("Error", "错误", "錯誤").to_string()
-    } else if turn.pending_permission {
-        locale::text("Waiting", "等待中", "等待中").to_string()
-    } else if !turn.complete {
-        locale::text("Working", "处理中", "處理中").to_string()
-    } else {
-        locale::text("Done", "完成", "完成").to_string()
-    }
-}
-
-fn timeline_turn_status_color(turn: &TimelineConversationTurn) -> u32 {
-    if turn.failed {
-        theme::ACCENT_RED
-    } else if turn.pending_permission {
-        theme::ACCENT_YELLOW
-    } else if !turn.complete {
-        theme::ACCENT_BLUE
-    } else {
-        theme::ACCENT_GREEN
     }
 }
 

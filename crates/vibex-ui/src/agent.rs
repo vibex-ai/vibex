@@ -17,7 +17,8 @@ use vibex_core::{
     VibexError, VibexResult, VibexSessionId,
 };
 use vibex_desktop_model::{
-    AgentSidebarRow, SidebarState, TimelineConversationTurn, TimelineModel, project_sidebar_rows,
+    AgentSidebarRow, ReasoningDisplayMode, SidebarState, TimelineConversationTurn, TimelineModel,
+    project_sidebar_rows,
 };
 
 use crate::{
@@ -314,14 +315,27 @@ impl AgentWorkflowState {
     }
 
     pub fn conversation_turns(&self) -> Vec<TimelineConversationTurn> {
+        self.conversation_turns_with_reasoning_mode(ReasoningDisplayMode::LatestAtBottom)
+    }
+
+    /// Project the authoritative timeline using an explicit presentation mode
+    /// so clients rendering the full timeline do not fall back to the legacy
+    /// bottom-only reasoning adapter.
+    pub fn conversation_turns_with_reasoning_mode(
+        &self,
+        reasoning_display_mode: ReasoningDisplayMode,
+    ) -> Vec<TimelineConversationTurn> {
         let session_state = self
             .active_session
             .value
             .as_ref()
             .map(|session| session.state);
         let pending_turn = !self.pending_mutations.is_empty();
-        self.timeline
-            .conversation_turns(session_state, pending_turn)
+        self.timeline.conversation_turns_with_reasoning_mode(
+            session_state,
+            pending_turn,
+            reasoning_display_mode,
+        )
     }
 
     pub fn approval_surfaces(&self, shell: ShellKind) -> Vec<ApprovalSurfaceModel> {
@@ -1280,9 +1294,9 @@ mod tests {
         ElicitationAnswerValue, ElicitationField, ElicitationFieldKind, ElicitationOption,
         ElicitationRequest, ElicitationRequestStatus, ElicitationResolutionAction,
         PermissionActionDetail, PermissionRequest, PermissionResolution, PermissionResponseKind,
-        PermissionResponseOption, PermissionRiskCategory, ProjectId, ProviderProfileId, RequestId,
-        SessionRuntimeSelection, TimelineItemId, TimelineRedactionState, TimelineSource,
-        UserMessagePayload, WorkspaceId, WorkspaceMode,
+        PermissionResponseOption, PermissionRiskCategory, ProjectId, ProviderProfileId,
+        ReasoningPayload, RequestId, SessionRuntimeSelection, TimelineItemId,
+        TimelineRedactionState, TimelineSource, UserMessagePayload, WorkspaceId, WorkspaceMode,
     };
 
     #[derive(Clone)]
@@ -1551,6 +1565,54 @@ mod tests {
         assert!(controller.apply_session_snapshot(&current, Ok(snapshot)));
         assert_eq!(controller.state.timeline.items.len(), 2);
         assert_eq!(controller.state.conversation_turns().len(), 1);
+    }
+
+    #[test]
+    fn timeline_reasoning_mode_preserves_streaming_reasoning_for_compact_clients() {
+        let mut running_session = session();
+        running_session.state = AgentSessionState::Running;
+        let mut state = AgentWorkflowState::default();
+        state.active_session.resolve(running_session.clone());
+        state.timeline.replace_authoritative(
+            running_session.id.clone(),
+            [
+                timeline_item(
+                    &running_session.id,
+                    1,
+                    TimelinePayload::UserMessage(UserMessagePayload {
+                        text: "Inspect the change".into(),
+                        attachments: Vec::new(),
+                    }),
+                ),
+                timeline_item(
+                    &running_session.id,
+                    2,
+                    TimelinePayload::Reasoning(ReasoningPayload {
+                        text: "Checking the timeline projection".into(),
+                        is_final: false,
+                    }),
+                ),
+            ],
+        );
+
+        let timeline_turn = state
+            .conversation_turns_with_reasoning_mode(ReasoningDisplayMode::Timeline)
+            .pop()
+            .expect("running session should produce a conversation turn");
+        assert!(timeline_turn.process_rows.iter().any(|row| row.kind
+            == vibex_desktop_model::TimelineRowKind::Reasoning
+            && row.streaming));
+
+        let compact_turn = state
+            .conversation_turns()
+            .pop()
+            .expect("running session should produce a compact conversation turn");
+        assert!(
+            compact_turn
+                .process_rows
+                .iter()
+                .all(|row| row.kind != vibex_desktop_model::TimelineRowKind::Reasoning)
+        );
     }
 
     #[test]
