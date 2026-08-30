@@ -3958,6 +3958,9 @@ impl MobileApp {
         if !self.expanded_process.insert(id.clone()) {
             self.expanded_process.remove(&id);
         }
+        // Expanded process rows change a turn's measured height. Re-measure the
+        // virtual list immediately so the following turns keep their anchors.
+        self.timeline_list.remeasure();
         cx.notify();
     }
 
@@ -6238,7 +6241,36 @@ impl MobileApp {
     ) -> impl IntoElement {
         let expanded = self.expanded_process.contains(&turn.id);
         let turn_id = turn.id.clone();
+        let agent_identity = turn
+            .runtime_attribution
+            .as_deref()
+            .and_then(|attribution| attribution.split(" · ").next())
+            .filter(|label| !label.is_empty())
+            .unwrap_or("Vibex")
+            .to_string();
+        let agent_icon = agent_icon_path(&agent_identity);
+        let runtime_label = turn.runtime_attribution.as_deref().and_then(|attribution| {
+            let label = attribution
+                .split(" · ")
+                .skip(1)
+                .collect::<Vec<_>>()
+                .join(" · ");
+            (!label.is_empty()).then_some(label)
+        });
+        let duration = format_compact_duration(
+            turn.started_at_ms,
+            turn.complete.then_some(turn.ended_at_ms).flatten(),
+        );
+        let worked_label = format!(
+            "{} {duration}",
+            locale::text("Worked for", "工作了", "工作了")
+        );
+        let status_label = timeline_turn_status_label(turn);
+        let status_color = timeline_turn_status_color(turn);
+        let has_response =
+            !turn.process_rows.is_empty() || turn.conclusion_row.is_some() || !turn.complete;
         div()
+            .id(format!("timeline-turn:{}", turn.id))
             .w_full()
             .flex()
             .flex_col()
@@ -6247,6 +6279,7 @@ impl MobileApp {
                 container.child(
                     div()
                         .ml_auto()
+                        .w(gpui::relative(0.78))
                         .max_w(px(520.0))
                         .rounded(px(theme::RADIUS_CARD))
                         .bg(theme::bg_card())
@@ -6261,6 +6294,69 @@ impl MobileApp {
                         .child(row.body.clone()),
                 )
             })
+            .when(has_response, |container| {
+                container.child(
+                    div().w_full().min_w_0().flex().flex_col().gap_3().child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .border_b_1()
+                            .border_color(theme::border_subtle())
+                            .pb_2()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                svg()
+                                                    .path(agent_icon)
+                                                    .size(px(theme::ICON_SM))
+                                                    .flex_shrink_0()
+                                                    .text_color(theme::text_secondary()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .min_w_0()
+                                                    .overflow_hidden()
+                                                    .text_ellipsis()
+                                                    .whitespace_nowrap()
+                                                    .text_size(px(theme::FONT_CAPTION))
+                                                    .text_color(theme::text_muted())
+                                                    .child(worked_label.clone()),
+                                            ),
+                                    )
+                                    .child(timeline_status_badge(status_label, status_color)),
+                            )
+                            .when_some(runtime_label.clone(), |header, runtime| {
+                                header.child(
+                                    div()
+                                        .ml(px(24.0))
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .text_size(px(theme::FONT_MICRO))
+                                        .text_color(theme::text_muted())
+                                        .child(runtime),
+                                )
+                            }),
+                    ),
+                )
+            })
             .when(!turn.process_rows.is_empty(), |container| {
                 container.child(
                     div()
@@ -6270,41 +6366,75 @@ impl MobileApp {
                         .bg(theme::bg_card_dim())
                         .border_1()
                         .border_color(theme::border_subtle())
-                        .cursor_pointer()
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| {
-                                this.toggle_process(turn_id.clone(), cx)
-                            }),
-                        )
                         .child(
                             div()
-                                .h(px(36.0))
+                                .id(format!("process-toggle:{}", turn.id))
+                                .min_h(px(40.0))
                                 .px_3()
                                 .flex()
                                 .items_center()
                                 .justify_between()
-                                .child(
-                                    div()
-                                        .text_size(px(theme::FONT_CAPTION))
-                                        .text_color(theme::text_muted())
-                                        .child(turn.live_status.clone().unwrap_or_else(|| {
-                                            locale::common("Process").to_string()
-                                        })),
+                                .gap_2()
+                                .cursor_pointer()
+                                .active(|style| style.bg(theme::row_pressed_bg()))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.toggle_process(turn_id.clone(), cx)
+                                    }),
                                 )
                                 .child(
                                     div()
-                                        .text_size(px(theme::FONT_MICRO))
-                                        .text_color(theme::text_muted())
-                                        .child(if expanded {
-                                            locale::common("Hide").to_string()
-                                        } else {
-                                            format!(
-                                                "{} {}",
-                                                turn.process_rows.len(),
-                                                locale::text("items", "项", "項")
-                                            )
-                                        }),
+                                        .min_w_0()
+                                        .flex_1()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            svg()
+                                                .path("icons/activity.svg")
+                                                .size(px(theme::ICON_SM))
+                                                .text_color(theme::text_muted()),
+                                        )
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .overflow_hidden()
+                                                .text_ellipsis()
+                                                .whitespace_nowrap()
+                                                .text_size(px(theme::FONT_CAPTION))
+                                                .text_color(theme::text_secondary())
+                                                .child(turn.live_status.clone().unwrap_or_else(
+                                                    || locale::common("Process").to_string(),
+                                                )),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .text_size(px(theme::FONT_MICRO))
+                                                .text_color(theme::text_muted())
+                                                .child(format!(
+                                                    "{} {}",
+                                                    turn.process_rows.len(),
+                                                    locale::text("items", "项", "項")
+                                                )),
+                                        )
+                                        .child(
+                                            svg()
+                                                .path(if expanded {
+                                                    "icons/chevron-down.svg"
+                                                } else {
+                                                    "icons/chevron-right.svg"
+                                                })
+                                                .size(px(theme::ICON_SM))
+                                                .text_color(theme::text_muted()),
+                                        ),
                                 ),
                         )
                         .when(expanded, |process| {
@@ -6312,7 +6442,10 @@ impl MobileApp {
                                 div()
                                     .border_t_1()
                                     .border_color(theme::border_subtle())
-                                    .p_3()
+                                    .px_3()
+                                    .py_2()
+                                    .ml_3()
+                                    .border_l_1()
                                     .flex()
                                     .flex_col()
                                     .gap_2()
@@ -6326,11 +6459,86 @@ impl MobileApp {
                 )
             })
             .when_some(turn.conclusion_row.as_ref(), |container, row| {
+                let answer_failed = turn.failed || row.failed || row.kind == TimelineRowKind::Error;
                 container.child(
                     div()
                         .w_full()
                         .min_w_0()
-                        .child(markdown::render(&row.body, row.last_sequence.max(0) as u64)),
+                        .when(answer_failed, |answer| {
+                            answer
+                                .rounded(px(theme::RADIUS_CARD))
+                                .border_1()
+                                .border_color(rgb(theme::ACCENT_RED))
+                                .bg(theme::bg_card_dim())
+                                .p_3()
+                        })
+                        .child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .flex()
+                                .items_start()
+                                .gap_2()
+                                .when(answer_failed, |content| {
+                                    content.child(
+                                        svg()
+                                            .path("icons/triangle-alert.svg")
+                                            .size(px(theme::ICON_SM))
+                                            .flex_shrink_0()
+                                            .text_color(rgb(theme::ACCENT_RED)),
+                                    )
+                                })
+                                .child(div().min_w_0().flex_1().child(markdown::render(
+                                    &row.body,
+                                    row.last_sequence.max(0) as u64,
+                                ))),
+                        )
+                        .when(
+                            turn.complete
+                                && row.kind == TimelineRowKind::AgentMessage
+                                && !row.body.trim().is_empty(),
+                            |answer| {
+                                answer.child(
+                                    div()
+                                        .w_full()
+                                        .min_w_0()
+                                        .mt_2()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .text_size(px(theme::FONT_MICRO))
+                                        .text_color(theme::text_muted())
+                                        .child(
+                                            svg()
+                                                .path(agent_icon)
+                                                .size(px(theme::ICON_SM))
+                                                .flex_shrink_0()
+                                                .text_color(theme::text_muted()),
+                                        )
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .flex_1()
+                                                .overflow_hidden()
+                                                .text_ellipsis()
+                                                .whitespace_nowrap()
+                                                .child(
+                                                    runtime_label
+                                                        .clone()
+                                                        .unwrap_or_else(|| agent_identity.clone()),
+                                                ),
+                                        )
+                                        .child(
+                                            svg()
+                                                .path("icons/clock.svg")
+                                                .size(px(theme::ICON_SM))
+                                                .flex_shrink_0()
+                                                .text_color(theme::text_muted()),
+                                        )
+                                        .child(duration.clone()),
+                                )
+                            },
+                        ),
                 )
             })
             .when(
@@ -6338,8 +6546,38 @@ impl MobileApp {
                 |container| {
                     container.child(
                         div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .gap_2()
                             .text_size(px(theme::FONT_CAPTION))
-                            .text_color(theme::text_muted())
+                            .text_color(if turn.pending_permission {
+                                rgb(theme::ACCENT_YELLOW)
+                            } else {
+                                rgb(theme::TEXT_MUTED)
+                            })
+                            .child(
+                                svg()
+                                    .path("icons/loader-circle.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .flex_shrink_0()
+                                    .text_color(if turn.pending_permission {
+                                        rgb(theme::ACCENT_YELLOW)
+                                    } else {
+                                        rgb(theme::TEXT_MUTED)
+                                    })
+                                    .with_animation(
+                                        format!("timeline-progress:{}", turn.id),
+                                        Animation::new(Duration::from_millis(900))
+                                            .repeat()
+                                            .with_easing(ease_in_out),
+                                        |this, delta| {
+                                            this.with_transformation(Transformation::rotate(
+                                                percentage(delta),
+                                            ))
+                                        },
+                                    ),
+                            )
                             .child(
                                 turn.live_status
                                     .clone()
@@ -6348,48 +6586,108 @@ impl MobileApp {
                     )
                 },
             )
+            .into_any_element()
     }
 
     fn render_process_row(&self, row: &TimelineRow) -> impl IntoElement {
-        let color = if row.failed {
-            theme::ACCENT_RED
-        } else if row.streaming {
-            theme::ACCENT_GREEN
-        } else {
-            theme::TEXT_MUTED
-        };
+        let color = timeline_row_color(row);
+        let icon_path = timeline_row_icon_path(row.kind);
+        let status_label = timeline_row_status_label(row);
+        let show_status = row.failed || row.streaming || row.pending_permission;
         div()
+            .id(format!("process-row:{}", row.id))
+            .w_full()
             .flex()
             .items_start()
             .gap_2()
             .child(
                 div()
-                    .mt(px(6.0))
-                    .size(px(theme::ICON_STATUS))
+                    .size(px(24.0))
+                    .flex_shrink_0()
                     .rounded_full()
-                    .bg(rgb(color)),
+                    .bg(theme::bg_card())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        svg()
+                            .path(icon_path)
+                            .size(px(theme::FONT_BODY))
+                            .text_color(rgb(color)),
+                    ),
             )
             .child(
                 div()
-                    .flex_1()
                     .min_w_0()
+                    .flex_1()
                     .flex()
                     .flex_col()
                     .gap_1()
                     .child(
                         div()
-                            .text_size(px(theme::FONT_CAPTION))
-                            .text_color(theme::text_secondary())
-                            .child(process_title(row)),
+                            .w_full()
+                            .min_w_0()
+                            .flex()
+                            .items_start()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .text_size(px(theme::FONT_CAPTION))
+                                    .font_weight(if row.streaming || row.failed {
+                                        FontWeight::SEMIBOLD
+                                    } else {
+                                        FontWeight::NORMAL
+                                    })
+                                    .text_color(if row.failed {
+                                        rgb(theme::ACCENT_RED)
+                                    } else {
+                                        rgb(theme::TEXT_SECONDARY)
+                                    })
+                                    .child(process_title(row)),
+                            )
+                            .when(show_status, |line| {
+                                line.child(timeline_status_badge(status_label, color))
+                            }),
                     )
                     .when(!row.body.trim().is_empty(), |content| {
                         content.child(
                             div()
+                                .w_full()
                                 .text_size(px(theme::FONT_CAPTION))
                                 .line_height(px(16.0))
                                 .text_color(theme::text_muted())
                                 .whitespace_normal()
                                 .child(row.body.clone()),
+                        )
+                    })
+                    .when_some(row.file_path.clone(), |content, path| {
+                        content.child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .text_size(px(theme::FONT_MICRO))
+                                .text_color(theme::text_muted())
+                                .child(
+                                    svg()
+                                        .path("icons/file-text.svg")
+                                        .size(px(theme::FONT_BODY))
+                                        .flex_shrink_0()
+                                        .text_color(rgb(color)),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .child(path),
+                                ),
                         )
                     }),
             )
@@ -10629,6 +10927,118 @@ fn process_title(row: &TimelineRow) -> String {
     .to_string()
 }
 
+fn format_compact_duration(started_at_ms: i64, ended_at_ms: Option<i64>) -> String {
+    let duration_ms = ended_at_ms
+        .unwrap_or_else(unix_timestamp_ms)
+        .saturating_sub(started_at_ms)
+        .max(1_000);
+    let total_seconds = (duration_ms / 1_000).max(1);
+    let hours = total_seconds / 3_600;
+    let minutes = (total_seconds % 3_600) / 60;
+    let seconds = total_seconds % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn timeline_turn_status_label(turn: &TimelineConversationTurn) -> String {
+    if turn.failed {
+        locale::text("Error", "错误", "錯誤").to_string()
+    } else if turn.pending_permission {
+        locale::text("Waiting", "等待中", "等待中").to_string()
+    } else if !turn.complete {
+        locale::text("Working", "处理中", "處理中").to_string()
+    } else {
+        locale::text("Done", "完成", "完成").to_string()
+    }
+}
+
+fn timeline_turn_status_color(turn: &TimelineConversationTurn) -> u32 {
+    if turn.failed {
+        theme::ACCENT_RED
+    } else if turn.pending_permission {
+        theme::ACCENT_YELLOW
+    } else if !turn.complete {
+        theme::ACCENT_BLUE
+    } else {
+        theme::ACCENT_GREEN
+    }
+}
+
+fn timeline_row_status_label(row: &TimelineRow) -> String {
+    if row.failed {
+        locale::text("Failed", "失败", "失敗").to_string()
+    } else if row.pending_permission {
+        locale::text("Waiting", "等待中", "等待中").to_string()
+    } else if row.streaming {
+        locale::text("Running", "运行中", "執行中").to_string()
+    } else {
+        locale::text("Done", "完成", "完成").to_string()
+    }
+}
+
+fn timeline_row_color(row: &TimelineRow) -> u32 {
+    if row.failed {
+        theme::ACCENT_RED
+    } else if row.pending_permission {
+        theme::ACCENT_YELLOW
+    } else if row.streaming {
+        theme::ACCENT_GREEN
+    } else {
+        match row.kind {
+            TimelineRowKind::Reasoning | TimelineRowKind::Plan => theme::ACCENT_PURPLE,
+            TimelineRowKind::Command | TimelineRowKind::FileOperation => theme::ACCENT_BLUE,
+            TimelineRowKind::WebSearch => theme::ACCENT_BLUE,
+            TimelineRowKind::ImageGeneration => theme::ACCENT_PURPLE,
+            TimelineRowKind::GitNotice => theme::ACCENT_YELLOW,
+            TimelineRowKind::Error => theme::ACCENT_RED,
+            _ => theme::TEXT_MUTED,
+        }
+    }
+}
+
+fn timeline_row_icon_path(kind: TimelineRowKind) -> &'static str {
+    match kind {
+        TimelineRowKind::Reasoning => "icons/sparkles.svg",
+        TimelineRowKind::Plan | TimelineRowKind::TodoUpdate => "icons/list-checks.svg",
+        TimelineRowKind::ToolCall => "icons/zap.svg",
+        TimelineRowKind::Command => "icons/file-terminal.svg",
+        TimelineRowKind::FileOperation => "icons/file-code.svg",
+        TimelineRowKind::WebSearch => "icons/search.svg",
+        TimelineRowKind::Collaboration => "icons/message-square.svg",
+        TimelineRowKind::ImageGeneration => "icons/image.svg",
+        TimelineRowKind::GitNotice => "icons/git-branch.svg",
+        TimelineRowKind::PermissionRequest | TimelineRowKind::Error => "icons/triangle-alert.svg",
+        TimelineRowKind::Retry => "icons/rotate-ccw.svg",
+        TimelineRowKind::SystemNotice
+        | TimelineRowKind::PermissionResolution
+        | TimelineRowKind::ElicitationRequest
+        | TimelineRowKind::ElicitationResolution => "icons/activity.svg",
+        TimelineRowKind::UserMessage | TimelineRowKind::AgentMessage => "icons/message-square.svg",
+    }
+}
+
+fn timeline_status_badge(label: String, color: u32) -> gpui::AnyElement {
+    div()
+        .flex_shrink_0()
+        .h(px(20.0))
+        .flex()
+        .items_center()
+        .rounded_full()
+        .border_1()
+        .border_color(rgb(color).opacity(0.42))
+        .bg(rgb(color).opacity(0.14))
+        .px_2()
+        .text_size(px(theme::FONT_MICRO))
+        .text_color(rgb(color))
+        .child(label)
+        .into_any_element()
+}
+
 fn flatten_join<T>(outcome: Result<BackendResult<T>, gpui_tokio::JoinError>) -> BackendResult<T> {
     outcome.unwrap_or_else(|_| {
         Err(BackendError::failed(
@@ -10830,6 +11240,13 @@ mod tests {
         );
         assert_eq!(sidebar_session_running_color(true), theme::ACCENT_GREEN);
         assert_eq!(sidebar_session_running_color(false), theme::TEXT_PRIMARY);
+    }
+
+    #[test]
+    fn timeline_duration_matches_desktop_compact_format() {
+        assert_eq!(format_compact_duration(1_000, Some(1_000)), "1s");
+        assert_eq!(format_compact_duration(1_000, Some(62_000)), "1m 1s");
+        assert_eq!(format_compact_duration(1_000, Some(3_661_000)), "1h 1m");
     }
 
     struct DrawerScrollIsolationProbe {
