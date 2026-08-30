@@ -1541,7 +1541,10 @@ impl DesktopRuntime {
             )
         })?;
         let mut timeline = self.agent.manager.subscribe();
+        let mut session_updates = self.agent.manager.subscribe_session_updates();
         let timeline_events = self.events.clone();
+        let session_event_tx = self.events.clone();
+        let session_gateway = self.remote.gateway.clone();
         let auth_contexts = self.agent.auth_contexts();
         tasks.push(tokio::spawn(async move {
             loop {
@@ -1569,6 +1572,37 @@ impl DesktopRuntime {
                             skipped,
                             refetch: AuthoritativeRefetch::for_stream(DesktopEventStream::Timeline),
                         });
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }));
+        tasks.push(tokio::spawn(async move {
+            loop {
+                match session_updates.recv().await {
+                    Ok(session) => {
+                        let _ = session_event_tx.send(DesktopEvent::SessionUpdated(session));
+                        if let Err(error) = session_gateway.publish_sidebar_invalidation() {
+                            tracing::warn!(
+                                target: "vibex_desktop",
+                                error_code = %error.code,
+                                "Remote session sidebar invalidation failed"
+                            );
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        let _ = session_event_tx.send(DesktopEvent::Lagged {
+                            stream: DesktopEventStream::Fanout,
+                            skipped,
+                            refetch: AuthoritativeRefetch::for_stream(DesktopEventStream::Fanout),
+                        });
+                        if let Err(error) = session_gateway.publish_sidebar_invalidation() {
+                            tracing::warn!(
+                                target: "vibex_desktop",
+                                error_code = %error.code,
+                                "Remote session sidebar invalidation failed"
+                            );
+                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }

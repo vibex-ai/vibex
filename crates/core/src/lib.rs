@@ -44,10 +44,11 @@ pub use agent::{
     AgentModelListSource, AgentNotificationIntent, AgentNotificationKind, AgentReasoningEffort,
     AgentSession, AgentSessionConfigProbe, AgentSessionSafety, AgentSessionState,
     AgentSessionSummary, ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest,
-    ForkAgentSessionRequest, GetMessageSubmissionRequest, MAX_MESSAGE_IDEMPOTENCY_KEY_LEN,
-    MessageSubmissionState, ProviderCapabilitiesResponse, RenameAgentSessionRequest,
-    ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest,
-    agent_session_turn_requires_continuation,
+    ForkAgentSessionRequest, GetMessageSubmissionRequest, MAX_AGENT_SESSION_TITLE_CHARS,
+    MAX_MESSAGE_IDEMPOTENCY_KEY_LEN, MessageSubmissionState, ProviderCapabilitiesResponse,
+    RenameAgentSessionRequest, ResolveElicitationRequest, ResolvePermissionRequest,
+    SendAgentMessageRequest, agent_session_turn_requires_continuation,
+    normalize_agent_session_title,
 };
 pub use agent_auth::{
     AgentAuthCatalog, AgentAuthContext, AgentAuthContextAuthenticateRequest,
@@ -375,14 +376,14 @@ pub use time::unix_timestamp_ms;
 pub use timeline::{
     AgentEventContentBlock, AgentEventLocation, AgentEventRawExtension, AgentEventRawOutput,
     AgentEventRawOutputMode, AgentMessageDeltaPayload, AgentMessagePayload, AgentMessagePhase,
-    CollaborationPayload, CommandPayload, CommandStatus, FileOperationKind, FileOperationPatch,
-    FileOperationPatchFormat, FileOperationPayload, GitNoticePayload, ImageGenerationPayload,
-    MessageAttachment, PlanPayload, PlanStepPayload, PlanStepStatus, ReasoningPayload,
-    SystemNoticeLevel, SystemNoticePayload, TimelineErrorPayload, TimelineItem, TimelineItemKind,
-    TimelineLiveEvent, TimelinePage, TimelinePayload, TimelineRedactionState, TimelineSource,
-    TodoUpdatePayload, ToolCallPayload, ToolCallStatus, TurnExecutionAttribution,
-    TurnExecutionAttributionView, UserMessagePayload, WebSearchPayload,
-    latest_timeline_turn_ended_normally,
+    AgentRetryPayload, CollaborationPayload, CommandPayload, CommandStatus, FileOperationKind,
+    FileOperationPatch, FileOperationPatchFormat, FileOperationPayload, GitNoticePayload,
+    ImageGenerationPayload, MessageAttachment, PlanPayload, PlanStepPayload, PlanStepStatus,
+    ReasoningPayload, RetryKind, RetryPhase, SystemNoticeLevel, SystemNoticePayload,
+    TimelineErrorPayload, TimelineItem, TimelineItemKind, TimelineLiveEvent, TimelinePage,
+    TimelinePayload, TimelineRedactionState, TimelineSource, TodoUpdatePayload, ToolCallPayload,
+    ToolCallStatus, TurnExecutionAttribution, TurnExecutionAttributionView, UserMessagePayload,
+    WebSearchPayload, latest_timeline_turn_ended_normally,
 };
 pub use usage::{
     AgentTurnUsageFact, AgentUsageAggregate, AgentUsageAnnualDay, AgentUsageAnnualProjection,

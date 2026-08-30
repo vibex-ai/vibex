@@ -43,6 +43,7 @@ pub enum TimelineItemKind {
     PermissionResolution,
     ElicitationRequest,
     ElicitationResolution,
+    Retry,
     Error,
 }
 
@@ -800,6 +801,40 @@ pub struct TimelineErrorPayload {
     pub recoverable: bool,
 }
 
+/// Provider-neutral description of an automatic retry performed inside an
+/// Agent turn. ACP has no standard retry notification, so adapters normalize
+/// their native extensions and progress text into this payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryKind {
+    ModelRequest,
+    StreamReconnect,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryPhase {
+    Started,
+    Recovered,
+    Exhausted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRetryPayload {
+    pub kind: RetryKind,
+    pub phase: RetryPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum TimelinePayload {
@@ -821,6 +856,7 @@ pub enum TimelinePayload {
     PermissionResolution(PermissionResolution),
     ElicitationRequest(ElicitationRequest),
     ElicitationResolution(ElicitationResolution),
+    Retry(AgentRetryPayload),
     Error(TimelineErrorPayload),
 }
 
@@ -845,6 +881,7 @@ impl TimelinePayload {
             Self::PermissionResolution(_) => TimelineItemKind::PermissionResolution,
             Self::ElicitationRequest(_) => TimelineItemKind::ElicitationRequest,
             Self::ElicitationResolution(_) => TimelineItemKind::ElicitationResolution,
+            Self::Retry(_) => TimelineItemKind::Retry,
             Self::Error(_) => TimelineItemKind::Error,
         }
     }
@@ -1039,6 +1076,53 @@ mod tests {
         );
         assert_eq!(
             latest_timeline_turn_ended_normally(&[final_message, trailing_delta]),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn retry_progress_is_not_a_turn_boundary_but_exhaustion_can_require_continuation() {
+        let session_id = VibexSessionId::new();
+        let user = completion_item(
+            &session_id,
+            1,
+            TimelineSource::User,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "try again".into(),
+                attachments: Vec::new(),
+            }),
+        );
+        let retry = completion_item(
+            &session_id,
+            2,
+            TimelineSource::Provider,
+            TimelinePayload::Retry(AgentRetryPayload {
+                kind: RetryKind::ModelRequest,
+                phase: RetryPhase::Started,
+                attempt: Some(1),
+                max_attempts: Some(3),
+                delay_ms: None,
+                reason: None,
+            }),
+        );
+        assert_eq!(
+            latest_timeline_turn_ended_normally(&[user.clone(), retry.clone()]),
+            Some(false)
+        );
+
+        let mut terminal_error = completion_item(
+            &session_id,
+            3,
+            TimelineSource::Provider,
+            TimelinePayload::Error(TimelineErrorPayload {
+                code: "provider_retry_exhausted".into(),
+                message: "retry budget exhausted".into(),
+                recoverable: true,
+            }),
+        );
+        terminal_error.provider_correlation_id = None;
+        assert_eq!(
+            latest_timeline_turn_ended_normally(&[user, retry, terminal_error]),
             Some(false)
         );
     }
@@ -1380,6 +1464,54 @@ mod tests {
                 TimelineItemKind::Collaboration,
                 TimelineItemKind::ImageGeneration,
             ]
+        );
+    }
+
+    #[test]
+    fn retry_payload_round_trips_with_optional_progress_fields() {
+        let payload = TimelinePayload::Retry(AgentRetryPayload {
+            kind: RetryKind::ModelRequest,
+            phase: RetryPhase::Started,
+            attempt: Some(2),
+            max_attempts: Some(5),
+            delay_ms: Some(4_000),
+            reason: Some("provider returned 503".to_string()),
+        });
+        let encoded = serde_json::to_value(&payload).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "type": "retry",
+                "data": {
+                    "kind": "model_request",
+                    "phase": "started",
+                    "attempt": 2,
+                    "maxAttempts": 5,
+                    "delayMs": 4000,
+                    "reason": "provider returned 503"
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<TimelinePayload>(encoded).unwrap(),
+            payload
+        );
+
+        let sparse = serde_json::json!({
+            "type": "retry",
+            "data": {"kind": "unknown", "phase": "exhausted"}
+        });
+        let decoded = serde_json::from_value::<TimelinePayload>(sparse).unwrap();
+        assert_eq!(
+            decoded,
+            TimelinePayload::Retry(AgentRetryPayload {
+                kind: RetryKind::Unknown,
+                phase: RetryPhase::Exhausted,
+                attempt: None,
+                max_attempts: None,
+                delay_ms: None,
+                reason: None,
+            })
         );
     }
 }

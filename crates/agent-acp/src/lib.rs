@@ -35,17 +35,18 @@ use vibex_core::{
     AgentCommandSelectionBehavior, AgentCommandSourceKind, AgentCommandTrigger,
     AgentEventRawExtension, AgentLogoutRequest, AgentMessageDeltaPayload, AgentMessagePayload,
     AgentMessagePhase, AgentModelCapabilities, AgentModelListResponse, AgentModelListSource,
-    AgentReasoningEffort, AgentSessionConfigProbe, AgentSessionSafety, AgentUsageCounterOrigin,
-    AgentUsageExecutionContext, ElicitationRequest, ExternalSessionImportCandidate,
-    MessageSubmissionId, PermissionActionDetail, PermissionRequest, PermissionRequestStatus,
-    PermissionResponseKind, PermissionResponseOption, PermissionRiskCategory, PlanPayload,
-    PlanStepPayload, ProviderBinding, ProviderBindingMetadata, ProviderCapabilities,
-    ProviderCapabilitySummary, ProviderKind, ProviderNativeBinding, ProviderProfileId,
-    ProviderRunCapabilityProbesRequest, ProviderSessionConfigOption, ProviderSessionConfigValue,
-    ReasoningPayload, RequestId, SessionRuntimeConfigMutationRequest,
-    SessionRuntimeConfigMutationResult, SessionRuntimeSelection, SystemNoticeLevel,
-    SystemNoticePayload, TimelineErrorPayload, TimelinePayload, TimelineRedactionState,
-    ToolCallPayload, ToolCallStatus, VibexError, VibexResult, VibexSessionId, unix_timestamp_ms,
+    AgentReasoningEffort, AgentRetryPayload, AgentSessionConfigProbe, AgentSessionSafety,
+    AgentUsageCounterOrigin, AgentUsageExecutionContext, ElicitationRequest,
+    ExternalSessionImportCandidate, MessageSubmissionId, PermissionActionDetail, PermissionRequest,
+    PermissionRequestStatus, PermissionResponseKind, PermissionResponseOption,
+    PermissionRiskCategory, PlanPayload, PlanStepPayload, ProviderBinding, ProviderBindingMetadata,
+    ProviderCapabilities, ProviderCapabilitySummary, ProviderKind, ProviderNativeBinding,
+    ProviderProfileId, ProviderRunCapabilityProbesRequest, ProviderSessionConfigOption,
+    ProviderSessionConfigValue, ReasoningPayload, RequestId, RetryKind, RetryPhase,
+    SessionRuntimeConfigMutationRequest, SessionRuntimeConfigMutationResult,
+    SessionRuntimeSelection, SystemNoticeLevel, SystemNoticePayload, TimelineErrorPayload,
+    TimelinePayload, TimelineRedactionState, ToolCallPayload, ToolCallStatus, VibexError,
+    VibexResult, VibexSessionId, unix_timestamp_ms,
 };
 
 mod adapter_activation;
@@ -318,6 +319,9 @@ pub struct AcpTurn {
 
 #[derive(Debug, Clone)]
 pub enum AcpEvent {
+    SessionTitle {
+        title: String,
+    },
     AssistantDelta {
         text_delta: String,
         chunk_index: u32,
@@ -355,6 +359,16 @@ pub enum AcpEvent {
         options: Vec<PermissionResponseOption>,
     },
     ElicitationRequest(ElicitationRequest),
+    /// A provider-normalized automatic retry inside the active ACP turn.
+    Retry {
+        kind: RetryKind,
+        phase: RetryPhase,
+        attempt: Option<u32>,
+        max_attempts: Option<u32>,
+        delay_ms: Option<u64>,
+        reason: Option<String>,
+        provider_correlation_id: Option<String>,
+    },
     SystemNotice {
         level: SystemNoticeLevel,
         message: String,
@@ -3182,6 +3196,7 @@ fn map_acp_event(session_id: vibex_core::VibexSessionId, event: AcpEvent) -> Pro
                 phase,
             },
         )),
+        AcpEvent::SessionTitle { title } => ProviderEvent::session_title(title),
         AcpEvent::AssistantMessage { text, is_final } => {
             ProviderEvent::agent(TimelinePayload::AgentMessage(AgentMessagePayload {
                 text,
@@ -3232,6 +3247,7 @@ fn map_acp_event(session_id: vibex_core::VibexSessionId, event: AcpEvent) -> Pro
                 0,
             )),
             redaction_state: TimelineRedactionState::None,
+            session_title: None,
         },
         AcpEvent::Canonical(event) => event.into_provider_event(),
         AcpEvent::PermissionRequest {
@@ -3267,12 +3283,36 @@ fn map_acp_event(session_id: vibex_core::VibexSessionId, event: AcpEvent) -> Pro
             }),
             provider_correlation_id: provider_request_id,
             redaction_state: TimelineRedactionState::None,
+            session_title: None,
         },
         AcpEvent::ElicitationRequest(request) => ProviderEvent {
             source: vibex_core::TimelineSource::Provider,
             provider_correlation_id: request.provider_request_id.clone(),
             payload: TimelinePayload::ElicitationRequest(request),
             redaction_state: TimelineRedactionState::None,
+            session_title: None,
+        },
+        AcpEvent::Retry {
+            kind,
+            phase,
+            attempt,
+            max_attempts,
+            delay_ms,
+            reason,
+            provider_correlation_id,
+        } => ProviderEvent {
+            source: vibex_core::TimelineSource::Provider,
+            payload: TimelinePayload::Retry(AgentRetryPayload {
+                kind,
+                phase,
+                attempt,
+                max_attempts,
+                delay_ms,
+                reason: reason.map(AgentEventRawExtension::bounded_text),
+            }),
+            provider_correlation_id,
+            redaction_state: TimelineRedactionState::None,
+            session_title: None,
         },
         AcpEvent::SystemNotice { level, message } => {
             ProviderEvent::provider(TimelinePayload::SystemNotice(SystemNoticePayload {
@@ -3285,16 +3325,28 @@ fn map_acp_event(session_id: vibex_core::VibexSessionId, event: AcpEvent) -> Pro
             message,
             recoverable,
             provider_correlation_id,
-        } => ProviderEvent {
-            source: vibex_core::TimelineSource::Provider,
-            payload: TimelinePayload::Error(TimelineErrorPayload {
-                code,
-                message,
-                recoverable,
-            }),
-            provider_correlation_id,
-            redaction_state: TimelineRedactionState::None,
-        },
+        } => {
+            if let Some(retry) = legacy_retry_payload(&code, &message, recoverable) {
+                return ProviderEvent {
+                    source: vibex_core::TimelineSource::Provider,
+                    payload: TimelinePayload::Retry(retry),
+                    provider_correlation_id,
+                    redaction_state: TimelineRedactionState::None,
+                    session_title: None,
+                };
+            }
+            ProviderEvent {
+                source: vibex_core::TimelineSource::Provider,
+                payload: TimelinePayload::Error(TimelineErrorPayload {
+                    code,
+                    message,
+                    recoverable,
+                }),
+                provider_correlation_id,
+                redaction_state: TimelineRedactionState::None,
+                session_title: None,
+            }
+        }
         AcpEvent::Unknown { event_kind } => {
             let event_kind = if looks_sensitive(&event_kind) {
                 "redacted".to_string()
@@ -3307,6 +3359,50 @@ fn map_acp_event(session_id: vibex_core::VibexSessionId, event: AcpEvent) -> Pro
             }))
         }
     }
+}
+
+fn legacy_retry_payload(code: &str, message: &str, recoverable: bool) -> Option<AgentRetryPayload> {
+    let (kind, phase) = match code {
+        "codex_stream_reconnecting" => (RetryKind::StreamReconnect, RetryPhase::Started),
+        "opencode_model_api_retrying" => (RetryKind::ModelRequest, RetryPhase::Started),
+        "codex_stream_reconnect_exhausted" => (RetryKind::StreamReconnect, RetryPhase::Exhausted),
+        "opencode_model_api_retry_exhausted" => (RetryKind::ModelRequest, RetryPhase::Exhausted),
+        _ if recoverable && code.ends_with("_retrying") => {
+            (RetryKind::Unknown, RetryPhase::Started)
+        }
+        _ => return None,
+    };
+    let (attempt, max_attempts) = retry_attempts_from_text(message);
+    Some(AgentRetryPayload {
+        kind,
+        phase,
+        attempt,
+        max_attempts,
+        delay_ms: None,
+        reason: (!message.trim().is_empty()).then(|| AgentEventRawExtension::bounded_text(message)),
+    })
+}
+
+fn retry_attempts_from_text(text: &str) -> (Option<u32>, Option<u32>) {
+    let mut candidate = text
+        .split(|ch: char| !(ch.is_ascii_digit() || ch == '/'))
+        .find(|value| value.contains('/') && value.split_once('/').is_some());
+    if candidate.is_none() {
+        candidate = text
+            .split_whitespace()
+            .find(|value| value.contains('/') && value.split_once('/').is_some());
+    }
+    let Some((attempt, max_attempts)) = candidate.and_then(|value| value.split_once('/')) else {
+        return (None, None);
+    };
+    (
+        attempt.parse::<u32>().ok().filter(|value| *value > 0),
+        max_attempts
+            .trim_matches(|ch: char| !ch.is_ascii_digit())
+            .parse::<u32>()
+            .ok()
+            .filter(|value| *value > 0),
+    )
 }
 
 fn sanitize_metadata(metadata: Vec<ProviderBindingMetadata>) -> Vec<ProviderBindingMetadata> {
@@ -4388,6 +4484,88 @@ mod tests {
             result.events[4].payload,
             TimelinePayload::SystemNotice(_)
         ));
+    }
+
+    #[test]
+    fn retry_events_map_to_provider_timeline_payloads() {
+        let session_id = VibexSessionId::new();
+        let provider_correlation_id = Some("retry-correlation".to_string());
+        let event = map_acp_event(
+            session_id,
+            AcpEvent::Retry {
+                kind: RetryKind::ModelRequest,
+                phase: RetryPhase::Started,
+                attempt: Some(2),
+                max_attempts: Some(3),
+                delay_ms: Some(1_000),
+                reason: Some("provider returned 503".to_string()),
+                provider_correlation_id: provider_correlation_id.clone(),
+            },
+        );
+        assert_eq!(event.source, vibex_core::TimelineSource::Provider);
+        assert_eq!(event.provider_correlation_id, provider_correlation_id);
+        assert_eq!(
+            event.payload,
+            TimelinePayload::Retry(AgentRetryPayload {
+                kind: RetryKind::ModelRequest,
+                phase: RetryPhase::Started,
+                attempt: Some(2),
+                max_attempts: Some(3),
+                delay_ms: Some(1_000),
+                reason: Some("provider returned 503".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn session_title_events_map_to_metadata_without_a_provider_correlation() {
+        let event = map_acp_event(
+            VibexSessionId::new(),
+            AcpEvent::SessionTitle {
+                title: "Release plan".to_string(),
+            },
+        );
+
+        assert_eq!(event.session_title.as_deref(), Some("Release plan"));
+        assert!(event.provider_correlation_id.is_none());
+        assert!(matches!(
+            event.payload,
+            TimelinePayload::SystemNotice(vibex_core::SystemNoticePayload { message, .. })
+                if message.is_empty()
+        ));
+    }
+
+    #[test]
+    fn legacy_retry_error_codes_keep_their_provider_neutral_kind() {
+        let session_id = VibexSessionId::new();
+        let exhausted = map_acp_event(
+            session_id.clone(),
+            AcpEvent::Error {
+                code: "opencode_model_api_retry_exhausted".to_string(),
+                message: "failed after 3 attempts".to_string(),
+                recoverable: false,
+                provider_correlation_id: Some("opencode-retry".to_string()),
+            },
+        );
+        assert!(matches!(
+            exhausted.payload,
+            TimelinePayload::Retry(AgentRetryPayload {
+                kind: RetryKind::ModelRequest,
+                phase: RetryPhase::Exhausted,
+                ..
+            })
+        ));
+
+        let terminal = map_acp_event(
+            session_id,
+            AcpEvent::Error {
+                code: "provider_auth_failed".to_string(),
+                message: "sign in required".to_string(),
+                recoverable: true,
+                provider_correlation_id: None,
+            },
+        );
+        assert!(matches!(terminal.payload, TimelinePayload::Error(_)));
     }
 
     fn test_binding(session_id: vibex_core::VibexSessionId) -> ProviderBinding {

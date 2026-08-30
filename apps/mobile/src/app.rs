@@ -10622,6 +10622,7 @@ fn process_title(row: &TimelineRow) -> String {
         TimelineRowKind::PermissionResolution => "Approval response",
         TimelineRowKind::ElicitationRequest => "Input requested",
         TimelineRowKind::ElicitationResolution => "Input response",
+        TimelineRowKind::Retry => "Retry",
         TimelineRowKind::Error => "Error",
         TimelineRowKind::UserMessage | TimelineRowKind::AgentMessage => "Message",
     })

@@ -74,7 +74,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 52;
+pub const CURRENT_SCHEMA_VERSION: i64 = 53;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -2534,6 +2534,29 @@ impl WorkspaceRepository {
 }
 
 impl SessionRepository {
+    pub fn lock_title(conn: &Connection, session_id: &VibexSessionId) -> VibexResult<()> {
+        let changed_rows = conn
+            .execute(
+                "
+                UPDATE agent_sessions
+                SET title_locked = 1, updated_at_ms = ?2
+                WHERE session_id = ?1 AND deleted_at_ms IS NULL
+                ",
+                params![session_id.as_str(), unix_timestamp_ms()],
+            )
+            .map_err(storage_err(
+                "session_title_lock_failed",
+                "failed to lock session title",
+            ))?;
+        if changed_rows == 0 {
+            return Err(VibexError::validation(
+                "session_not_found",
+                "Agent session was not found",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn insert(conn: &Connection, session: &AgentSession) -> VibexResult<()> {
         conn.execute(
             "
@@ -2722,22 +2745,19 @@ impl SessionRepository {
         session_id: &VibexSessionId,
         title: &str,
     ) -> VibexResult<AgentSession> {
-        let trimmed_title = title.trim();
-        if trimmed_title.is_empty() {
-            return Err(VibexError::validation(
-                "session_title_empty",
-                "session title must not be empty",
-            ));
-        }
+        let normalized_title =
+            vibex_core::normalize_agent_session_title(title).ok_or_else(|| {
+                VibexError::validation("session_title_empty", "session title must not be empty")
+            })?;
 
         let changed_rows = conn
             .execute(
                 "
                 UPDATE agent_sessions
-                SET title = ?2
+                SET title = ?2, title_locked = 1, updated_at_ms = ?3
                 WHERE session_id = ?1 AND deleted_at_ms IS NULL
                 ",
-                params![session_id.as_str(), trimmed_title],
+                params![session_id.as_str(), normalized_title, unix_timestamp_ms()],
             )
             .map_err(storage_err(
                 "session_title_update_failed",
@@ -2754,6 +2774,75 @@ impl SessionRepository {
         Self::get(conn, session_id)?.ok_or_else(|| {
             VibexError::validation("session_not_found", "Agent session was not found")
         })
+    }
+
+    pub fn seed_auto_title(
+        conn: &Connection,
+        session_id: &VibexSessionId,
+        title: &str,
+        default_title: &str,
+    ) -> VibexResult<Option<AgentSession>> {
+        let Some(normalized_title) = vibex_core::normalize_agent_session_title(title) else {
+            return Ok(None);
+        };
+        let default_title = vibex_core::normalize_agent_session_title(default_title)
+            .unwrap_or_else(|| default_title.trim().to_string());
+        let changed_rows = conn
+            .execute(
+                "
+                UPDATE agent_sessions
+                SET title = ?2, updated_at_ms = ?3
+                WHERE session_id = ?1
+                    AND deleted_at_ms IS NULL
+                    AND title_locked = 0
+                    AND title = ?4
+                    AND title <> ?2
+                ",
+                params![
+                    session_id.as_str(),
+                    normalized_title,
+                    unix_timestamp_ms(),
+                    default_title
+                ],
+            )
+            .map_err(storage_err(
+                "session_auto_title_update_failed",
+                "failed to seed session title",
+            ))?;
+        if changed_rows == 0 {
+            return Ok(None);
+        }
+        Self::get(conn, session_id)
+    }
+
+    pub fn refresh_auto_title(
+        conn: &Connection,
+        session_id: &VibexSessionId,
+        title: &str,
+    ) -> VibexResult<Option<AgentSession>> {
+        let Some(normalized_title) = vibex_core::normalize_agent_session_title(title) else {
+            return Ok(None);
+        };
+        let changed_rows = conn
+            .execute(
+                "
+                UPDATE agent_sessions
+                SET title = ?2, updated_at_ms = ?3
+                WHERE session_id = ?1
+                    AND deleted_at_ms IS NULL
+                    AND title_locked = 0
+                    AND title <> ?2
+                ",
+                params![session_id.as_str(), normalized_title, unix_timestamp_ms()],
+            )
+            .map_err(storage_err(
+                "session_auto_title_update_failed",
+                "failed to refresh session title",
+            ))?;
+        if changed_rows == 0 {
+            return Ok(None);
+        }
+        Self::get(conn, session_id)
     }
 
     pub fn archive(conn: &Connection, session_id: &VibexSessionId) -> VibexResult<()> {
@@ -10152,6 +10241,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_mcp_server_env_and_headers(conn, &mut applied)?;
     apply_custom_acp_agent_definitions(conn, &mut applied)?;
     apply_agent_delegations(conn, &mut applied)?;
+    apply_session_title_lock(conn, &mut applied)?;
 
     // Seed compatibility Profiles before the v37 backfill while no caller
     // transaction is active. Repository reads may run inside a transaction and
@@ -10247,6 +10337,40 @@ fn apply_agent_delegations(conn: &mut Connection, applied: &mut Vec<String>) -> 
     tx.commit().map_err(storage_err(
         "migration_commit_failed",
         "failed to commit Agent delegation migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
+}
+
+fn apply_session_title_lock(conn: &mut Connection, applied: &mut Vec<String>) -> VibexResult<()> {
+    const VERSION: i64 = 53;
+    const NAME: &str = "agent_session_title_lock";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    conn.execute(
+        "ALTER TABLE agent_sessions ADD COLUMN title_locked INTEGER NOT NULL DEFAULT 0 CHECK(title_locked IN (0, 1))",
+        [],
+    )
+    .map_err(storage_err(
+        "migration_apply_failed",
+        "failed to add Agent session title lock",
+    ))?;
+    // Earlier schema versions did not retain title provenance. Preserve every
+    // visible legacy title instead of guessing whether it came from a user or
+    // an Agent before automatic title refreshes become available.
+    conn.execute("UPDATE agent_sessions SET title_locked = 1", [])
+        .map_err(storage_err(
+            "migration_apply_failed",
+            "failed to preserve existing Agent session titles",
+        ))?;
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record Agent session title lock migration",
     ))?;
     applied.push(format!("{VERSION}:{NAME}"));
     Ok(())
@@ -13388,7 +13512,8 @@ mod tests {
                 "49:message_submission_runtime_policy",
                 "50:mcp_server_env_and_headers",
                 "51:custom_acp_agent_definitions",
-                "52:agent_delegations"
+                "52:agent_delegations",
+                "53:agent_session_title_lock"
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -13525,6 +13650,7 @@ mod tests {
                 "50:mcp_server_env_and_headers",
                 "51:custom_acp_agent_definitions",
                 "52:agent_delegations",
+                "53:agent_session_title_lock",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -13641,7 +13767,8 @@ mod tests {
                 "49:message_submission_runtime_policy",
                 "50:mcp_server_env_and_headers",
                 "51:custom_acp_agent_definitions",
-                "52:agent_delegations"
+                "52:agent_delegations",
+                "53:agent_session_title_lock"
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -13796,7 +13923,8 @@ mod tests {
                 "49:message_submission_runtime_policy",
                 "50:mcp_server_env_and_headers",
                 "51:custom_acp_agent_definitions",
-                "52:agent_delegations"
+                "52:agent_delegations",
+                "53:agent_session_title_lock"
             ]
         );
         assert_eq!(
@@ -15207,7 +15335,8 @@ mod tests {
                 "49:message_submission_runtime_policy",
                 "50:mcp_server_env_and_headers",
                 "51:custom_acp_agent_definitions",
-                "52:agent_delegations"
+                "52:agent_delegations",
+                "53:agent_session_title_lock"
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
@@ -16712,6 +16841,134 @@ mod tests {
             stored.window.as_ref().map(|window| window.label.as_str()),
             Some("monthly")
         );
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn automatic_session_titles_are_persisted_deduplicated_and_locked_by_manual_rename() {
+        let temp = temp_db_path("session-auto-title");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let (_project, workspace) = WorkspaceRepository::ensure(
+            &conn,
+            "/tmp/vibex-db-session-auto-title",
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let now = unix_timestamp_ms();
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: "generic session".to_string(),
+            project_id: workspace.project_id.clone(),
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path.clone(),
+            workspace_mode: workspace.mode,
+            agent_id: AgentId::parse("generic").unwrap(),
+            state: AgentSessionState::Idle,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_message_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        SessionRepository::insert(&conn, &session).unwrap();
+
+        let fallback = SessionRepository::seed_auto_title(
+            &conn,
+            &session.id,
+            "  summarize\nthis change  ",
+            "generic session",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(fallback.title, "summarize this change");
+        assert!(
+            SessionRepository::seed_auto_title(
+                &conn,
+                &session.id,
+                "another prompt",
+                "generic session",
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            SessionRepository::refresh_auto_title(&conn, &session.id, " \n\t ")
+                .unwrap()
+                .is_none()
+        );
+
+        let generated =
+            SessionRepository::refresh_auto_title(&conn, &session.id, "  Short agent title ")
+                .unwrap()
+                .unwrap();
+        assert_eq!(generated.title, "Short agent title");
+        assert!(
+            SessionRepository::refresh_auto_title(&conn, &session.id, "Short agent title",)
+                .unwrap()
+                .is_none()
+        );
+
+        let renamed =
+            SessionRepository::update_title(&conn, &session.id, "  User\nlabel  ").unwrap();
+        assert_eq!(renamed.title, "User label");
+        assert!(
+            SessionRepository::refresh_auto_title(
+                &conn,
+                &session.id,
+                "replacement generated title",
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            SessionRepository::get(&conn, &session.id)
+                .unwrap()
+                .unwrap()
+                .title,
+            "User label"
+        );
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn session_title_lock_migration_preserves_legacy_titles_once() {
+        let temp = temp_db_path("session-title-lock-migration");
+        let mut conn = open_database(&temp).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE agent_sessions (
+                session_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL
+            );
+            INSERT INTO agent_sessions (session_id, title) VALUES ('legacy-session', 'Imported title');
+            ",
+        )
+        .unwrap();
+
+        let mut applied = Vec::new();
+        apply_session_title_lock(&mut conn, &mut applied).unwrap();
+        assert_eq!(applied, ["53:agent_session_title_lock"]);
+        let locked: i64 = conn
+            .query_row(
+                "SELECT title_locked FROM agent_sessions WHERE session_id = 'legacy-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(locked, 1);
+
+        let mut reapplied = Vec::new();
+        apply_session_title_lock(&mut conn, &mut reapplied).unwrap();
+        assert!(reapplied.is_empty());
 
         cleanup_db(temp);
     }

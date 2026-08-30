@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use vibex_core::{
-    AgentSessionRuntimeSelectionEvent, ProviderProfileId, RuntimeSessionEvent, TimelineLiveEvent,
-    VibexSessionId,
+    AgentSession, AgentSessionRuntimeSelectionEvent, ProviderProfileId, RuntimeSessionEvent,
+    TimelineLiveEvent, VibexSessionId,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +67,7 @@ impl AuthoritativeRefetch {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum DesktopEvent {
     Timeline(TimelineLiveEvent),
+    SessionUpdated(AgentSession),
     Runtime(RuntimeSessionEvent),
     RuntimeSelection(AgentSessionRuntimeSelectionEvent),
     ProviderConfigChanged(ProviderConfigChangedEvent),

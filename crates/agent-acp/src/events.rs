@@ -162,6 +162,7 @@ impl NormalizedAgentEvent {
             payload: self.event.into_timeline_payload(),
             provider_correlation_id: Some(self.provider_correlation_id),
             redaction_state: TimelineRedactionState::None,
+            session_title: None,
         }
     }
 }

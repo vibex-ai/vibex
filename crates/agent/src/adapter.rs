@@ -378,6 +378,9 @@ pub struct ProviderEvent {
     pub payload: TimelinePayload,
     pub provider_correlation_id: Option<String>,
     pub redaction_state: TimelineRedactionState,
+    /// Optional session metadata update. Metadata events are consumed by the
+    /// manager and never persisted as timeline items.
+    pub session_title: Option<String>,
 }
 
 impl ProviderEvent {
@@ -387,6 +390,7 @@ impl ProviderEvent {
             payload,
             provider_correlation_id: None,
             redaction_state: TimelineRedactionState::None,
+            session_title: None,
         }
     }
 
@@ -396,6 +400,20 @@ impl ProviderEvent {
             payload,
             provider_correlation_id: None,
             redaction_state: TimelineRedactionState::None,
+            session_title: None,
+        }
+    }
+
+    pub fn session_title(title: String) -> Self {
+        Self {
+            source: TimelineSource::Provider,
+            payload: TimelinePayload::SystemNotice(vibex_core::SystemNoticePayload {
+                level: vibex_core::SystemNoticeLevel::Info,
+                message: String::new(),
+            }),
+            provider_correlation_id: None,
+            redaction_state: TimelineRedactionState::None,
+            session_title: Some(title),
         }
     }
 }

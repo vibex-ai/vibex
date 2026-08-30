@@ -28,6 +28,10 @@ use crate::{
 pub const AGENT_TIMELINE_PAGE_LIMIT: u32 = 500;
 pub const AGENT_TIMELINE_MAX_ITEMS: usize = 20_000;
 
+fn session_update_is_current(existing: &AgentSession, incoming: &AgentSession) -> bool {
+    incoming.updated_at_ms >= existing.updated_at_ms
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ElicitationDraftValue {
     Text(String),
@@ -1034,6 +1038,39 @@ impl AgentWorkflowController {
                     AgentEventDecision::IgnoredStale
                 }
             }
+            BackendEvent::SessionUpdated(session) => {
+                let mut changed = false;
+                if let Some(sessions) = self.state.sessions.value.as_mut() {
+                    if let Some(existing) = sessions.iter_mut().find(|item| item.id == session.id) {
+                        if existing != &session && session_update_is_current(existing, &session) {
+                            *existing = session.clone();
+                            changed = true;
+                        }
+                    } else {
+                        sessions.push(session.clone());
+                        changed = true;
+                    }
+                }
+                if self.state.selected_session_id.as_ref() == Some(&session.id) {
+                    if self
+                        .state
+                        .active_session
+                        .value
+                        .as_ref()
+                        .is_none_or(|existing| {
+                            existing != &session && session_update_is_current(existing, &session)
+                        })
+                    {
+                        changed = true;
+                        self.state.active_session.resolve(session);
+                    }
+                }
+                if changed {
+                    AgentEventDecision::Applied
+                } else {
+                    AgentEventDecision::IgnoredStale
+                }
+            }
             BackendEvent::Notification(_) => AgentEventDecision::IgnoredStale,
             BackendEvent::Runtime(event) => {
                 if self.state.selected_session_id.as_ref() != Some(&event.session_id) {
@@ -1514,6 +1551,60 @@ mod tests {
         assert!(controller.apply_session_snapshot(&current, Ok(snapshot)));
         assert_eq!(controller.state.timeline.items.len(), 2);
         assert_eq!(controller.state.conversation_turns().len(), 1);
+    }
+
+    #[test]
+    fn session_updates_refresh_selected_and_listed_titles_without_accepting_older_snapshots() {
+        let mut session = session();
+        session.updated_at_ms = 10;
+        let backend = Arc::new(MockAgentBackend::new(session.clone(), Vec::new()));
+        let mut controller = AgentWorkflowController::new(backend, capabilities());
+        controller.state.sessions.resolve(vec![session.clone()]);
+        controller.state.selected_session_id = Some(session.id.clone());
+        controller.state.active_session.resolve(session.clone());
+
+        let mut generated = session.clone();
+        generated.title = "Release plan".to_string();
+        generated.updated_at_ms = 11;
+        assert_eq!(
+            controller.apply_event(BackendEvent::SessionUpdated(generated.clone())),
+            AgentEventDecision::Applied
+        );
+        assert_eq!(
+            controller.state.sessions.value.as_ref().unwrap()[0].title,
+            "Release plan"
+        );
+        assert_eq!(
+            controller
+                .state
+                .active_session
+                .value
+                .as_ref()
+                .unwrap()
+                .title,
+            "Release plan"
+        );
+
+        let mut stale = session;
+        stale.title = "Older title".to_string();
+        assert_eq!(
+            controller.apply_event(BackendEvent::SessionUpdated(stale)),
+            AgentEventDecision::IgnoredStale
+        );
+        assert_eq!(
+            controller.state.sessions.value.as_ref().unwrap()[0].title,
+            "Release plan"
+        );
+        assert_eq!(
+            controller
+                .state
+                .active_session
+                .value
+                .as_ref()
+                .unwrap()
+                .title,
+            "Release plan"
+        );
     }
 
     #[test]

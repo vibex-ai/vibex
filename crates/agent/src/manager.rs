@@ -13,28 +13,29 @@ use vibex_core::{
     AgentCommandExecuteStatus, AgentCommandExecutionBehavior, AgentCommandSelectionBehavior,
     AgentCommandSourceKind, AgentCommandTrigger, AgentConfig, AgentDelegation, AgentDelegationId,
     AgentDelegationStatus, AgentId, AgentLogoutRequest, AgentModelListRequest,
-    AgentModelListResponse, AgentModelListSource, AgentNotificationIntent, AgentSession,
-    AgentSessionConfigProbe, AgentSessionRestoreMethod, AgentSessionSafety, AgentSessionState,
-    AgentUsageCounterOrigin, AgentUsageExecutionContext, AgentUsageStreamAttribution, BindingState,
-    CancelAgentDelegationRequest, ContinueAgentTurnRequest, CreateAgentDelegationRequest,
-    CreateAgentSessionRequest, ElicitationRequest, ExternalSessionContinuationStatus,
-    ExternalSessionImportCandidate, ExternalSessionImportCandidateStatus,
-    ExternalSessionImportDiagnostic, ExternalSessionImportPreview,
-    ExternalSessionImportPreviewRequest, ExternalSessionImportRequest, ExternalSessionImportResult,
-    ExternalSessionImportSource, ExternalSessionImportedTimelineCount, FetchTimelineRequest,
-    ForkAgentSessionRequest, McpSecretTarget, McpServer, McpServerSecretReference,
-    McpServerTransportKind, MessageAttachment, MessageSubmissionId, PermissionRequest, ProjectId,
-    PromptKind, PromptStatus, ProviderBinding, ProviderBindingMetadata, ProviderCapabilities,
-    ProviderCapabilitiesResponse, ProviderDefaultScopeKind, ProviderKind, ProviderNativeBinding,
-    ProviderProfile, ProviderProfileDefaultScope, ProviderProfileId, ProviderProfileStatus,
-    RenameAgentSessionRequest, ResolveElicitationRequest, ResolvePermissionRequest,
+    AgentModelListResponse, AgentModelListSource, AgentNotificationIntent, AgentRetryPayload,
+    AgentSession, AgentSessionConfigProbe, AgentSessionRestoreMethod, AgentSessionSafety,
+    AgentSessionState, AgentUsageCounterOrigin, AgentUsageExecutionContext,
+    AgentUsageStreamAttribution, BindingState, CancelAgentDelegationRequest,
+    ContinueAgentTurnRequest, CreateAgentDelegationRequest, CreateAgentSessionRequest,
+    ElicitationRequest, ExternalSessionContinuationStatus, ExternalSessionImportCandidate,
+    ExternalSessionImportCandidateStatus, ExternalSessionImportDiagnostic,
+    ExternalSessionImportPreview, ExternalSessionImportPreviewRequest,
+    ExternalSessionImportRequest, ExternalSessionImportResult, ExternalSessionImportSource,
+    ExternalSessionImportedTimelineCount, FetchTimelineRequest, ForkAgentSessionRequest,
+    McpSecretTarget, McpServer, McpServerSecretReference, McpServerTransportKind,
+    MessageAttachment, MessageSubmissionId, PermissionRequest, ProjectId, PromptKind, PromptStatus,
+    ProviderBinding, ProviderBindingMetadata, ProviderCapabilities, ProviderCapabilitiesResponse,
+    ProviderDefaultScopeKind, ProviderKind, ProviderNativeBinding, ProviderProfile,
+    ProviderProfileDefaultScope, ProviderProfileId, ProviderProfileStatus,
+    RenameAgentSessionRequest, ResolveElicitationRequest, ResolvePermissionRequest, RetryPhase,
     RuntimeLeaseRole, RuntimeModelSelection, SendAgentMessageRequest, SessionRuntimeSelection,
     SessionRuntimeSelectionStatus, SystemNoticeLevel, SystemNoticePayload, TimelineErrorPayload,
     TimelineItem, TimelineLiveEvent, TimelinePage, TimelinePayload, TimelineRedactionState,
     TimelineSource, TransportKind, TurnExecutionAttribution, UsageExecutionId, UserMessagePayload,
     VibexError, VibexResult, VibexSessionId, WorkspaceId, agent_id_for_provider_kind,
     agent_session_turn_requires_continuation, builtin_agent_definitions,
-    latest_timeline_turn_ended_normally, unix_timestamp_ms,
+    latest_timeline_turn_ended_normally, normalize_agent_session_title, unix_timestamp_ms,
 };
 use vibex_db::{
     AgentAuthContextRepository, AgentAuthenticationOperationRepository, AgentConfigRepository,
@@ -78,6 +79,7 @@ pub struct AgentManager {
     runtimes: HashMap<vibex_core::AgentRuntimeRouteKey, Arc<dyn AgentProvider>>,
     generic_acp_runtime: Option<Arc<dyn AgentProvider>>,
     live_events: broadcast::Sender<TimelineLiveEvent>,
+    session_events: broadcast::Sender<AgentSession>,
     notification_events: broadcast::Sender<AgentNotificationIntent>,
     runtime_selection: OnceLock<Weak<RuntimeSelectionService>>,
     runtime_lifecycle: OnceLock<Weak<RuntimeLifecycleService>>,
@@ -170,12 +172,14 @@ impl AgentManager {
         apply_migrations(&mut conn)?;
         let context_bridge = ContextBridgeService::new(db_path.clone())?;
         let (live_events, _) = broadcast::channel(512);
+        let (session_events, _) = broadcast::channel(256);
         let (notification_events, _) = broadcast::channel(256);
         let manager = Self {
             db_path,
             runtimes: HashMap::new(),
             generic_acp_runtime: None,
             live_events,
+            session_events,
             notification_events,
             runtime_selection: OnceLock::new(),
             runtime_lifecycle: OnceLock::new(),
@@ -247,6 +251,10 @@ impl AgentManager {
 
     pub fn subscribe(&self) -> broadcast::Receiver<TimelineLiveEvent> {
         self.live_events.subscribe()
+    }
+
+    pub fn subscribe_session_updates(&self) -> broadcast::Receiver<AgentSession> {
+        self.session_events.subscribe()
     }
 
     pub fn subscribe_notifications(&self) -> broadcast::Receiver<AgentNotificationIntent> {
@@ -595,6 +603,10 @@ impl AgentManager {
     where
         F: FnOnce(AgentSession) + Send,
     {
+        let requested_title = request
+            .title
+            .as_deref()
+            .and_then(normalize_agent_session_title);
         let mut desired = request.runtime;
         let resolved_agent =
             self.resolve_enabled_agent(Some(desired.agent_id.clone()), ProviderKind::Acp, true)?;
@@ -679,8 +691,7 @@ impl AgentManager {
         let now = unix_timestamp_ms();
         let session = AgentSession {
             id: requested_session_id.unwrap_or_default(),
-            title: request
-                .title
+            title: requested_title
                 .clone()
                 .unwrap_or_else(|| format!("{} session", resolved_agent.agent_id)),
             project_id: workspace.project_id.clone(),
@@ -701,6 +712,9 @@ impl AgentManager {
             &session,
             &initial_timeline,
         )?;
+        if requested_title.is_some() {
+            SessionRepository::lock_title(&conn, &session.id)?;
+        }
         for item in copied_items {
             self.publish_timeline_item(item)?;
         }
@@ -2236,6 +2250,15 @@ impl AgentManager {
                     return Err(err);
                 }
             };
+            let default_title = format!("{} session", session.agent_id);
+            if let Ok(Some(updated)) = SessionRepository::seed_auto_title(
+                &conn,
+                &session.id,
+                &request.text,
+                &default_title,
+            ) {
+                self.publish_session_update(updated);
+            }
             Some(appended_user)
         } else {
             None
@@ -2337,7 +2360,15 @@ impl AgentManager {
             })
             .collect::<HashMap<_, _>>();
         for event in turn_result.events {
-            if provider_event_was_streamed(&event, &appended, &streamed_event_indices) {
+            if let Some(title) = event.session_title.as_deref() {
+                let _ = self.apply_auto_session_title(&session.id, title);
+                continue;
+            }
+            if provider_event_was_streamed_in_final_result(
+                &event,
+                &appended,
+                &streamed_event_indices,
+            ) {
                 continue;
             }
             if let TimelinePayload::PermissionRequest(permission) = &event.payload {
@@ -2601,6 +2632,10 @@ impl AgentManager {
                 tokio::select! {
                     event = event_receiver.recv(), if event_receiver_open => {
                         if let Some(event) = event {
+                            if let Some(title) = event.session_title.as_deref() {
+                                let _ = self.apply_auto_session_title(&session.id, title);
+                                continue;
+                            }
                             if provider_event_was_streamed(
                                 &event,
                                 &appended,
@@ -2645,6 +2680,10 @@ impl AgentManager {
         };
 
         while let Ok(event) = event_receiver.try_recv() {
+            if let Some(title) = event.session_title.as_deref() {
+                let _ = self.apply_auto_session_title(&session.id, title);
+                continue;
+            }
             if provider_event_was_streamed(&event, &appended, &streamed_event_indices) {
                 continue;
             }
@@ -3067,7 +3106,9 @@ impl AgentManager {
         }
 
         let conn = self.open_migrated()?;
-        SessionRepository::update_title(&conn, &request.session_id, title)
+        let session = SessionRepository::update_title(&conn, &request.session_id, title)?;
+        self.publish_session_update(session.clone());
+        Ok(session)
     }
 
     pub async fn delete_session(&self, session_id: &VibexSessionId) -> VibexResult<()> {
@@ -3976,6 +4017,23 @@ impl AgentManager {
         Ok(item)
     }
 
+    fn publish_session_update(&self, session: AgentSession) {
+        let _ = self.session_events.send(session);
+    }
+
+    fn apply_auto_session_title(
+        &self,
+        session_id: &VibexSessionId,
+        title: &str,
+    ) -> VibexResult<bool> {
+        let conn = self.open_migrated()?;
+        let Some(session) = SessionRepository::refresh_auto_title(&conn, session_id, title)? else {
+            return Ok(false);
+        };
+        self.publish_session_update(session);
+        Ok(true)
+    }
+
     fn publish_attention_notification(&self, item: &TimelineItem) {
         let notification = match &item.payload {
             TimelinePayload::PermissionRequest(request)
@@ -4197,7 +4255,8 @@ fn push_or_replace_timeline_item(items: &mut Vec<TimelineItem>, item: TimelineIt
 }
 
 fn provider_event_matches_timeline_item(event: &ProviderEvent, item: &TimelineItem) -> bool {
-    item.provider_correlation_id == event.provider_correlation_id
+    event.session_title.is_none()
+        && item.provider_correlation_id == event.provider_correlation_id
         && item.source == event.source
         && item.payload == event.payload
         && item.redaction_state == event.redaction_state
@@ -4219,6 +4278,96 @@ fn provider_event_was_streamed(
         })
 }
 
+fn retry_phase_order(phase: RetryPhase) -> u8 {
+    match phase {
+        RetryPhase::Started => 0,
+        RetryPhase::Recovered => 1,
+        RetryPhase::Exhausted => 2,
+    }
+}
+
+/// Returns true when a final retry snapshot contains no newer state than the
+/// retry row already produced by the live stream. Provider responses may replay
+/// an older attempt, while a later recovery/exhaustion transition must still
+/// reach the coalescing upsert so the timeline row settles visibly.
+fn retry_snapshot_is_stale_or_equal(
+    incoming: &AgentRetryPayload,
+    current: &AgentRetryPayload,
+) -> bool {
+    if incoming.kind != current.kind {
+        return false;
+    }
+    let incoming_phase = retry_phase_order(incoming.phase);
+    let current_phase = retry_phase_order(current.phase);
+    if incoming_phase < current_phase {
+        return true;
+    }
+    if incoming_phase > current_phase {
+        return false;
+    }
+
+    if incoming.phase == RetryPhase::Started {
+        match (incoming.attempt, current.attempt) {
+            (Some(incoming), Some(current)) if incoming < current => return true,
+            (Some(incoming), Some(current)) if incoming > current => return false,
+            (None, Some(_)) => return true,
+            _ => {}
+        }
+        match (incoming.max_attempts, current.max_attempts) {
+            (Some(incoming), Some(current)) if incoming < current => return true,
+            (Some(incoming), Some(current)) if incoming > current => return false,
+            (None, Some(_)) => return true,
+            _ => {}
+        }
+    }
+
+    // A replayed partial snapshot must not erase details already observed by
+    // the live stream. A differing present value is treated as newer because
+    // providers can refine the reason or backoff while an attempt is pending.
+    if incoming.delay_ms.is_none() && current.delay_ms.is_some() {
+        return true;
+    }
+    if incoming.reason.is_none() && current.reason.is_some() {
+        return true;
+    }
+    incoming == current
+}
+
+/// Final provider results can replay an older retry snapshot after the live
+/// stream already delivered a newer attempt. A retry correlation identifies
+/// one timeline row, so the streamed row must win even when its payload has
+/// changed since the provider built the final result.
+fn provider_event_was_streamed_in_final_result(
+    event: &ProviderEvent,
+    streamed_items: &[TimelineItem],
+    streamed_event_indices: &HashMap<String, usize>,
+) -> bool {
+    event
+        .provider_correlation_id
+        .as_ref()
+        .and_then(|correlation| {
+            streamed_event_indices
+                .get(correlation)
+                .and_then(|index| streamed_items.get(*index))
+                .map(|item| {
+                    if provider_event_matches_timeline_item(event, item) {
+                        return true;
+                    }
+                    if item.source != event.source || item.redaction_state != event.redaction_state
+                    {
+                        return false;
+                    }
+                    match (&event.payload, &item.payload) {
+                        (TimelinePayload::Retry(incoming), TimelinePayload::Retry(current)) => {
+                            retry_snapshot_is_stale_or_equal(incoming, current)
+                        }
+                        _ => false,
+                    }
+                })
+        })
+        .unwrap_or(false)
+}
+
 fn describe_runtime_route(route: &vibex_core::AgentRuntimeRouteKey) -> String {
     format!(
         "{}/{}/{}",
@@ -4228,14 +4377,14 @@ fn describe_runtime_route(route: &vibex_core::AgentRuntimeRouteKey) -> String {
 
 fn should_coalesce_provider_event(event: &ProviderEvent) -> bool {
     event.provider_correlation_id.is_some()
-        && matches!(
-            &event.payload,
-            TimelinePayload::Error(error)
-                if matches!(
-                    error.code.as_str(),
-                    "codex_stream_reconnecting" | "opencode_model_api_retrying"
-                )
-        )
+        && match &event.payload {
+            TimelinePayload::Retry(_) => true,
+            TimelinePayload::Error(error) => matches!(
+                error.code.as_str(),
+                "codex_stream_reconnecting" | "opencode_model_api_retrying"
+            ),
+            _ => false,
+        }
 }
 
 fn fork_timeline_appends(items: &[TimelineItem]) -> Vec<TimelineAppend> {
@@ -4249,6 +4398,7 @@ fn fork_timeline_appends(items: &[TimelineItem]) -> Vec<TimelineAppend> {
                     | TimelinePayload::PermissionResolution(_)
                     | TimelinePayload::ElicitationRequest(_)
                     | TimelinePayload::ElicitationResolution(_)
+                    | TimelinePayload::Retry(_)
             )
         })
         .map(|item| TimelineAppend {
@@ -5842,6 +5992,69 @@ mod tests {
         assert_eq!(error.code, "reasoning_effort_invalid");
     }
 
+    #[tokio::test]
+    async fn automatic_session_title_updates_broadcast_once_and_respect_manual_titles() {
+        let db_path = temp_db_path("automatic-session-title-updates");
+        let manager = AgentManager::new(&db_path).unwrap();
+        let mut updates = manager.subscribe_session_updates();
+        let conn = manager.open_migrated().unwrap();
+        let workspace_root = temp_workspace_path("automatic-session-title-updates");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let session = insert_session(
+            &conn,
+            "opencode session",
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            AgentId::parse("opencode").unwrap(),
+            AgentSessionState::Idle,
+        );
+        drop(conn);
+
+        assert!(
+            manager
+                .apply_auto_session_title(&session.id, "  Plan\nrelease work  ")
+                .unwrap()
+        );
+        assert_eq!(
+            updates.try_recv().unwrap().title,
+            "Plan release work".to_string()
+        );
+        assert!(
+            !manager
+                .apply_auto_session_title(&session.id, "Plan release work")
+                .unwrap()
+        );
+        assert!(updates.try_recv().is_err());
+
+        let renamed = manager
+            .rename_session(RenameAgentSessionRequest {
+                session_id: session.id.clone(),
+                title: "  Manual\nlabel  ".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(renamed.title, "Manual label");
+        assert_eq!(updates.try_recv().unwrap(), renamed);
+
+        assert!(
+            !manager
+                .apply_auto_session_title(&session.id, "replacement generated title")
+                .unwrap()
+        );
+        assert!(updates.try_recv().is_err());
+        assert_eq!(
+            manager.get_session(&session.id).await.unwrap().title,
+            "Manual label"
+        );
+
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
     #[test]
     fn delegation_model_validation_rejects_unconfigured_profile_models() {
         let mut profile = ProviderProfile::local_default(ProviderKind::Acp);
@@ -6122,6 +6335,18 @@ mod tests {
             ),
             item(
                 4,
+                TimelineSource::Provider,
+                TimelinePayload::Retry(vibex_core::AgentRetryPayload {
+                    kind: vibex_core::RetryKind::ModelRequest,
+                    phase: vibex_core::RetryPhase::Started,
+                    attempt: Some(1),
+                    max_attempts: Some(3),
+                    delay_ms: None,
+                    reason: Some("provider unavailable".to_string()),
+                }),
+            ),
+            item(
+                5,
                 TimelineSource::Agent,
                 TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
                     text: "answer".to_string(),
@@ -6141,7 +6366,7 @@ mod tests {
             TimelinePayload::AgentMessage(_)
         ));
         assert_eq!(projected[0].timestamp_ms, Some(102));
-        assert_eq!(projected[1].timestamp_ms, Some(104));
+        assert_eq!(projected[1].timestamp_ms, Some(105));
         assert!(projected.iter().all(|item| item.correlation_id.is_none()
             && item.provider_correlation_id.is_none()
             && item.execution_attribution.is_none()));
@@ -6294,6 +6519,7 @@ mod tests {
             payload,
             provider_correlation_id: Some(correlation.clone()),
             redaction_state: TimelineRedactionState::None,
+            session_title: None,
         };
         assert!(provider_event_was_streamed(
             &duplicate,
@@ -6321,6 +6547,103 @@ mod tests {
     }
 
     #[test]
+    fn final_retry_snapshot_does_not_replace_latest_streamed_attempt() {
+        let session_id = VibexSessionId::new();
+        let correlation = "provider-retry".to_string();
+        let latest_payload = TimelinePayload::Retry(vibex_core::AgentRetryPayload {
+            kind: vibex_core::RetryKind::ModelRequest,
+            phase: vibex_core::RetryPhase::Started,
+            attempt: Some(2),
+            max_attempts: Some(3),
+            delay_ms: Some(2_000),
+            reason: Some("provider returned 502".to_string()),
+        });
+        let streamed = TimelineItem {
+            id: vibex_core::TimelineItemId::new(),
+            session_id,
+            sequence: 1,
+            timestamp_ms: 1,
+            source: TimelineSource::Provider,
+            kind: latest_payload.kind(),
+            correlation_id: None,
+            provider_correlation_id: Some(correlation.clone()),
+            redaction_state: TimelineRedactionState::None,
+            execution_attribution: None,
+            payload: latest_payload,
+        };
+        let indices = HashMap::from([(correlation.clone(), 0)]);
+        let stale = ProviderEvent {
+            source: TimelineSource::Provider,
+            payload: TimelinePayload::Retry(vibex_core::AgentRetryPayload {
+                kind: vibex_core::RetryKind::ModelRequest,
+                phase: vibex_core::RetryPhase::Started,
+                attempt: Some(1),
+                max_attempts: Some(3),
+                delay_ms: Some(1_000),
+                reason: Some("provider returned 503".to_string()),
+            }),
+            provider_correlation_id: Some(correlation),
+            redaction_state: TimelineRedactionState::None,
+            session_title: None,
+        };
+
+        assert!(provider_event_was_streamed_in_final_result(
+            &stale,
+            std::slice::from_ref(&streamed),
+            &indices,
+        ));
+        // A live update with the same correlation still reaches the upsert so
+        // the dynamic attempt counter can advance.
+        assert!(!provider_event_was_streamed(
+            &stale,
+            std::slice::from_ref(&streamed),
+            &indices,
+        ));
+
+        let settled = |phase| ProviderEvent {
+            source: TimelineSource::Provider,
+            payload: TimelinePayload::Retry(vibex_core::AgentRetryPayload {
+                kind: vibex_core::RetryKind::ModelRequest,
+                phase,
+                attempt: Some(2),
+                max_attempts: Some(3),
+                delay_ms: None,
+                reason: Some("provider returned 502".to_string()),
+            }),
+            provider_correlation_id: Some("provider-retry".to_string()),
+            redaction_state: TimelineRedactionState::None,
+            session_title: None,
+        };
+        assert!(!provider_event_was_streamed_in_final_result(
+            &settled(vibex_core::RetryPhase::Recovered),
+            std::slice::from_ref(&streamed),
+            &indices,
+        ));
+        assert!(!provider_event_was_streamed_in_final_result(
+            &settled(vibex_core::RetryPhase::Exhausted),
+            std::slice::from_ref(&streamed),
+            &indices,
+        ));
+
+        let exhausted = TimelineItem {
+            payload: TimelinePayload::Retry(vibex_core::AgentRetryPayload {
+                kind: vibex_core::RetryKind::ModelRequest,
+                phase: vibex_core::RetryPhase::Exhausted,
+                attempt: Some(3),
+                max_attempts: Some(3),
+                delay_ms: None,
+                reason: Some("provider returned 503".to_string()),
+            }),
+            ..streamed.clone()
+        };
+        assert!(provider_event_was_streamed_in_final_result(
+            &stale,
+            std::slice::from_ref(&exhausted),
+            &indices,
+        ));
+    }
+
+    #[test]
     fn streamed_event_index_keeps_state_changes_but_drops_repeated_snapshots() {
         let session_id = VibexSessionId::new();
         let correlation = "provider-command".to_string();
@@ -6336,6 +6659,7 @@ mod tests {
             }),
             provider_correlation_id: Some(correlation.clone()),
             redaction_state: TimelineRedactionState::None,
+            session_title: None,
         };
         let mut items = Vec::new();
         let mut indices = HashMap::new();

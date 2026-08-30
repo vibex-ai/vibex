@@ -17,8 +17,25 @@ use crate::timeline::{MessageAttachment, TimelineItem, TimelinePage};
 use crate::workspace::WorkspaceMode;
 
 pub const MAX_MESSAGE_IDEMPOTENCY_KEY_LEN: usize = 256;
+pub const MAX_AGENT_SESSION_TITLE_CHARS: usize = 120;
 pub const AGENT_ATTENTION_NOTIFICATION_TTL_MS: i64 = 15 * 60 * 1000;
 pub const AGENT_TERMINAL_NOTIFICATION_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Normalize a user- or Agent-supplied session title at the shared contract
+/// boundary. Titles are single-line display labels and must remain bounded
+/// before they enter persistence or a client projection.
+pub fn normalize_agent_session_title(value: &str) -> Option<String> {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(
+        normalized
+            .chars()
+            .take(MAX_AGENT_SESSION_TITLE_CHARS)
+            .collect(),
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -541,6 +558,18 @@ pub struct AgentCommandExecuteResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_title_normalization_collapses_whitespace_and_bounds_unicode() {
+        assert_eq!(
+            normalize_agent_session_title("  plan\n\t the release  "),
+            Some("plan the release".to_string())
+        );
+        assert_eq!(normalize_agent_session_title(" \n\t "), None);
+
+        let title = normalize_agent_session_title(&"你".repeat(121)).unwrap();
+        assert_eq!(title.chars().count(), MAX_AGENT_SESSION_TITLE_CHARS);
+    }
 
     #[test]
     fn continuation_requirement_uses_turn_completion_for_idle_and_error_sessions() {

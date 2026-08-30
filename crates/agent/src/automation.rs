@@ -1087,6 +1087,7 @@ mod tests {
                         ),
                         provider_correlation_id: Some("test-permission".to_string()),
                         redaction_state: vibex_core::TimelineRedactionState::None,
+                        session_title: None,
                     }],
                     binding_update: None,
                     completed: false,

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use vibex_core::{
     AgentDelegationId, AgentMessagePhase, AgentSession, AgentSessionState,
-    ElicitationRequestStatus, PermissionRequestStatus, PlanStepPayload, PlanStepStatus,
+    ElicitationRequestStatus, PermissionRequestStatus, PlanStepPayload, PlanStepStatus, RetryPhase,
     TimelineItem, TimelineItemKind, TimelinePayload, ToolCallStatus, VibexSessionId,
 };
 
@@ -147,6 +147,7 @@ pub enum TimelineRowKind {
     PermissionResolution,
     ElicitationRequest,
     ElicitationResolution,
+    Retry,
     Error,
 }
 
@@ -717,6 +718,7 @@ fn is_process_activity_row(kind: TimelineRowKind) -> bool {
             | TimelineRowKind::WebSearch
             | TimelineRowKind::TodoUpdate
             | TimelineRowKind::Collaboration
+            | TimelineRowKind::Retry
     )
 }
 
@@ -1307,6 +1309,31 @@ fn timeline_rows_from_refs(items: &[&TimelineItem]) -> Vec<TimelineRow> {
                 false,
                 false,
             )),
+            TimelinePayload::Retry(retry) => {
+                let key = correlation
+                    .as_deref()
+                    .map(|value| format!("retry:{value}"))
+                    .unwrap_or_else(|| format!("retry:{}", item.id));
+                let (title, body, streaming) = retry_row_text(retry);
+                if let Some(previous) = rows.iter_mut().find(|row| row.id == key) {
+                    previous.title = title;
+                    previous.body = body;
+                    previous.streaming = streaming;
+                    previous.last_sequence = item.sequence;
+                    record_row_item_id(&mut previous.item_ids, item.id.to_string());
+                    merge_runtime_attribution(previous, item);
+                } else {
+                    rows.push(simple_row(
+                        item,
+                        key,
+                        TimelineRowKind::Retry,
+                        title,
+                        body,
+                        streaming,
+                        false,
+                    ));
+                }
+            }
             TimelinePayload::Error(error) => {
                 let mut row = simple_row(
                     item,
@@ -1445,6 +1472,38 @@ fn simple_row(
     }
 }
 
+fn retry_row_text(retry: &vibex_core::AgentRetryPayload) -> (String, String, bool) {
+    let phase_title = match retry.phase {
+        RetryPhase::Started => "Retrying",
+        RetryPhase::Recovered => "Retry recovered",
+        RetryPhase::Exhausted => "Retry exhausted",
+    };
+    let attempt = match (retry.attempt, retry.max_attempts) {
+        (Some(attempt), Some(max)) => format!("attempt {attempt}/{max}"),
+        (Some(attempt), None) => format!("attempt {attempt}"),
+        _ => String::new(),
+    };
+    let title = if attempt.is_empty() {
+        phase_title.to_string()
+    } else {
+        format!("{phase_title} ({attempt})")
+    };
+    let delay = retry
+        .delay_ms
+        .filter(|delay| *delay > 0)
+        .map(|delay| format!("waiting {}s", delay.div_ceil(1000)));
+    let body = [
+        attempt,
+        delay.unwrap_or_default(),
+        retry.reason.clone().unwrap_or_default(),
+    ]
+    .into_iter()
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join(" - ");
+    (title, body, retry.phase == RetryPhase::Started)
+}
+
 fn runtime_attribution(item: &TimelineItem) -> Option<String> {
     item.execution_attribution.as_ref().map(|attribution| {
         format!(
@@ -1552,10 +1611,10 @@ mod tests {
     use serde_json::json;
     use vibex_core::{
         AgentDelegationId, AgentId, AgentMessageDeltaPayload, AgentMessagePayload,
-        AgentSessionSafety, CollaborationPayload, FileOperationPayload, PlanPayload, ProjectId,
-        ReasoningPayload, TimelineItemId, TimelineRedactionState, TimelineSource,
-        TodoUpdatePayload, ToolCallPayload, ToolCallStatus, TurnExecutionAttributionView,
-        UserMessagePayload, WorkspaceId, WorkspaceMode,
+        AgentRetryPayload, AgentSessionSafety, CollaborationPayload, FileOperationPayload,
+        PlanPayload, ProjectId, ReasoningPayload, RetryKind, RetryPhase, TimelineItemId,
+        TimelineRedactionState, TimelineSource, TodoUpdatePayload, ToolCallPayload, ToolCallStatus,
+        TurnExecutionAttributionView, UserMessagePayload, WorkspaceId, WorkspaceMode,
     };
 
     fn session(id: &str, project: &str, title: &str, updated_at_ms: i64) -> AgentSession {
@@ -1591,6 +1650,31 @@ mod tests {
             execution_attribution: None,
             payload,
         }
+    }
+
+    fn retry_item(
+        sequence: i64,
+        provider_correlation_id: &str,
+        phase: RetryPhase,
+        attempt: Option<u32>,
+        max_attempts: Option<u32>,
+        reason: Option<&str>,
+    ) -> TimelineItem {
+        let mut item = item(
+            sequence,
+            None,
+            TimelinePayload::Retry(AgentRetryPayload {
+                kind: RetryKind::ModelRequest,
+                phase,
+                attempt,
+                max_attempts,
+                delay_ms: None,
+                reason: reason.map(str::to_string),
+            }),
+        );
+        item.source = TimelineSource::Provider;
+        item.provider_correlation_id = Some(provider_correlation_id.to_string());
+        item
     }
 
     #[test]
@@ -2492,9 +2576,52 @@ mod tests {
         assert!(is_process_activity_row(TimelineRowKind::ToolCall));
         assert!(is_process_activity_row(TimelineRowKind::WebSearch));
         assert!(is_process_activity_row(TimelineRowKind::Collaboration));
+        assert!(is_process_activity_row(TimelineRowKind::Retry));
         assert!(!is_process_activity_row(TimelineRowKind::Command));
         assert!(!is_process_activity_row(TimelineRowKind::FileOperation));
         assert!(!is_process_activity_row(TimelineRowKind::ImageGeneration));
+    }
+
+    #[test]
+    fn retry_rows_coalesce_progress_into_one_dynamic_activity_line() {
+        let items = vec![
+            retry_item(
+                1,
+                "retry-turn-1",
+                RetryPhase::Started,
+                Some(1),
+                Some(3),
+                Some("provider returned 503"),
+            ),
+            retry_item(
+                2,
+                "retry-turn-1",
+                RetryPhase::Started,
+                Some(2),
+                Some(3),
+                Some("provider returned 502"),
+            ),
+            retry_item(
+                3,
+                "retry-turn-1",
+                RetryPhase::Exhausted,
+                Some(3),
+                Some(3),
+                Some("provider returned 500"),
+            ),
+        ];
+
+        let rows = timeline_rows(&items);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, TimelineRowKind::Retry);
+        assert_eq!(rows[0].id, "retry:retry-turn-1");
+        assert_eq!(rows[0].title, "Retry exhausted (attempt 3/3)");
+        assert_eq!(rows[0].body, "attempt 3/3 - provider returned 500");
+        assert!(!rows[0].streaming);
+        assert_eq!(rows[0].first_sequence, 1);
+        assert_eq!(rows[0].last_sequence, 3);
+        assert_eq!(rows[0].item_ids, vec!["timeline_1", "timeline_3"]);
     }
 
     #[test]

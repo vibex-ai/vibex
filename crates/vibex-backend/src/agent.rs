@@ -45,6 +45,7 @@ pub struct BackendRefetch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendEvent {
     Timeline(TimelineLiveEvent),
+    SessionUpdated(AgentSession),
     Notification(AgentNotificationIntent),
     Runtime(RuntimeSessionEvent),
     RuntimeSelection(AgentSessionRuntimeSelectionEvent),

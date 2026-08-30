@@ -94,7 +94,8 @@ use vibex_core::{
     TerminalStatus, TerminalSwitchShellRequest, TimelineItem, TimelineItemId, TimelineLiveEvent,
     TimelinePage, TimelinePayload, TimelineRedactionState, TimelineSource, UserMessagePayload,
     VibexSessionId, WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation,
-    latest_timeline_turn_ended_normally, managed_worktree_name_slug, unix_timestamp_ms,
+    latest_timeline_turn_ended_normally, managed_worktree_name_slug, normalize_agent_session_title,
+    unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     AgentOrderEntry, AgentOrdering, AgentPlanProjection, AgentSortStrategy, AppearanceUiState,
@@ -2347,6 +2348,16 @@ fn timeline_item_resident_bytes(item: &TimelineItem) -> usize {
                     .responder_device_id
                     .as_ref()
                     .map_or(0, |id| id.as_str().len()),
+            ),
+        TimelinePayload::Retry(retry) => retry
+            .reason
+            .as_ref()
+            .map_or(0, String::len)
+            .saturating_add(retry.attempt.map_or(0, |value| value.to_string().len()))
+            .saturating_add(
+                retry
+                    .max_attempts
+                    .map_or(0, |value| value.to_string().len()),
             ),
         TimelinePayload::Error(error) => error.code.len().saturating_add(error.message.len()),
     };
@@ -10531,6 +10542,32 @@ impl VibexWorkbench {
     fn apply_desktop_event(&mut self, event: DesktopEvent, cx: &mut Context<Self>) -> bool {
         match event {
             DesktopEvent::Timeline(event) => self.apply_live_timeline_batch(vec![event], cx),
+            DesktopEvent::SessionUpdated(session) => {
+                let selected_projection_changed = self
+                    .selected_session_id
+                    .as_ref()
+                    .is_some_and(|selected| selected == &session.id)
+                    && self
+                        .sessions
+                        .iter()
+                        .find(|existing| existing.id == session.id)
+                        .is_none_or(|existing| existing.state != session.state);
+                let changed = self
+                    .sessions
+                    .iter()
+                    .find(|existing| existing.id == session.id)
+                    .is_none_or(|existing| existing != &session);
+                if changed {
+                    let session_id = session.id.clone();
+                    self.upsert_session_snapshot(session);
+                    self.reconcile_sidebar_state();
+                    self.sync_auto_continue_for_session(&session_id, cx);
+                }
+                if selected_projection_changed {
+                    self.refresh_last_timeline_size();
+                }
+                changed
+            }
             DesktopEvent::Runtime(event) => {
                 let changed = self
                     .selected_session_id
@@ -16752,7 +16789,10 @@ impl VibexWorkbench {
                 runtime: selection.clone(),
                 workspace_root,
                 workspace_mode,
-                title,
+                // The prompt-derived title is an optimistic presentation value.
+                // The manager persists it as an unlocked automatic fallback after
+                // the first user message, so a later ACP title can replace it.
+                title: None,
                 safety: None,
             };
             let recovery_session_id = optimistic_session_id.clone();
@@ -31923,7 +31963,8 @@ impl VibexWorkbench {
             TimelineRowKind::ToolCall
             | TimelineRowKind::WebSearch
             | TimelineRowKind::TodoUpdate
-            | TimelineRowKind::Collaboration => self.render_process_activity_line(row, cx),
+            | TimelineRowKind::Collaboration
+            | TimelineRowKind::Retry => self.render_process_activity_line(row, cx),
             TimelineRowKind::GitNotice
             | TimelineRowKind::SystemNotice
             | TimelineRowKind::PermissionResolution
@@ -32366,7 +32407,8 @@ impl VibexWorkbench {
             | TimelineRowKind::ToolCall
             | TimelineRowKind::WebSearch
             | TimelineRowKind::TodoUpdate
-            | TimelineRowKind::Collaboration => {
+            | TimelineRowKind::Collaboration
+            | TimelineRowKind::Retry => {
                 let projection = tool_card_projection(row, payload);
                 let mut height = 24.0;
                 let expanded = !projection.details.is_empty()
@@ -40586,20 +40628,7 @@ fn clamp_attachment_preview_pan(
 }
 
 fn session_title_from_first_message(message: &str) -> Option<String> {
-    const MAX_CHARS: usize = 80;
-    let title = message.split_whitespace().collect::<Vec<_>>().join(" ");
-    if title.is_empty() {
-        return None;
-    }
-    let characters = title.chars().collect::<Vec<_>>();
-    if characters.len() <= MAX_CHARS {
-        Some(title)
-    } else {
-        Some(format!(
-            "{}...",
-            characters[..MAX_CHARS - 3].iter().collect::<String>()
-        ))
-    }
+    normalize_agent_session_title(message)
 }
 
 fn title_bar_session_context_visible(
@@ -55714,15 +55743,14 @@ mod tests {
     }
 
     #[test]
-    fn new_session_title_matches_tauri_whitespace_and_unicode_bounds() {
+    fn new_session_title_uses_shared_whitespace_and_unicode_bounds() {
         assert_eq!(
             session_title_from_first_message("  hello\nworld  "),
             Some("hello world".into())
         );
         assert_eq!(session_title_from_first_message(" \n\t "), None);
-        let title = session_title_from_first_message(&"你".repeat(81)).unwrap();
-        assert_eq!(title.chars().count(), 80);
-        assert!(title.ends_with("..."));
+        let title = session_title_from_first_message(&"你".repeat(121)).unwrap();
+        assert_eq!(title.chars().count(), 120);
     }
 
     #[test]
