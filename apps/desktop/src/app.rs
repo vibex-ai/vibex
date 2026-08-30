@@ -109,15 +109,16 @@ use vibex_desktop_model::{
     SidebarProjectLogo, SidebarProjectLogoColor, SidebarProjectProjection, SidebarState,
     SidebarWorkspaceProjection, StartupDestination, TerminalWorkingDirectory,
     ThemeMode as ModelThemeMode, ThrottledUiStateWriter, TimelineConversationTurn,
-    TimelineFollowState, TimelineModel, TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
-    UiStateStore, UnifiedDiffLineKind, WorkbenchRoute, WorkspaceContextProjection,
-    WorktreeLifecycleDisplayState, active_collaborations, complete_string_order,
-    composer_trigger_at, current_agent_plan, custom_worktree_path_is_absolute,
-    move_string_relative, move_strings_relative, ordered_agent_ids, parse_unified_diff,
+    TimelineDelegationProjection, TimelineFollowState, TimelineModel, TimelineProcessActivityGroup,
+    TimelineRow, TimelineRowKind, UiStateStore, UnifiedDiffLineKind, WorkbenchRoute,
+    WorkspaceContextProjection, WorktreeLifecycleDisplayState, active_collaborations,
+    complete_string_order, composer_trigger_at, current_agent_plan,
+    custom_worktree_path_is_absolute, has_managed_child_agent_delegations, move_string_relative,
+    move_strings_relative, ordered_agent_ids, parse_unified_diff,
     sidebar_project_custom_logo_file_is_valid, sidebar_project_items,
     sidebar_project_items_for_workspace, sidebar_project_projections_with_workspace_order,
     sidebar_root_items, timeline_agent_message_count_after_sequence, timeline_conversation_turns,
-    timeline_conversation_turns_with_reasoning_mode,
+    timeline_conversation_turns_with_reasoning_mode, timeline_row_delegation,
 };
 use vibex_desktop_runtime::{
     DesktopEvent, DesktopRuntime, DesktopRuntimeConfig, DesktopRuntimeFacade, PREVIEW_APP_ID,
@@ -265,6 +266,8 @@ const NEW_SESSION_AGENT_DRAG_HORIZONTAL_SLOP: f32 = 2.0;
 const NEW_SESSION_AGENT_DRAG_VERTICAL_SLOP: f32 = 8.0;
 const NEW_SESSION_COMPACT_SELECTOR_MAX_WIDTH: u32 = 860;
 const AGENT_TIMELINE_FETCH_PAGE_LIMIT: u32 = 500;
+const CHILD_AGENT_TIMELINE_PREVIEW_ROW_LIMIT: usize = 6;
+const CHILD_AGENT_TIMELINE_MAX_NESTING: u8 = 3;
 const AGENT_CONTENT_NARROW_MAX_WIDTH: f32 = 768.0;
 const AGENT_CONTENT_STANDARD_MAX_WIDTH: f32 = 1024.0;
 const AGENT_SESSION_VIEW_CACHE_LIMIT: usize = 12;
@@ -1960,6 +1963,41 @@ struct TimelineItemIndex {
     item_count: usize,
     end_sequence: Option<i64>,
     positions: HashMap<String, usize>,
+}
+
+struct ChildAgentTimelineState {
+    timeline: TimelineModel,
+    loaded: bool,
+    loading: bool,
+    error: Option<String>,
+    load_generation: u64,
+}
+
+impl ChildAgentTimelineState {
+    fn new(session_id: VibexSessionId) -> Self {
+        let mut timeline = TimelineModel::default();
+        timeline.replace_authoritative(session_id, std::iter::empty());
+        Self {
+            timeline,
+            loaded: false,
+            loading: false,
+            error: None,
+            load_generation: 0,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ChildAgentTimelineRowProjection {
+    row: TimelineRow,
+    delegation: Option<TimelineDelegationProjection>,
+}
+
+struct ChildAgentTimelineSnapshot {
+    loading: bool,
+    loaded: bool,
+    error: Option<String>,
+    rows: Vec<ChildAgentTimelineRowProjection>,
 }
 
 impl TimelineItemIndex {
@@ -4069,6 +4107,11 @@ pub struct VibexWorkbench {
     runtime_client_id: RuntimeClientId,
     session_generation: u64,
     timeline: TimelineModel,
+    child_agent_timelines: BTreeMap<String, ChildAgentTimelineState>,
+    child_agent_expanded_delegations: BTreeSet<String>,
+    child_agent_tabs: Vec<VibexSessionId>,
+    child_agent_active_tab: Option<VibexSessionId>,
+    child_agent_panel_active: bool,
     timeline_item_index: RefCell<TimelineItemIndex>,
     timeline_follow: TimelineFollowState,
     timeline_scroll: VirtualListScrollHandle,
@@ -4775,6 +4818,11 @@ impl VibexWorkbench {
             runtime_client_id: RuntimeClientId::new(),
             session_generation: 0,
             timeline: TimelineModel::default(),
+            child_agent_timelines: BTreeMap::new(),
+            child_agent_expanded_delegations: BTreeSet::new(),
+            child_agent_tabs: Vec::new(),
+            child_agent_active_tab: None,
+            child_agent_panel_active: false,
             timeline_item_index: RefCell::new(TimelineItemIndex::default()),
             timeline_follow: TimelineFollowState::default(),
             timeline_scroll: VirtualListScrollHandle::new(),
@@ -9578,6 +9626,18 @@ impl VibexWorkbench {
         }
         if navigation_changed {
             self.stash_current_composer_draft(cx);
+            // Child tabs and expanded previews are scoped to the parent
+            // session currently shown in the center timeline. Do not leave a
+            // previous parent's child session visible after navigation.
+            self.child_agent_timelines.clear();
+            self.child_agent_expanded_delegations.clear();
+            self.child_agent_tabs.clear();
+            self.child_agent_active_tab = None;
+            if self.child_agent_panel_active {
+                self.child_agent_panel_active = false;
+                self.ui_state.workbench.right_rail_visible = false;
+                self.right_rail_overlay_open = false;
+            }
         }
         self.stash_current_agent_session_view();
         self.session_generation = self.session_generation.saturating_add(1);
@@ -9773,6 +9833,157 @@ impl VibexWorkbench {
                 });
             },
         ));
+    }
+
+    fn child_agent_timeline_snapshot(
+        &self,
+        session_id: &VibexSessionId,
+    ) -> Option<ChildAgentTimelineSnapshot> {
+        self.child_agent_timelines
+            .get(session_id.as_str())
+            .map(|state| ChildAgentTimelineSnapshot {
+                loading: state.loading,
+                loaded: state.loaded,
+                error: state.error.clone(),
+                rows: state
+                    .timeline
+                    .rows()
+                    .into_iter()
+                    .map(|row| ChildAgentTimelineRowProjection {
+                        delegation: timeline_row_delegation(&row, &state.timeline.items),
+                        row,
+                    })
+                    .collect(),
+            })
+    }
+
+    fn ensure_child_agent_timeline(
+        &mut self,
+        session_id: VibexSessionId,
+        force_reload: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let key = session_id.as_str().to_string();
+        let load_generation = {
+            let state = self
+                .child_agent_timelines
+                .entry(key.clone())
+                .or_insert_with(|| ChildAgentTimelineState::new(session_id.clone()));
+            if state.loading
+                || (!force_reload && state.loaded && !state.timeline.needs_authoritative_refetch)
+            {
+                return;
+            }
+            state.loading = true;
+            state.error = None;
+            state.load_generation = state.load_generation.wrapping_add(1);
+            state.load_generation
+        };
+        let Some(runtime) = self.runtime.clone() else {
+            if let Some(state) = self.child_agent_timelines.get_mut(&key) {
+                state.loading = false;
+                state.error = Some("Agent runtime is not available".to_string());
+            }
+            cx.notify();
+            return;
+        };
+        let request_session_id = session_id.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            fetch_authoritative_timeline(runtime, request_session_id).await
+        });
+        cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    let Some(state) = this.child_agent_timelines.get_mut(&key) else {
+                        return;
+                    };
+                    if state.load_generation != load_generation {
+                        return;
+                    }
+                    state.loading = false;
+                    match outcome {
+                        Ok(Ok(items)) => {
+                            let fetched_end_sequence = items.last().map(|item| item.sequence);
+                            let live_tail = state
+                                .timeline
+                                .items
+                                .iter()
+                                .filter(|item| {
+                                    fetched_end_sequence
+                                        .is_none_or(|sequence| item.sequence > sequence)
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            state
+                                .timeline
+                                .replace_authoritative(session_id.clone(), items);
+                            for item in live_tail {
+                                state.timeline.apply_live(TimelineLiveEvent {
+                                    session_id: session_id.clone(),
+                                    sequence: item.sequence,
+                                    item,
+                                });
+                            }
+                            state.loaded = true;
+                            state.error = None;
+                        }
+                        Ok(Err(error)) => {
+                            state.error = Some(format!("{}: {}", error.code, error.message));
+                        }
+                        Err(error) => {
+                            state.error = Some(format!("child session load task failed: {error}"));
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        )
+        .detach();
+    }
+
+    fn apply_child_agent_timeline_events(
+        &mut self,
+        selected_session_id: Option<&VibexSessionId>,
+        events: &[TimelineLiveEvent],
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut changed = false;
+        let mut reloads = Vec::new();
+        for event in events {
+            if selected_session_id == Some(&event.session_id) {
+                continue;
+            }
+            let Some(state) = self
+                .child_agent_timelines
+                .get_mut(event.session_id.as_str())
+            else {
+                continue;
+            };
+            changed |= state.timeline.apply_live(event.clone());
+            if state.timeline.needs_authoritative_refetch && !state.loading {
+                reloads.push(event.session_id.clone());
+            }
+        }
+        reloads.sort();
+        reloads.dedup();
+        for session_id in reloads {
+            self.ensure_child_agent_timeline(session_id, true, cx);
+        }
+        changed
+    }
+
+    fn toggle_child_agent_delegation(
+        &mut self,
+        delegation: &TimelineDelegationProjection,
+        cx: &mut Context<Self>,
+    ) {
+        let delegation_id = delegation.delegation_id.as_str().to_string();
+        if !self.child_agent_expanded_delegations.remove(&delegation_id) {
+            self.child_agent_expanded_delegations.insert(delegation_id);
+            self.ensure_child_agent_timeline(delegation.child_session_id.clone(), false, cx);
+        }
+        cx.notify();
     }
 
     fn refresh_selected_agent_timeline(&mut self, cx: &mut Context<Self>) {
@@ -10164,15 +10375,18 @@ impl VibexWorkbench {
         if sidebar_changed || unread_changed {
             self.publish_sidebar_invalidation();
         }
-        let Some(selected_session_id) = self.selected_session_id.clone() else {
-            return unread_changed || sidebar_changed;
+        let selected_session_id = self.selected_session_id.clone();
+        let child_timeline_changed =
+            self.apply_child_agent_timeline_events(selected_session_id.as_ref(), &events, cx);
+        let Some(selected_session_id) = selected_session_id else {
+            return unread_changed || sidebar_changed || child_timeline_changed;
         };
         let events = events
             .into_iter()
             .filter(|event| event.session_id == selected_session_id)
             .collect::<Vec<_>>();
         if events.is_empty() {
-            return unread_changed || sidebar_changed;
+            return unread_changed || sidebar_changed || child_timeline_changed;
         }
 
         let previous_end_sequence = self.timeline.authoritative_end_sequence;
@@ -10256,8 +10470,8 @@ impl VibexWorkbench {
         }
         timeline_batch_should_repaint(
             &self.ui_state.workbench.active_tab,
-            unread_changed || sidebar_changed,
-            changed > 0,
+            unread_changed || sidebar_changed || child_timeline_changed,
+            changed > 0 || child_timeline_changed,
             needs_refetch,
         )
     }
@@ -19796,8 +20010,86 @@ impl VibexWorkbench {
         let visibility_changed = self.ui_state.workbench.right_rail_visible;
         self.ui_state.workbench.right_rail_visible = false;
         self.right_rail_overlay_open = false;
+        self.child_agent_panel_active = false;
         if visibility_changed {
             self.queue_ui_state();
+        }
+        cx.notify();
+    }
+
+    fn open_child_agent_timeline(&mut self, session_id: VibexSessionId, cx: &mut Context<Self>) {
+        if !self.child_agent_tabs.contains(&session_id) {
+            self.child_agent_tabs.push(session_id.clone());
+        }
+        self.child_agent_active_tab = Some(session_id.clone());
+        self.ensure_child_agent_timeline(session_id, false, cx);
+        self.open_child_agent_panel(cx);
+    }
+
+    fn open_child_agent_panel(&mut self, cx: &mut Context<Self>) {
+        if self.child_agent_tabs.is_empty() {
+            let child_session_id = self.timeline.rows().into_iter().rev().find_map(|row| {
+                timeline_row_delegation(&row, &self.timeline.items)
+                    .map(|delegation| delegation.child_session_id)
+            });
+            let Some(child_session_id) = child_session_id else {
+                return;
+            };
+            self.child_agent_tabs.push(child_session_id.clone());
+            self.child_agent_active_tab = Some(child_session_id.clone());
+            self.ensure_child_agent_timeline(child_session_id, false, cx);
+        }
+        self.child_agent_panel_active = true;
+        let visibility_changed = !self.ui_state.workbench.right_rail_visible;
+        self.ui_state.workbench.right_rail_visible = true;
+        if !self.right_rail_docks_when_open(cx) {
+            self.right_rail_overlay_open = true;
+            self.preview_overlay_open = false;
+        } else {
+            self.right_rail_overlay_open = false;
+        }
+        if visibility_changed {
+            self.queue_ui_state();
+        }
+        cx.notify();
+    }
+
+    fn toggle_child_agent_panel(&mut self, cx: &mut Context<Self>) {
+        if self.right_rail_panel_open() && self.child_agent_panel_active {
+            self.close_right_rail(cx);
+        } else {
+            self.open_child_agent_panel(cx);
+        }
+    }
+
+    fn select_child_agent_tab(&mut self, session_id: VibexSessionId, cx: &mut Context<Self>) {
+        if self.child_agent_tabs.contains(&session_id) {
+            self.child_agent_active_tab = Some(session_id.clone());
+            self.ensure_child_agent_timeline(session_id, false, cx);
+            cx.notify();
+        }
+    }
+
+    fn close_child_agent_tab(&mut self, session_id: &VibexSessionId, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .child_agent_tabs
+            .iter()
+            .position(|candidate| candidate == session_id)
+        else {
+            return;
+        };
+        self.child_agent_tabs.remove(index);
+        if self.child_agent_active_tab.as_ref() == Some(session_id) {
+            self.child_agent_active_tab = self
+                .child_agent_tabs
+                .get(index)
+                .cloned()
+                .or_else(|| self.child_agent_tabs.last().cloned());
+        }
+        if self.child_agent_tabs.is_empty() {
+            self.child_agent_panel_active = false;
+            self.close_right_rail(cx);
+            return;
         }
         cx.notify();
     }
@@ -19806,6 +20098,7 @@ impl VibexWorkbench {
         if mode == RightRailMode::Git && !self.selected_session_supports_git() {
             return;
         }
+        self.child_agent_panel_active = false;
         let activity_id = right_rail_activity_id(mode).to_string();
         let mode_changed =
             self.ui_state.right_rail.selected_activity_id.as_ref() != Some(&activity_id);
@@ -19855,11 +20148,22 @@ impl VibexWorkbench {
             self.close_right_rail(cx);
             return;
         }
+        if self.child_agent_panel_active {
+            self.open_child_agent_panel(cx);
+            return;
+        }
         let mode = self.right_rail_mode;
         self.open_right_rail_mode(mode, cx);
     }
 
     fn right_rail_panel_open(&self) -> bool {
+        if self.child_agent_panel_active {
+            return if self.last_visibility.right_rail_docked {
+                self.ui_state.workbench.right_rail_visible
+            } else {
+                self.right_rail_overlay_open
+            };
+        }
         if self.right_rail_mode == RightRailMode::Git && !self.selected_session_supports_git() {
             return false;
         }
@@ -19876,11 +20180,15 @@ impl VibexWorkbench {
             .is_some_and(|context| context.git_available)
     }
 
-    fn render_right_rail_panel(&self) -> AnyElement {
-        self.code_right_rail
-            .clone()
-            .cached(StyleRefinement::default().size_full())
-            .into_any_element()
+    fn render_right_rail_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if self.child_agent_panel_active {
+            self.render_child_agent_timeline_panel(cx)
+        } else {
+            self.code_right_rail
+                .clone()
+                .cached(StyleRefinement::default().size_full())
+                .into_any_element()
+        }
     }
 
     fn render_right_rail_activity_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -19930,11 +20238,27 @@ impl VibexWorkbench {
                     }
                 }))
                 .into_any_element();
-        let activities = if git_available {
+        let child_agent_activity = (has_managed_child_agent_delegations(&self.timeline.items)
+            || !self.child_agent_tabs.is_empty())
+        .then(|| {
+            right_rail_activity_button("activity-child-agents", Icon::new(IconName::Bot))
+                .tooltip(locale::text(
+                    "Child Agent timelines",
+                    "子 Agent 时间线",
+                    "子 Agent 時間線",
+                ))
+                .selected(panel_open && self.child_agent_panel_active)
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_child_agent_panel(cx)))
+                .into_any_element()
+        });
+        let mut activities = if git_available {
             vec![files, git, terminal]
         } else {
             vec![files, terminal]
         };
+        if let Some(child_agent_activity) = child_agent_activity {
+            activities.insert(1, child_agent_activity);
+        }
 
         v_flex()
             .id("right-rail-activity-bar")
@@ -30879,6 +31203,522 @@ impl VibexWorkbench {
             })
     }
 
+    fn render_child_agent_status_badge(status: vibex_core::ToolCallStatus, cx: &App) -> AnyElement {
+        let (label, color) = match status {
+            vibex_core::ToolCallStatus::Started => ("Starting", cx.theme().warning),
+            vibex_core::ToolCallStatus::Progress => ("Working", cx.theme().warning),
+            vibex_core::ToolCallStatus::Completed => ("Completed", cx.theme().success),
+            vibex_core::ToolCallStatus::Failed => ("Failed", cx.theme().danger),
+        };
+        div()
+            .flex_none()
+            .rounded(px(5.0))
+            .bg(color.opacity(if cx.theme().is_dark() { 0.20 } else { 0.12 }))
+            .px_2()
+            .py(px(2.0))
+            .text_xs()
+            .font_medium()
+            .text_color(color)
+            .child(label)
+            .into_any_element()
+    }
+
+    fn child_agent_session_label(&self, session_id: &VibexSessionId) -> String {
+        self.sessions
+            .iter()
+            .find(|session| session.id == *session_id)
+            .map(|session| session.title.clone())
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or_else(|| {
+                let suffix = session_id
+                    .as_str()
+                    .chars()
+                    .rev()
+                    .take(8)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<String>();
+                format!("Child Agent {suffix}")
+            })
+    }
+
+    fn render_agent_delegation_card(
+        &mut self,
+        row: &TimelineRow,
+        delegation: &TimelineDelegationProjection,
+        surface_id: &str,
+        nesting: u8,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let delegation_id = delegation.delegation_id.as_str().to_string();
+        let child_session_id = delegation.child_session_id.clone();
+        let expanded = self
+            .child_agent_expanded_delegations
+            .contains(&delegation_id);
+        let title = delegation
+            .agent_label
+            .clone()
+            .filter(|label| !label.trim().is_empty())
+            .unwrap_or_else(|| "Child Agent".to_string());
+        let card_id = format!("{surface_id}:delegation-card:{}", row.id);
+        let toggle_id = format!("{card_id}:toggle");
+        let open_id = format!("{card_id}:open");
+        let open_icon_id = format!("{card_id}:open-icon");
+        let preview = expanded.then(|| {
+            let preview_surface = format!("{surface_id}:delegation-preview:{delegation_id}");
+            self.child_agent_timeline_snapshot(&child_session_id)
+                .map(|snapshot| {
+                    self.render_child_agent_timeline_content(
+                        snapshot,
+                        &preview_surface,
+                        true,
+                        nesting.saturating_add(1),
+                        cx,
+                    )
+                })
+                .unwrap_or_else(|| {
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Loading child timeline")
+                        .into_any_element()
+                })
+        });
+        let toggle_delegation = delegation.clone();
+        let title_session_id = child_session_id.clone();
+        let icon_session_id = child_session_id.clone();
+        let mut card = v_flex()
+            .id(card_id)
+            .w_full()
+            .min_w_0()
+            .gap_2()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().muted.opacity(if expanded { 0.54 } else { 0.30 }))
+            .p_2()
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        Button::new(toggle_id)
+                            .ghost()
+                            .w_7()
+                            .px_0()
+                            .child(
+                                Icon::new(if expanded {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                })
+                                .size(px(15.0)),
+                            )
+                            .tooltip(if expanded {
+                                locale::text(
+                                    "Collapse child timeline",
+                                    "收起子 Agent 时间线",
+                                    "收起子 Agent 時間線",
+                                )
+                            } else {
+                                locale::text(
+                                    "Expand child timeline",
+                                    "展开子 Agent 时间线",
+                                    "展開子 Agent 時間線",
+                                )
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_child_agent_delegation(&toggle_delegation, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new(open_id)
+                            .small()
+                            .ghost()
+                            .min_w_0()
+                            .flex_1()
+                            .px_1()
+                            .justify_start()
+                            .label(title)
+                            .tooltip(locale::text(
+                                "Open child Agent timeline",
+                                "在右侧打开子 Agent 时间线",
+                                "在右側開啟子 Agent 時間線",
+                            ))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.open_child_agent_timeline(title_session_id.clone(), cx)
+                            })),
+                    )
+                    .child(Self::render_child_agent_status_badge(delegation.status, cx))
+                    .child(
+                        Button::new(open_icon_id)
+                            .ghost()
+                            .w_7()
+                            .px_0()
+                            .icon(IconName::ExternalLink)
+                            .tooltip(locale::text(
+                                "Open child Agent timeline",
+                                "在右侧打开子 Agent 时间线",
+                                "在右側開啟子 Agent 時間線",
+                            ))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.open_child_agent_timeline(icon_session_id.clone(), cx)
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .pl_8()
+                    .text_xs()
+                    .line_height(gpui::relative(1.4))
+                    .text_color(cx.theme().muted_foreground)
+                    .whitespace_normal()
+                    .child(delegation.summary.clone()),
+            );
+        if let Some(preview) = preview {
+            card = card.child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .ml_2()
+                    .pl_4()
+                    .border_l_1()
+                    .border_color(cx.theme().border)
+                    .child(preview),
+            );
+        }
+        card.into_any_element()
+    }
+
+    fn render_child_agent_timeline_row(
+        &mut self,
+        projection: &ChildAgentTimelineRowProjection,
+        surface_id: &str,
+        compact: bool,
+        nesting: u8,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if let Some(delegation) = projection.delegation.as_ref()
+            && nesting < CHILD_AGENT_TIMELINE_MAX_NESTING
+        {
+            return self.render_agent_delegation_card(
+                &projection.row,
+                delegation,
+                surface_id,
+                nesting,
+                cx,
+            );
+        }
+        let row = &projection.row;
+        let (icon, tone) = match row.kind {
+            TimelineRowKind::UserMessage => (Icon::new(IconName::User), cx.theme().foreground),
+            TimelineRowKind::AgentMessage => (Icon::new(IconName::Bot), cx.theme().foreground),
+            TimelineRowKind::Error => (Icon::new(IconName::CircleX), cx.theme().danger),
+            TimelineRowKind::PermissionRequest | TimelineRowKind::ElicitationRequest => {
+                (Icon::new(IconName::Info), cx.theme().warning)
+            }
+            TimelineRowKind::Collaboration => {
+                (Icon::new(IconName::Bot), cx.theme().muted_foreground)
+            }
+            _ => (Icon::new(IconName::Info), cx.theme().muted_foreground),
+        };
+        let body = if compact {
+            compact_agent_turn_preview_message(&row.body)
+        } else {
+            row.body.trim().to_string()
+        };
+        let row_id = format!("{surface_id}:timeline-row:{}", row.id);
+        v_flex()
+            .id(row_id)
+            .w_full()
+            .min_w_0()
+            .gap_1()
+            .rounded(px(5.0))
+            .px_2()
+            .py(px(6.0))
+            .when(row.failed, |this| {
+                this.bg(cx
+                    .theme()
+                    .danger
+                    .opacity(if cx.theme().is_dark() { 0.13 } else { 0.08 }))
+            })
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(tone)
+                    .child(icon.size(px(14.0)).flex_none())
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .font_medium()
+                            .child(row.title.clone()),
+                    )
+                    .when(row.streaming, |this| this.child(Spinner::new().xsmall()))
+                    .when(row.pending_permission, |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .rounded(px(4.0))
+                                .bg(cx.theme().warning.opacity(0.16))
+                                .px_1()
+                                .py(px(1.0))
+                                .text_xs()
+                                .text_color(cx.theme().warning)
+                                .child("Input required"),
+                        )
+                    }),
+            )
+            .when(!body.is_empty(), |this| {
+                this.child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .pl_5()
+                        .text_xs()
+                        .line_height(gpui::relative(1.4))
+                        .text_color(cx.theme().muted_foreground)
+                        .whitespace_normal()
+                        .child(body),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_child_agent_timeline_content(
+        &mut self,
+        snapshot: ChildAgentTimelineSnapshot,
+        surface_id: &str,
+        compact: bool,
+        nesting: u8,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if snapshot.rows.is_empty() && snapshot.loading {
+            return h_flex()
+                .w_full()
+                .min_w_0()
+                .items_center()
+                .gap_2()
+                .py_2()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(Spinner::new().xsmall())
+                .child("Loading timeline")
+                .into_any_element();
+        }
+        if let Some(error) = snapshot.error {
+            return div()
+                .w_full()
+                .min_w_0()
+                .rounded(px(5.0))
+                .bg(cx
+                    .theme()
+                    .danger
+                    .opacity(if cx.theme().is_dark() { 0.14 } else { 0.08 }))
+                .px_2()
+                .py_2()
+                .text_xs()
+                .text_color(cx.theme().danger)
+                .whitespace_normal()
+                .child(error)
+                .into_any_element();
+        }
+        if snapshot.rows.is_empty() {
+            return div()
+                .w_full()
+                .min_w_0()
+                .py_2()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(if snapshot.loaded {
+                    "No timeline activity"
+                } else {
+                    "Waiting for child Agent"
+                })
+                .into_any_element();
+        }
+        let start = compact
+            .then(|| {
+                snapshot
+                    .rows
+                    .len()
+                    .saturating_sub(CHILD_AGENT_TIMELINE_PREVIEW_ROW_LIMIT)
+            })
+            .unwrap_or_default();
+        let rows = snapshot.rows.into_iter().skip(start).collect::<Vec<_>>();
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .gap(if compact { px(2.0) } else { px(6.0) })
+            .children(rows.iter().map(|row| {
+                self.render_child_agent_timeline_row(row, surface_id, compact, nesting, cx)
+            }))
+            .into_any_element()
+    }
+
+    fn render_child_agent_timeline_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let tabs = self.child_agent_tabs.clone();
+        let active_session_id = self
+            .child_agent_active_tab
+            .clone()
+            .filter(|session_id| tabs.contains(session_id))
+            .or_else(|| tabs.last().cloned());
+        let active_snapshot = active_session_id
+            .as_ref()
+            .and_then(|session_id| self.child_agent_timeline_snapshot(session_id));
+        let tab_elements = tabs
+            .into_iter()
+            .map(|session_id| {
+                let active = active_session_id.as_ref() == Some(&session_id);
+                let label = self.child_agent_session_label(&session_id);
+                let select_session_id = session_id.clone();
+                let close_session_id = session_id.clone();
+                h_flex()
+                    .id(format!("child-agent-tab:{}", session_id.as_str()))
+                    .h(px(30.0))
+                    .min_w(px(112.0))
+                    .max_w(px(220.0))
+                    .items_center()
+                    .gap_1()
+                    .rounded(px(5.0))
+                    .border_1()
+                    .border_color(if active {
+                        cx.theme().accent
+                    } else {
+                        cx.theme().border
+                    })
+                    .bg(if active {
+                        cx.theme()
+                            .accent
+                            .opacity(if cx.theme().is_dark() { 0.18 } else { 0.10 })
+                    } else {
+                        cx.theme().muted.opacity(0.32)
+                    })
+                    .child(
+                        Button::new(format!("select-child-agent-tab:{}", session_id.as_str()))
+                            .ghost()
+                            .min_w_0()
+                            .flex_1()
+                            .h_full()
+                            .px_2()
+                            .justify_start()
+                            .label(label)
+                            .tooltip(session_id.as_str().to_string())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.select_child_agent_tab(select_session_id.clone(), cx)
+                            })),
+                    )
+                    .child(
+                        Button::new(format!("close-child-agent-tab:{}", session_id.as_str()))
+                            .ghost()
+                            .w_7()
+                            .px_0()
+                            .icon(IconName::Close)
+                            .tooltip(locale::text(
+                                "Close child Agent tab",
+                                "关闭子 Agent 标签页",
+                                "關閉子 Agent 分頁",
+                            ))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_child_agent_tab(&close_session_id, cx)
+                            })),
+                    )
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let body = if let (Some(session_id), Some(snapshot)) =
+            (active_session_id.as_ref(), active_snapshot)
+        {
+            self.render_child_agent_timeline_content(
+                snapshot,
+                &format!("child-agent-panel:{}", session_id.as_str()),
+                false,
+                0,
+                cx,
+            )
+        } else {
+            div()
+                .w_full()
+                .min_w_0()
+                .py_4()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child("Open a child Agent from the timeline")
+                .into_any_element()
+        };
+        v_flex()
+            .id("child-agent-right-rail")
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            .bg(cx.theme().background)
+            .child(
+                h_flex()
+                    .w_full()
+                    .h(px(42.0))
+                    .flex_none()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .px_3()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .font_medium()
+                            .child("Child Agents"),
+                    )
+                    .child(
+                        Button::new("close-child-agent-right-rail")
+                            .ghost()
+                            .w_8()
+                            .px_0()
+                            .icon(IconName::Close)
+                            .tooltip(locale::text("Close panel", "关闭面板", "關閉面板"))
+                            .on_click(cx.listener(|this, _, _, cx| this.close_right_rail(cx))),
+                    ),
+            )
+            .when(!tab_elements.is_empty(), |this| {
+                this.child(
+                    h_flex()
+                        .id("child-agent-tabs-scroll")
+                        .w_full()
+                        .flex_none()
+                        .min_w_0()
+                        .gap_1()
+                        .overflow_x_scroll()
+                        .px_2()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .children(tab_elements),
+                )
+            })
+            .child(
+                div()
+                    .id("child-agent-timeline-scroll")
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .p_3()
+                    .child(body),
+            )
+            .into_any_element()
+    }
+
     fn render_timeline_row(
         &mut self,
         row: &TimelineRow,
@@ -30888,6 +31728,9 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if let Some(delegation) = timeline_row_delegation(row, &self.timeline.items) {
+            return self.render_agent_delegation_card(row, &delegation, "main", 0, cx);
+        }
         // Keep prose in the document flow and lightweight activity on compact
         // lines. Structured commands use cards only when the session preference
         // enables their enhanced display.
@@ -36522,7 +37365,7 @@ impl VibexWorkbench {
                 right_rail_width,
                 cx,
             );
-            let panel = self.render_right_rail_panel();
+            let panel = self.render_right_rail_panel(cx);
             shell = shell.child(
                 div()
                     .relative()
@@ -36550,7 +37393,7 @@ impl VibexWorkbench {
                     right_rail_width,
                     cx,
                 );
-                let panel = self.render_right_rail_panel();
+                let panel = self.render_right_rail_panel(cx);
                 div()
                     .absolute()
                     .top_0()
@@ -46183,11 +47026,13 @@ pub fn open_workbench_window(cx: &mut App) -> Result<(), String> {
 }
 
 fn release_runtime_config() -> vibex_core::VibexResult<DesktopRuntimeConfig> {
-    match release_channel()? {
+    let mut config = match release_channel()? {
         ReleaseChannel::Stable => DesktopRuntimeConfig::release_stable_default(),
         ReleaseChannel::ReleaseCandidate => DesktopRuntimeConfig::release_candidate_default(),
         ReleaseChannel::Preview => DesktopRuntimeConfig::preview_default(),
-    }
+    }?;
+    config.delegation_sidecar_command = std::env::current_exe().ok();
+    Ok(config)
 }
 
 fn release_application_id() -> vibex_core::VibexResult<&'static str> {

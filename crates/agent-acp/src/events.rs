@@ -722,6 +722,8 @@ fn collaboration_event(input: &AgentEventInput) -> CanonicalAgentEvent {
             &input.title
         }),
         agent_label,
+        delegation_id: None,
+        child_session_id: None,
         raw_extension: input.raw_extension(),
     })
 }
@@ -1248,6 +1250,8 @@ mod tests {
                 status: ToolCallStatus::Completed,
                 summary: "done".to_string(),
                 agent_label: None,
+                delegation_id: None,
+                child_session_id: None,
                 raw_extension: extension.clone(),
             }),
             CanonicalAgentEvent::ImageGeneration(ImageGenerationPayload {

@@ -10,6 +10,7 @@ pub mod agent_config;
 pub mod agent_provider_runtime;
 pub mod automation_graph;
 pub mod canonical_json;
+pub mod delegation;
 pub mod diagnostics;
 pub mod elicitation;
 pub mod error;
@@ -87,6 +88,10 @@ pub use automation_graph::{
     AutomationTerminalCheckConfig,
 };
 pub use canonical_json::canonical_json_vec;
+pub use delegation::{
+    AgentDelegation, AgentDelegationStatus, CancelAgentDelegationRequest,
+    CreateAgentDelegationRequest, GetAgentDelegationRequest,
+};
 pub use diagnostics::{
     DIAGNOSTIC_BUNDLE_SCHEMA_VERSION, DiagnosticBundle, DiagnosticBundleMetadata,
     DiagnosticBundleRedactionPolicy, DiagnosticBundleRequest, DiagnosticCount,
@@ -140,13 +145,13 @@ pub use git::{
 };
 pub use ids::{
     AgentAuthContextId, AgentAuthenticationOperationId, AgentConfiguredModelBindingId,
-    AgentModelProviderBindingId, AgentProviderProjectionDescriptorId, AgentRuntimeProbeId,
-    AgentRuntimeProfileId, AutomationEdgeId, AutomationGraphId, AutomationNodeId, AutomationRunId,
-    AutomationRunStepId, ChannelId, CorrelationId, DeviceId, EventId, HookId, McpServerId,
-    MessageSubmissionId, ModelProviderProfileId, NativeStateHomeId, ProjectId, PromptId,
-    ProviderProfileId, RelayConnectionId, RelayFrameId, RelayPeerId, RelayRoomId, RelaySessionId,
-    RequestId, RuntimeBindingId, RuntimeClientId, RuntimeLeaseId, RuntimeProcessId,
-    RuntimeStreamId, RuntimeSwitchId, RuntimeSwitchOperationId, ScheduledTaskId,
+    AgentDelegationId, AgentModelProviderBindingId, AgentProviderProjectionDescriptorId,
+    AgentRuntimeProbeId, AgentRuntimeProfileId, AutomationEdgeId, AutomationGraphId,
+    AutomationNodeId, AutomationRunId, AutomationRunStepId, ChannelId, CorrelationId, DeviceId,
+    EventId, HookId, McpServerId, MessageSubmissionId, ModelProviderProfileId, NativeStateHomeId,
+    ProjectId, PromptId, ProviderProfileId, RelayConnectionId, RelayFrameId, RelayPeerId,
+    RelayRoomId, RelaySessionId, RequestId, RuntimeBindingId, RuntimeClientId, RuntimeLeaseId,
+    RuntimeProcessId, RuntimeStreamId, RuntimeSwitchId, RuntimeSwitchOperationId, ScheduledTaskId,
     ScheduledTaskRunId, SkillId, TerminalId, TimelineItemId, UsageExecutionId, VibexSessionId,
     WorkspaceId,
 };

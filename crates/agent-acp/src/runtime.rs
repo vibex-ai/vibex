@@ -46,8 +46,8 @@ use vibex_agent::runtime_switch::{
     OP_RESOLVE_PENDING_PERMISSION, OP_RESTORE_SESSION,
 };
 use vibex_agent::{
-    ActiveWorkGate, ActiveWorkSnapshot, AgentManager, AgentUsageTelemetryEvent,
-    ContextBridgeService, JournaledOperation, OperationReconcileOutcome,
+    AGENT_DELEGATION_MCP_SERVER_ID, ActiveWorkGate, ActiveWorkSnapshot, AgentManager,
+    AgentUsageTelemetryEvent, ContextBridgeService, JournaledOperation, OperationReconcileOutcome,
     PROVIDER_SELECTED_MODEL_METADATA_KEY, PreparedAttachment, PreparedProcess,
     ProviderRuntimeMcpServer, ProviderRuntimeMcpTransport, ProviderRuntimeResources,
     ProviderTurnAttachment, ProviderTurnExecutionIdentity, ResolvedInitialRuntimeSelection,
@@ -683,14 +683,26 @@ fn resolve_acp_mcp_descriptors(
     config: &AcpProviderConfig,
     resources: &ProviderRuntimeResources,
 ) -> VibexResult<Vec<AcpMcpServerDescriptor>> {
-    if !acp_config_mcp_forwarding_enabled(config) {
-        return Ok(Vec::new());
-    }
-    resources
+    // The built-in delegation bridge is a product capability, not a user MCP
+    // server. It must be advertised even when a profile has no optional MCP
+    // feature flag; user-configured servers remain behind that opt-in gate.
+    let mut descriptors = resources
         .mcp_servers
         .iter()
+        .filter(|server| server.id == AGENT_DELEGATION_MCP_SERVER_ID)
         .map(resolve_acp_mcp_descriptor)
-        .collect()
+        .collect::<VibexResult<Vec<_>>>()?;
+    if acp_config_mcp_forwarding_enabled(config) {
+        descriptors.extend(
+            resources
+                .mcp_servers
+                .iter()
+                .filter(|server| server.id != AGENT_DELEGATION_MCP_SERVER_ID)
+                .map(resolve_acp_mcp_descriptor)
+                .collect::<VibexResult<Vec<_>>>()?,
+        );
+    }
+    Ok(descriptors)
 }
 
 fn resolve_acp_mcp_descriptor(
@@ -5929,9 +5941,11 @@ impl AcpRuntimeSwitchBridge {
                         .ok_or_else(|| {
                             runtime_configuration_unavailable("provider_profile_not_found")
                         })?;
-                    let runtime_resources = self
-                        .manager
-                        .runtime_resources_for_profile(ProviderKind::Acp, provider_profile_id)?;
+                    let runtime_resources = self.manager.runtime_resources_for_session(
+                        session_id,
+                        &selection.agent_id,
+                        ProviderKind::Acp,
+                    )?;
                     (profile.updated_at_ms, config, runtime_resources, Vec::new())
                 }
                 RuntimeAuthSource::AgentAccount { auth_context_id } => {
@@ -5964,9 +5978,11 @@ impl AcpRuntimeSwitchBridge {
                         .config_service
                         .get_agent_acp_runtime_config(&selection.agent_id)
                         .map_err(|error| runtime_configuration_unavailable(&error.code))?;
-                    let runtime_resources = self
-                        .manager
-                        .runtime_resources_for_agent(&selection.agent_id, ProviderKind::Acp)?;
+                    let runtime_resources = self.manager.runtime_resources_for_session(
+                        session_id,
+                        &selection.agent_id,
+                        ProviderKind::Acp,
+                    )?;
                     let env_unsets = self.client.agent_account_env_unsets(&selection.agent_id);
                     (context.revision, config, runtime_resources, env_unsets)
                 }

@@ -125,6 +125,8 @@ pub fn map_wire_item(item: &serde_json::Value) -> Vec<ProviderEvent> {
                     .unwrap_or_else(|| "Codex collaboration update".to_string()),
                 agent_label: optional_text("receiverThreadId")
                     .or_else(|| optional_text("newThreadId")),
+                delegation_id: None,
+                child_session_id: None,
                 raw_extension: None,
             },
         ))],

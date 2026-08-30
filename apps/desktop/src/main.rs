@@ -7,6 +7,7 @@ use gpui::{
     AnyView, App, AppContext as _, Bounds, WindowBounds, WindowDecorations, WindowOptions, px, size,
 };
 use gpui_component::{Root, TitleBar};
+use vibex_agent::run_delegation_mcp_stdio;
 use vibex_desktop::{
     DEFAULT_HEIGHT, DEFAULT_WIDTH, MIN_HEIGHT, MIN_WIDTH, app, assets,
     code_workbench::{CodeWorkbenchFixture, CodeWorkbenchFixtureKind},
@@ -47,6 +48,13 @@ enum LaunchMode {
 
 fn main() {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if arguments.len() == 1 && arguments[0] == "--agent-delegation-mcp" {
+        if let Err(error) = run_delegation_mcp_stdio() {
+            eprintln!("Agent delegation MCP sidecar failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if arguments.iter().any(|argument| argument == "--probe") {
         println!(
             "{}",

@@ -6,8 +6,9 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Serialize, de::DeserializeOwned};
 use vibex_core::{
-    AdapterDiagnostic, AgentAuthCatalog, AgentCommandConfig, AgentConfig, AgentDiscoveryRecord,
-    AgentId, AgentManagedInstallState, AgentModelListResponse, AgentModelProviderDefaultSelection,
+    AdapterDiagnostic, AgentAuthCatalog, AgentCommandConfig, AgentConfig, AgentDelegation,
+    AgentDelegationId, AgentDelegationStatus, AgentDiscoveryRecord, AgentId,
+    AgentManagedInstallState, AgentModelListResponse, AgentModelProviderDefaultSelection,
     AgentModelProviderDisplayOrderEntry, AgentModelProviderFailoverEntry, AgentSession,
     AgentSessionConfigProbe, AgentSessionSafety, AgentSessionState, AutomationEdge,
     AutomationEdgeCreateRequest, AutomationEdgeId, AutomationGraph, AutomationGraphCreateRequest,
@@ -73,7 +74,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 51;
+pub const CURRENT_SCHEMA_VERSION: i64 = 52;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -1847,6 +1848,14 @@ pub struct DatabaseSmokeResult {
 
 pub struct WorkspaceRepository;
 pub struct SessionRepository;
+pub struct AgentDelegationRepository;
+/// Result of atomically reserving a child-session creation slot. A retry gets
+/// the durable delegation and must not create another child session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentDelegationReservation {
+    Existing(AgentDelegation),
+    Claimed(AgentDelegation),
+}
 pub struct AgentConfigRepository;
 pub struct CustomAgentDefinitionRepository;
 pub struct AgentDiscoveryRepository;
@@ -2820,6 +2829,390 @@ impl SessionRepository {
             "failed to delete session",
         ))?;
         Ok(())
+    }
+}
+
+impl AgentDelegationRepository {
+    pub fn reserve_or_get(
+        conn: &mut Connection,
+        delegation: &AgentDelegation,
+        active_limit: u32,
+    ) -> VibexResult<AgentDelegationReservation> {
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "agent_delegation_reservation_transaction_failed",
+                "failed to start Agent delegation reservation",
+            ))?;
+        if let Some(existing) = Self::get_by_parent_and_idempotency(
+            &tx,
+            &delegation.parent_session_id,
+            &delegation.idempotency_key,
+        )? {
+            tx.commit().map_err(storage_err(
+                "agent_delegation_reservation_commit_failed",
+                "failed to commit Agent delegation reservation",
+            ))?;
+            return Ok(AgentDelegationReservation::Existing(existing));
+        }
+        if Self::active_count_for_parent(&tx, &delegation.parent_session_id)? >= active_limit {
+            return Err(VibexError::conflict(
+                "agent_delegation_concurrency_exceeded",
+                "the parent session already has the maximum number of active child tasks",
+            ));
+        }
+        tx.execute(
+            "
+            INSERT INTO agent_delegations (
+                delegation_id, parent_session_id, parent_timeline_item_id,
+                child_session_id, idempotency_key, title, task_summary,
+                requested_agent_id, effective_agent_id, status, result_summary,
+                error_code, created_at_ms, updated_at_ms, started_at_ms,
+                completed_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+            ",
+            params![
+                delegation.id.as_str(),
+                delegation.parent_session_id.as_str(),
+                delegation
+                    .parent_timeline_item_id
+                    .as_ref()
+                    .map(TimelineItemId::as_str),
+                delegation
+                    .child_session_id
+                    .as_ref()
+                    .map(VibexSessionId::as_str),
+                delegation.idempotency_key,
+                delegation.title,
+                delegation.task_summary,
+                delegation.requested_agent_id.as_ref().map(AgentId::as_str),
+                delegation.effective_agent_id.as_ref().map(AgentId::as_str),
+                enum_to_db(&delegation.status)?,
+                delegation.result_summary,
+                delegation.error_code,
+                delegation.created_at_ms,
+                delegation.updated_at_ms,
+                delegation.started_at_ms,
+                delegation.completed_at_ms,
+            ],
+        )
+        .map_err(storage_err(
+            "agent_delegation_insert_failed",
+            "failed to persist Agent delegation",
+        ))?;
+        let persisted = Self::get_by_parent_and_idempotency(
+            &tx,
+            &delegation.parent_session_id,
+            &delegation.idempotency_key,
+        )?
+        .ok_or_else(|| {
+            VibexError::storage(
+                "agent_delegation_missing_after_insert",
+                "Agent delegation was not found after it was persisted",
+            )
+        })?;
+        tx.commit().map_err(storage_err(
+            "agent_delegation_reservation_commit_failed",
+            "failed to commit Agent delegation reservation",
+        ))?;
+        Ok(AgentDelegationReservation::Claimed(persisted))
+    }
+
+    pub fn get(
+        conn: &Connection,
+        delegation_id: &AgentDelegationId,
+    ) -> VibexResult<Option<AgentDelegation>> {
+        conn.query_row(
+            &agent_delegation_select_sql("WHERE delegation_id = ?1"),
+            params![delegation_id.as_str()],
+            map_agent_delegation,
+        )
+        .optional()
+        .map_err(storage_err(
+            "agent_delegation_lookup_failed",
+            "failed to lookup Agent delegation",
+        ))
+    }
+
+    pub fn get_for_parent(
+        conn: &Connection,
+        parent_session_id: &VibexSessionId,
+        delegation_id: &AgentDelegationId,
+    ) -> VibexResult<Option<AgentDelegation>> {
+        conn.query_row(
+            &agent_delegation_select_sql("WHERE parent_session_id = ?1 AND delegation_id = ?2"),
+            params![parent_session_id.as_str(), delegation_id.as_str()],
+            map_agent_delegation,
+        )
+        .optional()
+        .map_err(storage_err(
+            "agent_delegation_lookup_failed",
+            "failed to lookup Agent delegation",
+        ))
+    }
+
+    pub fn get_by_parent_and_idempotency(
+        conn: &Connection,
+        parent_session_id: &VibexSessionId,
+        idempotency_key: &str,
+    ) -> VibexResult<Option<AgentDelegation>> {
+        conn.query_row(
+            &agent_delegation_select_sql("WHERE parent_session_id = ?1 AND idempotency_key = ?2"),
+            params![parent_session_id.as_str(), idempotency_key],
+            map_agent_delegation,
+        )
+        .optional()
+        .map_err(storage_err(
+            "agent_delegation_idempotency_lookup_failed",
+            "failed to lookup Agent delegation idempotency key",
+        ))
+    }
+
+    pub fn list_for_parent(
+        conn: &Connection,
+        parent_session_id: &VibexSessionId,
+    ) -> VibexResult<Vec<AgentDelegation>> {
+        let mut statement = conn
+            .prepare(&format!(
+                "{} ORDER BY created_at_ms ASC, delegation_id ASC",
+                agent_delegation_select_sql("WHERE parent_session_id = ?1")
+            ))
+            .map_err(storage_err(
+                "agent_delegation_list_failed",
+                "failed to prepare Agent delegation list",
+            ))?;
+        let rows = statement
+            .query_map(params![parent_session_id.as_str()], map_agent_delegation)
+            .map_err(storage_err(
+                "agent_delegation_list_failed",
+                "failed to list Agent delegations",
+            ))?;
+        collect_rows(
+            rows,
+            "agent_delegation_decode_failed",
+            "failed to decode Agent delegation",
+        )
+    }
+
+    /// Returns every delegation whose child lifecycle still needs observation
+    /// after a desktop-runtime restart.
+    pub fn list_active(conn: &Connection) -> VibexResult<Vec<AgentDelegation>> {
+        let queued = enum_to_db(&AgentDelegationStatus::Queued)?;
+        let starting = enum_to_db(&AgentDelegationStatus::Starting)?;
+        let running = enum_to_db(&AgentDelegationStatus::Running)?;
+        let needs_input = enum_to_db(&AgentDelegationStatus::NeedsInput)?;
+        let mut statement = conn
+            .prepare(&format!(
+                "{}\n                 WHERE status IN (?1, ?2, ?3, ?4)\n                 ORDER BY updated_at_ms ASC, delegation_id ASC",
+                agent_delegation_select_sql("")
+            ))
+            .map_err(storage_err(
+                "agent_delegation_list_failed",
+                "failed to prepare active Agent delegation list",
+            ))?;
+        let rows = statement
+            .query_map(
+                params![queued, starting, running, needs_input],
+                map_agent_delegation,
+            )
+            .map_err(storage_err(
+                "agent_delegation_list_failed",
+                "failed to list active Agent delegations",
+            ))?;
+        collect_rows(
+            rows,
+            "agent_delegation_decode_failed",
+            "failed to decode Agent delegation",
+        )
+    }
+
+    pub fn active_count_for_parent(
+        conn: &Connection,
+        parent_session_id: &VibexSessionId,
+    ) -> VibexResult<u32> {
+        let queued = enum_to_db(&AgentDelegationStatus::Queued)?;
+        let starting = enum_to_db(&AgentDelegationStatus::Starting)?;
+        let running = enum_to_db(&AgentDelegationStatus::Running)?;
+        let needs_input = enum_to_db(&AgentDelegationStatus::NeedsInput)?;
+        let count = conn
+            .query_row(
+                "
+                SELECT COUNT(*) FROM agent_delegations
+                WHERE parent_session_id = ?1
+                  AND status IN (?2, ?3, ?4, ?5)
+                ",
+                params![
+                    parent_session_id.as_str(),
+                    queued,
+                    starting,
+                    running,
+                    needs_input
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(storage_err(
+                "agent_delegation_active_count_failed",
+                "failed to count active Agent delegations",
+            ))?;
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
+    pub fn ancestor_depth(conn: &Connection, session_id: &VibexSessionId) -> VibexResult<u32> {
+        let mut current = session_id.clone();
+        let mut depth = 0_u32;
+        for _ in 0..32 {
+            let parent = conn
+                .query_row(
+                    "
+                    SELECT parent_session_id
+                    FROM agent_delegations
+                    WHERE child_session_id = ?1
+                    LIMIT 1
+                    ",
+                    params![current.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(storage_err(
+                    "agent_delegation_ancestor_lookup_failed",
+                    "failed to inspect Agent delegation ancestry",
+                ))?;
+            let Some(parent) = parent else {
+                return Ok(depth);
+            };
+            current = VibexSessionId::parse(parent)?;
+            depth = depth.saturating_add(1);
+        }
+        Err(VibexError::storage(
+            "agent_delegation_ancestry_invalid",
+            "Agent delegation ancestry exceeds the supported depth",
+        ))
+    }
+
+    pub fn attach_claimed_child_session(
+        conn: &Connection,
+        delegation_id: &AgentDelegationId,
+        child_session_id: &VibexSessionId,
+        effective_agent_id: &AgentId,
+    ) -> VibexResult<Option<AgentDelegation>> {
+        let now = unix_timestamp_ms();
+        let changed = conn
+            .execute(
+                "
+                UPDATE agent_delegations
+                SET child_session_id = ?2,
+                    effective_agent_id = ?3,
+                    updated_at_ms = ?4
+                WHERE delegation_id = ?1
+                  AND child_session_id IS NULL
+                  AND status = ?5
+                ",
+                params![
+                    delegation_id.as_str(),
+                    child_session_id.as_str(),
+                    effective_agent_id.as_str(),
+                    now,
+                    enum_to_db(&AgentDelegationStatus::Starting)?,
+                ],
+            )
+            .map_err(storage_err(
+                "agent_delegation_child_update_failed",
+                "failed to attach child session to Agent delegation",
+            ))?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        Self::get(conn, delegation_id)?.map(Some).ok_or_else(|| {
+            VibexError::storage(
+                "agent_delegation_missing_after_update",
+                "Agent delegation was not found after it was updated",
+            )
+        })
+    }
+
+    pub fn attach_parent_timeline_item(
+        conn: &Connection,
+        delegation_id: &AgentDelegationId,
+        timeline_item_id: &TimelineItemId,
+    ) -> VibexResult<()> {
+        conn.execute(
+            "
+            UPDATE agent_delegations
+            SET parent_timeline_item_id = ?2, updated_at_ms = ?3
+            WHERE delegation_id = ?1
+            ",
+            params![
+                delegation_id.as_str(),
+                timeline_item_id.as_str(),
+                unix_timestamp_ms()
+            ],
+        )
+        .map_err(storage_err(
+            "agent_delegation_timeline_update_failed",
+            "failed to attach parent timeline item to Agent delegation",
+        ))?;
+        Ok(())
+    }
+
+    pub fn update_status_if_active(
+        conn: &Connection,
+        delegation_id: &AgentDelegationId,
+        status: AgentDelegationStatus,
+        result_summary: Option<&str>,
+        error_code: Option<&str>,
+    ) -> VibexResult<Option<AgentDelegation>> {
+        let now = unix_timestamp_ms();
+        let changed = conn
+            .execute(
+                "
+                UPDATE agent_delegations
+                SET status = ?2,
+                    result_summary = ?3,
+                    error_code = ?4,
+                    updated_at_ms = ?5,
+                    started_at_ms = CASE
+                        WHEN ?6 = 1 THEN COALESCE(started_at_ms, ?5)
+                        ELSE started_at_ms
+                    END,
+                    completed_at_ms = CASE
+                        WHEN ?7 = 1 THEN COALESCE(completed_at_ms, ?5)
+                        ELSE completed_at_ms
+                    END
+                WHERE delegation_id = ?1
+                  AND status NOT IN (?8, ?9, ?10)
+                ",
+                params![
+                    delegation_id.as_str(),
+                    enum_to_db(&status)?,
+                    result_summary,
+                    error_code,
+                    now,
+                    matches!(
+                        status,
+                        AgentDelegationStatus::Starting
+                            | AgentDelegationStatus::Running
+                            | AgentDelegationStatus::NeedsInput
+                    ),
+                    status.is_terminal(),
+                    enum_to_db(&AgentDelegationStatus::Completed)?,
+                    enum_to_db(&AgentDelegationStatus::Failed)?,
+                    enum_to_db(&AgentDelegationStatus::Cancelled)?,
+                ],
+            )
+            .map_err(storage_err(
+                "agent_delegation_status_update_failed",
+                "failed to update Agent delegation status",
+            ))?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        Self::get(conn, delegation_id)?.map(Some).ok_or_else(|| {
+            VibexError::storage(
+                "agent_delegation_missing_after_update",
+                "Agent delegation was not found after it was updated",
+            )
+        })
     }
 }
 
@@ -9758,6 +10151,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_message_submission_runtime_policy(conn, &mut applied)?;
     apply_mcp_server_env_and_headers(conn, &mut applied)?;
     apply_custom_acp_agent_definitions(conn, &mut applied)?;
+    apply_agent_delegations(conn, &mut applied)?;
 
     // Seed compatibility Profiles before the v37 backfill while no caller
     // transaction is active. Repository reads may run inside a transaction and
@@ -9798,6 +10192,61 @@ fn apply_custom_acp_agent_definitions(
     .map_err(storage_err(
         "migration_record_failed",
         "failed to record custom Agent migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
+}
+
+fn apply_agent_delegations(conn: &mut Connection, applied: &mut Vec<String>) -> VibexResult<()> {
+    const VERSION: i64 = 52;
+    const NAME: &str = "agent_delegations";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    let tx = conn.transaction().map_err(storage_err(
+        "migration_transaction_failed",
+        "failed to start Agent delegation migration transaction",
+    ))?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS agent_delegations (
+            delegation_id TEXT PRIMARY KEY,
+            parent_session_id TEXT NOT NULL REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+            parent_timeline_item_id TEXT NULL REFERENCES agent_timeline_items(timeline_item_id) ON DELETE SET NULL,
+            child_session_id TEXT NULL REFERENCES agent_sessions(session_id) ON DELETE SET NULL,
+            idempotency_key TEXT NOT NULL,
+            title TEXT NOT NULL,
+            task_summary TEXT NOT NULL,
+            requested_agent_id TEXT NULL,
+            effective_agent_id TEXT NULL,
+            status TEXT NOT NULL,
+            result_summary TEXT NULL,
+            error_code TEXT NULL,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            started_at_ms INTEGER NULL,
+            completed_at_ms INTEGER NULL,
+            UNIQUE(parent_session_id, idempotency_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_delegations_parent_updated
+            ON agent_delegations(parent_session_id, updated_at_ms DESC);
+        CREATE INDEX IF NOT EXISTS idx_agent_delegations_child
+            ON agent_delegations(child_session_id);",
+    )
+    .map_err(storage_err(
+        "migration_apply_failed",
+        "failed to create Agent delegation tables",
+    ))?;
+    tx.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record Agent delegation migration",
+    ))?;
+    tx.commit().map_err(storage_err(
+        "migration_commit_failed",
+        "failed to commit Agent delegation migration",
     ))?;
     applied.push(format!("{VERSION}:{NAME}"));
     Ok(())
@@ -12001,6 +12450,41 @@ fn map_agent_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSession> 
     })
 }
 
+fn agent_delegation_select_sql(where_clause: &str) -> String {
+    format!(
+        "
+        SELECT delegation_id, parent_session_id, parent_timeline_item_id,
+            child_session_id, idempotency_key, title, task_summary,
+            requested_agent_id, effective_agent_id, status, result_summary,
+            error_code, created_at_ms, updated_at_ms, started_at_ms,
+            completed_at_ms
+        FROM agent_delegations
+        {where_clause}
+        "
+    )
+}
+
+fn map_agent_delegation(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentDelegation> {
+    Ok(AgentDelegation {
+        id: parse_id_sql(row.get(0)?, AgentDelegationId::parse)?,
+        parent_session_id: parse_id_sql(row.get(1)?, VibexSessionId::parse)?,
+        parent_timeline_item_id: parse_optional_id_sql(row.get(2)?, TimelineItemId::parse)?,
+        child_session_id: parse_optional_id_sql(row.get(3)?, VibexSessionId::parse)?,
+        idempotency_key: row.get(4)?,
+        title: row.get(5)?,
+        task_summary: row.get(6)?,
+        requested_agent_id: parse_optional_id_sql(row.get(7)?, AgentId::parse)?,
+        effective_agent_id: parse_optional_id_sql(row.get(8)?, AgentId::parse)?,
+        status: enum_from_db_sql(row.get(9)?)?,
+        result_summary: row.get(10)?,
+        error_code: row.get(11)?,
+        created_at_ms: row.get(12)?,
+        updated_at_ms: row.get(13)?,
+        started_at_ms: row.get(14)?,
+        completed_at_ms: row.get(15)?,
+    })
+}
+
 fn map_agent_config(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentConfig> {
     let enabled: i64 = row.get(5)?;
     Ok(AgentConfig {
@@ -12505,8 +12989,9 @@ mod tests {
 
     use super::*;
     use vibex_core::{
-        AcpAdapterId, AdapterDiagnosticLevel, AgentCommandConfig, AgentConfigStatus, AgentId,
-        AgentInstallStatus, AgentMessageDeltaPayload, AgentMessagePayload, AgentModelListSource,
+        AcpAdapterId, AdapterDiagnosticLevel, AgentCommandConfig, AgentConfigStatus,
+        AgentDelegation, AgentDelegationStatus, AgentId, AgentInstallStatus,
+        AgentMessageDeltaPayload, AgentMessagePayload, AgentModelListSource,
         AgentModelProviderFailoverEntry, AgentReasoningEffort, AgentRuntimeKind,
         AgentRuntimeStatus, AgentSourceKind, AutomationAgentPromptConfig,
         AutomationApprovalGateConfig, AutomationEdgeCondition, AutomationEdgeConditionKind,
@@ -12545,6 +13030,162 @@ mod tests {
         let result = run_smoke(&temp).unwrap();
         assert_eq!(result.schema_version, CURRENT_SCHEMA_VERSION);
         assert!(result.marker.starts_with("vibex-db-smoke-"));
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn agent_delegations_are_idempotent_and_terminal_states_are_immutable() {
+        let temp = temp_db_path("agent-delegation");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let (_project, workspace) = WorkspaceRepository::ensure(
+            &conn,
+            "/tmp/vibex-agent-delegation-test",
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let now = unix_timestamp_ms();
+        let agent_id = AgentId::parse("codex").unwrap();
+        let parent = AgentSession {
+            id: VibexSessionId::new(),
+            title: "Parent session".to_string(),
+            project_id: workspace.project_id.clone(),
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path.clone(),
+            workspace_mode: workspace.mode,
+            agent_id: agent_id.clone(),
+            state: AgentSessionState::Idle,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_message_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        SessionRepository::insert(&conn, &parent).unwrap();
+        let delegation = AgentDelegation {
+            id: AgentDelegationId::new(),
+            parent_session_id: parent.id.clone(),
+            parent_timeline_item_id: None,
+            child_session_id: None,
+            idempotency_key: "delegate-review".to_string(),
+            title: "Review implementation".to_string(),
+            task_summary: "Review the current implementation for correctness".to_string(),
+            requested_agent_id: None,
+            effective_agent_id: Some(agent_id.clone()),
+            status: AgentDelegationStatus::Starting,
+            result_summary: None,
+            error_code: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+            started_at_ms: Some(now),
+            completed_at_ms: None,
+        };
+
+        let claimed = AgentDelegationRepository::reserve_or_get(&mut conn, &delegation, 1).unwrap();
+        assert!(matches!(claimed, AgentDelegationReservation::Claimed(_)));
+        let mut duplicate = delegation.clone();
+        duplicate.id = AgentDelegationId::new();
+        let existing = AgentDelegationRepository::reserve_or_get(&mut conn, &duplicate, 1).unwrap();
+        assert!(matches!(existing, AgentDelegationReservation::Existing(_)));
+        assert_eq!(
+            AgentDelegationRepository::active_count_for_parent(&conn, &parent.id).unwrap(),
+            1
+        );
+
+        let child = AgentSession {
+            id: VibexSessionId::new(),
+            title: "Review implementation".to_string(),
+            project_id: workspace.project_id.clone(),
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path.clone(),
+            workspace_mode: workspace.mode,
+            agent_id: agent_id.clone(),
+            state: AgentSessionState::Initializing,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_message_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        SessionRepository::insert(&conn, &child).unwrap();
+        let attached = AgentDelegationRepository::attach_claimed_child_session(
+            &conn,
+            &delegation.id,
+            &child.id,
+            &agent_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(attached.child_session_id, Some(child.id.clone()));
+
+        let timeline_item = TimelineRepository::append(
+            &mut conn,
+            &parent.id,
+            TimelineSource::System,
+            TimelinePayload::SystemNotice(SystemNoticePayload {
+                level: SystemNoticeLevel::Info,
+                message: "Child session started".to_string(),
+            }),
+            None,
+            None,
+            TimelineRedactionState::None,
+        )
+        .unwrap();
+        AgentDelegationRepository::attach_parent_timeline_item(
+            &conn,
+            &delegation.id,
+            &timeline_item.id,
+        )
+        .unwrap();
+        let running = AgentDelegationRepository::update_status_if_active(
+            &conn,
+            &delegation.id,
+            AgentDelegationStatus::Running,
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(running.parent_timeline_item_id, Some(timeline_item.id));
+        let completed = AgentDelegationRepository::update_status_if_active(
+            &conn,
+            &delegation.id,
+            AgentDelegationStatus::Completed,
+            Some("Review completed"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(completed.status, AgentDelegationStatus::Completed);
+        assert_eq!(
+            completed.result_summary.as_deref(),
+            Some("Review completed")
+        );
+        assert!(completed.completed_at_ms.is_some());
+        assert_eq!(
+            AgentDelegationRepository::active_count_for_parent(&conn, &parent.id).unwrap(),
+            0
+        );
+        assert!(
+            AgentDelegationRepository::list_active(&conn)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            AgentDelegationRepository::update_status_if_active(
+                &conn,
+                &delegation.id,
+                AgentDelegationStatus::Failed,
+                None,
+                Some("must-not-replace-terminal-status"),
+            )
+            .unwrap()
+            .is_none()
+        );
 
         cleanup_db(temp);
     }
@@ -12746,7 +13387,8 @@ mod tests {
                 "48:agent_usage_counter_scope",
                 "49:message_submission_runtime_policy",
                 "50:mcp_server_env_and_headers",
-                "51:custom_acp_agent_definitions"
+                "51:custom_acp_agent_definitions",
+                "52:agent_delegations"
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -12882,6 +13524,7 @@ mod tests {
                 "49:message_submission_runtime_policy",
                 "50:mcp_server_env_and_headers",
                 "51:custom_acp_agent_definitions",
+                "52:agent_delegations",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -12997,7 +13640,8 @@ mod tests {
                 "48:agent_usage_counter_scope",
                 "49:message_submission_runtime_policy",
                 "50:mcp_server_env_and_headers",
-                "51:custom_acp_agent_definitions"
+                "51:custom_acp_agent_definitions",
+                "52:agent_delegations"
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -13151,7 +13795,8 @@ mod tests {
                 "48:agent_usage_counter_scope",
                 "49:message_submission_runtime_policy",
                 "50:mcp_server_env_and_headers",
-                "51:custom_acp_agent_definitions"
+                "51:custom_acp_agent_definitions",
+                "52:agent_delegations"
             ]
         );
         assert_eq!(
@@ -14561,7 +15206,8 @@ mod tests {
                 "48:agent_usage_counter_scope",
                 "49:message_submission_runtime_policy",
                 "50:mcp_server_env_and_headers",
-                "51:custom_acp_agent_definitions"
+                "51:custom_acp_agent_definitions",
+                "52:agent_delegations"
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)

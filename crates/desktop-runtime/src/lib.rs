@@ -32,7 +32,7 @@ use vibex_agent::{
     AgentManager, MessageSubmissionCoordinator, MessageSubmissionCoordinatorConfig,
     RuntimeLifecycleConfig, RuntimeLifecycleService, RuntimeObservability, RuntimeSelectionService,
     RuntimeSelectionServiceConfig, RuntimeSwitchCoordinator, RuntimeSwitchCoordinatorConfig,
-    manager_message_dispatcher,
+    manager_message_dispatcher, start_delegation_broker,
 };
 use vibex_agent_acp::{
     AcpAgentProvider, AcpRuntimeClient, AcpRuntimeLifecycleBackend, AcpRuntimeSwitchBridge,
@@ -202,6 +202,9 @@ pub struct DesktopRuntimeConfig {
     pub agent_uv_runtime: AgentUvRuntimeOptions,
     pub acquire_home_lock: bool,
     pub remote_gateway: RemoteGatewayConfig,
+    /// Executable used for the session-scoped delegation MCP sidecar. `None`
+    /// keeps isolated/test runtimes from exposing a subprocess entry point.
+    pub delegation_sidecar_command: Option<PathBuf>,
 }
 
 impl DesktopRuntimeConfig {
@@ -227,6 +230,7 @@ impl DesktopRuntimeConfig {
             agent_uv_runtime: AgentUvRuntimeOptions::from_environment(),
             acquire_home_lock: true,
             remote_gateway: RemoteGatewayConfig::default(),
+            delegation_sidecar_command: None,
         })
     }
 
@@ -243,6 +247,7 @@ impl DesktopRuntimeConfig {
             agent_uv_runtime: AgentUvRuntimeOptions::from_environment(),
             acquire_home_lock: true,
             remote_gateway: RemoteGatewayConfig::default(),
+            delegation_sidecar_command: None,
         }
     }
 
@@ -266,6 +271,7 @@ impl DesktopRuntimeConfig {
             agent_uv_runtime: AgentUvRuntimeOptions::from_environment(),
             acquire_home_lock: true,
             remote_gateway: RemoteGatewayConfig::default(),
+            delegation_sidecar_command: None,
         }
     }
 
@@ -290,6 +296,7 @@ impl DesktopRuntimeConfig {
             agent_uv_runtime: AgentUvRuntimeOptions::from_environment(),
             acquire_home_lock: true,
             remote_gateway: RemoteGatewayConfig::default(),
+            delegation_sidecar_command: None,
         }
     }
 
@@ -311,6 +318,7 @@ impl DesktopRuntimeConfig {
             agent_uv_runtime: AgentUvRuntimeOptions::default(),
             acquire_home_lock: true,
             remote_gateway: RemoteGatewayConfig::default(),
+            delegation_sidecar_command: None,
         }
     }
 
@@ -942,6 +950,33 @@ impl DesktopRuntime {
             })?;
         let runtime_probe = acp_runtime.runtime_probe_service();
         let manager = Arc::new(manager);
+        let delegation_broker_task =
+            if let Some(command) = config.delegation_sidecar_command.clone() {
+                match start_delegation_broker(manager.clone(), command).await {
+                    Ok((tool_config, task)) => match manager.install_delegation_tool(tool_config) {
+                        Ok(()) => Some(task),
+                        Err(error) => {
+                            task.abort();
+                            tracing::warn!(
+                                target: "vibex_desktop",
+                                error_code = %error.code,
+                                "Agent delegation sidecar is unavailable"
+                            );
+                            None
+                        }
+                    },
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "vibex_desktop",
+                            error_code = %error.code,
+                            "Agent delegation sidecar is unavailable"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
         let db_path = manager.database_path().to_path_buf();
         let usage = AgentUsageService::new(db_path.clone())?;
         let (usage_sender, usage_receiver) = mpsc::unbounded_channel();
@@ -1128,6 +1163,18 @@ impl DesktopRuntime {
             home_lock: Mutex::new(home_lock),
             shutting_down: AtomicBool::new(false),
         });
+        if let Some(task) = delegation_broker_task {
+            runtime
+                .tasks
+                .lock()
+                .map_err(|_| {
+                    VibexError::process(
+                        "desktop_runtime_task_lock_failed",
+                        "desktop runtime task ownership is unavailable",
+                    )
+                })?
+                .push(task);
+        }
         startup_stage("usage_consumer_start", || {
             runtime.spawn_usage_consumer(usage_receiver)
         })?;
@@ -1226,6 +1273,7 @@ impl DesktopRuntime {
         })?;
         let runtime_selection = self.agent.runtime_selection.clone();
         let message_submission = self.agent.message_submission.clone();
+        let manager = self.agent.manager.clone();
         tasks.push(tokio::spawn(async move {
             if let Err(error) = startup_stage_async(
                 "runtime_selection_reconcile",
@@ -1247,6 +1295,13 @@ impl DesktopRuntime {
                     target: "vibex_desktop",
                     error_code = %error.code,
                     "message submission background reconciliation failed"
+                );
+            }
+            if let Err(error) = manager.reconcile_agent_delegations() {
+                tracing::warn!(
+                    target: "vibex_desktop",
+                    error_code = %error.code,
+                    "Agent delegation background reconciliation failed"
                 );
             }
         }));

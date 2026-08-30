@@ -730,6 +730,12 @@ pub struct CollaborationPayload {
     pub status: ToolCallStatus,
     pub summary: String,
     pub agent_label: Option<String>,
+    /// Present only for a product-managed child Agent session. Provider-native
+    /// collaboration events intentionally leave these fields absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_id: Option<crate::AgentDelegationId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_session_id: Option<crate::VibexSessionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_extension: Option<AgentEventRawExtension>,
 }
@@ -1354,6 +1360,8 @@ mod tests {
                 status: ToolCallStatus::Completed,
                 summary: "done".to_string(),
                 agent_label: None,
+                delegation_id: None,
+                child_session_id: None,
                 raw_extension: None,
             }),
             TimelinePayload::ImageGeneration(ImageGenerationPayload {

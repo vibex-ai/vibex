@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use vibex_core::{
-    AgentMessagePhase, AgentSession, AgentSessionState, ElicitationRequestStatus,
-    PermissionRequestStatus, PlanStepPayload, PlanStepStatus, TimelineItem, TimelineItemKind,
-    TimelinePayload, VibexSessionId,
+    AgentDelegationId, AgentMessagePhase, AgentSession, AgentSessionState,
+    ElicitationRequestStatus, PermissionRequestStatus, PlanStepPayload, PlanStepStatus,
+    TimelineItem, TimelineItemKind, TimelinePayload, ToolCallStatus, VibexSessionId,
 };
 
 use crate::{ReasoningDisplayMode, SidebarState};
@@ -255,6 +255,57 @@ pub struct ActiveCollaborationProjection {
     pub status: vibex_core::ToolCallStatus,
     pub summary: String,
     pub agent_label: Option<String>,
+}
+
+/// Provider-neutral metadata for a product-managed child Agent card. The
+/// timeline keeps the authoritative collaboration item; this projection keeps
+/// GPUI callers from parsing payloads locally.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineDelegationProjection {
+    pub delegation_id: AgentDelegationId,
+    pub child_session_id: VibexSessionId,
+    pub action: String,
+    pub status: ToolCallStatus,
+    pub summary: String,
+    pub agent_label: Option<String>,
+}
+
+/// Returns the latest managed-child metadata represented by a timeline row.
+/// Provider-native collaboration rows deliberately return `None` because they
+/// do not carry a durable child session identity.
+pub fn timeline_row_delegation(
+    row: &TimelineRow,
+    items: &[TimelineItem],
+) -> Option<TimelineDelegationProjection> {
+    if row.kind != TimelineRowKind::Collaboration {
+        return None;
+    }
+    let item = items
+        .iter()
+        .filter(|item| row.item_ids.iter().any(|id| id == item.id.as_str()))
+        .max_by_key(|item| item.sequence)?;
+    let TimelinePayload::Collaboration(collaboration) = &item.payload else {
+        return None;
+    };
+    Some(TimelineDelegationProjection {
+        delegation_id: collaboration.delegation_id.clone()?,
+        child_session_id: collaboration.child_session_id.clone()?,
+        action: collaboration.action.clone(),
+        status: collaboration.status,
+        summary: collaboration.summary.clone(),
+        agent_label: collaboration.agent_label.clone(),
+    })
+}
+
+pub fn has_managed_child_agent_delegations(items: &[TimelineItem]) -> bool {
+    items.iter().any(|item| {
+        matches!(
+            &item.payload,
+            TimelinePayload::Collaboration(collaboration)
+                if collaboration.delegation_id.is_some() && collaboration.child_session_id.is_some()
+        )
+    })
 }
 
 impl AgentPlanProjection {
@@ -628,7 +679,7 @@ fn timeline_process_activity_groups_matching(
     let mut group_start = None;
 
     for (index, row) in rows.iter().enumerate() {
-        if is_process_activity_row(row.kind)
+        if (is_process_activity_row(row.kind) && !row.id.starts_with("delegation:"))
             || (include_commands && row.kind == TimelineRowKind::Command)
             || (include_file_operations && row.kind == TimelineRowKind::FileOperation)
         {
@@ -1121,21 +1172,47 @@ fn timeline_rows_from_refs(items: &[&TimelineItem]) -> Vec<TimelineRow> {
                 false,
                 true,
             )),
-            TimelinePayload::Collaboration(collaboration) => rows.push(simple_row(
-                item,
-                format!("collaboration:{}", item.id),
-                TimelineRowKind::Collaboration,
-                collaboration
-                    .agent_label
-                    .clone()
-                    .unwrap_or_else(|| collaboration.action.clone()),
-                collaboration.summary.clone(),
-                matches!(
-                    collaboration.status,
-                    vibex_core::ToolCallStatus::Started | vibex_core::ToolCallStatus::Progress
-                ),
-                true,
-            )),
+            TimelinePayload::Collaboration(collaboration) => {
+                let key = collaboration
+                    .delegation_id
+                    .as_ref()
+                    .map(|id| format!("delegation:{id}"))
+                    .unwrap_or_else(|| format!("collaboration:{}", item.id));
+                if collaboration.delegation_id.is_some()
+                    && let Some(previous) = rows.iter_mut().find(|row| row.id == key)
+                {
+                    previous.title = collaboration
+                        .agent_label
+                        .clone()
+                        .unwrap_or_else(|| collaboration.action.clone());
+                    previous.body = collaboration.summary.clone();
+                    previous.streaming = matches!(
+                        collaboration.status,
+                        ToolCallStatus::Started | ToolCallStatus::Progress
+                    );
+                    previous.failed = matches!(collaboration.status, ToolCallStatus::Failed);
+                    previous.last_sequence = item.sequence;
+                    record_row_item_id(&mut previous.item_ids, item.id.to_string());
+                } else {
+                    let mut row = simple_row(
+                        item,
+                        key,
+                        TimelineRowKind::Collaboration,
+                        collaboration
+                            .agent_label
+                            .clone()
+                            .unwrap_or_else(|| collaboration.action.clone()),
+                        collaboration.summary.clone(),
+                        matches!(
+                            collaboration.status,
+                            ToolCallStatus::Started | ToolCallStatus::Progress
+                        ),
+                        true,
+                    );
+                    row.failed = matches!(collaboration.status, ToolCallStatus::Failed);
+                    rows.push(row);
+                }
+            }
             TimelinePayload::ImageGeneration(image) => rows.push(simple_row(
                 item,
                 format!("image:{}", item.id),
@@ -1474,11 +1551,11 @@ mod tests {
     use super::*;
     use serde_json::json;
     use vibex_core::{
-        AgentId, AgentMessageDeltaPayload, AgentMessagePayload, AgentSessionSafety,
-        CollaborationPayload, FileOperationPayload, PlanPayload, ProjectId, ReasoningPayload,
-        TimelineItemId, TimelineRedactionState, TimelineSource, TodoUpdatePayload, ToolCallPayload,
-        ToolCallStatus, TurnExecutionAttributionView, UserMessagePayload, WorkspaceId,
-        WorkspaceMode,
+        AgentDelegationId, AgentId, AgentMessageDeltaPayload, AgentMessagePayload,
+        AgentSessionSafety, CollaborationPayload, FileOperationPayload, PlanPayload, ProjectId,
+        ReasoningPayload, TimelineItemId, TimelineRedactionState, TimelineSource,
+        TodoUpdatePayload, ToolCallPayload, ToolCallStatus, TurnExecutionAttributionView,
+        UserMessagePayload, WorkspaceId, WorkspaceMode,
     };
 
     fn session(id: &str, project: &str, title: &str, updated_at_ms: i64) -> AgentSession {
@@ -2351,6 +2428,8 @@ mod tests {
                     status,
                     summary: format!("{agent} {status:?}"),
                     agent_label: Some(agent.into()),
+                    delegation_id: None,
+                    child_session_id: None,
                     raw_extension: None,
                 }),
             );
@@ -2369,6 +2448,43 @@ mod tests {
         assert_eq!(active[0].agent_label.as_deref(), Some("Builder"));
         assert_eq!(active[0].sequence, 2);
         assert_eq!(active[0].status, ToolCallStatus::Progress);
+    }
+
+    #[test]
+    fn managed_delegation_rows_coalesce_and_keep_the_child_session_projection() {
+        let delegation_id = AgentDelegationId::new();
+        let child_session_id = VibexSessionId::parse("session_child").unwrap();
+        let collaboration = |sequence, status, summary: &str| {
+            item(
+                sequence,
+                None,
+                TimelinePayload::Collaboration(CollaborationPayload {
+                    action: "delegate_to_agent".into(),
+                    status,
+                    summary: summary.into(),
+                    agent_label: Some("Reviewer".into()),
+                    delegation_id: Some(delegation_id.clone()),
+                    child_session_id: Some(child_session_id.clone()),
+                    raw_extension: None,
+                }),
+            )
+        };
+        let items = vec![
+            collaboration(1, ToolCallStatus::Started, "Starting"),
+            collaboration(2, ToolCallStatus::Completed, "Reviewed the changes"),
+        ];
+
+        let rows = timeline_rows(&items);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, format!("delegation:{delegation_id}"));
+        assert_eq!(rows[0].body, "Reviewed the changes");
+        assert_eq!(rows[0].item_ids.len(), 2);
+        let projection = timeline_row_delegation(&rows[0], &items).unwrap();
+        assert_eq!(projection.delegation_id, delegation_id);
+        assert_eq!(projection.child_session_id, child_session_id);
+        assert_eq!(projection.status, ToolCallStatus::Completed);
+        assert!(has_managed_child_agent_delegations(&items));
     }
 
     #[test]

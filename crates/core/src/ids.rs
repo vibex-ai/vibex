@@ -130,6 +130,7 @@ vibex_id!(RuntimeLeaseId, "runtime_lease");
 vibex_id!(RuntimeProcessId, "runtime_process");
 vibex_id!(NativeStateHomeId, "statehome");
 vibex_id!(MessageSubmissionId, "submission");
+vibex_id!(AgentDelegationId, "delegation");
 vibex_id!(UsageExecutionId, "usage_execution");
 
 impl UsageExecutionId {

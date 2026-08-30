@@ -4,40 +4,44 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc};
+use tokio::time::{Duration, sleep};
 use vibex_config_switch::secrets::resolve_provider_secret_reference;
 use vibex_core::{
     AgentAuthCatalog, AgentAuthContextStatus, AgentAuthenticateRequest, AgentAuthenticateResult,
     AgentAuthenticationCancelRequest, AgentCommandDiscoverRequest, AgentCommandDiscoverResponse,
     AgentCommandEntry, AgentCommandExecuteRequest, AgentCommandExecuteResult,
     AgentCommandExecuteStatus, AgentCommandExecutionBehavior, AgentCommandSelectionBehavior,
-    AgentCommandSourceKind, AgentCommandTrigger, AgentConfig, AgentId, AgentLogoutRequest,
-    AgentModelListRequest, AgentModelListResponse, AgentModelListSource, AgentNotificationIntent,
-    AgentSession, AgentSessionConfigProbe, AgentSessionRestoreMethod, AgentSessionSafety,
-    AgentSessionState, AgentUsageCounterOrigin, AgentUsageExecutionContext,
-    AgentUsageStreamAttribution, BindingState, ContinueAgentTurnRequest, CreateAgentSessionRequest,
-    ElicitationRequest, ExternalSessionContinuationStatus, ExternalSessionImportCandidate,
-    ExternalSessionImportCandidateStatus, ExternalSessionImportDiagnostic,
-    ExternalSessionImportPreview, ExternalSessionImportPreviewRequest,
-    ExternalSessionImportRequest, ExternalSessionImportResult, ExternalSessionImportSource,
-    ExternalSessionImportedTimelineCount, FetchTimelineRequest, ForkAgentSessionRequest,
-    McpSecretTarget, McpServer, McpServerSecretReference, McpServerTransportKind,
-    MessageAttachment, MessageSubmissionId, PermissionRequest, ProjectId, PromptKind, PromptStatus,
-    ProviderBinding, ProviderBindingMetadata, ProviderCapabilities, ProviderCapabilitiesResponse,
-    ProviderDefaultScopeKind, ProviderKind, ProviderNativeBinding, ProviderProfileDefaultScope,
-    ProviderProfileId, ProviderProfileStatus, RenameAgentSessionRequest, ResolveElicitationRequest,
-    ResolvePermissionRequest, RuntimeLeaseRole, RuntimeModelSelection, SendAgentMessageRequest,
-    SessionRuntimeSelection, SessionRuntimeSelectionStatus, SystemNoticeLevel, SystemNoticePayload,
-    TimelineErrorPayload, TimelineItem, TimelineLiveEvent, TimelinePage, TimelinePayload,
-    TimelineRedactionState, TimelineSource, TransportKind, TurnExecutionAttribution,
-    UsageExecutionId, UserMessagePayload, VibexError, VibexResult, VibexSessionId, WorkspaceId,
-    agent_id_for_provider_kind, agent_session_turn_requires_continuation,
-    builtin_agent_definitions, latest_timeline_turn_ended_normally, unix_timestamp_ms,
+    AgentCommandSourceKind, AgentCommandTrigger, AgentConfig, AgentDelegation, AgentDelegationId,
+    AgentDelegationStatus, AgentId, AgentLogoutRequest, AgentModelListRequest,
+    AgentModelListResponse, AgentModelListSource, AgentNotificationIntent, AgentSession,
+    AgentSessionConfigProbe, AgentSessionRestoreMethod, AgentSessionSafety, AgentSessionState,
+    AgentUsageCounterOrigin, AgentUsageExecutionContext, AgentUsageStreamAttribution, BindingState,
+    CancelAgentDelegationRequest, ContinueAgentTurnRequest, CreateAgentDelegationRequest,
+    CreateAgentSessionRequest, ElicitationRequest, ExternalSessionContinuationStatus,
+    ExternalSessionImportCandidate, ExternalSessionImportCandidateStatus,
+    ExternalSessionImportDiagnostic, ExternalSessionImportPreview,
+    ExternalSessionImportPreviewRequest, ExternalSessionImportRequest, ExternalSessionImportResult,
+    ExternalSessionImportSource, ExternalSessionImportedTimelineCount, FetchTimelineRequest,
+    ForkAgentSessionRequest, McpSecretTarget, McpServer, McpServerSecretReference,
+    McpServerTransportKind, MessageAttachment, MessageSubmissionId, PermissionRequest, ProjectId,
+    PromptKind, PromptStatus, ProviderBinding, ProviderBindingMetadata, ProviderCapabilities,
+    ProviderCapabilitiesResponse, ProviderDefaultScopeKind, ProviderKind, ProviderNativeBinding,
+    ProviderProfileDefaultScope, ProviderProfileId, ProviderProfileStatus,
+    RenameAgentSessionRequest, ResolveElicitationRequest, ResolvePermissionRequest,
+    RuntimeLeaseRole, RuntimeModelSelection, SendAgentMessageRequest, SessionRuntimeSelection,
+    SessionRuntimeSelectionStatus, SystemNoticeLevel, SystemNoticePayload, TimelineErrorPayload,
+    TimelineItem, TimelineLiveEvent, TimelinePage, TimelinePayload, TimelineRedactionState,
+    TimelineSource, TransportKind, TurnExecutionAttribution, UsageExecutionId, UserMessagePayload,
+    VibexError, VibexResult, VibexSessionId, WorkspaceId, agent_id_for_provider_kind,
+    agent_session_turn_requires_continuation, builtin_agent_definitions,
+    latest_timeline_turn_ended_normally, unix_timestamp_ms,
 };
 use vibex_db::{
     AgentAuthContextRepository, AgentAuthenticationOperationRepository, AgentConfigRepository,
-    AgentDefaultModelProviderProfileRepository, AgentSessionRuntimeRepository, DbConnection,
-    ElicitationRepository, McpServerRepository, MessageSubmissionRepository, PermissionRepository,
-    PromptRepository, ProviderProfileRepository, RuntimeBindingRepository, RuntimeSwitchRepository,
+    AgentDefaultModelProviderProfileRepository, AgentDelegationRepository,
+    AgentDelegationReservation, AgentSessionRuntimeRepository, DbConnection, ElicitationRepository,
+    McpServerRepository, MessageSubmissionRepository, PermissionRepository, PromptRepository,
+    ProviderProfileRepository, RuntimeBindingRepository, RuntimeSwitchRepository,
     SessionRepository, SkillRepository, TimelineAppend, TimelineRepository, WorkspaceRepository,
     apply_migrations, open_database,
 };
@@ -49,6 +53,7 @@ use crate::adapter::{
     ProviderTurnExecutionIdentity, ProviderTurnRequest, ProviderTurnResult,
 };
 use crate::context_bridge::{ContextBridgeService, PreparedContextBridge};
+use crate::delegation::{AGENT_DELEGATION_MCP_SERVER_ID, session_capability_token};
 use crate::message_submission::MessageSubmissionCoordinator;
 use crate::runtime_lifecycle::{RuntimeLeaseGuard, RuntimeLifecycleService};
 use crate::runtime_selection::RuntimeSelectionService;
@@ -56,6 +61,13 @@ use crate::state_machine::validate_transition;
 
 const CONTINUE_AGENT_TURN_PROMPT: &str = "Continue from where you stopped. Review the conversation context, avoid repeating completed work, and proceed with the remaining task.";
 const CONTINUE_TURN_TIMELINE_WINDOW: u32 = 500;
+const MAX_AGENT_DELEGATION_DEPTH: u32 = 2;
+const MAX_ACTIVE_AGENT_DELEGATIONS: u32 = 8;
+const MAX_AGENT_DELEGATION_TASK_CHARS: usize = 16 * 1024;
+const MAX_AGENT_DELEGATION_TITLE_CHARS: usize = 160;
+const MAX_AGENT_DELEGATION_SUMMARY_CHARS: usize = 480;
+const MAX_AGENT_DELEGATION_IDEMPOTENCY_KEY_CHARS: usize = 160;
+const AGENT_DELEGATION_OBSERVE_INTERVAL: Duration = Duration::from_millis(400);
 pub const PROVIDER_SELECTED_MODEL_METADATA_KEY: &str = "selectedModel";
 pub const PROVIDER_SELECTED_REASONING_EFFORT_METADATA_KEY: &str = "selectedReasoningEffort";
 
@@ -71,8 +83,20 @@ pub struct AgentManager {
     runtime_lifecycle: OnceLock<Weak<RuntimeLifecycleService>>,
     message_submission: OnceLock<Weak<MessageSubmissionCoordinator>>,
     usage_telemetry: OnceLock<mpsc::UnboundedSender<AgentUsageTelemetryEvent>>,
+    delegation_tool: OnceLock<AgentDelegationToolConfig>,
+    delegation_lifecycle_locks: StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     elicitation_resolution_locks: StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     context_bridge: ContextBridgeService,
+}
+
+/// Per-desktop-process launch metadata for the built-in, session-scoped MCP
+/// server. It is intentionally runtime-only and never persisted with user MCP
+/// configuration.
+#[derive(Debug, Clone)]
+pub struct AgentDelegationToolConfig {
+    pub command: PathBuf,
+    pub broker_endpoint: String,
+    pub capability_token: String,
 }
 
 #[derive(Clone)]
@@ -157,6 +181,8 @@ impl AgentManager {
             runtime_lifecycle: OnceLock::new(),
             message_submission: OnceLock::new(),
             usage_telemetry: OnceLock::new(),
+            delegation_tool: OnceLock::new(),
+            delegation_lifecycle_locks: StdMutex::new(HashMap::new()),
             elicitation_resolution_locks: StdMutex::new(HashMap::new()),
             context_bridge,
         };
@@ -288,6 +314,25 @@ impl AgentManager {
         })
     }
 
+    pub fn install_delegation_tool(&self, config: AgentDelegationToolConfig) -> VibexResult<()> {
+        if config.command.as_os_str().is_empty()
+            || config.broker_endpoint.trim().is_empty()
+            || config.capability_token.len() < 24
+            || config.capability_token.chars().any(char::is_whitespace)
+        {
+            return Err(VibexError::validation(
+                "agent_delegation_tool_config_invalid",
+                "Agent delegation tool launch configuration is invalid",
+            ));
+        }
+        self.delegation_tool.set(config).map_err(|_| {
+            VibexError::conflict(
+                "agent_delegation_tool_already_installed",
+                "Agent delegation tool is already installed",
+            )
+        })
+    }
+
     pub fn database_path(&self) -> &Path {
         &self.db_path
     }
@@ -309,6 +354,47 @@ impl AgentManager {
         provider_kind: ProviderKind,
     ) -> VibexResult<ProviderRuntimeResources> {
         self.resolve_runtime_resources_for_agent(agent_id, provider_kind)
+    }
+
+    /// Builds runtime resources for one logical session. User-configured
+    /// resources remain agent scoped; the built-in delegation MCP process is
+    /// additionally scoped to this session so it cannot impersonate another
+    /// parent session.
+    pub fn runtime_resources_for_session(
+        &self,
+        session_id: &VibexSessionId,
+        agent_id: &AgentId,
+        provider_kind: ProviderKind,
+    ) -> VibexResult<ProviderRuntimeResources> {
+        let mut resources = self.resolve_runtime_resources_for_agent(agent_id, provider_kind)?;
+        if provider_kind == ProviderKind::Acp
+            && let Some(tool) = self.delegation_tool.get()
+        {
+            resources.mcp_servers.push(ProviderRuntimeMcpServer {
+                id: AGENT_DELEGATION_MCP_SERVER_ID.to_string(),
+                display_name: "Agent delegation".to_string(),
+                transport: ProviderRuntimeMcpTransport::Stdio,
+                command: Some(tool.command.to_string_lossy().to_string()),
+                args: vec!["--agent-delegation-mcp".to_string()],
+                env: vec![
+                    (
+                        "VIBEX_AGENT_DELEGATION_ENDPOINT".to_string(),
+                        tool.broker_endpoint.clone(),
+                    ),
+                    (
+                        "VIBEX_AGENT_DELEGATION_TOKEN".to_string(),
+                        session_capability_token(&tool.capability_token, session_id),
+                    ),
+                    (
+                        "VIBEX_AGENT_DELEGATION_PARENT_SESSION".to_string(),
+                        session_id.as_str().to_string(),
+                    ),
+                ],
+                url: None,
+                headers: Vec::new(),
+            });
+        }
+        Ok(resources)
     }
 
     pub(crate) fn resolve_initial_runtime_selection(
@@ -786,6 +872,605 @@ impl AgentManager {
         SessionRepository::get(&conn, session_id)?.ok_or_else(|| {
             VibexError::validation("session_not_found", "Agent session was not found")
         })
+    }
+
+    /// Creates a child session and immediately queues its first turn. The
+    /// returned delegation is durable before the provider is contacted, so a
+    /// retry with the same idempotency key returns the original child instead
+    /// of creating a second session.
+    pub async fn create_agent_delegation(
+        self: &Arc<Self>,
+        mut request: CreateAgentDelegationRequest,
+    ) -> VibexResult<AgentDelegation> {
+        validate_delegation_request(&mut request)?;
+
+        let (parent, selection, delegation) = {
+            let mut conn = self.open_migrated()?;
+            let parent =
+                SessionRepository::get(&conn, &request.parent_session_id)?.ok_or_else(|| {
+                    VibexError::validation("session_not_found", "Agent session was not found")
+                })?;
+            if matches!(
+                parent.state,
+                AgentSessionState::Closed | AgentSessionState::Archived
+            ) {
+                return Err(VibexError::conflict(
+                    "agent_delegation_parent_closed",
+                    "a closed Agent session cannot delegate work",
+                ));
+            }
+            let depth = AgentDelegationRepository::ancestor_depth(&conn, &parent.id)?;
+            if depth >= MAX_AGENT_DELEGATION_DEPTH {
+                return Err(VibexError::conflict(
+                    "agent_delegation_depth_exceeded",
+                    "Agent delegation nesting depth is limited",
+                ));
+            }
+            if let Some(existing) = AgentDelegationRepository::get_by_parent_and_idempotency(
+                &conn,
+                &parent.id,
+                &request.idempotency_key,
+            )? {
+                return Ok(existing);
+            }
+            let runtime_state = AgentSessionRuntimeRepository::get_runtime_state(
+                &conn, &parent.id,
+            )?
+            .ok_or_else(|| {
+                VibexError::conflict(
+                    "agent_delegation_parent_runtime_missing",
+                    "parent Agent session has no durable runtime selection",
+                )
+            })?;
+            if runtime_state.runtime_selection_status != Some(SessionRuntimeSelectionStatus::Ready)
+                || runtime_state.pending_switch_id.is_some()
+                || runtime_state.desired_runtime_selection
+                    != runtime_state.effective_runtime_selection
+            {
+                return Err(VibexError::conflict(
+                    "agent_delegation_parent_runtime_not_ready",
+                    "parent Agent runtime must be ready before delegation",
+                ));
+            }
+            let inherited_runtime = runtime_state.effective_runtime_selection.ok_or_else(|| {
+                VibexError::conflict(
+                    "agent_delegation_parent_runtime_missing",
+                    "parent Agent session has no effective runtime selection",
+                )
+            })?;
+            let selection =
+                self.resolve_delegation_runtime(&conn, &parent, &inherited_runtime, &request)?;
+            let now = unix_timestamp_ms();
+            let delegation = AgentDelegation {
+                id: AgentDelegationId::new(),
+                parent_session_id: parent.id.clone(),
+                parent_timeline_item_id: None,
+                child_session_id: None,
+                idempotency_key: request.idempotency_key.clone(),
+                title: request
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| "Delegated task".to_string()),
+                task_summary: bounded_text(&request.task, MAX_AGENT_DELEGATION_SUMMARY_CHARS),
+                requested_agent_id: request.agent_id.clone(),
+                effective_agent_id: Some(selection.agent_id.clone()),
+                // Reserving this row atomically claims its child-session
+                // creation slot. Retried requests return this starting row.
+                status: AgentDelegationStatus::Starting,
+                result_summary: None,
+                error_code: None,
+                created_at_ms: now,
+                updated_at_ms: now,
+                started_at_ms: Some(now),
+                completed_at_ms: None,
+            };
+            match AgentDelegationRepository::reserve_or_get(
+                &mut conn,
+                &delegation,
+                MAX_ACTIVE_AGENT_DELEGATIONS,
+            )? {
+                AgentDelegationReservation::Existing(existing) => return Ok(existing),
+                AgentDelegationReservation::Claimed(persisted) => (parent, selection, persisted),
+            }
+        };
+
+        let lifecycle_lock = self.delegation_lifecycle_lock(&delegation.id)?;
+        let lifecycle_guard = lifecycle_lock.lock().await;
+        let current = self.get_agent_delegation(&delegation.parent_session_id, &delegation.id)?;
+        if current.child_session_id.is_some() || current.status != AgentDelegationStatus::Starting {
+            drop(lifecycle_guard);
+            return Ok(current);
+        }
+        let coordinator = match self.message_submission.get().and_then(Weak::upgrade) {
+            Some(coordinator) => coordinator,
+            None => {
+                let error = VibexError::process(
+                    "message_submission_coordinator_unavailable",
+                    "durable message submission coordinator is unavailable",
+                );
+                let _ = self.update_agent_delegation_status(
+                    &delegation.id,
+                    AgentDelegationStatus::Failed,
+                    None,
+                    Some(&error.code),
+                );
+                drop(lifecycle_guard);
+                return Err(error);
+            }
+        };
+
+        // Reserve the child id before deferred materialization so an error
+        // after session persistence can still be cleaned up deterministically.
+        let child_session_id = VibexSessionId::new();
+        let child = match self
+            .create_session_deferred_with_id(
+                CreateAgentSessionRequest {
+                    runtime: selection.clone(),
+                    workspace_root: parent.workspace_root.clone(),
+                    workspace_mode: parent.workspace_mode,
+                    title: Some(delegation.title.clone()),
+                    safety: Some(parent.safety.clone()),
+                },
+                child_session_id.clone(),
+            )
+            .await
+        {
+            Ok(child) => child,
+            Err(error) => {
+                // Deferred creation persists the logical session before it
+                // starts runtime materialization. Remove that known id on any
+                // synchronous failure so the failed delegation is not paired
+                // with an unreachable sidebar session.
+                let _ = self.delete_session(&child_session_id).await;
+                let _ = self.update_agent_delegation_status(
+                    &delegation.id,
+                    AgentDelegationStatus::Failed,
+                    None,
+                    Some(&error.code),
+                );
+                return Err(error);
+            }
+        };
+
+        let delegation = {
+            let mut conn = self.open_migrated()?;
+            let Some(delegation) = AgentDelegationRepository::attach_claimed_child_session(
+                &conn,
+                &delegation.id,
+                &child.id,
+                &selection.agent_id,
+            )?
+            else {
+                // The lifecycle lock normally rules this out. If durable state
+                // changed outside this process, remove the unlinked child rather
+                // than leaving an orphaned session in the workspace sidebar.
+                drop(conn);
+                let _ = self.delete_session(&child.id).await;
+                drop(lifecycle_guard);
+                return self.get_agent_delegation(&delegation.parent_session_id, &delegation.id);
+            };
+            let item = self.append_delegation_timeline(
+                &mut conn,
+                &delegation,
+                AgentDelegationStatus::Starting,
+                None,
+            )?;
+            AgentDelegationRepository::attach_parent_timeline_item(
+                &conn,
+                &delegation.id,
+                &item.id,
+            )?;
+            AgentDelegationRepository::get(&conn, &delegation.id)?.ok_or_else(|| {
+                VibexError::storage(
+                    "agent_delegation_missing_after_start",
+                    "Agent delegation disappeared while starting",
+                )
+            })?
+        };
+
+        let submission_id = match coordinator.prepare_submission(SendAgentMessageRequest {
+            session_id: child.id.clone(),
+            message_idempotency_key: format!("delegation:{}", delegation.id.as_str()),
+            desired_runtime: selection.clone(),
+            text: request.task,
+            attachments: Vec::new(),
+            reasoning_effort: selection.reasoning_effort.clone(),
+            correlation_id: None,
+        }) {
+            Ok(id) => id,
+            Err(error) => {
+                let _ = self.update_agent_delegation_status(
+                    &delegation.id,
+                    AgentDelegationStatus::Failed,
+                    None,
+                    Some(&error.code),
+                );
+                return Err(error);
+            }
+        };
+        drop(lifecycle_guard);
+
+        let manager = self.clone();
+        let watch_delegation_id = delegation.id.clone();
+        let watch_child_id = child.id.clone();
+        tokio::spawn(async move {
+            manager
+                .watch_agent_delegation(watch_delegation_id, watch_child_id, submission_id)
+                .await;
+        });
+        Ok(delegation)
+    }
+
+    pub fn get_agent_delegation(
+        &self,
+        parent_session_id: &VibexSessionId,
+        delegation_id: &AgentDelegationId,
+    ) -> VibexResult<AgentDelegation> {
+        let conn = self.open_migrated()?;
+        AgentDelegationRepository::get_for_parent(&conn, parent_session_id, delegation_id)?
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "agent_delegation_not_found",
+                    "Agent delegation was not found",
+                )
+            })
+    }
+
+    pub fn list_agent_delegations(
+        &self,
+        parent_session_id: &VibexSessionId,
+    ) -> VibexResult<Vec<AgentDelegation>> {
+        let conn = self.open_migrated()?;
+        AgentDelegationRepository::list_for_parent(&conn, parent_session_id)
+    }
+
+    /// Restores observation of durable child tasks after the desktop runtime
+    /// has restarted. The child turn itself remains owned by the durable
+    /// message-submission coordinator; this only re-establishes the parent
+    /// status/timeline projection.
+    pub fn reconcile_agent_delegations(self: &Arc<Self>) -> VibexResult<usize> {
+        let delegations = {
+            let conn = self.open_migrated()?;
+            AgentDelegationRepository::list_active(&conn)?
+        };
+        let mut resumed = 0;
+        for delegation in delegations {
+            let Some(child_session_id) = delegation.child_session_id.clone() else {
+                self.update_agent_delegation_status(
+                    &delegation.id,
+                    AgentDelegationStatus::Failed,
+                    Some("Child session creation was interrupted"),
+                    Some("agent_delegation_child_session_missing"),
+                )?;
+                continue;
+            };
+            let message_idempotency_key = format!("delegation:{}", delegation.id.as_str());
+            let submission_id = {
+                let conn = self.open_migrated()?;
+                MessageSubmissionRepository::get_by_key(
+                    &conn,
+                    &child_session_id,
+                    &message_idempotency_key,
+                )?
+                .map(|record| record.submission_id)
+            };
+            let Some(submission_id) = submission_id else {
+                self.update_agent_delegation_status(
+                    &delegation.id,
+                    AgentDelegationStatus::Failed,
+                    Some("Child task submission was interrupted"),
+                    Some("agent_delegation_submission_missing"),
+                )?;
+                continue;
+            };
+            let manager = self.clone();
+            let delegation_id = delegation.id.clone();
+            tokio::spawn(async move {
+                manager
+                    .watch_agent_delegation(delegation_id, child_session_id, submission_id)
+                    .await;
+            });
+            resumed += 1;
+        }
+        Ok(resumed)
+    }
+
+    pub async fn cancel_agent_delegation(
+        self: &Arc<Self>,
+        request: CancelAgentDelegationRequest,
+    ) -> VibexResult<AgentDelegation> {
+        let lifecycle_lock = self.delegation_lifecycle_lock(&request.delegation_id)?;
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        let delegation =
+            self.get_agent_delegation(&request.parent_session_id, &request.delegation_id)?;
+        if delegation.is_terminal() {
+            return Ok(delegation);
+        }
+        if let Some(child_session_id) = delegation.child_session_id.as_ref() {
+            self.interrupt(child_session_id).await?;
+        }
+        self.update_agent_delegation_status(
+            &delegation.id,
+            AgentDelegationStatus::Cancelled,
+            Some("Task cancelled"),
+            None,
+        )
+    }
+
+    fn resolve_delegation_runtime(
+        &self,
+        conn: &DbConnection,
+        parent: &AgentSession,
+        inherited: &SessionRuntimeSelection,
+        request: &CreateAgentDelegationRequest,
+    ) -> VibexResult<SessionRuntimeSelection> {
+        let requested_profile_agent = if let Some(profile_id) = request.provider_profile_id.as_ref()
+        {
+            ProviderProfileRepository::get(conn, profile_id)?.map(|profile| profile.agent_id)
+        } else {
+            None
+        };
+        let target_agent = request
+            .agent_id
+            .clone()
+            .or(requested_profile_agent)
+            .unwrap_or_else(|| inherited.agent_id.clone());
+        let profile_change =
+            request.provider_profile_id.is_some() || target_agent != inherited.agent_id;
+        let mut selection = if profile_change {
+            let profile_id = resolve_provider_profile_id(
+                conn,
+                &target_agent,
+                ProviderKind::Acp,
+                request.provider_profile_id.clone(),
+                Some(&parent.project_id),
+                Some(&parent.workspace_id),
+            )?;
+            self.resolve_initial_runtime_selection(
+                Some(profile_id),
+                ProviderKind::Acp,
+                Some(&parent.project_id),
+                Some(&parent.workspace_id),
+            )?
+        } else {
+            inherited.clone()
+        };
+        if let Some(model) = request
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if model.len() > 256 || model.chars().any(char::is_control) {
+                return Err(VibexError::validation(
+                    "agent_delegation_model_invalid",
+                    "delegation model must be a bounded provider model identifier",
+                ));
+            }
+            selection.model = RuntimeModelSelection::explicit(model.to_string());
+        }
+        if let Some(reasoning_effort) = request.reasoning_effort.as_deref() {
+            selection.reasoning_effort = normalize_reasoning_effort(Some(reasoning_effort))?;
+        }
+        if let Some(mode_id) = request.mode_id.as_deref() {
+            selection.mode_id = normalize_delegation_option(mode_id, "mode")?;
+        }
+        Ok(selection)
+    }
+
+    fn append_delegation_timeline(
+        &self,
+        conn: &mut DbConnection,
+        delegation: &AgentDelegation,
+        status: AgentDelegationStatus,
+        summary: Option<&str>,
+    ) -> VibexResult<TimelineItem> {
+        let status_text = summary
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| bounded_text(value, MAX_AGENT_DELEGATION_SUMMARY_CHARS))
+            .unwrap_or_else(|| delegation_status_summary(status));
+        self.append_timeline_item(
+            conn,
+            &delegation.parent_session_id,
+            TimelineSource::System,
+            TimelinePayload::Collaboration(vibex_core::CollaborationPayload {
+                action: "delegate_to_agent".to_string(),
+                status: delegation_tool_status(status),
+                summary: format!("{}: {}", delegation.title, status_text),
+                agent_label: delegation
+                    .effective_agent_id
+                    .as_ref()
+                    .map(ToString::to_string),
+                delegation_id: Some(delegation.id.clone()),
+                child_session_id: delegation.child_session_id.clone(),
+                raw_extension: None,
+            }),
+            None,
+            Some(delegation.id.as_str()),
+            TimelineRedactionState::None,
+        )
+    }
+
+    fn update_agent_delegation_status(
+        &self,
+        delegation_id: &AgentDelegationId,
+        status: AgentDelegationStatus,
+        result_summary: Option<&str>,
+        error_code: Option<&str>,
+    ) -> VibexResult<AgentDelegation> {
+        let mut conn = self.open_migrated()?;
+        let current = AgentDelegationRepository::get(&conn, delegation_id)?.ok_or_else(|| {
+            VibexError::validation(
+                "agent_delegation_not_found",
+                "Agent delegation was not found",
+            )
+        })?;
+        if current.is_terminal() {
+            return Ok(current);
+        }
+        let bounded_result =
+            result_summary.map(|value| bounded_text(value, MAX_AGENT_DELEGATION_SUMMARY_CHARS));
+        let bounded_error = error_code.map(|value| bounded_text(value, 160));
+        if current.status == status
+            && current.result_summary == bounded_result
+            && current.error_code == bounded_error
+        {
+            return Ok(current);
+        }
+        let Some(updated) = AgentDelegationRepository::update_status_if_active(
+            &conn,
+            delegation_id,
+            status,
+            bounded_result.as_deref(),
+            bounded_error.as_deref(),
+        )?
+        else {
+            return AgentDelegationRepository::get(&conn, delegation_id)?.ok_or_else(|| {
+                VibexError::validation(
+                    "agent_delegation_not_found",
+                    "Agent delegation was not found",
+                )
+            });
+        };
+        let _ = self.append_delegation_timeline(
+            &mut conn,
+            &updated,
+            status,
+            updated
+                .result_summary
+                .as_deref()
+                .or(updated.error_code.as_deref()),
+        )?;
+        Ok(updated)
+    }
+
+    async fn watch_agent_delegation(
+        self: Arc<Self>,
+        delegation_id: AgentDelegationId,
+        child_session_id: VibexSessionId,
+        submission_id: MessageSubmissionId,
+    ) {
+        let _ = self.update_agent_delegation_status(
+            &delegation_id,
+            AgentDelegationStatus::Running,
+            None,
+            None,
+        );
+        let Some(coordinator) = self.message_submission.get().and_then(Weak::upgrade) else {
+            let _ = self.update_agent_delegation_status(
+                &delegation_id,
+                AgentDelegationStatus::Failed,
+                None,
+                Some("message_submission_coordinator_unavailable"),
+            );
+            return;
+        };
+        let mut events = self.subscribe();
+        if let Err(error) = coordinator.wait_for_submission(&submission_id).await {
+            let status = if error.code.contains("cancel") {
+                AgentDelegationStatus::Cancelled
+            } else {
+                AgentDelegationStatus::Failed
+            };
+            let _ = self.update_agent_delegation_status(
+                &delegation_id,
+                status,
+                Some(&error.message),
+                Some(&error.code),
+            );
+            return;
+        }
+        loop {
+            let session = match self.get_session(&child_session_id).await {
+                Ok(session) => session,
+                Err(error) => {
+                    let _ = self.update_agent_delegation_status(
+                        &delegation_id,
+                        AgentDelegationStatus::Failed,
+                        Some(&error.message),
+                        Some(&error.code),
+                    );
+                    return;
+                }
+            };
+            match session.state {
+                AgentSessionState::NeedsInput => {
+                    let _ = self.update_agent_delegation_status(
+                        &delegation_id,
+                        AgentDelegationStatus::NeedsInput,
+                        Some("Waiting for input"),
+                        None,
+                    );
+                }
+                AgentSessionState::Initializing | AgentSessionState::Running => {
+                    let _ = self.update_agent_delegation_status(
+                        &delegation_id,
+                        AgentDelegationStatus::Running,
+                        None,
+                        None,
+                    );
+                }
+                AgentSessionState::Idle => {
+                    let summary = self.child_result_summary(&child_session_id).ok().flatten();
+                    let _ = self.update_agent_delegation_status(
+                        &delegation_id,
+                        AgentDelegationStatus::Completed,
+                        summary.as_deref().or(Some("Task completed")),
+                        None,
+                    );
+                    return;
+                }
+                AgentSessionState::Error => {
+                    let _ = self.update_agent_delegation_status(
+                        &delegation_id,
+                        AgentDelegationStatus::Failed,
+                        Some("Child session failed"),
+                        Some("child_session_failed"),
+                    );
+                    return;
+                }
+                AgentSessionState::Closed | AgentSessionState::Archived => {
+                    let _ = self.update_agent_delegation_status(
+                        &delegation_id,
+                        AgentDelegationStatus::Cancelled,
+                        Some("Child session closed"),
+                        None,
+                    );
+                    return;
+                }
+            }
+            tokio::select! {
+                _ = sleep(AGENT_DELEGATION_OBSERVE_INTERVAL) => {},
+                event = events.recv() => {
+                    if event.is_err() {
+                        sleep(AGENT_DELEGATION_OBSERVE_INTERVAL).await;
+                    }
+                }
+            }
+        }
+    }
+
+    fn child_result_summary(
+        &self,
+        child_session_id: &VibexSessionId,
+    ) -> VibexResult<Option<String>> {
+        let conn = self.open_migrated()?;
+        let page = TimelineRepository::fetch_after(&conn, child_session_id, None, 500)?;
+        Ok(page
+            .items
+            .iter()
+            .rev()
+            .find_map(|item| match &item.payload {
+                TimelinePayload::AgentMessage(message) if !message.text.trim().is_empty() => Some(
+                    bounded_text(&message.text, MAX_AGENT_DELEGATION_SUMMARY_CHARS),
+                ),
+                TimelinePayload::Error(error) => Some(bounded_text(
+                    &error.message,
+                    MAX_AGENT_DELEGATION_SUMMARY_CHARS,
+                )),
+                _ => None,
+            }))
     }
 
     pub async fn fetch_timeline(&self, request: FetchTimelineRequest) -> VibexResult<TimelinePage> {
@@ -1793,18 +2478,21 @@ impl AgentManager {
                 });
             }
         };
-        let runtime_resources =
-            match self.resolve_runtime_resources_for_agent(&session.agent_id, ProviderKind::Acp) {
-                Ok(resources) => resources,
-                Err(error) => {
-                    return ProviderTurnAttemptOutcome::Failure(ProviderTurnAttemptFailure {
-                        error,
-                        appended: Vec::new(),
-                        provider_output_started: false,
-                        execution_attribution: None,
-                    });
-                }
-            };
+        let runtime_resources = match self.runtime_resources_for_session(
+            &session.id,
+            &session.agent_id,
+            ProviderKind::Acp,
+        ) {
+            Ok(resources) => resources,
+            Err(error) => {
+                return ProviderTurnAttemptOutcome::Failure(ProviderTurnAttemptFailure {
+                    error,
+                    appended: Vec::new(),
+                    provider_output_started: false,
+                    execution_attribution: None,
+                });
+            }
+        };
         let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
         let mut turn_request = ProviderTurnRequest {
             session_id: session.id.clone(),
@@ -2213,6 +2901,25 @@ impl AgentManager {
         }
         let lock = Arc::new(AsyncMutex::new(()));
         locks.insert(request_id.to_string(), Arc::downgrade(&lock));
+        Ok(lock)
+    }
+
+    fn delegation_lifecycle_lock(
+        &self,
+        delegation_id: &AgentDelegationId,
+    ) -> VibexResult<Arc<AsyncMutex<()>>> {
+        let mut locks = self.delegation_lifecycle_locks.lock().map_err(|_| {
+            VibexError::process(
+                "agent_delegation_lifecycle_lock_poisoned",
+                "Agent delegation lifecycle coordination is unavailable",
+            )
+        })?;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(delegation_id.as_str()).and_then(Weak::upgrade) {
+            return Ok(lock);
+        }
+        let lock = Arc::new(AsyncMutex::new(()));
+        locks.insert(delegation_id.as_str().to_string(), Arc::downgrade(&lock));
         Ok(lock)
     }
 
@@ -3693,6 +4400,103 @@ fn normalize_reasoning_effort(value: Option<&str>) -> VibexResult<Option<String>
         ));
     }
     Ok(Some(value.to_string()))
+}
+
+fn validate_delegation_request(request: &mut CreateAgentDelegationRequest) -> VibexResult<()> {
+    request.idempotency_key = request.idempotency_key.trim().to_string();
+    if request.idempotency_key.is_empty() {
+        request.idempotency_key = format!("request-{}", AgentDelegationId::new());
+    }
+    if request.idempotency_key.len() > MAX_AGENT_DELEGATION_IDEMPOTENCY_KEY_CHARS
+        || request.idempotency_key.chars().any(char::is_control)
+    {
+        return Err(VibexError::validation(
+            "agent_delegation_idempotency_key_invalid",
+            "delegation idempotency key must be short and contain no control characters",
+        ));
+    }
+    let task = request.task.trim();
+    if task.is_empty() {
+        return Err(VibexError::validation(
+            "agent_delegation_task_empty",
+            "delegation task must not be empty",
+        ));
+    }
+    if task.chars().count() > MAX_AGENT_DELEGATION_TASK_CHARS
+        || task.chars().any(|character| character == '\0')
+    {
+        return Err(VibexError::validation(
+            "agent_delegation_task_invalid",
+            "delegation task is empty, too large, or contains an invalid character",
+        ));
+    }
+    request.task = task.to_string();
+    if let Some(title) = request.title.as_mut() {
+        *title = title
+            .chars()
+            .filter(|character| !character.is_control())
+            .take(MAX_AGENT_DELEGATION_TITLE_CHARS)
+            .collect::<String>()
+            .trim()
+            .to_string();
+        if title.is_empty() {
+            request.title = None;
+        }
+    }
+    Ok(())
+}
+
+fn normalize_delegation_option(value: &str, label: &str) -> VibexResult<Option<String>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > 128 || value.chars().any(char::is_control) {
+        return Err(VibexError::validation(
+            "agent_delegation_option_invalid",
+            format!("delegation {label} is invalid"),
+        ));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn bounded_text(value: &str, limit: usize) -> String {
+    let mut text = value
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
+        .collect::<String>();
+    if text.chars().count() > limit {
+        text = text.chars().take(limit.saturating_sub(3)).collect();
+        text.push_str("...");
+    }
+    text.trim().to_string()
+}
+
+fn delegation_tool_status(status: AgentDelegationStatus) -> vibex_core::ToolCallStatus {
+    match status {
+        AgentDelegationStatus::Queued | AgentDelegationStatus::Starting => {
+            vibex_core::ToolCallStatus::Started
+        }
+        AgentDelegationStatus::Running | AgentDelegationStatus::NeedsInput => {
+            vibex_core::ToolCallStatus::Progress
+        }
+        AgentDelegationStatus::Completed => vibex_core::ToolCallStatus::Completed,
+        AgentDelegationStatus::Failed | AgentDelegationStatus::Cancelled => {
+            vibex_core::ToolCallStatus::Failed
+        }
+    }
+}
+
+fn delegation_status_summary(status: AgentDelegationStatus) -> String {
+    match status {
+        AgentDelegationStatus::Queued => "Task queued".to_string(),
+        AgentDelegationStatus::Starting => "Starting child session".to_string(),
+        AgentDelegationStatus::Running => "Task running".to_string(),
+        AgentDelegationStatus::NeedsInput => "Waiting for input".to_string(),
+        AgentDelegationStatus::Completed => "Task completed".to_string(),
+        AgentDelegationStatus::Failed => "Task failed".to_string(),
+        AgentDelegationStatus::Cancelled => "Task cancelled".to_string(),
+    }
 }
 
 fn disabled_agent_error(
@@ -5948,6 +6752,116 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, "message_submission_coordinator_unavailable");
         cleanup_db(&db_path);
+    }
+
+    #[test]
+    fn delegation_sidecar_resource_is_scoped_to_its_parent_session() {
+        let db_path = temp_db_path("delegation-sidecar-resource");
+        let manager = AgentManager::new(&db_path).unwrap();
+        let global_token = "delegation-token-with-sufficient-entropy".to_string();
+        manager
+            .install_delegation_tool(AgentDelegationToolConfig {
+                command: PathBuf::from("/tmp/vibex-desktop"),
+                broker_endpoint: "127.0.0.1:43123".to_string(),
+                capability_token: global_token.clone(),
+            })
+            .unwrap();
+        let session_id = VibexSessionId::new();
+        let agent_id = AgentId::parse("claude").unwrap();
+
+        let resources = manager
+            .runtime_resources_for_session(&session_id, &agent_id, ProviderKind::Acp)
+            .unwrap();
+        let sidecar = resources
+            .mcp_servers
+            .iter()
+            .find(|server| server.id == "vibex-agent-delegation")
+            .unwrap();
+        let expected_token = session_capability_token(&global_token, &session_id);
+        assert_eq!(sidecar.command.as_deref(), Some("/tmp/vibex-desktop"));
+        assert_eq!(sidecar.args, vec!["--agent-delegation-mcp".to_string()]);
+        assert_eq!(
+            sidecar
+                .env
+                .iter()
+                .find(|(key, _)| key == "VIBEX_AGENT_DELEGATION_TOKEN")
+                .map(|(_, value)| value.as_str()),
+            Some(expected_token.as_str())
+        );
+        assert_eq!(
+            sidecar
+                .env
+                .iter()
+                .find(|(key, _)| key == "VIBEX_AGENT_DELEGATION_PARENT_SESSION")
+                .map(|(_, value)| value.as_str()),
+            Some(session_id.as_str())
+        );
+        let non_acp_resources = manager
+            .runtime_resources_for_session(&session_id, &agent_id, ProviderKind::Claude)
+            .unwrap();
+        assert!(
+            non_acp_resources
+                .mcp_servers
+                .iter()
+                .all(|server| server.id != "vibex-agent-delegation")
+        );
+
+        cleanup_db(&db_path);
+    }
+
+    #[test]
+    fn restart_reconciliation_marks_unlinked_delegations_failed() {
+        let db_path = temp_db_path("delegation-reconcile");
+        let workspace_root = temp_workspace_path("delegation-reconcile");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let manager = Arc::new(AgentManager::new(&db_path).unwrap());
+        let mut conn = manager.open_migrated().unwrap();
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let parent = insert_session(
+            &conn,
+            "delegation parent",
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            AgentId::parse("claude").unwrap(),
+            AgentSessionState::Initializing,
+        );
+        let now = unix_timestamp_ms();
+        let delegation = AgentDelegation {
+            id: AgentDelegationId::new(),
+            parent_session_id: parent.id.clone(),
+            parent_timeline_item_id: None,
+            child_session_id: None,
+            idempotency_key: "reconcile-unlinked".to_string(),
+            title: "Interrupted child".to_string(),
+            task_summary: "A task interrupted before its child session persisted".to_string(),
+            requested_agent_id: None,
+            effective_agent_id: Some(parent.agent_id.clone()),
+            status: AgentDelegationStatus::Starting,
+            result_summary: None,
+            error_code: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+            started_at_ms: Some(now),
+            completed_at_ms: None,
+        };
+        AgentDelegationRepository::reserve_or_get(&mut conn, &delegation, 8).unwrap();
+        drop(conn);
+
+        assert_eq!(manager.reconcile_agent_delegations().unwrap(), 0);
+        let recovered = manager
+            .get_agent_delegation(&parent.id, &delegation.id)
+            .unwrap();
+        assert_eq!(recovered.status, AgentDelegationStatus::Failed);
+        assert_eq!(
+            recovered.error_code.as_deref(),
+            Some("agent_delegation_child_session_missing")
+        );
+
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
     }
 
     fn runtime_route(agent_id: &str, adapter_id: &str) -> AgentRuntimeRouteKey {

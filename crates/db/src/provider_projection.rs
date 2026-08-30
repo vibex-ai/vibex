@@ -2179,6 +2179,7 @@ mod tests {
                 "49:message_submission_runtime_policy",
                 "50:mcp_server_env_and_headers",
                 "51:custom_acp_agent_definitions",
+                "52:agent_delegations",
             ]
         );
         assert_eq!(
