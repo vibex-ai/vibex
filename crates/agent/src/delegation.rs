@@ -15,8 +15,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use vibex_core::{
-    AgentDelegationId, AgentId, CancelAgentDelegationRequest, CreateAgentDelegationRequest,
-    ProviderProfileId, VibexError, VibexResult, VibexSessionId,
+    AgentDelegation, AgentDelegationId, AgentDelegationStatus, AgentId,
+    CancelAgentDelegationRequest, CreateAgentDelegationRequest, ProviderProfileId, VibexError,
+    VibexResult, VibexSessionId,
 };
 
 use crate::manager::{AgentDelegationToolConfig, AgentManager};
@@ -171,6 +172,59 @@ struct BrokerRequest {
     params: Value,
 }
 
+/// Product-safe result returned to the Agent through MCP. The desktop and
+/// remote UI still receive the full `AgentDelegation` DTO, but an Agent only
+/// needs the delegation id to poll. In particular, internal session ids must
+/// not be handed to unrelated session-context tools with a different id
+/// format.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentDelegationToolResult {
+    id: AgentDelegationId,
+    idempotency_key: String,
+    title: String,
+    task_summary: String,
+    requested_agent_id: Option<AgentId>,
+    effective_agent_id: Option<AgentId>,
+    status: AgentDelegationStatus,
+    result_summary: Option<String>,
+    error_code: Option<String>,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    started_at_ms: Option<i64>,
+    completed_at_ms: Option<i64>,
+}
+
+impl From<AgentDelegation> for AgentDelegationToolResult {
+    fn from(delegation: AgentDelegation) -> Self {
+        Self {
+            id: delegation.id,
+            idempotency_key: delegation.idempotency_key,
+            title: delegation.title,
+            task_summary: delegation.task_summary,
+            requested_agent_id: delegation.requested_agent_id,
+            effective_agent_id: delegation.effective_agent_id,
+            status: delegation.status,
+            result_summary: delegation.result_summary,
+            error_code: delegation.error_code,
+            created_at_ms: delegation.created_at_ms,
+            updated_at_ms: delegation.updated_at_ms,
+            started_at_ms: delegation.started_at_ms,
+            completed_at_ms: delegation.completed_at_ms,
+        }
+    }
+}
+
+fn encode_delegation_tool_result(delegation: AgentDelegation) -> VibexResult<Value> {
+    serde_json::to_value(AgentDelegationToolResult::from(delegation)).map_err(|error| {
+        VibexError::process(
+            "agent_delegation_encode_failed",
+            "failed to encode Agent delegation result",
+        )
+        .with_diagnostic("error", error.to_string())
+    })
+}
+
 async fn handle_broker_request(
     manager: &Arc<AgentManager>,
     global_token: &str,
@@ -238,13 +292,7 @@ async fn delegate(
         reasoning_effort: optional_string(object, "reasoningEffort"),
         mode_id: optional_string(object, "modeId"),
     };
-    serde_json::to_value(manager.create_agent_delegation(request).await?).map_err(|error| {
-        VibexError::process(
-            "agent_delegation_encode_failed",
-            "failed to encode Agent delegation result",
-        )
-        .with_diagnostic("error", error.to_string())
-    })
+    encode_delegation_tool_result(manager.create_agent_delegation(request).await?)
 }
 
 fn get_status(
@@ -253,15 +301,7 @@ fn get_status(
     params: Value,
 ) -> VibexResult<Value> {
     let delegation_id = parse_required_id(&params, "delegationId", AgentDelegationId::parse)?;
-    serde_json::to_value(manager.get_agent_delegation(&parent_session_id, &delegation_id)?).map_err(
-        |error| {
-            VibexError::process(
-                "agent_delegation_encode_failed",
-                "failed to encode Agent delegation result",
-            )
-            .with_diagnostic("error", error.to_string())
-        },
-    )
+    encode_delegation_tool_result(manager.get_agent_delegation(&parent_session_id, &delegation_id)?)
 }
 
 async fn cancel(
@@ -276,13 +316,7 @@ async fn cancel(
             delegation_id,
         })
         .await?;
-    serde_json::to_value(value).map_err(|error| {
-        VibexError::process(
-            "agent_delegation_encode_failed",
-            "failed to encode Agent delegation result",
-        )
-        .with_diagnostic("error", error.to_string())
-    })
+    encode_delegation_tool_result(value)
 }
 
 fn broker_error(code: &str, message: &str) -> Value {
@@ -410,7 +444,7 @@ fn delegation_tool_definitions() -> Value {
     json!([
         {
             "name": "delegate_to_agent",
-            "description": "Run a bounded task in an independent child Agent session.",
+            "description": "Run a bounded task in an independent child Agent session. The response object's id is the delegationId to use for polling, and internal session ids are intentionally omitted. Omit model to inherit the parent session model; a supplied model must be configured for the selected Agent Profile.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -428,7 +462,7 @@ fn delegation_tool_definitions() -> Value {
         },
         {
             "name": "get_delegation_status",
-            "description": "Read the current status and bounded result of a child Agent task.",
+            "description": "Read the current status and bounded result of a child Agent task using delegationId. The response intentionally omits internal session ids; resultSummary is bounded.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "delegationId": { "type": "string" } },
@@ -437,7 +471,7 @@ fn delegation_tool_definitions() -> Value {
         },
         {
             "name": "cancel_delegation",
-            "description": "Cancel a child Agent task owned by this parent session.",
+            "description": "Cancel a child Agent task owned by this parent session using delegationId. The response intentionally omits internal session ids.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "delegationId": { "type": "string" } },
@@ -476,12 +510,16 @@ fn call_broker(
     if response.get("ok").and_then(Value::as_bool) == Some(true) {
         Ok(response.get("value").cloned().unwrap_or(Value::Null))
     } else {
-        Err(response
-            .get("error")
+        let error = response.get("error");
+        let code = error
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_str)
+            .unwrap_or("agent_delegation_request_failed");
+        let message = error
             .and_then(|error| error.get("message"))
             .and_then(Value::as_str)
-            .unwrap_or("delegation broker request failed")
-            .to_string())
+            .unwrap_or("delegation broker request failed");
+        Err(format!("{code}: {message}"))
     }
 }
 
@@ -564,6 +602,40 @@ mod tests {
         let tools = delegation_tool_definitions();
         assert_eq!(tools.as_array().map(Vec::len), Some(3));
         assert_eq!(tools[0]["name"], "delegate_to_agent");
+        assert!(
+            tools[0]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("object's id is the delegationId"))
+        );
+    }
+
+    #[test]
+    fn agent_results_do_not_expose_internal_session_ids() {
+        let result = serde_json::to_value(AgentDelegationToolResult::from(AgentDelegation {
+            id: AgentDelegationId::new(),
+            parent_session_id: VibexSessionId::new(),
+            parent_timeline_item_id: None,
+            child_session_id: Some(VibexSessionId::new()),
+            idempotency_key: "test".to_string(),
+            title: "Child task".to_string(),
+            task_summary: "Inspect the project".to_string(),
+            requested_agent_id: None,
+            effective_agent_id: Some(AgentId::parse("zcode").unwrap()),
+            status: AgentDelegationStatus::Running,
+            result_summary: None,
+            error_code: None,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            started_at_ms: Some(1),
+            completed_at_ms: None,
+        }))
+        .unwrap();
+
+        assert!(result.get("delegationId").is_none());
+        assert!(result.get("parentSessionId").is_none());
+        assert!(result.get("childSessionId").is_none());
+        assert!(result.get("id").is_some());
+        assert_eq!(result["status"], "running");
     }
 
     #[test]

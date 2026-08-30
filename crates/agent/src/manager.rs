@@ -26,7 +26,7 @@ use vibex_core::{
     McpServerTransportKind, MessageAttachment, MessageSubmissionId, PermissionRequest, ProjectId,
     PromptKind, PromptStatus, ProviderBinding, ProviderBindingMetadata, ProviderCapabilities,
     ProviderCapabilitiesResponse, ProviderDefaultScopeKind, ProviderKind, ProviderNativeBinding,
-    ProviderProfileDefaultScope, ProviderProfileId, ProviderProfileStatus,
+    ProviderProfile, ProviderProfileDefaultScope, ProviderProfileId, ProviderProfileStatus,
     RenameAgentSessionRequest, ResolveElicitationRequest, ResolvePermissionRequest,
     RuntimeLeaseRole, RuntimeModelSelection, SendAgentMessageRequest, SessionRuntimeSelection,
     SessionRuntimeSelectionStatus, SystemNoticeLevel, SystemNoticePayload, TimelineErrorPayload,
@@ -1246,6 +1246,21 @@ impl AgentManager {
                     "agent_delegation_model_invalid",
                     "delegation model must be a bounded provider model identifier",
                 ));
+            }
+            if let Some(provider_profile_id) = selection.provider_profile_id() {
+                let profile = ProviderProfileRepository::get(conn, provider_profile_id)?
+                    .ok_or_else(|| {
+                        VibexError::validation(
+                            "provider_profile_not_found",
+                            "Provider Profile was not found for Agent delegation",
+                        )
+                    })?;
+                validate_delegation_model_for_profile(
+                    &profile,
+                    &selection.agent_id,
+                    provider_profile_id,
+                    model,
+                )?;
             }
             selection.model = RuntimeModelSelection::explicit(model.to_string());
         }
@@ -3397,21 +3412,7 @@ impl AgentManager {
         let Some(profile) = ProviderProfileRepository::get(&conn, provider_profile_id)? else {
             return Ok(Vec::new());
         };
-        let configured = normalize_model_names(
-            profile
-                .configured_models
-                .iter()
-                .filter(|model| model.enabled)
-                .map(|model| Some(model.id.clone())),
-        );
-        if !configured.is_empty() {
-            return Ok(configured);
-        }
-        Ok(normalize_model_names([
-            profile.default_model,
-            profile.small_model,
-            profile.large_model,
-        ]))
+        Ok(configured_model_ids_for_profile(&profile))
     }
 
     fn resolve_enabled_agent(
@@ -4277,6 +4278,49 @@ fn normalize_model_names(models: impl IntoIterator<Item = Option<String>>) -> Ve
     normalized
 }
 
+fn configured_model_ids_for_profile(profile: &ProviderProfile) -> Vec<String> {
+    let configured = normalize_model_names(
+        profile
+            .configured_models
+            .iter()
+            .filter(|model| model.enabled)
+            .map(|model| Some(model.id.clone())),
+    );
+    if !configured.is_empty() {
+        return configured;
+    }
+    normalize_model_names([
+        profile.default_model.clone(),
+        profile.small_model.clone(),
+        profile.large_model.clone(),
+    ])
+}
+
+fn validate_delegation_model_for_profile(
+    profile: &ProviderProfile,
+    agent_id: &AgentId,
+    provider_profile_id: &ProviderProfileId,
+    model: &str,
+) -> VibexResult<()> {
+    let configured_models = configured_model_ids_for_profile(profile);
+    // A profile without a declared model list may expose models dynamically
+    // through ACP. The runtime resolver remains authoritative in that case.
+    if configured_models.is_empty() || configured_models.iter().any(|candidate| candidate == model)
+    {
+        return Ok(());
+    }
+    Err(VibexError::validation(
+        "agent_delegation_model_unavailable",
+        "requested delegation model is not configured for the selected Agent Profile",
+    )
+    .with_recovery_hint(
+        "Omit the model to inherit the parent session model, or choose a configured model",
+    )
+    .with_diagnostic("agentId", agent_id.as_str())
+    .with_diagnostic("providerProfileId", provider_profile_id.as_str())
+    .with_diagnostic("model", model))
+}
+
 fn merge_model_lists(probed_models: &[String], configured_models: &[String]) -> Vec<String> {
     let probed = probed_models.iter().cloned().map(Some);
     let configured = configured_models.iter().cloned().map(Some);
@@ -4786,9 +4830,10 @@ mod tests {
     use async_trait::async_trait;
     use vibex_core::{
         AcpAdapterId, AgentRuntimeRouteKey, AgentSessionSafety, MessageSubmissionStatus,
-        NativeStateHomeId, RuntimeBinding, RuntimeBindingId, RuntimeMaterializationStatus,
-        RuntimeProcessId, RuntimeProcessSnapshot, RuntimeSwitchActiveWorkPolicy, RuntimeSwitchId,
-        RuntimeSwitchPolicy, RuntimeSwitchStatus, SessionRuntimeConfigState, WorkspaceMode,
+        NativeStateHomeId, ProviderConfiguredModel, RuntimeBinding, RuntimeBindingId,
+        RuntimeMaterializationStatus, RuntimeProcessId, RuntimeProcessSnapshot,
+        RuntimeSwitchActiveWorkPolicy, RuntimeSwitchId, RuntimeSwitchPolicy, RuntimeSwitchStatus,
+        SessionRuntimeConfigState, WorkspaceMode,
     };
     use vibex_db::{DesiredRuntimeSwitchEnqueueRequest, WorkspaceRepository};
 
@@ -5795,6 +5840,54 @@ mod tests {
         );
         let error = normalize_reasoning_effort(Some("high=value")).unwrap_err();
         assert_eq!(error.code, "reasoning_effort_invalid");
+    }
+
+    #[test]
+    fn delegation_model_validation_rejects_unconfigured_profile_models() {
+        let mut profile = ProviderProfile::local_default(ProviderKind::Acp);
+        profile.configured_models = vec![ProviderConfiguredModel {
+            id: "configured-model".to_string(),
+            display_name: None,
+            enabled: true,
+            wire_api: None,
+            capabilities: Default::default(),
+        }];
+        let agent_id = AgentId::parse("zcode").unwrap();
+
+        assert!(
+            validate_delegation_model_for_profile(
+                &profile,
+                &agent_id,
+                &profile.id,
+                "configured-model",
+            )
+            .is_ok()
+        );
+        let error =
+            validate_delegation_model_for_profile(&profile, &agent_id, &profile.id, "sonnet")
+                .unwrap_err();
+        assert_eq!(error.code, "agent_delegation_model_unavailable");
+        assert_eq!(
+            error.recovery_hint.as_deref(),
+            Some(
+                "Omit the model to inherit the parent session model, or choose a configured model"
+            )
+        );
+    }
+
+    #[test]
+    fn delegation_model_validation_allows_dynamic_profile_models() {
+        let profile = ProviderProfile::local_default(ProviderKind::Acp);
+        let agent_id = AgentId::parse("zcode").unwrap();
+        assert!(
+            validate_delegation_model_for_profile(
+                &profile,
+                &agent_id,
+                &profile.id,
+                "runtime-discovered-model",
+            )
+            .is_ok()
+        );
     }
 
     #[test]
