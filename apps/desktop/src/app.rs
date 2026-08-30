@@ -2793,12 +2793,14 @@ fn append_agent_streaming_deltas_to_cache(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentAnswerAction {
     Copy,
+    ScrollToUserMessage,
     Fork,
     Timestamp,
 }
 
-const AGENT_ANSWER_ACTION_ORDER: [AgentAnswerAction; 3] = [
+const AGENT_ANSWER_ACTION_ORDER: [AgentAnswerAction; 4] = [
     AgentAnswerAction::Copy,
+    AgentAnswerAction::ScrollToUserMessage,
     AgentAnswerAction::Fork,
     AgentAnswerAction::Timestamp,
 ];
@@ -11117,6 +11119,23 @@ impl VibexWorkbench {
         if should_follow {
             self.request_timeline_scroll_to_latest();
         }
+        cx.notify();
+    }
+
+    fn scroll_to_timeline_turn_top(&mut self, turn_id: &str, cx: &mut Context<Self>) {
+        let Some(turn_index) = self
+            .conversation_turns()
+            .iter()
+            .position(|turn| turn.id == turn_id)
+        else {
+            return;
+        };
+
+        self.timeline_scroll_wheel_idle_task = None;
+        self.timeline_follow.set_following_bottom(false);
+        self.timeline_scroll_to_latest_pending = false;
+        self.timeline_scroll
+            .scroll_to_item(turn_index, ScrollStrategy::Top);
         cx.notify();
     }
 
@@ -32896,6 +32915,7 @@ impl VibexWorkbench {
         let fork_disabled = self.agent_action_pending
             || self.fork_session_pending
             || self.timeline.needs_authoritative_refetch;
+        let scroll_to_user_message_turn_id = row.turn_id.clone();
         let show_answer_actions = !self.rendering_child_agent_timeline()
             && show_agent_answer_actions(conversation_conclusion, row);
         let answer_actions = if show_answer_actions {
@@ -32918,6 +32938,25 @@ impl VibexWorkbench {
                                 })
                                 .into_any_element(),
                         )
+                    }
+                    AgentAnswerAction::ScrollToUserMessage => {
+                        scroll_to_user_message_turn_id.clone().map(|turn_id| {
+                            Button::new(format!("scroll-to-user-message:{}", row.id))
+                                .xsmall()
+                                .ghost()
+                                .compact()
+                                .size(px(24.0))
+                                .icon(Icon::default().path("icons/vibex/user-arrow-up.svg"))
+                                .tooltip(locale::text(
+                                    "Scroll to User Message",
+                                    "滚动到用户消息",
+                                    "捲動到使用者訊息",
+                                ))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.scroll_to_timeline_turn_top(&turn_id, cx)
+                                }))
+                                .into_any_element()
+                        })
                     }
                     AgentAnswerAction::Fork => Some(
                         Button::new(format!("fork-conclusion:{}", row.id))
@@ -56387,18 +56426,23 @@ mod tests {
     }
 
     #[test]
-    fn agent_answer_actions_keep_copy_fork_timestamp_order() {
+    fn agent_answer_actions_keep_copy_scroll_fork_timestamp_order() {
         assert_eq!(
             agent_answer_actions(true).collect::<Vec<_>>(),
             vec![
                 AgentAnswerAction::Copy,
+                AgentAnswerAction::ScrollToUserMessage,
                 AgentAnswerAction::Fork,
                 AgentAnswerAction::Timestamp,
             ]
         );
         assert_eq!(
             agent_answer_actions(false).collect::<Vec<_>>(),
-            vec![AgentAnswerAction::Copy, AgentAnswerAction::Fork]
+            vec![
+                AgentAnswerAction::Copy,
+                AgentAnswerAction::ScrollToUserMessage,
+                AgentAnswerAction::Fork,
+            ]
         );
     }
 
