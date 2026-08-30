@@ -12,8 +12,8 @@ use gpui::{Hsla, hsla, rgb};
 
 // The values below mirror the shared desktop dark tokens
 // (`crates/vibex-ui/theme/tokens.json`) so the phone reads as the same product
-// as the desktop shell: the session page uses `background`, the sessions page
-// uses `sidebar`, and the workbench page uses the right-rail surfaces.
+// as the desktop shell: the session page uses `background`, while the sessions
+// and workbench pages share the same compact sidebar base.
 pub const BG_PRIMARY: u32 = 0x09090b;
 pub const BG_CARD: u32 = 0x18181b;
 /// Lower-contrast card fill than [`BG_CARD`]; blends into [`BG_PRIMARY`] on dense lists.
@@ -43,9 +43,9 @@ pub const SIDEBAR_TEXT_PRIMARY: u32 = 0xfafafa;
 pub const SIDEBAR_TEXT_SECONDARY: u32 = 0xd4d4d8;
 pub const SIDEBAR_TEXT_MUTED: u32 = 0x9f9fa9;
 
-/// Workbench page surfaces mirror the desktop right rail: the activity bar and
-/// panel body sit on `background`, and the panel chrome uses `sidebar`.
-pub const WORKBENCH_BG: u32 = 0x09090b;
+/// The compact workbench shares the sessions sidebar base for a consistent
+/// page background; panel chrome uses the same token as well.
+pub const WORKBENCH_BG: u32 = SIDEBAR_BG;
 pub const WORKBENCH_PANEL_BG: u32 = 0x18181b;
 
 // ---------------------------------------------------------------------------

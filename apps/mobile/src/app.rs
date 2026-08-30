@@ -7990,9 +7990,7 @@ impl MobileApp {
             .absolute()
             .top_0()
             .bottom_0()
-            // The workbench page is the phone's right rail, so it mirrors the
-            // desktop right-rail surfaces rather than the session page.
-            .bg(theme::workbench_bg())
+            .bg(theme::sidebar_bg())
             .border_l_1()
             .border_color(theme::border_default())
             .flex()

@@ -43,13 +43,7 @@ pub enum WorkbenchSurface {
 }
 
 impl WorkbenchSurface {
-    pub const ALL: [Self; 5] = [
-        Self::Files,
-        Self::Git,
-        Self::Terminal,
-        Self::Providers,
-        Self::Runtime,
-    ];
+    pub const ALL: [Self; 3] = [Self::Files, Self::Git, Self::Terminal];
 
     pub const fn label(self) -> &'static str {
         match self {
@@ -2513,7 +2507,7 @@ impl Render for MobileWorkbench {
         let surface = self.surface;
         div()
             .size_full()
-            .bg(theme::bg_primary())
+            .bg(theme::sidebar_bg())
             .flex()
             .flex_col()
             .child(
@@ -2539,7 +2533,7 @@ impl Render for MobileWorkbench {
                             .border_color(if candidate == surface {
                                 rgb(theme::ACCENT_BLUE).into()
                             } else {
-                                theme::bg_primary()
+                                theme::sidebar_bg()
                             })
                             .text_size(px(theme::FONT_CAPTION))
                             .text_color(if candidate == surface {
@@ -2870,5 +2864,18 @@ mod tests {
 
         let available = runtime_option(selection.clone(), RuntimeOptionAvailability::Available);
         assert!(runtime_selection_is_available(&[available], &selection));
+    }
+
+    #[test]
+    fn visible_surfaces_exclude_provider_and_runtime_entries() {
+        assert_eq!(
+            WorkbenchSurface::ALL,
+            [
+                WorkbenchSurface::Files,
+                WorkbenchSurface::Git,
+                WorkbenchSurface::Terminal,
+            ]
+        );
+        assert_eq!(theme::WORKBENCH_BG, theme::SIDEBAR_BG);
     }
 }
