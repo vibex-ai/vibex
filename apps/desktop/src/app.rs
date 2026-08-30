@@ -22656,7 +22656,6 @@ impl VibexWorkbench {
             .id(format!("sidebar-folder-row-{folder_id}"))
             .group(hover_group.clone())
             .relative()
-            .left(px(SIDEBAR_ROW_ICON_SLOT_OVERHANG))
             .h(px(32.0))
             .min_h(px(32.0))
             .w_full()
@@ -22851,7 +22850,8 @@ impl VibexWorkbench {
                     .size_full()
                     .min_w_0()
                     .items_center()
-                    .gap(px(SIDEBAR_ICON_TITLE_GAP))
+                    // Match a sibling session's leading Agent logo and title.
+                    .gap(px(0.0))
                     .child(
                         h_flex()
                             .size(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))
@@ -51819,9 +51819,9 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_project("))
             .map(|(body, _)| body)
             .expect("folder renderer should remain inspectable");
-        assert!(folder.contains(".left(px(SIDEBAR_ROW_ICON_SLOT_OVERHANG))"));
+        assert!(!folder.contains(".left(px(SIDEBAR_ROW_ICON_SLOT_OVERHANG))"));
         assert!(!folder.contains("root_level_folder"));
-        assert!(folder.contains(".gap(px(SIDEBAR_ICON_TITLE_GAP))"));
+        assert!(folder.contains(".gap(px(0.0))"));
         assert!(!folder.contains(".pl(px(16.0))"));
         assert!(folder.contains(
             ".size(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))\n                            .flex_none()\n                            .items_center()\n                            .justify_center()"
@@ -56967,7 +56967,7 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_project("))
             .map(|(body, _)| body)
             .expect("sidebar folder renderer should remain inspectable");
-        assert!(folder.contains(".gap(px(SIDEBAR_ICON_TITLE_GAP))"));
+        assert!(folder.contains(".gap(px(0.0))"));
         assert!(!folder.contains("root_level_folder"));
         assert!(!folder.contains(".pl(px(16.0))"));
         assert!(folder.contains(
