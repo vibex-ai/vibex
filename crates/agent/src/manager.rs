@@ -2417,6 +2417,16 @@ impl AgentManager {
             push_or_replace_timeline_item(&mut appended, item);
         }
 
+        if let Some(error) = exhausted_retry_turn_error(&appended) {
+            self.finish_turn_with_error_on_conn_with_attribution(
+                &mut conn,
+                &session.id,
+                &error,
+                execution_attribution.as_ref(),
+            )?;
+            return Err(error);
+        }
+
         if turn_completed && context_bridge_behavior == ContextBridgeTurnBehavior::ConsumePending {
             let identity = &expected_execution_identity;
             let consumed_context_sequence = appended
@@ -3791,6 +3801,9 @@ impl AgentManager {
             execution_attribution,
         );
         SessionRepository::update_state(conn, session_id, AgentSessionState::Error)?;
+        if let Some(session) = SessionRepository::get(conn, session_id)? {
+            self.publish_root_session_update(conn, session);
+        }
         if let Ok(item) = item {
             self.publish_notification(AgentNotificationIntent::turn_failed(&item));
         }
@@ -4315,12 +4328,51 @@ fn provider_event_was_streamed(
         })
 }
 
-fn retry_phase_order(phase: RetryPhase) -> u8 {
-    match phase {
-        RetryPhase::Started => 0,
-        RetryPhase::Recovered => 1,
-        RetryPhase::Exhausted => 2,
+fn retry_counter_staleness(incoming: Option<u32>, current: Option<u32>) -> Option<bool> {
+    match (incoming, current) {
+        (Some(incoming), Some(current)) if incoming < current => Some(true),
+        (Some(incoming), Some(current)) if incoming > current => Some(false),
+        (None, Some(_)) => Some(true),
+        (Some(_), None) => Some(false),
+        _ => None,
     }
+}
+
+fn retry_snapshot_counter_staleness(
+    incoming: &AgentRetryPayload,
+    current: &AgentRetryPayload,
+) -> Option<bool> {
+    retry_counter_staleness(incoming.attempt, current.attempt)
+        .or_else(|| retry_counter_staleness(incoming.max_attempts, current.max_attempts))
+}
+
+fn exhausted_retry_turn_error(items: &[TimelineItem]) -> Option<VibexError> {
+    let retry = items.iter().rev().find_map(|item| match &item.payload {
+        TimelinePayload::Retry(retry) if retry.phase == RetryPhase::Exhausted => Some(retry),
+        _ => None,
+    })?;
+    let message =
+        retry
+            .reason
+            .clone()
+            .unwrap_or_else(|| match (retry.attempt, retry.max_attempts) {
+                (Some(attempt), Some(max_attempts)) => {
+                    format!("Agent retry attempts exhausted after {attempt}/{max_attempts}")
+                }
+                (Some(attempt), None) => {
+                    format!("Agent retry attempts exhausted after attempt {attempt}")
+                }
+                _ => "Agent retry attempts exhausted".to_string(),
+            });
+    let mut error = VibexError::provider("agent_retry_exhausted", message)
+        .with_recovery_hint("Continue the session to retry from the failed turn");
+    if let Some(attempt) = retry.attempt {
+        error = error.with_diagnostic("attempt", attempt.to_string());
+    }
+    if let Some(max_attempts) = retry.max_attempts {
+        error = error.with_diagnostic("maxAttempts", max_attempts.to_string());
+    }
+    Some(error)
 }
 
 /// Returns true when a final retry snapshot contains no newer state than the
@@ -4334,28 +4386,22 @@ fn retry_snapshot_is_stale_or_equal(
     if incoming.kind != current.kind {
         return false;
     }
-    let incoming_phase = retry_phase_order(incoming.phase);
-    let current_phase = retry_phase_order(current.phase);
-    if incoming_phase < current_phase {
+
+    if current.phase == RetryPhase::Exhausted && incoming.phase != RetryPhase::Exhausted {
         return true;
     }
-    if incoming_phase > current_phase {
+    if current.phase != RetryPhase::Exhausted && incoming.phase == RetryPhase::Exhausted {
         return false;
     }
 
-    if incoming.phase == RetryPhase::Started {
-        match (incoming.attempt, current.attempt) {
-            (Some(incoming), Some(current)) if incoming < current => return true,
-            (Some(incoming), Some(current)) if incoming > current => return false,
-            (None, Some(_)) => return true,
-            _ => {}
-        }
-        match (incoming.max_attempts, current.max_attempts) {
-            (Some(incoming), Some(current)) if incoming < current => return true,
-            (Some(incoming), Some(current)) if incoming > current => return false,
-            (None, Some(_)) => return true,
-            _ => {}
-        }
+    if current.phase == RetryPhase::Recovered && incoming.phase == RetryPhase::Started {
+        return retry_snapshot_counter_staleness(incoming, current).unwrap_or(false);
+    }
+    if current.phase != incoming.phase {
+        return false;
+    }
+    if let Some(is_stale) = retry_snapshot_counter_staleness(incoming, current) {
+        return is_stale;
     }
 
     // A replayed partial snapshot must not erase details already observed by
@@ -6491,6 +6537,7 @@ mod tests {
             AgentSessionState::Running,
         );
         let mut notifications = manager.subscribe_notifications();
+        let mut session_updates = manager.subscribe_session_updates();
 
         manager
             .finish_turn_with_error_on_conn(
@@ -6505,6 +6552,10 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .state,
+            AgentSessionState::Error
+        );
+        assert_eq!(
+            session_updates.try_recv().unwrap().state,
             AgentSessionState::Error
         );
         let notification = notifications.try_recv().unwrap();
@@ -6676,6 +6727,53 @@ mod tests {
         assert!(provider_event_was_streamed_in_final_result(
             &stale,
             std::slice::from_ref(&exhausted),
+            &indices,
+        ));
+    }
+
+    #[test]
+    fn final_retry_snapshot_allows_a_new_started_cycle_after_recovery() {
+        let session_id = VibexSessionId::new();
+        let correlation = "provider-retry-cycle".to_string();
+        let recovered = TimelineItem {
+            id: vibex_core::TimelineItemId::new(),
+            session_id,
+            sequence: 1,
+            timestamp_ms: 1,
+            source: TimelineSource::Provider,
+            kind: vibex_core::TimelineItemKind::Retry,
+            correlation_id: None,
+            provider_correlation_id: Some(correlation.clone()),
+            redaction_state: TimelineRedactionState::None,
+            execution_attribution: None,
+            payload: TimelinePayload::Retry(vibex_core::AgentRetryPayload {
+                kind: vibex_core::RetryKind::ModelRequest,
+                phase: vibex_core::RetryPhase::Recovered,
+                attempt: Some(1),
+                max_attempts: Some(3),
+                delay_ms: None,
+                reason: Some("first retry recovered".to_string()),
+            }),
+        };
+        let indices = HashMap::from([(correlation.clone(), 0)]);
+        let restarted = ProviderEvent {
+            source: TimelineSource::Provider,
+            payload: TimelinePayload::Retry(vibex_core::AgentRetryPayload {
+                kind: vibex_core::RetryKind::ModelRequest,
+                phase: vibex_core::RetryPhase::Started,
+                attempt: Some(2),
+                max_attempts: Some(3),
+                delay_ms: Some(1_000),
+                reason: Some("second retry started".to_string()),
+            }),
+            provider_correlation_id: Some(correlation),
+            redaction_state: TimelineRedactionState::None,
+            session_title: None,
+        };
+
+        assert!(!provider_event_was_streamed_in_final_result(
+            &restarted,
+            std::slice::from_ref(&recovered),
             &indices,
         ));
     }

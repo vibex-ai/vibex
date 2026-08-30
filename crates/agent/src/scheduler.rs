@@ -880,7 +880,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scheduled_prompt_failure_records_ambiguous_failed_run() {
+    async fn scheduled_prompt_failure_records_terminal_failed_run() {
         let db_path = temp_db_path("scheduler-failure");
         let manager = test_manager(&db_path);
         let task = insert_task(
@@ -898,7 +898,7 @@ mod tests {
         assert_eq!(result.failed, 1);
         assert_eq!(
             result.outcomes[0].error_code.as_deref(),
-            Some("message_submission_prompt_dispatch_ambiguous")
+            Some("test_provider_error")
         );
 
         let conn = open_database(&db_path).unwrap();
@@ -913,10 +913,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(runs.len(), 1);
-        assert_eq!(
-            runs[0].error_code.as_deref(),
-            Some("message_submission_prompt_dispatch_ambiguous")
-        );
+        assert_eq!(runs[0].error_code.as_deref(), Some("test_provider_error"));
         assert_eq!(
             ScheduledTaskRepository::get(&conn, &task.id)
                 .unwrap()

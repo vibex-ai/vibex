@@ -9,8 +9,8 @@ use vibex_core::{
     AdapterDiagnostic, AgentAuthCatalog, AgentCommandConfig, AgentConfig, AgentDelegation,
     AgentDelegationId, AgentDelegationStatus, AgentDiscoveryRecord, AgentId,
     AgentManagedInstallState, AgentModelListResponse, AgentModelProviderDefaultSelection,
-    AgentModelProviderDisplayOrderEntry, AgentModelProviderFailoverEntry, AgentSession,
-    AgentSessionConfigProbe, AgentSessionSafety, AgentSessionState, AutomationEdge,
+    AgentModelProviderDisplayOrderEntry, AgentModelProviderFailoverEntry, AgentRetryPayload,
+    AgentSession, AgentSessionConfigProbe, AgentSessionSafety, AgentSessionState, AutomationEdge,
     AutomationEdgeCreateRequest, AutomationEdgeId, AutomationGraph, AutomationGraphCreateRequest,
     AutomationGraphId, AutomationGraphListRequest, AutomationGraphStatus,
     AutomationGraphUpdateRequest, AutomationNode, AutomationNodeCreateRequest, AutomationNodeId,
@@ -37,7 +37,7 @@ use vibex_core::{
     ProviderProfileSetDefaultRequest, ProviderProfileStatus, ProviderSandboxDefaults,
     ProviderSecretReference, ProviderUsageRecord, ProviderUsageWindow, RedactedDiagnostic,
     RemoteAuditListRequest, RemoteAuditRecord, RemoteDeviceDetail, RemoteDeviceStatus,
-    RemotePairingCode, RequestId, ScheduledTask, ScheduledTaskAttentionKind,
+    RemotePairingCode, RequestId, RetryPhase, ScheduledTask, ScheduledTaskAttentionKind,
     ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
     ScheduledTaskAuditListRequest, ScheduledTaskAuditOutcome, ScheduledTaskAuditRecord,
     ScheduledTaskCreateRequest, ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun,
@@ -7995,6 +7995,49 @@ impl HookRepository {
     }
 }
 
+fn retain_larger_retry_counter(incoming: Option<u32>, current: Option<u32>) -> Option<u32> {
+    match (incoming, current) {
+        (Some(incoming), Some(current)) => Some(incoming.max(current)),
+        (Some(incoming), None) => Some(incoming),
+        (None, current) => current,
+    }
+}
+
+fn merge_retry_payload_metadata(
+    mut incoming: AgentRetryPayload,
+    current: &AgentRetryPayload,
+) -> AgentRetryPayload {
+    incoming.attempt = retain_larger_retry_counter(incoming.attempt, current.attempt);
+    incoming.max_attempts =
+        retain_larger_retry_counter(incoming.max_attempts, current.max_attempts);
+    if incoming.delay_ms.is_none() {
+        incoming.delay_ms = current.delay_ms;
+    }
+    if incoming.reason.is_none() {
+        incoming.reason = current.reason.clone();
+    }
+    incoming
+}
+
+/// A retry correlation represents one visible activity row. Terminal metadata
+/// can race with buffered progress, so an exhausted row must not be replaced
+/// by a late recovery/progress snapshot.
+fn merge_retry_payload(
+    current: &AgentRetryPayload,
+    incoming: &AgentRetryPayload,
+) -> AgentRetryPayload {
+    if current.kind == incoming.kind
+        && current.phase == RetryPhase::Exhausted
+        && incoming.phase != RetryPhase::Exhausted
+    {
+        return current.clone();
+    }
+    if current.kind == incoming.kind {
+        return merge_retry_payload_metadata(incoming.clone(), current);
+    }
+    incoming.clone()
+}
+
 impl TimelineRepository {
     pub fn latest_sequence(conn: &Connection, session_id: &VibexSessionId) -> VibexResult<i64> {
         conn.query_row(
@@ -8160,29 +8203,37 @@ impl TimelineRepository {
                     "provider event attribution does not match the existing timeline item",
                 ));
             }
-            item.timestamp_ms = unix_timestamp_ms();
-            item.payload = payload;
-            item.redaction_state = redaction_state;
-            tx.execute(
-                "
-                UPDATE agent_timeline_items
-                SET timestamp_ms = ?3,
-                    payload_json = ?4,
-                    redaction_state = ?5
-                WHERE session_id = ?1 AND sequence = ?2
-                ",
-                params![
-                    session_id.as_str(),
-                    item.sequence,
-                    item.timestamp_ms,
-                    timeline_payload_json(&item.payload)?,
-                    enum_to_db(&item.redaction_state)?
-                ],
-            )
-            .map_err(storage_err(
-                "timeline_provider_correlation_update_failed",
-                "failed to update timeline item by provider correlation id",
-            ))?;
+            let merged_payload = match (&item.payload, &payload) {
+                (TimelinePayload::Retry(current), TimelinePayload::Retry(incoming)) => {
+                    TimelinePayload::Retry(merge_retry_payload(current, incoming))
+                }
+                _ => payload,
+            };
+            if item.payload != merged_payload || item.redaction_state != redaction_state {
+                item.timestamp_ms = unix_timestamp_ms();
+                item.payload = merged_payload;
+                item.redaction_state = redaction_state;
+                tx.execute(
+                    "
+                    UPDATE agent_timeline_items
+                    SET timestamp_ms = ?3,
+                        payload_json = ?4,
+                        redaction_state = ?5
+                    WHERE session_id = ?1 AND sequence = ?2
+                    ",
+                    params![
+                        session_id.as_str(),
+                        item.sequence,
+                        item.timestamp_ms,
+                        timeline_payload_json(&item.payload)?,
+                        enum_to_db(&item.redaction_state)?
+                    ],
+                )
+                .map_err(storage_err(
+                    "timeline_provider_correlation_update_failed",
+                    "failed to update timeline item by provider correlation id",
+                ))?;
+            }
             item
         } else {
             append_timeline_in_transaction(
@@ -17837,6 +17888,131 @@ mod tests {
         let recent = RecentFileRepository::list(&conn, &workspace.id, 10).unwrap();
         assert_eq!(recent, vec!["src/main.rs".to_string()]);
 
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn retry_upsert_restarts_a_recovered_row_but_keeps_exhaustion_terminal() {
+        let temp = temp_db_path("retry-upsert-terminal");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let (_project, workspace) = WorkspaceRepository::ensure(
+            &conn,
+            "/tmp/vibex-retry-upsert-terminal",
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let now = unix_timestamp_ms();
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: "Retry terminal".to_string(),
+            project_id: workspace.project_id.clone(),
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path.clone(),
+            workspace_mode: workspace.mode,
+            agent_id: AgentId::parse("codex").unwrap(),
+            state: AgentSessionState::Running,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_message_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        SessionRepository::insert(&conn, &session).unwrap();
+
+        let retry = |phase: RetryPhase, attempt: u32, reason: &str| {
+            TimelinePayload::Retry(AgentRetryPayload {
+                kind: vibex_core::RetryKind::StreamReconnect,
+                phase,
+                attempt: Some(attempt),
+                max_attempts: Some(3),
+                delay_ms: None,
+                reason: Some(reason.to_string()),
+            })
+        };
+        let started = TimelineRepository::upsert_by_provider_correlation(
+            &mut conn,
+            &session.id,
+            TimelineSource::Provider,
+            retry(RetryPhase::Started, 1, "connection lost"),
+            "retry-turn-1",
+            0,
+            TimelineRedactionState::None,
+            None,
+        )
+        .unwrap();
+        let recovered = TimelineRepository::upsert_by_provider_correlation(
+            &mut conn,
+            &session.id,
+            TimelineSource::Provider,
+            retry(RetryPhase::Recovered, 1, "connection restored"),
+            "retry-turn-1",
+            0,
+            TimelineRedactionState::None,
+            None,
+        )
+        .unwrap();
+        let restarted = TimelineRepository::upsert_by_provider_correlation(
+            &mut conn,
+            &session.id,
+            TimelineSource::Provider,
+            retry(RetryPhase::Started, 2, "connection lost again"),
+            "retry-turn-1",
+            0,
+            TimelineRedactionState::None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(started.sequence, recovered.sequence);
+        assert_eq!(recovered.sequence, restarted.sequence);
+        assert!(matches!(
+            restarted.payload,
+            TimelinePayload::Retry(AgentRetryPayload {
+                phase: RetryPhase::Started,
+                attempt: Some(2),
+                reason: Some(ref reason),
+                ..
+            }) if reason == "connection lost again"
+        ));
+
+        TimelineRepository::upsert_by_provider_correlation(
+            &mut conn,
+            &session.id,
+            TimelineSource::Provider,
+            retry(RetryPhase::Exhausted, 3, "retry budget exhausted"),
+            "retry-turn-1",
+            0,
+            TimelineRedactionState::None,
+            None,
+        )
+        .unwrap();
+        TimelineRepository::upsert_by_provider_correlation(
+            &mut conn,
+            &session.id,
+            TimelineSource::Provider,
+            retry(RetryPhase::Recovered, 3, "late buffered progress"),
+            "retry-turn-1",
+            0,
+            TimelineRedactionState::None,
+            None,
+        )
+        .unwrap();
+
+        let timeline = TimelineRepository::fetch_after(&conn, &session.id, None, 10).unwrap();
+        assert_eq!(timeline.items.len(), 1);
+        assert!(matches!(
+            &timeline.items[0].payload,
+            TimelinePayload::Retry(AgentRetryPayload {
+                phase: RetryPhase::Exhausted,
+                attempt: Some(3),
+                max_attempts: Some(3),
+                reason: Some(reason),
+                ..
+            }) if reason == "retry budget exhausted"
+        ));
+
+        drop(conn);
         cleanup_db(temp);
     }
 

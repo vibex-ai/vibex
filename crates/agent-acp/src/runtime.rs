@@ -1129,6 +1129,10 @@ struct ActiveTurn {
     sink: TurnSink,
     retry_scope: u64,
     retry_progress: BTreeMap<RetryKind, AcpRetrySignal>,
+    // Terminal retry observations must survive late stream updates. ACP agents
+    // commonly deliver their final retry metadata and buffered progress through
+    // separate pipes, so a later progress message is not evidence of recovery.
+    retry_exhausted: BTreeMap<RetryKind, AcpRetrySignal>,
     usage: Option<ActiveUsageTurn>,
     chunk_index: u32,
     codex_reconnect: Option<CodexReconnectState>,
@@ -1220,6 +1224,28 @@ struct AcpRetrySignal {
     max_attempts: Option<u32>,
     delay_ms: Option<u64>,
     reason: Option<String>,
+}
+
+fn merge_retry_signal_metadata(signal: &mut AcpRetrySignal, previous: &AcpRetrySignal) {
+    if signal.kind != previous.kind {
+        return;
+    }
+    signal.attempt = match (signal.attempt, previous.attempt) {
+        (Some(incoming), Some(previous)) => Some(incoming.max(previous)),
+        (Some(incoming), None) => Some(incoming),
+        (None, previous) => previous,
+    };
+    signal.max_attempts = match (signal.max_attempts, previous.max_attempts) {
+        (Some(incoming), Some(previous)) => Some(incoming.max(previous)),
+        (Some(incoming), None) => Some(incoming),
+        (None, previous) => previous,
+    };
+    if signal.delay_ms.is_none() {
+        signal.delay_ms = previous.delay_ms;
+    }
+    if signal.reason.is_none() {
+        signal.reason = previous.reason.clone();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1473,16 +1499,18 @@ fn parse_codex_acp_retry_signal(candidate: &Value) -> Option<AcpRetrySignal> {
     let object = candidate.as_object()?;
     // Codex's `error` metadata is also used for terminal failures. Require an
     // explicit, correctly typed boolean so an evolving/partial payload cannot
-    // be mistaken for a transient retry.
-    if object
+    // be mistaken for retry state. `willRetry: false` is an explicit exhausted
+    // retry result rather than an ordinary assistant response.
+    let phase = match object
         .get("willRetry")
         .or_else(|| object.get("will_retry"))
         .and_then(Value::as_bool)
-        != Some(true)
     {
-        return None;
-    }
-    retry_signal_fields(object, RetryPhase::Started)
+        Some(true) => RetryPhase::Started,
+        Some(false) => RetryPhase::Exhausted,
+        None => return None,
+    };
+    retry_signal_fields(object, phase)
 }
 
 fn parse_air_acp_retry_signal(candidate: &Value) -> Option<AcpRetrySignal> {
@@ -1540,14 +1568,13 @@ fn parse_acp_terminal_error(update: &Value) -> Option<VibexError> {
             ACP_RETRY_EXHAUSTED_ERROR_CODE,
             "Codex exhausted its automatic retry attempts",
         )
-    } else if let Some(candidate) = air_failure {
+    } else {
+        let candidate = air_failure?;
         (
             candidate,
             ACP_SESSION_FAILURE_ERROR_CODE,
             "ACP agent reported a terminal session failure",
         )
-    } else {
-        return None;
     };
     let object = candidate.as_object()?;
     let message = retry_signal_reason(object).unwrap_or_else(|| fallback_message.to_string());
@@ -2524,6 +2551,7 @@ impl AcpSessionAttachment {
             sink,
             retry_scope,
             retry_progress: BTreeMap::new(),
+            retry_exhausted: BTreeMap::new(),
             usage: usage_execution_context.zip(usage_event_sender).map(
                 |(context, event_sender)| ActiveUsageTurn {
                     context,
@@ -2787,27 +2815,33 @@ impl AcpSessionAttachment {
         let Some(turn) = state.active_turn.as_mut() else {
             return false;
         };
-        let previous = turn.retry_progress.get(&signal.kind).cloned();
-        if let Some(previous) = previous.as_ref() {
-            if signal.attempt.is_none() {
-                signal.attempt = previous.attempt;
+        let exhausted = turn.retry_exhausted.get(&signal.kind).cloned();
+        if let Some(previous) = exhausted.as_ref() {
+            if signal.phase != RetryPhase::Exhausted {
+                // A terminal retry state is monotonic for this turn. A late
+                // progress update cannot prove that the provider recovered.
+                return false;
             }
-            if signal.max_attempts.is_none() {
-                signal.max_attempts = previous.max_attempts;
+            merge_retry_signal_metadata(&mut signal, previous);
+            if &signal == previous {
+                return false;
             }
-            if signal.delay_ms.is_none() {
-                signal.delay_ms = previous.delay_ms;
-            }
-            if signal.reason.is_none() {
-                signal.reason = previous.reason.clone();
+        } else if let Some(previous) = turn.retry_progress.get(&signal.kind) {
+            merge_retry_signal_metadata(&mut signal, previous);
+            if signal.phase == RetryPhase::Started && &signal == previous {
+                return false;
             }
         }
         match signal.phase {
             RetryPhase::Started => {
                 turn.retry_progress.insert(signal.kind, signal.clone());
             }
-            RetryPhase::Recovered | RetryPhase::Exhausted => {
+            RetryPhase::Recovered => {
                 turn.retry_progress.remove(&signal.kind);
+            }
+            RetryPhase::Exhausted => {
+                turn.retry_progress.remove(&signal.kind);
+                turn.retry_exhausted.insert(signal.kind, signal.clone());
             }
         }
         match &mut turn.sink {
@@ -2870,6 +2904,33 @@ impl AcpSessionAttachment {
             .unwrap_or_default();
         for kind in kinds {
             self.recover_retry_if_active(kind);
+        }
+    }
+
+    fn exhaust_active_retries(&self, terminal_reason: Option<String>) {
+        let signals = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| {
+                state.active_turn.as_ref().map(|turn| {
+                    turn.retry_progress
+                        .values()
+                        .cloned()
+                        .map(|mut signal| {
+                            signal.phase = RetryPhase::Exhausted;
+                            signal.delay_ms = None;
+                            if let Some(reason) = terminal_reason.as_ref() {
+                                signal.reason = Some(reason.clone());
+                            }
+                            signal
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_default();
+        for signal in signals {
+            self.emit_retry_signal(signal);
         }
     }
 
@@ -2942,6 +3003,24 @@ impl AcpSessionAttachment {
         let Some(turn) = state.active_turn.as_mut() else {
             return;
         };
+        if turn
+            .retry_exhausted
+            .contains_key(&RetryKind::StreamReconnect)
+            || turn.codex_terminal_error.is_some()
+            || turn
+                .codex_reconnect
+                .as_ref()
+                .is_some_and(|reconnect| reconnect.terminal_message.is_some())
+        {
+            return;
+        }
+        if turn
+            .codex_reconnect
+            .as_ref()
+            .is_some_and(|current| current.progress.attempt > progress.attempt)
+        {
+            return;
+        }
         turn.codex_terminal_error = None;
         turn.codex_reconnect = Some(CodexReconnectState {
             progress,
@@ -2950,24 +3029,44 @@ impl AcpSessionAttachment {
     }
 
     fn record_codex_reconnect_terminal_message(&self, message: &str) -> bool {
-        let Ok(mut state) = self.state.lock() else {
-            return false;
-        };
-        let Some(reconnect) = state
-            .active_turn
-            .as_mut()
-            .and_then(|turn| turn.codex_reconnect.as_mut())
-            .filter(|reconnect| reconnect.progress.attempt == reconnect.progress.total)
-        else {
-            return false;
-        };
-        reconnect.terminal_message = Some(bounded_session_content(message));
-        true
+        let signal = self.state.lock().ok().and_then(|mut state| {
+            let turn = state.active_turn.as_mut()?;
+            let reconnect = turn
+                .codex_reconnect
+                .as_mut()
+                .filter(|reconnect| reconnect.progress.attempt == reconnect.progress.total)?;
+            let message = bounded_session_content(message);
+            reconnect.terminal_message = Some(message.clone());
+            Some(AcpRetrySignal {
+                kind: RetryKind::StreamReconnect,
+                phase: RetryPhase::Exhausted,
+                attempt: Some(reconnect.progress.attempt),
+                max_attempts: Some(reconnect.progress.total),
+                delay_ms: None,
+                reason: Some(message),
+            })
+        });
+        if let Some(signal) = signal {
+            self.emit_retry_signal(signal);
+            true
+        } else {
+            false
+        }
     }
 
     fn clear_codex_reconnect(&self) {
         let recovered = self.state.lock().ok().and_then(|mut state| {
             let turn = state.active_turn.as_mut()?;
+            if turn
+                .retry_exhausted
+                .contains_key(&RetryKind::StreamReconnect)
+                || turn
+                    .codex_reconnect
+                    .as_ref()
+                    .is_some_and(|reconnect| reconnect.terminal_message.is_some())
+            {
+                return None;
+            }
             let recovered = turn.codex_reconnect.take();
             turn.codex_terminal_error = None;
             recovered
@@ -3054,7 +3153,7 @@ impl AcpSessionAttachment {
         true
     }
 
-    fn codex_terminal_error(&self) -> Option<VibexError> {
+    fn terminal_turn_error(&self) -> Option<VibexError> {
         let state = self.state.lock().ok()?;
         let turn = state.active_turn.as_ref()?;
         turn.codex_reconnect
@@ -3078,6 +3177,12 @@ impl AcpSessionAttachment {
                 VibexError::provider(CODEX_STREAM_RECONNECT_EXHAUSTED_CODE, message)
                     .with_recovery_hint("Continue the session to retry from the failed turn")
                     .with_diagnostic("reconnectAttempts", reconnect.progress.total.to_string())
+            })
+            .or_else(|| {
+                turn.retry_exhausted
+                    .values()
+                    .next_back()
+                    .map(retry_exhausted_error)
             })
             .or_else(|| turn.codex_terminal_error.clone())
             .or_else(|| turn.provider_terminal_error.clone())
@@ -3823,16 +3928,20 @@ impl AcpSessionAttachment {
         let Some(kind) = update.get("sessionUpdate").and_then(Value::as_str) else {
             return;
         };
-        if let Some(error) = parse_acp_terminal_error(update) {
-            self.record_provider_terminal_error(error);
-            return;
-        }
-        if let Some(signal) = parse_acp_retry_signal(update) {
+        let retry_signal = parse_acp_retry_signal(update);
+        let terminal_error = parse_acp_terminal_error(update);
+        if let Some(signal) = retry_signal.as_ref() {
             let exhausted = signal.phase == RetryPhase::Exhausted;
             self.emit_retry_signal(signal.clone());
-            if exhausted {
-                self.record_provider_terminal_error(retry_exhausted_error(&signal));
+            if exhausted && terminal_error.is_none() {
+                self.record_provider_terminal_error(retry_exhausted_error(signal));
             }
+        }
+        if let Some(error) = terminal_error.as_ref() {
+            self.exhaust_active_retries(Some(error.message.clone()));
+            self.record_provider_terminal_error(error.clone());
+        }
+        if retry_signal.is_some() || terminal_error.is_some() {
             return;
         }
         match kind {
@@ -17018,15 +17127,18 @@ impl AcpClient for AcpRuntimeClient {
                 return Err(err);
             }
         };
-        if let Some(error) = parse_acp_terminal_error(&response) {
-            payload.record_provider_terminal_error(error);
-        }
-        if let Some(signal) = parse_acp_retry_signal(&response) {
+        let retry_signal = parse_acp_retry_signal(&response);
+        let terminal_error = parse_acp_terminal_error(&response);
+        if let Some(signal) = retry_signal.as_ref() {
             let exhausted = signal.phase == RetryPhase::Exhausted;
             payload.emit_retry_signal(signal.clone());
-            if exhausted {
-                payload.record_provider_terminal_error(retry_exhausted_error(&signal));
+            if exhausted && terminal_error.is_none() {
+                payload.record_provider_terminal_error(retry_exhausted_error(signal));
             }
+        }
+        if let Some(error) = terminal_error.as_ref() {
+            payload.exhaust_active_retries(Some(error.message.clone()));
+            payload.record_provider_terminal_error(error.clone());
         }
         let usage_changed = payload.merge_prompt_response_usage(&response);
         let has_pending_permissions = payload.has_pending_permissions();
@@ -17043,11 +17155,11 @@ impl AcpClient for AcpRuntimeClient {
         if usage_changed {
             process.publish_attachment_payload(&payload);
         }
-        if stop_reason == "end_turn"
-            && !has_pending_permissions
-            && let Some(error) = payload.codex_terminal_error()
+        payload.emit_codex_retry_exhausted();
+        if !has_pending_permissions
+            && !user_initiated_stop
+            && let Some(error) = payload.terminal_turn_error()
         {
-            payload.emit_codex_retry_exhausted();
             turn_guard.abort(false, AgentUsageExecutionStatus::Failed);
             return Err(error);
         }
@@ -19333,7 +19445,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_signal_parser_fails_closed_for_terminal_and_malformed_metadata() {
+    fn retry_signal_parser_maps_explicit_terminal_metadata_and_rejects_malformed_payloads() {
         let codex_terminal = json!({
             "_meta": {
                 "codex": {"error": {
@@ -19342,7 +19454,13 @@ mod tests {
                 }}
             }
         });
-        assert!(parse_acp_retry_signal(&codex_terminal).is_none());
+        let codex_retry =
+            parse_acp_retry_signal(&codex_terminal).expect("explicit Codex retry exhaustion");
+        assert_eq!(codex_retry.phase, RetryPhase::Exhausted);
+        assert_eq!(
+            codex_retry.reason.as_deref(),
+            Some("provider rejected the request")
+        );
         assert_eq!(
             parse_acp_terminal_error(&codex_terminal)
                 .expect("Codex terminal error")
@@ -23444,7 +23562,11 @@ for line in sys.stdin:
         if prompt_mode == "empty_end_turn":
             send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
             continue
-        if prompt_mode in ("codex_reconnect_exhausted", "codex_reconnect_recovered"):
+        if prompt_mode in (
+            "codex_reconnect_exhausted",
+            "codex_reconnect_exhausted_late_progress",
+            "codex_reconnect_recovered",
+        ):
             for attempt in range(1, 6):
                 send({
                     "jsonrpc": "2.0",
@@ -23460,7 +23582,10 @@ for line in sys.stdin:
                         },
                     },
                 })
-            if prompt_mode == "codex_reconnect_exhausted":
+            if prompt_mode in (
+                "codex_reconnect_exhausted",
+                "codex_reconnect_exhausted_late_progress",
+            ):
                 send({
                     "jsonrpc": "2.0",
                     "method": "session/update",
@@ -23475,6 +23600,18 @@ for line in sys.stdin:
                         },
                     },
                 })
+                if prompt_mode == "codex_reconnect_exhausted_late_progress":
+                    send({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": session_id,
+                            "update": {
+                                "sessionUpdate": "agent_thought_chunk",
+                                "content": {"type": "text", "text": "late buffered progress"},
+                            },
+                        },
+                    })
             else:
                 send({
                     "jsonrpc": "2.0",
@@ -23735,6 +23872,7 @@ for line in sys.stdin:
                     "sessionId": session_id,
                     "update": {
                         "sessionUpdate": "agent_message_chunk",
+                        "messageId": "mock-agent-message",
                         "content": {"type": "text", "text": session_id + ":" + text},
                     },
                 },
@@ -29944,6 +30082,100 @@ for line in sys.stdin:
         assert_eq!(
             logged_request_count(&fixture.request_log(), "session/cancel"),
             0
+        );
+
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_codex_progress_cannot_recover_an_exhausted_reconnect() {
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "codex-reconnect-exhausted-late-progress",
+            Some(AgentId::parse("codex").unwrap()),
+        ) else {
+            return;
+        };
+        fixture.set_prompt_mode("codex_reconnect_exhausted_late_progress");
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let error = prepare_and_send_turn(
+            &client,
+            AcpSendTurnRequest {
+                session_id: session_id.clone(),
+                message_submission_id: None,
+                required_runtime: None,
+                text: "exhaust Codex reconnects with late progress".to_string(),
+                attachments: Vec::new(),
+                workspace_root: fixture.workspace.display().to_string(),
+                binding: binding.clone(),
+                runtime_resources: ProviderRuntimeResources::default(),
+                execution_identity: None,
+                event_sender: Some(event_tx),
+                usage_execution_context: None,
+                usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                usage_event_sender: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code, CODEX_STREAM_RECONNECT_EXHAUSTED_CODE);
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        let retry_events = events
+            .iter()
+            .filter_map(|event| match event {
+                AcpEvent::Retry {
+                    phase,
+                    attempt,
+                    max_attempts,
+                    provider_correlation_id,
+                    ..
+                } => Some((
+                    *phase,
+                    *attempt,
+                    *max_attempts,
+                    provider_correlation_id.as_deref(),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            retry_events
+                .iter()
+                .any(|(phase, attempt, max_attempts, _)| {
+                    *phase == RetryPhase::Exhausted
+                        && *attempt == Some(5)
+                        && *max_attempts == Some(5)
+                })
+        );
+        assert!(
+            retry_events
+                .iter()
+                .all(|(phase, _, _, _)| *phase != RetryPhase::Recovered)
+        );
+        let correlations = retry_events
+            .iter()
+            .filter_map(|(_, _, _, correlation)| *correlation)
+            .collect::<Vec<_>>();
+        assert!(!correlations.is_empty());
+        assert!(
+            correlations
+                .iter()
+                .all(|correlation| *correlation == correlations[0])
         );
 
         client.close_session(&binding).await.unwrap();

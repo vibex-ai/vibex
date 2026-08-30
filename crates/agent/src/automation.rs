@@ -1157,7 +1157,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn automation_runner_records_ambiguous_prompt_failure() {
+    async fn automation_runner_records_terminal_prompt_failure() {
         let db_path = temp_db_path("automation-error");
         let manager = test_manager(&db_path);
         let graph = create_agent_graph(&manager, "please error", Vec::new());
@@ -1168,10 +1168,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(run.status, AutomationRunStatus::Failed);
-        assert_eq!(
-            run.error_code.as_deref(),
-            Some("message_submission_prompt_dispatch_ambiguous")
-        );
+        assert_eq!(run.error_code.as_deref(), Some("test_provider_error"));
         assert!(
             run.redacted_diagnostics
                 .iter()

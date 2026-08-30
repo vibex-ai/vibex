@@ -2564,6 +2564,19 @@ AgentManager::execute_command(AgentCommandExecuteRequest) -> AgentCommandExecute
   source, and the current turn's start sequence. The manager must broadcast the
   same sequence so clients replace the visible row instead of appending
   duplicates, while later turns get their own retry/progress item.
+- ACP does not define one universal retry notification. Adapters normalize
+  explicit provider retry metadata or bounded provider-specific progress into
+  the provider-neutral `TimelinePayload::Retry` contract. For one turn and one
+  retry correlation, `RetryPhase::Exhausted` is monotonic: preserve its highest
+  known counters and reason, and reject any later `started` or `recovered`
+  snapshot rather than replacing the visible row. `Recovered` is nonterminal:
+  a later `started` retry with a newer counter updates that same visible row.
+- An exhausted retry is a failed conversational turn even when an ACP adapter
+  later returns `completed=true` or a buffered final message. The manager must
+  append a recoverable provider error, transition the authoritative session to
+  `error`, and publish the session snapshot after persistence. Desktop and
+  mobile then use their existing continuation and automatic-continuation
+  paths; they must not infer failure from a locally rendered retry row.
 - Timeline insert failures must include bounded diagnostics such as session id,
   allocated sequence, item kind, source, and the SQLite error string. Do not
   include prompt text, tool payloads, terminal output, env values, or secrets.
@@ -2582,6 +2595,12 @@ AgentManager::execute_command(AgentCommandExecuteRequest) -> AgentCommandExecute
   bounded diagnostics.
 - Timeline insert fails -> `storage/timeline_insert_failed` with bounded
   SQLite, session, sequence, kind, and source diagnostics.
+- A provider reports retry exhaustion, including metadata with
+  `willRetry=false` -> preserve the single correlated retry row, append
+  `provider/agent_retry_exhausted`, and end the session in `error`.
+- A late retry `started` or `recovered` snapshot follows exhaustion -> retain
+  the exhausted row and `error` state; do not reopen the turn or hide
+  continuation.
 
 ### 5. Good/Base/Bad Cases
 
@@ -2590,10 +2609,15 @@ AgentManager::execute_command(AgentCommandExecuteRequest) -> AgentCommandExecute
   and no second user timeline item is persisted.
 - Base: a failed session can be continued once by `continue_turn`; a second
   simultaneous continue attempt is rejected by the same claim path.
+- Good: an ACP Agent exhausts a retry budget, then emits buffered progress; the
+  timeline still has one exhausted retry row, the session is `error`, and an
+  enabled automatic continuation starts only through `continue_turn`.
 - Bad: manager code reads the session state, checks `state != running`, then
   performs an unconditional `UPDATE agent_sessions SET state = running`.
 - Bad: provider-stream handlers open separate connections and insert timeline
   items without the repository write transaction.
+- Bad: a late `recovered` snapshot overwrites an exhausted retry row or lets a
+  synthetic final message return the session to `idle`.
 
 ### 6. Tests Required
 
@@ -2608,6 +2632,10 @@ AgentManager::execute_command(AgentCommandExecuteRequest) -> AgentCommandExecute
 - Regression tests for coalesced provider retry/progress events must assert
   both the manager return value and fetched authoritative timeline contain one
   updated item with the latest payload.
+- ACP/runtime, DB, core, and manager regressions must cover retry exhaustion
+  followed by late progress or a final message: the row remains exhausted, the
+  session publishes `error`, and the incomplete turn remains eligible for
+  continuation.
 
 ### 7. Wrong vs Correct
 
@@ -2633,6 +2661,28 @@ SessionRepository::claim_running_turn(&conn, &session_id, session.state)?;
 
 The conditional update is the durable claim. Only the winner may append turn
 timeline items or call the provider.
+
+#### Wrong
+
+```rust
+upsert_retry(correlation, RetryPhase::Exhausted);
+upsert_retry(correlation, RetryPhase::Recovered);
+SessionRepository::update_state(&conn, &session_id, AgentSessionState::Idle)?;
+```
+
+A buffered recovery snapshot can hide the failure and prevent continuation.
+
+#### Correct
+
+```rust
+let retry = merge_retry_monotonically(current, incoming);
+if retry.phase == RetryPhase::Exhausted {
+    finish_turn_with_error(session_id, retry_exhausted_error(&retry))?;
+}
+```
+
+The terminal retry payload and the authoritative `error` state remain visible
+until a user or automatic continuation claims a new turn.
 
 ## Scenario: Phase 6 Generic ACP Adapter Foundation
 

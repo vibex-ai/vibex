@@ -32,6 +32,14 @@ const AMBIGUOUS_PROMPT_ERROR_DETAIL: &str =
     "prompt dispatch began, but no durable provider result was recorded";
 const PRE_DISPATCH_ERROR_DETAIL: &str = "message submission could not be prepared for dispatch";
 const RUNTIME_PREPARATION_ERROR_DETAIL: &str = "required runtime could not be prepared";
+const TERMINAL_PROVIDER_ERROR_DETAIL: &str =
+    "the provider completed the turn with a recoverable failure";
+
+enum PersistedDispatchResult {
+    Completed(Vec<TimelineItem>),
+    Failed { error_code: String },
+    Unknown,
+}
 
 #[derive(Debug, Clone)]
 pub struct MessageSubmissionCoordinatorConfig {
@@ -822,18 +830,32 @@ impl MessageSubmissionCoordinator {
         let items = match result {
             Ok(items) => items,
             Err(error) => {
-                if let Some(items) = self.persisted_dispatch_result(
+                match self.persisted_dispatch_result(
                     record,
                     dispatch_start_sequence,
                     &expected_user_text,
                     &expected_user_attachments,
                 )? {
-                    return self.complete_dispatch(
-                        record,
-                        &expected_user_text,
-                        &expected_user_attachments,
-                        &items,
-                    );
+                    PersistedDispatchResult::Completed(items) => {
+                        return self.complete_dispatch(
+                            record,
+                            &expected_user_text,
+                            &expected_user_attachments,
+                            &items,
+                        );
+                    }
+                    PersistedDispatchResult::Failed { error_code } => {
+                        let conn = self.open_connection()?;
+                        MessageSubmissionRepository::fail(
+                            &conn,
+                            &record.submission_id,
+                            MessageSubmissionStatus::AboutToPrompt,
+                            &safe_error_code(&error_code),
+                            Some(TERMINAL_PROVIDER_ERROR_DETAIL),
+                        )?;
+                        return Ok(());
+                    }
+                    PersistedDispatchResult::Unknown => {}
                 }
                 let conn = self.open_connection()?;
                 if TimelineRepository::latest_sequence(&conn, &record.session_id)?
@@ -874,11 +896,11 @@ impl MessageSubmissionCoordinator {
         dispatch_start_sequence: i64,
         expected_user_text: &str,
         expected_user_attachments: &[vibex_core::MessageAttachment],
-    ) -> VibexResult<Option<Vec<TimelineItem>>> {
+    ) -> VibexResult<PersistedDispatchResult> {
         let conn = self.open_connection()?;
         let last_sequence = TimelineRepository::latest_sequence(&conn, &record.session_id)?;
         if last_sequence <= dispatch_start_sequence {
-            return Ok(None);
+            return Ok(PersistedDispatchResult::Unknown);
         }
         let items = TimelineRepository::fetch_range(
             &conn,
@@ -895,15 +917,59 @@ impl MessageSubmissionCoordinator {
             )
         });
         let Some(matching_user_index) = matching_user_index else {
-            return Ok(None);
+            return Ok(PersistedDispatchResult::Unknown);
         };
-        let provider_output_persisted = items[matching_user_index + 1..].iter().any(|item| {
+        let turn_items = &items[matching_user_index + 1..];
+        let exhausted_retry = turn_items.iter().any(|item| {
+            matches!(
+                &item.payload,
+                TimelinePayload::Retry(retry)
+                    if retry.phase == vibex_core::RetryPhase::Exhausted
+            )
+        });
+        if exhausted_retry {
+            let error_code = turn_items
+                .iter()
+                .rev()
+                .find_map(|item| match &item.payload {
+                    TimelinePayload::Error(error) => Some(error.code.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "agent_retry_exhausted".to_string());
+            return Ok(PersistedDispatchResult::Failed { error_code });
+        }
+        if let Some(item) = turn_items.iter().rev().find(|item| match &item.payload {
+            TimelinePayload::Error(_) => true,
+            TimelinePayload::AgentMessage(message) => message.is_final,
+            _ => false,
+        }) {
+            match &item.payload {
+                TimelinePayload::Error(error) => {
+                    return Ok(PersistedDispatchResult::Failed {
+                        error_code: error.code.clone(),
+                    });
+                }
+                TimelinePayload::AgentMessage(message) if message.is_final => {
+                    return Ok(PersistedDispatchResult::Completed(items));
+                }
+                _ => unreachable!("terminal timeline item was filtered before matching"),
+            }
+        }
+        let provider_output_persisted = turn_items.iter().any(|item| {
             matches!(
                 item.source,
                 vibex_core::TimelineSource::Agent | vibex_core::TimelineSource::Provider
-            ) && !matches!(item.payload, TimelinePayload::Error(_))
+            ) && !matches!(
+                item.payload,
+                TimelinePayload::Error(_)
+                    | TimelinePayload::Retry(_)
+                    | TimelinePayload::SystemNotice(_)
+            )
         });
-        Ok(provider_output_persisted.then_some(items))
+        Ok(provider_output_persisted
+            .then_some(items)
+            .map(PersistedDispatchResult::Completed)
+            .unwrap_or(PersistedDispatchResult::Unknown))
     }
 
     fn complete_dispatch(
@@ -1220,8 +1286,9 @@ mod tests {
     use vibex_core::{
         AcpAdapterId, AgentId, AgentMessagePayload, AgentSession, AgentSessionSafety,
         AgentSessionState, MAX_MESSAGE_IDEMPOTENCY_KEY_LEN, ProviderProfileId, RequestId,
-        RuntimeSelectionActionableError, SessionRuntimeSelection, TimelineRedactionState,
-        TimelineSource, UserMessagePayload, WorkspaceMode, unix_timestamp_ms,
+        RuntimeSelectionActionableError, SessionRuntimeSelection, TimelineErrorPayload,
+        TimelineRedactionState, TimelineSource, UserMessagePayload, WorkspaceMode,
+        unix_timestamp_ms,
     };
     use vibex_db::{RuntimeSwitchReserveRequest, SessionRepository, WorkspaceRepository};
 
@@ -1382,6 +1449,7 @@ mod tests {
         dispatched: Mutex<Vec<(VibexSessionId, String, String)>>,
         failure_message: Mutex<Option<String>>,
         fail_after_output: AtomicBool,
+        fail_after_exhausted_retry: AtomicBool,
     }
 
     #[async_trait]
@@ -1408,6 +1476,7 @@ mod tests {
             let failure_message = self.failure_message.lock().unwrap().take();
             if let Some(message) = failure_message.as_ref()
                 && !self.fail_after_output.load(Ordering::SeqCst)
+                && !self.fail_after_exhausted_retry.load(Ordering::SeqCst)
             {
                 return Err(VibexError::provider("mock_dispatch_failed", message));
             }
@@ -1424,6 +1493,55 @@ mod tests {
                 None,
                 TimelineRedactionState::None,
             )?;
+            if failure_message.is_some() && self.fail_after_output.load(Ordering::SeqCst) {
+                TimelineRepository::append(
+                    &mut conn,
+                    &request.session_id,
+                    TimelineSource::Provider,
+                    TimelinePayload::Error(TimelineErrorPayload {
+                        code: "mock_transient_provider_error".to_string(),
+                        message: "the provider recovered before its final response".to_string(),
+                        recoverable: true,
+                    }),
+                    request.correlation_id.as_ref(),
+                    None,
+                    TimelineRedactionState::None,
+                )?;
+            }
+            if self.fail_after_exhausted_retry.load(Ordering::SeqCst)
+                && let Some(message) = failure_message.as_ref()
+            {
+                TimelineRepository::append(
+                    &mut conn,
+                    &request.session_id,
+                    TimelineSource::Provider,
+                    TimelinePayload::Retry(vibex_core::AgentRetryPayload {
+                        kind: vibex_core::RetryKind::ModelRequest,
+                        phase: vibex_core::RetryPhase::Exhausted,
+                        attempt: Some(3),
+                        max_attempts: Some(3),
+                        delay_ms: None,
+                        reason: Some("retry budget exhausted".to_string()),
+                    }),
+                    request.correlation_id.as_ref(),
+                    Some("mock-retry"),
+                    TimelineRedactionState::None,
+                )?;
+                TimelineRepository::append(
+                    &mut conn,
+                    &request.session_id,
+                    TimelineSource::Provider,
+                    TimelinePayload::Error(TimelineErrorPayload {
+                        code: "provider_retry_exhausted".to_string(),
+                        message: "retry budget exhausted".to_string(),
+                        recoverable: true,
+                    }),
+                    request.correlation_id.as_ref(),
+                    None,
+                    TimelineRedactionState::None,
+                )?;
+                return Err(VibexError::provider("mock_dispatch_failed", message));
+            }
             let agent = TimelineRepository::append(
                 &mut conn,
                 &request.session_id,
@@ -1556,6 +1674,7 @@ mod tests {
             dispatched: Mutex::new(Vec::new()),
             failure_message: Mutex::new(None),
             fail_after_output: AtomicBool::new(false),
+            fail_after_exhausted_retry: AtomicBool::new(false),
         });
         let dispatcher_trait: Arc<dyn MessageDispatchExecutor> = dispatcher.clone();
         let coordinator = Arc::new(
@@ -2396,7 +2515,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(items.len(), 2);
+        assert_eq!(items.len(), 3);
         assert!(items.iter().any(|item| {
             matches!(
                 &item.payload,
@@ -2412,6 +2531,43 @@ mod tests {
             .unwrap();
         assert_eq!(state.status, MessageSubmissionStatus::Completed);
         assert!(state.error_code.is_none());
+        cleanup_db(db_path);
+    }
+
+    #[tokio::test]
+    async fn exhausted_retry_and_terminal_error_do_not_complete_a_submission() {
+        let db_path = temp_db_path("retry-exhausted-dispatch-error");
+        let initial = selection("gpt-5");
+        let session_id = seed_session(&db_path, "retry-exhausted-dispatch-error", initial.clone());
+        let (coordinator, _runtime, dispatcher) =
+            harness(&db_path, &session_id, initial.clone(), false);
+        dispatcher
+            .fail_after_exhausted_retry
+            .store(true, Ordering::SeqCst);
+        *dispatcher.failure_message.lock().unwrap() =
+            Some("turn cleanup failed after retry exhaustion".to_string());
+
+        let error = coordinator
+            .submit(request(
+                &session_id,
+                "retry-exhausted-dispatch-error",
+                initial,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "provider_retry_exhausted");
+        let state = coordinator
+            .get_submission(&GetMessageSubmissionRequest {
+                session_id,
+                message_idempotency_key: "retry-exhausted-dispatch-error".to_string(),
+            })
+            .unwrap();
+        assert_eq!(state.status, MessageSubmissionStatus::Failed);
+        assert_eq!(
+            state.error_code.as_deref(),
+            Some("provider_retry_exhausted")
+        );
+
         cleanup_db(db_path);
     }
 

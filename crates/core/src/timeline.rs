@@ -923,6 +923,22 @@ pub fn latest_timeline_turn_ended_normally(items: &[TimelineItem]) -> Option<boo
         return None;
     }
 
+    // An exhausted automatic retry is a terminal failure for the current
+    // conversational turn, even if a late provider snapshot also carries a
+    // synthetic final message. Otherwise the UI could hide continuation after
+    // the retry budget was already spent.
+    if turn_items.iter().any(|item| {
+        matches!(
+            &item.payload,
+            TimelinePayload::Retry(AgentRetryPayload {
+                phase: RetryPhase::Exhausted,
+                ..
+            })
+        )
+    }) {
+        return Some(false);
+    }
+
     let latest_conversational_item = turn_items.iter().rev().find(|item| {
         matches!(
             item.source,
@@ -1123,6 +1139,45 @@ mod tests {
         terminal_error.provider_correlation_id = None;
         assert_eq!(
             latest_timeline_turn_ended_normally(&[user, retry, terminal_error]),
+            Some(false)
+        );
+
+        let exhausted = completion_item(
+            &session_id,
+            4,
+            TimelineSource::Provider,
+            TimelinePayload::Retry(AgentRetryPayload {
+                kind: RetryKind::ModelRequest,
+                phase: RetryPhase::Exhausted,
+                attempt: Some(3),
+                max_attempts: Some(3),
+                delay_ms: None,
+                reason: Some("retry budget exhausted".to_string()),
+            }),
+        );
+        let late_final = completion_item(
+            &session_id,
+            5,
+            TimelineSource::Agent,
+            TimelinePayload::AgentMessage(AgentMessagePayload {
+                text: "late synthetic completion".to_string(),
+                is_final: true,
+            }),
+        );
+        assert_eq!(
+            latest_timeline_turn_ended_normally(&[
+                completion_item(
+                    &session_id,
+                    1,
+                    TimelineSource::User,
+                    TimelinePayload::UserMessage(UserMessagePayload {
+                        text: "try again".into(),
+                        attachments: Vec::new(),
+                    }),
+                ),
+                exhausted,
+                late_final,
+            ]),
             Some(false)
         );
     }
