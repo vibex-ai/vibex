@@ -12359,20 +12359,58 @@ impl VibexWorkbench {
         }
     }
 
-    fn render_composer_queue_attachment_content(
+    fn render_composer_queue_inline_content(
         &self,
         message_id: u64,
+        text: &str,
         attachments: &[MessageAttachment],
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        h_flex()
+        let mut used_attachments = vec![false; attachments.len()];
+        let mut content = h_flex()
             .min_w_0()
+            .flex_1()
             .flex_wrap()
-            .gap_1()
-            .children(attachments.iter().enumerate().map(|(index, attachment)| {
-                self.render_composer_queue_attachment_chip(message_id, index, attachment, cx)
-            }))
-            .into_any_element()
+            .items_center()
+            .gap_1();
+
+        for segment in user_message_inline_segments(text, attachments) {
+            match segment {
+                UserMessageInlineSegment::Text(value) if !value.is_empty() => {
+                    content = content.child(
+                        div()
+                            .min_w_0()
+                            .flex_shrink(1.0)
+                            .text_sm()
+                            .whitespace_normal()
+                            .child(value),
+                    );
+                }
+                UserMessageInlineSegment::Attachment(attachment) => {
+                    let Some(attachment_index) =
+                        attachments
+                            .iter()
+                            .enumerate()
+                            .find_map(|(index, candidate)| {
+                                (!used_attachments[index] && candidate == &attachment)
+                                    .then_some(index)
+                            })
+                    else {
+                        continue;
+                    };
+                    used_attachments[attachment_index] = true;
+                    content = content.child(self.render_composer_queue_attachment_chip(
+                        message_id,
+                        attachment_index,
+                        &attachment,
+                        cx,
+                    ));
+                }
+                UserMessageInlineSegment::Text(_) => {}
+            }
+        }
+
+        content.into_any_element()
     }
 
     fn delete_composer_queue_message(
@@ -35509,9 +35547,6 @@ impl VibexWorkbench {
                     .trim()
                     .is_empty()
                     || attachment_count > 0);
-            let attachment_content = (!message.attachments.is_empty()).then(|| {
-                self.render_composer_queue_attachment_content(message_id, &message.attachments, cx)
-            });
             let content = if editing {
                 h_flex()
                     .min_w_0()
@@ -35607,16 +35642,12 @@ impl VibexWorkbench {
                     .flex_1()
                     .items_center()
                     .gap_2()
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .flex_1()
-                            .gap_1()
-                            .child(div().min_w_0().truncate().text_sm().child(display_text))
-                            .when_some(attachment_content, |this, attachments| {
-                                this.child(attachments)
-                            }),
-                    )
+                    .child(self.render_composer_queue_inline_content(
+                        message_id,
+                        &message.text,
+                        &message.attachments,
+                        cx,
+                    ))
                     .when(attachment_count > 0, |this| {
                         this.child(
                             div()
@@ -54249,9 +54280,9 @@ mod tests {
         assert!(!queue.contains("Turn off queueing"));
         assert!(!queue.contains("More actions"));
         assert!(queue.contains("ComposerQueueDrag"));
-        assert!(queue.contains("render_composer_queue_attachment_content"));
+        assert!(queue.contains("render_composer_queue_inline_content"));
+        assert!(source.contains("user_message_inline_segments"));
         assert!(source.contains("composer-queue-attachment-"));
-        assert!(queue.contains("let attachment_content = (!message.attachments.is_empty())"));
 
         let header = queue
             .find("composer-queue-header")
