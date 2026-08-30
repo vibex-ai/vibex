@@ -1779,10 +1779,6 @@ impl MobileApp {
         }
     }
 
-    fn close_workbench(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.start_drawer_snap(0.0, Some(window), cx);
-    }
-
     fn create_session(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.start_session_creation(None, window, cx);
     }
@@ -4894,7 +4890,7 @@ impl MobileApp {
                     );
                 let drawer_base = match page {
                     DrawerPage::Sessions => self.render_drawer(cx),
-                    DrawerPage::Workbench => self.render_workbench_drawer(workbench.clone(), cx),
+                    DrawerPage::Workbench => self.render_workbench_drawer(workbench.clone()),
                 }
                 .w(px(page_width))
                 .block_mouse_except_scroll();
@@ -7968,11 +7964,7 @@ impl MobileApp {
             .into_any_element()
     }
 
-    fn render_workbench_drawer(
-        &self,
-        workbench: Option<Entity<MobileWorkbench>>,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
+    fn render_workbench_drawer(&self, workbench: Option<Entity<MobileWorkbench>>) -> gpui::Div {
         let body = match workbench {
             Some(workbench) => div().flex_1().min_h_0().child(workbench),
             None => div()
@@ -7995,42 +7987,6 @@ impl MobileApp {
             .border_color(theme::border_default())
             .flex()
             .flex_col()
-            .child(
-                div()
-                    .h(px(theme::HEADER_HEIGHT))
-                    .flex_shrink_0()
-                    .bg(theme::workbench_panel_bg())
-                    .border_b_1()
-                    .border_color(theme::border_subtle())
-                    .pl(px(theme::SPACING_LG))
-                    .pr(px(theme::SPACING_XS))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_size(px(theme::FONT_HEADING))
-                            .text_color(theme::text_primary())
-                            .child(locale::common("Workspace tools")),
-                    )
-                    .child(
-                        div()
-                            .id("close-mobile-workbench")
-                            .size(px(theme::HEADER_BUTTON_SIZE))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .active(|style| style.opacity(0.6))
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::close_workbench))
-                            .child(
-                                svg()
-                                    .path("icons/x.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(theme::text_muted()),
-                            ),
-                    ),
-            )
             .child(body)
     }
 }
@@ -8950,7 +8906,7 @@ impl Render for MobileApp {
         let insets = window.insets().effective();
         let page_width = workspace_page_width(window);
         let root_background = match visible_drawer_page(self.drawer_offset, self.drawer_snap) {
-            Some(DrawerPage::Sessions) => theme::sidebar_bg(),
+            Some(DrawerPage::Sessions) | Some(DrawerPage::Workbench) => theme::sidebar_bg(),
             _ => theme::bg_primary(),
         };
         div()
