@@ -42,6 +42,23 @@ const ICONS: &[&str] = &[
     "icons/folder-open.svg",
     "icons/triangle-alert.svg",
     "icons/git-branch.svg",
+    "icons/download.svg",
+    "icons/upload.svg",
+    "icons/rotate-ccw.svg",
+    "icons/undo.svg",
+    "icons/chevrons-down-up.svg",
+    "icons/file-code.svg",
+    "icons/coffee.svg",
+    "icons/file-braces.svg",
+    "icons/file-spreadsheet.svg",
+    "icons/audio-lines.svg",
+    "icons/file-video-camera.svg",
+    "icons/file-symlink.svg",
+    "icons/file-cog.svg",
+    "icons/file-lock.svg",
+    "icons/file-key.svg",
+    "icons/file-type.svg",
+    "icons/file-text.svg",
     "icons/image.svg",
     "icons/boxes.svg",
     "icons/code-xml.svg",
@@ -163,6 +180,45 @@ impl AssetSource for MobileAssets {
             }
             "icons/git-branch.svg" => {
                 Some(include_bytes!("../../desktop/assets/icons/git-branch.svg"))
+            }
+            "icons/download.svg" => Some(include_bytes!("../../desktop/assets/icons/download.svg")),
+            "icons/upload.svg" => Some(include_bytes!("../../desktop/assets/icons/upload.svg")),
+            "icons/rotate-ccw.svg" => {
+                Some(include_bytes!("../../desktop/assets/icons/rotate-ccw.svg"))
+            }
+            "icons/undo.svg" => Some(include_bytes!("../../../vendor/zed/assets/icons/undo.svg")),
+            "icons/chevrons-down-up.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/chevrons-down-up.svg"
+            )),
+            "icons/file-code.svg" => {
+                Some(include_bytes!("../../desktop/assets/icons/file-code.svg"))
+            }
+            "icons/coffee.svg" => Some(include_bytes!("../../desktop/assets/icons/coffee.svg")),
+            "icons/file-braces.svg" => {
+                Some(include_bytes!("../../desktop/assets/icons/file-braces.svg"))
+            }
+            "icons/file-spreadsheet.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/file-spreadsheet.svg"
+            )),
+            "icons/audio-lines.svg" => {
+                Some(include_bytes!("../../desktop/assets/icons/audio-lines.svg"))
+            }
+            "icons/file-video-camera.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/file-video-camera.svg"
+            )),
+            "icons/file-symlink.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/file-symlink.svg"
+            )),
+            "icons/file-cog.svg" => Some(include_bytes!("../../desktop/assets/icons/file-cog.svg")),
+            "icons/file-lock.svg" => {
+                Some(include_bytes!("../../desktop/assets/icons/file-lock.svg"))
+            }
+            "icons/file-key.svg" => Some(include_bytes!("../../desktop/assets/icons/file-key.svg")),
+            "icons/file-type.svg" => {
+                Some(include_bytes!("../../desktop/assets/icons/file-type.svg"))
+            }
+            "icons/file-text.svg" => {
+                Some(include_bytes!("../../desktop/assets/icons/file-text.svg"))
             }
             "icons/image.svg" => Some(include_bytes!("../../desktop/assets/icons/image.svg")),
             "icons/boxes.svg" => Some(include_bytes!("../../desktop/assets/icons/boxes.svg")),

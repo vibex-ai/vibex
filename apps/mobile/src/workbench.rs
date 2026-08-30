@@ -11,12 +11,17 @@ use vibex_backend::{
     TerminalBackend as _,
 };
 use vibex_core::{
-    AgentSessionRuntimeSelectionState, FileEntryKind, FileSearchRequest, GitChange,
-    GitDiffResponse, ProviderRunHealthProbesRequest, RequestId, RuntimeOptionAvailability,
-    RuntimeSelectionInteraction, SessionRuntimeFeature, SessionRuntimeFeatureKind,
-    SessionRuntimeOption, SessionRuntimeOptionCatalog, SessionRuntimeSelection,
-    SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest, TerminalId, TerminalSnapshot,
-    VibexSessionId, WorkspaceId,
+    AgentSessionRuntimeSelectionState, FileEntryKind, FileSearchRequest, GitChange, GitChangeKind,
+    GitCommitSummary, GitDiffResponse, GitHistoryRequest, GitRemoteActionKind,
+    GitRemoteActionRequest, GitStageRequest, ProviderRunHealthProbesRequest, RemoteActionClass,
+    RequestId, RuntimeOptionAvailability, RuntimeSelectionInteraction, SessionRuntimeFeature,
+    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
+    SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest,
+    TerminalId, TerminalSnapshot, VibexSessionId, WorkspaceId,
+};
+use vibex_desktop_model::{
+    FileGitSignal, FileIconDescriptor, FileIconKind, GitPathSelectionState, GitQueryKind,
+    GitTreeRow, GitTreeRowKind, GitWorkbenchMode, file_icon_descriptor,
 };
 use vibex_remote_client::WebRemoteBackend;
 use vibex_ui::{
@@ -40,6 +45,28 @@ pub enum WorkbenchSurface {
     Terminal,
     Providers,
     Runtime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MobileFileSearchMode {
+    Name,
+    Content,
+}
+
+impl MobileFileSearchMode {
+    fn toggle(self) -> Self {
+        match self {
+            Self::Name => Self::Content,
+            Self::Content => Self::Name,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Name => "Name",
+            Self::Content => "Content",
+        }
+    }
 }
 
 impl WorkbenchSurface {
@@ -69,12 +96,16 @@ pub struct MobileWorkbench {
     terminal: TerminalWorkflowController,
     management: ManagementWorkflowController,
     file_search_input: Entity<TextInput>,
+    file_search_mode: MobileFileSearchMode,
     file_editor_input: Entity<TextInput>,
     git_commit_input: Entity<TextInput>,
+    git_history_query_input: Entity<TextInput>,
     terminal_input: Entity<TextInput>,
     file_editor_path: Option<String>,
     git_diff: Option<GitDiffResponse>,
     git_commit_confirmation: bool,
+    git_history_loading: bool,
+    git_history_request_generation: u64,
     terminal_snapshot: Option<TerminalSnapshot>,
     terminal_close_confirmation: Option<TerminalId>,
     agent_summaries: Vec<vibex_core::RemoteAgentConfigSummary>,
@@ -125,11 +156,22 @@ impl MobileWorkbench {
             management,
             file_search_input: cx
                 .new(|cx| TextInput::new(locale::text("Search files", "搜索文件", "搜尋檔案"), cx)),
+            file_search_mode: MobileFileSearchMode::Name,
             file_editor_input: cx.new(|cx| {
                 TextInput::new(locale::text("File content", "文件内容", "檔案內容"), cx).multiline()
             }),
             git_commit_input: cx.new(|cx| {
                 TextInput::new(locale::text("Commit message", "提交消息", "提交訊息"), cx)
+            }),
+            git_history_query_input: cx.new(|cx| {
+                TextInput::new(
+                    locale::text(
+                        "Search commit information or code",
+                        "搜索提交信息或代码",
+                        "搜尋提交資訊或代碼",
+                    ),
+                    cx,
+                )
             }),
             terminal_input: cx.new(|cx| {
                 TextInput::new(locale::text("Type a command", "输入命令", "輸入命令"), cx)
@@ -137,6 +179,8 @@ impl MobileWorkbench {
             file_editor_path: None,
             git_diff: None,
             git_commit_confirmation: false,
+            git_history_loading: false,
+            git_history_request_generation: 0,
             terminal_snapshot: None,
             terminal_close_confirmation: None,
             agent_summaries: Vec::new(),
@@ -186,6 +230,10 @@ impl MobileWorkbench {
         self.git_diff = None;
         self.terminal_snapshot = None;
         self.terminal_close_confirmation = None;
+        self.git_history_loading = false;
+        self.git_history_request_generation = self.git_history_request_generation.wrapping_add(1);
+        self.git_history_query_input
+            .update(cx, |input, cx| input.set_text("", cx));
         self.stop_terminal_poll();
         self.refresh_all(cx);
     }
@@ -291,9 +339,22 @@ impl MobileWorkbench {
         self.tasks.push(task);
     }
 
-    fn activate_file_row(&mut self, path: String, kind: FileEntryKind, cx: &mut Context<Self>) {
+    fn activate_file_row(
+        &mut self,
+        path: String,
+        path_chain: Vec<String>,
+        kind: FileEntryKind,
+        cx: &mut Context<Self>,
+    ) {
         if kind == FileEntryKind::Directory {
-            if self.files.state.tree.toggle_expanded(&path) {
+            let was_expanded = self.files.state.tree.chain_is_expanded(&path_chain);
+            if self
+                .files
+                .state
+                .tree
+                .set_chain_expanded(&path_chain, !was_expanded)
+                && !was_expanded
+            {
                 self.load_file_tree_path(path, cx);
             } else {
                 cx.notify();
@@ -303,7 +364,7 @@ impl MobileWorkbench {
         }
     }
 
-    fn search_files(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn start_file_search(&mut self, cx: &mut Context<Self>) {
         let query = self.file_search_input.read(cx).text().trim().to_string();
         if query.is_empty() {
             self.files.state.search.clear();
@@ -319,7 +380,7 @@ impl MobileWorkbench {
         let request = FileSearchRequest {
             workspace_id: self.workspace_id.clone(),
             query,
-            include_content: true,
+            include_content: self.file_search_mode == MobileFileSearchMode::Content,
             case_sensitive: false,
             whole_word: false,
             regex: false,
@@ -335,6 +396,31 @@ impl MobileWorkbench {
             });
         });
         self.tasks.push(task);
+    }
+
+    fn search_files(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.start_file_search(cx);
+    }
+
+    fn toggle_file_search_mode(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.file_search_mode = self.file_search_mode.toggle();
+        if !self.file_search_input.read(cx).text().trim().is_empty() {
+            self.start_file_search(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn clear_file_search(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.file_search_input
+            .update(cx, |input, cx| input.set_text("", cx));
+        self.files.state.search.clear();
+        cx.notify();
     }
 
     fn save_file(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -408,10 +494,251 @@ impl MobileWorkbench {
             let _ = entity.update(cx, |this, cx| {
                 this.git.apply_status(&ticket, outcome);
                 this.error = this.git.state.last_error.clone();
+                if let Some(status) = this.git.state.model.status.as_ref() {
+                    this.files.state.tree.set_git_changes(&status.changes);
+                }
+                if this.git.state.model.mode == GitWorkbenchMode::History {
+                    this.refresh_git_history(false, cx);
+                }
                 cx.notify();
             });
         });
         self.tasks.push(task);
+    }
+
+    fn can_mutate_git(&self) -> bool {
+        self.backend
+            .permits_remote_action(RemoteActionClass::MutateGit)
+    }
+
+    fn set_git_mode(&mut self, mode: GitWorkbenchMode, cx: &mut Context<Self>) {
+        self.git.state.model.set_mode(mode);
+        if mode == GitWorkbenchMode::History {
+            self.refresh_git_history(false, cx);
+        }
+        cx.notify();
+    }
+
+    fn refresh_git_history(&mut self, append: bool, cx: &mut Context<Self>) {
+        if self.git_history_loading && !append {
+            self.git_history_request_generation =
+                self.git_history_request_generation.wrapping_add(1);
+        }
+        let mut filter = self.git.state.model.history_filter.clone();
+        if filter.ref_name.is_none() {
+            let branch = self
+                .git
+                .state
+                .model
+                .status
+                .as_ref()
+                .and_then(|status| status.branch.clone());
+            if branch.is_some() {
+                filter.ref_name = branch;
+                self.git.state.model.set_history_filter(filter.clone());
+            }
+        }
+        let before_commit = append
+            .then(|| {
+                self.git
+                    .state
+                    .model
+                    .history
+                    .last()
+                    .map(|commit| commit.hash.clone())
+            })
+            .flatten();
+        let key = format!(
+            "{}:{}:{}:{}:{}:{}",
+            filter.ref_name.as_deref().unwrap_or_default(),
+            filter.author.as_deref().unwrap_or_default(),
+            filter.query.as_deref().unwrap_or_default(),
+            filter.authored_after_ms.unwrap_or_default(),
+            filter.authored_before_ms.unwrap_or_default(),
+            before_commit.as_deref().unwrap_or_default(),
+        );
+        let Some(ticket) = self.git.state.model.begin_query(GitQueryKind::History, key) else {
+            return;
+        };
+        let request = GitHistoryRequest {
+            workspace_id: self.workspace_id.clone(),
+            limit: Some(60),
+            before_commit,
+            ref_name: filter.ref_name,
+            author: filter.author,
+            query: filter.query,
+            authored_after_ms: filter.authored_after_ms,
+            authored_before_ms: filter.authored_before_ms,
+        };
+        self.git_history_loading = true;
+        self.git_history_request_generation = self.git_history_request_generation.wrapping_add(1);
+        let generation = self.git_history_request_generation;
+        let backend = self.backend.clone();
+        let runner =
+            gpui_tokio::Tokio::spawn(cx, async move { backend.git_history(request).await });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                if generation != this.git_history_request_generation {
+                    return;
+                }
+                this.git_history_loading = false;
+                match outcome {
+                    Ok(history) => {
+                        if !this.git.state.model.apply_history(&ticket, history, append) {
+                            return;
+                        }
+                        this.error = None;
+                    }
+                    Err(error) => {
+                        this.git.state.model.fail_query(&ticket, &error.code);
+                        this.error = Some(error);
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+    }
+
+    fn search_git_history(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let query = self
+            .git_history_query_input
+            .read(cx)
+            .text()
+            .trim()
+            .to_string();
+        let mut filter = self.git.state.model.history_filter.clone();
+        filter.query = (!query.is_empty()).then_some(query);
+        self.git.state.model.set_history_filter(filter);
+        self.refresh_git_history(false, cx);
+    }
+
+    fn clear_git_history_search(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.git_history_query_input
+            .update(cx, |input, cx| input.set_text("", cx));
+        let mut filter = self.git.state.model.history_filter.clone();
+        filter.query = None;
+        self.git.state.model.set_history_filter(filter);
+        self.refresh_git_history(false, cx);
+    }
+
+    fn toggle_git_history_author(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let authors = self.git.state.model.history_authors.clone();
+        let current = self.git.state.model.history_filter.author.clone();
+        let next = if authors.is_empty() {
+            None
+        } else if let Some(current) = current {
+            authors
+                .iter()
+                .position(|author| author.email == current || author.name == current)
+                .and_then(|index| authors.get(index.saturating_add(1)))
+                .map(|author| author.email.clone())
+        } else {
+            authors.first().map(|author| author.email.clone())
+        };
+        let mut filter = self.git.state.model.history_filter.clone();
+        filter.author = next;
+        self.git.state.model.set_history_filter(filter);
+        self.refresh_git_history(false, cx);
+    }
+
+    fn load_more_git_history(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.git_history_loading && self.git.state.model.history_has_more {
+            self.refresh_git_history(true, cx);
+        }
+    }
+
+    fn run_git_remote_action(&mut self, kind: GitRemoteActionKind, cx: &mut Context<Self>) {
+        if self.busy
+            || !self
+                .git
+                .capabilities()
+                .supports(BackendOperation::GitStatus)
+            || !self.can_mutate_git()
+        {
+            return;
+        }
+        let request = GitRemoteActionRequest {
+            workspace_id: self.workspace_id.clone(),
+            kind,
+            remote: None,
+            branch: None,
+        };
+        self.busy = true;
+        let backend = self.backend.clone();
+        let runner =
+            gpui_tokio::Tokio::spawn(cx, async move { backend.git_remote_action(request).await });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.busy = false;
+                match outcome {
+                    Ok(result) => {
+                        // Reconcile through the normal ticketed status path so
+                        // the shared tree and selection model stay authoritative.
+                        this.refresh_git(cx);
+                        this.notice = Some(result.summary);
+                        this.error = None;
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    fn revert_selected_git(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.busy
+            || !self
+                .git
+                .capabilities()
+                .supports(BackendOperation::GitStatus)
+            || !self.can_mutate_git()
+        {
+            return;
+        }
+        let paths = self.git.state.model.selected_change_paths();
+        if paths.is_empty() {
+            return;
+        }
+        let request = GitStageRequest {
+            workspace_id: self.workspace_id.clone(),
+            paths,
+        };
+        self.busy = true;
+        let backend = self.backend.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move { backend.git_revert(request).await });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.busy = false;
+                match outcome {
+                    Ok(_) => {
+                        this.refresh_git(cx);
+                        this.notice =
+                            Some(locale::common("Selected changes rolled back").to_string());
+                        this.error = None;
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
     }
 
     fn open_git_diff(&mut self, path: String, staged: bool, cx: &mut Context<Self>) {
@@ -467,8 +794,29 @@ impl MobileWorkbench {
     }
 
     fn request_git_commit(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self
+            .git
+            .capabilities()
+            .supports(BackendOperation::GitCommit)
+            || !self.can_mutate_git()
+        {
+            return;
+        }
         let message = self.git_commit_input.read(cx).text().trim().to_string();
-        match self.git.request_commit_confirmation(message, Vec::new()) {
+        let paths = self.git.state.model.selected_change_paths();
+        if paths.is_empty() {
+            self.error = Some(BackendError::failed(
+                "git_paths_empty",
+                locale::text(
+                    "Select at least one change first.",
+                    "请先选择至少一项更改。",
+                    "請先選擇至少一項變更。",
+                ),
+            ));
+            cx.notify();
+            return;
+        }
+        match self.git.request_commit_confirmation(message, paths) {
             Ok(_) => {
                 self.git_commit_confirmation = true;
                 self.error = None;
@@ -1188,6 +1536,9 @@ impl MobileWorkbench {
         let selected_path = view.selected_path.clone();
         let rows = view.rows.clone();
         let search = view.search.clone();
+        let query_present = !self.file_search_input.read(cx).text().trim().is_empty();
+        let search_loading = self.files.state.search.is_loading();
+        let search_has_results = !search.is_empty();
         let has_conflict = view.status == FileEditorStatus::Conflict;
         let can_write = self
             .files
@@ -1201,15 +1552,73 @@ impl MobileWorkbench {
             .child(
                 div()
                     .flex_shrink_0()
-                    .p_3()
+                    .p_2()
                     .border_b_1()
                     .border_color(theme::border_subtle())
                     .flex()
-                    .gap_2()
-                    .child(input_shell(self.file_search_input.clone()))
+                    .items_center()
+                    .gap_1()
                     .child(
-                        action_button("file-search", "Search")
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::search_files)),
+                        div()
+                            .h(px(32.0))
+                            .min_w_0()
+                            .flex_1()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(theme::border_default())
+                            .bg(theme::workbench_panel_bg())
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                svg()
+                                    .path("icons/search.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_muted()),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .child(self.file_search_input.clone()),
+                            )
+                            .when(search_loading, |bar| {
+                                bar.child(
+                                    svg()
+                                        .path("icons/loader-circle.svg")
+                                        .size(px(theme::ICON_SM))
+                                        .text_color(theme::text_primary()),
+                                )
+                            })
+                            .when(query_present, |bar| {
+                                bar.child(
+                                    icon_button("clear-file-search", "icons/x.svg", "Clear search")
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(Self::clear_file_search),
+                                        ),
+                                )
+                            }),
+                    )
+                    .child(
+                        compact_action(
+                            "toggle-file-search-mode",
+                            self.file_search_mode.label().to_string(),
+                        )
+                        .h(px(32.0))
+                        .when(query_present, |button| {
+                            button.on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(Self::toggle_file_search_mode),
+                            )
+                        })
+                        .when(!query_present, |button| {
+                            button.on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(Self::toggle_file_search_mode),
+                            )
+                        }),
                     ),
             )
             .child(
@@ -1218,42 +1627,1049 @@ impl MobileWorkbench {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .child(section_heading("Explorer"))
-                    .when(rows.is_empty(), |body| {
-                        body.child(empty_label("No files found"))
+                    .when(!query_present, |body| {
+                        body.children(
+                            rows.into_iter()
+                                .map(|row| self.render_file_tree_row(row, cx)),
+                        )
                     })
-                    .children(rows.into_iter().map(|row| {
-                        let path = row.path.clone();
-                        let kind = row.kind;
-                        let marker = match row.kind {
-                            FileEntryKind::Directory if row.expanded => "v",
-                            FileEntryKind::Directory => ">",
-                            _ => "",
-                        };
-                        div()
-                            .id(format!("file:{}", row.id))
-                            .min_h(px(theme::TOUCH_TARGET))
-                            .pl(px(12.0 + row.depth as f32 * 16.0))
-                            .pr_3()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .when(row.selected, |item| item.bg(theme::bg_card()))
-                            .cursor_pointer()
-                            .active(|style| style.bg(theme::row_pressed_bg()))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.activate_file_row(path.clone(), kind, cx)
-                                }),
+                    .when(query_present && search_loading, |body| {
+                        body.child(empty_label("Searching"))
+                    })
+                    .when(
+                        query_present && !search_loading && !search_has_results,
+                        |body| {
+                            body.child(empty_label(
+                                if self.file_search_mode == MobileFileSearchMode::Name {
+                                    "No matching items"
+                                } else {
+                                    "No matching files"
+                                },
+                            ))
+                        },
+                    )
+                    .when(query_present && search_has_results, |body| {
+                        body.child(
+                            div()
+                                .h(px(30.0))
+                                .px_3()
+                                .flex()
+                                .items_center()
+                                .border_t_1()
+                                .border_b_1()
+                                .border_color(theme::border_subtle())
+                                .text_size(px(theme::FONT_MICRO))
+                                .text_color(theme::text_muted())
+                                .child(format!("{} {}", search.len(), locale::common("results"))),
+                        )
+                        .children(search.into_iter().map(|result| {
+                            let path = result.path.clone();
+                            let line = result.line.unwrap_or_default();
+                            let select_path = path.clone();
+                            div()
+                                .id(format!("file-search-result:{path}:{line}"))
+                                .min_h(px(36.0))
+                                .px_3()
+                                .py_1()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .cursor_pointer()
+                                .active(|style| style.bg(theme::row_pressed_bg()))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.select_file(select_path.clone(), cx)
+                                    }),
+                                )
+                                .child(mobile_file_tree_icon(
+                                    file_icon_descriptor(&path, FileEntryKind::File),
+                                    false,
+                                    false,
+                                ))
+                                .child({
+                                    let display_path = if line > 0 {
+                                        format!("{path}:{line}")
+                                    } else {
+                                        path.clone()
+                                    };
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .text_size(px(theme::FONT_CAPTION))
+                                        .text_color(theme::text_secondary())
+                                        .child(display_path)
+                                })
+                                .when_some(result.snippet, |row, snippet| {
+                                    row.child(
+                                        div()
+                                            .max_w(px(120.0))
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .text_size(px(theme::FONT_MICRO))
+                                            .text_color(theme::text_muted())
+                                            .child(snippet),
+                                    )
+                                })
+                                .into_any_element()
+                        }))
+                    })
+                    .when(!query_present, |body| {
+                        body.when_some(selected_path, |body, path| {
+                            body.child(
+                                div()
+                                    .h(px(30.0))
+                                    .px_3()
+                                    .flex()
+                                    .items_center()
+                                    .border_t_1()
+                                    .border_color(theme::border_subtle())
+                                    .text_size(px(theme::FONT_MICRO))
+                                    .text_color(theme::text_muted())
+                                    .child(locale::common("Editor")),
                             )
                             .child(
                                 div()
-                                    .w(px(12.0))
-                                    .text_size(px(theme::FONT_CAPTION))
-                                    .text_color(theme::text_muted())
-                                    .child(marker),
+                                    .px_3()
+                                    .pb_3()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .overflow_hidden()
+                                                    .text_ellipsis()
+                                                    .whitespace_nowrap()
+                                                    .text_size(px(theme::FONT_CAPTION))
+                                                    .text_color(theme::text_muted())
+                                                    .child(path),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(theme::FONT_MICRO))
+                                                    .text_color(status_color)
+                                                    .child(status),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .h(px(240.0))
+                                            .rounded(px(theme::RADIUS_CONTROL))
+                                            .border_1()
+                                            .border_color(theme::border_default())
+                                            .bg(theme::bg_card())
+                                            .overflow_hidden()
+                                            .child(self.file_editor_input.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .justify_end()
+                                            .gap_2()
+                                            .when(has_conflict, |actions| {
+                                                actions.child(
+                                                    action_button(
+                                                        "reload-desktop-file",
+                                                        "Use desktop version",
+                                                    )
+                                                    .on_mouse_up(
+                                                        MouseButton::Left,
+                                                        cx.listener(Self::reload_desktop_file),
+                                                    ),
+                                                )
+                                            })
+                                            .child(
+                                                action_button(
+                                                    "save-file",
+                                                    if !can_write {
+                                                        "Read only"
+                                                    } else if self.busy {
+                                                        "Saving..."
+                                                    } else {
+                                                        "Save"
+                                                    },
+                                                )
+                                                .when(!self.busy && can_write, |button| {
+                                                    button.on_mouse_up(
+                                                        MouseButton::Left,
+                                                        cx.listener(Self::save_file),
+                                                    )
+                                                })
+                                                .when(!can_write, |button| button.opacity(0.55)),
+                                            ),
+                                    ),
                             )
+                        })
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_file_tree_row(
+        &self,
+        row: vibex_desktop_model::FileExplorerRow,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let path = row.path.clone();
+        let kind = row.kind;
+        let path_chain = row.path_chain.clone();
+        let is_directory = kind == FileEntryKind::Directory;
+        let text_color = file_tree_row_text_color(&row);
+        let label = if is_directory && !row.segments.is_empty() {
+            row.segments
+                .iter()
+                .map(|segment| segment.name.as_str())
+                .collect::<Vec<_>>()
+                .join(" / ")
+        } else {
+            row.name.clone()
+        };
+        let status = row.git.map(|git| git.signal);
+        let loading = matches!(
+            row.load_state,
+            vibex_desktop_model::FileTreeLoadState::Loading
+        );
+        div()
+            .id(format!("file:{}", row.id))
+            .relative()
+            .min_h(px(30.0))
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_1()
+            .when(row.selected, |item| item.bg(theme::sidebar_selected_bg()))
+            .when(!row.selected, |item| {
+                item.hover(|style| style.bg(theme::row_pressed_bg()))
+            })
+            .cursor_pointer()
+            .active(|style| style.bg(theme::row_pressed_bg()))
+            .children(file_tree_guides_mobile(row.depth))
+            .child(div().w(px(row.depth as f32 * 20.0)).flex_none())
+            .child(
+                div()
+                    .w(px(14.0))
+                    .h(px(20.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(if is_directory {
+                        svg()
+                            .path(if row.expanded {
+                                "icons/chevron-down.svg"
+                            } else {
+                                "icons/chevron-right.svg"
+                            })
+                            .size(px(12.0))
+                            .text_color(theme::text_muted())
+                    } else {
+                        svg()
+                            .path("icons/chevron-right.svg")
+                            .size(px(12.0))
+                            .text_color(theme::workbench_bg())
+                    }),
+            )
+            .child(mobile_file_tree_icon(row.icon, row.ignored, row.expanded))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_size(px(theme::FONT_BODY))
+                    .text_color(text_color)
+                    .child(label),
+            )
+            .when(loading, |item| {
+                item.child(
+                    svg()
+                        .path("icons/loader-circle.svg")
+                        .size(px(theme::ICON_SM))
+                        .text_color(theme::text_primary()),
+                )
+            })
+            .when_some(status, |item, signal| {
+                item.child(
+                    div()
+                        .w(px(16.0))
+                        .flex_none()
+                        .font_family("monospace")
+                        .text_size(px(theme::FONT_MICRO))
+                        .text_color(file_git_signal_color(signal))
+                        .child(signal.short_label()),
+                )
+            })
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.activate_file_row(path.clone(), path_chain.clone(), kind, cx)
+                }),
+            )
+            .into_any_element()
+    }
+
+    fn render_git(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let mode = self.git.state.model.mode;
+        let changes_active = mode == GitWorkbenchMode::Changes;
+        let history_active = mode == GitWorkbenchMode::History;
+        let status = self.git.state.model.status.clone();
+        let status_loading = status.is_none();
+        let additions = status
+            .as_ref()
+            .map(|status| {
+                status
+                    .changes
+                    .iter()
+                    .map(|change| change.additions)
+                    .sum::<u32>()
+            })
+            .unwrap_or_default();
+        let deletions = status
+            .as_ref()
+            .map(|status| {
+                status
+                    .changes
+                    .iter()
+                    .map(|change| change.deletions)
+                    .sum::<u32>()
+            })
+            .unwrap_or_default();
+        let change_count = status.as_ref().map_or(0, |status| status.changes.len());
+        let can_commit = self
+            .git
+            .capabilities()
+            .supports(BackendOperation::GitCommit)
+            && self.can_mutate_git();
+        let can_remote = self
+            .git
+            .capabilities()
+            .supports(BackendOperation::GitStatus)
+            && self.can_mutate_git();
+        let has_selected_paths = self.git.state.model.selected_path_count() > 0;
+        let can_revert = can_remote && has_selected_paths;
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(40.0))
+                    .flex_shrink_0()
+                    .border_b_1()
+                    .border_color(theme::border_default())
+                    .flex()
+                    .children([
+                        git_mode_tab(
+                            "git-mode-changes",
+                            locale::text("Changes", "更改", "變更"),
+                            changes_active,
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.set_git_mode(GitWorkbenchMode::Changes, cx)
+                            }),
+                        ),
+                        git_mode_tab(
+                            "git-mode-history",
+                            locale::text("Commits", "提交", "提交"),
+                            history_active,
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.set_git_mode(GitWorkbenchMode::History, cx)
+                            }),
+                        ),
+                    ]),
+            )
+            .child(
+                div()
+                    .h(px(40.0))
+                    .flex_shrink_0()
+                    .px_2()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(theme::border_subtle())
+                    .flex()
+                    .items_center()
+                    .child(
+                        icon_button("git-fetch", "icons/download.svg", "Fetch")
+                            .when(can_remote && !self.busy, |button| {
+                                button.on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.run_git_remote_action(GitRemoteActionKind::Fetch, cx)
+                                    }),
+                                )
+                            })
+                            .when(!can_remote, |button| button.opacity(0.55)),
+                    )
+                    .child(
+                        icon_button("git-push", "icons/upload.svg", "Push")
+                            .when(can_remote && !self.busy, |button| {
+                                button.on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.run_git_remote_action(GitRemoteActionKind::Push, cx)
+                                    }),
+                                )
+                            })
+                            .when(!can_remote, |button| button.opacity(0.55)),
+                    )
+                    .child(
+                        icon_button("git-refresh", "icons/rotate-ccw.svg", "Refresh").when(
+                            !self.busy,
+                            |button| {
+                                button.on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(Self::refresh_active_surface),
+                                )
+                            },
+                        ),
+                    )
+                    .when(changes_active, |bar| {
+                        bar.child(
+                            icon_button("git-revert", "icons/undo.svg", "Rollback selected")
+                                .when(!self.busy && can_revert, |button| {
+                                    button.on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(Self::revert_selected_git),
+                                    )
+                                })
+                                .when(!can_revert, |button| button.opacity(0.55)),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            icon_button(
+                                "git-toggle-directories",
+                                "icons/chevrons-down-up.svg",
+                                "Expand or collapse all",
+                            )
+                            .when(
+                                self.git.state.model.has_change_directories(),
+                                |button| {
+                                    button.on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.git.state.model.toggle_all_change_directories();
+                                            cx.notify();
+                                        }),
+                                    )
+                                },
+                            ),
+                        )
+                    })
+                    .when(history_active, |bar| {
+                        bar.child(
+                            div()
+                                .h(px(30.0))
+                                .min_w_0()
+                                .flex_1()
+                                .rounded(px(theme::RADIUS_CONTROL))
+                                .border_1()
+                                .border_color(theme::border_default())
+                                .bg(theme::workbench_panel_bg())
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    svg()
+                                        .path("icons/search.svg")
+                                        .size(px(theme::ICON_SM))
+                                        .text_color(theme::text_muted()),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .child(self.git_history_query_input.clone()),
+                                )
+                                .when(
+                                    !self
+                                        .git_history_query_input
+                                        .read(cx)
+                                        .text()
+                                        .trim()
+                                        .is_empty(),
+                                    |bar| {
+                                        bar.child(
+                                            icon_button(
+                                                "clear-git-history-search",
+                                                "icons/x.svg",
+                                                "Clear commit search",
+                                            )
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(Self::clear_git_history_search),
+                                            ),
+                                        )
+                                    },
+                                )
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(Self::search_git_history),
+                                ),
+                        )
+                        .child(
+                            compact_action(
+                                "git-history-author",
+                                self.git
+                                    .state
+                                    .model
+                                    .history_filter
+                                    .author
+                                    .as_deref()
+                                    .unwrap_or("All authors")
+                                    .to_string(),
+                            )
+                            .h(px(30.0))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(Self::toggle_git_history_author),
+                            ),
+                        )
+                    }),
+            )
+            .when(changes_active, |root| {
+                root.child(
+                    div()
+                        .h(px(44.0))
+                        .flex_shrink_0()
+                        .px_2()
+                        .border_b_1()
+                        .border_color(theme::border_subtle())
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            icon_button("select-all-git", "icons/list-checks.svg", "Select all")
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        let selected =
+                                            this.git.state.model.path_selection_state("")
+                                                != GitPathSelectionState::Checked;
+                                        this.git.state.model.select_path_prefix("", selected);
+                                        cx.notify();
+                                    }),
+                                ),
+                        )
+                        .child(git_selection_indicator_mobile(
+                            self.git.state.model.path_selection_state(""),
+                        ))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .text_size(px(theme::FONT_CAPTION))
+                                .text_color(theme::text_secondary())
+                                .child(
+                                    status
+                                        .as_ref()
+                                        .and_then(|status| status.branch.clone())
+                                        .unwrap_or_else(|| "No repository".to_string()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .font_family("monospace")
+                                .text_size(px(theme::FONT_MICRO))
+                                .text_color(theme::text_muted())
+                                .child(format!("{} files", change_count)),
+                        )
+                        .child(
+                            div()
+                                .font_family("monospace")
+                                .text_size(px(theme::FONT_MICRO))
+                                .text_color(if additions > 0 {
+                                    rgb(theme::ACCENT_GREEN).into()
+                                } else {
+                                    theme::text_muted()
+                                })
+                                .child(format!("+{additions}")),
+                        )
+                        .child(
+                            div()
+                                .font_family("monospace")
+                                .text_size(px(theme::FONT_MICRO))
+                                .text_color(if deletions > 0 {
+                                    rgb(theme::ACCENT_RED).into()
+                                } else {
+                                    theme::text_muted()
+                                })
+                                .child(format!("-{deletions}")),
+                        ),
+                )
+            })
+            .child(
+                div()
+                    .id("mobile-git-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .when(changes_active, |body| {
+                        let row_count = self.git.state.model.change_tree_row_count();
+                        body.when(row_count == 0, |body| {
+                            body.child(empty_label(if status_loading {
+                                "Loading repository status..."
+                            } else {
+                                "Working tree is clean"
+                            }))
+                        })
+                        .children((0..row_count).filter_map(|index| {
+                            self.git
+                                .state
+                                .model
+                                .change_tree_row(index)
+                                .map(|(row, change)| {
+                                    self.render_git_tree_row_mobile(
+                                        row.clone(),
+                                        change.cloned(),
+                                        cx,
+                                    )
+                                })
+                        }))
+                        .when_some(self.git_diff.clone(), |body, diff| {
+                            body.child(self.render_git_diff(diff))
+                        })
+                    })
+                    .when(history_active, |body| {
+                        self.render_git_history_body(body, cx)
+                    }),
+            )
+            .when(changes_active, |root| {
+                root.child(self.render_git_commit_panel(can_commit, has_selected_paths, cx))
+            })
+            .into_any_element()
+    }
+
+    fn render_git_tree_row_mobile(
+        &self,
+        row: GitTreeRow,
+        change: Option<GitChange>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let is_directory = row.kind == GitTreeRowKind::Directory;
+        let path = row.path.clone();
+        let path_chain = row
+            .segments
+            .iter()
+            .map(|segment| segment.path.clone())
+            .collect::<Vec<_>>();
+        let label = row
+            .segments
+            .iter()
+            .map(|segment| segment.name.as_str())
+            .collect::<Vec<_>>()
+            .join(" / ");
+        let selection = self.git.state.model.path_selection_state(&path);
+        let selected_path = change.as_ref().is_some_and(|change| {
+            self.git
+                .state
+                .model
+                .selected_change_paths()
+                .contains(&change.path)
+        });
+        let row_id = row.id.clone();
+        let change_staged = change
+            .as_ref()
+            .is_some_and(|change| change.staged && !change.unstaged);
+        let text_color = change
+            .as_ref()
+            .map(git_change_text_color_mobile)
+            .unwrap_or_else(|| theme::text_primary());
+        let file_name = row
+            .segments
+            .last()
+            .map(|segment| segment.name.as_str())
+            .unwrap_or(row.path.as_str())
+            .to_string();
+        let icon = if is_directory {
+            file_icon_descriptor("", FileEntryKind::Directory)
+        } else {
+            file_icon_descriptor(&file_name, FileEntryKind::File)
+        };
+        div()
+            .id(format!("git-tree:{row_id}"))
+            .relative()
+            .min_h(px(32.0))
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_1()
+            .when(selected_path, |item| item.bg(theme::sidebar_selected_bg()))
+            .when(!selected_path, |item| {
+                item.hover(|style| style.bg(theme::row_pressed_bg()))
+            })
+            .children(file_tree_guides_mobile(row.depth))
+            .child(div().w(px(row.depth as f32 * 20.0)).flex_none())
+            .child({
+                let select_path = path.clone();
+                div()
+                    .id(format!("git-select:{row_id}"))
+                    .size(px(24.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            let selected = selection != GitPathSelectionState::Checked;
+                            if is_directory {
+                                this.git
+                                    .state
+                                    .model
+                                    .select_path_prefix(&select_path, selected);
+                            } else {
+                                this.git.state.model.select_path(&select_path, selected);
+                            }
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .child(git_selection_indicator_mobile(selection))
+            })
+            .child(
+                div()
+                    .w(px(14.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(if is_directory {
+                        svg()
+                            .path(if row.expanded {
+                                "icons/chevron-down.svg"
+                            } else {
+                                "icons/chevron-right.svg"
+                            })
+                            .size(px(12.0))
+                            .text_color(theme::text_muted())
+                    } else {
+                        svg()
+                            .path("icons/chevron-right.svg")
+                            .size(px(12.0))
+                            .text_color(theme::workbench_bg())
+                    }),
+            )
+            .child(mobile_file_tree_icon(icon, false, row.expanded))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_size(px(theme::FONT_BODY))
+                    .text_color(text_color)
+                    .when(
+                        change
+                            .as_ref()
+                            .is_some_and(|change| change.kind == GitChangeKind::Deleted),
+                        |item| item.line_through(),
+                    )
+                    .child(if label.is_empty() {
+                        path.clone()
+                    } else {
+                        label
+                    }),
+            )
+            .when_some(change.clone(), |item, change| {
+                item.child(
+                    div()
+                        .h(px(18.0))
+                        .min_w(px(22.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(3.0))
+                        .border_1()
+                        .border_color(theme::border_default())
+                        .px_1()
+                        .flex_none()
+                        .font_family("monospace")
+                        .text_size(px(theme::FONT_MICRO))
+                        .text_color(git_change_text_color_mobile(&change))
+                        .child(git_change_label_mobile(change.kind)),
+                )
+                .child(
+                    div()
+                        .w(px(30.0))
+                        .flex_none()
+                        .font_family("monospace")
+                        .text_size(px(theme::FONT_MICRO))
+                        .text_color(if change.additions > 0 {
+                            rgb(theme::ACCENT_GREEN).into()
+                        } else {
+                            theme::text_muted()
+                        })
+                        .child(format!("+{}", change.additions)),
+                )
+                .child(
+                    div()
+                        .w(px(30.0))
+                        .flex_none()
+                        .font_family("monospace")
+                        .text_size(px(theme::FONT_MICRO))
+                        .text_color(if change.deletions > 0 {
+                            rgb(theme::ACCENT_RED).into()
+                        } else {
+                            theme::text_muted()
+                        })
+                        .child(format!("-{}", change.deletions)),
+                )
+            })
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    if is_directory {
+                        this.git.state.model.toggle_change_directories(&path_chain);
+                    } else if change.is_some() {
+                        this.open_git_diff(path.clone(), change_staged, cx);
+                    }
+                    cx.notify();
+                }),
+            )
+            .into_any_element()
+    }
+
+    fn render_git_diff(&self, diff: GitDiffResponse) -> gpui::AnyElement {
+        div()
+            .px_3()
+            .py_2()
+            .border_t_1()
+            .border_color(theme::border_subtle())
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_size(px(theme::FONT_CAPTION))
+                    .text_color(theme::text_secondary())
+                    .child(diff.path),
+            )
+            .children(diff.diff.lines().take(500).map(|line| {
+                let line = line.to_string();
+                let color = if line.starts_with('+') && !line.starts_with("+++") {
+                    rgb(theme::ACCENT_GREEN).into()
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    rgb(theme::ACCENT_RED).into()
+                } else {
+                    theme::text_muted()
+                };
+                div()
+                    .font_family("IBM Plex Mono")
+                    .text_size(px(theme::FONT_MICRO))
+                    .text_color(color)
+                    .whitespace_normal()
+                    .child(if line.is_empty() {
+                        " ".to_string()
+                    } else {
+                        line
+                    })
+            }))
+            .into_any_element()
+    }
+
+    fn render_git_commit_panel(
+        &self,
+        can_commit: bool,
+        has_selected_paths: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .flex_shrink_0()
+            .border_t_1()
+            .border_color(theme::border_default())
+            .bg(theme::workbench_panel_bg())
+            .p_2()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(input_shell(self.git_commit_input.clone()))
+            .when(self.git_commit_confirmation, |panel| {
+                panel.child(
+                    div()
+                        .p_2()
+                        .rounded(px(theme::RADIUS_CONTROL))
+                        .border_1()
+                        .border_color(rgb(theme::ACCENT_YELLOW))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_size(px(theme::FONT_CAPTION))
+                        .text_color(theme::text_secondary())
+                        .child(locale::text(
+                            "Commit staged changes?",
+                            "提交已暂存的更改？",
+                            "提交已暫存的變更？",
+                        ))
+                        .child(div().flex_1())
+                        .child(
+                            compact_action("cancel-commit", locale::common("Cancel")).on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(Self::cancel_git_commit),
+                            ),
+                        )
+                        .child(
+                            compact_action("confirm-commit", locale::common("Commit"))
+                                .when(can_commit, |button| {
+                                    button.on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(Self::confirm_git_commit),
+                                    )
+                                })
+                                .when(!can_commit, |button| button.opacity(0.55)),
+                        ),
+                )
+            })
+            .when(!self.git_commit_confirmation, |panel| {
+                panel.child(
+                    div().flex().justify_end().child(
+                        compact_action(
+                            "request-commit",
+                            if !can_commit {
+                                locale::common("Read only")
+                            } else if !has_selected_paths {
+                                locale::common("Select changes")
+                            } else if self.busy {
+                                locale::common("Working...")
+                            } else {
+                                locale::common("Commit")
+                            },
+                        )
+                        .when(!self.busy && can_commit && has_selected_paths, |button| {
+                            button.on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(Self::request_git_commit),
+                            )
+                        })
+                        .when(!can_commit || !has_selected_paths, |button| {
+                            button.opacity(0.55)
+                        }),
+                    ),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_git_history_body(
+        &self,
+        body: gpui::Stateful<gpui::Div>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let count = self.git.state.model.history_row_count();
+        body.when(count == 0, |body| {
+            body.child(empty_label(if self.git_history_loading {
+                "Loading history"
+            } else {
+                "No commits found"
+            }))
+        })
+        .children((0..count).filter_map(|index| {
+            self.git
+                .state
+                .model
+                .history_row(index)
+                .cloned()
+                .map(|commit| self.render_git_history_row(commit, cx))
+        }))
+        .when(self.git.state.model.history_has_more, |body| {
+            body.child(
+                compact_action(
+                    "load-more-git-history",
+                    if self.git_history_loading {
+                        locale::common("Loading...")
+                    } else {
+                        locale::common("Load more")
+                    },
+                )
+                .mx_3()
+                .my_2()
+                .on_mouse_up(MouseButton::Left, cx.listener(Self::load_more_git_history)),
+            )
+        })
+    }
+
+    fn render_git_history_row(
+        &self,
+        commit: GitCommitSummary,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let hash = commit.hash.clone();
+        let selected = self.git.state.model.selected_commit_hash.as_deref() == Some(hash.as_str());
+        div()
+            .id(format!("git-history:{}", commit.hash))
+            .min_h(px(58.0))
+            .px_2()
+            .py_1()
+            .flex()
+            .items_center()
+            .gap_2()
+            .cursor_pointer()
+            .when(selected, |item| item.bg(theme::sidebar_selected_bg()))
+            .when(!selected, |item| {
+                item.hover(|style| style.bg(theme::row_pressed_bg()))
+            })
+            .child(
+                div()
+                    .w(px(18.0))
+                    .h(px(42.0))
+                    .flex_none()
+                    .relative()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .w(px(1.0))
+                            .bg(theme::border_default()),
+                    )
+                    .child(
+                        div()
+                            .relative()
+                            .size(px(if selected { 9.0 } else { 7.0 }))
+                            .rounded_full()
+                            .bg(rgb(theme::ACCENT_BLUE)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
                             .child(
                                 div()
                                     .flex_1()
@@ -1262,387 +2678,50 @@ impl MobileWorkbench {
                                     .text_ellipsis()
                                     .whitespace_nowrap()
                                     .text_size(px(theme::FONT_BODY))
-                                    .text_color(theme::text_secondary())
-                                    .child(row.name),
+                                    .text_color(theme::text_primary())
+                                    .child(commit.subject.clone()),
                             )
-                            .into_any_element()
-                    }))
-                    .when(!search.is_empty(), |body| {
-                        body.child(section_heading("Search results")).children(
-                            search.into_iter().map(|result| {
-                                let path = result.path.clone();
+                            .children(commit.refs.iter().take(2).cloned().map(|reference| {
                                 div()
-                                    .id(format!(
-                                        "file-search-result:{}:{}",
-                                        result.path,
-                                        result.line.unwrap_or_default()
-                                    ))
-                                    .min_h(px(theme::TOUCH_TARGET))
-                                    .px_3()
-                                    .py_2()
-                                    .border_b_1()
-                                    .border_color(theme::border_subtle())
-                                    .flex()
-                                    .flex_col()
-                                    .justify_center()
-                                    .cursor_pointer()
-                                    .active(|style| style.bg(theme::row_pressed_bg()))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.select_file(path.clone(), cx)
-                                        }),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(theme::FONT_BODY))
-                                            .text_color(theme::text_secondary())
-                                            .child(result.path),
-                                    )
-                                    .when_some(result.snippet, |row, snippet| {
-                                        row.child(
-                                            div()
-                                                .text_size(px(theme::FONT_MICRO))
-                                                .text_color(theme::text_muted())
-                                                .child(snippet),
-                                        )
-                                    })
-                                    .into_any_element()
-                            }),
-                        )
-                    })
-                    .when_some(selected_path, |body, path| {
-                        body.child(section_heading("Editor")).child(
-                            div()
-                                .px_3()
-                                .pb_3()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .gap_2()
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .overflow_hidden()
-                                                .text_ellipsis()
-                                                .whitespace_nowrap()
-                                                .text_size(px(theme::FONT_CAPTION))
-                                                .text_color(theme::text_muted())
-                                                .child(path),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(px(theme::FONT_MICRO))
-                                                .text_color(status_color)
-                                                .child(status),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .h(px(240.0))
-                                        .rounded(px(theme::RADIUS_CONTROL))
-                                        .border_1()
-                                        .border_color(theme::border_default())
-                                        .bg(theme::bg_card())
-                                        .overflow_hidden()
-                                        .child(self.file_editor_input.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .justify_end()
-                                        .gap_2()
-                                        .when(has_conflict, |actions| {
-                                            actions.child(
-                                                action_button(
-                                                    "reload-desktop-file",
-                                                    "Use desktop version",
-                                                )
-                                                .on_mouse_up(
-                                                    MouseButton::Left,
-                                                    cx.listener(Self::reload_desktop_file),
-                                                ),
-                                            )
-                                        })
-                                        .child(
-                                            action_button(
-                                                "save-file",
-                                                if !can_write {
-                                                    "Read only"
-                                                } else if self.busy {
-                                                    "Saving..."
-                                                } else {
-                                                    "Save"
-                                                },
-                                            )
-                                            .when(!self.busy && can_write, |button| {
-                                                button.on_mouse_up(
-                                                    MouseButton::Left,
-                                                    cx.listener(Self::save_file),
-                                                )
-                                            })
-                                            .when(!can_write, |button| button.opacity(0.55)),
-                                        ),
-                                ),
-                        )
-                    }),
-            )
-            .into_any_element()
-    }
-
-    fn render_git(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let status = self.git.state.model.status.clone();
-        let can_commit = self
-            .git
-            .capabilities()
-            .supports(BackendOperation::GitCommit);
-        let changes = status
-            .as_ref()
-            .map(|status| status.changes.clone())
-            .unwrap_or_default();
-        let summary = status.as_ref().map(|status| {
-            format!(
-                "{}  {} {}  {} {}",
-                status.branch.as_deref().unwrap_or("detached"),
-                status.staged_count,
-                locale::text("staged", "已暂存", "已暫存"),
-                status.unstaged_count,
-                locale::text("unstaged", "未暂存", "未暫存"),
-            )
-        });
-
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .px_3()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(theme::border_subtle())
-                    .text_size(px(theme::FONT_CAPTION))
-                    .text_color(theme::text_muted())
-                    .child(summary.unwrap_or_else(|| {
-                        locale::common("Loading repository status...").to_string()
-                    })),
-            )
-            .child(
-                div()
-                    .id("mobile-git-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(section_heading("Changes"))
-                    .when(changes.is_empty(), |body| {
-                        body.child(empty_label("Working tree is clean"))
-                    })
-                    .children(
-                        changes
-                            .into_iter()
-                            .map(|change| self.render_git_change(change, cx)),
+                                    .max_w(px(88.0))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .rounded(px(3.0))
+                                    .bg(rgb(theme::ACCENT_BLUE).opacity(0.18))
+                                    .px_1()
+                                    .text_size(px(theme::FONT_MICRO))
+                                    .text_color(rgb(theme::ACCENT_BLUE))
+                                    .child(reference)
+                            })),
                     )
-                    .when_some(self.git_diff.clone(), |body, diff| {
-                        body.child(section_heading("Diff")).child(
-                            div()
-                                .px_3()
-                                .pb_3()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_size(px(theme::FONT_CAPTION))
-                                        .text_color(theme::text_secondary())
-                                        .child(diff.path),
-                                )
-                                .children(diff.diff.lines().take(500).map(|line| {
-                                    let color = if line.starts_with('+') && !line.starts_with("+++")
-                                    {
-                                        rgb(theme::ACCENT_GREEN).into()
-                                    } else if line.starts_with('-') && !line.starts_with("---") {
-                                        rgb(theme::ACCENT_RED).into()
-                                    } else {
-                                        theme::text_muted()
-                                    };
-                                    div()
-                                        .font_family("IBM Plex Mono")
-                                        .text_size(px(theme::FONT_MICRO))
-                                        .text_color(color)
-                                        .whitespace_normal()
-                                        .child(if line.is_empty() {
-                                            " ".to_string()
-                                        } else {
-                                            line.to_string()
-                                        })
-                                })),
-                        )
-                    })
-                    .child(section_heading("Commit"))
                     .child(
                         div()
-                            .px_3()
-                            .pb_3()
                             .flex()
-                            .flex_col()
+                            .items_center()
                             .gap_2()
-                            .child(input_shell(self.git_commit_input.clone()))
-                            .when(self.git_commit_confirmation, |panel| {
-                                panel.child(
-                                    div()
-                                        .rounded(px(theme::RADIUS_CONTROL))
-                                        .border_1()
-                                        .border_color(rgb(theme::ACCENT_YELLOW))
-                                        .p_3()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_2()
-                                        .text_size(px(theme::FONT_CAPTION))
-                                        .text_color(theme::text_secondary())
-                                        .child(locale::text(
-                                            "Commit the currently staged changes?",
-                                            "提交当前已暂存的更改？",
-                                            "提交目前已暫存的變更？",
-                                        ))
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .justify_end()
-                                                .gap_2()
-                                                .child(
-                                                    action_button("cancel-commit", "Cancel")
-                                                        .on_mouse_up(
-                                                            MouseButton::Left,
-                                                            cx.listener(Self::cancel_git_commit),
-                                                        ),
-                                                )
-                                                .child(
-                                                    action_button("confirm-commit", "Commit")
-                                                        .when(can_commit, |button| {
-                                                            button.on_mouse_up(
-                                                                MouseButton::Left,
-                                                                cx.listener(
-                                                                    Self::confirm_git_commit,
-                                                                ),
-                                                            )
-                                                        })
-                                                        .when(!can_commit, |button| {
-                                                            button.opacity(0.55)
-                                                        }),
-                                                ),
-                                        ),
-                                )
-                            })
-                            .when(!self.git_commit_confirmation, |panel| {
-                                panel.child(
-                                    div().flex().justify_end().child(
-                                        action_button(
-                                            "request-commit",
-                                            if !can_commit {
-                                                "Read only"
-                                            } else if self.busy {
-                                                "Working..."
-                                            } else {
-                                                "Commit"
-                                            },
-                                        )
-                                        .when(!self.busy && can_commit, |button| {
-                                            button.on_mouse_up(
-                                                MouseButton::Left,
-                                                cx.listener(Self::request_git_commit),
-                                            )
-                                        })
-                                        .when(!can_commit, |button| button.opacity(0.55)),
-                                    ),
-                                )
-                            }),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn render_git_change(&self, change: GitChange, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let can_stage = self.git.capabilities().supports(BackendOperation::GitStage);
-        let can_unstage = self
-            .git
-            .capabilities()
-            .supports(BackendOperation::GitUnstage);
-        let diff_path = change.path.clone();
-        let diff_staged = change.staged && !change.unstaged;
-        let stage_path = change.path.clone();
-        let unstage_path = change.path.clone();
-        div()
-            .min_h(px(58.0))
-            .px_3()
-            .py_2()
-            .border_b_1()
-            .border_color(theme::border_subtle())
-            .flex()
-            .items_center()
-            .gap_2()
-            .child(
-                div()
-                    .id(format!("git-diff:{}", change.path))
-                    .flex_1()
-                    .min_w_0()
-                    .cursor_pointer()
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            this.open_git_diff(diff_path.clone(), diff_staged, cx)
-                        }),
-                    )
-                    .child(
-                        div()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .text_size(px(theme::FONT_BODY))
-                            .text_color(theme::text_secondary())
-                            .child(change.path),
-                    )
-                    .child(
-                        div()
                             .text_size(px(theme::FONT_MICRO))
                             .text_color(theme::text_muted())
-                            .child(format!(
-                                "{:?}  +{} -{}",
-                                change.kind, change.additions, change.deletions
-                            )),
+                            .child(history_relative_time(commit.authored_at_ms))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .child(commit.author_name),
+                            )
+                            .child(div().font_family("monospace").child(commit.short_hash)),
                     ),
             )
-            .when(change.unstaged && can_stage, |row| {
-                row.child(
-                    compact_action(format!("stage:{}", stage_path), locale::common("Stage"))
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| {
-                                this.mutate_git_path(stage_path.clone(), true, cx)
-                            }),
-                        ),
-                )
-            })
-            .when(change.staged && can_unstage, |row| {
-                row.child(
-                    compact_action(
-                        format!("unstage:{}", unstage_path),
-                        locale::common("Unstage"),
-                    )
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            this.mutate_git_path(unstage_path.clone(), false, cx)
-                        }),
-                    ),
-                )
-            })
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.git.state.model.select_commit(hash.clone());
+                    cx.notify();
+                }),
+            )
             .into_any_element()
     }
 
@@ -2619,6 +3698,268 @@ fn input_shell(input: Entity<TextInput>) -> gpui::Div {
         .child(input)
 }
 
+fn icon_button(
+    id: impl Into<gpui::ElementId>,
+    path: &'static str,
+    label: &'static str,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .size(px(30.0))
+        .rounded(px(theme::RADIUS_CONTROL))
+        .flex()
+        .items_center()
+        .justify_center()
+        .aria_label(locale::common(label))
+        .cursor_pointer()
+        .active(|style| style.bg(theme::row_pressed_bg()))
+        .child(
+            svg()
+                .path(path)
+                .size(px(theme::ICON_SM))
+                .text_color(theme::text_secondary()),
+        )
+}
+
+fn git_mode_tab(
+    id: &'static str,
+    label: &'static str,
+    selected: bool,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .h_full()
+        .min_w_0()
+        .flex_1()
+        .px_3()
+        .flex()
+        .items_center()
+        .justify_center()
+        .border_b_2()
+        .border_color(if selected {
+            rgb(theme::TEXT_PRIMARY).into()
+        } else {
+            theme::workbench_bg()
+        })
+        .text_size(px(theme::FONT_CAPTION))
+        .text_color(if selected {
+            theme::text_primary()
+        } else {
+            theme::text_muted()
+        })
+        .cursor_pointer()
+        .active(|style| style.bg(theme::row_pressed_bg()))
+        .child(label)
+}
+
+fn file_tree_guides_mobile(depth: usize) -> Vec<gpui::AnyElement> {
+    (0..depth)
+        .map(|index| {
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left(px(index as f32 * 20.0 + 16.0))
+                .w(px(1.0))
+                .bg(theme::border_default())
+                .into_any_element()
+        })
+        .collect()
+}
+
+fn mobile_file_tree_icon(
+    icon: FileIconDescriptor,
+    ignored: bool,
+    expanded: bool,
+) -> gpui::AnyElement {
+    let path = match icon.kind {
+        FileIconKind::Directory => {
+            return svg()
+                .path(if expanded {
+                    "icons/folder-open.svg"
+                } else {
+                    "icons/folder.svg"
+                })
+                .size(px(theme::ICON_SM))
+                .text_color(mobile_file_icon_color(icon.kind, ignored))
+                .into_any_element();
+        }
+        FileIconKind::Code
+        | FileIconKind::Rust
+        | FileIconKind::TypeScript
+        | FileIconKind::JavaScript => "icons/file-code.svg",
+        FileIconKind::Java => "icons/coffee.svg",
+        FileIconKind::Json => "icons/file-braces.svg",
+        FileIconKind::Archive => "icons/file-archive.svg",
+        FileIconKind::Spreadsheet => "icons/file-spreadsheet.svg",
+        FileIconKind::Audio => "icons/audio-lines.svg",
+        FileIconKind::Video => "icons/file-video-camera.svg",
+        FileIconKind::Symlink => "icons/file-symlink.svg",
+        FileIconKind::Config => "icons/file-cog.svg",
+        FileIconKind::Lock => "icons/file-lock.svg",
+        FileIconKind::Secret => "icons/file-key.svg",
+        FileIconKind::Font => "icons/file-type.svg",
+        FileIconKind::Markdown => "icons/book-open-text.svg",
+        FileIconKind::Image => "icons/image.svg",
+        FileIconKind::Svg | FileIconKind::Markup => "icons/code-xml.svg",
+        FileIconKind::Database => "icons/database.svg",
+        FileIconKind::Style => "icons/hash.svg",
+        FileIconKind::Script => "icons/file-terminal.svg",
+        FileIconKind::Pdf
+        | FileIconKind::Office
+        | FileIconKind::Text
+        | FileIconKind::File
+        | FileIconKind::Other => "icons/file-text.svg",
+    };
+    svg()
+        .path(path)
+        .size(px(theme::ICON_SM))
+        .text_color(mobile_file_icon_color(icon.kind, ignored))
+        .into_any_element()
+}
+
+fn mobile_file_icon_color(kind: FileIconKind, ignored: bool) -> gpui::Hsla {
+    let color = match kind {
+        FileIconKind::Directory => rgb(0x85899d).into(),
+        FileIconKind::Code
+        | FileIconKind::Java
+        | FileIconKind::Rust
+        | FileIconKind::TypeScript
+        | FileIconKind::Markdown
+        | FileIconKind::Image
+        | FileIconKind::Svg => rgb(theme::ACCENT_BLUE).into(),
+        FileIconKind::JavaScript | FileIconKind::Script => rgb(theme::ACCENT_YELLOW).into(),
+        FileIconKind::Json => rgb(theme::ACCENT_PURPLE).into(),
+        FileIconKind::Archive | FileIconKind::Config => rgb(0xf0a050).into(),
+        FileIconKind::Database | FileIconKind::Spreadsheet => rgb(theme::ACCENT_GREEN).into(),
+        FileIconKind::Style => rgb(0x5ed2d9).into(),
+        FileIconKind::Markup => rgb(0xf0a050).into(),
+        FileIconKind::Audio => rgb(0xd08ad8).into(),
+        FileIconKind::Video => rgb(0xf08fc4).into(),
+        FileIconKind::Symlink => rgb(0xb091f2).into(),
+        FileIconKind::Lock | FileIconKind::Secret => rgb(theme::ACCENT_YELLOW).into(),
+        FileIconKind::Font => rgb(0xd08ad8).into(),
+        FileIconKind::Pdf
+        | FileIconKind::Office
+        | FileIconKind::Text
+        | FileIconKind::File
+        | FileIconKind::Other => theme::text_secondary(),
+    };
+    if ignored { color.opacity(0.35) } else { color }
+}
+
+fn file_tree_row_text_color(row: &vibex_desktop_model::FileExplorerRow) -> gpui::Hsla {
+    if row.ignored {
+        return theme::text_muted();
+    }
+    match row.git.map(|git| git.signal) {
+        Some(FileGitSignal::Added) => rgb(theme::ACCENT_GREEN).into(),
+        Some(FileGitSignal::Untracked) => rgb(theme::ACCENT_YELLOW).into(),
+        Some(FileGitSignal::Ignored) => theme::text_muted(),
+        Some(_) => rgb(theme::ACCENT_BLUE).into(),
+        None => theme::text_primary(),
+    }
+}
+
+fn file_git_signal_color(signal: FileGitSignal) -> gpui::Hsla {
+    match signal {
+        FileGitSignal::Added => rgb(theme::ACCENT_GREEN).into(),
+        FileGitSignal::Untracked => rgb(theme::ACCENT_YELLOW).into(),
+        FileGitSignal::Modified
+        | FileGitSignal::Deleted
+        | FileGitSignal::Renamed
+        | FileGitSignal::Copied
+        | FileGitSignal::Conflicted => rgb(theme::ACCENT_BLUE).into(),
+        FileGitSignal::Ignored => theme::text_muted(),
+    }
+}
+
+fn git_selection_indicator_mobile(state: GitPathSelectionState) -> gpui::AnyElement {
+    let selected = state != GitPathSelectionState::Unchecked;
+    div()
+        .size(px(14.0))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(3.0))
+        .border_1()
+        .border_color(if selected {
+            rgb(theme::ACCENT_BLUE).into()
+        } else {
+            theme::border_default()
+        })
+        .bg(if selected {
+            rgb(theme::ACCENT_BLUE).into()
+        } else {
+            theme::workbench_bg()
+        })
+        .text_color(theme::text_primary())
+        .when(state == GitPathSelectionState::Checked, |item| {
+            item.child(
+                svg()
+                    .path("icons/x.svg")
+                    .size(px(10.0))
+                    .text_color(theme::text_primary()),
+            )
+        })
+        .when(state == GitPathSelectionState::Indeterminate, |item| {
+            item.child(div().w(px(7.0)).h(px(1.0)).bg(theme::text_primary()))
+        })
+        .into_any_element()
+}
+
+fn file_icon_kind_for_path(path: &str) -> FileIconKind {
+    file_icon_descriptor(path, FileEntryKind::File).kind
+}
+
+fn git_change_text_color_mobile(change: &GitChange) -> gpui::Hsla {
+    match change.kind {
+        GitChangeKind::Deleted => theme::text_muted(),
+        GitChangeKind::Untracked => rgb(theme::ACCENT_YELLOW).into(),
+        GitChangeKind::Added if !change.staged => rgb(theme::ACCENT_YELLOW).into(),
+        GitChangeKind::Added => rgb(theme::ACCENT_GREEN).into(),
+        GitChangeKind::Modified
+        | GitChangeKind::Renamed
+        | GitChangeKind::Copied
+        | GitChangeKind::TypeChanged
+        | GitChangeKind::Unmerged
+        | GitChangeKind::Unknown => rgb(theme::ACCENT_BLUE).into(),
+    }
+}
+
+fn git_change_label_mobile(kind: GitChangeKind) -> &'static str {
+    match kind {
+        GitChangeKind::Added => "A",
+        GitChangeKind::Deleted => "D",
+        GitChangeKind::Renamed => "R",
+        GitChangeKind::Copied => "C",
+        GitChangeKind::Untracked => "U",
+        GitChangeKind::Unmerged => "!",
+        GitChangeKind::Modified | GitChangeKind::TypeChanged | GitChangeKind::Unknown => "M",
+    }
+}
+
+fn history_relative_time(authored_at_ms: Option<i64>) -> String {
+    let Some(timestamp) = authored_at_ms
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .map(|timestamp| timestamp.with_timezone(&chrono::Local))
+    else {
+        return locale::common("Unknown").to_string();
+    };
+    let age = chrono::Local::now().signed_duration_since(timestamp);
+    let seconds = age.num_seconds().max(0);
+    if seconds < 60 {
+        format!("{seconds}s ago")
+    } else if seconds < 3_600 {
+        format!("{}m ago", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h ago", seconds / 3_600)
+    } else {
+        timestamp.format("%Y-%m-%d %H:%M").to_string()
+    }
+}
+
 fn action_button(id: impl Into<gpui::ElementId>, label: &'static str) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
@@ -2864,6 +4205,27 @@ mod tests {
 
         let available = runtime_option(selection.clone(), RuntimeOptionAvailability::Available);
         assert!(runtime_selection_is_available(&[available], &selection));
+    }
+
+    #[test]
+    fn mobile_workbench_file_and_git_mappings_follow_desktop_labels() {
+        assert_eq!(
+            MobileFileSearchMode::Name.toggle(),
+            MobileFileSearchMode::Content
+        );
+        assert_eq!(
+            MobileFileSearchMode::Content.toggle(),
+            MobileFileSearchMode::Name
+        );
+        assert_eq!(MobileFileSearchMode::Name.label(), "Name");
+        assert_eq!(MobileFileSearchMode::Content.label(), "Content");
+        assert_eq!(git_change_label_mobile(GitChangeKind::Added), "A");
+        assert_eq!(git_change_label_mobile(GitChangeKind::Deleted), "D");
+        assert_eq!(git_change_label_mobile(GitChangeKind::Untracked), "U");
+        assert_eq!(git_change_label_mobile(GitChangeKind::Unmerged), "!");
+        assert_eq!(file_icon_kind_for_path("src/main.rs"), FileIconKind::Rust);
+        assert_eq!(file_icon_kind_for_path("README.md"), FileIconKind::Markdown);
+        assert_eq!(file_icon_kind_for_path("config.toml"), FileIconKind::Config);
     }
 
     #[test]

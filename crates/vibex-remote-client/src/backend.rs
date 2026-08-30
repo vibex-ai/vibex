@@ -22,8 +22,9 @@ use vibex_core::{
     ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest, FileMutationRequest,
     FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
     FileTreeRequest, FileWriteRequest, GetMessageSubmissionRequest, GitCommitRequest,
-    GitCommitResult, GitDiffRequest, GitDiffResponse, GitProjectEligibility, GitStageRequest,
-    GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
+    GitCommitResult, GitDiffRequest, GitDiffResponse, GitHistoryRequest, GitHistoryResponse,
+    GitProjectEligibility, GitRemoteActionResult, GitStageRequest, GitStatusSummary,
+    GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
     GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeCreateRequest,
     GitWorktreeCreateResult, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
     GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
@@ -64,8 +65,9 @@ use vibex_core::{
     RemoteFileSearchRequest, RemoteFileSearchResponse, RemoteFileTreeRequest,
     RemoteFileTreeResponse, RemoteFileWriteRequest, RemoteFileWriteResponse,
     RemoteGitCommitRequest, RemoteGitCommitResponse, RemoteGitDiffRequest, RemoteGitDiffResponse,
-    RemoteGitStageRequest, RemoteGitStatusMutationResponse, RemoteGitStatusRequest,
-    RemoteGitStatusResponse, RemoteGitWorktreeEligibilityRequest,
+    RemoteGitHistoryRequest, RemoteGitHistoryResponse, RemoteGitRemoteActionRequest,
+    RemoteGitRemoteActionResponse, RemoteGitStageRequest, RemoteGitStatusMutationResponse,
+    RemoteGitStatusRequest, RemoteGitStatusResponse, RemoteGitWorktreeEligibilityRequest,
     RemoteGitWorktreeEligibilityResponse, RemoteGitWorktreeSnapshotRequest,
     RemoteGitWorktreeSnapshotResponse, RemoteOperationKind, RemotePairingOfferSummary,
     RemoteProviderHealthSummaryListRequest, RemoteProviderHealthSummaryListResponse,
@@ -252,6 +254,102 @@ impl WebRemoteBackend {
 
     pub fn apply_lifecycle_signal(&self, signal: RemoteLifecycleSignal) {
         self.transport.apply_lifecycle_signal(signal);
+    }
+
+    /// Reads the same commit history endpoint used by the desktop Git rail.
+    /// This stays an adapter method instead of expanding `GitBackend`, whose
+    /// shared workflow intentionally covers only the compact mutation surface.
+    pub async fn git_history(
+        &self,
+        request: GitHistoryRequest,
+    ) -> BackendResult<GitHistoryResponse> {
+        let workspace_id = request.workspace_id.clone();
+        let payload = RemoteWorkbenchRequest::GitHistory(RemoteGitHistoryRequest {
+            auth: self.auth(),
+            request,
+        });
+        let value = self
+            .rpc(
+                RemoteOperationKind::Git,
+                payload,
+                None,
+                None,
+                vibex_core::RemoteTimeoutClass::Standard,
+            )
+            .await?;
+        let history = decode::<RemoteGitHistoryResponse>(value)?.history;
+        if history.workspace_id != workspace_id {
+            return Err(BackendError::failed(
+                "remote_git_workspace_mismatch",
+                "remote Git response workspace does not match the request",
+            ));
+        }
+        Ok(history)
+    }
+
+    /// Applies a destructive revert from the compact Git toolbar and returns
+    /// the authoritative status snapshot produced by the desktop.
+    pub async fn git_revert(
+        &self,
+        request: vibex_core::GitStageRequest,
+    ) -> BackendResult<GitStatusSummary> {
+        let request_id = vibex_core::RequestId::new();
+        let idempotency_key = format!("mobile-git-revert:{}", request_id.as_str());
+        let workspace_id = request.workspace_id.clone();
+        let payload = RemoteWorkbenchRequest::GitRevert(RemoteGitStageRequest {
+            auth: self.auth(),
+            request,
+        });
+        let value = self
+            .rpc(
+                RemoteOperationKind::Git,
+                payload,
+                Some(request_id),
+                Some((&idempotency_key, None, None)),
+                vibex_core::RemoteTimeoutClass::LongRunning,
+            )
+            .await?;
+        let status = decode::<RemoteGitStatusMutationResponse>(value)?.status;
+        if status.workspace_id != workspace_id {
+            return Err(BackendError::failed(
+                "remote_git_workspace_mismatch",
+                "remote Git response workspace does not match the request",
+            ));
+        }
+        Ok(status)
+    }
+
+    /// Runs fetch or push from the compact Git toolbar. The returned result
+    /// may already include a fresh status, so callers can avoid a duplicate
+    /// status round trip when it is present.
+    pub async fn git_remote_action(
+        &self,
+        request: vibex_core::GitRemoteActionRequest,
+    ) -> BackendResult<GitRemoteActionResult> {
+        let request_id = vibex_core::RequestId::new();
+        let idempotency_key = format!("mobile-git-remote:{}", request_id.as_str());
+        let workspace_id = request.workspace_id.clone();
+        let payload = RemoteWorkbenchRequest::GitRemoteAction(RemoteGitRemoteActionRequest {
+            auth: self.auth(),
+            request,
+        });
+        let value = self
+            .rpc(
+                RemoteOperationKind::Git,
+                payload,
+                Some(request_id),
+                Some((&idempotency_key, None, None)),
+                vibex_core::RemoteTimeoutClass::LongRunning,
+            )
+            .await?;
+        let result = decode::<RemoteGitRemoteActionResponse>(value)?.result;
+        if result.workspace_id != workspace_id {
+            return Err(BackendError::failed(
+                "remote_git_workspace_mismatch",
+                "remote Git response workspace does not match the request",
+            ));
+        }
+        Ok(result)
     }
 
     pub async fn list_agent_config_summaries(
