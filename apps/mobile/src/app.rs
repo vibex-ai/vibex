@@ -10387,7 +10387,7 @@ fn workspace_mode_label(mode: WorkspaceMode) -> &'static str {
 
 fn sidebar_workspace_status_color(state: Option<AgentSessionState>) -> u32 {
     match state {
-        Some(AgentSessionState::Running | AgentSessionState::Initializing) => theme::ACCENT_BLUE,
+        Some(AgentSessionState::Running | AgentSessionState::Initializing) => theme::TEXT_PRIMARY,
         Some(AgentSessionState::NeedsInput) => theme::ACCENT_YELLOW,
         Some(AgentSessionState::Error) => theme::ACCENT_RED,
         Some(AgentSessionState::Idle) => theme::ACCENT_GREEN,
@@ -10420,6 +10420,14 @@ fn sidebar_running_indicator(color: gpui::Hsla) -> gpui::AnyElement {
         .into_any_element()
 }
 
+fn sidebar_session_running_color(auto_continue_enabled: bool) -> u32 {
+    if auto_continue_enabled {
+        theme::ACCENT_GREEN
+    } else {
+        theme::TEXT_PRIMARY
+    }
+}
+
 fn sidebar_workspace_status_indicator(state: Option<AgentSessionState>) -> gpui::AnyElement {
     let color = rgb(sidebar_workspace_status_color(state));
     match state {
@@ -10440,12 +10448,7 @@ fn sidebar_session_status_indicator(
 ) -> gpui::AnyElement {
     match state {
         AgentSessionState::Running | AgentSessionState::Initializing => sidebar_running_indicator(
-            rgb(if auto_continue_enabled {
-                theme::ACCENT_GREEN
-            } else {
-                theme::ACCENT_BLUE
-            })
-            .into(),
+            rgb(sidebar_session_running_color(auto_continue_enabled)).into(),
         ),
         AgentSessionState::NeedsInput => sidebar_status_dot(rgb(theme::ACCENT_YELLOW).into()),
         AgentSessionState::Error => sidebar_status_dot(rgb(theme::ACCENT_RED).into()),
@@ -10856,6 +10859,20 @@ mod tests {
         assert_eq!(agent_icon_path("chatgpt-acp"), "icons/openai.svg");
         assert_eq!(agent_icon_path("tongyi"), "icons/qwen.svg");
         assert_eq!(agent_icon_path("unknown-provider"), "brand/logo.svg");
+    }
+
+    #[test]
+    fn sidebar_running_status_colors_match_desktop_semantics() {
+        assert_eq!(
+            sidebar_workspace_status_color(Some(AgentSessionState::Running)),
+            theme::TEXT_PRIMARY
+        );
+        assert_eq!(
+            sidebar_workspace_status_color(Some(AgentSessionState::Initializing)),
+            theme::TEXT_PRIMARY
+        );
+        assert_eq!(sidebar_session_running_color(true), theme::ACCENT_GREEN);
+        assert_eq!(sidebar_session_running_color(false), theme::TEXT_PRIMARY);
     }
 
     struct DrawerScrollIsolationProbe {
