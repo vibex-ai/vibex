@@ -3262,6 +3262,28 @@ fn timeline_streaming_agent_row<'a>(
         .find(|row| row.id == row_id && row.kind == TimelineRowKind::AgentMessage && row.streaming)
 }
 
+fn timeline_streaming_reasoning_row<'a>(
+    turn: &'a TimelineConversationTurn,
+    row_id: &str,
+) -> Option<&'a TimelineRow> {
+    turn.process_rows
+        .iter()
+        .rev()
+        .find(|row| row.id == row_id && row.kind == TimelineRowKind::Reasoning && row.streaming)
+}
+
+fn streaming_timeline_row_body_len(
+    turn: &TimelineConversationTurn,
+    state: &StreamingRowStateCache,
+) -> Option<usize> {
+    if state.row_id == format!("reasoning-live:{}", turn.id) {
+        return turn.live_status.as_ref().map(String::len);
+    }
+    timeline_streaming_agent_row(turn, &state.row_id)
+        .or_else(|| timeline_streaming_reasoning_row(turn, &state.row_id))
+        .map(|row| row.body.len())
+}
+
 fn show_agent_answer_actions(conversation_conclusion: bool, row: &TimelineRow) -> bool {
     conversation_conclusion && !row.streaming && !row.body.is_empty()
 }
@@ -10523,7 +10545,6 @@ impl VibexWorkbench {
                     previous_turn_id,
                 )
             } else {
-                self.streaming_row_state = None;
                 self.refresh_last_timeline_size()
             };
             if timeline_should_auto_follow_content(
@@ -10678,6 +10699,9 @@ impl VibexWorkbench {
     fn rebuild_timeline_sizes(&mut self) -> bool {
         self.timeline_pending_turn_heights.clear();
         let turns = self.conversation_turns_cached();
+        self.streaming_row_state = turns
+            .last()
+            .and_then(|turn| self.streaming_timeline_row_state(turn));
         let active_turn_ids = turns
             .iter()
             .map(|turn| turn.id.as_str())
@@ -10711,14 +10735,63 @@ impl VibexWorkbench {
         self.timeline_estimated_turn_heights.clear();
     }
 
+    fn streaming_timeline_row_state(
+        &self,
+        turn: &TimelineConversationTurn,
+    ) -> Option<StreamingRowStateCache> {
+        if let Some(row) = turn
+            .conclusion_row
+            .iter()
+            .chain(turn.process_rows.iter().rev())
+            .find(|row| {
+                row.streaming
+                    && matches!(
+                        row.kind,
+                        TimelineRowKind::AgentMessage | TimelineRowKind::Reasoning
+                    )
+            })
+        {
+            return Some(StreamingRowStateCache {
+                turn_id: turn.id.clone(),
+                row_id: row.id.clone(),
+                body_len: row.body.len(),
+            });
+        }
+
+        (self.ui_state.session.reasoning_display_mode == ReasoningDisplayMode::LatestAtBottom)
+            .then_some(())
+            .and_then(|_| turn.live_status.as_ref())
+            .map(|body| StreamingRowStateCache {
+                turn_id: turn.id.clone(),
+                row_id: format!("reasoning-live:{}", turn.id),
+                body_len: body.len(),
+            })
+    }
+
     fn refresh_last_timeline_size(&mut self) -> bool {
         self.timeline_pending_turn_heights.clear();
         let turns = self.conversation_turns_cached();
         let Some(turn) = turns.last().cloned() else {
+            self.streaming_row_state = None;
             return self.rebuild_timeline_sizes();
         };
+        self.streaming_row_state = self.streaming_timeline_row_state(&turn);
         if self.timeline_row_sizes.len() != turns.len() {
             return self.rebuild_timeline_sizes();
+        }
+        if self.streaming_row_state.is_some() {
+            let Some(current_height) = self
+                .timeline_row_sizes
+                .last()
+                .map(|row_size| f32::from(row_size.height))
+            else {
+                return self.rebuild_timeline_sizes();
+            };
+            let process_expansion = self.timeline_process_expansion.get(&turn.id).copied();
+            let signature = self.timeline_turn_estimate_signature(&turn, process_expansion);
+            self.timeline_estimated_turn_heights
+                .insert(turn.id.clone(), (signature, current_height));
+            return false;
         }
         self.timeline_measured_turn_heights.remove(&turn.id);
         let process_expansion = self.timeline_process_expansion.get(&turn.id).copied();
@@ -10972,8 +11045,8 @@ impl VibexWorkbench {
                     .conversation_turns_cache
                     .get(turn_index)
                     .filter(|turn| turn.id == turn_id)
-                    .and_then(|turn| timeline_streaming_agent_row(turn, &state.row_id))
-                    .is_some_and(|row| row.body.len() == state.body_len)
+                    .and_then(|turn| streaming_timeline_row_body_len(turn, state))
+                    .is_some_and(|body_len| body_len == state.body_len)
         });
         let measured_height = stable_streaming_timeline_height(
             previous_height,
@@ -52809,6 +52882,68 @@ mod tests {
         assert_eq!(
             stable_streaming_timeline_height(Some(220.0), 180.0, false),
             180.0
+        );
+    }
+
+    #[test]
+    fn streaming_reasoning_measurements_match_timeline_and_live_rows() {
+        let reasoning_row = TimelineRow {
+            id: "reasoning:stream".into(),
+            kind: TimelineRowKind::Reasoning,
+            item_ids: vec!["item:stream".into()],
+            turn_id: Some("turn:stream".into()),
+            turn_item_count: 1,
+            turn_failed: false,
+            turn_pending_permission: false,
+            conclusion: false,
+            first_sequence: 1,
+            last_sequence: 1,
+            title: "Reasoning".into(),
+            body: "Inspecting the workspace".into(),
+            streaming: true,
+            collapsible: true,
+            pending_permission: false,
+            failed: false,
+            runtime_attribution: None,
+            file_path: None,
+        };
+        let turn = TimelineConversationTurn {
+            id: "turn:stream".into(),
+            user_row: None,
+            process_rows: vec![reasoning_row],
+            process_activity_groups: Vec::new(),
+            process_activity_groups_with_commands: Vec::new(),
+            process_activity_groups_with_file_operations: Vec::new(),
+            process_activity_groups_with_commands_and_file_operations: Vec::new(),
+            live_status: Some("Inspecting the workspace".into()),
+            conclusion_row: None,
+            runtime_attribution: None,
+            complete: false,
+            failed: false,
+            pending_permission: false,
+            item_count: 1,
+            started_at_ms: 1,
+            ended_at_ms: None,
+        };
+
+        let timeline_state = StreamingRowStateCache {
+            turn_id: turn.id.clone(),
+            row_id: "reasoning:stream".into(),
+            body_len: "Inspecting the workspace".len(),
+        };
+        assert_eq!(
+            streaming_timeline_row_body_len(&turn, &timeline_state),
+            Some(timeline_state.body_len)
+        );
+
+        let live_state = StreamingRowStateCache {
+            turn_id: turn.id.clone(),
+            row_id: "reasoning-live:turn:stream".into(),
+            body_len: "Inspecting the workspace".len(),
+        };
+        assert_eq!(
+            streaming_timeline_row_body_len(&turn, &live_state),
+            Some(live_state.body_len)
         );
     }
 
