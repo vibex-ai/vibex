@@ -309,6 +309,7 @@ const AGENT_TIMELINE_BOTTOM_CONTROL_HEIGHT_PX: f32 = 32.0;
 const AGENT_TIMELINE_BOTTOM_CONTROL_TRANSITION_DURATION: Duration = Duration::from_millis(140);
 const AGENT_TIMELINE_SCROLL_IDLE_DELAY: Duration = Duration::from_millis(160);
 const AGENT_TURN_DURATION_TICK_INTERVAL: Duration = Duration::from_secs(1);
+const AGENT_TIMELINE_LAYOUT_WIDTH_EPSILON_PX: f32 = 1.0;
 const AUTO_CONTINUE_COUNTDOWN_SECONDS: u8 = 5;
 const AUTO_CONTINUE_TICK_INTERVAL: Duration = Duration::from_secs(1);
 const SIDEBAR_AUTO_ARCHIVE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -2100,6 +2101,7 @@ struct AgentSessionViewCacheEntry {
     conversation_turns_cache_key: Option<ConversationTurnsCacheKey>,
     conversation_turns_summary: ConversationTurnsSummary,
     streaming_row_state: Option<StreamingRowStateCache>,
+    timeline_layout_width: Option<f32>,
     content_width: SessionContentWidthMode,
     collapsed_timeline_rows: BTreeSet<String>,
     reasoning_expansion: BTreeMap<String, bool>,
@@ -3034,6 +3036,15 @@ fn stable_streaming_timeline_height(
             .max(measured_height)
     } else {
         measured_height
+    }
+}
+
+fn timeline_layout_width_changed(previous: Option<f32>, current: Option<f32>) -> bool {
+    match (previous, current) {
+        (Some(previous), Some(current)) => {
+            (previous - current).abs() >= AGENT_TIMELINE_LAYOUT_WIDTH_EPSILON_PX
+        }
+        _ => true,
     }
 }
 
@@ -4172,6 +4183,7 @@ pub struct VibexWorkbench {
     timeline_measured_turn_heights: BTreeMap<String, f32>,
     timeline_pending_turn_heights: BTreeMap<usize, (String, f32)>,
     timeline_estimated_turn_heights: BTreeMap<String, (u64, f32)>,
+    timeline_layout_width: Option<f32>,
     timeline_markdown_sources: BTreeMap<String, (i64, TimelineMarkdownSourceSnapshot)>,
     timeline_tool_card_projections: BTreeMap<String, (i64, Rc<ToolCardProjection>)>,
     timeline_file_diff_previews: BTreeMap<String, (i64, Rc<AgentFileDiffPreview>)>,
@@ -4909,6 +4921,7 @@ impl VibexWorkbench {
             timeline_measured_turn_heights: BTreeMap::new(),
             timeline_pending_turn_heights: BTreeMap::new(),
             timeline_estimated_turn_heights: BTreeMap::new(),
+            timeline_layout_width: None,
             timeline_markdown_sources: BTreeMap::new(),
             timeline_tool_card_projections: BTreeMap::new(),
             timeline_file_diff_previews: BTreeMap::new(),
@@ -9022,6 +9035,7 @@ impl VibexWorkbench {
             conversation_turns_cache_key: self.conversation_turns_cache_key.take(),
             conversation_turns_summary: std::mem::take(&mut self.conversation_turns_summary),
             streaming_row_state: self.streaming_row_state.take(),
+            timeline_layout_width: self.timeline_layout_width,
             content_width: self.ui_state.session.content_width,
             collapsed_timeline_rows: std::mem::take(&mut self.collapsed_timeline_rows),
             reasoning_expansion: std::mem::take(&mut self.reasoning_expansion),
@@ -9102,6 +9116,9 @@ impl VibexWorkbench {
             return false;
         };
         self.agent_session_view_lru.retain(|cached| cached != &key);
+        let cached_timeline_layout_width = entry.timeline_layout_width;
+        let layout_width_changed =
+            timeline_layout_width_changed(self.timeline_layout_width, cached_timeline_layout_width);
         self.timeline = entry.timeline;
         self.timeline_item_index.get_mut().invalidate();
         self.runtime_selection = entry.runtime_selection;
@@ -9125,7 +9142,11 @@ impl VibexWorkbench {
         self.timeline_process_expansion = entry.timeline_process_expansion;
         self.timeline_command_expansion = entry.timeline_command_expansion;
         self.timeline_file_changes_expansion = entry.timeline_file_changes_expansion;
-        if entry.content_width != self.ui_state.session.content_width
+        if layout_width_changed {
+            self.invalidate_timeline_layout_measurements();
+        }
+        if layout_width_changed
+            || entry.content_width != self.ui_state.session.content_width
             || self.conversation_turns_cache_key.as_ref()
                 != Some(&self.current_conversation_turns_cache_key())
         {
@@ -10778,6 +10799,22 @@ impl VibexWorkbench {
         self.timeline_measured_turn_heights.clear();
         self.timeline_pending_turn_heights.clear();
         self.timeline_estimated_turn_heights.clear();
+        self.timeline_row_sizes = Rc::new(Vec::new());
+    }
+
+    fn sync_timeline_layout_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        if !width.is_finite() || width <= 0.0 {
+            return;
+        }
+        let width = width.round();
+        let previous = self.timeline_layout_width;
+        self.timeline_layout_width = Some(width);
+        if !timeline_layout_width_changed(previous, Some(width)) {
+            return;
+        }
+        self.invalidate_timeline_layout_measurements();
+        self.rebuild_timeline_sizes();
+        cx.notify();
     }
 
     fn streaming_timeline_row_state(
@@ -28480,12 +28517,19 @@ impl VibexWorkbench {
         let timeline_bottom_control_mounted = self.timeline_bottom_control_mounted;
         let turn_preview_rail = (self.ui_state.session.turn_preview_rail && !turns.is_empty())
             .then(|| self.render_agent_turn_preview_rail(turns.as_slice(), cx));
+        let timeline_layout_entity = cx.weak_entity();
         let timeline_surface = div()
             .relative()
             .flex_1()
             .min_h_0()
             .min_w_0()
             .overflow_hidden()
+            .on_prepaint(move |bounds, _, cx| {
+                let width = f32::from(bounds.size.width);
+                let _ = timeline_layout_entity.update(cx, |this, cx| {
+                    this.sync_timeline_layout_width(width, cx);
+                });
+            })
             .when(turns.is_empty(), |this| {
                 this.child(
                     v_flex()
@@ -51316,6 +51360,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("session view cache should remain inspectable");
         assert!(cache_entry.contains("timeline_row_sizes: Rc<Vec<Size<gpui::Pixels>>>"));
+        assert!(cache_entry.contains("timeline_layout_width: Option<f32>"));
         assert!(
             cache_entry.contains("conversation_turns_cache: Rc<Vec<Rc<TimelineConversationTurn>>>")
         );
@@ -51327,6 +51372,7 @@ mod tests {
             .expect("session view stashing should remain inspectable");
         assert!(stash.contains("timeline: std::mem::take(&mut self.timeline)"));
         assert!(stash.contains("&mut self.timeline_row_sizes"));
+        assert!(stash.contains("timeline_layout_width: self.timeline_layout_width"));
         assert!(stash.contains("&mut self.conversation_turns_cache"));
         assert!(stash.contains("self.timeline_markdown_sources.clear();"));
         assert!(stash.contains("self.timeline_tool_card_projections.clear();"));
@@ -51340,6 +51386,8 @@ mod tests {
         assert!(restore.contains("self.agent_session_view_cache.remove(&key)"));
         assert!(!restore.contains(".cloned()"));
         assert!(restore.contains("self.timeline_row_sizes = entry.timeline_row_sizes;"));
+        assert!(restore.contains("cached_timeline_layout_width"));
+        assert!(restore.contains("self.invalidate_timeline_layout_measurements();"));
         assert!(
             restore.contains("self.conversation_turns_cache = entry.conversation_turns_cache;")
         );
@@ -53232,6 +53280,30 @@ mod tests {
             stable_streaming_timeline_height(Some(220.0), 180.0, false),
             180.0
         );
+    }
+
+    #[test]
+    fn timeline_layout_width_cache_invalidates_only_for_real_changes() {
+        assert!(timeline_layout_width_changed(None, Some(800.0)));
+        assert!(!timeline_layout_width_changed(Some(800.0), Some(800.9)));
+        assert!(timeline_layout_width_changed(Some(800.0), Some(801.0)));
+        assert!(timeline_layout_width_changed(Some(800.0), None));
+
+        let source = include_str!("app.rs");
+        let workbench = source
+            .split_once("    fn render_agent_workbench(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_controls("))
+            .map(|(body, _)| body)
+            .expect("agent workbench renderer should remain inspectable");
+        assert!(workbench.contains("sync_timeline_layout_width"));
+        assert!(workbench.contains(".on_prepaint(move |bounds, _, cx|"));
+
+        let invalidation = source
+            .split_once("    fn invalidate_timeline_layout_measurements(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn sync_timeline_layout_width("))
+            .map(|(body, _)| body)
+            .expect("timeline layout invalidation should remain inspectable");
+        assert!(invalidation.contains("self.timeline_row_sizes = Rc::new(Vec::new());"));
     }
 
     #[test]
@@ -58731,7 +58803,7 @@ mod tests {
             .expect("file changes card should be inserted into the conclusion");
         assert!(changes < conclusion);
         assert!(renderer.contains("review-turn-file-changes:"));
-        assert!(renderer.contains("undo-turn-file-changes:"));
+        assert!(!renderer.contains("undo-turn-file-changes:"));
         assert!(renderer.contains("toggle-turn-file-changes:"));
         assert!(renderer.contains("workspace_is_active"));
         assert!(renderer.contains(".role(Role::Button)"));
