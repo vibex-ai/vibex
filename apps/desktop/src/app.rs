@@ -79,7 +79,7 @@ use vibex_core::{
     ExternalSessionImportCandidateStatus, ExternalSessionImportRequest, FetchTimelineRequest,
     FileEntryKind, FileOperationKind, FileOperationPatchFormat, FileTreeRequest,
     ForkAgentSessionRequest, GetMessageSubmissionRequest, GitProjectEligibilityState,
-    GitProjectIneligibleReason, GitStageRequest, GitStatusSummary,
+    GitProjectIneligibleReason, GitStatusSummary,
     GitWorktreeAssistanceSessionRequest, GitWorktreeConflictKind, GitWorktreeDiscardRequest,
     GitWorktreeOperationRecord, GitWorktreeOperationStatus, MessageAttachment,
     MessageSubmissionState, MessageSubmissionStatus, OpenWorkspaceRequest, PermissionResolution,
@@ -2084,12 +2084,6 @@ impl ConversationTurnsSummary {
             has_pending_permission: turns.iter().any(|turn| turn.borrow().pending_permission),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TurnChangesUndoStatus {
-    Pending,
-    Completed,
 }
 
 struct AgentSessionViewCacheEntry {
@@ -4221,7 +4215,6 @@ pub struct VibexWorkbench {
     timeline_process_expansion: BTreeMap<String, bool>,
     reasoning_expansion: BTreeMap<String, bool>,
     timeline_file_changes_expansion: BTreeMap<String, bool>,
-    turn_changes_undo_statuses: BTreeMap<String, TurnChangesUndoStatus>,
     composer_attachments: Vec<InlineComposerAttachment>,
     composer_attachment_serial: u64,
     composer_queue: Vec<ComposerQueueMessage>,
@@ -4292,7 +4285,6 @@ pub struct VibexWorkbench {
     runtime_heartbeat_task: Option<Task<()>>,
     agent_poll_task: Option<Task<()>>,
     composer_attachment_task: Option<Task<()>>,
-    turn_changes_undo_task: Option<Task<()>>,
     startup_loading_indicator_task: Option<Task<()>>,
     startup_loading_release_task: Option<Task<()>>,
     appearance_subscription: Option<Subscription>,
@@ -4935,7 +4927,6 @@ impl VibexWorkbench {
             timeline_process_expansion: BTreeMap::new(),
             reasoning_expansion: BTreeMap::new(),
             timeline_file_changes_expansion: BTreeMap::new(),
-            turn_changes_undo_statuses: BTreeMap::new(),
             composer_attachments: Vec::new(),
             composer_attachment_serial: 0,
             composer_queue: Vec::new(),
@@ -5006,7 +4997,6 @@ impl VibexWorkbench {
             runtime_heartbeat_task: None,
             agent_poll_task: None,
             composer_attachment_task: None,
-            turn_changes_undo_task: None,
             startup_loading_indicator_task: None,
             startup_loading_release_task: None,
             appearance_subscription: None,
@@ -30818,13 +30808,6 @@ impl VibexWorkbench {
             .iter()
             .map(|file| file.removed_lines)
             .sum::<usize>();
-        let action_key = turn_changes_action_key(&session.id, &turn.id);
-        let undo_status = self.turn_changes_undo_statuses.get(&action_key).copied();
-        let undo_pending = undo_status == Some(TurnChangesUndoStatus::Pending);
-        let undo_completed = undo_status == Some(TurnChangesUndoStatus::Completed);
-        let can_undo = turn_file_changes_undo_available(is_latest_turn, turn.complete, &summary)
-            && self.turn_changes_undo_task.is_none()
-            && !undo_completed;
         let first_review = summary.files.iter().find_map(|file| {
             file.review_path
                 .clone()
@@ -30963,39 +30946,6 @@ impl VibexWorkbench {
                     }
                 }))
         };
-        let undo_turn_id = turn.id.clone();
-        let undo_button = Button::new(format!("undo-turn-file-changes:{}", turn.id))
-            .small()
-            .outline()
-            .icon(if undo_completed {
-                IconName::Check
-            } else {
-                IconName::Undo2
-            })
-            .label(if undo_completed {
-                locale::text("Undone", "已撤销", "已復原")
-            } else {
-                locale::text("Undo", "撤销", "復原")
-            })
-            .loading(undo_pending)
-            .disabled(!can_undo)
-            .tooltip(if can_undo || undo_pending || undo_completed {
-                locale::text(
-                    "Undo changes from this turn",
-                    "撤销本轮文件变更",
-                    "復原本輪檔案變更",
-                )
-            } else {
-                locale::text(
-                    "Undo is available only for the latest completed turn with workspace files",
-                    "仅可撤销最新已完成轮次中的工作区文件",
-                    "僅可復原最新已完成輪次中的工作區檔案",
-                )
-            })
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.confirm_undo_turn_file_changes(undo_turn_id.clone(), window, cx)
-            }));
-
         Some(
             v_flex()
                 .id(format!("turn-file-changes-card:{}", turn.id))
@@ -31061,13 +31011,7 @@ impl VibexWorkbench {
                         .border_color(cx.theme().border.opacity(0.72))
                         .when_some(disclosure, |this, disclosure| this.child(disclosure))
                         .when(!has_disclosure, |this| this.child(div().flex_1()))
-                        .child(
-                            h_flex()
-                                .items_center()
-                                .gap_2()
-                                .child(undo_button)
-                                .child(review_button),
-                        ),
+                        .child(h_flex().items_center().gap_2().child(review_button)),
                 )
                 .into_any_element(),
         )
@@ -31103,160 +31047,6 @@ impl VibexWorkbench {
         if review_ready {
             self.reveal_code_preview(cx);
         }
-    }
-
-    fn confirm_undo_turn_file_changes(
-        &mut self,
-        turn_id: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(session) = self.selected_session().cloned() else {
-            return;
-        };
-        let Some(turn) = self
-            .conversation_turns_cached()
-            .last()
-            .filter(|turn| turn.id == turn_id && turn.complete)
-            .cloned()
-        else {
-            return;
-        };
-        let summary = self.agent_turn_file_changes_cached(&turn);
-        if !turn_file_changes_undo_available(true, turn.complete, &summary) {
-            return;
-        }
-        let Some(paths) = summary.actionable_paths() else {
-            return;
-        };
-        let action_key = turn_changes_action_key(&session.id, &turn_id);
-        if self.turn_changes_undo_task.is_some()
-            || self.turn_changes_undo_statuses.contains_key(&action_key)
-        {
-            return;
-        }
-        let count = paths.len();
-        let description = match self.resolved_locale() {
-            locale::ResolvedLocale::ZhCn => format!(
-                "这会丢弃这 {count} 个文件中的所有未提交变更，包括本轮之后所做的编辑。此操作无法恢复。"
-            ),
-            locale::ResolvedLocale::ZhTw => format!(
-                "這會捨棄這 {count} 個檔案中的所有未提交變更，包括本輪之後所做的編輯。此操作無法還原。"
-            ),
-            locale::ResolvedLocale::En => format!(
-                "This discards all uncommitted changes in these {count} files, including edits made after this turn. This cannot be undone."
-            ),
-        };
-        let entity = cx.weak_entity();
-        let session_id = session.id.clone();
-        let workspace_id = session.workspace_id.clone();
-        window.open_dialog(cx, move |dialog, _, _| {
-            let entity = entity.clone();
-            let session_id = session_id.clone();
-            let workspace_id = workspace_id.clone();
-            let action_key = action_key.clone();
-            let paths = paths.clone();
-            dialog
-                .title(locale::text(
-                    "Undo changes from this turn?",
-                    "撤销本轮变更？",
-                    "復原本輪變更？",
-                ))
-                .child(div().text_sm().child(description.clone()))
-                .footer(
-                    DialogFooter::new()
-                        .child(
-                            DialogClose::new().child(
-                                Button::new("cancel-undo-turn-file-changes")
-                                    .outline()
-                                    .label(locale::text("Cancel", "取消", "取消")),
-                            ),
-                        )
-                        .child(
-                            DialogAction::new().child(
-                                Button::new("confirm-undo-turn-file-changes")
-                                    .danger()
-                                    .label(locale::text("Undo changes", "撤销变更", "復原變更")),
-                            ),
-                        ),
-                )
-                .on_ok(move |_, _, cx| {
-                    let _ = entity.update(cx, |this, cx| {
-                        this.undo_turn_file_changes(
-                            session_id.clone(),
-                            workspace_id.clone(),
-                            action_key.clone(),
-                            paths.clone(),
-                            cx,
-                        )
-                    });
-                    true
-                })
-        });
-    }
-
-    fn undo_turn_file_changes(
-        &mut self,
-        session_id: VibexSessionId,
-        workspace_id: vibex_core::WorkspaceId,
-        action_key: String,
-        paths: Vec<String>,
-        cx: &mut Context<Self>,
-    ) {
-        if self.turn_changes_undo_task.is_some()
-            || self.selected_session_id.as_ref() != Some(&session_id)
-        {
-            return;
-        }
-        let Some(runtime) = self.runtime.clone() else {
-            return;
-        };
-        let generation = self.session_generation;
-        self.agent_error = None;
-        self.turn_changes_undo_statuses
-            .insert(action_key.clone(), TurnChangesUndoStatus::Pending);
-        let request = GitStageRequest {
-            workspace_id,
-            paths,
-        };
-        let runner = gpui_tokio::Tokio::spawn(cx, async move { runtime.git().revert(&request) });
-        self.turn_changes_undo_task = Some(cx.spawn(
-            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let outcome = runner.await;
-                let _ = entity.update(cx, |this, cx| {
-                    this.turn_changes_undo_task = None;
-                    let active = this.session_generation == generation
-                        && this.selected_session_id.as_ref() == Some(&session_id);
-                    match outcome {
-                        Ok(Ok(_)) => {
-                            this.turn_changes_undo_statuses
-                                .insert(action_key.clone(), TurnChangesUndoStatus::Completed);
-                            if active {
-                                this.code_workbench
-                                    .update(cx, |workbench, cx| workbench.refresh_git(cx));
-                                this.refresh_workspace_contexts(cx);
-                            }
-                        }
-                        Ok(Err(error)) => {
-                            this.turn_changes_undo_statuses.remove(&action_key);
-                            if active {
-                                this.agent_error =
-                                    Some(format!("{}: {}", error.code, error.message));
-                            }
-                        }
-                        Err(error) => {
-                            this.turn_changes_undo_statuses.remove(&action_key);
-                            if active {
-                                this.agent_error =
-                                    Some(format!("turn changes undo failed: {error}"));
-                            }
-                        }
-                    }
-                    cx.notify();
-                });
-            },
-        ));
-        cx.notify();
     }
 
     fn timeline_turn_execution_attribution(
@@ -38080,16 +37870,6 @@ impl TurnFileChangesSummary {
                     .sum::<usize>(),
             )
     }
-
-    fn actionable_paths(&self) -> Option<Vec<String>> {
-        if self.files.is_empty() {
-            return None;
-        }
-        self.files
-            .iter()
-            .map(|file| file.actionable_path.clone())
-            .collect()
-    }
 }
 
 #[derive(Debug)]
@@ -38248,18 +38028,6 @@ fn apply_git_status_to_turn_file_changes(
         file.review_path = Some(change.path.clone());
         file.review_staged = change.staged && !change.unstaged;
     }
-}
-
-fn turn_file_changes_undo_available(
-    is_latest_turn: bool,
-    turn_complete: bool,
-    summary: &TurnFileChangesSummary,
-) -> bool {
-    is_latest_turn && turn_complete && summary.actionable_paths().is_some()
-}
-
-fn turn_changes_action_key(session_id: &VibexSessionId, turn_id: &str) -> String {
-    format!("{}:{turn_id}", session_id.as_str())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58566,7 +58334,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_file_changes_reject_unsafe_undo_paths() {
+    fn turn_file_changes_keep_external_paths_non_reviewable() {
         let (items, turn) = completed_turn_with_file_operations(vec![
             FileOperationPayload {
                 operation: FileOperationKind::Edit,
@@ -58595,8 +58363,7 @@ mod tests {
             Some("src/app.rs")
         );
         assert_eq!(summary.files[1].actionable_path, None);
-        assert!(!turn_file_changes_undo_available(true, true, &summary));
-        assert!(!turn_file_changes_undo_available(false, true, &summary));
+        assert_eq!(summary.files[1].review_path, None);
     }
 
     #[test]
@@ -58639,8 +58406,6 @@ mod tests {
         assert_eq!(summary.files[0].added_lines, 7);
         assert_eq!(summary.files[0].removed_lines, 3);
         assert!(summary.files[0].review_staged);
-        assert!(turn_file_changes_undo_available(true, true, &summary));
-        assert!(!turn_file_changes_undo_available(false, true, &summary));
     }
 
     #[test]
