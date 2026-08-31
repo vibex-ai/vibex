@@ -358,7 +358,9 @@ const RUNTIME_MENU_VIEWPORT_MARGIN: f32 = 12.0;
 const RUNTIME_MENU_TRIGGER_GAP: f32 = 4.0;
 const COMPOSER_RUNTIME_CHOICE_ROW_HEIGHT: f32 = 36.0;
 const COMPOSER_RUNTIME_AGENT_MENU_CHROME_HEIGHT: f32 = 94.0;
-const COMPOSER_RUNTIME_PROFILE_MENU_CHROME_HEIGHT: f32 = 53.0;
+// Search row (34 + 4 margin), footer (1 border + 8 padding + 24 button), and
+// 12 panel padding must all stay visible above the scroll body.
+const COMPOSER_RUNTIME_PROFILE_MENU_CHROME_HEIGHT: f32 = 83.0;
 const COMPOSER_RUNTIME_MODEL_MENU_CHROME_HEIGHT: f32 = 55.0;
 const COMPOSER_RUNTIME_AGENT_PROFILE_ROW_HEIGHT: f32 = 40.0;
 const COMPOSER_RUNTIME_MODEL_ROW_HEIGHT: f32 = 48.0;
@@ -54626,7 +54628,7 @@ mod tests {
         );
         assert_eq!(
             composer_runtime_menu_height(ComposerRuntimeMenuView::AuthSource, 0, 448.0),
-            93.0
+            123.0
         );
         assert_eq!(
             composer_runtime_menu_height(ComposerRuntimeMenuView::Model, 0, 448.0),
@@ -54638,7 +54640,7 @@ mod tests {
         );
         assert_eq!(
             composer_runtime_menu_height(ComposerRuntimeMenuView::AuthSource, 2, 448.0),
-            133.0
+            163.0
         );
         assert_eq!(
             composer_runtime_menu_height(ComposerRuntimeMenuView::Model, 1, 448.0),
