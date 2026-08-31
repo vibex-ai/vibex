@@ -157,7 +157,7 @@ mod tests {
         assert_eq!(TOKEN_SCHEMA_VERSION, "vibex-design-tokens.v1");
         assert_eq!(TOKEN_PRODUCT_VISUAL_SOURCE, "apps/desktop");
         assert_eq!(TOKEN_SOURCE_PATH, "crates/vibex-ui/theme/tokens.json");
-        assert_eq!(GPUI_REVISION, "e8dc516cb25aecf6f3a4732d12cf533527b47219");
+        assert_eq!(GPUI_REVISION, "7b7bad0fbcea1ec312db104af451b7bb31146e96");
         assert_eq!(
             GPUI_COMPONENT_REVISION,
             "031555662e99a1b5a549990b47f246d475b8288a"
