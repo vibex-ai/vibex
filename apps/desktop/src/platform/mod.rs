@@ -17,6 +17,7 @@ pub struct StorageUsage {
     pub terminal_bytes: u64,
     pub attachment_bytes: u64,
     pub diagnostic_bytes: u64,
+    pub agent_installation_bytes: u64,
     pub other_bytes: u64,
 }
 
@@ -27,6 +28,7 @@ impl StorageUsage {
             .saturating_add(self.terminal_bytes)
             .saturating_add(self.attachment_bytes)
             .saturating_add(self.diagnostic_bytes)
+            .saturating_add(self.agent_installation_bytes)
             .saturating_add(self.other_bytes)
     }
 }
@@ -102,6 +104,10 @@ fn collect_storage_usage(root: &Path, path: &Path, usage: &mut StorageUsage) -> 
             StorageBucket::Diagnostic => {
                 usage.diagnostic_bytes = usage.diagnostic_bytes.saturating_add(bytes)
             }
+            StorageBucket::AgentInstallation => {
+                usage.agent_installation_bytes =
+                    usage.agent_installation_bytes.saturating_add(bytes)
+            }
             StorageBucket::Terminal => {
                 usage.terminal_bytes = usage.terminal_bytes.saturating_add(bytes)
             }
@@ -121,6 +127,7 @@ enum StorageBucket {
     Terminal,
     Attachment,
     Diagnostic,
+    AgentInstallation,
     Other,
 }
 
@@ -130,6 +137,8 @@ fn storage_bucket(relative_path: &str) -> StorageBucket {
         || relative_path.ends_with("vibex.db-shm")
     {
         StorageBucket::Database
+    } else if relative_path == "acp-agents" || relative_path.starts_with("acp-agents/") {
+        StorageBucket::AgentInstallation
     } else if relative_path.contains("attachment") || relative_path.contains("upload") {
         StorageBucket::Attachment
     } else if relative_path.contains("diagnostic")
@@ -916,6 +925,10 @@ mod tests {
     fn storage_bucket_prefers_specific_runtime_artifacts() {
         assert_eq!(storage_bucket("vibex.db-wal"), StorageBucket::Database);
         assert_eq!(
+            storage_bucket("acp-agents/agents/codex/node_modules/index.js"),
+            StorageBucket::AgentInstallation
+        );
+        assert_eq!(
             storage_bucket("clipboard-attachments/image.bin"),
             StorageBucket::Attachment
         );
@@ -929,6 +942,15 @@ mod tests {
         );
         assert_eq!(storage_bucket("sessions/item.json"), StorageBucket::Session);
         assert_eq!(storage_bucket("misc.bin"), StorageBucket::Other);
+    }
+
+    #[test]
+    fn storage_usage_total_includes_agent_installations() {
+        let usage = StorageUsage {
+            agent_installation_bytes: 7,
+            ..StorageUsage::default()
+        };
+        assert_eq!(usage.total_bytes(), 7);
     }
 
     #[cfg(target_os = "linux")]

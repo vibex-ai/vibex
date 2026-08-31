@@ -14,6 +14,7 @@ pub mod network_proxy;
 mod relay;
 mod remote_connectivity;
 mod sidebar_organization;
+mod storage;
 mod usage;
 mod workbench;
 mod worktree;
@@ -106,6 +107,7 @@ pub use remote_connectivity::{
     normalize_https_origin, parse_tailscale_inspection,
 };
 pub use sidebar_organization::{SidebarOrganizationBridge, SidebarOrganizationRequest};
+pub use storage::{StorageCleanupKind, StorageCleanupReport};
 pub use usage::AgentUsageService;
 pub use worktree::{WorktreeCoordinator, WorktreeCreateContext};
 
@@ -2014,6 +2016,14 @@ impl DesktopRuntime {
             remote: self.remote.clone(),
             relay: self.relay.clone(),
         }
+    }
+
+    pub async fn clear_storage(
+        &self,
+        kind: StorageCleanupKind,
+    ) -> VibexResult<StorageCleanupReport> {
+        self.ensure_accepting_actions()?;
+        storage::clear_storage(self, kind).await
     }
 
     pub fn polling_policy(&self) -> DesktopPollingPolicy {

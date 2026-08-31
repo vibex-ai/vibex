@@ -8713,9 +8713,29 @@ impl AdapterDiagnosticsRepository {
         ))?;
         Ok(())
     }
+
+    pub fn delete_all(conn: &Connection) -> VibexResult<u64> {
+        let deleted = conn
+            .execute("DELETE FROM adapter_diagnostics", [])
+            .map_err(storage_err(
+                "adapter_diagnostics_delete_failed",
+                "failed to clear adapter diagnostics",
+            ))?;
+        Ok(deleted as u64)
+    }
 }
 
 impl TerminalSessionRepository {
+    pub fn delete_all(conn: &Connection) -> VibexResult<u64> {
+        let deleted = conn
+            .execute("DELETE FROM terminal_sessions", [])
+            .map_err(storage_err(
+                "terminal_sessions_delete_failed",
+                "failed to clear terminal sessions",
+            ))?;
+        Ok(deleted as u64)
+    }
+
     pub fn upsert(conn: &Connection, session: &TerminalSession) -> VibexResult<()> {
         conn.execute(
             "
@@ -13302,7 +13322,7 @@ mod tests {
         ScheduledTaskRunStatus, ScheduledTaskRunTrigger, ScheduledTaskSchedule,
         SendAgentMessageRequest, SessionRuntimeConfigState, SessionRuntimeSelection,
         SkillCreateRequest, SkillProviderMatrix, SkillScopeKind, SkillSourceKind, SkillStatus,
-        SystemNoticeLevel, SystemNoticePayload, TerminalStatus, TransportKind,
+        SystemNoticeLevel, SystemNoticePayload, TerminalId, TerminalStatus, TransportKind,
         TurnExecutionAttribution, UserMessagePayload,
     };
     use vibex_core::{
@@ -17887,6 +17907,64 @@ mod tests {
         assert_eq!(terminals, vec![terminal]);
         let recent = RecentFileRepository::list(&conn, &workspace.id, 10).unwrap();
         assert_eq!(recent, vec!["src/main.rs".to_string()]);
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn storage_cleanup_repositories_delete_all_rows() {
+        let temp = temp_db_path("storage-cleanup-repositories");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let (_project, workspace) = WorkspaceRepository::ensure(
+            &conn,
+            "/tmp/vibex-storage-cleanup-repositories",
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let now = unix_timestamp_ms();
+        conn.execute(
+            "INSERT INTO adapter_diagnostics (
+                session_id, provider_kind, level, code, message,
+                redacted_details_json, timestamp_ms
+             ) VALUES (NULL, 'codex', 'info', 'cleanup-test', 'diagnostic', '[]', ?1)",
+            params![now],
+        )
+        .unwrap();
+        TerminalSessionRepository::upsert(
+            &conn,
+            &TerminalSession {
+                id: TerminalId::new(),
+                workspace_id: workspace.id,
+                title: "cleanup".to_string(),
+                shell: "/bin/sh".to_string(),
+                cwd: "/tmp".to_string(),
+                rows: 24,
+                cols: 80,
+                status: TerminalStatus::Exited,
+                created_at_ms: now,
+                updated_at_ms: now,
+                closed_at_ms: Some(now),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(AdapterDiagnosticsRepository::delete_all(&conn).unwrap(), 1);
+        assert_eq!(TerminalSessionRepository::delete_all(&conn).unwrap(), 1);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM adapter_diagnostics", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM terminal_sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
 
         cleanup_db(temp);
     }

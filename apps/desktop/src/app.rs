@@ -124,7 +124,7 @@ use vibex_desktop_model::{
 use vibex_desktop_runtime::{
     DesktopEvent, DesktopRuntime, DesktopRuntimeConfig, DesktopRuntimeFacade, PREVIEW_APP_ID,
     ProviderConfigChangePhase, RC_APP_ID, STABLE_DESKTOP_APP_ID, SidebarOrganizationRequest,
-    validate_external_open_url,
+    StorageCleanupKind, StorageCleanupReport, validate_external_open_url,
 };
 use vibex_markdown::{
     Block, BlockNode, Inline, InlineNode, MarkdownDocument, MarkdownInput, MarkdownLimits,
@@ -43712,6 +43712,89 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn storage_cleanup_dialog(kind: StorageCleanupKind) -> (&'static str, &'static str) {
+    match kind {
+        StorageCleanupKind::SessionsAndAttachments => (
+            locale::text(
+                "Clear sessions and attachments?",
+                "清理会话与附件？",
+                "清理會話與附件？",
+            ),
+            locale::text(
+                "This removes all local session history and uploaded or edited attachment files. It cannot be undone.",
+                "这会删除所有本地会话历史以及已上传或编辑的附件文件，且无法撤销。",
+                "這會刪除所有本機會話記錄以及已上傳或編輯的附件檔案，且無法復原。",
+            ),
+        ),
+        StorageCleanupKind::Terminals => (
+            locale::text("Clear terminal data?", "清理终端数据？", "清理終端機資料？"),
+            locale::text(
+                "This stops active terminals and removes their local history. It cannot be undone.",
+                "这会停止活动终端并删除本地终端记录，且无法撤销。",
+                "這會停止作用中的終端機並刪除本機終端機記錄，且無法復原。",
+            ),
+        ),
+        StorageCleanupKind::Diagnostics => (
+            locale::text("Clear diagnostic data?", "清理诊断数据？", "清理診斷資料？"),
+            locale::text(
+                "This removes diagnostic records, exported diagnostics and local backups. It cannot be undone.",
+                "这会删除诊断记录、导出的诊断文件和本地备份，且无法撤销。",
+                "這會刪除診斷記錄、匯出的診斷檔案與本機備份，且無法復原。",
+            ),
+        ),
+    }
+}
+
+fn storage_cleanup_success(kind: StorageCleanupKind, report: StorageCleanupReport) -> String {
+    let detail = match kind {
+        StorageCleanupKind::SessionsAndAttachments => format!(
+            "{} {} · {} {}",
+            report.removed_records,
+            locale::text("sessions", "个会话", "個會話"),
+            report.removed_files,
+            locale::text("files", "个文件", "個檔案"),
+        ),
+        StorageCleanupKind::Terminals => format!(
+            "{} {}",
+            report.removed_records,
+            locale::text("terminals", "个终端", "個終端機"),
+        ),
+        StorageCleanupKind::Diagnostics => format!(
+            "{} {} · {} {}",
+            report.removed_records,
+            locale::text("records", "条记录", "筆記錄"),
+            report.removed_files,
+            locale::text("files", "个文件", "個檔案"),
+        ),
+    };
+    format!(
+        "{} · {detail}",
+        match kind {
+            StorageCleanupKind::SessionsAndAttachments => {
+                locale::text(
+                    "Sessions and attachments cleared",
+                    "会话与附件已清理",
+                    "會話與附件已清理",
+                )
+            }
+            StorageCleanupKind::Terminals => {
+                locale::text(
+                    "Terminal data cleared",
+                    "终端数据已清理",
+                    "終端機資料已清理",
+                )
+            }
+            StorageCleanupKind::Diagnostics => {
+                locale::text(
+                    "Diagnostic data cleared",
+                    "诊断数据已清理",
+                    "診斷資料已清理",
+                )
+            }
+        }
+    )
+}
+
 #[derive(Clone)]
 struct LocaleChoice {
     label: SharedString,
@@ -43818,6 +43901,7 @@ struct FoundationSettings {
     settings_render_context: SettingsRenderContext,
     storage_usage_state: SettingsStorageUsageState,
     storage_usage_task: Option<Task<()>>,
+    storage_cleanup_task: Option<Task<()>>,
     operation_note: Option<String>,
     active_section: SettingsSection,
 }
@@ -44019,6 +44103,7 @@ impl FoundationSettings {
                 settings_render_context,
                 storage_usage_state: SettingsStorageUsageState::Unloaded,
                 storage_usage_task: None,
+                storage_cleanup_task: None,
                 operation_note: None,
                 active_section: SettingsSection::General,
             }
@@ -44068,6 +44153,123 @@ impl FoundationSettings {
                 this.storage_usage_state = usage
                     .map(SettingsStorageUsageState::Ready)
                     .unwrap_or(SettingsStorageUsageState::Unavailable);
+                cx.notify();
+            });
+        }));
+    }
+
+    fn confirm_storage_cleanup(
+        &mut self,
+        kind: StorageCleanupKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.storage_cleanup_task.is_some() {
+            return;
+        }
+        let (title, description) = storage_cleanup_dialog(kind);
+        let entity = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let entity = entity.clone();
+            dialog
+                .title(title)
+                .child(description)
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            DialogClose::new().child(
+                                Button::new("cancel-storage-cleanup")
+                                    .outline()
+                                    .label(locale::text("Cancel", "取消", "取消")),
+                            ),
+                        )
+                        .child(
+                            DialogAction::new().child(
+                                Button::new("confirm-storage-cleanup")
+                                    .danger()
+                                    .label(locale::text("Clear", "清理", "清理")),
+                            ),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = entity.update(cx, |this, cx| this.clear_storage_data(kind, cx));
+                    true
+                })
+        });
+    }
+
+    fn clear_storage_data(&mut self, kind: StorageCleanupKind, cx: &mut Context<Self>) {
+        if self.storage_cleanup_task.is_some() {
+            return;
+        }
+        let Some(runtime) = self
+            .workbench
+            .read_with(cx, |this, _| this.runtime.clone())
+            .ok()
+            .flatten()
+        else {
+            self.operation_note = Some(
+                locale::text(
+                    "The local runtime is not ready.",
+                    "本地运行时尚未就绪。",
+                    "本機執行階段尚未就緒。",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        };
+
+        self.operation_note = None;
+        self.storage_usage_state = SettingsStorageUsageState::Loading;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move { runtime.clear_storage(kind).await });
+        self.storage_cleanup_task = Some(cx.spawn(async move |entity, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                this.storage_cleanup_task = None;
+                match outcome {
+                    Ok(Ok(report)) => {
+                        this.operation_note = Some(storage_cleanup_success(kind, report));
+                        this.storage_usage_state = SettingsStorageUsageState::Unloaded;
+                        this.start_storage_usage_probe(cx);
+                        let _ = this.workbench.update(cx, |workbench, cx| match kind {
+                            StorageCleanupKind::SessionsAndAttachments => {
+                                workbench.load_agent_overview(cx);
+                            }
+                            StorageCleanupKind::Terminals => {
+                                if let (Some(runtime), Some(session_id)) = (
+                                    workbench.runtime.clone(),
+                                    workbench.selected_session_id.clone(),
+                                ) {
+                                    let workspace_id = workbench
+                                        .sessions
+                                        .iter()
+                                        .find(|session| session.id == session_id)
+                                        .map(|session| session.workspace_id.clone());
+                                    let generation = workbench.session_generation;
+                                    workbench.load_agent_session_terminals(
+                                        runtime,
+                                        session_id,
+                                        workspace_id,
+                                        generation,
+                                        cx,
+                                    );
+                                }
+                            }
+                            StorageCleanupKind::Diagnostics => {}
+                        });
+                    }
+                    Ok(Err(error)) => {
+                        this.storage_usage_state = SettingsStorageUsageState::Unloaded;
+                        this.operation_note = Some(format!("{}: {}", error.code, error.message));
+                        this.start_storage_usage_probe(cx);
+                    }
+                    Err(error) => {
+                        this.storage_usage_state = SettingsStorageUsageState::Unloaded;
+                        this.operation_note = Some(format!("storage cleanup task failed: {error}"));
+                        this.start_storage_usage_probe(cx);
+                    }
+                }
                 cx.notify();
             });
         }));
@@ -46325,10 +46527,16 @@ impl FoundationSettings {
             self.storage_usage_state,
             SettingsStorageUsageState::Unloaded | SettingsStorageUsageState::Loading
         );
+        let cleanup_disabled = storage_pending
+            || self.storage_cleanup_task.is_some()
+            || matches!(
+                self.storage_usage_state,
+                SettingsStorageUsageState::Unavailable
+            );
         let storage_label = match self.storage_usage_state {
             SettingsStorageUsageState::Ready(usage) => {
                 format!(
-                    "{} {} · DB {} · {} {} · {} {} · {} {} · {} {}",
+                    "{} {} · DB {} · {} {} · {} {} · {} {} · {} {} · {} {}",
                     locale::text("Total", "总计", "總計"),
                     format_bytes(usage.total_bytes()),
                     format_bytes(usage.database_bytes),
@@ -46340,6 +46548,8 @@ impl FoundationSettings {
                     format_bytes(usage.attachment_bytes),
                     locale::text("Diagnostics", "诊断", "診斷"),
                     format_bytes(usage.diagnostic_bytes),
+                    locale::text("Agent installations", "Agent 安装", "Agent 安裝"),
+                    format_bytes(usage.agent_installation_bytes),
                 )
             }
             SettingsStorageUsageState::Unavailable => {
@@ -46371,6 +46581,74 @@ impl FoundationSettings {
                         "資料庫、會話、終端機記錄、附件與診斷檔案。",
                     ),
                     storage_control,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Sessions and attachments", "会话与附件", "會話與附件"),
+                    locale::text(
+                        "Remove local session history and uploaded or edited attachment files.",
+                        "删除本地会话历史以及已上传或编辑的附件文件。",
+                        "刪除本機會話記錄以及已上傳或編輯的附件檔案。",
+                    ),
+                    Button::new("clear-sessions-and-attachments")
+                        .small()
+                        .outline()
+                        .danger()
+                        .icon(Icon::default().path("icons/vibex/trash-2.svg"))
+                        .label(locale::text("Clear", "清理", "清理"))
+                        .disabled(cleanup_disabled)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.confirm_storage_cleanup(
+                                StorageCleanupKind::SessionsAndAttachments,
+                                window,
+                                cx,
+                            )
+                        })),
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Terminal data", "终端数据", "終端機資料"),
+                    locale::text(
+                        "Stop active terminals and remove their local records.",
+                        "停止活动终端并删除本地终端记录。",
+                        "停止作用中的終端機並刪除本機終端機記錄。",
+                    ),
+                    Button::new("clear-terminal-data")
+                        .small()
+                        .outline()
+                        .danger()
+                        .icon(Icon::default().path("icons/vibex/trash-2.svg"))
+                        .label(locale::text("Clear", "清理", "清理"))
+                        .disabled(cleanup_disabled)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.confirm_storage_cleanup(StorageCleanupKind::Terminals, window, cx)
+                        })),
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Diagnostic data", "诊断数据", "診斷資料"),
+                    locale::text(
+                        "Remove diagnostic records, exported diagnostics and local backups.",
+                        "删除诊断记录、导出的诊断文件和本地备份。",
+                        "刪除診斷記錄、匯出的診斷檔案與本機備份。",
+                    ),
+                    Button::new("clear-diagnostic-data")
+                        .small()
+                        .outline()
+                        .danger()
+                        .icon(Icon::default().path("icons/vibex/trash-2.svg"))
+                        .label(locale::text("Clear", "清理", "清理"))
+                        .disabled(cleanup_disabled)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.confirm_storage_cleanup(
+                                StorageCleanupKind::Diagnostics,
+                                window,
+                                cx,
+                            )
+                        })),
                     stacked,
                     cx,
                 ),
@@ -56378,6 +56656,63 @@ mod tests {
         assert!(probe.contains("SettingsStorageUsageState::Loading"));
         assert!(probe.contains("SettingsStorageUsageState::Ready"));
         assert!(probe.contains("cx.notify()"));
+    }
+
+    #[test]
+    fn data_settings_displays_agent_installations_and_cleanup_controls() {
+        let source = include_str!("app.rs");
+        let data_page = source
+            .split_once("    fn render_data_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_about_page("))
+            .map(|(body, _)| body)
+            .expect("data settings page should remain inspectable");
+
+        assert!(data_page.contains("usage.agent_installation_bytes"));
+        assert!(data_page.contains("Agent installations"));
+        for (button_id, cleanup_kind) in [
+            (
+                "clear-sessions-and-attachments",
+                "StorageCleanupKind::SessionsAndAttachments",
+            ),
+            ("clear-terminal-data", "StorageCleanupKind::Terminals"),
+            ("clear-diagnostic-data", "StorageCleanupKind::Diagnostics"),
+        ] {
+            assert!(data_page.contains(&format!("Button::new(\"{button_id}\")")));
+            assert!(data_page.contains(cleanup_kind));
+        }
+        assert_eq!(data_page.matches(".disabled(cleanup_disabled)").count(), 3);
+    }
+
+    #[test]
+    fn data_settings_cleanup_requires_confirmation_and_refreshes_usage() {
+        let source = include_str!("app.rs");
+        let confirmation = source
+            .split_once("    fn confirm_storage_cleanup(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn clear_storage_data("))
+            .map(|(body, _)| body)
+            .expect("storage cleanup confirmation should remain inspectable");
+        assert!(confirmation.contains("window.open_dialog"));
+        assert!(confirmation.contains("DialogAction::new()"));
+        assert!(confirmation.contains(".on_ok("));
+        assert!(confirmation.contains("clear_storage_data(kind, cx)"));
+
+        let cleanup = source
+            .split_once("    fn clear_storage_data(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn preview_settings_search_selection("))
+            .map(|(body, _)| body)
+            .expect("storage cleanup action should remain inspectable");
+        assert!(cleanup.contains("gpui_tokio::Tokio::spawn"));
+        assert!(cleanup.contains("runtime.clear_storage(kind).await"));
+        assert!(cleanup.contains("this.storage_cleanup_task = None"));
+        assert!(cleanup.contains("this.start_storage_usage_probe(cx)"));
+        assert_eq!(
+            cleanup
+                .matches("this.start_storage_usage_probe(cx)")
+                .count(),
+            3
+        );
+        assert!(cleanup.contains("workbench.load_agent_overview(cx)"));
+        assert!(cleanup.contains("workbench.load_agent_session_terminals("));
     }
 
     #[test]
