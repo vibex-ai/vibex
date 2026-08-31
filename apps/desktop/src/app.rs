@@ -15172,7 +15172,7 @@ impl VibexWorkbench {
             let mut diagnostics = Vec::new();
             for preview in [codex, claude].into_iter().flatten() {
                 candidates.extend(preview.candidates.into_iter().filter(|candidate| {
-                    candidate.status != ExternalSessionImportCandidateStatus::Blocked
+                    external_session_candidate_is_importable(candidate.status)
                 }));
                 diagnostics.extend(preview.diagnostics);
             }
@@ -42250,6 +42250,10 @@ fn import_candidate_status_label(status: ExternalSessionImportCandidateStatus) -
     }
 }
 
+fn external_session_candidate_is_importable(status: ExternalSessionImportCandidateStatus) -> bool {
+    status == ExternalSessionImportCandidateStatus::Importable
+}
+
 pub struct ExternalImportDialog {
     runtime: Option<Arc<DesktopRuntime>>,
     workbench: WeakEntity<VibexWorkbench>,
@@ -42413,9 +42417,7 @@ impl ExternalImportDialog {
                 preview
                     .candidates
                     .iter()
-                    .filter(|candidate| {
-                        candidate.status != ExternalSessionImportCandidateStatus::Blocked
-                    })
+                    .filter(|candidate| external_session_candidate_is_importable(candidate.status))
                     .cloned()
                     .collect()
             })
@@ -42458,16 +42460,21 @@ impl ExternalImportDialog {
                         let _ = entity.update(cx, |this, cx| {
                             this.import_pending = false;
                             this.task = None;
-                            cx.notify();
-                        });
-                        let _ = workbench.update(cx, |workbench, cx| {
-                            workbench.selected_session_id =
+                            let selected_session_id =
                                 result.sessions.first().map(|session| session.id.clone());
-                            workbench.load_agent_overview(cx);
+                            let workbench = workbench.clone();
+                            cx.defer(move |cx| {
+                                let _ = workbench.update(cx, |workbench, cx| {
+                                    workbench.selected_session_id = selected_session_id;
+                                    workbench.external_import_view = None;
+                                    workbench.load_agent_overview(cx);
+                                    cx.notify();
+                                });
+                                let _ = window_handle.update(cx, |_, window, cx| {
+                                    window.close_dialog(cx);
+                                });
+                            });
                             cx.notify();
-                        });
-                        let _ = window_handle.update(cx, |_, window, cx| {
-                            window.close_dialog(cx);
                         });
                     }
                     Ok(Err(error)) => {
@@ -48243,6 +48250,29 @@ mod tests {
         SessionRuntimeOption, TimelineItemId, TimelineRedactionState, TimelineSource,
         TodoUpdatePayload, UserMessagePayload, WorkspaceId,
     };
+
+    #[test]
+    fn external_session_import_only_accepts_importable_candidates() {
+        assert!(external_session_candidate_is_importable(
+            ExternalSessionImportCandidateStatus::Importable
+        ));
+        assert!(!external_session_candidate_is_importable(
+            ExternalSessionImportCandidateStatus::Partial
+        ));
+        assert!(!external_session_candidate_is_importable(
+            ExternalSessionImportCandidateStatus::Blocked
+        ));
+
+        let source = include_str!("app.rs");
+        let import = source
+            .split_once("    fn import_candidates(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_candidate_card("))
+            .map(|(body, _)| body)
+            .expect("external import completion should remain inspectable");
+        assert!(import.contains("cx.defer(move |cx|"));
+        assert!(import.contains("workbench.external_import_view = None;"));
+        assert!(import.contains("window.close_dialog(cx);"));
+    }
 
     #[test]
     fn worktree_assistance_context_is_bounded_structured_and_keeps_finalization_with_the_user() {
