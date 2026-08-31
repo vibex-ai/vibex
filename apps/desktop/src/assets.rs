@@ -21,6 +21,46 @@ const INTER_LATIN_EXT: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../node_modules/.pnpm/@fontsource-variable+inter@5.2.8/node_modules/@fontsource-variable/inter/files/inter-latin-ext-wght-normal.woff2"
 ));
+const IBM_PLEX_SANS_REGULAR: &[u8] =
+    include_bytes!("../../../vendor/zed/assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
+const IBM_PLEX_SANS_ITALIC: &[u8] =
+    include_bytes!("../../../vendor/zed/assets/fonts/ibm-plex-sans/IBMPlexSans-Italic.ttf");
+const IBM_PLEX_SANS_SEMIBOLD: &[u8] =
+    include_bytes!("../../../vendor/zed/assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBold.ttf");
+const IBM_PLEX_SANS_SEMIBOLD_ITALIC: &[u8] =
+    include_bytes!("../../../vendor/zed/assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBoldItalic.ttf");
+const LILEX_REGULAR: &[u8] =
+    include_bytes!("../../../vendor/zed/assets/fonts/lilex/Lilex-Regular.ttf");
+const LILEX_ITALIC: &[u8] =
+    include_bytes!("../../../vendor/zed/assets/fonts/lilex/Lilex-Italic.ttf");
+const LILEX_BOLD: &[u8] = include_bytes!("../../../vendor/zed/assets/fonts/lilex/Lilex-Bold.ttf");
+const LILEX_BOLD_ITALIC: &[u8] =
+    include_bytes!("../../../vendor/zed/assets/fonts/lilex/Lilex-BoldItalic.ttf");
+const WQY_MICROHEI: &[u8] =
+    include_bytes!("../../mobile/assets/fonts/wqy-microhei/wqy-microhei.ttc");
+const BUNDLED_GPUI_FONT_ASSETS: &[(&str, &[u8])] = &[
+    (
+        "fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf",
+        IBM_PLEX_SANS_REGULAR,
+    ),
+    (
+        "fonts/ibm-plex-sans/IBMPlexSans-Italic.ttf",
+        IBM_PLEX_SANS_ITALIC,
+    ),
+    (
+        "fonts/ibm-plex-sans/IBMPlexSans-SemiBold.ttf",
+        IBM_PLEX_SANS_SEMIBOLD,
+    ),
+    (
+        "fonts/ibm-plex-sans/IBMPlexSans-SemiBoldItalic.ttf",
+        IBM_PLEX_SANS_SEMIBOLD_ITALIC,
+    ),
+    ("fonts/lilex/Lilex-Regular.ttf", LILEX_REGULAR),
+    ("fonts/lilex/Lilex-Italic.ttf", LILEX_ITALIC),
+    ("fonts/lilex/Lilex-Bold.ttf", LILEX_BOLD),
+    ("fonts/lilex/Lilex-BoldItalic.ttf", LILEX_BOLD_ITALIC),
+    ("fonts/wqy-microhei/wqy-microhei.ttc", WQY_MICROHEI),
+];
 const APP_ICON: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/app-icons/icon.png"
@@ -1812,8 +1852,9 @@ pub(crate) fn file_tree_asset_icon(path: &'static str, size: Pixels, color: Hsla
 
 impl AssetSource for VibexAssets {
     fn load(&self, path: &str) -> GpuiResult<Option<Cow<'static, [u8]>>> {
-        if let Some((_, bytes)) = VIBEX_ASSETS
+        if let Some((_, bytes)) = BUNDLED_GPUI_FONT_ASSETS
             .iter()
+            .chain(VIBEX_ASSETS.iter())
             .chain(PROJECT_LOGO_ASSETS.iter())
             .chain(FILE_INTEGRATION_ASSETS.iter())
             .chain(AGENT_BRAND_ASSETS.iter())
@@ -1828,8 +1869,9 @@ impl AssetSource for VibexAssets {
     fn list(&self, path: &str) -> GpuiResult<Vec<SharedString>> {
         let mut assets = ComponentAssets.list(path)?;
         assets.extend(
-            VIBEX_ASSETS
+            BUNDLED_GPUI_FONT_ASSETS
                 .iter()
+                .chain(VIBEX_ASSETS.iter())
                 .chain(PROJECT_LOGO_ASSETS.iter())
                 .chain(FILE_INTEGRATION_ASSETS.iter())
                 .chain(AGENT_BRAND_ASSETS.iter())
@@ -1855,12 +1897,26 @@ pub struct AssetLoadReport {
 }
 
 pub fn load_fonts(cx: &mut App) -> Result<AssetLoadReport, String> {
+    let mut fonts = vec![Cow::Borrowed(INTER_LATIN), Cow::Borrowed(INTER_LATIN_EXT)];
+    #[cfg(not(target_os = "linux"))]
+    fonts.extend(
+        [
+            IBM_PLEX_SANS_REGULAR,
+            IBM_PLEX_SANS_ITALIC,
+            IBM_PLEX_SANS_SEMIBOLD,
+            IBM_PLEX_SANS_SEMIBOLD_ITALIC,
+            LILEX_REGULAR,
+            LILEX_ITALIC,
+            LILEX_BOLD,
+            LILEX_BOLD_ITALIC,
+        ]
+        .into_iter()
+        .map(Cow::Borrowed),
+    );
+    fonts.push(Cow::Borrowed(WQY_MICROHEI));
     cx.text_system()
-        .add_fonts(vec![
-            Cow::Borrowed(INTER_LATIN),
-            Cow::Borrowed(INTER_LATIN_EXT),
-        ])
-        .map_err(|error| format!("failed to load bundled Inter Variable fonts: {error}"))?;
+        .add_fonts(fonts)
+        .map_err(|error| format!("failed to load bundled desktop fonts: {error}"))?;
     Ok(asset_report())
 }
 

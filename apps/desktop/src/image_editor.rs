@@ -361,7 +361,18 @@ fn editor_font_database() -> Arc<resvg::usvg::fontdb::Database> {
                 ))
                 .to_vec(),
             );
-            database.load_system_fonts();
+            database.load_font_data(
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../mobile/assets/fonts/wqy-microhei/wqy-microhei.ttc"
+                ))
+                .to_vec(),
+            );
+            database.set_sans_serif_family("IBM Plex Sans");
+            database.set_serif_family("IBM Plex Sans");
+            database.set_monospace_family("IBM Plex Sans");
+            database.set_cursive_family("IBM Plex Sans");
+            database.set_fantasy_family("IBM Plex Sans");
             Arc::new(database)
         })
         .clone()

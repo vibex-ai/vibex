@@ -5,6 +5,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(target_os = "linux")]
+use std::{borrow::Cow, collections::BTreeSet};
+
 use gpui::App;
 use vibex_core::{VibexError, VibexResult};
 
@@ -387,6 +390,141 @@ pub fn platform_font_fallbacks() -> &'static [&'static str] {
     }
 }
 
+/// Loads only the selected system font families into GPUI.
+///
+/// Linux GPUI starts with an empty font database so calling this function does
+/// not fall back to loading every font installed on the machine. Fontconfig
+/// resolves the requested family to its matching files, and those files alone
+/// are copied into the process.
+pub fn load_selected_font_families(cx: &mut App, families: &[&str]) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut paths = Vec::new();
+        let mut seen_paths = BTreeSet::new();
+        for family in families {
+            for path in system_font_paths(family) {
+                if seen_paths.insert(path.clone()) {
+                    paths.push(path);
+                }
+            }
+        }
+
+        if paths.is_empty() {
+            return Ok(());
+        }
+
+        let mut font_data = Vec::new();
+        let mut paths_to_mark = Vec::new();
+        for path in paths {
+            if cx
+                .try_global::<LoadedSystemFontPaths>()
+                .is_some_and(|loaded| loaded.0.contains(&path))
+            {
+                continue;
+            }
+            let data = fs::read(&path).map_err(|error| {
+                format!("failed to read system font {}: {error}", path.display())
+            })?;
+            font_data.push(Cow::Owned(data));
+            paths_to_mark.push(path);
+        }
+
+        if font_data.is_empty() {
+            return Ok(());
+        }
+
+        cx.text_system()
+            .add_fonts(font_data)
+            .map_err(|error| format!("failed to load selected system fonts: {error}"))?;
+        cx.default_global::<LoadedSystemFontPaths>()
+            .0
+            .extend(paths_to_mark);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (cx, families);
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct LoadedSystemFontPaths(BTreeSet<PathBuf>);
+
+#[cfg(target_os = "linux")]
+impl gpui::Global for LoadedSystemFontPaths {}
+
+#[cfg(target_os = "linux")]
+fn system_font_paths(family: &str) -> Vec<PathBuf> {
+    let family = family.trim();
+    if family.is_empty()
+        || family.len() > 160
+        || family.chars().any(char::is_control)
+        || is_bundled_font_family(family)
+        || is_generic_font_family(family)
+    {
+        return Vec::new();
+    }
+
+    let mut paths = BTreeSet::new();
+    for pattern in [
+        family.to_string(),
+        format!("{family}:weight=bold"),
+        format!("{family}:slant=italic"),
+        format!("{family}:weight=bold:slant=italic"),
+    ] {
+        if let Some(path) = fc_match_path(&pattern, family) {
+            paths.insert(path);
+        }
+    }
+
+    paths.into_iter().collect()
+}
+
+#[cfg(target_os = "linux")]
+fn fc_match_path(pattern: &str, requested_family: &str) -> Option<PathBuf> {
+    let output = Command::new("fc-match")
+        .args(["--format=%{family}\t%{file}\n", "--", pattern])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let line = String::from_utf8_lossy(&output.stdout);
+    let (matched_family, path) = line.lines().next()?.split_once('\t')?;
+    if !font_family_matches(requested_family, matched_family) {
+        return None;
+    }
+    let path = PathBuf::from(path.trim());
+    path.is_file().then_some(path)
+}
+
+#[cfg(target_os = "linux")]
+fn font_family_matches(requested: &str, matched: &str) -> bool {
+    matched
+        .split(',')
+        .any(|candidate| candidate.trim().eq_ignore_ascii_case(requested))
+}
+
+#[cfg(target_os = "linux")]
+fn is_generic_font_family(family: &str) -> bool {
+    matches!(
+        family.trim().to_ascii_lowercase().as_str(),
+        "sans-serif" | "serif" | "monospace" | "cursive" | "fantasy" | "system-ui"
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn is_bundled_font_family(family: &str) -> bool {
+    matches!(
+        family.trim().to_ascii_lowercase().as_str(),
+        "inter variable" | "ibm plex sans" | "lilex"
+    )
+}
+
 pub fn default_code_font_family() -> &'static str {
     #[cfg(target_os = "macos")]
     {
@@ -402,10 +540,14 @@ pub fn default_code_font_family() -> &'static str {
     }
 }
 
-pub fn system_font_families(cx: &App) -> Vec<String> {
+pub fn system_font_families(_cx: &App) -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    let discovered = discover_system_font_families();
+    #[cfg(not(target_os = "linux"))]
+    let discovered = _cx.text_system().all_font_names();
+
     normalize_font_families(
-        cx.text_system()
-            .all_font_names()
+        discovered
             .into_iter()
             .chain(
                 platform_font_fallbacks()
@@ -417,6 +559,30 @@ pub fn system_font_families(cx: &App) -> Vec<String> {
                 default_code_font_family().to_string(),
             ]),
     )
+}
+
+#[cfg(target_os = "linux")]
+fn discover_system_font_families() -> Vec<String> {
+    // This asks fontconfig for names only. The child process may inspect its
+    // own caches, but no font files are loaded into Vibex's address space until
+    // the user selects a family through `load_selected_font_families`.
+    let output = Command::new("fc-list")
+        .args(["--format=%{family}\n"])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .flat_map(|line| line.split(','))
+        .map(str::trim)
+        .filter(|family| !family.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -919,6 +1085,30 @@ mod tests {
             ]),
             vec!["inter variable".to_string(), "Noto Sans".to_string()]
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn font_family_matching_accepts_fontconfig_aliases_without_substring_matches() {
+        assert!(font_family_matches(
+            "JetBrains Mono",
+            "JetBrains Mono,JetBrains Mono Light"
+        ));
+        assert!(!font_family_matches("Mono", "JetBrains Mono"));
+        assert!(is_bundled_font_family("IBM Plex Sans"));
+        assert!(!is_bundled_font_family("JetBrains Mono"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn selected_font_lookup_ignores_missing_and_logical_families() {
+        assert!(system_font_paths("Vibex Missing Font 9f2c").is_empty());
+        assert!(system_font_paths("monospace").is_empty());
+        assert!(system_font_paths("sans-serif").is_empty());
+
+        let selected = system_font_paths("JetBrains Mono");
+        assert!(selected.len() <= 4);
+        assert!(selected.iter().all(|path| path.is_file()));
     }
 
     #[test]

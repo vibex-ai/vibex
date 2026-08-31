@@ -4349,6 +4349,18 @@ impl VibexWorkbench {
                 ui_state.network_proxy = NetworkProxyUiState::default();
             }
         }
+        let selected_font_families = [
+            ui_state.appearance.interface_font.family.as_deref(),
+            ui_state.appearance.code_font.family.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        if let Err(error) =
+            crate::platform::load_selected_font_families(cx, &selected_font_families)
+        {
+            eprintln!("vibex-fonts: {error}");
+        }
         theme::apply_appearance(&ui_state.appearance, Some(window), cx);
         Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
         let focus_handle = cx.focus_handle();
@@ -5501,6 +5513,18 @@ impl VibexWorkbench {
             .clone()
             .unwrap_or_else(|| crate::platform::default_code_font_family().to_string());
         let code_font_size = state.appearance.code_font.size;
+        let selected_font_families = [
+            state.appearance.interface_font.family.as_deref(),
+            state.appearance.code_font.family.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        if let Err(error) =
+            crate::platform::load_selected_font_families(cx, &selected_font_families)
+        {
+            eprintln!("vibex-fonts: {error}");
+        }
         self.ui_state = state;
         if let Some(config) = self.config.as_ref() {
             self.ui_state.desktop_behavior.launch_at_login =
@@ -20811,6 +20835,11 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(family) = family.as_deref()
+            && let Err(error) = crate::platform::load_selected_font_families(cx, &[family])
+        {
+            eprintln!("vibex-fonts: {error}");
+        }
         self.ui_state.appearance.interface_font.family = family;
         theme::apply_appearance(&self.ui_state.appearance, Some(window), cx);
         self.queue_ui_state();
@@ -20823,6 +20852,11 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(family) = family.as_deref()
+            && let Err(error) = crate::platform::load_selected_font_families(cx, &[family])
+        {
+            eprintln!("vibex-fonts: {error}");
+        }
         self.ui_state.appearance.code_font.family = family;
         let code_family = self
             .ui_state
