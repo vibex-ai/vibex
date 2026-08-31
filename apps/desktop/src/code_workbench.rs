@@ -2077,6 +2077,14 @@ impl CodeWorkbench {
                             this.load_git_status(cx);
                             this.load_worktree_lifecycle(cx);
                         }
+                        // The right-rail Git entry badge renders the current
+                        // branch sync (ahead) count, so branch data must stay
+                        // fresh even while the Git panel itself stays hidden.
+                        // The gate skips workspaces that never reported
+                        // branches (non-Git roots) and in-flight mutations.
+                        if this.git.branches.is_some() && this.git.pending_mutation.is_none() {
+                            this.load_branches(cx);
+                        }
                         true
                     })
                     .unwrap_or(false);
@@ -15110,6 +15118,9 @@ mod tests {
         assert!(polling.contains("if this.files_surface_visible"));
         assert!(polling.contains("if this.git_surface_visible"));
         assert!(polling.matches("HIDDEN_WORKSPACE_POLL_INTERVAL").count() >= 4);
+        assert!(polling.contains("this.git.branches.is_some()"));
+        assert!(polling.contains("this.git.pending_mutation.is_none()"));
+        assert!(polling.contains("this.load_branches(cx);"));
 
         let visibility = source
             .split_once("    pub(crate) fn set_workspace_surface_visibility(")
