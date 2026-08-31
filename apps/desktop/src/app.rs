@@ -4201,6 +4201,7 @@ pub struct VibexWorkbench {
     composer_runtime_search: Entity<InputState>,
     runtime_provider_scroll: ScrollHandle,
     runtime_provider_scroll_to_selection: bool,
+    runtime_provider_keyboard_selection: Option<SessionRuntimeSelection>,
     runtime_authentication_menu: Option<RuntimeAuthenticationMenuState>,
     composer_geometry: ComposerGeometry,
     runtime_choice_menu_open: Option<String>,
@@ -4513,12 +4514,24 @@ impl VibexWorkbench {
             cx.subscribe(&new_session_base_ref_search, |_, _, _: &InputEvent, cx| {
                 cx.notify()
             }),
-            cx.subscribe(&new_session_runtime_search, |_, _, _: &InputEvent, cx| {
-                cx.notify()
-            }),
-            cx.subscribe(&composer_runtime_search, |_, _, _: &InputEvent, cx| {
-                cx.notify()
-            }),
+            cx.subscribe(
+                &new_session_runtime_search,
+                |this, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        this.runtime_provider_keyboard_selection = None;
+                    }
+                    cx.notify()
+                },
+            ),
+            cx.subscribe(
+                &composer_runtime_search,
+                |this, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        this.runtime_provider_keyboard_selection = None;
+                    }
+                    cx.notify()
+                },
+            ),
             cx.subscribe_in(
                 &sidebar_rename_input,
                 window,
@@ -4913,6 +4926,7 @@ impl VibexWorkbench {
             composer_runtime_search,
             runtime_provider_scroll: ScrollHandle::new(),
             runtime_provider_scroll_to_selection: false,
+            runtime_provider_keyboard_selection: None,
             runtime_authentication_menu: None,
             composer_geometry: ComposerGeometry::default(),
             runtime_choice_menu_open: None,
@@ -16536,6 +16550,7 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) {
         self.new_session_agent_id = Some(selection.agent_id.clone());
+        self.runtime_provider_keyboard_selection = None;
         self.new_session_runtime_menu_open = false;
         self.runtime_choice_menu_open = None;
         self.new_session_runtime_menu_auth_source = None;
@@ -17300,6 +17315,7 @@ impl VibexWorkbench {
         if self.active_runtime_controls_pending() {
             return;
         }
+        self.runtime_provider_keyboard_selection = None;
         self.composer_runtime_menu_open = false;
         self.runtime_choice_menu_open = None;
         self.composer_runtime_menu_agent_id = None;
@@ -17310,6 +17326,7 @@ impl VibexWorkbench {
     fn set_composer_runtime_menu_open(&mut self, open: bool, cx: &mut Context<Self>) {
         let open = open && !self.active_runtime_controls_pending();
         self.composer_runtime_menu_open = open;
+        self.runtime_provider_keyboard_selection = None;
         if open {
             self.runtime_choice_menu_open = None;
             self.runtime_provider_scroll_to_selection = true;
@@ -17341,12 +17358,14 @@ impl VibexWorkbench {
         self.composer_runtime_menu_agent_id = agent_id;
         self.composer_runtime_menu_auth_source = auth_source;
         self.composer_runtime_menu_view = view;
+        self.runtime_provider_keyboard_selection = None;
         cx.notify();
     }
 
     fn set_new_session_runtime_menu_open(&mut self, open: bool, cx: &mut Context<Self>) {
         let open = open && !self.agent_action_pending && self.new_session_agent_id.is_some();
         self.new_session_runtime_menu_open = open;
+        self.runtime_provider_keyboard_selection = None;
         if open {
             self.runtime_choice_menu_open = None;
             self.runtime_provider_scroll_to_selection = true;
@@ -17378,10 +17397,12 @@ impl VibexWorkbench {
         };
         let open = open && !blocked;
         if open {
+            self.runtime_provider_keyboard_selection = None;
             self.new_session_runtime_menu_open = false;
             self.composer_runtime_menu_open = false;
             self.runtime_choice_menu_open = Some(menu_id);
         } else if self.runtime_choice_menu_open.as_deref() == Some(menu_id.as_str()) {
+            self.runtime_provider_keyboard_selection = None;
             self.runtime_choice_menu_open = None;
         }
         cx.notify();
@@ -25684,6 +25705,91 @@ impl VibexWorkbench {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn on_runtime_provider_model_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        agent_id: AgentId,
+        catalog: SessionRuntimeOptionCatalog,
+        selected: Option<SessionRuntimeSelection>,
+        preferred: Option<SessionRuntimeSelection>,
+        search: Entity<InputState>,
+        new_session: bool,
+    ) {
+        if !search.read(cx).focus_handle(cx).is_focused(window) {
+            return;
+        }
+        let choices = runtime_provider_model_choices_for_query(
+            &catalog,
+            &agent_id,
+            search.read(cx).value().as_ref(),
+            preferred.as_ref(),
+            &self.ui_state.composer.runtime_selections_by_model,
+        );
+        if choices.is_empty() {
+            return;
+        }
+
+        let matches_selection = |left: &SessionRuntimeSelection,
+                                 right: &SessionRuntimeSelection| {
+            runtime_selection_identity_matches(left, right)
+        };
+        let current_index = self
+            .runtime_provider_keyboard_selection
+            .as_ref()
+            .and_then(|selection| {
+                choices
+                    .iter()
+                    .position(|choice| matches_selection(&choice.selection, selection))
+            })
+            .or_else(|| {
+                selected.as_ref().and_then(|selection| {
+                    choices
+                        .iter()
+                        .position(|choice| matches_selection(&choice.selection, selection))
+                })
+            });
+
+        match event.keystroke.key.as_str() {
+            "up" | "down" => {
+                let delta = if event.keystroke.key == "up" { -1 } else { 1 };
+                let index = current_index.map_or_else(
+                    || {
+                        if delta < 0 { choices.len() - 1 } else { 0 }
+                    },
+                    |index| wrap_runtime_provider_model_selection(index, delta, choices.len()),
+                );
+                self.runtime_provider_keyboard_selection = Some(choices[index].selection.clone());
+                self.runtime_provider_scroll_to_selection = true;
+                search.update(cx, |input, cx| input.focus(window, cx));
+                cx.notify();
+                cx.stop_propagation();
+            }
+            "enter" => {
+                let selection = self
+                    .runtime_provider_keyboard_selection
+                    .clone()
+                    .or_else(|| {
+                        selected.filter(|selection| {
+                            choices
+                                .iter()
+                                .any(|choice| matches_selection(&choice.selection, selection))
+                        })
+                    })
+                    .unwrap_or_else(|| choices[current_index.unwrap_or(0)].selection.clone());
+                if new_session {
+                    self.choose_new_session_runtime(selection, window, cx);
+                } else {
+                    self.choose_runtime_selection(selection, cx);
+                }
+                cx.stop_propagation();
+            }
+            _ => {}
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn render_provider_model_groups(
         &mut self,
         agent_id: &AgentId,
@@ -25700,6 +25806,7 @@ impl VibexWorkbench {
         let remembered = &self.ui_state.composer.runtime_selections_by_model;
         let provider_scroll = self.runtime_provider_scroll.clone();
         let workbench = cx.weak_entity();
+        let keyboard_selection = self.runtime_provider_keyboard_selection.clone();
         let agent_identity = self
             .agent_snapshots
             .iter()
@@ -25821,8 +25928,13 @@ impl VibexWorkbench {
                         && choice.selection.auth_source == selected.auth_source
                         && choice.selection.model == selected.model
                 });
+                let keyboard_selected = keyboard_selection.as_ref().is_some_and(|selection| {
+                    runtime_selection_identity_matches(&choice.selection, selection)
+                });
+                let highlighted =
+                    keyboard_selected || (is_selected && keyboard_selection.is_none());
                 let selected_anchor =
-                    is_selected.then(|| ScrollAnchor::for_handle(provider_scroll.clone()));
+                    highlighted.then(|| ScrollAnchor::for_handle(provider_scroll.clone()));
                 let reveal_anchor = selected_anchor.clone();
                 let reveal_workbench = workbench.clone();
                 let selection = choice.selection;
@@ -25860,7 +25972,7 @@ impl VibexWorkbench {
                 .pl(px(28.0))
                 .pr_2()
                 .justify_start()
-                .selected(is_selected)
+                .selected(highlighted)
                 .rounded(gpui_component::button::ButtonRounded::Size(px(6.0)))
                 .child(
                     h_flex()
@@ -25972,20 +26084,43 @@ impl VibexWorkbench {
                             .border_1()
                             .border_color(cx.theme().border.opacity(0.70))
                             .bg(cx.theme().muted.opacity(0.45))
-                            .child(
-                                Input::new(&search)
-                                    .small()
-                                    .w_full()
-                                    .appearance(false)
-                                    .text_xs()
-                                    .prefix(
-                                        h_flex().h_full().items_center().child(
-                                            Icon::new(IconName::Search)
-                                                .small()
-                                                .text_color(cx.theme().muted_foreground),
-                                        ),
-                                    ),
-                            ),
+                            .child({
+                                let key_agent_id = agent_id.clone();
+                                let key_catalog = catalog.clone();
+                                let key_selected = selected.cloned();
+                                let key_preferred = preferred.cloned();
+                                let key_search = search.clone();
+                                div()
+                                    .capture_key_down(cx.listener(
+                                        move |this, event: &KeyDownEvent, window, cx| {
+                                            this.on_runtime_provider_model_key_down(
+                                                event,
+                                                window,
+                                                cx,
+                                                key_agent_id.clone(),
+                                                key_catalog.clone(),
+                                                key_selected.clone(),
+                                                key_preferred.clone(),
+                                                key_search.clone(),
+                                                new_session,
+                                            )
+                                        },
+                                    ))
+                                    .child(
+                                        Input::new(&search)
+                                            .small()
+                                            .w_full()
+                                            .appearance(false)
+                                            .text_xs()
+                                            .prefix(
+                                                h_flex().h_full().items_center().child(
+                                                    Icon::new(IconName::Search)
+                                                        .small()
+                                                        .text_color(cx.theme().muted_foreground),
+                                                ),
+                                            ),
+                                    )
+                            }),
                     ),
             )
             .child(
@@ -41170,6 +41305,57 @@ fn runtime_provider_model_menu_row_count(
         .sum()
 }
 
+fn runtime_provider_model_choices_for_query(
+    catalog: &SessionRuntimeOptionCatalog,
+    agent_id: &AgentId,
+    query: &str,
+    preferred: Option<&SessionRuntimeSelection>,
+    remembered: &[SessionRuntimeSelection],
+) -> Vec<RuntimeCascadeChoice> {
+    let query = normalized_session_search_query(query);
+    let mut sources = runtime_auth_sources_for_agent(catalog, agent_id);
+    sources.sort_by_key(|source| !matches!(source.kind, RuntimeAuthSourceKind::AgentAccount));
+
+    sources
+        .into_iter()
+        .filter_map(|source| {
+            let model_count = runtime_auth_source_model_count(catalog, agent_id, &source.source);
+            if source.kind == RuntimeAuthSourceKind::ProviderProfile && model_count == 0 {
+                return None;
+            }
+            let source_label = runtime_auth_source_display_label(&source);
+            let source_matches =
+                runtime_search_matches(&query, [source_label.as_str(), source.label.as_str()]);
+            let choices =
+                runtime_model_choices(catalog, agent_id, &source.source, preferred, remembered)
+                    .into_iter()
+                    .filter(|choice| {
+                        let model_identity = runtime_model_selection_label(&choice.selection.model);
+                        source_matches
+                            || runtime_search_matches(
+                                &query,
+                                [choice.label.as_str(), model_identity.as_str()],
+                            )
+                    })
+                    .collect::<Vec<_>>();
+            (!choices.is_empty()).then_some(choices)
+        })
+        .flatten()
+        .collect()
+}
+
+fn wrap_runtime_provider_model_selection(index: usize, delta: isize, count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    if delta < 0 {
+        let steps = delta.unsigned_abs() % count;
+        (index + count - steps) % count
+    } else {
+        index.saturating_add(delta as usize) % count
+    }
+}
+
 fn runtime_auth_source_status_label(
     source: &RuntimeAuthSourceSummary,
     model_count: usize,
@@ -51704,6 +51890,14 @@ mod tests {
             "",
             ["OpenAI Provider", "Claude Sonnet"]
         ));
+    }
+
+    #[test]
+    fn runtime_provider_model_selection_wraps_at_each_boundary() {
+        assert_eq!(wrap_runtime_provider_model_selection(0, -1, 3), 2);
+        assert_eq!(wrap_runtime_provider_model_selection(2, 1, 3), 0);
+        assert_eq!(wrap_runtime_provider_model_selection(1, -1, 3), 0);
+        assert_eq!(wrap_runtime_provider_model_selection(0, 1, 0), 0);
     }
 
     #[test]
