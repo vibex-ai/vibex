@@ -138,6 +138,11 @@ pub fn common_for(locale: Locale, en: &'static str) -> &'static str {
         "Agent access" => ("Agent 访问", "Agent 存取"),
         "Provider settings" => ("供应商设置", "供應商設定"),
         "Runtime options" => ("运行时选项", "執行環境選項"),
+        "Session timeline" => ("会话时间线", "工作階段時間線"),
+        "Agent generation status" => ("Agent 生成状态", "Agent 生成狀態"),
+        "Expand reasoning by default" => ("默认展开推理", "預設展開推理"),
+        "Command cards" => ("命令卡片", "命令卡片"),
+        "File edit cards" => ("文件编辑卡片", "檔案編輯卡片"),
         "About" => ("关于", "關於"),
         "Version" => ("版本", "版本"),
         "Usage details are available on the desktop host." => (

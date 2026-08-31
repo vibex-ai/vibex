@@ -11,8 +11,8 @@ use vibex_core::{
     AgentUsageStatistics, AgentUsageStatisticsRequest, CancelAgentSessionRuntimeSwitchRequest,
     ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest, FileMutationRequest,
     FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
-    FileTreeRequest, FileWriteRequest, GitCommitRequest, GitCommitResult, GitDiffRequest,
-    GitDiffResponse, GitProjectEligibility, GitStageRequest, GitStatusSummary,
+    FileTreeRequest, FileWriteRequest, ForkAgentSessionRequest, GitCommitRequest, GitCommitResult,
+    GitDiffRequest, GitDiffResponse, GitProjectEligibility, GitStageRequest, GitStatusSummary,
     GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
     GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeCreateRequest,
     GitWorktreeCreateResult, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
@@ -204,6 +204,33 @@ impl AgentBackend for NativeBackend {
             runtime
                 .agent()
                 .fetch_timeline(request)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn get_timeline_display_settings(
+        &self,
+    ) -> BackendFuture<'_, vibex_core::AgentTimelineDisplaySettings> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            Ok(runtime.timeline_display_settings())
+        })
+    }
+
+    fn fork_session(
+        &self,
+        request: MutationRequest<ForkAgentSessionRequest>,
+    ) -> BackendFuture<'_, AgentSession> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .manager()
+                .fork_session(request.payload)
                 .await
                 .map_err(Into::into)
         })

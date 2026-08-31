@@ -20,7 +20,7 @@ use vibex_core::{
     RemoteAgentAttachRuntimeResponse, RemoteAgentCancelRuntimeSwitchResponse,
     RemoteAgentCatchUpRequest, RemoteAgentCatchUpResponse, RemoteAgentContinueTurnResponse,
     RemoteAgentCreateSessionResponse, RemoteAgentDeepLinkResolveResponse,
-    RemoteAgentDetachRuntimeResponse, RemoteAgentInterruptResponse,
+    RemoteAgentDetachRuntimeResponse, RemoteAgentForkSessionResponse, RemoteAgentInterruptResponse,
     RemoteAgentMessageSubmissionResponse, RemoteAgentProjectionCapabilityResponse,
     RemoteAgentProjectionPreviewResponse, RemoteAgentRenameSessionResponse, RemoteAgentRequest,
     RemoteAgentResolveElicitationResponse, RemoteAgentResolvePermissionResponse,
@@ -31,10 +31,10 @@ use vibex_core::{
     RemoteAgentRuntimeSnapshotResponse, RemoteAgentSendMessageResponse,
     RemoteAgentSessionActionResponse, RemoteAgentSessionDetailResponse,
     RemoteAgentSessionListResponse, RemoteAgentSetDesiredRuntimeResponse,
-    RemoteAgentTimelineCursor, RemoteAgentTimelineFetchResponse, RemoteAuditAction,
-    RemoteAuditOutcome, RemoteAuditRecord, RemoteAuditTargetKind, RemoteAuthContext,
-    RemoteAuthProof, RemoteCapabilitySummary, RemoteClaimPairingCodeRequest,
-    RemoteClaimPairingCodeResponse, RemoteCreatePairingCodeRequest,
+    RemoteAgentTimelineCursor, RemoteAgentTimelineDisplaySettingsResponse,
+    RemoteAgentTimelineFetchResponse, RemoteAuditAction, RemoteAuditOutcome, RemoteAuditRecord,
+    RemoteAuditTargetKind, RemoteAuthContext, RemoteAuthProof, RemoteCapabilitySummary,
+    RemoteClaimPairingCodeRequest, RemoteClaimPairingCodeResponse, RemoteCreatePairingCodeRequest,
     RemoteCreatePairingCodeResponse, RemoteDeepLinkResolution, RemoteDeepLinkResolutionStatus,
     RemoteDeviceDetail, RemoteDevicePermissionLevel, RemoteDeviceStatus, RemoteFileDeleteResponse,
     RemoteFileReadResponse, RemoteFileRenameResponse, RemoteFileSearchResponse,
@@ -119,6 +119,7 @@ struct RemoteRouterState {
     config: RemoteServiceConfig,
     capabilities: RemoteCapabilitySummary,
     agent_manager: Option<Arc<AgentManager>>,
+    timeline_display_settings: Option<Arc<dyn RemoteAgentTimelineDisplaySettingsSource>>,
     runtime_selection: Option<Arc<RuntimeSelectionService>>,
     runtime_lifecycle: Option<Arc<RuntimeLifecycleService>>,
     message_submission: Option<Arc<MessageSubmissionCoordinator>>,
@@ -133,6 +134,13 @@ struct RemoteRouterState {
 #[async_trait]
 pub trait RemoteRuntimeOptionCatalogSource: Send + Sync {
     async fn list_runtime_options(&self) -> VibexResult<SessionRuntimeOptionCatalog>;
+}
+
+#[async_trait]
+pub trait RemoteAgentTimelineDisplaySettingsSource: Send + Sync {
+    async fn timeline_display_settings(
+        &self,
+    ) -> VibexResult<vibex_core::AgentTimelineDisplaySettings>;
 }
 
 /// The Desktop shell owns the sidebar tree, so the service does not read it
@@ -279,6 +287,7 @@ impl RemoteRouterState {
             config,
             capabilities: RemoteCapabilitySummary::foundation(),
             agent_manager: None,
+            timeline_display_settings: None,
             runtime_selection: None,
             runtime_lifecycle: None,
             message_submission: None,
@@ -296,6 +305,7 @@ impl RemoteRouterState {
             config,
             capabilities: RemoteCapabilitySummary::with_agent_sessions(),
             agent_manager: Some(agent_manager),
+            timeline_display_settings: None,
             runtime_selection: None,
             runtime_lifecycle: None,
             message_submission: None,
@@ -318,6 +328,7 @@ impl RemoteRouterState {
             config,
             capabilities: RemoteCapabilitySummary::with_agent_workbench_and_provider(),
             agent_manager: Some(agent_manager),
+            timeline_display_settings: None,
             runtime_selection: None,
             runtime_lifecycle: None,
             message_submission: None,
@@ -342,6 +353,7 @@ impl RemoteRouterState {
             config,
             capabilities: RemoteCapabilitySummary::with_agent_workbench_and_provider(),
             agent_manager: Some(agent_manager),
+            timeline_display_settings: None,
             runtime_selection: Some(runtime_selection),
             runtime_lifecycle: None,
             message_submission: Some(message_submission),
@@ -472,6 +484,18 @@ impl RemoteDispatcher {
         self.state.capabilities.supports_seamless_runtime_selection =
             self.state.runtime_selection.is_some();
         self
+    }
+
+    pub fn with_timeline_display_settings_source(
+        mut self,
+        source: Arc<dyn RemoteAgentTimelineDisplaySettingsSource>,
+    ) -> Self {
+        self.state.timeline_display_settings = Some(source);
+        self
+    }
+
+    pub fn supports_timeline_display_settings(&self) -> bool {
+        self.state.timeline_display_settings.is_some()
     }
 
     pub fn with_sidebar_organization_source(
@@ -1643,6 +1667,30 @@ async fn dispatch_agent_request(
             serde_json::to_value(RemoteAgentCreateSessionResponse { session })
                 .map_err(remote_payload_encode_error)
         }
+        RemoteAgentRequest::ForkSession(request) => {
+            let target_id = request.request.source_session_id.as_str().to_string();
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentSession,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = manager.fork_session(request.request).await;
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentSession,
+                target_id,
+                "Agent session fork",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let session = result?;
+            serde_json::to_value(RemoteAgentForkSessionResponse { session })
+                .map_err(remote_payload_encode_error)
+        }
         RemoteAgentRequest::RenameSession(request) => {
             let target_id = request.request.session_id.as_str().to_string();
             let auth = authorize_agent_action(
@@ -1725,6 +1773,20 @@ async fn dispatch_agent_request(
             )?;
             let page = manager.fetch_timeline(request.request).await?;
             serde_json::to_value(RemoteAgentTimelineFetchResponse { page })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::GetTimelineDisplaySettings(request) => {
+            authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::ReadAgentSession,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let settings = remote_timeline_display_settings(state)?
+                .timeline_display_settings()
+                .await?;
+            serde_json::to_value(RemoteAgentTimelineDisplaySettingsResponse { settings })
                 .map_err(remote_payload_encode_error)
         }
         RemoteAgentRequest::ResolveOpaqueLocator(request) => {
@@ -2356,6 +2418,17 @@ fn remote_runtime_catalog(
         VibexError::capability(
             "remote_agent_runtime_catalog_unavailable",
             "remote Agent runtime option catalog is not available on this service",
+        )
+    })
+}
+
+fn remote_timeline_display_settings(
+    state: &RemoteRouterState,
+) -> VibexResult<&Arc<dyn RemoteAgentTimelineDisplaySettingsSource>> {
+    state.timeline_display_settings.as_ref().ok_or_else(|| {
+        VibexError::capability(
+            "remote_agent_timeline_display_settings_unavailable",
+            "desktop timeline display settings are not available on this service",
         )
     })
 }
@@ -4956,6 +5029,7 @@ mod tests {
                 config: RemoteServiceConfig::loopback_disabled(),
                 capabilities,
                 agent_manager: Some(manager),
+                timeline_display_settings: None,
                 runtime_selection: None,
                 runtime_lifecycle: Some(lifecycle.clone()),
                 message_submission: None,

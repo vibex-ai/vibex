@@ -220,6 +220,56 @@ pub struct ForkAgentSessionRequest {
     pub expected_source_end_sequence: Option<i64>,
 }
 
+/// Shared session timeline presentation preferences.  The desktop remains the
+/// authority for the inherited values; mobile may persist a local override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTimelineReasoningDisplayMode {
+    LatestAtBottom,
+    Timeline,
+}
+
+impl Default for AgentTimelineReasoningDisplayMode {
+    fn default() -> Self {
+        Self::LatestAtBottom
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentTimelineDisplaySettings {
+    #[serde(default = "default_show_agent_generation_status")]
+    pub show_agent_generation_status: bool,
+    #[serde(default)]
+    pub reasoning_display_mode: AgentTimelineReasoningDisplayMode,
+    #[serde(default)]
+    pub reasoning_expanded_by_default: bool,
+    #[serde(default)]
+    pub enhanced_command_execution_display: bool,
+    #[serde(default = "default_enhanced_file_operation_display")]
+    pub enhanced_file_operation_display: bool,
+}
+
+impl Default for AgentTimelineDisplaySettings {
+    fn default() -> Self {
+        Self {
+            show_agent_generation_status: true,
+            reasoning_display_mode: AgentTimelineReasoningDisplayMode::LatestAtBottom,
+            reasoning_expanded_by_default: false,
+            enhanced_command_execution_display: false,
+            enhanced_file_operation_display: true,
+        }
+    }
+}
+
+const fn default_show_agent_generation_status() -> bool {
+    true
+}
+
+const fn default_enhanced_file_operation_display() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RenameAgentSessionRequest {

@@ -5,12 +5,13 @@ use vibex_core::{
     AgentAuthContextMutationResult, AgentAuthContextRefreshModelsRequest,
     AgentAuthContextVerifyRequest, AgentAuthenticationOperation, AgentAuthenticationOperationId,
     AgentId, AgentNotificationIntent, AgentSession, AgentSessionRuntimeSelectionEvent,
-    AgentSessionRuntimeSelectionState, AgentUsageStatistics, AgentUsageStatisticsRequest,
-    CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
-    FetchTimelineRequest, RemoteDeepLinkResolution, RenameAgentSessionRequest,
-    ResolveElicitationRequest, ResolvePermissionRequest, RuntimeSessionEvent,
-    SendAgentMessageRequest, SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest,
-    TimelineItem, TimelineLiveEvent, TimelinePage, VibexSessionId,
+    AgentSessionRuntimeSelectionState, AgentTimelineDisplaySettings, AgentUsageStatistics,
+    AgentUsageStatisticsRequest, CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest,
+    CreateAgentSessionRequest, FetchTimelineRequest, ForkAgentSessionRequest,
+    RemoteDeepLinkResolution, RenameAgentSessionRequest, ResolveElicitationRequest,
+    ResolvePermissionRequest, RuntimeSessionEvent, SendAgentMessageRequest,
+    SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, TimelineItem,
+    TimelineLiveEvent, TimelinePage, VibexSessionId,
 };
 
 use crate::{BackendBound, BackendFuture, BackendResult, MutationRequest};
@@ -76,6 +77,29 @@ pub trait AgentBackend: BackendBound {
     ) -> BackendFuture<'_, AgentSession>;
 
     fn fetch_timeline(&self, request: FetchTimelineRequest) -> BackendFuture<'_, TimelinePage>;
+
+    /// Reads the desktop-owned timeline presentation preferences. Mobile uses
+    /// this as the inherited base for its local overrides.
+    fn get_timeline_display_settings(&self) -> BackendFuture<'_, AgentTimelineDisplaySettings> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_timeline_display_settings_unavailable",
+                "Agent timeline display settings are unavailable on this backend",
+            ))
+        })
+    }
+
+    fn fork_session(
+        &self,
+        _request: MutationRequest<ForkAgentSessionRequest>,
+    ) -> BackendFuture<'_, AgentSession> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_session_fork_unavailable",
+                "Agent session forking is unavailable on this backend",
+            ))
+        })
+    }
 
     fn usage_statistics(
         &self,

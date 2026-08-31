@@ -4907,6 +4907,9 @@ fn gateway_features(state: &GatewayState) -> Vec<String> {
     {
         features.push("agent_account_auth".to_string());
     }
+    if state.dispatcher.supports_timeline_display_settings() {
+        features.push("agent_timeline_display_settings".to_string());
+    }
     if state
         .pairing_routes
         .lock()

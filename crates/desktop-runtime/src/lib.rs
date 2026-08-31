@@ -15,6 +15,7 @@ mod relay;
 mod remote_connectivity;
 mod sidebar_organization;
 mod storage;
+mod timeline_display_settings;
 mod usage;
 mod workbench;
 mod worktree;
@@ -48,10 +49,10 @@ use vibex_core::{
     AgentAuthContextMutationResult, AgentAuthContextRefreshModelsRequest,
     AgentAuthContextVerifyRequest, AgentAuthenticateRequest, AgentAuthenticateResult,
     AgentAuthenticationCancelRequest, AgentLogoutRequest, AgentRuntimeKind, AgentSession,
-    AgentTokenUsage, FetchTimelineRequest, OpenWorkspaceRequest, ProjectId, ProjectRecord,
-    ProviderProfileId, TerminalCreateRequest, TerminalId, TerminalSession,
-    TerminalSwitchShellRequest, TimelinePage, TimelinePayload, VibexError, VibexResult,
-    VibexSessionId, WorkspaceId, WorkspaceMode, WorkspaceRecord,
+    AgentTimelineDisplaySettings, AgentTokenUsage, FetchTimelineRequest, OpenWorkspaceRequest,
+    ProjectId, ProjectRecord, ProviderProfileId, TerminalCreateRequest, TerminalId,
+    TerminalSession, TerminalSwitchShellRequest, TimelinePage, TimelinePayload, VibexError,
+    VibexResult, VibexSessionId, WorkspaceId, WorkspaceMode, WorkspaceRecord,
 };
 use vibex_db::{
     TerminalSessionRepository, WorkspaceRepository, apply_migrations, default_database_path,
@@ -108,6 +109,7 @@ pub use remote_connectivity::{
 };
 pub use sidebar_organization::{SidebarOrganizationBridge, SidebarOrganizationRequest};
 pub use storage::{StorageCleanupKind, StorageCleanupReport};
+pub use timeline_display_settings::TimelineDisplaySettingsBridge;
 pub use usage::AgentUsageService;
 pub use worktree::{WorktreeCoordinator, WorktreeCreateContext};
 
@@ -892,6 +894,7 @@ pub struct DesktopRuntime {
     relay: RelayClientRuntime,
     usage: AgentUsageService,
     sidebar_organization: Arc<SidebarOrganizationBridge>,
+    timeline_display_settings: Arc<TimelineDisplaySettingsBridge>,
     polling: DesktopPollingPolicy,
     events: broadcast::Sender<DesktopEvent>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -1065,11 +1068,13 @@ impl DesktopRuntime {
                 .with_worktree_snapshot_source(Arc::new(git.clone())),
         );
         let sidebar_organization = SidebarOrganizationBridge::new();
+        let timeline_display_settings = TimelineDisplaySettingsBridge::new();
         let remote_dispatcher = remote_dispatcher
             .with_runtime_option_catalog_source(runtime_catalog.clone())
             .with_agent_auth_context_source(auth_contexts.clone())
             .with_agent_runtime_probe_source(Arc::new(providers.clone()))
-            .with_sidebar_organization_source(sidebar_organization.clone());
+            .with_sidebar_organization_source(sidebar_organization.clone())
+            .with_timeline_display_settings_source(timeline_display_settings.clone());
         let remote_gateway = RemoteGateway::new(
             config.remote_gateway.clone(),
             remote_dispatcher.clone(),
@@ -1159,6 +1164,7 @@ impl DesktopRuntime {
             relay,
             usage,
             sidebar_organization,
+            timeline_display_settings,
             polling: DesktopPollingPolicy::default(),
             events,
             tasks: Mutex::new(Vec::new()),
@@ -1825,6 +1831,19 @@ impl DesktopRuntime {
     /// from the state it is rendering.
     pub fn sidebar_organization_bridge(&self) -> Arc<SidebarOrganizationBridge> {
         self.sidebar_organization.clone()
+    }
+
+    /// Returns the live mirror consumed by the RemoteGateway.
+    pub fn timeline_display_settings_bridge(&self) -> Arc<TimelineDisplaySettingsBridge> {
+        self.timeline_display_settings.clone()
+    }
+
+    pub fn timeline_display_settings(&self) -> AgentTimelineDisplaySettings {
+        self.timeline_display_settings.get()
+    }
+
+    pub fn set_timeline_display_settings(&self, settings: AgentTimelineDisplaySettings) {
+        self.timeline_display_settings.set(settings);
     }
 
     pub fn app_update(&self) -> AppUpdateService {

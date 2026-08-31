@@ -4,10 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::agent::{
-    AgentSession, AgentSessionSummary, ContinueAgentTurnRequest, CreateAgentSessionRequest,
-    FetchTimelineRequest, GetMessageSubmissionRequest, MessageSubmissionState,
-    RenameAgentSessionRequest, ResolveElicitationRequest, ResolvePermissionRequest,
-    SendAgentMessageRequest,
+    AgentSession, AgentSessionSummary, AgentTimelineDisplaySettings, ContinueAgentTurnRequest,
+    CreateAgentSessionRequest, FetchTimelineRequest, ForkAgentSessionRequest,
+    GetMessageSubmissionRequest, MessageSubmissionState, RenameAgentSessionRequest,
+    ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest,
 };
 use crate::agent_auth::{
     AgentAuthCatalog, AgentAuthContext, AgentAuthContextAuthenticateRequest,
@@ -386,7 +386,9 @@ pub enum RemoteAgentOperationKind {
     RenameSession,
     ArchiveSession,
     DeleteSession,
+    ForkSession,
     FetchTimeline,
+    GetTimelineDisplaySettings,
     ResolveOpaqueLocator,
     ListRuntimeOptions,
     ListAuthContexts,
@@ -457,6 +459,31 @@ pub struct RemoteAgentCreateSessionRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAgentCreateSessionResponse {
     pub session: AgentSession,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentForkSessionRequest {
+    pub auth: RemoteAuthProof,
+    pub request: ForkAgentSessionRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentForkSessionResponse {
+    pub session: AgentSession,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentTimelineDisplaySettingsRequest {
+    pub auth: RemoteAuthProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentTimelineDisplaySettingsResponse {
+    pub settings: AgentTimelineDisplaySettings,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -859,10 +886,12 @@ pub enum RemoteAgentRequest {
     ListSessions(RemoteAgentSessionListRequest),
     GetSession(RemoteAgentSessionDetailRequest),
     CreateSession(RemoteAgentCreateSessionRequest),
+    ForkSession(RemoteAgentForkSessionRequest),
     RenameSession(RemoteAgentRenameSessionRequest),
     ArchiveSession(RemoteAgentSessionActionRequest),
     DeleteSession(RemoteAgentSessionActionRequest),
     FetchTimeline(RemoteAgentTimelineFetchRequest),
+    GetTimelineDisplaySettings(RemoteAgentTimelineDisplaySettingsRequest),
     ResolveOpaqueLocator(RemoteAgentDeepLinkResolveRequest),
     ListRuntimeOptions(RemoteAgentRuntimeOptionsRequest),
     ListAuthContexts(RemoteAgentAuthContextListRequest),
@@ -899,10 +928,14 @@ impl RemoteAgentRequest {
             Self::ListSessions(_) => RemoteAgentOperationKind::ListSessions,
             Self::GetSession(_) => RemoteAgentOperationKind::GetSession,
             Self::CreateSession(_) => RemoteAgentOperationKind::CreateSession,
+            Self::ForkSession(_) => RemoteAgentOperationKind::ForkSession,
             Self::RenameSession(_) => RemoteAgentOperationKind::RenameSession,
             Self::ArchiveSession(_) => RemoteAgentOperationKind::ArchiveSession,
             Self::DeleteSession(_) => RemoteAgentOperationKind::DeleteSession,
             Self::FetchTimeline(_) => RemoteAgentOperationKind::FetchTimeline,
+            Self::GetTimelineDisplaySettings(_) => {
+                RemoteAgentOperationKind::GetTimelineDisplaySettings
+            }
             Self::ResolveOpaqueLocator(_) => RemoteAgentOperationKind::ResolveOpaqueLocator,
             Self::ListRuntimeOptions(_) => RemoteAgentOperationKind::ListRuntimeOptions,
             Self::ListAuthContexts(_) => RemoteAgentOperationKind::ListAuthContexts,
@@ -2275,6 +2308,39 @@ mod tests {
             assert_eq!(decoded, request);
             assert!(!format!("{request:?}").contains("session-mutation-token"));
         }
+    }
+
+    #[test]
+    fn timeline_settings_and_fork_requests_use_stable_tags() {
+        let auth = RemoteAuthProof {
+            device_id: DeviceId::new(),
+            auth_token: "timeline-settings-token".to_string(),
+        };
+        let fork = RemoteAgentRequest::ForkSession(RemoteAgentForkSessionRequest {
+            auth: auth.clone(),
+            request: ForkAgentSessionRequest {
+                source_session_id: VibexSessionId::new(),
+                through_sequence: 12,
+                expected_source_end_sequence: Some(12),
+            },
+        });
+        let settings = RemoteAgentRequest::GetTimelineDisplaySettings(
+            RemoteAgentTimelineDisplaySettingsRequest { auth },
+        );
+
+        let fork_json = serde_json::to_value(&fork).unwrap();
+        assert_eq!(fork.operation_kind(), RemoteAgentOperationKind::ForkSession);
+        assert_eq!(fork_json["type"], "fork_session");
+        assert_eq!(fork_json["data"]["request"]["throughSequence"], 12);
+        assert!(!format!("{fork:?}").contains("timeline-settings-token"));
+
+        let settings_json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(
+            settings.operation_kind(),
+            RemoteAgentOperationKind::GetTimelineDisplaySettings
+        );
+        assert_eq!(settings_json["type"], "get_timeline_display_settings");
+        assert!(!format!("{settings:?}").contains("timeline-settings-token"));
     }
 
     #[test]

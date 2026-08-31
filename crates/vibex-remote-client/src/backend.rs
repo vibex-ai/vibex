@@ -18,21 +18,22 @@ use vibex_core::{
     AgentAuthContextMutationResult, AgentAuthContextRefreshModelsRequest,
     AgentAuthContextVerifyRequest, AgentAuthenticationOperation, AgentAuthenticationOperationId,
     AgentId, AgentListRequest, AgentListResponse, AgentNotificationIntent, AgentSession,
-    AgentSessionRuntimeSelectionState, CancelAgentSessionRuntimeSwitchRequest,
-    ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest, FileMutationRequest,
-    FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
-    FileTreeRequest, FileWriteRequest, GetMessageSubmissionRequest, GitCommitRequest,
-    GitCommitResult, GitDiffRequest, GitDiffResponse, GitHistoryRequest, GitHistoryResponse,
-    GitProjectEligibility, GitRemoteActionResult, GitStageRequest, GitStatusSummary,
-    GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
-    GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeCreateRequest,
-    GitWorktreeCreateResult, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
-    GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
-    GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeReadinessRecord,
-    GitWorktreeReadinessRequest, GitWorktreeRestoreRequest, MessageSubmissionState,
-    OpenWorkspaceRequest, ProjectId, ProjectWorkspaceSummary, ProviderHealthSummary,
-    ProviderProfileSummary, ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult,
-    RemoteActionClass, RemoteAgentAuthContextListRequest, RemoteAgentAuthContextListResponse,
+    AgentSessionRuntimeSelectionState, AgentTimelineDisplaySettings,
+    CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
+    FetchTimelineRequest, FileMutationRequest, FileReadRequest, FileReadResponse,
+    FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest, FileWriteRequest,
+    ForkAgentSessionRequest, GetMessageSubmissionRequest, GitCommitRequest, GitCommitResult,
+    GitDiffRequest, GitDiffResponse, GitHistoryRequest, GitHistoryResponse, GitProjectEligibility,
+    GitRemoteActionResult, GitStageRequest, GitStatusSummary, GitWorktreeArchiveRequest,
+    GitWorktreeAssistanceSessionRequest, GitWorktreeConflictResolveRequest,
+    GitWorktreeConflictStageRequest, GitWorktreeCreateRequest, GitWorktreeCreateResult,
+    GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
+    GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeOperationRecord,
+    GitWorktreeOperationRequest, GitWorktreeReadinessRecord, GitWorktreeReadinessRequest,
+    GitWorktreeRestoreRequest, MessageSubmissionState, OpenWorkspaceRequest, ProjectId,
+    ProjectWorkspaceSummary, ProviderHealthSummary, ProviderProfileSummary,
+    ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, RemoteActionClass,
+    RemoteAgentAuthContextListRequest, RemoteAgentAuthContextListResponse,
     RemoteAgentAuthContextMutationResponse, RemoteAgentAuthLogoutPreviewRequest,
     RemoteAgentAuthLogoutPreviewResponse, RemoteAgentAuthMethodListRequest,
     RemoteAgentAuthMethodListResponse, RemoteAgentAuthenticateContextRequest,
@@ -41,7 +42,8 @@ use vibex_core::{
     RemoteAgentCancelRuntimeSwitchRequest, RemoteAgentCancelRuntimeSwitchResponse,
     RemoteAgentCreateSessionRequest, RemoteAgentCreateSessionResponse,
     RemoteAgentDeepLinkResolveRequest, RemoteAgentDeepLinkResolveResponse,
-    RemoteAgentInterruptRequest, RemoteAgentInterruptResponse, RemoteAgentLogoutAuthContextRequest,
+    RemoteAgentForkSessionRequest, RemoteAgentForkSessionResponse, RemoteAgentInterruptRequest,
+    RemoteAgentInterruptResponse, RemoteAgentLogoutAuthContextRequest,
     RemoteAgentMessageSubmissionRequest, RemoteAgentMessageSubmissionResponse,
     RemoteAgentRefreshAuthModelsRequest, RemoteAgentRenameSessionRequest,
     RemoteAgentRenameSessionResponse, RemoteAgentRequest, RemoteAgentResolveElicitationRequest,
@@ -53,7 +55,8 @@ use vibex_core::{
     RemoteAgentSessionActionResponse, RemoteAgentSessionDetailRequest,
     RemoteAgentSessionDetailResponse, RemoteAgentSessionListRequest,
     RemoteAgentSessionListResponse, RemoteAgentSetDesiredRuntimeRequest,
-    RemoteAgentSetDesiredRuntimeResponse, RemoteAgentTimelineFetchRequest,
+    RemoteAgentSetDesiredRuntimeResponse, RemoteAgentTimelineDisplaySettingsRequest,
+    RemoteAgentTimelineDisplaySettingsResponse, RemoteAgentTimelineFetchRequest,
     RemoteAgentTimelineFetchResponse, RemoteAgentVerifyAuthContextRequest, RemoteAuditListRequest,
     RemoteAuditRecord, RemoteAuthProof, RemoteCreatePairingCodeRequest,
     RemoteCreatePairingCodeResponse, RemoteCreatePairingOfferRequest,
@@ -715,6 +718,50 @@ impl AgentBackend for WebRemoteBackend {
                 )
                 .await?;
             Ok(decode::<RemoteAgentTimelineFetchResponse>(value)?.page)
+        })
+    }
+
+    fn get_timeline_display_settings(&self) -> BackendFuture<'_, AgentTimelineDisplaySettings> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteAgentRequest::GetTimelineDisplaySettings(
+                RemoteAgentTimelineDisplaySettingsRequest { auth: this.auth() },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<RemoteAgentTimelineDisplaySettingsResponse>(value)?.settings)
+        })
+    }
+
+    fn fork_session(
+        &self,
+        request: MutationRequest<ForkAgentSessionRequest>,
+    ) -> BackendFuture<'_, AgentSession> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteAgentRequest::ForkSession(RemoteAgentForkSessionRequest {
+                auth: this.auth(),
+                request: request.payload,
+            });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<RemoteAgentForkSessionResponse>(value)?.session)
         })
     }
 
@@ -2642,6 +2689,7 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
         .unwrap_or_default();
     let has_agent = features.is_empty() || features.contains("agent");
     let has_agent_account_auth = features.contains("agent_account_auth");
+    let has_timeline_display_settings = features.contains("agent_timeline_display_settings");
     let has_workbench = features.is_empty() || features.contains("workspace_file");
     let has_git = features.is_empty() || features.contains("git");
     let has_worktree_read = features.contains("git_worktree_read");
@@ -2681,6 +2729,10 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
                     permits(RemoteActionClass::ReadAgentSession),
                 ),
                 (
+                    AgentGetTimelineDisplaySettings,
+                    has_timeline_display_settings && permits(RemoteActionClass::ReadAgentSession),
+                ),
+                (
                     AgentSendMessage,
                     permits(RemoteActionClass::MutateAgentSession),
                 ),
@@ -2694,6 +2746,10 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
                 ),
                 (
                     AgentManageSession,
+                    permits(RemoteActionClass::MutateAgentSession),
+                ),
+                (
+                    AgentForkSession,
                     permits(RemoteActionClass::MutateAgentSession),
                 ),
                 (
@@ -3620,5 +3676,31 @@ mod tests {
         let snapshot = remote_capabilities(Some(&read_only));
         assert!(snapshot.agent.supports(BackendOperation::AgentAuthRead));
         assert!(!snapshot.agent.supports(BackendOperation::AgentAuthManage));
+    }
+
+    #[test]
+    fn timeline_display_settings_are_advertised_only_when_negotiated() {
+        let without_feature = full_control_server_info(&["agent"]);
+        let snapshot = remote_capabilities(Some(&without_feature));
+        assert!(
+            !snapshot
+                .agent
+                .supports(BackendOperation::AgentGetTimelineDisplaySettings)
+        );
+
+        let with_feature = full_control_server_info(&["agent", "agent_timeline_display_settings"]);
+        let snapshot = remote_capabilities(Some(&with_feature));
+        assert!(
+            snapshot
+                .agent
+                .supports(BackendOperation::AgentGetTimelineDisplaySettings)
+        );
+
+        let disconnected = remote_capabilities(None);
+        assert!(
+            !disconnected
+                .agent
+                .supports(BackendOperation::AgentGetTimelineDisplaySettings)
+        );
     }
 }

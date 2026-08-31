@@ -1,9 +1,11 @@
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use vibex_backend::{BackendError, BackendResult};
+use vibex_core::AgentTimelineReasoningDisplayMode;
 
 use crate::pairing::MobileCredentialBundle;
 
@@ -13,12 +15,42 @@ const MAX_CREDENTIAL_BYTES: u64 = 64 * 1024;
 const MAX_HOSTS: usize = 32;
 const MAX_HOST_BYTES: u64 = 2 * 1024 * 1024;
 const HOSTS_SCHEMA_VERSION: &str = "vibex-native-mobile-hosts.v1";
+const TIMELINE_DISPLAY_SETTINGS_FILE: &str = "timeline-display-settings.json";
+const TIMELINE_DISPLAY_SETTINGS_SCHEMA_VERSION: &str =
+    "vibex-native-mobile-timeline-display-settings.v1";
+const MAX_TIMELINE_DISPLAY_SETTINGS_BYTES: u64 = 128 * 1024;
+const MAX_TIMELINE_DISPLAY_SETTINGS_OVERRIDES: usize = 32;
+const MAX_TIMELINE_DISPLAY_SETTINGS_HOST_ID_BYTES: usize = 256;
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StoredHosts {
     schema_version: String,
     hosts: Vec<MobileCredentialBundle>,
+}
+
+/// Per-host mobile presentation overrides. `None` means that the desktop
+/// value should be used for that setting.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MobileTimelineDisplaySettingsOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_agent_generation_status: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_display_mode: Option<AgentTimelineReasoningDisplayMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_expanded_by_default: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enhanced_command_execution_display: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enhanced_file_operation_display: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredTimelineDisplaySettingsOverrides {
+    schema_version: String,
+    overrides: BTreeMap<String, MobileTimelineDisplaySettingsOverride>,
 }
 
 #[derive(Clone, Debug)]
@@ -37,6 +69,10 @@ impl CredentialStorage {
 
     pub fn hosts_path(&self) -> PathBuf {
         self.data_dir.join(HOSTS_FILE)
+    }
+
+    pub fn timeline_display_settings_overrides_path(&self) -> PathBuf {
+        self.data_dir.join(TIMELINE_DISPLAY_SETTINGS_FILE)
     }
 
     pub fn load(&self) -> BackendResult<Option<MobileCredentialBundle>> {
@@ -187,6 +223,108 @@ impl CredentialStorage {
         outcome
     }
 
+    pub fn load_timeline_display_settings_overrides(
+        &self,
+    ) -> BackendResult<BTreeMap<String, MobileTimelineDisplaySettingsOverride>> {
+        let path = self.timeline_display_settings_overrides_path();
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(BTreeMap::new());
+            }
+            Err(_) => return Err(storage_error("mobile_timeline_settings_read_failed")),
+        };
+        if metadata.len() == 0 || metadata.len() > MAX_TIMELINE_DISPLAY_SETTINGS_BYTES {
+            return self.reject_invalid_timeline_settings(&path);
+        }
+        let bytes =
+            fs::read(&path).map_err(|_| storage_error("mobile_timeline_settings_read_failed"))?;
+        let stored: StoredTimelineDisplaySettingsOverrides = match serde_json::from_slice(&bytes) {
+            Ok(stored) => stored,
+            Err(_) => return self.reject_invalid_timeline_settings(&path),
+        };
+        if stored.schema_version != TIMELINE_DISPLAY_SETTINGS_SCHEMA_VERSION
+            || stored.overrides.len() > MAX_TIMELINE_DISPLAY_SETTINGS_OVERRIDES
+            || stored.overrides.keys().any(|host_id| {
+                host_id.is_empty()
+                    || host_id.len() > MAX_TIMELINE_DISPLAY_SETTINGS_HOST_ID_BYTES
+                    || host_id.chars().any(char::is_control)
+            })
+        {
+            return self.reject_invalid_timeline_settings(&path);
+        }
+        Ok(stored.overrides)
+    }
+
+    pub fn save_timeline_display_settings_overrides(
+        &self,
+        overrides: &BTreeMap<String, MobileTimelineDisplaySettingsOverride>,
+    ) -> BackendResult<()> {
+        if overrides.len() > MAX_TIMELINE_DISPLAY_SETTINGS_OVERRIDES
+            || overrides.keys().any(|host_id| {
+                host_id.is_empty()
+                    || host_id.len() > MAX_TIMELINE_DISPLAY_SETTINGS_HOST_ID_BYTES
+                    || host_id.chars().any(char::is_control)
+            })
+        {
+            return Err(storage_error("mobile_timeline_settings_invalid"));
+        }
+        fs::create_dir_all(&self.data_dir)
+            .map_err(|_| storage_error("mobile_timeline_settings_write_failed"))?;
+        let stored = StoredTimelineDisplaySettingsOverrides {
+            schema_version: TIMELINE_DISPLAY_SETTINGS_SCHEMA_VERSION.to_string(),
+            overrides: overrides.clone(),
+        };
+        let encoded = serde_json::to_vec(&stored)
+            .map_err(|_| storage_error("mobile_timeline_settings_encode_failed"))?;
+        if encoded.is_empty() || encoded.len() as u64 > MAX_TIMELINE_DISPLAY_SETTINGS_BYTES {
+            return Err(storage_error("mobile_timeline_settings_invalid"));
+        }
+        let path = self.timeline_display_settings_overrides_path();
+        let temporary = temporary_path(&path);
+        match fs::remove_file(&temporary) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(storage_error("mobile_timeline_settings_write_failed")),
+        }
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let outcome = (|| {
+            let mut file = options
+                .open(&temporary)
+                .map_err(|_| storage_error("mobile_timeline_settings_write_failed"))?;
+            file.write_all(&encoded)
+                .and_then(|_| file.sync_all())
+                .map_err(|_| storage_error("mobile_timeline_settings_write_failed"))?;
+            fs::rename(&temporary, &path)
+                .map_err(|_| storage_error("mobile_timeline_settings_write_failed"))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                    .map_err(|_| storage_error("mobile_timeline_settings_write_failed"))?;
+            }
+            Ok(())
+        })();
+        if outcome.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        outcome
+    }
+
+    pub fn clear_timeline_display_settings_overrides(&self) -> BackendResult<()> {
+        match fs::remove_file(self.timeline_display_settings_overrides_path()) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(storage_error("mobile_timeline_settings_clear_failed")),
+        }
+    }
+
     pub fn clear(&self) -> BackendResult<()> {
         match fs::remove_file(self.path()) {
             Ok(()) => Ok(()),
@@ -222,6 +360,19 @@ impl CredentialStorage {
             Err(_) => Err(storage_error("mobile_hosts_clear_failed")),
         }
     }
+
+    fn reject_invalid_timeline_settings(
+        &self,
+        path: &Path,
+    ) -> BackendResult<BTreeMap<String, MobileTimelineDisplaySettingsOverride>> {
+        match fs::remove_file(path) {
+            Ok(()) => Err(storage_error("mobile_timeline_settings_invalid")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(storage_error("mobile_timeline_settings_invalid"))
+            }
+            Err(_) => Err(storage_error("mobile_timeline_settings_clear_failed")),
+        }
+    }
 }
 
 fn temporary_path(path: &Path) -> PathBuf {
@@ -235,7 +386,7 @@ fn storage_error(code: &'static str) -> BackendError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vibex_core::{RemoteAuthProof, RemoteClientType};
+    use vibex_core::{AgentTimelineReasoningDisplayMode, RemoteAuthProof, RemoteClientType};
     use vibex_remote_client::{ClientDeviceIdentity, RemoteCredentialRecord};
 
     use crate::pairing::MobileRemoteRouteBundle;
@@ -303,6 +454,55 @@ mod tests {
         let error = storage.load_hosts().unwrap_err();
         assert_eq!(error.code, "mobile_hosts_invalid");
         assert!(!storage.hosts_path().exists());
+    }
+
+    #[test]
+    fn timeline_display_settings_overrides_round_trip_and_clear() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            "desktop-primary".to_string(),
+            MobileTimelineDisplaySettingsOverride {
+                show_agent_generation_status: Some(false),
+                reasoning_display_mode: Some(AgentTimelineReasoningDisplayMode::Timeline),
+                ..Default::default()
+            },
+        );
+
+        storage
+            .save_timeline_display_settings_overrides(&overrides)
+            .unwrap();
+        assert_eq!(
+            storage.load_timeline_display_settings_overrides().unwrap(),
+            overrides
+        );
+
+        storage.clear_timeline_display_settings_overrides().unwrap();
+        assert!(
+            storage
+                .load_timeline_display_settings_overrides()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn malformed_timeline_display_settings_are_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        fs::create_dir_all(temp.path()).unwrap();
+        fs::write(
+            storage.timeline_display_settings_overrides_path(),
+            b"not-json",
+        )
+        .unwrap();
+
+        let error = storage
+            .load_timeline_display_settings_overrides()
+            .unwrap_err();
+        assert_eq!(error.code, "mobile_timeline_settings_invalid");
+        assert!(!storage.timeline_display_settings_overrides_path().exists());
     }
 
     #[test]

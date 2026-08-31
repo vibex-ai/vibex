@@ -42,6 +42,8 @@ const ICONS: &[&str] = &[
     "icons/folder.svg",
     "icons/folder-open.svg",
     "icons/triangle-alert.svg",
+    "icons/copy.svg",
+    "icons/user-arrow-up.svg",
     "icons/git-branch.svg",
     "icons/download.svg",
     "icons/upload.svg",
@@ -87,8 +89,12 @@ const ICONS: &[&str] = &[
     "icons/chevrons-right-left.svg",
     "icons/chevrons-left-right.svg",
     "icons/pencil.svg",
+    "icons/brain.svg",
+    "icons/file-plus.svg",
     "icons/file-archive.svg",
     "icons/trash-2.svg",
+    "icons/plug-zap.svg",
+    "icons/user.svg",
     "icons/openai.svg",
     "icons/claude.svg",
     "icons/opencode.svg",
@@ -180,6 +186,10 @@ impl AssetSource for MobileAssets {
             "icons/triangle-alert.svg" => {
                 Some(include_bytes!("../assets/icons/triangle-alert.svg"))
             }
+            "icons/copy.svg" => Some(include_bytes!("../assets/icons/copy.svg")),
+            "icons/user-arrow-up.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/user-arrow-up.svg"
+            )),
             "icons/git-branch.svg" => {
                 Some(include_bytes!("../../desktop/assets/icons/git-branch.svg"))
             }
@@ -265,10 +275,16 @@ impl AssetSource for MobileAssets {
                 "../../desktop/assets/icons/chevrons-left-right.svg"
             )),
             "icons/pencil.svg" => Some(include_bytes!("../../desktop/assets/icons/pencil.svg")),
+            "icons/brain.svg" => Some(include_bytes!("../../desktop/assets/icons/brain.svg")),
+            "icons/file-plus.svg" => {
+                Some(include_bytes!("../../desktop/assets/icons/file-plus.svg"))
+            }
             "icons/file-archive.svg" => Some(include_bytes!(
                 "../../desktop/assets/icons/file-archive.svg"
             )),
             "icons/trash-2.svg" => Some(include_bytes!("../../desktop/assets/icons/trash-2.svg")),
+            "icons/plug-zap.svg" => Some(include_bytes!("../../desktop/assets/icons/plug-zap.svg")),
+            "icons/user.svg" => Some(include_bytes!("../assets/icons/user.svg")),
             // Reuse the reviewed desktop provider marks so the compact client
             // and desktop sidebar show the same Agent identity.
             "icons/openai.svg" => Some(include_bytes!("../../desktop/assets/icons/openai.svg")),

@@ -73,29 +73,29 @@ use vibex_core::{
     AgentCommandExecutionBehavior, AgentCommandSelectionBehavior, AgentCommandSourceKind,
     AgentCommandTrigger, AgentId, AgentListRequest, AgentMessagePhase, AgentSession,
     AgentSessionRuntimeSelectionState, AgentSessionSafety, AgentSessionState, AgentSnapshotEntry,
-    AgentTokenUsage, AttachRuntimeRequest, CancelAgentSessionRuntimeSwitchRequest,
-    ContinueAgentTurnRequest, CreateAgentSessionRequest, DetachRuntimeRequest, ElicitationField,
-    ElicitationFieldKind, ElicitationRequest, ElicitationResolutionAction,
-    ExternalSessionImportCandidateStatus, ExternalSessionImportRequest, FetchTimelineRequest,
-    FileEntryKind, FileOperationKind, FileOperationPatchFormat, FileTreeRequest,
-    ForkAgentSessionRequest, GetMessageSubmissionRequest, GitProjectEligibilityState,
-    GitProjectIneligibleReason, GitStatusSummary,
-    GitWorktreeAssistanceSessionRequest, GitWorktreeConflictKind, GitWorktreeDiscardRequest,
-    GitWorktreeOperationRecord, GitWorktreeOperationStatus, MessageAttachment,
-    MessageSubmissionState, MessageSubmissionStatus, OpenWorkspaceRequest, PermissionResolution,
-    PermissionResponseKind, PlanStepStatus, ProjectId, ProjectRecord, PromptId,
-    ProviderBindingMetadata, ProviderKind, ProviderProfileSummary, RenameAgentSessionRequest,
-    RequestId, ResolvePermissionRequest, RuntimeAuthSource, RuntimeAuthSourceAvailability,
-    RuntimeAuthSourceKind, RuntimeAuthSourceSummary, RuntimeClientId, RuntimeLeaseRole,
-    RuntimeModelSelection, RuntimeSelectionInteraction, SendAgentMessageRequest,
-    SessionRuntimeFeature, SessionRuntimeFeatureKind, SessionRuntimeOption,
-    SessionRuntimeOptionCatalog, SessionRuntimeSelection, SessionRuntimeSelectionStatus,
-    SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest, TerminalId, TerminalSession,
-    TerminalStatus, TerminalSwitchShellRequest, TimelineItem, TimelineItemId, TimelineLiveEvent,
-    TimelinePage, TimelinePayload, TimelineRedactionState, TimelineSource, UserMessagePayload,
-    VibexSessionId, WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation,
-    latest_timeline_turn_ended_normally, managed_worktree_name_slug, normalize_agent_session_title,
-    unix_timestamp_ms,
+    AgentTimelineDisplaySettings, AgentTimelineReasoningDisplayMode, AgentTokenUsage,
+    AttachRuntimeRequest, CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest,
+    CreateAgentSessionRequest, DetachRuntimeRequest, ElicitationField, ElicitationFieldKind,
+    ElicitationRequest, ElicitationResolutionAction, ExternalSessionImportCandidateStatus,
+    ExternalSessionImportRequest, FetchTimelineRequest, FileEntryKind, FileOperationKind,
+    FileOperationPatchFormat, FileTreeRequest, ForkAgentSessionRequest,
+    GetMessageSubmissionRequest, GitProjectEligibilityState, GitProjectIneligibleReason,
+    GitStatusSummary, GitWorktreeAssistanceSessionRequest, GitWorktreeConflictKind,
+    GitWorktreeDiscardRequest, GitWorktreeOperationRecord, GitWorktreeOperationStatus,
+    MessageAttachment, MessageSubmissionState, MessageSubmissionStatus, OpenWorkspaceRequest,
+    PermissionResolution, PermissionResponseKind, PlanStepStatus, ProjectId, ProjectRecord,
+    PromptId, ProviderBindingMetadata, ProviderKind, ProviderProfileSummary,
+    RenameAgentSessionRequest, RequestId, ResolvePermissionRequest, RuntimeAuthSource,
+    RuntimeAuthSourceAvailability, RuntimeAuthSourceKind, RuntimeAuthSourceSummary,
+    RuntimeClientId, RuntimeLeaseRole, RuntimeModelSelection, RuntimeSelectionInteraction,
+    SendAgentMessageRequest, SessionRuntimeFeature, SessionRuntimeFeatureKind,
+    SessionRuntimeOption, SessionRuntimeOptionCatalog, SessionRuntimeSelection,
+    SessionRuntimeSelectionStatus, SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest,
+    TerminalId, TerminalSession, TerminalStatus, TerminalSwitchShellRequest, TimelineItem,
+    TimelineItemId, TimelineLiveEvent, TimelinePage, TimelinePayload, TimelineRedactionState,
+    TimelineSource, UserMessagePayload, VibexSessionId, WorkspaceMode, WorkspaceRecord,
+    agent_session_turn_requires_continuation, latest_timeline_turn_ended_normally,
+    managed_worktree_name_slug, normalize_agent_session_title, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     AgentOrderEntry, AgentOrdering, AgentPlanProjection, AgentSortStrategy, AppearanceUiState,
@@ -5200,6 +5200,7 @@ impl VibexWorkbench {
                                 this.persistence_note = Some(note);
                             }
                             this.runtime = Some(runtime.clone());
+                            this.sync_timeline_display_settings_to_runtime();
                             this.start_sidebar_organization_bridge(&runtime, cx);
                             let facade = Arc::new(NativeBackend::new(runtime.clone())).facade();
                             this.shared_workflow =
@@ -20965,6 +20966,7 @@ impl VibexWorkbench {
         self.invalidate_timeline_render_caches();
         self.rebuild_timeline_sizes();
         self.queue_ui_state();
+        self.sync_timeline_display_settings_to_runtime();
         cx.notify();
     }
 
@@ -20977,6 +20979,7 @@ impl VibexWorkbench {
         self.invalidate_timeline_layout_measurements();
         self.rebuild_timeline_sizes();
         self.queue_ui_state();
+        self.sync_timeline_display_settings_to_runtime();
         cx.notify();
     }
 
@@ -20985,6 +20988,7 @@ impl VibexWorkbench {
         self.invalidate_timeline_layout_measurements();
         self.rebuild_timeline_sizes();
         self.queue_ui_state();
+        self.sync_timeline_display_settings_to_runtime();
         cx.notify();
     }
 
@@ -20993,6 +20997,7 @@ impl VibexWorkbench {
         self.invalidate_timeline_layout_measurements();
         self.rebuild_timeline_sizes();
         self.queue_ui_state();
+        self.sync_timeline_display_settings_to_runtime();
         cx.notify();
     }
 
@@ -21002,7 +21007,29 @@ impl VibexWorkbench {
             self.agent_generation_stats = None;
         }
         self.queue_ui_state();
+        self.sync_timeline_display_settings_to_runtime();
         cx.notify();
+    }
+
+    fn sync_timeline_display_settings_to_runtime(&self) {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return;
+        };
+        runtime.set_timeline_display_settings(AgentTimelineDisplaySettings {
+            show_agent_generation_status: self.ui_state.session.show_agent_generation_status,
+            reasoning_display_mode: match self.ui_state.session.reasoning_display_mode {
+                ReasoningDisplayMode::LatestAtBottom => {
+                    AgentTimelineReasoningDisplayMode::LatestAtBottom
+                }
+                ReasoningDisplayMode::Timeline => AgentTimelineReasoningDisplayMode::Timeline,
+            },
+            reasoning_expanded_by_default: self.ui_state.session.reasoning_expanded_by_default,
+            enhanced_command_execution_display: self
+                .ui_state
+                .session
+                .enhanced_command_execution_display,
+            enhanced_file_operation_display: self.ui_state.session.enhanced_file_operation_display,
+        });
     }
 
     fn set_close_to_tray(&mut self, enabled: bool, cx: &mut Context<Self>) {

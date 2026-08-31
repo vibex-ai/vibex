@@ -7,27 +7,29 @@ use std::time::Duration;
 
 use futures_util::StreamExt as _;
 use gpui::{
-    Animation, AnimationExt as _, App, AppContext as _, Context, ElementId, Entity, Focusable,
-    FontWeight, IntoElement, KeyBinding, ListAlignment, ListState, MouseButton, MouseUpEvent,
-    ParentElement as _, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, Styled as _, Task,
-    TouchPhase, Transformation, UniformListScrollHandle, WeakEntity, Window, div, ease_in_out,
-    ease_out_quint, list, percentage, prelude::*, px, rgb, svg, uniform_list,
+    Animation, AnimationExt as _, App, AppContext as _, ClipboardItem, Context, ElementId, Entity,
+    Focusable, FontWeight, IntoElement, KeyBinding, ListAlignment, ListOffset, ListState,
+    MouseButton, MouseUpEvent, ParentElement as _, Render, ScrollDelta, ScrollHandle,
+    ScrollWheelEvent, Styled as _, Task, TouchPhase, Transformation, UniformListScrollHandle,
+    WeakEntity, Window, div, ease_in_out, ease_out_quint, list, percentage, prelude::*, px, rgb,
+    svg, uniform_list,
 };
 use vibex_backend::{
     AgentBackend as _, BackendError, BackendEvent, BackendFuture, BackendOperation,
     BackendProjection, BackendResult, MutationRequest, WorkspaceBackend as _, WorkspaceSummary,
 };
 use vibex_core::{
-    AgentSessionState, ContinueAgentTurnRequest, CreateAgentSessionRequest, ElicitationFieldKind,
-    ElicitationResolutionAction, OpenWorkspaceRequest, PermissionResolution,
-    PermissionResponseKind, PermissionRiskCategory, RemoteDeepLinkResolutionStatus,
-    RemoteLanPairingRequestState, RemoteSidebarDropPosition, RemoteSidebarItemKind,
-    RemoteSidebarItemRef, RemoteSidebarOrganizationMutation, RenameAgentSessionRequest, RequestId,
-    ResolvePermissionRequest, RuntimeOptionAvailability, RuntimeSelectionInteraction,
-    SendAgentMessageRequest, SessionRuntimeFeature, SessionRuntimeFeatureKind,
-    SessionRuntimeOption, SessionRuntimeOptionCatalog, SessionRuntimeSelection,
-    SetDesiredAgentSessionRuntimeRequest, TimelinePayload, VibexSessionId, WorkspaceMode,
-    WorkspaceRecord, agent_session_turn_requires_continuation, unix_timestamp_ms,
+    AgentSessionState, AgentTimelineDisplaySettings, AgentTimelineReasoningDisplayMode,
+    ContinueAgentTurnRequest, CreateAgentSessionRequest, ElicitationFieldKind,
+    ElicitationResolutionAction, ForkAgentSessionRequest, OpenWorkspaceRequest,
+    PermissionResolution, PermissionResponseKind, PermissionRiskCategory,
+    RemoteDeepLinkResolutionStatus, RemoteLanPairingRequestState, RemoteSidebarDropPosition,
+    RemoteSidebarItemKind, RemoteSidebarItemRef, RemoteSidebarOrganizationMutation,
+    RenameAgentSessionRequest, RequestId, ResolvePermissionRequest, RuntimeOptionAvailability,
+    RuntimeSelectionInteraction, SendAgentMessageRequest, SessionRuntimeFeature,
+    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
+    SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest, TimelinePayload, VibexSessionId,
+    WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     NewSessionLocation, ReasoningDisplayMode, RuntimeCascadeChoice, RuntimeCascadeProjection,
@@ -55,17 +57,13 @@ use crate::sidebar::{
     SidebarRow, SidebarRowInput, SidebarRowKind, SidebarWorkspace, ancestors_of, drop_target,
     folder_guides, press_is_on_trailing_actions, row_at_position, sidebar_rows, workspace_cards,
 };
-use crate::storage::CredentialStorage;
+use crate::storage::{CredentialStorage, MobileTimelineDisplaySettingsOverride};
 use crate::workbench::{MobileWorkbench, WorkbenchSurface};
 use crate::{locale, markdown, notifications, scanner, theme};
 
 const TIMELINE_NEAR_BOTTOM_PX: f32 = 96.0;
 const TIMELINE_LIST_OVERDRAW_PX: f32 = 800.0;
 const TIMELINE_TURN_ESTIMATED_HEIGHT_PX: f32 = 180.0;
-/// The compact session surface follows the desktop timeline ordering and
-/// keeps reasoning rows in their authored position instead of using the old
-/// bottom-only compatibility projection.
-const MOBILE_REASONING_DISPLAY_MODE: ReasoningDisplayMode = ReasoningDisplayMode::Timeline;
 const RESUME_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const RESUME_RECOVERY_POLL_ATTEMPTS: usize = 600;
 const RUNTIME_FEATURE_VALUE_LIMIT: usize = 256;
@@ -148,6 +146,14 @@ enum WorkspaceActionKind {
 enum RuntimeOptionsTarget {
     ActiveSession,
     NewSession,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimelineBooleanSetting {
+    ShowAgentGenerationStatus,
+    ReasoningExpandedByDefault,
+    EnhancedCommandExecutionDisplay,
+    EnhancedFileOperationDisplay,
 }
 
 /// Touch shells cannot rely on hover, so the sidebar keeps only the most-used
@@ -313,6 +319,9 @@ pub struct MobileApp {
     workbench_open: bool,
     composer_input: Entity<TextInput>,
     timeline_turns: Arc<Vec<TimelineConversationTurn>>,
+    desktop_timeline_display_settings: AgentTimelineDisplaySettings,
+    timeline_display_settings_overrides: BTreeMap<String, MobileTimelineDisplaySettingsOverride>,
+    timeline_display_settings_sync_busy: bool,
     timeline_list: ListState,
     drawer_scroll: UniformListScrollHandle,
     settings_scroll: ScrollHandle,
@@ -328,6 +337,7 @@ pub struct MobileApp {
     drawer_snap_task: Option<Task<()>>,
     expanded_process: BTreeMap<String, bool>,
     expanded_timeline_rows: BTreeSet<String>,
+    collapsed_timeline_rows: BTreeSet<String>,
     expanded_approval: BTreeSet<String>,
     workspaces: Vec<WorkspaceRecord>,
     workspace_summaries: Vec<WorkspaceSummary>,
@@ -347,6 +357,7 @@ pub struct MobileApp {
     nearby_discovery_generation: u64,
     lan_pairing_task: Option<Task<()>>,
     operation_busy: bool,
+    fork_session_busy: bool,
     new_session_busy: bool,
     new_session_open: bool,
     new_session_project_id: Option<String>,
@@ -399,11 +410,35 @@ pub struct MobileApp {
     tasks: Vec<Task<()>>,
 }
 
+fn timeline_action_button(
+    id: impl Into<ElementId>,
+    icon: &'static str,
+    label: &'static str,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .aria_label(label)
+        .size(px(theme::HEADER_BUTTON_SIZE))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(theme::RADIUS_CONTROL))
+        .cursor_pointer()
+        .active(|style| style.bg(theme::row_pressed_bg()))
+        .child(
+            svg()
+                .path(icon)
+                .size(px(theme::ICON_SM))
+                .text_color(theme::text_secondary()),
+        )
+}
+
 impl MobileApp {
     pub fn new(data_dir: PathBuf, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let storage = CredentialStorage::new(data_dir);
         let stored = storage.load();
         let stored_hosts = storage.load_hosts();
+        let stored_timeline_display_settings = storage.load_timeline_display_settings_overrides();
         let mode = if matches!(stored, Ok(Some(_))) {
             RootMode::Connecting
         } else {
@@ -412,6 +447,10 @@ impl MobileApp {
         let known_hosts = stored_hosts
             .as_ref()
             .map(|hosts| hosts.iter().map(MobileHostEntry::from_bundle).collect())
+            .unwrap_or_default();
+        let timeline_display_settings_overrides = stored_timeline_display_settings
+            .as_ref()
+            .cloned()
             .unwrap_or_default();
         let sidebar_search_input = cx.new(|cx| TextInput::new(locale::common("Search"), cx));
         let sidebar_search_subscription = cx.observe(&sidebar_search_input, |_, _, cx| cx.notify());
@@ -430,6 +469,9 @@ impl MobileApp {
                 )
             }),
             timeline_turns: Arc::new(Vec::new()),
+            desktop_timeline_display_settings: AgentTimelineDisplaySettings::default(),
+            timeline_display_settings_overrides,
+            timeline_display_settings_sync_busy: false,
             timeline_list: timeline_list_state(0),
             drawer_scroll: UniformListScrollHandle::new(),
             settings_scroll: ScrollHandle::new(),
@@ -445,6 +487,7 @@ impl MobileApp {
             drawer_snap_task: None,
             expanded_process: BTreeMap::new(),
             expanded_timeline_rows: BTreeSet::new(),
+            collapsed_timeline_rows: BTreeSet::new(),
             expanded_approval: BTreeSet::new(),
             workspaces: Vec::new(),
             workspace_summaries: Vec::new(),
@@ -464,6 +507,7 @@ impl MobileApp {
             nearby_discovery_generation: 0,
             lan_pairing_task: None,
             operation_busy: false,
+            fork_session_busy: false,
             new_session_busy: false,
             new_session_open: false,
             new_session_project_id: None,
@@ -523,7 +567,8 @@ impl MobileApp {
                 .as_ref()
                 .err()
                 .cloned()
-                .or_else(|| stored_hosts.as_ref().err().cloned()),
+                .or_else(|| stored_hosts.as_ref().err().cloned())
+                .or_else(|| stored_timeline_display_settings.as_ref().err().cloned()),
             app_backgrounded: crate::lifecycle::is_backgrounded(),
             event_consumer_task: None,
             resume_recovery_task: None,
@@ -599,6 +644,7 @@ impl MobileApp {
                             }
                             this.start_event_stream(cx);
                             this.refresh_sessions(cx);
+                            this.refresh_timeline_display_settings(cx);
                             this.refresh_runtime_options(cx);
                             this.refresh_workspaces(cx);
                             this.reload_selected_session(cx);
@@ -749,6 +795,9 @@ impl MobileApp {
                 self.mode = RootMode::Connecting;
                 self.error = None;
                 self.backend = Some(backend.clone());
+                self.desktop_timeline_display_settings = AgentTimelineDisplaySettings::default();
+                self.timeline_display_settings_sync_busy = false;
+                self.fork_session_busy = false;
                 self.persist_known_hosts();
                 self.connect_backend(backend, cx);
             }
@@ -801,6 +850,7 @@ impl MobileApp {
                         this.notice = None;
                         this.start_event_stream(cx);
                         this.refresh_sessions(cx);
+                        this.refresh_timeline_display_settings(cx);
                         this.refresh_runtime_options(cx);
                         this.refresh_workspaces(cx);
                         notifications::request_authorization();
@@ -2398,6 +2448,7 @@ impl MobileApp {
         self.reset_drawers();
         self.expanded_process.clear();
         self.expanded_timeline_rows.clear();
+        self.collapsed_timeline_rows.clear();
         self.expanded_approval.clear();
         self.timeline_turns = Arc::new(Vec::new());
         self.timeline_list.reset(0);
@@ -3975,6 +4026,195 @@ impl MobileApp {
             })
     }
 
+    fn effective_timeline_display_settings(&self) -> AgentTimelineDisplaySettings {
+        let mut settings = self.desktop_timeline_display_settings;
+        let Some(host_id) = self.active_host_id.as_deref() else {
+            return settings;
+        };
+        let Some(overrides) = self.timeline_display_settings_overrides.get(host_id) else {
+            return settings;
+        };
+        if let Some(value) = overrides.show_agent_generation_status {
+            settings.show_agent_generation_status = value;
+        }
+        if let Some(value) = overrides.reasoning_display_mode {
+            settings.reasoning_display_mode = value;
+        }
+        if let Some(value) = overrides.reasoning_expanded_by_default {
+            settings.reasoning_expanded_by_default = value;
+        }
+        if let Some(value) = overrides.enhanced_command_execution_display {
+            settings.enhanced_command_execution_display = value;
+        }
+        if let Some(value) = overrides.enhanced_file_operation_display {
+            settings.enhanced_file_operation_display = value;
+        }
+        settings
+    }
+
+    fn active_timeline_display_override(&self) -> Option<&MobileTimelineDisplaySettingsOverride> {
+        self.active_host_id
+            .as_deref()
+            .and_then(|host_id| self.timeline_display_settings_overrides.get(host_id))
+    }
+
+    fn persist_timeline_display_settings_overrides(&mut self) {
+        if let Err(error) = self
+            .storage
+            .save_timeline_display_settings_overrides(&self.timeline_display_settings_overrides)
+        {
+            self.error = Some(error);
+        }
+    }
+
+    fn timeline_override_is_empty(override_value: &MobileTimelineDisplaySettingsOverride) -> bool {
+        override_value.show_agent_generation_status.is_none()
+            && override_value.reasoning_display_mode.is_none()
+            && override_value.reasoning_expanded_by_default.is_none()
+            && override_value.enhanced_command_execution_display.is_none()
+            && override_value.enhanced_file_operation_display.is_none()
+    }
+
+    fn update_timeline_display_override(
+        &mut self,
+        update: impl FnOnce(&mut MobileTimelineDisplaySettingsOverride),
+        cx: &mut Context<Self>,
+    ) {
+        let Some(host_id) = self.active_host_id.clone() else {
+            return;
+        };
+        let entry = self
+            .timeline_display_settings_overrides
+            .entry(host_id.clone())
+            .or_default();
+        update(entry);
+        if Self::timeline_override_is_empty(entry) {
+            self.timeline_display_settings_overrides.remove(&host_id);
+        }
+        self.persist_timeline_display_settings_overrides();
+        self.rebuild_timeline_turns();
+        self.timeline_list.remeasure();
+        cx.notify();
+    }
+
+    fn toggle_timeline_boolean_setting(
+        &mut self,
+        setting: TimelineBooleanSetting,
+        cx: &mut Context<Self>,
+    ) {
+        let effective = self.effective_timeline_display_settings();
+        let value = match setting {
+            TimelineBooleanSetting::ShowAgentGenerationStatus => {
+                !effective.show_agent_generation_status
+            }
+            TimelineBooleanSetting::ReasoningExpandedByDefault => {
+                !effective.reasoning_expanded_by_default
+            }
+            TimelineBooleanSetting::EnhancedCommandExecutionDisplay => {
+                !effective.enhanced_command_execution_display
+            }
+            TimelineBooleanSetting::EnhancedFileOperationDisplay => {
+                !effective.enhanced_file_operation_display
+            }
+        };
+        self.update_timeline_display_override(
+            move |override_value| match setting {
+                TimelineBooleanSetting::ShowAgentGenerationStatus => {
+                    override_value.show_agent_generation_status = Some(value)
+                }
+                TimelineBooleanSetting::ReasoningExpandedByDefault => {
+                    override_value.reasoning_expanded_by_default = Some(value)
+                }
+                TimelineBooleanSetting::EnhancedCommandExecutionDisplay => {
+                    override_value.enhanced_command_execution_display = Some(value)
+                }
+                TimelineBooleanSetting::EnhancedFileOperationDisplay => {
+                    override_value.enhanced_file_operation_display = Some(value)
+                }
+            },
+            cx,
+        );
+    }
+
+    fn cycle_timeline_reasoning_display_mode(&mut self, cx: &mut Context<Self>) {
+        let next = match self
+            .effective_timeline_display_settings()
+            .reasoning_display_mode
+        {
+            AgentTimelineReasoningDisplayMode::LatestAtBottom => {
+                AgentTimelineReasoningDisplayMode::Timeline
+            }
+            AgentTimelineReasoningDisplayMode::Timeline => {
+                AgentTimelineReasoningDisplayMode::LatestAtBottom
+            }
+        };
+        self.update_timeline_display_override(
+            move |override_value| override_value.reasoning_display_mode = Some(next),
+            cx,
+        );
+    }
+
+    fn clear_timeline_display_overrides(&mut self, cx: &mut Context<Self>) {
+        let Some(host_id) = self.active_host_id.clone() else {
+            return;
+        };
+        self.timeline_display_settings_overrides.remove(&host_id);
+        self.persist_timeline_display_settings_overrides();
+        self.rebuild_timeline_turns();
+        self.timeline_list.remeasure();
+        cx.notify();
+    }
+
+    fn refresh_timeline_display_settings(&mut self, cx: &mut Context<Self>) {
+        if self.timeline_display_settings_sync_busy {
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let expected_host_id = self.active_host_id.clone();
+        let expected_backend = backend.clone();
+        if !backend
+            .capability_snapshot()
+            .agent
+            .supports(BackendOperation::AgentGetTimelineDisplaySettings)
+        {
+            return;
+        }
+        self.timeline_display_settings_sync_busy = true;
+        let runner =
+            gpui_tokio::Tokio::spawn(
+                cx,
+                async move { backend.get_timeline_display_settings().await },
+            );
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                let is_current_connection = this.active_host_id == expected_host_id
+                    && this
+                        .backend
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &expected_backend));
+                if !is_current_connection {
+                    return;
+                }
+                this.timeline_display_settings_sync_busy = false;
+                match outcome {
+                    Ok(settings) => {
+                        this.desktop_timeline_display_settings = settings;
+                        this.rebuild_timeline_turns();
+                        this.timeline_list.remeasure();
+                    }
+                    Err(error) => {
+                        this.error = Some(error);
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+    }
+
     fn toggle_process(&mut self, id: String, expanded: bool, cx: &mut Context<Self>) {
         self.expanded_process.insert(id, !expanded);
         // Expanded process rows change a turn's measured height. Re-measure the
@@ -3984,12 +4224,21 @@ impl MobileApp {
     }
 
     fn timeline_row_expanded(&self, id: &str) -> bool {
-        self.expanded_timeline_rows.contains(id)
+        self.expanded_timeline_rows.contains(id) && !self.collapsed_timeline_rows.contains(id)
     }
 
     fn toggle_timeline_row(&mut self, id: String, cx: &mut Context<Self>) {
-        if !self.expanded_timeline_rows.insert(id.clone()) {
-            self.expanded_timeline_rows.remove(&id);
+        if self.collapsed_timeline_rows.remove(&id) {
+            self.expanded_timeline_rows.insert(id);
+        } else if self.expanded_timeline_rows.remove(&id) {
+            self.collapsed_timeline_rows.insert(id);
+        } else if self
+            .effective_timeline_display_settings()
+            .reasoning_expanded_by_default
+        {
+            self.collapsed_timeline_rows.insert(id);
+        } else {
+            self.expanded_timeline_rows.insert(id);
         }
         self.timeline_list.remeasure();
         cx.notify();
@@ -4023,14 +4272,23 @@ impl MobileApp {
     }
 
     fn rebuild_timeline_turns(&mut self) {
+        let reasoning_display_mode = match self
+            .effective_timeline_display_settings()
+            .reasoning_display_mode
+        {
+            AgentTimelineReasoningDisplayMode::LatestAtBottom => {
+                ReasoningDisplayMode::LatestAtBottom
+            }
+            AgentTimelineReasoningDisplayMode::Timeline => ReasoningDisplayMode::Timeline,
+        };
         let turns = self
             .controller
             .as_ref()
-            .map(|controller| match MOBILE_REASONING_DISPLAY_MODE {
+            .map(|controller| match reasoning_display_mode {
                 ReasoningDisplayMode::LatestAtBottom => controller.state.conversation_turns(),
                 ReasoningDisplayMode::Timeline => controller
                     .state
-                    .conversation_turns_with_reasoning_mode(MOBILE_REASONING_DISPLAY_MODE),
+                    .conversation_turns_with_reasoning_mode(reasoning_display_mode),
             })
             .unwrap_or_default();
         self.sync_timeline_list(turns.len());
@@ -4047,6 +4305,7 @@ impl MobileApp {
             }
         }
         self.refresh_sessions(cx);
+        self.refresh_timeline_display_settings(cx);
         self.reload_selected_session(cx);
     }
 
@@ -4071,8 +4330,15 @@ impl MobileApp {
         self.reset_sidebar_ui(cx);
         self.known_hosts.clear();
         self.active_host_id = None;
+        self.desktop_timeline_display_settings = AgentTimelineDisplaySettings::default();
+        self.timeline_display_settings_sync_busy = false;
+        self.fork_session_busy = false;
+        self.timeline_display_settings_overrides.clear();
+        let _ = self.storage.clear_timeline_display_settings_overrides();
         self.pairing_from_hosts = false;
         self.expanded_process.clear();
+        self.expanded_timeline_rows.clear();
+        self.collapsed_timeline_rows.clear();
         self.expanded_approval.clear();
         self.elicitation_request_id = None;
         self.elicitation_inputs.clear();
@@ -6269,23 +6535,11 @@ impl MobileApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let expanded = self.timeline_process_expanded(turn);
+        let display_settings = self.effective_timeline_display_settings();
         let turn_id = turn.id.clone();
-        let agent_identity = turn
-            .runtime_attribution
-            .as_deref()
-            .and_then(|attribution| attribution.split(" · ").next())
-            .filter(|label| !label.is_empty())
-            .unwrap_or("Vibex")
-            .to_string();
-        let agent_icon = agent_icon_path(&agent_identity);
-        let runtime_label = turn.runtime_attribution.as_deref().and_then(|attribution| {
-            let label = attribution
-                .split(" · ")
-                .skip(1)
-                .collect::<Vec<_>>()
-                .join(" · ");
-            (!label.is_empty()).then_some(label)
-        });
+        let (agent_identity, runtime_label) =
+            timeline_runtime_attribution_parts(turn.runtime_attribution.as_deref());
+        let agent_icon = agent_identity.as_deref().map(agent_icon_path);
         let duration = format_compact_duration(
             turn.started_at_ms,
             turn.complete.then_some(turn.ended_at_ms).flatten(),
@@ -6357,23 +6611,36 @@ impl MobileApp {
                                             .flex()
                                             .items_center()
                                             .gap_2()
-                                            .child(
-                                                svg()
-                                                    .path(agent_icon)
-                                                    .size(px(theme::ICON_SM))
-                                                    .flex_shrink_0()
-                                                    .text_color(theme::text_secondary()),
-                                            )
+                                            .flex_wrap()
+                                            .when_some(agent_icon, |left, path| {
+                                                left.child(
+                                                    svg()
+                                                        .path(path)
+                                                        .size(px(theme::ICON_SM))
+                                                        .flex_shrink_0()
+                                                        .text_color(theme::text_secondary()),
+                                                )
+                                            })
                                             .child(
                                                 div()
                                                     .min_w_0()
-                                                    .overflow_hidden()
-                                                    .text_ellipsis()
+                                                    .flex_shrink_0()
                                                     .whitespace_nowrap()
                                                     .text_size(px(theme::FONT_CAPTION))
                                                     .text_color(theme::text_muted())
                                                     .child(worked_label.clone()),
-                                            ),
+                                            )
+                                            .when_some(runtime_label.clone(), |left, runtime| {
+                                                left.child(
+                                                    div()
+                                                        .min_w_0()
+                                                        .flex_1()
+                                                        .whitespace_normal()
+                                                        .text_size(px(theme::FONT_MICRO))
+                                                        .text_color(theme::text_muted())
+                                                        .child(runtime),
+                                                )
+                                            }),
                                     )
                                     .when(process_collapsible, |header| {
                                         header.child(
@@ -6388,20 +6655,7 @@ impl MobileApp {
                                                 .text_color(theme::text_muted()),
                                         )
                                     }),
-                            )
-                            .when_some(runtime_label.clone(), |header, runtime| {
-                                header.child(
-                                    div()
-                                        .ml(px(24.0))
-                                        .min_w_0()
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .whitespace_nowrap()
-                                        .text_size(px(theme::FONT_MICRO))
-                                        .text_color(theme::text_muted())
-                                        .child(runtime),
-                                )
-                            }),
+                            ),
                     ),
                 )
             })
@@ -6423,6 +6677,15 @@ impl MobileApp {
                         .iter()
                         .any(|row| row.kind == TimelineRowKind::Reasoning && row.streaming),
                 |container| {
+                    if display_settings.reasoning_display_mode
+                        == AgentTimelineReasoningDisplayMode::LatestAtBottom
+                        && let Some(reasoning) = turn.live_status.as_deref()
+                    {
+                        return container.child(self.render_live_reasoning(turn, reasoning, cx));
+                    }
+                    if !display_settings.show_agent_generation_status {
+                        return container;
+                    }
                     container.child(
                         div()
                             .w_full()
@@ -6468,6 +6731,35 @@ impl MobileApp {
             .into_any_element()
     }
 
+    fn render_live_reasoning(
+        &self,
+        turn: &TimelineConversationTurn,
+        body: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let row = TimelineRow {
+            id: format!("reasoning-live:{}", turn.id),
+            kind: TimelineRowKind::Reasoning,
+            item_ids: Vec::new(),
+            turn_id: Some(turn.id.clone()),
+            turn_item_count: turn.item_count,
+            turn_failed: turn.failed,
+            turn_pending_permission: turn.pending_permission,
+            conclusion: false,
+            first_sequence: 0,
+            last_sequence: 0,
+            title: locale::common("Reasoning").to_string(),
+            body: body.to_string(),
+            streaming: true,
+            collapsible: true,
+            pending_permission: turn.pending_permission,
+            failed: turn.failed,
+            runtime_attribution: turn.runtime_attribution.clone(),
+            file_path: None,
+        };
+        self.render_thought_process_row(&row, cx)
+    }
+
     fn timeline_row_latest_payload(&self, row: &TimelineRow) -> Option<&TimelinePayload> {
         self.controller
             .as_ref()?
@@ -6480,6 +6772,12 @@ impl MobileApp {
             .map(|item| &item.payload)
     }
 
+    fn timeline_row_icon_path_for_row(&self, row: &TimelineRow) -> &'static str {
+        self.timeline_row_latest_payload(row)
+            .map(timeline_payload_icon_path)
+            .unwrap_or_else(|| timeline_row_icon_path(row.kind))
+    }
+
     fn render_timeline_process_rows(
         &self,
         turn: &TimelineConversationTurn,
@@ -6488,7 +6786,12 @@ impl MobileApp {
         let mut elements = Vec::new();
         let mut row_index = 0;
         let mut group_index = 0;
-        let groups = &turn.process_activity_groups;
+        let settings = self.effective_timeline_display_settings();
+        let groups = timeline_process_activity_groups_for_display(
+            turn,
+            settings.enhanced_command_execution_display,
+            settings.enhanced_file_operation_display,
+        );
 
         while row_index < turn.process_rows.len() {
             while groups
@@ -6526,10 +6829,11 @@ impl MobileApp {
         conversation_conclusion: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let settings = self.effective_timeline_display_settings();
         match row.kind {
             TimelineRowKind::UserMessage => self.render_user_message_row(row).into_any_element(),
             TimelineRowKind::AgentMessage => {
-                self.render_agent_message_row(turn, row, conversation_conclusion)
+                self.render_agent_message_row(turn, row, conversation_conclusion, cx)
             }
             TimelineRowKind::Reasoning | TimelineRowKind::Plan => {
                 self.render_thought_process_row(row, cx)
@@ -6537,8 +6841,14 @@ impl MobileApp {
             TimelineRowKind::Error => self.render_error_row(row, conversation_conclusion),
             TimelineRowKind::PermissionRequest => self.render_permission_request_card(row, cx),
             TimelineRowKind::ElicitationRequest => self.render_elicitation_request_card(row, cx),
-            TimelineRowKind::Command => self.render_command_execution_card(row, cx),
-            TimelineRowKind::FileOperation => self.render_file_operation_card(row, cx),
+            TimelineRowKind::Command if settings.enhanced_command_execution_display => {
+                self.render_command_execution_card(row, cx)
+            }
+            TimelineRowKind::Command => self.render_process_activity_line(row, cx),
+            TimelineRowKind::FileOperation if settings.enhanced_file_operation_display => {
+                self.render_file_operation_card(row, cx)
+            }
+            TimelineRowKind::FileOperation => self.render_process_activity_line(row, cx),
             TimelineRowKind::ImageGeneration => self.render_image_generation_card(row, cx),
             TimelineRowKind::ToolCall
             | TimelineRowKind::WebSearch
@@ -6581,6 +6891,7 @@ impl MobileApp {
         turn: &TimelineConversationTurn,
         row: &TimelineRow,
         conversation_conclusion: bool,
+        cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         div()
             .id(row.id.clone())
@@ -6592,7 +6903,7 @@ impl MobileApp {
             .child(markdown::render(&row.body, row.last_sequence.max(0) as u64))
             .when_some(
                 conversation_conclusion
-                    .then(|| self.render_agent_answer_metadata(turn, row))
+                    .then(|| self.render_agent_answer_metadata(turn, row, cx))
                     .flatten(),
                 |message, metadata| message.child(metadata),
             )
@@ -6603,38 +6914,29 @@ impl MobileApp {
         &self,
         turn: &TimelineConversationTurn,
         row: &TimelineRow,
+        cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         if !turn.complete || row.kind != TimelineRowKind::AgentMessage || row.body.trim().is_empty()
         {
             return None;
         }
-        let agent_identity = turn
-            .runtime_attribution
-            .as_deref()
-            .and_then(|attribution| attribution.split(" · ").next())
-            .filter(|label| !label.is_empty())
-            .unwrap_or("Vibex")
-            .to_string();
-        let runtime_label = turn
-            .runtime_attribution
-            .as_deref()
-            .map(|attribution| {
-                let label = attribution
-                    .split(" · ")
-                    .skip(1)
-                    .collect::<Vec<_>>()
-                    .join(" · ");
-                if label.is_empty() {
-                    attribution.to_string()
-                } else {
-                    label
-                }
-            })
-            .unwrap_or_else(|| agent_identity.clone());
+        let (agent_identity, runtime_label) =
+            timeline_runtime_attribution_parts(turn.runtime_attribution.as_deref());
         let duration = format_compact_duration(
             turn.started_at_ms,
             turn.complete.then_some(turn.ended_at_ms).flatten(),
         );
+        let turn_id = turn.id.clone();
+        let copy_text = row.body.clone();
+        let fork_sequence = row.last_sequence;
+        let fork_available = fork_sequence > 0
+            && !self.fork_session_busy
+            && self.backend.as_ref().is_some_and(|backend| {
+                backend
+                    .capability_snapshot()
+                    .agent
+                    .supports(BackendOperation::AgentForkSession)
+            });
         Some(
             div()
                 .id(format!("agent-answer-metadata:{}", row.id))
@@ -6643,35 +6945,178 @@ impl MobileApp {
                 .mt_1()
                 .flex()
                 .items_center()
+                .justify_between()
                 .gap_2()
                 .text_size(px(theme::FONT_MICRO))
                 .text_color(theme::text_muted())
                 .child(
-                    svg()
-                        .path(agent_icon_path(&agent_identity))
-                        .size(px(theme::ICON_SM))
-                        .flex_shrink_0()
-                        .text_color(theme::text_muted()),
-                )
-                .child(
                     div()
                         .min_w_0()
                         .flex_1()
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
-                        .child(runtime_label),
+                        .flex()
+                        .items_center()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(
+                            svg()
+                                .path("icons/clock.svg")
+                                .size(px(theme::ICON_SM))
+                                .flex_shrink_0()
+                                .text_color(theme::text_muted()),
+                        )
+                        .child(div().flex_shrink_0().child(duration))
+                        .when_some(agent_identity.as_deref(), |left, identity| {
+                            left.child(
+                                svg()
+                                    .path(agent_icon_path(identity))
+                                    .size(px(theme::ICON_SM))
+                                    .flex_shrink_0()
+                                    .text_color(theme::text_muted()),
+                            )
+                        })
+                        .when_some(runtime_label, |left, runtime| {
+                            left.child(div().min_w_0().flex_1().whitespace_normal().child(runtime))
+                        }),
                 )
                 .child(
-                    svg()
-                        .path("icons/clock.svg")
-                        .size(px(theme::ICON_SM))
+                    div()
                         .flex_shrink_0()
-                        .text_color(theme::text_muted()),
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            timeline_action_button(
+                                format!("copy-answer:{}", row.id),
+                                "icons/copy.svg",
+                                locale::text("Copy", "复制", "複製"),
+                            )
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |_, _, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        copy_text.clone(),
+                                    ));
+                                }),
+                            ),
+                        )
+                        .when(turn.user_row.is_some(), |actions| {
+                            actions.child(
+                                timeline_action_button(
+                                    format!("scroll-to-user:{}", row.id),
+                                    "icons/user-arrow-up.svg",
+                                    locale::text(
+                                        "Scroll to User Message",
+                                        "滚动到用户消息",
+                                        "捲動到使用者訊息",
+                                    ),
+                                )
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.scroll_to_timeline_turn(&turn_id, cx);
+                                    }),
+                                ),
+                            )
+                        })
+                        .child(
+                            timeline_action_button(
+                                format!("fork-answer:{}", row.id),
+                                "icons/git-branch.svg",
+                                locale::text("Fork", "分叉会话", "分支會話"),
+                            )
+                            .when(fork_available, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.fork_session_at(fork_sequence, cx);
+                                        }),
+                                    )
+                            })
+                            .when(!fork_available, |button| button.opacity(0.4)),
+                        ),
                 )
-                .child(duration)
                 .into_any_element(),
         )
+    }
+
+    fn scroll_to_timeline_turn(&mut self, turn_id: &str, _cx: &mut Context<Self>) {
+        if let Some(index) = self
+            .timeline_turns
+            .iter()
+            .position(|turn| turn.id == turn_id)
+        {
+            self.timeline_list.scroll_to(ListOffset {
+                item_ix: index,
+                offset_in_item: px(0.0),
+            });
+        }
+    }
+
+    fn fork_session_at(&mut self, through_sequence: i64, cx: &mut Context<Self>) {
+        if self.fork_session_busy || through_sequence <= 0 {
+            return;
+        }
+        let Some(backend) = self.backend.clone().filter(|backend| {
+            backend
+                .capability_snapshot()
+                .agent
+                .supports(BackendOperation::AgentForkSession)
+        }) else {
+            self.error = Some(BackendError::unsupported(
+                "agent_session_fork_unavailable",
+                locale::text(
+                    "Session forking is unavailable on this desktop.",
+                    "此桌面端不支持分叉会话。",
+                    "此桌面版不支援分支工作階段。",
+                ),
+            ));
+            cx.notify();
+            return;
+        };
+        let Some(source_session_id) = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone())
+        else {
+            return;
+        };
+        self.fork_session_busy = true;
+        self.error = None;
+        let request = MutationRequest::new(ForkAgentSessionRequest {
+            source_session_id,
+            through_sequence,
+            expected_source_end_sequence: None,
+        });
+        let runner =
+            gpui_tokio::Tokio::spawn(cx, async move { backend.fork_session(request).await });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.fork_session_busy = false;
+                match outcome {
+                    Ok(session) => {
+                        let session_id = session.id.clone();
+                        this.notice = Some(
+                            locale::text(
+                                "Forked session created",
+                                "分叉会话已创建",
+                                "分支工作階段已建立",
+                            )
+                            .to_string(),
+                        );
+                        this.refresh_sessions(cx);
+                        this.open_session(session_id, cx);
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
     }
 
     fn render_thought_process_row(
@@ -6682,7 +7127,16 @@ impl MobileApp {
         if row.body.trim().is_empty() {
             return div().id(row.id.clone()).into_any_element();
         }
-        let expanded = self.timeline_row_expanded(&row.id);
+        let expanded = if self.collapsed_timeline_rows.contains(&row.id) {
+            false
+        } else if self.expanded_timeline_rows.contains(&row.id) {
+            true
+        } else {
+            row.kind == TimelineRowKind::Reasoning
+                && self
+                    .effective_timeline_display_settings()
+                    .reasoning_expanded_by_default
+        };
         let can_expand = row.collapsible;
         let row_id = row.id.clone();
         let tone = if row.failed {
@@ -6724,7 +7178,7 @@ impl MobileApp {
                     })
                     .child(
                         svg()
-                            .path(timeline_row_icon_path(row.kind))
+                            .path(self.timeline_row_icon_path_for_row(row))
                             .size(px(theme::ICON_SM))
                             .flex_shrink_0()
                             .text_color(tone),
@@ -6815,7 +7269,7 @@ impl MobileApp {
                     )
                     .child(
                         svg()
-                            .path(timeline_row_icon_path(latest_row.kind))
+                            .path(self.timeline_row_icon_path_for_row(latest_row))
                             .size(px(theme::ICON_SM))
                             .flex_shrink_0()
                             .text_color(rgb(timeline_row_color(latest_row))),
@@ -6910,7 +7364,7 @@ impl MobileApp {
                     })
                     .child(
                         svg()
-                            .path(timeline_row_icon_path(row.kind))
+                            .path(self.timeline_row_icon_path_for_row(row))
                             .size(px(theme::ICON_SM))
                             .flex_shrink_0()
                             .text_color(rgb(color)),
@@ -7165,7 +7619,7 @@ impl MobileApp {
                     })
                     .child(
                         svg()
-                            .path("icons/file-code.svg")
+                            .path("icons/file-text.svg")
                             .size(px(theme::ICON_SM))
                             .flex_shrink_0()
                             .text_color(rgb(theme::ACCENT_BLUE)),
@@ -7469,7 +7923,7 @@ impl MobileApp {
             .text_color(theme::text_muted())
             .child(
                 svg()
-                    .path(timeline_row_icon_path(row.kind))
+                    .path(self.timeline_row_icon_path_for_row(row))
                     .size(px(theme::ICON_SM))
                     .flex_shrink_0()
                     .text_color(theme::text_muted()),
@@ -10245,6 +10699,81 @@ fn settings_section_heading(label: &'static str) -> gpui::AnyElement {
         .into_any_element()
 }
 
+fn timeline_setting_bool_label(value: bool) -> String {
+    locale::text(
+        if value { "On" } else { "Off" },
+        if value { "开启" } else { "关闭" },
+        if value { "開啟" } else { "關閉" },
+    )
+    .to_string()
+}
+
+fn timeline_setting_switch(value: bool) -> gpui::Div {
+    let switch = div()
+        .w(px(36.0))
+        .h(px(20.0))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .rounded_full()
+        .p(px(2.0))
+        .bg(if value {
+            rgb(theme::ACCENT_GREEN)
+        } else {
+            rgb(theme::ACCENT_DIM)
+        });
+    let switch = if value {
+        switch.justify_end()
+    } else {
+        switch.justify_start()
+    };
+    switch.child(
+        div()
+            .size(px(16.0))
+            .rounded_full()
+            .bg(rgb(theme::TEXT_PRIMARY)),
+    )
+}
+
+fn timeline_setting_source_label(overridden: bool) -> String {
+    locale::text(
+        if overridden {
+            "Mobile override"
+        } else {
+            "Desktop setting"
+        },
+        if overridden {
+            "移动端单独设置"
+        } else {
+            "桌面端设置"
+        },
+        if overridden {
+            "行動端個別設定"
+        } else {
+            "桌面版設定"
+        },
+    )
+    .to_string()
+}
+
+fn timeline_reasoning_mode_label(mode: AgentTimelineReasoningDisplayMode) -> String {
+    locale::text(
+        match mode {
+            AgentTimelineReasoningDisplayMode::LatestAtBottom => "Latest at bottom",
+            AgentTimelineReasoningDisplayMode::Timeline => "In timeline",
+        },
+        match mode {
+            AgentTimelineReasoningDisplayMode::LatestAtBottom => "最新内容置底",
+            AgentTimelineReasoningDisplayMode::Timeline => "显示在时间线",
+        },
+        match mode {
+            AgentTimelineReasoningDisplayMode::LatestAtBottom => "最新內容置底",
+            AgentTimelineReasoningDisplayMode::Timeline => "顯示在時間線",
+        },
+    )
+    .to_string()
+}
+
 fn settings_info_row(
     id: &'static str,
     icon: &'static str,
@@ -10782,6 +11311,70 @@ impl MobileApp {
             .into_any_element()
     }
 
+    fn render_timeline_boolean_setting_row(
+        &self,
+        id: &'static str,
+        icon: &'static str,
+        title: &'static str,
+        value: bool,
+        overridden: bool,
+        setting: TimelineBooleanSetting,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let detail = format!(
+            "{} · {}",
+            timeline_setting_bool_label(value),
+            timeline_setting_source_label(overridden),
+        );
+        settings_info_row_base(
+            id,
+            icon,
+            locale::common(title).to_string(),
+            detail,
+            theme::text_muted(),
+        )
+        .cursor_pointer()
+        .active(|style| style.bg(theme::row_pressed_bg()))
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| this.toggle_timeline_boolean_setting(setting, cx)),
+        )
+        .child(timeline_setting_switch(value))
+        .into_any_element()
+    }
+
+    fn render_timeline_reasoning_setting_row(
+        &self,
+        mode: AgentTimelineReasoningDisplayMode,
+        overridden: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        settings_info_row_base(
+            "mobile-settings-reasoning-display",
+            "icons/brain.svg",
+            locale::text("Reasoning display", "推理显示方式", "推理顯示方式").to_string(),
+            format!(
+                "{} · {}",
+                timeline_reasoning_mode_label(mode),
+                timeline_setting_source_label(overridden),
+            ),
+            rgb(theme::ACCENT_PURPLE).into(),
+        )
+        .cursor_pointer()
+        .active(|style| style.bg(theme::row_pressed_bg()))
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| this.cycle_timeline_reasoning_display_mode(cx)),
+        )
+        .child(
+            svg()
+                .path("icons/chevron-right.svg")
+                .size(px(theme::ICON_SM))
+                .text_color(theme::text_muted()),
+        )
+        .into_any_element()
+    }
+
     fn render_settings(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let host_label = self.active_host_label();
         let host_url = self.active_host_url();
@@ -10794,6 +11387,24 @@ impl MobileApp {
         let connection_online = self.backend.as_ref().is_some_and(|backend| {
             backend.connection_state().state == RemoteConnectionState::Online
         });
+        let timeline_settings = self.effective_timeline_display_settings();
+        let timeline_override = self.active_timeline_display_override();
+        let has_timeline_override = timeline_override.is_some();
+        let show_generation_override = timeline_override
+            .and_then(|settings| settings.show_agent_generation_status)
+            .is_some();
+        let reasoning_mode_override = timeline_override
+            .and_then(|settings| settings.reasoning_display_mode)
+            .is_some();
+        let reasoning_expanded_override = timeline_override
+            .and_then(|settings| settings.reasoning_expanded_by_default)
+            .is_some();
+        let command_display_override = timeline_override
+            .and_then(|settings| settings.enhanced_command_execution_display)
+            .is_some();
+        let file_display_override = timeline_override
+            .and_then(|settings| settings.enhanced_file_operation_display)
+            .is_some();
         div()
             .absolute()
             .inset_0()
@@ -11006,6 +11617,95 @@ impl MobileApp {
                                     .size(px(theme::ICON_SM))
                                     .text_color(theme::text_muted()),
                             ),
+                    )
+                    .child(settings_section_heading("Session timeline"))
+                    .child(self.render_timeline_boolean_setting_row(
+                        "mobile-settings-show-generation",
+                        "icons/loader-circle.svg",
+                        "Agent generation status",
+                        timeline_settings.show_agent_generation_status,
+                        show_generation_override,
+                        TimelineBooleanSetting::ShowAgentGenerationStatus,
+                        cx,
+                    ))
+                    .child(self.render_timeline_reasoning_setting_row(
+                        timeline_settings.reasoning_display_mode,
+                        reasoning_mode_override,
+                        cx,
+                    ))
+                    .child(self.render_timeline_boolean_setting_row(
+                        "mobile-settings-reasoning-expanded",
+                        "icons/chevrons-down-up.svg",
+                        "Expand reasoning by default",
+                        timeline_settings.reasoning_expanded_by_default,
+                        reasoning_expanded_override,
+                        TimelineBooleanSetting::ReasoningExpandedByDefault,
+                        cx,
+                    ))
+                    .child(self.render_timeline_boolean_setting_row(
+                        "mobile-settings-command-cards",
+                        "icons/file-terminal.svg",
+                        "Command cards",
+                        timeline_settings.enhanced_command_execution_display,
+                        command_display_override,
+                        TimelineBooleanSetting::EnhancedCommandExecutionDisplay,
+                        cx,
+                    ))
+                    .child(self.render_timeline_boolean_setting_row(
+                        "mobile-settings-file-cards",
+                        "icons/file-code.svg",
+                        "File edit cards",
+                        timeline_settings.enhanced_file_operation_display,
+                        file_display_override,
+                        TimelineBooleanSetting::EnhancedFileOperationDisplay,
+                        cx,
+                    ))
+                    .child(
+                        settings_info_row_base(
+                            "mobile-settings-follow-desktop-timeline",
+                            "icons/rotate-ccw.svg",
+                            locale::text(
+                                "Use desktop timeline settings",
+                                "跟随桌面端时间线设置",
+                                "跟隨桌面版時間線設定",
+                            )
+                            .to_string(),
+                            if self.timeline_display_settings_sync_busy {
+                                locale::text("Syncing...", "同步中...", "同步中...").to_string()
+                            } else if has_timeline_override {
+                                locale::text(
+                                    "Clear mobile overrides",
+                                    "清除移动端单独设置",
+                                    "清除行動端個別設定",
+                                )
+                                .to_string()
+                            } else {
+                                locale::text(
+                                    "Already following desktop",
+                                    "当前跟随桌面端",
+                                    "目前跟隨桌面版",
+                                )
+                                .to_string()
+                            },
+                            theme::text_muted(),
+                        )
+                        .when(has_timeline_override, |row| {
+                            row.cursor_pointer()
+                                .active(|style| style.bg(theme::row_pressed_bg()))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.clear_timeline_display_overrides(cx)
+                                    }),
+                                )
+                        })
+                        .when(!has_timeline_override, |row| row.opacity(0.6))
+                        .child(
+                            svg()
+                                .path("icons/chevron-right.svg")
+                                .size(px(theme::ICON_SM))
+                                .text_color(theme::text_muted()),
+                        ),
                     )
                     .child(settings_section_heading("Appearance"))
                     .child(settings_info_row(
@@ -11777,6 +12477,24 @@ fn agent_icon_path(agent_id: &str) -> &'static str {
     }
 }
 
+fn timeline_runtime_attribution_parts(
+    attribution: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let Some(attribution) = attribution.map(str::trim).filter(|value| !value.is_empty()) else {
+        return (None, None);
+    };
+
+    let mut parts = attribution.split(" · ");
+    let identity = parts
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let runtime = parts.collect::<Vec<_>>().join(" · ");
+    let runtime = (!runtime.trim().is_empty()).then_some(runtime);
+
+    (identity.map(str::to_owned), runtime)
+}
+
 fn sidebar_project_icon_path(
     appearance: &vibex_desktop_model::SidebarProjectAppearance,
 ) -> &'static str {
@@ -11876,6 +12594,19 @@ fn session_sidebar_time_label_at(
 
 fn timeline_distance_to_bottom(offset_y: f32, max_offset_y: f32) -> f32 {
     (max_offset_y + offset_y).max(0.0)
+}
+
+fn timeline_process_activity_groups_for_display(
+    turn: &TimelineConversationTurn,
+    enhanced_command_display: bool,
+    enhanced_file_operation_display: bool,
+) -> &[TimelineProcessActivityGroup] {
+    match (enhanced_command_display, enhanced_file_operation_display) {
+        (true, true) => &turn.process_activity_groups,
+        (false, true) => &turn.process_activity_groups_with_commands,
+        (true, false) => &turn.process_activity_groups_with_file_operations,
+        (false, false) => &turn.process_activity_groups_with_commands_and_file_operations,
+    }
 }
 
 fn approval_response_label(
@@ -12032,7 +12763,7 @@ fn timeline_row_color(row: &TimelineRow) -> u32 {
 
 fn timeline_row_icon_path(kind: TimelineRowKind) -> &'static str {
     match kind {
-        TimelineRowKind::Reasoning => "icons/sparkles.svg",
+        TimelineRowKind::Reasoning => "icons/brain.svg",
         TimelineRowKind::Plan | TimelineRowKind::TodoUpdate => "icons/list-checks.svg",
         TimelineRowKind::ToolCall => "icons/zap.svg",
         TimelineRowKind::Command => "icons/file-terminal.svg",
@@ -12049,6 +12780,138 @@ fn timeline_row_icon_path(kind: TimelineRowKind) -> &'static str {
         | TimelineRowKind::ElicitationResolution => "icons/activity.svg",
         TimelineRowKind::UserMessage | TimelineRowKind::AgentMessage => "icons/message-square.svg",
     }
+}
+
+fn timeline_payload_icon_path(payload: &TimelinePayload) -> &'static str {
+    match payload {
+        TimelinePayload::UserMessage(_) | TimelinePayload::AgentMessageDelta(_) => {
+            "icons/message-square.svg"
+        }
+        TimelinePayload::AgentMessage(_) => "icons/message-square.svg",
+        TimelinePayload::Reasoning(_) => "icons/brain.svg",
+        TimelinePayload::Plan(_) => "icons/list-checks.svg",
+        TimelinePayload::ToolCall(tool) => timeline_tool_icon_path(&tool.tool_name, &tool.summary),
+        TimelinePayload::Command(_) => "icons/file-terminal.svg",
+        TimelinePayload::FileOperation(operation) => match operation.operation {
+            vibex_core::FileOperationKind::Read => "icons/book-open-text.svg",
+            vibex_core::FileOperationKind::Write => "icons/file-plus.svg",
+            vibex_core::FileOperationKind::Edit | vibex_core::FileOperationKind::Move => {
+                "icons/pencil.svg"
+            }
+            vibex_core::FileOperationKind::Delete => "icons/trash-2.svg",
+        },
+        TimelinePayload::WebSearch(_) => "icons/search.svg",
+        TimelinePayload::TodoUpdate(_) => "icons/list-checks.svg",
+        TimelinePayload::Collaboration(_) => "icons/user.svg",
+        TimelinePayload::ImageGeneration(_) => "icons/image.svg",
+        TimelinePayload::GitNotice(_) => "icons/git-branch.svg",
+        TimelinePayload::SystemNotice(_)
+        | TimelinePayload::PermissionResolution(_)
+        | TimelinePayload::ElicitationResolution(_) => "icons/activity.svg",
+        TimelinePayload::PermissionRequest(_) | TimelinePayload::ElicitationRequest(_) => {
+            "icons/triangle-alert.svg"
+        }
+        TimelinePayload::Retry(_) => "icons/rotate-ccw.svg",
+        TimelinePayload::Error(_) => "icons/triangle-alert.svg",
+    }
+}
+
+fn timeline_tool_icon_path(tool_name: &str, summary: &str) -> &'static str {
+    semantic_timeline_tool_icon_path(tool_name)
+        .or_else(|| semantic_timeline_tool_icon_path(summary))
+        .unwrap_or("icons/zap.svg")
+}
+
+fn semantic_timeline_tool_icon_path(value: &str) -> Option<&'static str> {
+    let terms = normalized_timeline_activity_terms(value);
+    let has_any = |candidates: &[&str]| {
+        terms
+            .split_whitespace()
+            .any(|term| candidates.contains(&term))
+    };
+
+    if has_any(&[
+        "command",
+        "execute",
+        "exec",
+        "shell",
+        "terminal",
+        "bash",
+        "powershell",
+        "run",
+        "ran",
+    ]) {
+        Some("icons/file-terminal.svg")
+    } else if has_any(&["search", "searched", "grep", "find", "query", "rg"]) {
+        Some("icons/search.svg")
+    } else if has_any(&[
+        "list",
+        "listed",
+        "glob",
+        "directory",
+        "directories",
+        "folder",
+        "folders",
+        "tree",
+    ]) {
+        Some("icons/folder.svg")
+    } else if has_any(&["delete", "deleted", "remove", "removed", "trash"]) {
+        Some("icons/trash-2.svg")
+    } else if has_any(&["create", "created", "write", "wrote", "add", "added", "new"]) {
+        Some("icons/file-plus.svg")
+    } else if has_any(&[
+        "edit", "edited", "patch", "patched", "replace", "replaced", "update", "updated",
+    ]) {
+        Some("icons/pencil.svg")
+    } else if has_any(&[
+        "read",
+        "view",
+        "viewed",
+        "open",
+        "opened",
+        "inspect",
+        "inspected",
+        "load",
+        "loaded",
+    ]) {
+        Some("icons/book-open-text.svg")
+    } else if has_any(&["todo", "plan", "checklist"]) {
+        Some("icons/list-checks.svg")
+    } else if has_any(&["agent", "collaboration", "delegate", "task"]) {
+        Some("icons/user.svg")
+    } else if has_any(&["image", "picture", "photo"]) {
+        Some("icons/image.svg")
+    } else if has_any(&["mcp", "plugin", "integration", "skill"]) {
+        Some("icons/plug-zap.svg")
+    } else {
+        None
+    }
+}
+
+fn normalized_timeline_activity_terms(value: &str) -> String {
+    let mut terms = String::with_capacity(value.len());
+    let mut previous_was_lower_or_digit = false;
+    let mut previous_was_separator = true;
+    for character in value.trim().chars() {
+        if character.is_ascii_alphanumeric() {
+            if character.is_ascii_uppercase()
+                && previous_was_lower_or_digit
+                && !previous_was_separator
+            {
+                terms.push(' ');
+            }
+            terms.push(character.to_ascii_lowercase());
+            previous_was_lower_or_digit =
+                character.is_ascii_lowercase() || character.is_ascii_digit();
+            previous_was_separator = false;
+        } else if !previous_was_separator && !terms.is_empty() {
+            terms.push(' ');
+            previous_was_lower_or_digit = false;
+            previous_was_separator = true;
+        }
+    }
+    terms.truncate(terms.trim_end().len());
+    terms
 }
 
 fn timeline_status_badge(label: String, color: u32) -> gpui::AnyElement {
@@ -12276,6 +13139,22 @@ mod tests {
         assert_eq!(format_compact_duration(1_000, Some(1_000)), "1s");
         assert_eq!(format_compact_duration(1_000, Some(62_000)), "1m 1s");
         assert_eq!(format_compact_duration(1_000, Some(3_661_000)), "1h 1m");
+    }
+
+    #[test]
+    fn timeline_tool_icon_prefers_tool_name_over_summary() {
+        assert_eq!(
+            timeline_tool_icon_path("read_file", "run command"),
+            "icons/book-open-text.svg"
+        );
+        assert_eq!(
+            timeline_tool_icon_path("custom_tool", "search files"),
+            "icons/search.svg"
+        );
+        assert_eq!(
+            timeline_tool_icon_path("custom_tool", "unclassified result"),
+            "icons/zap.svg"
+        );
     }
 
     struct DrawerScrollIsolationProbe {
