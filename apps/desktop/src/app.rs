@@ -4105,6 +4105,7 @@ pub struct VibexWorkbench {
     collapsed_project_restore: Option<BTreeSet<String>>,
     selected_session_id: Option<VibexSessionId>,
     pending_new_session: Option<PendingNewSession>,
+    pending_new_session_titles: HashMap<String, String>,
     pending_initial_turn_interrupts: BTreeMap<String, watch::Sender<bool>>,
     new_session_open: bool,
     new_session_draft_initialized: bool,
@@ -4818,6 +4819,7 @@ impl VibexWorkbench {
             collapsed_project_restore: None,
             selected_session_id,
             pending_new_session: None,
+            pending_new_session_titles: HashMap::new(),
             pending_initial_turn_interrupts: BTreeMap::new(),
             new_session_open: false,
             new_session_draft_initialized: false,
@@ -6481,6 +6483,29 @@ impl VibexWorkbench {
         changed
     }
 
+    /// While a freshly created session is still awaiting its seeded or
+    /// Agent-supplied title, snapshots carrying only the manager's default
+    /// fallback title must not clobber the optimistic prompt-derived title
+    /// the sidebar is already showing. `seed_auto_title` and ACP
+    /// `session_info_update` broadcasts carry non-fallback titles and pass
+    /// through unchanged; the first such broadcast releases the recorded
+    /// optimistic title so later manual renames and Agent titles always win.
+    fn reconcile_pending_new_session_title(&mut self, mut session: AgentSession) -> AgentSession {
+        if session.title != agent_session_fallback_title(&session.agent_id) {
+            self.pending_new_session_titles.remove(session.id.as_str());
+            return session;
+        }
+        let Some(optimistic_title) = self
+            .pending_new_session_titles
+            .get(session.id.as_str())
+            .cloned()
+        else {
+            return session;
+        };
+        session.title = optimistic_title;
+        session
+    }
+
     fn upsert_session_snapshot(&mut self, session: AgentSession) {
         if self
             .optimistically_removed_session_ids
@@ -6488,6 +6513,7 @@ impl VibexWorkbench {
         {
             return;
         }
+        let session = self.reconcile_pending_new_session_title(session);
         let snapshot_changed = self
             .sessions
             .iter()
@@ -16130,6 +16156,7 @@ impl VibexWorkbench {
         self.sessions.retain(|session| session.id != *session_id);
         self.optimistic_runtime_selections
             .remove(session_id.as_str());
+        self.pending_new_session_titles.remove(session_id.as_str());
         let interrupted = self
             .pending_initial_turn_interrupts
             .remove(session_id.as_str())
@@ -16719,7 +16746,7 @@ impl VibexWorkbench {
             id: optimistic_session_id.clone(),
             title: title
                 .clone()
-                .unwrap_or_else(|| format!("{} session", selection.agent_id)),
+                .unwrap_or_else(|| agent_session_fallback_title(&selection.agent_id)),
             project_id: optimistic_workspace
                 .as_ref()
                 .map(|workspace| workspace.project_id.clone())
@@ -16751,6 +16778,12 @@ impl VibexWorkbench {
             archived_at_ms: None,
             deleted_at_ms: None,
         };
+        if optimistic_session.title != agent_session_fallback_title(&selection.agent_id) {
+            self.pending_new_session_titles.insert(
+                optimistic_session_id.as_str().to_string(),
+                optimistic_session.title.clone(),
+            );
+        }
         let optimistic_message = has_initial_message.then(|| OptimisticUserMessage {
             session_id: optimistic_session_id.clone(),
             item_id: TimelineItemId::new(),
@@ -22706,6 +22739,10 @@ impl VibexWorkbench {
         let Some(folder_scope) = self.ui_state.sidebar.organization.folder_scope(&folder_id) else {
             return Empty.into_any_element();
         };
+        // Root-scoped folders can be nested under other root folders, but every
+        // level still shares the project column. Project/workspace-scoped
+        // folders instead share the session column.
+        let root_level_folder = folder_scope == SidebarOrganizationScope::Root;
         let folder_item = SidebarOrganizationItem::Folder(folder_id.clone());
         let drop_position = self.sidebar_organization_drop_position(&folder_item);
         let active_folder_drag = self
@@ -22730,6 +22767,9 @@ impl VibexWorkbench {
             .id(format!("sidebar-folder-row-{folder_id}"))
             .group(hover_group.clone())
             .relative()
+            .when(root_level_folder, |this| {
+                this.left(px(SIDEBAR_ROW_ICON_SLOT_OVERHANG))
+            })
             .h(px(32.0))
             .min_h(px(32.0))
             .w_full()
@@ -22924,8 +22964,11 @@ impl VibexWorkbench {
                     .size_full()
                     .min_w_0()
                     .items_center()
-                    // Match a sibling session's leading Agent logo and title.
-                    .gap(px(0.0))
+                    .gap(px(if root_level_folder {
+                        SIDEBAR_ICON_TITLE_GAP
+                    } else {
+                        0.0
+                    }))
                     .child(
                         h_flex()
                             .size(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))
@@ -40646,6 +40689,15 @@ fn session_title_from_first_message(message: &str) -> Option<String> {
     normalize_agent_session_title(message)
 }
 
+/// The manager persists a newly created session with this default title when
+/// the creation request carries no explicit title (the desktop keeps the
+/// prompt-derived title unlocked so a later ACP title can replace it). Keep a
+/// single source of truth for the desktop so optimistic titles can recognize
+/// — and outlast — the fallback snapshot.
+fn agent_session_fallback_title(agent_id: impl std::fmt::Display) -> String {
+    format!("{agent_id} session")
+}
+
 fn title_bar_session_context_visible(
     active_tab: &str,
     new_session_open: bool,
@@ -51937,9 +51989,17 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_project("))
             .map(|(body, _)| body)
             .expect("folder renderer should remain inspectable");
-        assert!(!folder.contains(".left(px(SIDEBAR_ROW_ICON_SLOT_OVERHANG))"));
-        assert!(!folder.contains("root_level_folder"));
-        assert!(folder.contains(".gap(px(0.0))"));
+        assert!(
+            folder.contains(
+                "let root_level_folder = folder_scope == SidebarOrganizationScope::Root;"
+            )
+        );
+        assert!(folder.contains(
+            ".when(root_level_folder, |this| {\n                this.left(px(SIDEBAR_ROW_ICON_SLOT_OVERHANG))"
+        ));
+        assert!(folder.contains(
+            ".gap(px(if root_level_folder {\n                        SIDEBAR_ICON_TITLE_GAP\n                    } else {\n                        0.0\n                    }))"
+        ));
         assert!(!folder.contains(".pl(px(16.0))"));
         assert!(folder.contains(
             ".size(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))\n                            .flex_none()\n                            .items_center()\n                            .justify_center()"
@@ -55804,6 +55864,37 @@ mod tests {
     }
 
     #[test]
+    fn agent_session_fallback_title_matches_the_manager_default() {
+        assert_eq!(agent_session_fallback_title("codex"), "codex session");
+    }
+
+    #[test]
+    fn new_session_snapshots_keep_the_optimistic_title_until_a_real_title_arrives() {
+        let source = include_str!("app.rs");
+        let upsert = source
+            .split_once("    fn upsert_session_snapshot(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn session_turn_pending("))
+            .map(|(body, _)| body)
+            .expect("session snapshot upsert should remain inspectable");
+        assert!(upsert.contains("self.reconcile_pending_new_session_title(session);"));
+
+        let reconcile = source
+            .split_once("    fn reconcile_pending_new_session_title(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn upsert_session_snapshot("))
+            .map(|(body, _)| body)
+            .expect("pending-title reconciliation should remain inspectable");
+        assert!(reconcile.contains("agent_session_fallback_title(&session.agent_id)"));
+        assert!(reconcile.contains("pending_new_session_titles"));
+
+        let submit = source
+            .split_once("    fn submit_new_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn choose_runtime_selection("))
+            .map(|(body, _)| body)
+            .expect("new-session submission should remain inspectable");
+        assert!(submit.contains("pending_new_session_titles"));
+    }
+
+    #[test]
     fn collapse_all_restores_by_snapshot_even_if_the_collapsed_set_changes() {
         let project_ids = ["workspace-a", "workspace-b"]
             .into_iter()
@@ -57089,8 +57180,17 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_project("))
             .map(|(body, _)| body)
             .expect("sidebar folder renderer should remain inspectable");
-        assert!(folder.contains(".gap(px(0.0))"));
-        assert!(!folder.contains("root_level_folder"));
+        assert!(
+            folder.contains(
+                "let root_level_folder = folder_scope == SidebarOrganizationScope::Root;"
+            )
+        );
+        assert!(folder.contains(
+            ".when(root_level_folder, |this| {\n                this.left(px(SIDEBAR_ROW_ICON_SLOT_OVERHANG))"
+        ));
+        assert!(folder.contains(
+            ".gap(px(if root_level_folder {\n                        SIDEBAR_ICON_TITLE_GAP\n                    } else {\n                        0.0\n                    }))"
+        ));
         assert!(!folder.contains(".pl(px(16.0))"));
         assert!(folder.contains(
             ".size(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))\n                            .flex_none()\n                            .items_center()\n                            .justify_center()"
