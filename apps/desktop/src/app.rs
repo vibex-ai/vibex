@@ -6500,11 +6500,27 @@ impl VibexWorkbench {
     /// fallback title must not clobber the optimistic prompt-derived title
     /// the sidebar is already showing. `seed_auto_title` and ACP
     /// `session_info_update` broadcasts carry non-fallback titles and pass
-    /// through unchanged; the first such broadcast releases the recorded
-    /// optimistic title so later manual renames and Agent titles always win.
+    /// through unchanged; the first such authoritative update releases the
+    /// recorded optimistic title so later manual renames and Agent titles
+    /// always win. The optimistic row itself is also a non-fallback snapshot,
+    /// but it is a fresh insert for a session the backend has never reported
+    /// — releasing there would drop the record before the fallback ever
+    /// arrives, so only snapshots that update an already-known row release it.
     fn reconcile_pending_new_session_title(&mut self, mut session: AgentSession) -> AgentSession {
-        if session.title != agent_session_fallback_title(&session.agent_id) {
-            self.pending_new_session_titles.remove(session.id.as_str());
+        let is_fallback = session.title == agent_session_fallback_title(&session.agent_id);
+        let known_row = self
+            .sessions
+            .iter()
+            .any(|existing| existing.id == session.id);
+        if !is_fallback {
+            // An authoritative update (the seeded prompt title or an
+            // Agent-supplied title) releases the record. The optimistic
+            // new-session row is the first non-fallback snapshot for its id
+            // and arrives as a fresh insert; releasing there would drop the
+            // record before the manager's fallback snapshot ever arrives.
+            if known_row {
+                self.pending_new_session_titles.remove(session.id.as_str());
+            }
             return session;
         }
         let Some(optimistic_title) = self
@@ -18355,6 +18371,8 @@ impl VibexWorkbench {
             .retain(|session_id, _| !session_ids.contains(session_id));
         self.agent_session_view_lru
             .retain(|session_id| !session_ids.contains(session_id));
+        self.pending_new_session_titles
+            .retain(|session_id, _| !session_ids.contains(session_id));
         self.pending_agent_turn_session_ids
             .retain(|session_id| !session_ids.contains(session_id));
         self.unread_agent_completion_session_ids
@@ -56066,6 +56084,10 @@ mod tests {
             .expect("pending-title reconciliation should remain inspectable");
         assert!(reconcile.contains("agent_session_fallback_title(&session.agent_id)"));
         assert!(reconcile.contains("pending_new_session_titles"));
+        // The optimistic new-session row is itself a non-fallback snapshot;
+        // releasing the recorded title on any non-fallback title would drop
+        // the record before the manager's fallback snapshot ever arrives.
+        assert!(reconcile.contains("existing.id == session.id"));
 
         let submit = source
             .split_once("    fn submit_new_session(")
