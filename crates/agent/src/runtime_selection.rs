@@ -23,6 +23,7 @@ use vibex_db::{
     open_database,
 };
 
+use crate::adapter::ProviderEvent;
 use crate::runtime_switch::{
     RuntimeSwitchCoordinator, RuntimeSwitchReconcileReport, RuntimeSwitchRequest,
 };
@@ -56,6 +57,7 @@ impl fmt::Debug for ResolvedRuntimeSelection {
 pub struct ResolvedInitialRuntimeSelection {
     pub binding: RuntimeBinding,
     pub selection: SessionRuntimeSelection,
+    pub initial_events: Vec<ProviderEvent>,
 }
 
 #[async_trait]
@@ -74,6 +76,23 @@ pub trait RuntimeSelectionResolver: Send + Sync {
         Err(VibexError::capability(
             "runtime_selection_initialization_unsupported",
             "current runtime selection cannot be materialized by this runtime",
+        ))
+    }
+
+    /// Loads an existing native session and returns the durable binding that
+    /// should become the first runtime for a new logical Vibex session. The
+    /// native handle is deliberately passed separately from the product
+    /// selection so it can never become a client-facing session identity.
+    async fn resolve_imported(
+        &self,
+        _session_id: &VibexSessionId,
+        _selection: &SessionRuntimeSelection,
+        _native_session_id: &str,
+        _additional_workspace_roots: &[String],
+    ) -> VibexResult<ResolvedInitialRuntimeSelection> {
+        Err(VibexError::capability(
+            "runtime_selection_import_unsupported",
+            "native session import is not supported by this runtime",
         ))
     }
 
@@ -213,6 +232,70 @@ impl RuntimeSelectionService {
         let event = self.emit_authoritative(session_id)?;
         self.start_watcher(&record)?;
         Ok(event.state)
+    }
+
+    /// Attaches an existing native ACP session as the first runtime of a new
+    /// logical session. This path intentionally bypasses the fresh-session
+    /// switch strategy: the ACP adapter has already performed `session/load`,
+    /// and the returned attachment is persisted as the initial current binding.
+    pub async fn initialize_imported_session(
+        &self,
+        session_id: &VibexSessionId,
+        desired: SessionRuntimeSelection,
+        native_session_id: &str,
+        additional_workspace_roots: &[String],
+    ) -> VibexResult<(AgentSessionRuntimeSelectionState, Vec<ProviderEvent>)> {
+        let native_session_id = native_session_id.trim();
+        if native_session_id.is_empty() {
+            return Err(VibexError::validation(
+                "runtime_selection_import_native_session_id_empty",
+                "native session import requires a non-empty native session id",
+            ));
+        }
+        let durable = self.required_runtime_state(session_id)?;
+        let initialized_fields = [
+            durable.current_binding_id.is_some(),
+            durable.desired_runtime_selection.is_some(),
+            durable.effective_runtime_selection.is_some(),
+            durable.runtime_selection_status.is_some(),
+        ];
+        if initialized_fields.iter().any(|initialized| *initialized)
+            || durable.pending_switch_id.is_some()
+            || durable.selection_revision != 0
+        {
+            return Err(VibexError::conflict(
+                "runtime_selection_import_already_initialized",
+                "Agent session runtime selection is already initialized",
+            ));
+        }
+        let resolved = self
+            .inner
+            .resolver
+            .resolve_imported(
+                session_id,
+                &desired,
+                native_session_id,
+                additional_workspace_roots,
+            )
+            .await?;
+        if &resolved.binding.session_id != session_id {
+            return Err(VibexError::conflict(
+                "runtime_selection_initial_session_mismatch",
+                "resolved imported runtime binding belongs to another logical session",
+            ));
+        }
+        {
+            let mut conn = open_database(self.inner.coordinator.database_path())?;
+            AgentSessionRuntimeRepository::initialize_runtime_selection(
+                &mut conn,
+                &resolved.binding,
+                &resolved.selection,
+            )?;
+        }
+        Ok((
+            self.emit_authoritative(session_id)?.state,
+            resolved.initial_events,
+        ))
     }
 
     async fn enqueue_initial_runtime_switch(
@@ -1822,6 +1905,7 @@ mod tests {
             .set_initial(Some(ResolvedInitialRuntimeSelection {
                 binding: binding.clone(),
                 selection: env.effective.clone(),
+                initial_events: Vec::new(),
             }));
         drop(conn);
 

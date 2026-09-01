@@ -372,7 +372,7 @@ fn infer_image_mime_type(path: &str) -> Option<String> {
     Some(mime_type.to_string())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderEvent {
     pub source: TimelineSource,
     pub payload: TimelinePayload,

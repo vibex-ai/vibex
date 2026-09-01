@@ -33,6 +33,7 @@ use agent_client_protocol_schema::v1::{
     StringFormat as AcpStringFormat,
 };
 use async_trait::async_trait;
+use chrono::DateTime;
 use command_group::AsyncCommandGroup;
 use command_group::AsyncGroupChild;
 use serde_json::{Value, json};
@@ -294,6 +295,9 @@ pub(crate) const PROBE_ENV: &[(&str, &str)] = &[
 /// Session-update kinds that are intentionally ignored without emitting an
 /// "unknown event" notice into the timeline.
 const IGNORED_SESSION_UPDATE_KINDS: &[&str] = &["user_message_chunk", "current_model_update"];
+const ACP_SESSION_REPLAY_EVENT_LIMIT: usize = 512;
+const ACP_SESSION_REPLAY_BYTES_LIMIT: usize = 4 * 1024 * 1024;
+const ACP_SESSION_LIST_PAGE_LIMIT: usize = 128;
 
 #[derive(Debug, Clone)]
 struct AcpRpcFailure {
@@ -672,9 +676,15 @@ fn build_session_new_params(cwd: &Path, mcp_servers: &[AcpMcpServerDescriptor]) 
 fn build_session_load_params(
     native_session_id: &str,
     cwd: &Path,
+    additional_directories: &[PathBuf],
     mcp_servers: &[AcpMcpServerDescriptor],
 ) -> Value {
-    protocol::build_session_load_params(native_session_id, cwd, mcp_servers_json(mcp_servers))
+    protocol::build_session_load_params(
+        native_session_id,
+        cwd,
+        additional_directories,
+        mcp_servers_json(mcp_servers),
+    )
 }
 
 fn resolve_acp_mcp_descriptors(
@@ -820,6 +830,29 @@ fn acp_fs_write_roots(cwd: &Path, env_overlays: &[(String, String)]) -> Vec<Path
         }
     }
     roots
+}
+
+fn normalize_additional_workspace_roots(cwd: &Path, roots: &[String]) -> VibexResult<Vec<PathBuf>> {
+    let mut seen = BTreeSet::new();
+    let mut normalized = Vec::new();
+    for raw in roots {
+        let value = raw.trim();
+        if value.is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(value);
+        if !path.is_absolute() {
+            return Err(VibexError::validation(
+                "acp_additional_workspace_relative",
+                "ACP additional workspace roots must be absolute paths",
+            ));
+        }
+        if path == cwd || !seen.insert(path.clone()) {
+            continue;
+        }
+        normalized.push(path);
+    }
+    Ok(normalized)
 }
 
 fn mcp_servers_json(mcp_servers: &[AcpMcpServerDescriptor]) -> Value {
@@ -1127,6 +1160,7 @@ enum TurnSink {
 
 struct ActiveTurn {
     sink: TurnSink,
+    history_replay: bool,
     retry_scope: u64,
     retry_progress: BTreeMap<RetryKind, AcpRetrySignal>,
     // Terminal retry observations must survive late stream updates. ACP agents
@@ -1921,6 +1955,7 @@ struct AcpSessionAttachment {
     binding_id: RuntimeBindingId,
     activation_generation: AtomicI64,
     state: Mutex<AcpAttachmentShared>,
+    history_events: Mutex<Vec<AcpEvent>>,
     crash_receiver: Mutex<Option<broadcast::Receiver<AcpProcessCrash>>>,
     crash_watcher: Mutex<Option<tokio::task::AbortHandle>>,
     /// Tails the agent's native transcript for work that never reaches the
@@ -2042,6 +2077,13 @@ struct OpenedAcpSession {
     native_session_id: String,
     state: AcpAttachmentShared,
     registration_barrier: Option<AcpRegistrationBarrier>,
+    replay_params: Vec<Value>,
+}
+
+#[derive(Default)]
+struct PendingSessionReplay {
+    events: VecDeque<Value>,
+    bytes: usize,
 }
 
 struct AcpRegistrationBarrier {
@@ -2183,7 +2225,7 @@ pub(crate) struct AcpProcess {
     workspace_root: PathBuf,
     /// Roots the agent may write into through `fs/write_text_file`. Reads stay
     /// unrestricted on purpose (see `host_fs`).
-    fs_write_roots: Vec<PathBuf>,
+    fs_write_roots: Mutex<Vec<PathBuf>>,
     /// How this agent records work that never reaches the ACP wire, and the
     /// state home it records it in. `None` means the runtime has no parser for
     /// the agent's native store and the wire is the only source of events.
@@ -2219,6 +2261,7 @@ pub(crate) struct AcpProcess {
     /// one session.
     probe_initial_config_update: Mutex<Option<oneshot::Sender<Value>>>,
     pending_available_commands: Mutex<PendingAvailableCommandCatalogs>,
+    pending_session_replays: Mutex<HashMap<String, PendingSessionReplay>>,
     active_terminal_owners: Mutex<HashMap<TerminalId, Weak<AcpSessionAttachment>>>,
     request_admission: Mutex<()>,
     shared: Mutex<ProcessShared>,
@@ -2369,6 +2412,7 @@ impl AcpSessionAttachment {
             native_session_id,
             mut state,
             registration_barrier,
+            replay_params,
         } = opened;
         lease.process().normalize_attachment_models(&mut state);
         let attachment = Self {
@@ -2378,14 +2422,74 @@ impl AcpSessionAttachment {
             binding_id,
             activation_generation: AtomicI64::new(activation_generation),
             state: Mutex::new(state),
+            history_events: Mutex::new(Vec::new()),
             crash_receiver: Mutex::new(Some(crash_receiver)),
             crash_watcher: Mutex::new(None),
             transcript_watcher: Mutex::new(None),
             transcript_state: Mutex::new(None),
             registration_barrier: Mutex::new(registration_barrier),
         };
+        attachment.replay_history(replay_params);
         attachment.publish_profile_config_evidence();
         attachment
+    }
+
+    fn replay_history(&self, params: Vec<Value>) {
+        if params.is_empty() || self.begin_history_replay().is_err() {
+            return;
+        }
+        let mut replayed_events = Vec::new();
+        let mut turn_has_response = false;
+        for params in params {
+            let kind = params
+                .get("update")
+                .and_then(|update| update.get("sessionUpdate"))
+                .and_then(Value::as_str);
+            if kind == Some("user_message_chunk") && turn_has_response {
+                if let Ok(events) = self.finish_turn(turn_has_response) {
+                    replayed_events.extend(events);
+                }
+                if self.begin_history_replay().is_err() {
+                    break;
+                }
+                turn_has_response = false;
+            }
+            self.handle_session_update(&params);
+            if kind.is_some_and(|kind| {
+                !matches!(
+                    kind,
+                    "user_message_chunk"
+                        | "session_info_update"
+                        | "available_commands_update"
+                        | "current_mode_update"
+                        | "config_option_update"
+                        | "config_options_update"
+                        | "usage_update"
+                        | "token_usage"
+                )
+            }) {
+                turn_has_response = true;
+            }
+        }
+        let Ok(events) = self.finish_turn(turn_has_response) else {
+            return;
+        };
+        replayed_events.extend(events);
+        // ACP commonly sends a user message in several adjacent chunks. Keep
+        // those chunks as one Vibex timeline row while preserving turn order.
+        let mut coalesced = Vec::with_capacity(replayed_events.len());
+        for event in replayed_events {
+            match (coalesced.last_mut(), &event) {
+                (
+                    Some(AcpEvent::UserMessage { text: previous }),
+                    AcpEvent::UserMessage { text: current },
+                ) => previous.push_str(current),
+                _ => coalesced.push(event),
+            }
+        }
+        if let Ok(mut history) = self.history_events.lock() {
+            *history = coalesced;
+        }
     }
 
     fn release_registration_barrier(&self) {
@@ -2549,6 +2653,7 @@ impl AcpSessionAttachment {
         };
         state.active_turn = Some(ActiveTurn {
             sink,
+            history_replay: false,
             retry_scope,
             retry_progress: BTreeMap::new(),
             retry_exhausted: BTreeMap::new(),
@@ -2576,6 +2681,53 @@ impl AcpSessionAttachment {
             assistant_segment_phase: None,
         });
         Ok(())
+    }
+
+    fn begin_history_replay(&self) -> VibexResult<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| lock_poisoned_error("attachmentState"))?;
+        if state.active_turn.is_some() {
+            return Err(VibexError::conflict(
+                "acp_turn_already_running",
+                "ACP session already has an active turn",
+            ));
+        }
+        state.recent_usage_turn = None;
+        state.next_retry_scope = state.next_retry_scope.wrapping_add(1);
+        let retry_scope = state.next_retry_scope;
+        state.active_turn = Some(ActiveTurn {
+            sink: TurnSink::Buffer(Vec::new()),
+            history_replay: true,
+            retry_scope,
+            retry_progress: BTreeMap::new(),
+            retry_exhausted: BTreeMap::new(),
+            usage: None,
+            chunk_index: 0,
+            codex_reconnect: None,
+            codex_terminal_error: None,
+            provider_terminal_error: None,
+            opencode_stream_error_count: 0,
+            opencode_stream_error_epoch: 0,
+            latest_opencode_stream_error: None,
+            opencode_stream_error_watchdog: None,
+            opencode_stream_progress_seen: false,
+            assistant_text: String::new(),
+            assistant_text_truncated: false,
+            assistant_segment: String::new(),
+            assistant_segment_truncated: false,
+            assistant_segment_phase: None,
+        });
+        Ok(())
+    }
+
+    fn history_replay_active(&self) -> bool {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.active_turn.as_ref().map(|turn| turn.history_replay))
+            .unwrap_or(false)
     }
 
     fn mark_turn_dispatched(&self, dispatched_at_ms: i64) -> VibexResult<()> {
@@ -3930,12 +4082,19 @@ impl AcpSessionAttachment {
                 });
             }
         }
+        let history_events = self
+            .history_events
+            .lock()
+            .ok()
+            .map(|mut events| std::mem::take(&mut *events))
+            .unwrap_or_default();
         AcpSession {
             native_session_id: Some(self.native_session_id.clone()),
             native_thread_id: None,
             native_resume_token: None,
             session_config_state,
             redacted_metadata: metadata,
+            history_events,
         }
     }
 
@@ -4081,6 +4240,12 @@ impl AcpSessionAttachment {
                         text,
                         is_final: false,
                     });
+                }
+            }
+            "user_message_chunk" if self.history_replay_active() => {
+                let text = content_block_text(update.get("content"));
+                if !text.is_empty() {
+                    self.emit_turn_event(AcpEvent::UserMessage { text });
                 }
             }
             "tool_call" | "tool_call_update" => {
@@ -4827,6 +4992,73 @@ impl AcpProcess {
             .lock()
             .ok()
             .and_then(|mut pending| pending.take(native_session_id))
+    }
+
+    fn begin_session_replay_capture(&self, native_session_id: &str) {
+        let native_session_id = native_session_id.trim();
+        if native_session_id.is_empty() {
+            return;
+        }
+        if let Ok(mut pending) = self.pending_session_replays.lock() {
+            pending.insert(
+                native_session_id.to_string(),
+                PendingSessionReplay::default(),
+            );
+        }
+    }
+
+    fn capture_session_replay(&self, params: &Value) -> bool {
+        let Some(native_session_id) = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return false;
+        };
+        let Ok(mut pending) = self.pending_session_replays.lock() else {
+            return false;
+        };
+        let Some(replay) = pending.get_mut(native_session_id) else {
+            return false;
+        };
+        let Ok(event_bytes) = serde_json::to_vec(params) else {
+            return true;
+        };
+        if event_bytes.len() > ACP_SESSION_REPLAY_BYTES_LIMIT {
+            // Consume oversized notifications rather than routing them to an
+            // unregistered session. The bounded cache is a protection against
+            // a provider replaying arbitrarily large native payloads.
+            return true;
+        }
+        while replay.events.len() >= ACP_SESSION_REPLAY_EVENT_LIMIT
+            || replay.bytes.saturating_add(event_bytes.len()) > ACP_SESSION_REPLAY_BYTES_LIMIT
+        {
+            let Some(oldest) = replay.events.pop_front() else {
+                break;
+            };
+            if let Ok(oldest_bytes) = serde_json::to_vec(&oldest) {
+                replay.bytes = replay.bytes.saturating_sub(oldest_bytes.len());
+            }
+        }
+        replay.bytes = replay.bytes.saturating_add(event_bytes.len());
+        replay.events.push_back(params.clone());
+        true
+    }
+
+    fn take_session_replay(&self, native_session_id: &str) -> Vec<Value> {
+        self.pending_session_replays
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.remove(native_session_id))
+            .map(|replay| replay.events.into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    fn clear_session_replay(&self, native_session_id: &str) {
+        if let Ok(mut pending) = self.pending_session_replays.lock() {
+            pending.remove(native_session_id);
+        }
     }
 
     fn clear_pending_prompt_for_session(&self, native_session_id: &str) {
@@ -5889,7 +6121,17 @@ impl AcpProcess {
         };
         // Containment is decided before the operation is queued: a denied
         // write must not consume a permit or wait behind other work.
-        let target = match resolve_contained_write_path(Path::new(path), &self.fs_write_roots) {
+        let target = match self
+            .fs_write_roots
+            .lock()
+            .map_err(|_| {
+                VibexError::process(
+                    "acp_fs_write_roots_unavailable",
+                    "ACP writable roots are unavailable",
+                )
+            })
+            .and_then(|roots| resolve_contained_write_path(Path::new(path), &roots))
+        {
             Ok(target) => target,
             Err(error) => {
                 self.respond_error(rpc_id, -32602, &error.message);
@@ -5902,6 +6144,17 @@ impl AcpProcess {
                 .map(|()| Value::Null)
                 .map_err(|error| (-32603, error.message.to_string()))
         });
+    }
+
+    fn add_fs_write_roots(&self, roots: &[PathBuf]) {
+        let Ok(mut writable_roots) = self.fs_write_roots.lock() else {
+            return;
+        };
+        for root in roots {
+            if !writable_roots.contains(root) {
+                writable_roots.push(root.clone());
+            }
+        }
     }
 
     fn handle_terminal_create(self: &Arc<Self>, rpc_id: Value, params: &Value) {
@@ -6105,6 +6358,9 @@ impl AcpProcess {
 
     fn handle_session_update(&self, params: &Value) {
         if self.capture_probe_config_update(params) {
+            return;
+        }
+        if self.capture_session_replay(params) {
             return;
         }
         let is_available_commands_update = params
@@ -8082,7 +8338,105 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
             &payload.lease,
             &attachment,
         )?;
-        Ok(ResolvedInitialRuntimeSelection { binding, selection })
+        Ok(ResolvedInitialRuntimeSelection {
+            binding,
+            selection,
+            initial_events: Vec::new(),
+        })
+    }
+
+    async fn resolve_imported(
+        &self,
+        session_id: &VibexSessionId,
+        selection: &SessionRuntimeSelection,
+        native_session_id: &str,
+        additional_workspace_roots: &[String],
+    ) -> VibexResult<ResolvedInitialRuntimeSelection> {
+        let native_session_id = native_session_id.trim();
+        if native_session_id.is_empty() {
+            return Err(VibexError::validation(
+                "acp_import_session_id_missing",
+                "ACP import requires a native session id",
+            ));
+        }
+        let context = self.target_context(session_id, selection)?;
+        let provider_profile_id = selection.provider_profile_id().cloned().ok_or_else(|| {
+            VibexError::validation(
+                "acp_import_provider_profile_missing",
+                "ACP native session import requires a Provider Profile",
+            )
+        })?;
+
+        // `AcpRuntimeClient::import_session` owns process startup, capability
+        // probing, native `session/load`, and attachment registration. Reuse
+        // that boundary here so imported sessions enter the same attachment
+        // registry as newly-created and restored sessions.
+        let acp_session = self
+            .client
+            .import_session(AcpImportSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id,
+                native_session_id: Some(native_session_id.to_string()),
+                workspace_root: context.cwd.to_string_lossy().into_owned(),
+                additional_workspace_roots: additional_workspace_roots.to_vec(),
+                runtime_resources: context.runtime_resources.clone(),
+            })
+            .await?;
+
+        let attachment = self.client.current_attachment(session_id).ok_or_else(|| {
+            VibexError::conflict(
+                "runtime_selection_import_attachment_missing",
+                "ACP import loaded a native session without registering an attachment",
+            )
+        })?;
+        if attachment.state()? != SessionAttachmentState::Committed {
+            return Err(VibexError::conflict(
+                "runtime_selection_import_attachment_uncommitted",
+                "ACP imported session attachment is not committed",
+            ));
+        }
+        if attachment.fence().native_session_id != native_session_id {
+            return Err(VibexError::conflict(
+                "runtime_selection_import_native_session_mismatch",
+                "ACP imported attachment does not match the requested native session",
+            ));
+        }
+
+        // The native session may report the model it was created with. Keep
+        // that value in the product selection so the first durable binding is
+        // internally consistent even when the profile's default changed.
+        let mut effective_selection = selection.clone();
+        if let Some(model_id) = attachment
+            .payload()
+            .runtime_config_state()
+            .effective_model
+            .filter(|model| !model.trim().is_empty())
+        {
+            effective_selection.model = RuntimeModelSelection::explicit(model_id);
+        }
+        let adapter_id = self
+            .client
+            .route_key_for_agent(&effective_selection.agent_id)
+            .adapter_id;
+        let binding = self.build_runtime_binding_for_attachment(
+            session_id,
+            &effective_selection,
+            &adapter_id,
+            BindingState::Current,
+            None,
+            &context,
+            &attachment.payload().lease,
+            &attachment,
+        )?;
+        Ok(ResolvedInitialRuntimeSelection {
+            binding,
+            selection: effective_selection,
+            initial_events: acp_session
+                .history_events
+                .into_iter()
+                .map(|event| crate::map_acp_event(session_id.clone(), event))
+                .collect(),
+        })
     }
 
     async fn materialize_current_runtime(&self, session_id: &VibexSessionId) -> VibexResult<()> {
@@ -11918,7 +12272,7 @@ impl AcpRuntimeClient {
             compatibility_identity: adapter_identity.compatibility_identity,
             event_enricher: adapter_identity.event_enricher,
             workspace_root: cwd.to_path_buf(),
-            fs_write_roots: acp_fs_write_roots(cwd, &spawn_env_overlays),
+            fs_write_roots: Mutex::new(acp_fs_write_roots(cwd, &spawn_env_overlays)),
             transcript_strategy,
             transcript_home: claude_config_home(&spawn_env_overlays),
             fs_operation_permits: Arc::new(tokio::sync::Semaphore::new(
@@ -11937,6 +12291,7 @@ impl AcpRuntimeClient {
             probe_config_update_waiters: Mutex::new(HashMap::new()),
             probe_initial_config_update: Mutex::new(None),
             pending_available_commands: Mutex::new(PendingAvailableCommandCatalogs::default()),
+            pending_session_replays: Mutex::new(HashMap::new()),
             active_terminal_owners: Mutex::new(HashMap::new()),
             request_admission: Mutex::new(()),
             shared: Mutex::new(ProcessShared::default()),
@@ -12295,6 +12650,7 @@ impl AcpRuntimeClient {
             native_session_id,
             state,
             registration_barrier,
+            replay_params: Vec::new(),
         })
     }
 
@@ -12349,6 +12705,7 @@ impl AcpRuntimeClient {
             native_session_id: native_session_id.to_string(),
             state,
             registration_barrier: Some(registration_barrier),
+            replay_params: Vec::new(),
         })
     }
 
@@ -12357,9 +12714,23 @@ impl AcpRuntimeClient {
         process: &Arc<AcpProcess>,
         native_session_id: &str,
     ) -> VibexResult<OpenedAcpSession> {
+        self.load_existing_session_for_attachment_with_directories(process, native_session_id, &[])
+            .await
+    }
+
+    async fn load_existing_session_for_attachment_with_directories(
+        &self,
+        process: &Arc<AcpProcess>,
+        native_session_id: &str,
+        additional_directories: &[PathBuf],
+    ) -> VibexResult<OpenedAcpSession> {
         let started = Instant::now();
         let result = self
-            .load_existing_session_for_attachment_inner(process, native_session_id)
+            .load_existing_session_for_attachment_inner(
+                process,
+                native_session_id,
+                additional_directories,
+            )
             .await;
         self.record_session_open(
             process,
@@ -12374,19 +12745,39 @@ impl AcpRuntimeClient {
         &self,
         process: &Arc<AcpProcess>,
         native_session_id: &str,
+        additional_directories: &[PathBuf],
     ) -> VibexResult<OpenedAcpSession> {
-        let (result, registration_barrier) = process
+        // ACP agents replay the native transcript as session/update
+        // notifications while session/load is in flight. The attachment is
+        // not registered until the load response is validated, so capture the
+        // bounded raw notifications first and replay them after registration.
+        process.begin_session_replay_capture(native_session_id);
+        let request = process
             .request_with_registration_barrier(
                 AcpOperation::SessionLoad.method(),
                 build_session_load_params(
                     native_session_id,
                     &process.workspace_root,
+                    additional_directories,
                     &process.wire_mcp_servers(),
                 ),
                 self.restore_timeout,
             )
-            .await?;
-        validate_restore_response(AcpOperation::SessionLoad, &result, native_session_id)?;
+            .await;
+        let (result, registration_barrier) = match request {
+            Ok(result) => result,
+            Err(error) => {
+                process.clear_session_replay(native_session_id);
+                return Err(error);
+            }
+        };
+        if let Err(error) =
+            validate_restore_response(AcpOperation::SessionLoad, &result, native_session_id)
+        {
+            process.clear_session_replay(native_session_id);
+            return Err(error);
+        }
+        let replay_params = process.take_session_replay(native_session_id);
         let mut state = AcpAttachmentShared::default();
         apply_session_state_to_attachment(
             &mut state,
@@ -12403,6 +12794,7 @@ impl AcpRuntimeClient {
             native_session_id: native_session_id.to_string(),
             state,
             registration_barrier: Some(registration_barrier),
+            replay_params,
         })
     }
 
@@ -16771,6 +17163,7 @@ impl AcpClient for AcpRuntimeClient {
             native_resume_token: binding.native.native_resume_token.clone(),
             session_config_state: binding.native.session_config_state.clone(),
             redacted_metadata: binding.native.redacted_metadata.clone(),
+            history_events: Vec::new(),
         })
     }
 
@@ -16838,6 +17231,14 @@ impl AcpClient for AcpRuntimeClient {
                 )
             })?;
         let cwd = Self::resolve_probe_cwd(&config, workspace_root)?;
+        let list_cwd = workspace_root
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .filter(|value| {
+                let path = Path::new(value);
+                path.is_absolute() && path.exists()
+            })
+            .map(|_| cwd.clone());
         let probe_resources = ProviderRuntimeResources::default();
         let auth_source = RuntimeAuthSource::provider_profile(provider_profile_id.clone());
         let env_unsets = Vec::new();
@@ -16875,17 +17276,45 @@ impl AcpClient for AcpRuntimeClient {
                     "ACP native session listing is not supported by this provider",
                 ));
             }
-            let response = process
-                .request(
-                    AcpOperation::SessionList.method(),
-                    json!({ "cwd": cwd.display().to_string() }),
-                    ACP_PROBE_TIMEOUT,
-                )
-                .await?;
-            Ok(normalize_session_list_candidates(
-                &response,
-                provider_profile_id,
-                &cwd,
+            let mut cursor: Option<String> = None;
+            let mut candidates = Vec::new();
+            for _ in 0..ACP_SESSION_LIST_PAGE_LIMIT {
+                let mut params = json!({});
+                if let Some(list_cwd) = list_cwd.as_ref() {
+                    params["cwd"] = Value::String(list_cwd.display().to_string());
+                }
+                if let Some(cursor) = cursor.as_deref() {
+                    params["cursor"] = Value::String(cursor.to_string());
+                }
+                let response = process
+                    .request(
+                        AcpOperation::SessionList.method(),
+                        params,
+                        ACP_PROBE_TIMEOUT,
+                    )
+                    .await?;
+                candidates.extend(normalize_session_list_candidates(
+                    &response,
+                    provider_profile_id,
+                    &profile.agent_id,
+                    &cwd,
+                ));
+                let next_cursor = response
+                    .get("nextCursor")
+                    .or_else(|| response.get("next_cursor"))
+                    .and_then(value_to_string)
+                    .and_then(|cursor| sanitize_config_string(&cursor));
+                let Some(next_cursor) = next_cursor else {
+                    return Ok(candidates);
+                };
+                if cursor.as_deref() == Some(next_cursor.as_str()) {
+                    return Ok(candidates);
+                }
+                cursor = Some(next_cursor);
+            }
+            Err(VibexError::provider(
+                "acp_session_list_page_limit_exceeded",
+                "ACP native session listing exceeded the page limit",
             ))
         }
         .await;
@@ -16930,6 +17359,8 @@ impl AcpClient for AcpRuntimeClient {
             profile.updated_at_ms,
         )?;
         let cwd = Self::resolve_workspace_cwd(&config, &request.workspace_root)?;
+        let additional_directories =
+            normalize_additional_workspace_roots(&cwd, &request.additional_workspace_roots)?;
         let env_unsets = Vec::new();
         let lease = self
             .acquire_initialized_process(AcpProcessLaunch {
@@ -16946,6 +17377,7 @@ impl AcpClient for AcpRuntimeClient {
             })
             .await?;
         let requested_native_session_id = native_session_id.clone();
+        let additional_directories_for_load = additional_directories.clone();
         let attachment = self
             .acquire_attachment(
                 request.session_id.clone(),
@@ -16954,6 +17386,7 @@ impl AcpClient for AcpRuntimeClient {
                 Some(native_session_id),
                 AttachmentActivationMode::Immediate,
                 move |process| async move {
+                    process.add_fs_write_roots(&additional_directories_for_load);
                     let supports_load_session = process
                         .shared
                         .lock()
@@ -16965,9 +17398,10 @@ impl AcpClient for AcpRuntimeClient {
                             "ACP native session loading is not supported by this provider",
                         ));
                     }
-                    self.load_existing_session_for_attachment(
+                    self.load_existing_session_for_attachment_with_directories(
                         &process,
                         &requested_native_session_id,
+                        &additional_directories_for_load,
                     )
                     .await
                 },
@@ -19032,6 +19466,7 @@ fn sanitize_config_string(value: &str) -> Option<String> {
 fn normalize_session_list_candidates(
     response: &Value,
     provider_profile_id: &ProviderProfileId,
+    agent_id: &AgentId,
     fallback_workspace_root: &Path,
 ) -> Vec<ExternalSessionImportCandidate> {
     let sessions = response
@@ -19063,11 +19498,13 @@ fn normalize_session_list_candidates(
                         .unwrap_or_else(|| format!("ACP session {}", index + 1))
                 });
             let workspace_root = session
-                .get("workspaceRoot")
-                .or_else(|| session.get("cwd"))
+                .get("cwd")
+                .or_else(|| session.get("workspaceRoot"))
                 .and_then(Value::as_str)
                 .and_then(sanitize_config_string)
                 .unwrap_or_else(|| fallback_workspace_root.display().to_string());
+            let additional_workspace_roots =
+                session_additional_workspace_roots(session, &workspace_root);
             let read_only = session
                 .get("readOnly")
                 .or_else(|| session.get("read_only"))
@@ -19092,17 +19529,36 @@ fn normalize_session_list_candidates(
             } else {
                 ExternalSessionImportCandidateStatus::Blocked
             };
+            // Native session ids are only unique within one Agent/Profile.
+            // Include both routing dimensions so the desktop multi-select UI
+            // cannot alias equal ids returned by different ACP profiles.
             let candidate_id = native_session_id
                 .as_deref()
-                .map(|id| format!("acp:{id}"))
-                .unwrap_or_else(|| format!("acp:list:{index}"));
+                .map(|id| {
+                    format!(
+                        "acp:{}:{}:session:{}",
+                        agent_id.as_str(),
+                        provider_profile_id.as_str(),
+                        id
+                    )
+                })
+                .unwrap_or_else(|| {
+                    format!(
+                        "acp:{}:{}:list:{}",
+                        agent_id.as_str(),
+                        provider_profile_id.as_str(),
+                        index
+                    )
+                });
 
             ExternalSessionImportCandidate {
                 candidate_id,
                 source: ExternalSessionImportSource::Acp,
+                agent_id: agent_id.clone(),
                 provider_kind: ProviderKind::Acp,
                 provider_profile_id: Some(provider_profile_id.clone()),
                 workspace_root,
+                additional_workspace_roots,
                 workspace_mode: WorkspaceMode::CurrentCheckout,
                 title,
                 native_session_id,
@@ -19121,6 +19577,7 @@ fn normalize_session_list_candidates(
                         .and_then(Value::as_str),
                 ),
                 status,
+                already_imported: false,
                 redaction_state: TimelineRedactionState::None,
                 timeline_items: Vec::new(),
                 diagnostics: Vec::new(),
@@ -19131,15 +19588,44 @@ fn normalize_session_list_candidates(
 
 fn session_updated_at_ms(session: &Value) -> Option<i64> {
     session
-        .get("updatedAtMs")
+        .get("updatedAt")
+        .or_else(|| session.get("updatedAtMs"))
         .or_else(|| session.get("updated_at_ms"))
         .and_then(|value| {
             value.as_i64().or_else(|| {
-                value
-                    .as_str()
-                    .and_then(|text| text.trim().parse::<i64>().ok())
+                value.as_str().and_then(|text| {
+                    let text = text.trim();
+                    text.parse::<i64>().ok().or_else(|| {
+                        DateTime::parse_from_rfc3339(text)
+                            .ok()
+                            .map(|timestamp| timestamp.timestamp_millis())
+                    })
+                })
             })
         })
+}
+
+fn session_additional_workspace_roots(session: &Value, cwd: &str) -> Vec<String> {
+    let Some(values) = session
+        .get("additionalDirectories")
+        .or_else(|| session.get("additional_directories"))
+        .or_else(|| session.get("additionalWorkspaceRoots"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let cwd = Path::new(cwd);
+    let mut seen = BTreeSet::new();
+    values
+        .iter()
+        .filter_map(Value::as_str)
+        .filter_map(sanitize_config_string)
+        .map(|value| value.trim().to_string())
+        .filter(|value| {
+            let path = Path::new(value);
+            path.is_absolute() && path != cwd && seen.insert(value.clone())
+        })
+        .collect()
 }
 
 fn runtime_prompt_content(text: &str, attachments: &[ProviderTurnAttachment]) -> Vec<Value> {
@@ -20403,7 +20889,7 @@ mod tests {
             compatibility_identity: "test-acp@1".to_string(),
             event_enricher: AgentEventEnricherKind::Passthrough,
             workspace_root: std::env::temp_dir(),
-            fs_write_roots: vec![std::env::temp_dir()],
+            fs_write_roots: Mutex::new(vec![std::env::temp_dir()]),
             transcript_strategy: None,
             transcript_home: None,
             fs_operation_permits: Arc::new(tokio::sync::Semaphore::new(
@@ -20422,6 +20908,7 @@ mod tests {
             probe_config_update_waiters: Mutex::new(HashMap::new()),
             probe_initial_config_update: Mutex::new(None),
             pending_available_commands: Mutex::new(PendingAvailableCommandCatalogs::default()),
+            pending_session_replays: Mutex::new(HashMap::new()),
             active_terminal_owners: Mutex::new(HashMap::new()),
             request_admission: Mutex::new(()),
             shared: Mutex::new(ProcessShared::default()),
@@ -20655,6 +21142,7 @@ mod tests {
                             native_session_id,
                             state: AcpAttachmentShared::default(),
                             registration_barrier: None,
+                            replay_params: Vec::new(),
                         },
                         crash_receiver,
                         payload_binding_id,
@@ -21113,6 +21601,7 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
                         native_session_id: "native-registration-race".to_string(),
                         state: AcpAttachmentShared::default(),
                         registration_barrier: None,
+                        replay_params: Vec::new(),
                     })
                 },
             )
@@ -21179,7 +21668,7 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
             })
         );
         assert_eq!(
-            build_session_load_params("native-1", &cwd, &[]),
+            build_session_load_params("native-1", &cwd, &[], &[]),
             json!({
                 "sessionId": "native-1",
                 "cwd": "/tmp/vibex-workspace",
@@ -21252,7 +21741,7 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
             })
         );
         assert_eq!(
-            build_session_load_params("native-1", &cwd, &servers)["mcpServers"],
+            build_session_load_params("native-1", &cwd, &[], &servers)["mcpServers"],
             build_session_new_params(&cwd, &servers)["mcpServers"]
         );
     }
@@ -22428,6 +22917,11 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
                     "sessionId": "native-1",
                     "title": "Existing ACP session",
                     "workspaceRoot": "/tmp/workspace-one",
+                    "additionalDirectories": [
+                        "/tmp/workspace-extra",
+                        "/tmp/workspace-one",
+                        "/tmp/workspace-extra"
+                    ],
                     "updatedAtMs": 42,
                     "models": {
                         "availableModels": [{ "modelId": "mock/model-1" }],
@@ -22446,17 +22940,27 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
             ]
         });
 
-        let candidates = normalize_session_list_candidates(&response, &profile_id, &fallback_root);
+        let agent_id = AgentId::parse("fixture").unwrap();
+        let candidates =
+            normalize_session_list_candidates(&response, &profile_id, &agent_id, &fallback_root);
 
         assert_eq!(candidates.len(), 3);
-        assert_eq!(candidates[0].candidate_id, "acp:native-1");
+        assert_eq!(
+            candidates[0].candidate_id,
+            format!("acp:fixture:{}:session:native-1", profile_id)
+        );
         assert_eq!(candidates[0].source, ExternalSessionImportSource::Acp);
+        assert_eq!(candidates[0].agent_id, agent_id);
         assert_eq!(candidates[0].provider_kind, ProviderKind::Acp);
         assert_eq!(
             candidates[0].provider_profile_id.as_ref(),
             Some(&profile_id)
         );
         assert_eq!(candidates[0].workspace_root, "/tmp/workspace-one");
+        assert_eq!(
+            candidates[0].additional_workspace_roots,
+            vec!["/tmp/workspace-extra".to_string()]
+        );
         assert_eq!(
             candidates[0].continuation_status,
             ExternalSessionContinuationStatus::Resumable
@@ -22480,6 +22984,18 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
             ExternalSessionImportCandidateStatus::Blocked
         );
         assert_eq!(candidates[2].workspace_root, "/tmp/vibex-acp-list");
+    }
+
+    #[test]
+    fn session_updated_at_ms_accepts_rfc3339_and_legacy_numbers() {
+        assert_eq!(
+            session_updated_at_ms(&json!({ "updatedAt": "2026-01-02T03:04:05.678Z" })),
+            Some(1_767_323_045_678)
+        );
+        assert_eq!(
+            session_updated_at_ms(&json!({ "updatedAtMs": "42" })),
+            Some(42)
+        );
     }
 
     #[test]
@@ -33611,6 +34127,7 @@ for line in sys.stdin:
                 provider_profile_id: fixture.profile_id.clone(),
                 native_session_id: Some("mock-import-session".to_string()),
                 workspace_root: fixture.workspace.display().to_string(),
+                additional_workspace_roots: Vec::new(),
                 runtime_resources: fixture_mcp_resources(),
             })
             .await

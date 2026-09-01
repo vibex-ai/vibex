@@ -541,7 +541,7 @@ impl AcpBridgeContractRunner {
                 connection
                     .timed_request(
                         AcpOperation::SessionLoad,
-                        build_session_load_params(session_id, workspace, mcp_servers),
+                        build_session_load_params(session_id, workspace, &[], mcp_servers),
                         self.request_timeout,
                     )
                     .await,

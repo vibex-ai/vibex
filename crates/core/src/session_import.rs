@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentSession;
+use crate::agent_config::AgentId;
 use crate::ids::{CorrelationId, ProviderProfileId, VibexSessionId};
 use crate::provider::{ProviderBindingMetadata, ProviderKind, ProviderSessionConfigState};
 use crate::timeline::{TimelinePayload, TimelineRedactionState, TimelineSource};
@@ -86,14 +87,23 @@ pub struct ExternalSessionImportTimelineItem {
     pub timestamp_ms: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalSessionImportCandidate {
     pub candidate_id: String,
     pub source: ExternalSessionImportSource,
+    /// Concrete Agent identity used for route selection and UI grouping. This
+    /// is intentionally separate from `provider_kind`: several ACP Agents can
+    /// coexist behind the same provider kind.
+    pub agent_id: AgentId,
     pub provider_kind: ProviderKind,
     pub provider_profile_id: Option<ProviderProfileId>,
     pub workspace_root: String,
+    /// Additional ACP workspace roots, in the order reported by the Agent.
+    /// The primary `workspace_root` is always kept separate because it owns
+    /// the Vibex project/workspace identity.
+    #[serde(default)]
+    pub additional_workspace_roots: Vec<String>,
     pub workspace_mode: WorkspaceMode,
     pub title: String,
     pub native_session_id: Option<String>,
@@ -104,9 +114,90 @@ pub struct ExternalSessionImportCandidate {
     pub updated_at_ms: Option<i64>,
     pub session_config_state: Option<ProviderSessionConfigState>,
     pub status: ExternalSessionImportCandidateStatus,
+    /// Set by the ACP scanner when the native session is already represented
+    /// by a durable Vibex runtime binding. Re-scans remain safe and can show
+    /// provenance without offering a duplicate import.
+    #[serde(default)]
+    pub already_imported: bool,
     pub redaction_state: TimelineRedactionState,
+    /// Legacy offline-import payload. Online ACP imports deliberately ignore
+    /// this field and load the native session instead. It remains readable for
+    /// parity fixtures and older local data.
     pub timeline_items: Vec<ExternalSessionImportTimelineItem>,
     pub diagnostics: Vec<ExternalSessionImportDiagnostic>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExternalSessionImportCandidateWire {
+    candidate_id: String,
+    source: ExternalSessionImportSource,
+    #[serde(default)]
+    agent_id: Option<AgentId>,
+    provider_kind: ProviderKind,
+    provider_profile_id: Option<ProviderProfileId>,
+    workspace_root: String,
+    #[serde(default)]
+    additional_workspace_roots: Vec<String>,
+    workspace_mode: WorkspaceMode,
+    title: String,
+    native_session_id: Option<String>,
+    native_thread_id: Option<String>,
+    native_resume_token: Option<String>,
+    continuation_status: ExternalSessionContinuationStatus,
+    continuation_reason: Option<String>,
+    updated_at_ms: Option<i64>,
+    session_config_state: Option<ProviderSessionConfigState>,
+    status: ExternalSessionImportCandidateStatus,
+    #[serde(default)]
+    already_imported: bool,
+    redaction_state: TimelineRedactionState,
+    timeline_items: Vec<ExternalSessionImportTimelineItem>,
+    diagnostics: Vec<ExternalSessionImportDiagnostic>,
+}
+
+impl<'de> Deserialize<'de> for ExternalSessionImportCandidate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ExternalSessionImportCandidateWire::deserialize(deserializer)?;
+        let agent_id = wire
+            .agent_id
+            .unwrap_or_else(|| default_agent_id_for_import_source(wire.source));
+        Ok(Self {
+            candidate_id: wire.candidate_id,
+            source: wire.source,
+            agent_id,
+            provider_kind: wire.provider_kind,
+            provider_profile_id: wire.provider_profile_id,
+            workspace_root: wire.workspace_root,
+            additional_workspace_roots: wire.additional_workspace_roots,
+            workspace_mode: wire.workspace_mode,
+            title: wire.title,
+            native_session_id: wire.native_session_id,
+            native_thread_id: wire.native_thread_id,
+            native_resume_token: wire.native_resume_token,
+            continuation_status: wire.continuation_status,
+            continuation_reason: wire.continuation_reason,
+            updated_at_ms: wire.updated_at_ms,
+            session_config_state: wire.session_config_state,
+            status: wire.status,
+            already_imported: wire.already_imported,
+            redaction_state: wire.redaction_state,
+            timeline_items: wire.timeline_items,
+            diagnostics: wire.diagnostics,
+        })
+    }
+}
+
+fn default_agent_id_for_import_source(source: ExternalSessionImportSource) -> AgentId {
+    let value = match source {
+        ExternalSessionImportSource::Codex => "codex",
+        ExternalSessionImportSource::Claude => "claude",
+        ExternalSessionImportSource::Acp => "acp",
+    };
+    AgentId::parse(value).expect("builtin import Agent id must be valid")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,9 +250,11 @@ mod tests {
         let candidate = ExternalSessionImportCandidate {
             candidate_id: "codex-thread-1".to_string(),
             source: ExternalSessionImportSource::Codex,
+            agent_id: AgentId::parse("codex").unwrap(),
             provider_kind: ProviderKind::Codex,
             provider_profile_id: None,
             workspace_root: "/tmp/vibex-import".to_string(),
+            additional_workspace_roots: Vec::new(),
             workspace_mode: WorkspaceMode::CurrentCheckout,
             title: "Imported Codex".to_string(),
             native_session_id: None,
@@ -172,6 +265,7 @@ mod tests {
             updated_at_ms: Some(1),
             session_config_state: None,
             status: ExternalSessionImportCandidateStatus::Importable,
+            already_imported: false,
             redaction_state: TimelineRedactionState::None,
             timeline_items: vec![ExternalSessionImportTimelineItem {
                 source: TimelineSource::Agent,
@@ -198,5 +292,14 @@ mod tests {
             ExternalSessionContinuationStatus::Resumable
         );
         assert_eq!(decoded.source.provider_kind(), ProviderKind::Codex);
+
+        let mut legacy_json = serde_json::to_value(&candidate).unwrap();
+        legacy_json
+            .as_object_mut()
+            .expect("candidate should serialize as an object")
+            .remove("agentId");
+        let legacy_decoded: ExternalSessionImportCandidate =
+            serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(legacy_decoded.agent_id, AgentId::parse("codex").unwrap());
     }
 }

@@ -9797,6 +9797,7 @@ dependencies = [
  "agent-client-protocol-schema",
  "async-trait",
  "base64",
+ "chrono",
  "command-group",
  "libc",
  "rusqlite",

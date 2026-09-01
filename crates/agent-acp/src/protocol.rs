@@ -40,7 +40,7 @@
 //!    bodies is deferred to the compatibility registry (P2-02+).
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use agent_client_protocol_schema::{
     ProtocolVersion,
@@ -782,14 +782,17 @@ pub(crate) fn build_session_new_params(cwd: &Path, mcp_servers: Value) -> Value 
 }
 
 /// Build `session/load` params (capability-gated; caller must have verified
-/// the initialize capability). Same `mcpServers` quirk as `session/new`.
+/// the initialize capability). The primary cwd and additional roots mirror
+/// the ACP SessionInfo project scope. Same `mcpServers` quirk as `session/new`.
 pub(crate) fn build_session_load_params(
     native_session_id: &str,
     cwd: &Path,
+    additional_directories: &[PathBuf],
     mcp_servers: Value,
 ) -> Value {
     let request =
-        LoadSessionRequest::new(SessionId::new(native_session_id), cwd.display().to_string());
+        LoadSessionRequest::new(SessionId::new(native_session_id), cwd.display().to_string())
+            .additional_directories(additional_directories.to_vec());
     let mut params = serde_json::to_value(&request).unwrap_or_else(|_| json!({}));
     if let Some(object) = params.as_object_mut() {
         object.insert("mcpServers".to_string(), mcp_servers);
@@ -939,8 +942,22 @@ mod tests {
             json!({ "cwd": "/tmp/w", "mcpServers": servers })
         );
         assert_eq!(
-            build_session_load_params("native-1", Path::new("/tmp/w"), servers.clone()),
+            build_session_load_params("native-1", Path::new("/tmp/w"), &[], servers.clone()),
             json!({ "sessionId": "native-1", "cwd": "/tmp/w", "mcpServers": servers })
+        );
+        assert_eq!(
+            build_session_load_params(
+                "native-1",
+                Path::new("/tmp/w"),
+                &[PathBuf::from("/tmp/extra")],
+                json!([]),
+            ),
+            json!({
+                "sessionId": "native-1",
+                "cwd": "/tmp/w",
+                "additionalDirectories": ["/tmp/extra"],
+                "mcpServers": []
+            })
         );
         let servers = json!([]);
         assert_eq!(
@@ -969,7 +986,7 @@ mod tests {
         let expected = cwd.display().to_string();
         assert_eq!(build_session_new_params(&cwd, json!([]))["cwd"], expected);
         assert_eq!(
-            build_session_load_params("native-1", &cwd, json!([]))["cwd"],
+            build_session_load_params("native-1", &cwd, &[], json!([]))["cwd"],
             expected
         );
         assert_eq!(

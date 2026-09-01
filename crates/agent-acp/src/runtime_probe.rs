@@ -1086,7 +1086,7 @@ async fn probe_session_resume(
                 build_session_resume_params(native_session_id, cwd, json!([]))
             }
             AcpOperation::SessionLoad => {
-                build_session_load_params(native_session_id, cwd, json!([]))
+                build_session_load_params(native_session_id, cwd, &[], json!([]))
             }
             _ => unreachable!("session restore probe only uses restore operations"),
         };

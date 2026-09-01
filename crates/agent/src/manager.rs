@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
@@ -1601,6 +1601,35 @@ impl AgentManager {
             }
         }
 
+        // `session/list` is queried once per configured ACP profile. Mark
+        // native sessions that already have a durable binding so rescanning is
+        // idempotent and the UI can hide them from the importable count.
+        let imported_bindings = self.imported_native_session_keys()?;
+        let mut seen = HashSet::new();
+        candidates.retain_mut(|candidate| {
+            let profile_key = candidate
+                .provider_profile_id
+                .as_ref()
+                .map(|profile| profile.as_str().to_string())
+                .unwrap_or_default();
+            let native_key = candidate
+                .native_session_id
+                .as_deref()
+                .filter(|native_id| has_text(native_id))
+                .map(ToString::to_string)
+                .unwrap_or_else(|| format!("candidate:{}", candidate.candidate_id));
+            let key = (
+                candidate.agent_id.as_str().to_string(),
+                profile_key,
+                native_key,
+            );
+            if !seen.insert(key.clone()) {
+                return false;
+            }
+            candidate.already_imported = imported_bindings.contains(&key);
+            true
+        });
+
         Ok(ExternalSessionImportPreview {
             candidates,
             diagnostics,
@@ -1615,17 +1644,180 @@ impl AgentManager {
         let mut sessions = Vec::new();
         let mut imported_timeline_counts = Vec::new();
         let mut diagnostics = Vec::new();
+        let mut imported_keys = self.imported_native_session_keys()?;
 
         for candidate in request.candidates {
             self.validate_import_candidate(&candidate)?;
             diagnostics.extend(candidate.diagnostics.clone());
 
             let mut conn = self.open_migrated()?;
+            let acp_profile = if candidate.source == ExternalSessionImportSource::Acp {
+                let profile_id = candidate.provider_profile_id.clone().ok_or_else(|| {
+                    VibexError::validation(
+                        "external_session_import_provider_profile_missing",
+                        "ACP native session import requires a Provider Profile",
+                    )
+                })?;
+                let profile =
+                    ProviderProfileRepository::get(&conn, &profile_id)?.ok_or_else(|| {
+                        VibexError::validation(
+                            "provider_profile_not_found",
+                            "Provider Profile was not found for ACP session import",
+                        )
+                    })?;
+                if profile.agent_id != candidate.agent_id
+                    || profile.kind != ProviderKind::Acp
+                    || profile.status != ProviderProfileStatus::Enabled
+                {
+                    return Err(VibexError::validation(
+                        "provider_profile_route_mismatch",
+                        "Provider Profile is not enabled for the imported ACP Agent",
+                    ));
+                }
+                Some(profile)
+            } else {
+                None
+            };
             let (_project, workspace) = WorkspaceRepository::ensure(
                 &conn,
                 &candidate.workspace_root,
                 candidate.workspace_mode,
             )?;
+            if candidate.source == ExternalSessionImportSource::Acp {
+                let profile = acp_profile
+                    .as_ref()
+                    .expect("ACP profile was validated above");
+                let profile_id = profile.id.clone();
+                let native_session_id =
+                    candidate.native_session_id.as_deref().ok_or_else(|| {
+                        VibexError::validation(
+                            "external_session_import_native_session_id_missing",
+                            "ACP native session import requires a native session id",
+                        )
+                    })?;
+                let key = (
+                    candidate.agent_id.as_str().to_string(),
+                    profile_id.as_str().to_string(),
+                    native_session_id.to_string(),
+                );
+                if !imported_keys.insert(key) {
+                    continue;
+                }
+                let desired = self.import_runtime_selection(&candidate, &profile, &workspace)?;
+                let now = unix_timestamp_ms();
+                let session = AgentSession {
+                    id: VibexSessionId::new(),
+                    title: candidate.title.clone(),
+                    project_id: workspace.project_id.clone(),
+                    workspace_id: workspace.id.clone(),
+                    workspace_root: workspace.root_path.clone(),
+                    workspace_mode: workspace.mode,
+                    agent_id: candidate.agent_id.clone(),
+                    state: AgentSessionState::Initializing,
+                    safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+                    created_at_ms: now,
+                    updated_at_ms: now,
+                    last_message_at_ms: now,
+                    archived_at_ms: None,
+                    deleted_at_ms: None,
+                };
+                TimelineRepository::insert_session_and_append_many(&mut conn, &session, &[])?;
+                self.append_system_notice(
+                    &mut conn,
+                    &session.id,
+                    imported_session_notice(&candidate),
+                    SystemNoticeLevel::Info,
+                )?;
+                drop(conn);
+
+                let runtime_selection = self
+                    .runtime_selection
+                    .get()
+                    .and_then(Weak::upgrade)
+                    .ok_or_else(|| {
+                        VibexError::process(
+                            "runtime_selection_service_unavailable",
+                            "ACP runtime selection service is not installed",
+                        )
+                    })?;
+                let initialization = runtime_selection
+                    .initialize_imported_session(
+                        &session.id,
+                        desired,
+                        native_session_id,
+                        &candidate.additional_workspace_roots,
+                    )
+                    .await;
+                let (_initialization_state, initial_events) = match initialization {
+                    Ok(initialization) => initialization,
+                    Err(error) => {
+                        let mut conn = self.open_migrated()?;
+                        SessionRepository::update_state(
+                            &conn,
+                            &session.id,
+                            AgentSessionState::Error,
+                        )?;
+                        self.append_provider_error(&mut conn, &session.id, &error)?;
+                        return Err(error);
+                    }
+                };
+                let mut conn = self.open_migrated()?;
+                let coalesce_after_sequence =
+                    TimelineRepository::latest_sequence(&conn, &session.id)?;
+                let mut imported_count = 0_u32;
+                let mut needs_input = false;
+                for event in initial_events {
+                    if event.session_title.is_some() {
+                        // ACP session titles are metadata, not empty timeline
+                        // rows. The candidate title was already persisted.
+                        continue;
+                    }
+                    if let TimelinePayload::PermissionRequest(permission) = &event.payload {
+                        PermissionRepository::insert_request(&conn, permission)?;
+                        needs_input = true;
+                    }
+                    if let TimelinePayload::ElicitationRequest(elicitation) = &event.payload {
+                        ElicitationRepository::insert_request(&conn, elicitation)?;
+                        needs_input = true;
+                    }
+                    let item = self.append_provider_event(
+                        &mut conn,
+                        &session.id,
+                        event,
+                        coalesce_after_sequence,
+                        None,
+                    )?;
+                    self.publish_attention_notification(&item);
+                    imported_count = imported_count.saturating_add(1);
+                }
+                self.transition(&conn, &session, AgentSessionState::Idle)?;
+                if needs_input {
+                    SessionRepository::update_state(
+                        &conn,
+                        &session.id,
+                        AgentSessionState::NeedsInput,
+                    )?;
+                }
+                self.append_system_notice(
+                    &mut conn,
+                    &session.id,
+                    "Agent session is ready",
+                    SystemNoticeLevel::Info,
+                )?;
+                let loaded = SessionRepository::get(&conn, &session.id)?.ok_or_else(|| {
+                    VibexError::storage(
+                        "session_missing_after_import",
+                        "imported session could not be reloaded",
+                    )
+                })?;
+                imported_timeline_counts.push(ExternalSessionImportedTimelineCount {
+                    session_id: loaded.id.clone(),
+                    count: imported_count,
+                });
+                sessions.push(loaded);
+                continue;
+            }
+
             let agent_id = candidate
                 .provider_profile_id
                 .as_ref()
@@ -1635,7 +1827,7 @@ impl AgentManager {
                         .flatten()
                 })
                 .map(|profile| profile.agent_id)
-                .unwrap_or_else(|| agent_id_for_provider_kind(candidate.provider_kind));
+                .unwrap_or_else(|| candidate.agent_id.clone());
             let now = unix_timestamp_ms();
             let session = AgentSession {
                 id: VibexSessionId::new(),
@@ -3494,6 +3686,40 @@ impl AgentManager {
                 "external session import workspace root must not be empty",
             ));
         }
+        if candidate.source == ExternalSessionImportSource::Acp
+            && !candidate.native_session_id.as_deref().is_some_and(has_text)
+        {
+            return Err(VibexError::validation(
+                "external_session_import_native_session_id_missing",
+                "ACP native session import requires a native session id",
+            )
+            .with_diagnostic("candidateId", &candidate.candidate_id));
+        }
+        if candidate.source == ExternalSessionImportSource::Acp {
+            let workspace_root = Path::new(candidate.workspace_root.trim());
+            if !workspace_root.is_absolute() {
+                return Err(VibexError::validation(
+                    "external_session_import_workspace_root_not_absolute",
+                    "external session import workspace root must be an absolute path",
+                )
+                .with_diagnostic("candidateId", &candidate.candidate_id));
+            }
+            let metadata = std::fs::metadata(workspace_root).map_err(|error| {
+                VibexError::validation(
+                    "external_session_import_workspace_root_unavailable",
+                    "external session import workspace root does not exist",
+                )
+                .with_diagnostic("candidateId", &candidate.candidate_id)
+                .with_diagnostic("error", error.to_string())
+            })?;
+            if !metadata.is_dir() {
+                return Err(VibexError::validation(
+                    "external_session_import_workspace_root_not_directory",
+                    "external session import workspace root must be a directory",
+                )
+                .with_diagnostic("candidateId", &candidate.candidate_id));
+            }
+        }
         if candidate.status != ExternalSessionImportCandidateStatus::Importable {
             return Err(VibexError::validation(
                 "external_session_import_candidate_not_importable",
@@ -3528,6 +3754,90 @@ impl AgentManager {
             }
         }
         Ok(())
+    }
+
+    fn imported_native_session_keys(&self) -> VibexResult<HashSet<(String, String, String)>> {
+        let conn = self.open_migrated()?;
+        let mut keys = HashSet::new();
+        for session in SessionRepository::list(&conn, true)? {
+            for binding in RuntimeBindingRepository::list_by_session(&conn, &session.id)? {
+                let Some(native_session_id) = binding.native_session_id else {
+                    continue;
+                };
+                let Some(provider_profile_id) = binding.auth_source.provider_profile_id() else {
+                    continue;
+                };
+                keys.insert((
+                    binding.agent_id.as_str().to_string(),
+                    provider_profile_id.as_str().to_string(),
+                    native_session_id,
+                ));
+            }
+        }
+        Ok(keys)
+    }
+
+    fn import_runtime_selection(
+        &self,
+        candidate: &ExternalSessionImportCandidate,
+        profile: &ProviderProfile,
+        _workspace: &vibex_core::WorkspaceRecord,
+    ) -> VibexResult<SessionRuntimeSelection> {
+        let model_id = candidate
+            .session_config_state
+            .as_ref()
+            .and_then(|state| state.current_model.as_ref())
+            .map(|model| model.value.trim())
+            .filter(|model| !model.is_empty())
+            .or_else(|| {
+                profile
+                    .default_model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+            })
+            .or_else(|| {
+                profile
+                    .configured_models
+                    .iter()
+                    .find(|model| model.enabled && !model.id.trim().is_empty())
+                    .map(|model| model.id.trim())
+            })
+            .or_else(|| {
+                [
+                    profile.small_model.as_deref(),
+                    profile.large_model.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .map(str::trim)
+                .find(|model| !model.is_empty())
+            })
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "runtime_selection_model_required",
+                    "ACP imported session has no configured model",
+                )
+                .with_diagnostic("providerProfileId", profile.id.as_str())
+            })?;
+        Ok(SessionRuntimeSelection {
+            agent_id: candidate.agent_id.clone(),
+            auth_source: vibex_core::RuntimeAuthSource::provider_profile(profile.id.clone()),
+            model: RuntimeModelSelection::explicit(model_id.to_string()),
+            reasoning_effort: profile
+                .reasoning_effort
+                .as_deref()
+                .map(str::trim)
+                .filter(|effort| !effort.is_empty())
+                .map(str::to_string),
+            mode_id: candidate
+                .session_config_state
+                .as_ref()
+                .and_then(|state| state.current_mode.as_ref())
+                .map(|mode| mode.value.trim().to_string())
+                .filter(|mode| !mode.is_empty()),
+            config_values: Default::default(),
+        })
     }
 
     fn configured_models_for_profile(

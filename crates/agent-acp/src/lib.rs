@@ -45,8 +45,8 @@ use vibex_core::{
     ProviderSessionConfigValue, ReasoningPayload, RequestId, RetryKind, RetryPhase,
     SessionRuntimeConfigMutationRequest, SessionRuntimeConfigMutationResult,
     SessionRuntimeSelection, SystemNoticeLevel, SystemNoticePayload, TimelineErrorPayload,
-    TimelinePayload, TimelineRedactionState, ToolCallPayload, ToolCallStatus, VibexError,
-    VibexResult, VibexSessionId, unix_timestamp_ms,
+    TimelinePayload, TimelineRedactionState, ToolCallPayload, ToolCallStatus, UserMessagePayload,
+    VibexError, VibexResult, VibexSessionId, unix_timestamp_ms,
 };
 
 mod adapter_activation;
@@ -308,6 +308,10 @@ pub struct AcpSession {
     pub native_resume_token: Option<String>,
     pub session_config_state: Option<vibex_core::ProviderSessionConfigState>,
     pub redacted_metadata: Vec<ProviderBindingMetadata>,
+    /// Events replayed by ACP `session/load`. The provider bridge consumes
+    /// these once while initializing a logical Vibex session; subsequent
+    /// binding refreshes leave the field empty.
+    pub history_events: Vec<AcpEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -381,6 +385,9 @@ pub enum AcpEvent {
     },
     Unknown {
         event_kind: String,
+    },
+    UserMessage {
+        text: String,
     },
 }
 
@@ -613,6 +620,7 @@ pub struct AcpImportSessionRequest {
     pub provider_profile_id: ProviderProfileId,
     pub native_session_id: Option<String>,
     pub workspace_root: String,
+    pub additional_workspace_roots: Vec<String>,
     pub runtime_resources: ProviderRuntimeResources,
 }
 
@@ -875,6 +883,7 @@ impl AcpClient for OpenCodeAcpClient {
                 &new_session.config_snapshot,
                 stderr_summary.as_deref(),
             ),
+            history_events: Vec::new(),
         };
 
         let mut active_session = self.active_session.lock().map_err(|_| {
@@ -2355,6 +2364,7 @@ impl AgentProvider for AcpAgentProvider {
                 provider_profile_id: request.provider_profile_id.clone(),
                 native_session_id: candidate.native_session_id.clone(),
                 workspace_root: request.workspace_root,
+                additional_workspace_roots: candidate.additional_workspace_roots.clone(),
                 runtime_resources: request.runtime_resources,
             })
             .await?;
@@ -3183,8 +3193,21 @@ fn provider_binding(
     }
 }
 
-fn map_acp_event(session_id: vibex_core::VibexSessionId, event: AcpEvent) -> ProviderEvent {
+pub(crate) fn map_acp_event(
+    session_id: vibex_core::VibexSessionId,
+    event: AcpEvent,
+) -> ProviderEvent {
     match event {
+        AcpEvent::UserMessage { text } => ProviderEvent {
+            source: vibex_core::TimelineSource::User,
+            payload: TimelinePayload::UserMessage(UserMessagePayload {
+                text,
+                attachments: Vec::new(),
+            }),
+            provider_correlation_id: None,
+            redaction_state: TimelineRedactionState::None,
+            session_title: None,
+        },
         AcpEvent::AssistantDelta {
             text_delta,
             chunk_index,
@@ -4346,6 +4369,7 @@ mod tests {
                         value: "sk-should-not-persist".to_string(),
                     },
                 ],
+                history_events: Vec::new(),
             },
             Ok(AcpTurn {
                 events: Vec::new(),
