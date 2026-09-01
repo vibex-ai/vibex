@@ -33571,7 +33571,7 @@ impl VibexWorkbench {
                                 .ghost()
                                 .compact()
                                 .size(px(24.0))
-                                .icon(Icon::default().path("icons/vibex/user-arrow-up.svg"))
+                                .icon(Icon::default().path("icons/vibex/arrow-to-top.svg"))
                                 .tooltip(locale::text(
                                     "Scroll to User Message",
                                     "滚动到用户消息",
@@ -39037,6 +39037,7 @@ enum ProcessActivityIcon {
     Collaboration,
     Image,
     Integration,
+    Retry,
     Generic,
 }
 
@@ -39053,6 +39054,7 @@ fn process_activity_icon(kind: ProcessActivityIcon) -> Icon {
         ProcessActivityIcon::Collaboration => Icon::new(IconName::User),
         ProcessActivityIcon::Image => Icon::default().path("icons/vibex/image.svg"),
         ProcessActivityIcon::Integration => Icon::default().path("icons/vibex/plug-zap.svg"),
+        ProcessActivityIcon::Retry => Icon::default().path("icons/vibex/wifi-outlined.svg"),
         ProcessActivityIcon::Generic => Icon::default().path("icons/vibex/zap.svg"),
     }
 }
@@ -39687,6 +39689,7 @@ fn tool_card_projection(
                 TimelineRowKind::TodoUpdate => ProcessActivityIcon::Todo,
                 TimelineRowKind::Collaboration => ProcessActivityIcon::Collaboration,
                 TimelineRowKind::ImageGeneration => ProcessActivityIcon::Image,
+                TimelineRowKind::Retry => ProcessActivityIcon::Retry,
                 _ => ProcessActivityIcon::Generic,
             },
         },

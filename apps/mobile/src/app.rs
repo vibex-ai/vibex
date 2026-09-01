@@ -7464,7 +7464,7 @@ impl MobileApp {
                                     actions.child(
                                         timeline_action_button(
                                             format!("scroll-to-user:{}", row.id),
-                                            "icons/user-arrow-up.svg",
+                                            "icons/arrow-to-top.svg",
                                             locale::text(
                                                 "Scroll to User Message",
                                                 "滚动到用户消息",
@@ -13561,7 +13561,7 @@ fn timeline_row_icon_path(kind: TimelineRowKind) -> &'static str {
         TimelineRowKind::ImageGeneration => "icons/image.svg",
         TimelineRowKind::GitNotice => "icons/git-branch.svg",
         TimelineRowKind::PermissionRequest | TimelineRowKind::Error => "icons/triangle-alert.svg",
-        TimelineRowKind::Retry => "icons/rotate-ccw.svg",
+        TimelineRowKind::Retry => "icons/wifi-outlined.svg",
         TimelineRowKind::SystemNotice
         | TimelineRowKind::PermissionResolution
         | TimelineRowKind::ElicitationRequest
@@ -13599,7 +13599,7 @@ fn timeline_payload_icon_path(payload: &TimelinePayload) -> &'static str {
         TimelinePayload::PermissionRequest(_) | TimelinePayload::ElicitationRequest(_) => {
             "icons/triangle-alert.svg"
         }
-        TimelinePayload::Retry(_) => "icons/rotate-ccw.svg",
+        TimelinePayload::Retry(_) => "icons/wifi-outlined.svg",
         TimelinePayload::Error(_) => "icons/triangle-alert.svg",
     }
 }

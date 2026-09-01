@@ -310,6 +310,20 @@ const VIBEX_ASSETS: &[(&str, &[u8])] = &[
         )),
     ),
     (
+        "icons/vibex/wifi-outlined.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/wifi-outlined.svg"
+        )),
+    ),
+    (
+        "icons/vibex/arrow-to-top.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/arrow-to-top.svg"
+        )),
+    ),
+    (
         "icons/vibex/zap.svg",
         include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/zap.svg")),
     ),
@@ -318,13 +332,6 @@ const VIBEX_ASSETS: &[(&str, &[u8])] = &[
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/assets/icons/message-square.svg"
-        )),
-    ),
-    (
-        "icons/vibex/user-arrow-up.svg",
-        include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/assets/icons/user-arrow-up.svg"
         )),
     ),
     (
