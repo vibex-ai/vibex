@@ -165,6 +165,42 @@ enum ContextBridgeTurnBehavior {
     PreservePending,
 }
 
+/// Per-turn display and title policy for manager-driven turns.
+///
+/// `display_user_message` controls whether the request text is persisted to
+/// the timeline as a user message (and allowed to seed the session title
+/// while it still carries the default fallback). `apply_provider_session_title`
+/// controls whether provider-pushed session titles may update the session
+/// while the turn runs.
+///
+/// Internal prompts — turn continuations in particular — keep both disabled:
+/// the provider sees the synthetic retry instruction as (typically) the first
+/// prompt of a fresh provider session, and providers that report their first
+/// prompt back as the session title would otherwise replace the user-visible
+/// title with the continuation prompt text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AgentTurnDisplayPolicy {
+    display_user_message: bool,
+    apply_provider_session_title: bool,
+}
+
+impl AgentTurnDisplayPolicy {
+    /// The turn was authored by the user (composer message, slash command, or
+    /// prompt): display it and let the provider refine the title.
+    const USER_AUTHORED: Self = Self {
+        display_user_message: true,
+        apply_provider_session_title: true,
+    };
+
+    /// The turn was synthesized by Vibex (e.g. the turn-continuation prompt
+    /// sent by the auto-retry): keep it out of the visible transcript and
+    /// leave the session title alone.
+    const INTERNAL: Self = Self {
+        display_user_message: false,
+        apply_provider_session_title: false,
+    };
+}
+
 impl AgentManager {
     pub fn new(db_path: impl Into<PathBuf>) -> VibexResult<Self> {
         let db_path = db_path.into();
@@ -1700,7 +1736,7 @@ impl AgentManager {
         turn_request.required_runtime = required_runtime;
         self.run_agent_turn(
             turn_request,
-            true,
+            AgentTurnDisplayPolicy::USER_AUTHORED,
             ContextBridgeTurnBehavior::ConsumePending,
             submission_id,
             |provider, handle, turn_request| async move {
@@ -1750,7 +1786,12 @@ impl AgentManager {
                 reasoning_effort: None,
                 correlation_id: request.correlation_id,
             },
-            false,
+            // The continuation prompt is an internal retry instruction. It
+            // must stay out of the transcript and must not update the session
+            // title: providers that report their first prompt back as the
+            // session title would otherwise replace the user-visible title
+            // with the continuation prompt text.
+            AgentTurnDisplayPolicy::INTERNAL,
             ContextBridgeTurnBehavior::ConsumePending,
             None,
             |provider, handle, turn_request| async move {
@@ -2040,7 +2081,7 @@ impl AgentManager {
         let items = self
             .run_agent_turn(
                 send_request,
-                true,
+                AgentTurnDisplayPolicy::USER_AUTHORED,
                 ContextBridgeTurnBehavior::PreservePending,
                 None,
                 move |provider, handle, turn_request| {
@@ -2117,7 +2158,7 @@ impl AgentManager {
                     reasoning_effort: request.reasoning_effort,
                     correlation_id: request.correlation_id,
                 },
-                true,
+                AgentTurnDisplayPolicy::USER_AUTHORED,
                 ContextBridgeTurnBehavior::ConsumePending,
                 None,
                 |provider, handle, turn_request| async move {
@@ -2136,7 +2177,7 @@ impl AgentManager {
     async fn run_agent_turn<F, Fut>(
         &self,
         request: AgentTurnRequest,
-        display_user_message: bool,
+        display: AgentTurnDisplayPolicy,
         context_bridge_behavior: ContextBridgeTurnBehavior,
         message_submission_id: Option<MessageSubmissionId>,
         runner: F,
@@ -2231,7 +2272,7 @@ impl AgentManager {
         };
         SessionRepository::claim_running_turn(&conn, &session.id, session.state)?;
 
-        let user_item = if display_user_message {
+        let user_item = if display.display_user_message {
             let appended_user = match self.append_timeline_item(
                 &mut conn,
                 &session.id,
@@ -2302,6 +2343,7 @@ impl AgentManager {
                 Some(required_runtime.clone()),
                 Some(expected_execution_identity.clone()),
                 coalesce_after_sequence,
+                display.apply_provider_session_title,
                 &runner,
             )
             .await;
@@ -2361,7 +2403,9 @@ impl AgentManager {
             .collect::<HashMap<_, _>>();
         for event in turn_result.events {
             if let Some(title) = event.session_title.as_deref() {
-                let _ = self.apply_auto_session_title(&session.id, title);
+                if display.apply_provider_session_title {
+                    let _ = self.apply_auto_session_title(&session.id, title);
+                }
                 continue;
             }
             if provider_event_was_streamed_in_final_result(
@@ -2517,6 +2561,7 @@ impl AgentManager {
         required_runtime: Option<SessionRuntimeSelection>,
         expected_execution_identity: Option<ProviderTurnExecutionIdentity>,
         coalesce_after_sequence: i64,
+        apply_provider_session_title: bool,
         runner: &F,
     ) -> ProviderTurnAttemptOutcome
     where
@@ -2643,7 +2688,9 @@ impl AgentManager {
                     event = event_receiver.recv(), if event_receiver_open => {
                         if let Some(event) = event {
                             if let Some(title) = event.session_title.as_deref() {
-                                let _ = self.apply_auto_session_title(&session.id, title);
+                                if apply_provider_session_title {
+                                    let _ = self.apply_auto_session_title(&session.id, title);
+                                }
                                 continue;
                             }
                             if provider_event_was_streamed(
@@ -2691,7 +2738,9 @@ impl AgentManager {
 
         while let Ok(event) = event_receiver.try_recv() {
             if let Some(title) = event.session_title.as_deref() {
-                let _ = self.apply_auto_session_title(&session.id, title);
+                if apply_provider_session_title {
+                    let _ = self.apply_auto_session_title(&session.id, title);
+                }
                 continue;
             }
             if provider_event_was_streamed(&event, &appended, &streamed_event_indices) {
@@ -5102,6 +5151,11 @@ mod tests {
         executed_turns: Mutex<Vec<String>>,
     }
 
+    struct TitlePushingProvider {
+        identity: ProviderTurnExecutionIdentity,
+        title: Mutex<String>,
+    }
+
     struct FailingContinueRuntimeBackend {
         materialize_calls: AtomicUsize,
     }
@@ -5364,6 +5418,56 @@ mod tests {
             self.executed_turns.lock().unwrap().push(turn.text);
             Ok(ProviderTurnResult {
                 events: Vec::new(),
+                binding_update: None,
+                completed: true,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl AgentProvider for TitlePushingProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Acp
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::conservative(ProviderKind::Acp, "title-push-test")
+        }
+
+        async fn create_session(
+            &self,
+            _request: ProviderCreateRequest,
+        ) -> VibexResult<ProviderSessionHandle> {
+            unreachable!("title push test resumes its seeded binding")
+        }
+
+        async fn resume_session(
+            &self,
+            binding: ProviderBinding,
+        ) -> VibexResult<ProviderSessionHandle> {
+            Ok(ProviderSessionHandle {
+                binding,
+                capabilities: self.capabilities(),
+            })
+        }
+
+        async fn prepare_turn_execution(
+            &self,
+            _handle: &ProviderSessionHandle,
+            _request: &ProviderTurnRequest,
+        ) -> VibexResult<Option<ProviderTurnExecutionIdentity>> {
+            Ok(Some(self.identity.clone()))
+        }
+
+        async fn send_turn(
+            &self,
+            _handle: ProviderSessionHandle,
+            _request: ProviderTurnRequest,
+        ) -> VibexResult<ProviderTurnResult> {
+            Ok(ProviderTurnResult {
+                events: vec![ProviderEvent::session_title(
+                    self.title.lock().unwrap().clone(),
+                )],
                 binding_update: None,
                 completed: true,
             })
@@ -5706,6 +5810,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn continuation_turns_do_not_apply_provider_session_titles() {
+        let db_path = temp_db_path("continue-title-suppressed");
+        let workspace_root = temp_workspace_path("continue-title-suppressed");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let mut manager = AgentManager::new(&db_path).unwrap();
+        let mut conn = manager.open_migrated().unwrap();
+        ProviderProfileRepository::ensure_local_defaults(&conn).unwrap();
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let agent_id = AgentId::parse("title-push-test-agent").unwrap();
+        let adapter_id = AcpAdapterId::parse("title-push-test-acp").unwrap();
+        let provider_profile_id =
+            ProviderProfileId::parse(ProviderKind::Acp.local_default_profile_id().to_string())
+                .unwrap();
+        let default_title = format!("{agent_id} session");
+        let session = insert_session(
+            &conn,
+            &default_title,
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            agent_id.clone(),
+            AgentSessionState::Error,
+        );
+        let selection = SessionRuntimeSelection::provider(
+            agent_id.clone(),
+            provider_profile_id.clone(),
+            "title-push-test-model",
+        );
+        let mut runtime_config = SessionRuntimeConfigState {
+            preferred_model: selection.model_id().map(str::to_string),
+            effective_model: selection.model_id().map(str::to_string),
+            ..SessionRuntimeConfigState::default()
+        };
+        runtime_config.mark_generation_if_converged(0);
+        let now = unix_timestamp_ms();
+        let binding = RuntimeBinding {
+            binding_id: RuntimeBindingId::new(),
+            session_id: session.id.clone(),
+            agent_id: agent_id.clone(),
+            transport_kind: TransportKind::Acp,
+            auth_source: selection.auth_source.clone(),
+            auth_source_revision: 1,
+            adapter_id: adapter_id.clone(),
+            adapter_version: "1.0.0".to_string(),
+            adapter_compatibility_identity: "title-push-test-acp@1".to_string(),
+            native_session_id: Some("native-title-push-test".to_string()),
+            native_state_home_id: NativeStateHomeId::new(),
+            provider_resume_identity: None,
+            process_spawn_fingerprint: "title-push-test".to_string(),
+            session_runtime_config_state: runtime_config,
+            capability_snapshot: None,
+            restore_compatibility_key: None,
+            last_context_sequence: 0,
+            last_summary_sequence: 0,
+            context_bridge_version: 0,
+            activation_generation: 0,
+            binding_state: BindingState::Current,
+            created_by_switch_id: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        AgentSessionRuntimeRepository::initialize_runtime_selection(
+            &mut conn, &binding, &selection,
+        )
+        .unwrap();
+        drop(conn);
+
+        // Providers that report their first prompt back as the session title
+        // surface the continuation prompt after an auto-retry; it must never
+        // replace the session title.
+        let provider = Arc::new(TitlePushingProvider {
+            identity: ProviderTurnExecutionIdentity {
+                binding_id: binding.binding_id.clone(),
+                activation_generation: binding.activation_generation,
+                model_id: Some(selection.model_id().unwrap().to_string()),
+            },
+            title: Mutex::new(CONTINUE_AGENT_TURN_PROMPT.to_string()),
+        });
+        manager
+            .register_runtime(
+                AgentRuntimeRouteKey {
+                    agent_id: agent_id.clone(),
+                    transport_kind: TransportKind::Acp,
+                    adapter_id,
+                },
+                provider.clone(),
+            )
+            .unwrap();
+
+        manager
+            .continue_turn(ContinueAgentTurnRequest {
+                session_id: session.id.clone(),
+                correlation_id: None,
+            })
+            .await
+            .unwrap();
+
+        let conn = manager.open_migrated().unwrap();
+        assert_eq!(
+            SessionRepository::get(&conn, &session.id)
+                .unwrap()
+                .unwrap()
+                .title,
+            default_title
+        );
+        drop(conn);
+
+        // User-authored turns still accept the provider-reported title.
+        *provider.title.lock().unwrap() = "provider generated title".to_string();
+        manager
+            .run_agent_turn(
+                AgentTurnRequest {
+                    session_id: session.id.clone(),
+                    required_runtime: Some(selection),
+                    text: "hello there".to_string(),
+                    attachments: Vec::new(),
+                    reasoning_effort: None,
+                    correlation_id: None,
+                },
+                AgentTurnDisplayPolicy::USER_AUTHORED,
+                ContextBridgeTurnBehavior::ConsumePending,
+                None,
+                |provider, handle, turn_request| async move {
+                    provider.send_turn(handle, turn_request).await
+                },
+            )
+            .await
+            .unwrap();
+        let conn = manager.open_migrated().unwrap();
+        assert_eq!(
+            SessionRepository::get(&conn, &session.id)
+                .unwrap()
+                .unwrap()
+                .title,
+            "provider generated title"
+        );
+        drop(conn);
+
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
     async fn elicitation_turn_needs_input_and_callback_failure_remains_retryable() {
         let db_path = temp_db_path("elicitation-callback-retry");
         let workspace_root = temp_workspace_path("elicitation-callback-retry");
@@ -5817,7 +6066,7 @@ mod tests {
                     reasoning_effort: None,
                     correlation_id: None,
                 },
-                true,
+                AgentTurnDisplayPolicy::USER_AUTHORED,
                 ContextBridgeTurnBehavior::ConsumePending,
                 None,
                 |_provider, _handle, _request| {
@@ -6339,6 +6588,7 @@ mod tests {
                     None,
                     Some(identity.clone()),
                     0,
+                    true,
                     &runner,
                 )
                 .await;
