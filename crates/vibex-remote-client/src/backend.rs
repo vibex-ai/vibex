@@ -89,7 +89,10 @@ use vibex_core::{
     TimelineItem, TimelineLiveEvent, TimelinePage, VibexSessionId, WorkspaceId,
 };
 
-use crate::binary::TerminalBinaryBuffer;
+use crate::binary::{
+    ChunkedFileReceiver, DEFAULT_FILE_CHUNK_BYTES, DEFAULT_MAX_FILE_TRANSFER_BYTES, FileChunkSink,
+    TerminalBinaryBuffer,
+};
 use crate::sync::SyncDecision;
 use crate::transport::{
     AutoRemoteTransport, DirectWebSocketTransport, RelayE2eeTransport, RemoteConnectionState,
@@ -149,6 +152,84 @@ impl WebRemoteBackend {
 
     pub fn transport(&self) -> &Arc<dyn RemoteTransport> {
         &self.transport
+    }
+
+    /// Downloads a bounded workspace-relative file through the v2 binary
+    /// attachment channel. The desktop remains the only filesystem authority.
+    pub async fn download_file(
+        &self,
+        workspace_id: vibex_core::WorkspaceId,
+        path: String,
+    ) -> BackendResult<Vec<u8>> {
+        let attachment_id = vibex_core::RequestId::new().into_string();
+        let generation = self.transport.state().session_epoch.unwrap_or(0);
+        let result = async {
+            let accepted = self
+                .transport
+                .attach(vibex_core::RemoteAttachRequestV2 {
+                    attachment_id: attachment_id.clone(),
+                    kind: vibex_core::RemoteAttachmentKind::FileTransfer,
+                    resource_id: path,
+                    scope_id: Some(workspace_id.as_str().to_string()),
+                    generation,
+                    // A new file stream starts at sequence zero; the gateway
+                    // still reports the next cursor as one in its acceptance.
+                    after_sequence: 0,
+                })
+                .await?;
+            if accepted.generation != self.transport.state().session_epoch.unwrap_or(0) {
+                return Err(BackendError::conflict(
+                    "remote_file_generation_changed",
+                    "the remote file changed while it was being requested",
+                ));
+            }
+            let sink = MemoryFileChunkSink::default();
+            let mut receiver = ChunkedFileReceiver::new(
+                attachment_id.clone(),
+                DEFAULT_MAX_FILE_TRANSFER_BYTES,
+                DEFAULT_FILE_CHUNK_BYTES,
+                sink,
+            )
+            .map_err(|error| {
+                BackendError::failed("remote_file_receiver_invalid", format!("{error:?}"))
+            })?;
+            loop {
+                match self
+                    .transport
+                    .next_binary_event_for(Some(attachment_id.clone()))
+                    .await?
+                {
+                    Some(RemoteTransportEvent::Binary(frame)) => {
+                        if frame.header.generation != accepted.generation {
+                            return Err(BackendError::conflict(
+                                "remote_file_generation_changed",
+                                "the remote file changed while it was being transferred",
+                            ));
+                        }
+                        receiver.push_binary_frame(&frame).map_err(|error| {
+                            BackendError::failed(
+                                "remote_file_transfer_invalid",
+                                format!("{error:?}"),
+                            )
+                        })?;
+                        if frame.header.end_of_stream {
+                            break;
+                        }
+                    }
+                    Some(RemoteTransportEvent::Closed) | None => {
+                        return Err(BackendError::offline(
+                            "remote_file_transfer_closed",
+                            "the remote file transfer closed before completion",
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
+            Ok(receiver.into_sink().bytes)
+        }
+        .await;
+        let _ = self.transport.detach(attachment_id).await;
+        result
     }
 
     pub fn connection_state(&self) -> crate::transport::RemoteConnectionSnapshot {
@@ -1929,6 +2010,31 @@ impl WebRemoteBackend {
             Ok(response.status)
         })
     }
+}
+
+#[derive(Default)]
+struct MemoryFileChunkSink {
+    bytes: Vec<u8>,
+}
+
+impl FileChunkSink for MemoryFileChunkSink {
+    fn write_chunk(
+        &mut self,
+        _descriptor: &crate::binary::FileChunkDescriptor,
+        bytes: &[u8],
+    ) -> Result<(), crate::binary::FileChunkError> {
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn finish(
+        &mut self,
+        _checksum_sha256: Option<&str>,
+    ) -> Result<(), crate::binary::FileChunkError> {
+        Ok(())
+    }
+
+    fn cancel(&mut self) {}
 }
 
 struct RemoteTerminalSubscription {

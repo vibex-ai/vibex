@@ -8,11 +8,11 @@ use std::time::Duration;
 use futures_util::StreamExt as _;
 use gpui::{
     Animation, AnimationExt as _, App, AppContext as _, ClipboardItem, Context, ElementId, Entity,
-    Focusable, FontWeight, IntoElement, KeyBinding, ListAlignment, ListOffset, ListState,
-    MouseButton, MouseUpEvent, ParentElement as _, Render, ScrollDelta, ScrollHandle,
-    ScrollWheelEvent, Styled as _, Task, TouchPhase, Transformation, UniformListScrollHandle,
-    WeakEntity, Window, div, ease_in_out, ease_out_quint, list, percentage, prelude::*, px, rgb,
-    svg, uniform_list,
+    Focusable, FontWeight, Hsla, Image, ImageFormat, IntoElement, KeyBinding, ListAlignment,
+    ListOffset, ListState, MouseButton, MouseUpEvent, ObjectFit, ParentElement as _, Render,
+    ScrollDelta, ScrollHandle, ScrollWheelEvent, Styled as _, Task, TouchPhase, Transformation,
+    UniformListScrollHandle, WeakEntity, Window, div, ease_in_out, ease_out_quint, img, list,
+    percentage, prelude::*, px, rgb, svg, uniform_list,
 };
 use vibex_backend::{
     AgentBackend as _, BackendError, BackendEvent, BackendFuture, BackendOperation,
@@ -21,21 +21,22 @@ use vibex_backend::{
 use vibex_core::{
     AgentSessionState, AgentTimelineDisplaySettings, AgentTimelineReasoningDisplayMode,
     ContinueAgentTurnRequest, CreateAgentSessionRequest, ElicitationFieldKind,
-    ElicitationResolutionAction, ForkAgentSessionRequest, OpenWorkspaceRequest,
+    ElicitationResolutionAction, ForkAgentSessionRequest, MessageAttachment, OpenWorkspaceRequest,
     PermissionResolution, PermissionResponseKind, PermissionRiskCategory,
     RemoteDeepLinkResolutionStatus, RemoteLanPairingRequestState, RemoteSidebarDropPosition,
     RemoteSidebarItemKind, RemoteSidebarItemRef, RemoteSidebarOrganizationMutation,
     RenameAgentSessionRequest, RequestId, ResolvePermissionRequest, RuntimeOptionAvailability,
     RuntimeSelectionInteraction, SendAgentMessageRequest, SessionRuntimeFeature,
     SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
-    SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest, TimelinePayload, VibexSessionId,
-    WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation, unix_timestamp_ms,
+    SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest, TimelineItem, TimelinePayload,
+    TimelineRedactionState, TimelineSource, UserMessagePayload, VibexSessionId, WorkspaceMode,
+    WorkspaceRecord, agent_session_turn_requires_continuation, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     NewSessionLocation, ReasoningDisplayMode, RuntimeCascadeChoice, RuntimeCascadeProjection,
     SidebarHierarchyMode, SidebarOrganizationItem, SidebarOrganizationView, SidebarProjectLogo,
-    SidebarProjectLogoColor, SidebarState, TimelineConversationTurn, TimelineProcessActivityGroup,
-    TimelineRow, TimelineRowKind,
+    SidebarProjectLogoColor, SidebarState, TimelineConversationTurn, TimelineModel,
+    TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
 };
 use vibex_remote_client::{
     RemoteConnectionState, RemoteLifecycleSignal, WebRemoteBackend, ZeroConfigLanPairingSession,
@@ -64,6 +65,11 @@ use crate::{locale, markdown, notifications, scanner, theme};
 const TIMELINE_NEAR_BOTTOM_PX: f32 = 96.0;
 const TIMELINE_LIST_OVERDRAW_PX: f32 = 800.0;
 const TIMELINE_TURN_ESTIMATED_HEIGHT_PX: f32 = 180.0;
+const TIMELINE_ACTION_BUTTON_SIZE_PX: f32 = 32.0;
+const TIMELINE_RUNTIME_LABEL_MAX_CHARS: usize = 48;
+const TIMELINE_SHIMMER_DURATION: Duration = Duration::from_secs(12);
+const TIMELINE_SHIMMER_SCAN_PASSES: f32 = 10.0;
+const MAX_INLINE_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024;
 const RESUME_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const RESUME_RECOVERY_POLL_ATTEMPTS: usize = 600;
 const RUNTIME_FEATURE_VALUE_LIMIT: usize = 256;
@@ -154,6 +160,76 @@ enum TimelineBooleanSetting {
     ReasoningExpandedByDefault,
     EnhancedCommandExecutionDisplay,
     EnhancedFileOperationDisplay,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingMobileUserMessage {
+    session_id: VibexSessionId,
+    item_id: vibex_core::TimelineItemId,
+    after_sequence: i64,
+    submitted_at_ms: i64,
+    text: String,
+    attachments: Vec<MessageAttachment>,
+}
+
+impl PendingMobileUserMessage {
+    fn is_confirmed_by(&self, timeline: &TimelineModel) -> bool {
+        timeline.session_id.as_ref() == Some(&self.session_id)
+            && timeline.items.iter().any(|item| {
+                item.sequence > self.after_sequence
+                    && matches!(
+                        &item.payload,
+                        TimelinePayload::UserMessage(message)
+                            if message.text.trim() == self.text.trim()
+                                && message.attachments == self.attachments
+                    )
+            })
+    }
+
+    fn projected_items(&self, timeline: &TimelineModel) -> Option<Vec<TimelineItem>> {
+        if timeline
+            .session_id
+            .as_ref()
+            .is_some_and(|session_id| session_id != &self.session_id)
+            || self.is_confirmed_by(timeline)
+        {
+            return None;
+        }
+        let mut items = timeline.items.clone();
+        let payload = TimelinePayload::UserMessage(UserMessagePayload {
+            text: self.text.clone(),
+            attachments: self.attachments.clone(),
+        });
+        items.push(TimelineItem {
+            id: self.item_id.clone(),
+            session_id: self.session_id.clone(),
+            sequence: items
+                .last()
+                .map(|item| item.sequence.saturating_add(1))
+                .unwrap_or(1),
+            timestamp_ms: self.submitted_at_ms,
+            source: TimelineSource::User,
+            kind: payload.kind(),
+            correlation_id: None,
+            provider_correlation_id: None,
+            redaction_state: TimelineRedactionState::None,
+            execution_attribution: None,
+            payload,
+        });
+        Some(items)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TimelineMetadataTip {
+    Runtime { row_id: String, value: String },
+    Duration { row_id: String, value: String },
+}
+
+#[derive(Debug, Clone)]
+struct MobileAttachmentPreview {
+    label: String,
+    image: Arc<Image>,
 }
 
 /// Touch shells cannot rely on hover, so the sidebar keeps only the most-used
@@ -319,6 +395,10 @@ pub struct MobileApp {
     workbench_open: bool,
     composer_input: Entity<TextInput>,
     timeline_turns: Arc<Vec<TimelineConversationTurn>>,
+    pending_user_message: Option<PendingMobileUserMessage>,
+    timeline_metadata_tip: Option<TimelineMetadataTip>,
+    attachment_preview: Option<MobileAttachmentPreview>,
+    attachment_preview_loading: Option<String>,
     desktop_timeline_display_settings: AgentTimelineDisplaySettings,
     timeline_display_settings_overrides: BTreeMap<String, MobileTimelineDisplaySettingsOverride>,
     timeline_display_settings_sync_busy: bool,
@@ -418,7 +498,7 @@ fn timeline_action_button(
     div()
         .id(id)
         .aria_label(label)
-        .size(px(theme::HEADER_BUTTON_SIZE))
+        .size(px(TIMELINE_ACTION_BUTTON_SIZE_PX))
         .flex()
         .items_center()
         .justify_center()
@@ -469,6 +549,10 @@ impl MobileApp {
                 )
             }),
             timeline_turns: Arc::new(Vec::new()),
+            pending_user_message: None,
+            timeline_metadata_tip: None,
+            attachment_preview: None,
+            attachment_preview_loading: None,
             desktop_timeline_display_settings: AgentTimelineDisplaySettings::default(),
             timeline_display_settings_overrides,
             timeline_display_settings_sync_busy: false,
@@ -791,6 +875,10 @@ impl MobileApp {
                 self.workspace_summaries.clear();
                 self.pending_workbench_surface = None;
                 self.clear_overlay();
+                self.pending_user_message = None;
+                self.timeline_metadata_tip = None;
+                self.attachment_preview = None;
+                self.attachment_preview_loading = None;
                 self.pairing_from_hosts = false;
                 self.mode = RootMode::Connecting;
                 self.error = None;
@@ -2272,6 +2360,10 @@ impl MobileApp {
                                 controller.state.runtime_selection.clear();
                             }
                             this.timeline_turns = Arc::new(Vec::new());
+                            this.pending_user_message = None;
+                            this.timeline_metadata_tip = None;
+                            this.attachment_preview = None;
+                            this.attachment_preview_loading = None;
                             this.timeline_list.reset(0);
                             if let Some(workbench) = this.workbench.as_ref() {
                                 workbench
@@ -2428,6 +2520,10 @@ impl MobileApp {
 
     fn open_session(&mut self, session_id: VibexSessionId, cx: &mut Context<Self>) {
         self.reset_runtime_options();
+        self.pending_user_message = None;
+        self.timeline_metadata_tip = None;
+        self.attachment_preview = None;
+        self.attachment_preview_loading = None;
         self.sidebar_state.selected_ids.clear();
         self.sidebar_state
             .selected_ids
@@ -3550,6 +3646,20 @@ impl MobileApp {
         let Some(session_id) = controller.state.selected_session_id.clone() else {
             return;
         };
+        let attachments = Vec::new();
+        let after_sequence = controller
+            .state
+            .timeline
+            .authoritative_end_sequence
+            .or_else(|| {
+                controller
+                    .state
+                    .timeline
+                    .items
+                    .last()
+                    .map(|item| item.sequence)
+            })
+            .unwrap_or_default();
         let Some(runtime) = controller.state.runtime_selection.value.as_ref() else {
             self.error = Some(BackendError::loading(
                 "mobile_runtime_selection_loading",
@@ -3563,12 +3673,21 @@ impl MobileApp {
             return;
         };
         let restore_text = text.clone();
+        let submitted_at_ms = unix_timestamp_ms();
+        let pending_user_message = PendingMobileUserMessage {
+            session_id: session_id.clone(),
+            item_id: vibex_core::TimelineItemId::new(),
+            after_sequence,
+            submitted_at_ms,
+            text: text.clone(),
+            attachments: attachments.clone(),
+        };
         let request = MutationRequest::new(SendAgentMessageRequest {
             session_id,
             message_idempotency_key: RequestId::new().into_string(),
             desired_runtime: runtime.desired.clone(),
             text,
-            attachments: Vec::new(),
+            attachments,
             reasoning_effort: runtime.desired.reasoning_effort.clone(),
             correlation_id: None,
         });
@@ -3581,6 +3700,8 @@ impl MobileApp {
             }
         };
         let future = controller.send_message(request);
+        self.pending_user_message = Some(pending_user_message);
+        self.timeline_metadata_tip = None;
         self.composer_input.update(cx, |input, cx| {
             let _ = input.take(cx);
         });
@@ -3632,6 +3753,9 @@ impl MobileApp {
                 if let Some(controller) = this.controller.as_mut() {
                     controller.apply_timeline_mutation(&ticket, outcome);
                     this.error = controller.state.latest_mutation.error.clone();
+                }
+                if failed {
+                    this.pending_user_message = None;
                 }
                 this.rebuild_timeline_turns();
                 if failed
@@ -4014,16 +4138,13 @@ impl MobileApp {
     }
 
     fn timeline_process_expanded(&self, turn: &TimelineConversationTurn) -> bool {
+        if !turn.complete {
+            return true;
+        }
         self.expanded_process
             .get(&turn.id)
             .copied()
-            .unwrap_or_else(|| {
-                !turn.complete
-                    && turn
-                        .conclusion_row
-                        .as_ref()
-                        .is_none_or(|row| row.body.trim().is_empty())
-            })
+            .unwrap_or(false)
     }
 
     fn effective_timeline_display_settings(&self) -> AgentTimelineDisplaySettings {
@@ -4281,14 +4402,38 @@ impl MobileApp {
             }
             AgentTimelineReasoningDisplayMode::Timeline => ReasoningDisplayMode::Timeline,
         };
+        let pending_confirmed = self.controller.as_ref().is_some_and(|controller| {
+            self.pending_user_message
+                .as_ref()
+                .is_some_and(|pending| pending.is_confirmed_by(&controller.state.timeline))
+        });
+        if pending_confirmed {
+            self.pending_user_message = None;
+        }
         let turns = self
             .controller
             .as_ref()
-            .map(|controller| match reasoning_display_mode {
-                ReasoningDisplayMode::LatestAtBottom => controller.state.conversation_turns(),
-                ReasoningDisplayMode::Timeline => controller
-                    .state
-                    .conversation_turns_with_reasoning_mode(reasoning_display_mode),
+            .map(|controller| {
+                if let Some(pending) = self
+                    .pending_user_message
+                    .as_ref()
+                    .filter(|pending| !pending.is_confirmed_by(&controller.state.timeline))
+                    && let Some(items) = pending.projected_items(&controller.state.timeline)
+                {
+                    let mut projected = controller.state.timeline.clone();
+                    projected.items = items;
+                    return projected.conversation_turns_with_reasoning_mode(
+                        Some(AgentSessionState::Running),
+                        true,
+                        reasoning_display_mode,
+                    );
+                }
+                match reasoning_display_mode {
+                    ReasoningDisplayMode::LatestAtBottom => controller.state.conversation_turns(),
+                    ReasoningDisplayMode::Timeline => controller
+                        .state
+                        .conversation_turns_with_reasoning_mode(reasoning_display_mode),
+                }
             })
             .unwrap_or_default();
         self.sync_timeline_list(turns.len());
@@ -4321,6 +4466,10 @@ impl MobileApp {
         self.controller = None;
         self.mode = RootMode::Pairing;
         self.timeline_turns = Arc::new(Vec::new());
+        self.pending_user_message = None;
+        self.timeline_metadata_tip = None;
+        self.attachment_preview = None;
+        self.attachment_preview_loading = None;
         self.timeline_list.reset(0);
         self.reset_drawers();
         self.pending_workbench_surface = None;
@@ -5053,6 +5202,8 @@ impl MobileApp {
         let row_menu = self.sidebar_row_menu.clone();
         let name_prompt = self.sidebar_name_prompt.clone();
         let overlay = self.overlay;
+        let attachment_preview = self.attachment_preview.clone();
+        let attachment_preview_loading = self.attachment_preview_loading.clone();
         let can_create_session = self.backend.as_ref().is_some_and(|backend| {
             backend
                 .capability_snapshot()
@@ -5252,6 +5403,67 @@ impl MobileApp {
             .when_some(overlay, |root, overlay| {
                 root.child(self.render_mobile_overlay(overlay, cx))
             })
+            .when_some(attachment_preview, |root, preview| {
+                root.child(self.render_attachment_preview(preview, cx))
+            })
+            .when_some(attachment_preview_loading, |root, label| {
+                root.child(self.render_attachment_preview_loading(&label, cx))
+            })
+    }
+
+    fn render_attachment_preview(
+        &self,
+        preview: MobileAttachmentPreview,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .id("mobile-attachment-preview")
+            .absolute()
+            .inset_0()
+            .bg(theme::backdrop(0.94))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .cursor_pointer()
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(Self::close_attachment_preview),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        img(preview.image)
+                            .max_w_full()
+                            .max_h_full()
+                            .object_fit(ObjectFit::Contain),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_attachment_preview_loading(
+        &self,
+        label: &str,
+        _cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .id("mobile-attachment-preview-loading")
+            .absolute()
+            .inset_0()
+            .bg(theme::backdrop(0.82))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(theme::FONT_BODY))
+            .text_color(theme::text_primary())
+            .child(format!("{}: {}", locale::common("Loading"), label))
+            .into_any_element()
     }
 
     /// Row actions that are too rare to sit permanently on a touch row. What
@@ -6537,7 +6749,7 @@ impl MobileApp {
         let expanded = self.timeline_process_expanded(turn);
         let display_settings = self.effective_timeline_display_settings();
         let turn_id = turn.id.clone();
-        let (agent_identity, runtime_label) =
+        let (agent_identity, _runtime_label) =
             timeline_runtime_attribution_parts(turn.runtime_attribution.as_deref());
         let agent_icon = agent_identity.as_deref().map(agent_icon_path);
         let duration = format_compact_duration(
@@ -6552,8 +6764,7 @@ impl MobileApp {
             .conclusion_row
             .as_ref()
             .filter(|row| !row.body.trim().is_empty());
-        let process_collapsible =
-            turn.complete || (conclusion_row.is_some() && !turn.process_rows.is_empty());
+        let process_collapsible = turn.complete;
         let has_response =
             !turn.process_rows.is_empty() || conclusion_row.is_some() || !turn.complete;
         div()
@@ -6565,7 +6776,7 @@ impl MobileApp {
             .gap_3()
             .when(!is_first, |turn| turn.pt_2())
             .when_some(turn.user_row.as_ref(), |container, row| {
-                container.child(self.render_user_message_row(row))
+                container.child(self.render_user_message_row(row, cx))
             })
             .when(has_response, |container| {
                 container.child(
@@ -6629,18 +6840,7 @@ impl MobileApp {
                                                     .text_size(px(theme::FONT_CAPTION))
                                                     .text_color(theme::text_muted())
                                                     .child(worked_label.clone()),
-                                            )
-                                            .when_some(runtime_label.clone(), |left, runtime| {
-                                                left.child(
-                                                    div()
-                                                        .min_w_0()
-                                                        .flex_1()
-                                                        .whitespace_normal()
-                                                        .text_size(px(theme::FONT_MICRO))
-                                                        .text_color(theme::text_muted())
-                                                        .child(runtime),
-                                                )
-                                            }),
+                                            ),
                                     )
                                     .when(process_collapsible, |header| {
                                         header.child(
@@ -6686,46 +6886,13 @@ impl MobileApp {
                     if !display_settings.show_agent_generation_status {
                         return container;
                     }
-                    container.child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .text_size(px(theme::FONT_CAPTION))
-                            .text_color(if turn.pending_permission {
-                                rgb(theme::ACCENT_YELLOW)
-                            } else {
-                                rgb(theme::TEXT_MUTED)
-                            })
-                            .child(
-                                svg()
-                                    .path("icons/loader-circle.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .flex_shrink_0()
-                                    .text_color(if turn.pending_permission {
-                                        rgb(theme::ACCENT_YELLOW)
-                                    } else {
-                                        rgb(theme::TEXT_MUTED)
-                                    })
-                                    .with_animation(
-                                        format!("timeline-progress:{}", turn.id),
-                                        Animation::new(Duration::from_millis(900))
-                                            .repeat()
-                                            .with_easing(ease_in_out),
-                                        |this, delta| {
-                                            this.with_transformation(Transformation::rotate(
-                                                percentage(delta),
-                                            ))
-                                        },
-                                    ),
-                            )
-                            .child(
-                                turn.live_status
-                                    .clone()
-                                    .unwrap_or_else(|| locale::common("Working...").to_string()),
-                            ),
-                    )
+                    container.child(render_mobile_thinking_indicator(
+                        &turn.id,
+                        turn.live_status
+                            .as_deref()
+                            .unwrap_or(locale::common("Working...")),
+                        turn.pending_permission,
+                    ))
                 },
             )
             .into_any_element()
@@ -6770,6 +6937,161 @@ impl MobileApp {
             .filter(|item| row.item_ids.iter().any(|id| id == item.id.as_str()))
             .max_by_key(|item| item.sequence)
             .map(|item| &item.payload)
+    }
+
+    fn timeline_row_user_attachments(&self, row: &TimelineRow) -> Vec<MessageAttachment> {
+        if let Some(TimelinePayload::UserMessage(message)) = self.timeline_row_latest_payload(row) {
+            return message.attachments.clone();
+        }
+        self.pending_user_message
+            .as_ref()
+            .filter(|pending| {
+                row.item_ids
+                    .iter()
+                    .any(|item_id| item_id == pending.item_id.as_str())
+            })
+            .map(|pending| pending.attachments.clone())
+            .unwrap_or_default()
+    }
+
+    fn toggle_timeline_metadata_tip(&mut self, tip: TimelineMetadataTip, cx: &mut Context<Self>) {
+        if self.timeline_metadata_tip.as_ref() == Some(&tip) {
+            self.timeline_metadata_tip = None;
+        } else {
+            self.timeline_metadata_tip = Some(tip);
+        }
+        cx.notify();
+    }
+
+    fn open_user_attachment(
+        &mut self,
+        attachment: MessageAttachment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !message_attachment_is_image(&attachment) {
+            self.open_user_attachment_file(attachment, window, cx);
+            return;
+        }
+        if let Some((format, bytes)) = decode_message_attachment_data_uri(&attachment) {
+            self.attachment_preview = Some(MobileAttachmentPreview {
+                label: attachment.label.clone(),
+                image: Arc::new(Image::from_bytes(format, bytes)),
+            });
+            self.attachment_preview_loading = None;
+            cx.notify();
+            return;
+        }
+        let Some((workspace_id, workspace_root)) = self.active_workspace_context() else {
+            self.error = Some(BackendError::failed(
+                "mobile_attachment_workspace_missing",
+                locale::text(
+                    "The attachment workspace is not available.",
+                    "附件所在工作区不可用。",
+                    "附件所在工作區無法使用。",
+                ),
+            ));
+            cx.notify();
+            return;
+        };
+        let Some(path) = message_attachment_workspace_path(
+            attachment.uri.as_deref().unwrap_or_default(),
+            Some(&workspace_root),
+        ) else {
+            self.open_user_attachment_file(attachment, window, cx);
+            return;
+        };
+        let Some(format) = message_attachment_image_format(&attachment) else {
+            self.open_user_attachment_file(attachment, window, cx);
+            return;
+        };
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let label = if attachment.label.trim().is_empty() {
+            locale::text("Image", "图片", "圖片").to_string()
+        } else {
+            attachment.label.clone()
+        };
+        self.attachment_preview_loading = Some(label.clone());
+        self.error = None;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend.download_file(workspace_id, path).await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.attachment_preview_loading = None;
+                match outcome {
+                    Ok(bytes) => {
+                        this.attachment_preview = Some(MobileAttachmentPreview {
+                            label: label.clone(),
+                            image: Arc::new(Image::from_bytes(format, bytes)),
+                        });
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+    }
+
+    fn open_user_attachment_file(
+        &mut self,
+        attachment: MessageAttachment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((workspace_id, workspace_root)) = self.active_workspace_context() else {
+            return;
+        };
+        let Some(path) = message_attachment_workspace_path(
+            attachment.uri.as_deref().unwrap_or_default(),
+            Some(&workspace_root),
+        ) else {
+            self.error = Some(BackendError::failed(
+                "mobile_attachment_path_invalid",
+                locale::text(
+                    "This attachment cannot be opened from the workspace.",
+                    "无法从工作区打开此附件。",
+                    "無法從工作區開啟此附件。",
+                ),
+            ));
+            cx.notify();
+            return;
+        };
+        self.pending_workbench_surface = Some(WorkbenchSurface::Files);
+        self.ensure_workbench(workspace_id, cx);
+        if let Some(workbench) = self.workbench.as_ref() {
+            workbench.update(cx, |workbench, cx| {
+                workbench.set_surface(WorkbenchSurface::Files, cx);
+                workbench.open_file(path.clone(), cx);
+            });
+        }
+        self.start_drawer_snap(DrawerPage::Workbench.open_offset(), Some(window), cx);
+    }
+
+    fn active_workspace_context(&self) -> Option<(vibex_core::WorkspaceId, String)> {
+        let session = self
+            .controller
+            .as_ref()?
+            .state
+            .active_session
+            .value
+            .as_ref()?;
+        Some((session.workspace_id.clone(), session.workspace_root.clone()))
+    }
+
+    fn close_attachment_preview(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.attachment_preview = None;
+        self.attachment_preview_loading = None;
+        cx.notify();
     }
 
     fn timeline_row_icon_path_for_row(&self, row: &TimelineRow) -> &'static str {
@@ -6831,7 +7153,7 @@ impl MobileApp {
     ) -> gpui::AnyElement {
         let settings = self.effective_timeline_display_settings();
         match row.kind {
-            TimelineRowKind::UserMessage => self.render_user_message_row(row).into_any_element(),
+            TimelineRowKind::UserMessage => self.render_user_message_row(row, cx),
             TimelineRowKind::AgentMessage => {
                 self.render_agent_message_row(turn, row, conversation_conclusion, cx)
             }
@@ -6862,7 +7184,74 @@ impl MobileApp {
         }
     }
 
-    fn render_user_message_row(&self, row: &TimelineRow) -> impl IntoElement {
+    fn render_user_message_row(
+        &self,
+        row: &TimelineRow,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let attachments = self.timeline_row_user_attachments(row);
+        let row_id = row.id.clone();
+        let attachment_elements = attachments.iter().enumerate().map(|(index, attachment)| {
+            let attachment = attachment.clone();
+            let is_image = message_attachment_is_image(&attachment);
+            let label = if attachment.label.trim().is_empty() {
+                locale::text("Image", "图片", "圖片").to_string()
+            } else {
+                attachment.label.clone()
+            };
+            let action_attachment = attachment.clone();
+            div()
+                .id(format!("user-attachment:{row_id}:{index}"))
+                .w_full()
+                .min_w_0()
+                .mt_2()
+                .px_2()
+                .py_2()
+                .rounded(px(theme::RADIUS_CONTROL))
+                .border_1()
+                .border_color(theme::border_subtle())
+                .bg(theme::bg_card_dim())
+                .flex()
+                .items_center()
+                .gap_2()
+                .cursor_pointer()
+                .active(|style| style.bg(theme::row_pressed_bg()))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        this.open_user_attachment(action_attachment.clone(), window, cx)
+                    }),
+                )
+                .child(
+                    svg()
+                        .path(if is_image {
+                            "icons/image.svg"
+                        } else {
+                            "icons/file-text.svg"
+                        })
+                        .size(px(16.0))
+                        .flex_shrink_0()
+                        .text_color(theme::text_secondary()),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_size(px(theme::FONT_CAPTION))
+                        .text_color(theme::text_secondary())
+                        .child(label),
+                )
+                .child(
+                    svg()
+                        .path("icons/chevron-right.svg")
+                        .size(px(14.0))
+                        .flex_shrink_0()
+                        .text_color(theme::text_muted()),
+                )
+        });
         div()
             .id(row.id.clone())
             .w_full()
@@ -6882,8 +7271,10 @@ impl MobileApp {
                     .line_height(px(19.0))
                     .text_color(theme::text_primary())
                     .whitespace_normal()
-                    .child(row.body.clone()),
+                    .child(row.body.clone())
+                    .children(attachment_elements),
             )
+            .into_any_element()
     }
 
     fn render_agent_message_row(
@@ -6926,7 +7317,12 @@ impl MobileApp {
             turn.started_at_ms,
             turn.complete.then_some(turn.ended_at_ms).flatten(),
         );
+        let generation_time = format_generation_time(turn.started_at_ms, turn.ended_at_ms);
+        let runtime_value = runtime_label.unwrap_or_default();
+        let runtime_display =
+            truncate_single_line(&runtime_value, TIMELINE_RUNTIME_LABEL_MAX_CHARS);
         let turn_id = turn.id.clone();
+        let row_id = row.id.clone();
         let copy_text = row.body.clone();
         let fork_sequence = row.last_sequence;
         let fork_available = fork_sequence > 0
@@ -6937,6 +7333,26 @@ impl MobileApp {
                     .agent
                     .supports(BackendOperation::AgentForkSession)
             });
+        let runtime_tip = TimelineMetadataTip::Runtime {
+            row_id: row.id.clone(),
+            value: runtime_value.clone(),
+        };
+        let duration_tip = TimelineMetadataTip::Duration {
+            row_id: row.id.clone(),
+            value: generation_time.clone(),
+        };
+        let active_tip = self
+            .timeline_metadata_tip
+            .as_ref()
+            .filter(|tip| match tip {
+                TimelineMetadataTip::Runtime { row_id: id, .. }
+                | TimelineMetadataTip::Duration { row_id: id, .. } => id == &row.id,
+            })
+            .cloned();
+        let tip_text = active_tip.as_ref().map(|tip| match tip {
+            TimelineMetadataTip::Runtime { value, .. } => value.clone(),
+            TimelineMetadataTip::Duration { value, .. } => value.clone(),
+        });
         Some(
             div()
                 .id(format!("agent-answer-metadata:{}", row.id))
@@ -6944,100 +7360,168 @@ impl MobileApp {
                 .min_w_0()
                 .mt_1()
                 .flex()
-                .items_center()
-                .justify_between()
-                .gap_2()
+                .flex_col()
+                .gap_1()
                 .text_size(px(theme::FONT_MICRO))
                 .text_color(theme::text_muted())
                 .child(
                     div()
+                        .w_full()
                         .min_w_0()
-                        .flex_1()
                         .flex()
                         .items_center()
-                        .flex_wrap()
+                        .justify_between()
                         .gap_2()
                         .child(
-                            svg()
-                                .path("icons/clock.svg")
-                                .size(px(theme::ICON_SM))
-                                .flex_shrink_0()
-                                .text_color(theme::text_muted()),
-                        )
-                        .child(div().flex_shrink_0().child(duration))
-                        .when_some(agent_identity.as_deref(), |left, identity| {
-                            left.child(
-                                svg()
-                                    .path(agent_icon_path(identity))
-                                    .size(px(theme::ICON_SM))
-                                    .flex_shrink_0()
-                                    .text_color(theme::text_muted()),
-                            )
-                        })
-                        .when_some(runtime_label, |left, runtime| {
-                            left.child(div().min_w_0().flex_1().whitespace_normal().child(runtime))
-                        }),
-                )
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(
-                            timeline_action_button(
-                                format!("copy-answer:{}", row.id),
-                                "icons/copy.svg",
-                                locale::text("Copy", "复制", "複製"),
-                            )
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |_, _, _, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        copy_text.clone(),
-                                    ));
-                                }),
-                            ),
-                        )
-                        .when(turn.user_row.is_some(), |actions| {
-                            actions.child(
-                                timeline_action_button(
-                                    format!("scroll-to-user:{}", row.id),
-                                    "icons/user-arrow-up.svg",
-                                    locale::text(
-                                        "Scroll to User Message",
-                                        "滚动到用户消息",
-                                        "捲動到使用者訊息",
-                                    ),
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    svg()
+                                        .path(agent_icon_path(
+                                            agent_identity.as_deref().unwrap_or("unknown"),
+                                        ))
+                                        .size(px(theme::ICON_SM))
+                                        .flex_shrink_0()
+                                        .text_color(theme::text_muted()),
                                 )
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.scroll_to_timeline_turn(&turn_id, cx);
-                                    }),
+                                .when(!runtime_value.is_empty(), |left| {
+                                    let runtime_tip = runtime_tip.clone();
+                                    left.child(
+                                        div()
+                                            .id(format!("runtime-label:{row_id}"))
+                                            .min_w_0()
+                                            .flex_1()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .cursor_pointer()
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.toggle_timeline_metadata_tip(
+                                                        runtime_tip.clone(),
+                                                        cx,
+                                                    )
+                                                }),
+                                            )
+                                            .child(runtime_display.clone()),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .id(format!("duration-label:{row_id}"))
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .cursor_pointer()
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.toggle_timeline_metadata_tip(
+                                                    duration_tip.clone(),
+                                                    cx,
+                                                )
+                                            }),
+                                        )
+                                        .child(
+                                            svg()
+                                                .path("icons/clock.svg")
+                                                .size(px(theme::ICON_SM))
+                                                .flex_shrink_0()
+                                                .text_color(theme::text_muted()),
+                                        )
+                                        .child(duration),
                                 ),
-                            )
-                        })
+                        )
                         .child(
-                            timeline_action_button(
-                                format!("fork-answer:{}", row.id),
-                                "icons/git-branch.svg",
-                                locale::text("Fork", "分叉会话", "分支會話"),
-                            )
-                            .when(fork_available, |button| {
-                                button
-                                    .cursor_pointer()
-                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                            div()
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .justify_end()
+                                .gap_1()
+                                .child(
+                                    timeline_action_button(
+                                        format!("copy-answer:{}", row.id),
+                                        "icons/copy.svg",
+                                        locale::text("Copy", "复制", "複製"),
+                                    )
                                     .on_mouse_up(
                                         MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.fork_session_at(fork_sequence, cx);
+                                        cx.listener(move |_, _, _, cx| {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                copy_text.clone(),
+                                            ));
                                         }),
+                                    ),
+                                )
+                                .when(turn.user_row.is_some(), |actions| {
+                                    actions.child(
+                                        timeline_action_button(
+                                            format!("scroll-to-user:{}", row.id),
+                                            "icons/user-arrow-up.svg",
+                                            locale::text(
+                                                "Scroll to User Message",
+                                                "滚动到用户消息",
+                                                "捲動到使用者訊息",
+                                            ),
+                                        )
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.scroll_to_timeline_turn(&turn_id, cx);
+                                            }),
+                                        ),
                                     )
-                            })
-                            .when(!fork_available, |button| button.opacity(0.4)),
+                                })
+                                .child(
+                                    timeline_action_button(
+                                        format!("fork-answer:{}", row.id),
+                                        "icons/git-branch.svg",
+                                        locale::text("Fork", "分叉会话", "分支會話"),
+                                    )
+                                    .when(fork_available, |button| {
+                                        button
+                                            .cursor_pointer()
+                                            .active(|style| style.bg(theme::row_pressed_bg()))
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.fork_session_at(fork_sequence, cx);
+                                                }),
+                                            )
+                                    })
+                                    .when(!fork_available, |button| button.opacity(0.4)),
+                                ),
                         ),
                 )
+                .when_some(tip_text, |metadata, text| {
+                    metadata.child(
+                        div()
+                            .id(format!("metadata-tip:{row_id}"))
+                            .w_full()
+                            .px_2()
+                            .py_1()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .bg(theme::bg_card_dim())
+                            .text_color(theme::text_secondary())
+                            .whitespace_normal()
+                            .cursor_pointer()
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.timeline_metadata_tip = None;
+                                    cx.notify();
+                                }),
+                            )
+                            .child(text),
+                    )
+                })
                 .into_any_element(),
         )
     }
@@ -7127,7 +7611,9 @@ impl MobileApp {
         if row.body.trim().is_empty() {
             return div().id(row.id.clone()).into_any_element();
         }
-        let expanded = if self.collapsed_timeline_rows.contains(&row.id) {
+        let expanded = if row.streaming {
+            true
+        } else if self.collapsed_timeline_rows.contains(&row.id) {
             false
         } else if self.expanded_timeline_rows.contains(&row.id) {
             true
@@ -7137,7 +7623,7 @@ impl MobileApp {
                     .effective_timeline_display_settings()
                     .reasoning_expanded_by_default
         };
-        let can_expand = row.collapsible;
+        let can_expand = row.collapsible && !row.streaming;
         let row_id = row.id.clone();
         let tone = if row.failed {
             rgb(theme::ACCENT_RED).into()
@@ -7179,7 +7665,7 @@ impl MobileApp {
                     .child(
                         svg()
                             .path(self.timeline_row_icon_path_for_row(row))
-                            .size(px(theme::ICON_SM))
+                            .size(px(14.0))
                             .flex_shrink_0()
                             .text_color(tone),
                     )
@@ -7240,7 +7726,9 @@ impl MobileApp {
         let Some(latest_row) = rows.last() else {
             return div().id(group.id.clone()).into_any_element();
         };
-        let expanded = self.timeline_row_expanded(&group.id);
+        let streaming = rows.iter().any(|row| row.streaming);
+        let expanded = streaming || self.timeline_row_expanded(&group.id);
+        let can_expand = !streaming;
         let group_id = group.id.clone();
         let summary = timeline_activity_summary(latest_row);
         div()
@@ -7259,20 +7747,23 @@ impl MobileApp {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .cursor_pointer()
-                    .active(|style| style.bg(theme::row_pressed_bg()))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            this.toggle_timeline_row(group_id.clone(), cx)
-                        }),
-                    )
+                    .when(can_expand, |header| {
+                        header
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.toggle_timeline_row(group_id.clone(), cx)
+                                }),
+                            )
+                    })
                     .child(
                         svg()
                             .path(self.timeline_row_icon_path_for_row(latest_row))
-                            .size(px(theme::ICON_SM))
+                            .size(px(14.0))
                             .flex_shrink_0()
-                            .text_color(rgb(timeline_row_color(latest_row))),
+                            .text_color(timeline_activity_icon_color(latest_row)),
                     )
                     .child(
                         div()
@@ -7296,17 +7787,19 @@ impl MobileApp {
                             .text_color(theme::text_muted())
                             .child(format!("{}", rows.len())),
                     )
-                    .child(
-                        svg()
-                            .path(if expanded {
-                                "icons/chevron-down.svg"
-                            } else {
-                                "icons/chevron-right.svg"
-                            })
-                            .size(px(theme::ICON_SM))
-                            .flex_shrink_0()
-                            .text_color(theme::text_muted()),
-                    ),
+                    .when(can_expand, |header| {
+                        header.child(
+                            svg()
+                                .path(if expanded {
+                                    "icons/chevron-down.svg"
+                                } else {
+                                    "icons/chevron-right.svg"
+                                })
+                                .size(px(14.0))
+                                .flex_shrink_0()
+                                .text_color(theme::text_muted()),
+                        )
+                    }),
             )
             .when(expanded, |group| {
                 group.child(
@@ -7333,7 +7826,8 @@ impl MobileApp {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let has_details = !row.body.trim().is_empty() || row.file_path.is_some();
-        let expanded = has_details && self.timeline_row_expanded(&row.id);
+        let can_expand = has_details && !row.streaming;
+        let expanded = has_details && (row.streaming || self.timeline_row_expanded(&row.id));
         let row_id = row.id.clone();
         let color = timeline_row_color(row);
         div()
@@ -7352,7 +7846,7 @@ impl MobileApp {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .when(has_details, |line| {
+                    .when(can_expand, |line| {
                         line.cursor_pointer()
                             .active(|style| style.bg(theme::row_pressed_bg()))
                             .on_mouse_up(
@@ -7365,9 +7859,9 @@ impl MobileApp {
                     .child(
                         svg()
                             .path(self.timeline_row_icon_path_for_row(row))
-                            .size(px(theme::ICON_SM))
+                            .size(px(14.0))
                             .flex_shrink_0()
-                            .text_color(rgb(color)),
+                            .text_color(timeline_activity_icon_color(row)),
                     )
                     .child(
                         div()
@@ -7390,7 +7884,7 @@ impl MobileApp {
                             line.child(timeline_status_badge(timeline_row_status_label(row), color))
                         },
                     )
-                    .when(has_details, |line| {
+                    .when(can_expand, |line| {
                         line.child(
                             svg()
                                 .path(if expanded {
@@ -7398,7 +7892,7 @@ impl MobileApp {
                                 } else {
                                     "icons/chevron-right.svg"
                                 })
-                                .size(px(theme::ICON_SM))
+                                .size(px(14.0))
                                 .flex_shrink_0()
                                 .text_color(theme::text_muted()),
                         )
@@ -7442,7 +7936,8 @@ impl MobileApp {
             || command.cwd.is_some()
             || command.output_summary.is_some()
             || command.exit_code.is_some();
-        let expanded = has_details && self.timeline_row_expanded(&row.id);
+        let can_expand = has_details && !row.streaming;
+        let expanded = has_details && (row.streaming || self.timeline_row_expanded(&row.id));
         let row_id = row.id.clone();
         let failed = command.status == vibex_core::CommandStatus::Failed;
         let title = if command.command.trim().is_empty() {
@@ -7473,7 +7968,7 @@ impl MobileApp {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .when(has_details, |header| {
+                    .when(can_expand, |header| {
                         header
                             .cursor_pointer()
                             .active(|style| style.bg(theme::row_pressed_bg()))
@@ -7487,7 +7982,7 @@ impl MobileApp {
                     .child(
                         svg()
                             .path("icons/file-terminal.svg")
-                            .size(px(theme::ICON_SM))
+                            .size(px(14.0))
                             .flex_shrink_0()
                             .text_color(if failed {
                                 rgb(theme::ACCENT_RED)
@@ -7506,7 +8001,7 @@ impl MobileApp {
                             .text_color(theme::text_primary())
                             .child(title),
                     )
-                    .when(has_details, |header| {
+                    .when(can_expand, |header| {
                         header.child(
                             svg()
                                 .path(if expanded {
@@ -7580,7 +8075,8 @@ impl MobileApp {
         };
         let patch = operation.patch.as_ref().map(|patch| patch.text.as_str());
         let has_details = !operation.summary.trim().is_empty() || patch.is_some();
-        let expanded = has_details && self.timeline_row_expanded(&row.id);
+        let can_expand = has_details && !row.streaming;
+        let expanded = has_details && (row.streaming || self.timeline_row_expanded(&row.id));
         let row_id = row.id.clone();
         let title = format!(
             "{} {}",
@@ -7606,7 +8102,7 @@ impl MobileApp {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .when(has_details, |header| {
+                    .when(can_expand, |header| {
                         header
                             .cursor_pointer()
                             .active(|style| style.bg(theme::row_pressed_bg()))
@@ -7620,7 +8116,7 @@ impl MobileApp {
                     .child(
                         svg()
                             .path("icons/file-text.svg")
-                            .size(px(theme::ICON_SM))
+                            .size(px(14.0))
                             .flex_shrink_0()
                             .text_color(rgb(theme::ACCENT_BLUE)),
                     )
@@ -7635,7 +8131,7 @@ impl MobileApp {
                             .text_color(theme::text_primary())
                             .child(title),
                     )
-                    .when(has_details, |header| {
+                    .when(can_expand, |header| {
                         header.child(
                             svg()
                                 .path(if expanded {
@@ -7685,7 +8181,8 @@ impl MobileApp {
             return self.render_process_activity_line(row, cx);
         };
         let has_details = !image.summary.trim().is_empty() || image.image_reference.is_some();
-        let expanded = has_details && self.timeline_row_expanded(&row.id);
+        let can_expand = has_details && !row.streaming;
+        let expanded = has_details && (row.streaming || self.timeline_row_expanded(&row.id));
         let row_id = row.id.clone();
         let failed = image.status == vibex_core::ToolCallStatus::Failed;
         let title = if image.summary.trim().is_empty() {
@@ -7716,7 +8213,7 @@ impl MobileApp {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .when(has_details, |header| {
+                    .when(can_expand, |header| {
                         header
                             .cursor_pointer()
                             .active(|style| style.bg(theme::row_pressed_bg()))
@@ -7730,7 +8227,7 @@ impl MobileApp {
                     .child(
                         svg()
                             .path("icons/image.svg")
-                            .size(px(theme::ICON_SM))
+                            .size(px(14.0))
                             .flex_shrink_0()
                             .text_color(if failed {
                                 rgb(theme::ACCENT_RED)
@@ -7749,7 +8246,7 @@ impl MobileApp {
                             .text_color(theme::text_primary())
                             .child(title),
                     )
-                    .when(has_details, |header| {
+                    .when(can_expand, |header| {
                         header.child(
                             svg()
                                 .path(if expanded {
@@ -12729,6 +13226,285 @@ fn format_compact_duration(started_at_ms: i64, ended_at_ms: Option<i64>) -> Stri
     }
 }
 
+fn format_generation_time(started_at_ms: i64, ended_at_ms: Option<i64>) -> String {
+    let format_timestamp = |timestamp_ms: i64| {
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(timestamp_ms)
+            .map(|timestamp| {
+                timestamp
+                    .with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string()
+            })
+            .unwrap_or_else(|| locale::common("Unknown time").to_string())
+    };
+    let started = format_timestamp(started_at_ms);
+    match ended_at_ms.filter(|timestamp| *timestamp > 0) {
+        Some(ended) => format!(
+            "{}: {} - {}",
+            locale::text("Generated", "生成时间", "生成時間"),
+            started,
+            format_timestamp(ended)
+        ),
+        None => format!(
+            "{}: {}",
+            locale::text("Started", "开始时间", "開始時間"),
+            started
+        ),
+    }
+}
+
+fn truncate_single_line(value: &str, max_chars: usize) -> String {
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if max_chars == 0 {
+        return String::new();
+    }
+    if value.chars().count() <= max_chars {
+        return value;
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+    let mut truncated = value.chars().take(max_chars - 3).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+fn shimmer_scan_position(delta: f32) -> f32 {
+    -0.35 + (delta * TIMELINE_SHIMMER_SCAN_PASSES).fract() * 1.7
+}
+
+fn shimmer_color(base: Hsla, glow: Hsla, position: f32, scan_position: f32) -> Hsla {
+    let intensity = (1.0 - (position - scan_position).abs() / 0.42).clamp(0.0, 1.0);
+    let intensity = intensity * intensity * (3.0 - 2.0 * intensity);
+    Hsla {
+        h: base.h + (glow.h - base.h) * intensity,
+        s: base.s + (glow.s - base.s) * intensity,
+        l: base.l + (glow.l - base.l) * intensity,
+        a: base.a + (glow.a - base.a) * intensity,
+    }
+}
+
+fn render_mobile_thinking_indicator(
+    turn_id: &str,
+    label: &str,
+    pending_permission: bool,
+) -> gpui::AnyElement {
+    let base: Hsla = if pending_permission {
+        rgb(theme::ACCENT_YELLOW).opacity(0.78).into()
+    } else {
+        theme::text_muted().opacity(0.78)
+    };
+    let glow: Hsla = if pending_permission {
+        rgb(theme::ACCENT_YELLOW).into()
+    } else {
+        theme::text_primary()
+    };
+    let label = truncate_single_line(label, 48);
+    let character_count = label.chars().count();
+    div()
+        .flex()
+        .w_full()
+        .min_w_0()
+        .py_1()
+        .child(
+            div()
+                .id(format!("timeline-progress:{turn_id}"))
+                .min_w_0()
+                .flex_1()
+                .overflow_hidden()
+                .text_size(px(theme::FONT_CAPTION))
+                .with_animation(
+                    format!("timeline-progress-animation:{turn_id}"),
+                    Animation::new(TIMELINE_SHIMMER_DURATION).repeat(),
+                    move |this, delta| {
+                        let scan_position = shimmer_scan_position(delta);
+                        this.child(div().flex().flex_none().whitespace_nowrap().children(
+                            label.chars().enumerate().map(|(index, character)| {
+                                let position = if character_count > 1 {
+                                    index as f32 / (character_count - 1) as f32
+                                } else {
+                                    0.5
+                                };
+                                div()
+                                    .flex_none()
+                                    .text_color(shimmer_color(base, glow, position, scan_position))
+                                    .child(character.to_string())
+                            }),
+                        ))
+                    },
+                ),
+        )
+        .into_any_element()
+}
+
+fn message_attachment_is_image(attachment: &MessageAttachment) -> bool {
+    attachment
+        .mime_type
+        .as_deref()
+        .and_then(attachment_mime)
+        .is_some_and(|mime| is_image_mime(&mime))
+        || attachment
+            .uri
+            .as_deref()
+            .and_then(data_uri_mime)
+            .is_some_and(is_image_mime)
+        || attachment
+            .uri
+            .as_deref()
+            .and_then(attachment_uri_without_query)
+            .and_then(|uri| uri.rsplit('.').next())
+            .is_some_and(|extension| {
+                matches!(
+                    extension.to_ascii_lowercase().as_str(),
+                    "png"
+                        | "jpg"
+                        | "jpeg"
+                        | "gif"
+                        | "webp"
+                        | "svg"
+                        | "bmp"
+                        | "tif"
+                        | "tiff"
+                        | "ico"
+                        | "pbm"
+                        | "pgm"
+                        | "ppm"
+                        | "pnm"
+                )
+            })
+}
+
+fn message_attachment_image_format(attachment: &MessageAttachment) -> Option<ImageFormat> {
+    attachment
+        .mime_type
+        .as_deref()
+        .and_then(attachment_mime)
+        .and_then(|mime| ImageFormat::from_mime_type(&mime))
+        .or_else(|| {
+            attachment
+                .uri
+                .as_deref()
+                .and_then(data_uri_mime)
+                .and_then(|mime| ImageFormat::from_mime_type(&mime.to_ascii_lowercase()))
+        })
+        .or_else(|| {
+            attachment
+                .uri
+                .as_deref()
+                .and_then(attachment_uri_without_query)
+                .and_then(|uri| uri.rsplit('.').next())
+                .and_then(|extension| match extension.to_ascii_lowercase().as_str() {
+                    "png" => Some(ImageFormat::Png),
+                    "jpg" | "jpeg" => Some(ImageFormat::Jpeg),
+                    "gif" => Some(ImageFormat::Gif),
+                    "webp" => Some(ImageFormat::Webp),
+                    "svg" => Some(ImageFormat::Svg),
+                    "bmp" => Some(ImageFormat::Bmp),
+                    "tif" | "tiff" => Some(ImageFormat::Tiff),
+                    "ico" => Some(ImageFormat::Ico),
+                    "pbm" | "pgm" | "ppm" | "pnm" => Some(ImageFormat::Pnm),
+                    _ => None,
+                })
+        })
+}
+
+fn decode_message_attachment_data_uri(
+    attachment: &MessageAttachment,
+) -> Option<(ImageFormat, Vec<u8>)> {
+    let uri = attachment.uri.as_deref()?.trim();
+    let (header, encoded) = data_uri_parts(uri)?;
+    let mut header_parts = header.split(';');
+    let mime = header_parts.next()?.trim();
+    if !header_parts.any(|part| part.eq_ignore_ascii_case("base64")) {
+        return None;
+    }
+    let format = ImageFormat::from_mime_type(&mime.to_ascii_lowercase())
+        .or_else(|| message_attachment_image_format(attachment))?;
+    let encoded_len = encoded
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .count();
+    // STANDARD base64 expands three bytes into four characters. Reject an
+    // oversized payload before decoding so malformed remote data cannot cause
+    // an unbounded temporary allocation.
+    let max_encoded_len = MAX_INLINE_ATTACHMENT_BYTES
+        .saturating_add(2)
+        .saturating_div(3)
+        .saturating_mul(4)
+        .saturating_add(4);
+    if encoded_len > max_encoded_len {
+        return None;
+    }
+    let bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded.trim()).ok()?;
+    (bytes.len() <= MAX_INLINE_ATTACHMENT_BYTES).then_some((format, bytes))
+}
+
+fn attachment_mime(mime: &str) -> Option<String> {
+    let mime = mime.split(';').next().unwrap_or(mime).trim();
+    (!mime.is_empty()).then(|| mime.to_ascii_lowercase())
+}
+
+fn is_image_mime(mime: &str) -> bool {
+    mime.get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
+}
+
+fn attachment_uri_without_query(uri: &str) -> Option<&str> {
+    let uri = uri.trim();
+    (!uri.is_empty()).then(|| uri.split(['?', '#']).next().unwrap_or(uri))
+}
+
+fn data_uri_parts(uri: &str) -> Option<(&str, &str)> {
+    let prefix = uri.get(..5)?;
+    if !prefix.eq_ignore_ascii_case("data:") {
+        return None;
+    }
+    uri[5..].split_once(',')
+}
+
+fn data_uri_mime(uri: &str) -> Option<&str> {
+    let (header, _) = data_uri_parts(uri.trim())?;
+    let mime = header.split(';').next()?.trim();
+    (!mime.is_empty()).then_some(mime)
+}
+
+fn message_attachment_workspace_path(uri: &str, workspace_root: Option<&str>) -> Option<String> {
+    let uri = uri.trim();
+    if uri.is_empty() {
+        return None;
+    }
+    let parsed_path = if std::path::Path::new(uri).is_absolute() {
+        std::path::PathBuf::from(uri)
+    } else {
+        match url::Url::parse(uri) {
+            Ok(url) if url.scheme() == "file" => url.to_file_path().ok()?,
+            Ok(url) if url.scheme().is_empty() => std::path::PathBuf::from(uri),
+            Ok(_) => return None,
+            Err(_) => std::path::PathBuf::from(uri),
+        }
+    };
+    let path = if parsed_path.is_absolute() {
+        let root = std::path::Path::new(workspace_root?);
+        parsed_path.strip_prefix(root).ok()?.to_path_buf()
+    } else {
+        parsed_path
+    };
+    let mut relative = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(segment) => relative.push(segment),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                relative.pop().then_some(())?;
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    (!relative.is_empty()).then_some(relative)
+}
+
 fn timeline_row_status_label(row: &TimelineRow) -> String {
     if row.failed {
         locale::text("Failed", "失败", "失敗").to_string()
@@ -12758,6 +13534,18 @@ fn timeline_row_color(row: &TimelineRow) -> u32 {
             TimelineRowKind::Error => theme::ACCENT_RED,
             _ => theme::TEXT_MUTED,
         }
+    }
+}
+
+fn timeline_activity_icon_color(row: &TimelineRow) -> Hsla {
+    if row.failed {
+        rgb(theme::ACCENT_RED).into()
+    } else if row.pending_permission {
+        rgb(theme::ACCENT_YELLOW).into()
+    } else if row.streaming {
+        rgb(theme::ACCENT_GREEN).into()
+    } else {
+        theme::text_muted()
     }
 }
 
@@ -13139,6 +13927,106 @@ mod tests {
         assert_eq!(format_compact_duration(1_000, Some(1_000)), "1s");
         assert_eq!(format_compact_duration(1_000, Some(62_000)), "1m 1s");
         assert_eq!(format_compact_duration(1_000, Some(3_661_000)), "1h 1m");
+    }
+
+    fn message_attachment(
+        label: &str,
+        mime_type: Option<&str>,
+        uri: Option<&str>,
+    ) -> MessageAttachment {
+        MessageAttachment {
+            label: label.to_string(),
+            mime_type: mime_type.map(str::to_string),
+            uri: uri.map(str::to_string),
+            inline_text_offset: None,
+        }
+    }
+
+    #[test]
+    fn mobile_timeline_metadata_truncates_to_one_line() {
+        assert_eq!(
+            truncate_single_line("  provider\nmodel  ", 32),
+            "provider model"
+        );
+        assert_eq!(truncate_single_line("abcdef", 5), "ab...");
+        assert_eq!(truncate_single_line("abcdef", 3), "...");
+        assert_eq!(truncate_single_line("abcdef", 2), "..");
+        assert_eq!(truncate_single_line("abcdef", 0), "");
+    }
+
+    #[test]
+    fn mobile_timeline_attachment_image_detection_handles_mime_and_data_uris() {
+        assert!(message_attachment_is_image(&message_attachment(
+            "screen",
+            Some("IMAGE/PNG; charset=binary"),
+            None,
+        )));
+        assert!(message_attachment_is_image(&message_attachment(
+            "screen",
+            None,
+            Some("DATA:image/png;base64,aGVsbG8="),
+        )));
+        assert!(message_attachment_is_image(&message_attachment(
+            "screen",
+            None,
+            Some("file:///workspace/SCREEN.PNG?download=1"),
+        )));
+        assert!(!message_attachment_is_image(&message_attachment(
+            "notes",
+            Some("text/plain"),
+            Some("notes.md"),
+        )));
+        assert_eq!(
+            message_attachment_image_format(&message_attachment(
+                "screen",
+                None,
+                Some("DATA:image/png;base64,aGVsbG8="),
+            )),
+            Some(ImageFormat::Png)
+        );
+    }
+
+    #[test]
+    fn mobile_timeline_data_uri_decoding_is_bounded_and_case_insensitive() {
+        let attachment = message_attachment("screen", None, Some("DATA:IMAGE/PNG;BASE64,aGVsbG8="));
+        let (format, bytes) = decode_message_attachment_data_uri(&attachment).unwrap();
+        assert_eq!(format, ImageFormat::Png);
+        assert_eq!(bytes, b"hello");
+        assert!(
+            decode_message_attachment_data_uri(&message_attachment(
+                "screen",
+                Some("image/png"),
+                Some("data:image/png,not-base64"),
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn mobile_timeline_attachment_paths_stay_inside_workspace() {
+        assert_eq!(
+            message_attachment_workspace_path("src/../README.md", Some("/work/project")),
+            Some("README.md".into())
+        );
+        assert_eq!(
+            message_attachment_workspace_path(
+                "file:///work/project/src/main.rs",
+                Some("/work/project")
+            ),
+            Some("src/main.rs".into())
+        );
+        assert_eq!(
+            message_attachment_workspace_path("../../etc/passwd", Some("/work/project")),
+            None
+        );
+        assert_eq!(
+            message_attachment_workspace_path("/etc/passwd", Some("/work/project")),
+            None
+        );
+        assert_eq!(
+            message_attachment_workspace_path("https://example.com/a.png", Some("/work/project")),
+            None
+        );
     }
 
     #[test]

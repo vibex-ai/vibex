@@ -339,6 +339,11 @@ impl MobileWorkbench {
         self.tasks.push(task);
     }
 
+    /// Opens a workspace-relative file from another mobile surface.
+    pub fn open_file(&mut self, path: String, cx: &mut Context<Self>) {
+        self.select_file(path, cx);
+    }
+
     fn activate_file_row(
         &mut self,
         path: String,

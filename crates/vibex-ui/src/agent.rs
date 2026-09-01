@@ -8,7 +8,7 @@ use vibex_backend::{
     DomainCapabilities, MutationRequest,
 };
 use vibex_core::{
-    AgentSession, AgentSessionRuntimeSelectionState, ContinueAgentTurnRequest,
+    AgentSession, AgentSessionRuntimeSelectionState, AgentSessionState, ContinueAgentTurnRequest,
     CreateAgentSessionRequest, ElicitationAnswerValue, ElicitationFieldKind, ElicitationRequest,
     ElicitationRequestStatus, ElicitationResolution, ElicitationResolutionAction,
     FetchTimelineRequest, PermissionRequestStatus, RenameAgentSessionRequest,
@@ -235,7 +235,7 @@ pub struct AgentWorkflowState {
     pub latest_mutation: AsyncState<Vec<TimelineItem>>,
     pub connection: AgentConnectionState,
     pub last_runtime_event: Option<vibex_core::RuntimeSessionEvent>,
-    pending_mutations: BTreeSet<String>,
+    pending_mutations: BTreeMap<String, AgentMutationKind>,
     pending_permission_resolutions: BTreeSet<String>,
     pending_elicitation_resolutions: BTreeSet<String>,
 }
@@ -285,7 +285,7 @@ impl Default for AgentWorkflowState {
             latest_mutation: AsyncState::default(),
             connection: AgentConnectionState::Online,
             last_runtime_event: None,
-            pending_mutations: BTreeSet::new(),
+            pending_mutations: BTreeMap::new(),
             pending_permission_resolutions: BTreeSet::new(),
             pending_elicitation_resolutions: BTreeSet::new(),
         }
@@ -330,7 +330,24 @@ impl AgentWorkflowState {
             .value
             .as_ref()
             .map(|session| session.state);
-        let pending_turn = !self.pending_mutations.is_empty();
+        let pending_turn = self.pending_mutations.values().any(|kind| {
+            matches!(
+                kind,
+                AgentMutationKind::SendMessage | AgentMutationKind::ContinueTurn
+            )
+        });
+        // The Desktop remains authoritative, but its session snapshot can lag a
+        // just-accepted send/continue mutation. Keep that short gap visibly
+        // running without mutating the cached authoritative session state.
+        let session_state = if pending_turn
+            && matches!(
+                session_state,
+                Some(AgentSessionState::Idle | AgentSessionState::Error)
+            ) {
+            Some(AgentSessionState::Running)
+        } else {
+            session_state
+        };
         self.timeline.conversation_turns_with_reasoning_mode(
             session_state,
             pending_turn,
@@ -1137,12 +1154,15 @@ impl AgentWorkflowController {
                 "the Agent action targets a session that is no longer selected",
             ));
         }
-        if !self.state.pending_mutations.insert(request_id.to_string()) {
+        if self.state.pending_mutations.contains_key(request_id) {
             return Err(BackendError::conflict(
                 "agent_mutation_already_pending",
                 "this Agent mutation is already pending",
             ));
         }
+        self.state
+            .pending_mutations
+            .insert(request_id.to_string(), kind);
         self.state.latest_mutation.begin();
         Ok(AgentMutationTicket {
             generation: self.state.mutation_generation,
@@ -1158,7 +1178,10 @@ impl AgentWorkflowController {
         {
             return false;
         }
-        self.state.pending_mutations.remove(&ticket.request_id)
+        self.state
+            .pending_mutations
+            .remove(&ticket.request_id)
+            .is_some()
     }
 
     fn require(&self, operation: BackendOperation) -> BackendResult<()> {
@@ -1613,6 +1636,49 @@ mod tests {
                 .iter()
                 .all(|row| row.kind != vibex_desktop_model::TimelineRowKind::Reasoning)
         );
+    }
+
+    #[test]
+    fn pending_send_keeps_an_idle_user_turn_visibly_running() {
+        let session = session();
+        let backend = Arc::new(MockAgentBackend::new(session.clone(), Vec::new()));
+        let mut controller = AgentWorkflowController::new(backend, capabilities());
+        controller.state.selected_session_id = Some(session.id.clone());
+        controller.state.active_session.resolve(session.clone());
+        controller.state.timeline.replace_authoritative(
+            session.id.clone(),
+            [timeline_item(
+                &session.id,
+                1,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "Inspect the mobile timeline".into(),
+                    attachments: Vec::new(),
+                }),
+            )],
+        );
+
+        let request = MutationRequest::new(SendAgentMessageRequest {
+            session_id: session.id.clone(),
+            message_idempotency_key: "pending-message".into(),
+            desired_runtime: SessionRuntimeSelection::provider(
+                AgentId::parse("codex").unwrap(),
+                ProviderProfileId::new(),
+                "model",
+            ),
+            text: "Inspect the mobile timeline".into(),
+            attachments: Vec::new(),
+            reasoning_effort: None,
+            correlation_id: None,
+        });
+        controller.begin_send_message(&request).unwrap();
+
+        let turn = controller
+            .state
+            .conversation_turns()
+            .pop()
+            .expect("pending send should retain the user turn");
+        assert!(turn.user_row.is_some());
+        assert!(!turn.complete);
     }
 
     #[test]
