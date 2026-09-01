@@ -1,9 +1,10 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 use vibex_agent::AgentManager;
 use vibex_core::{
@@ -18,6 +19,32 @@ use vibex_core::{
 
 const DEFAULT_IMPORT_LIMIT: usize = 50;
 const MAX_IMPORT_LIMIT: usize = 200;
+const DEFAULT_SCAN_LIMIT: usize = 500;
+const MAX_SCAN_LIMIT: usize = 2000;
+const MAX_SCAN_WORKERS: usize = 8;
+/// Summary scans stop reading a transcript once every scan field is known;
+/// this line cap bounds the read for transcripts whose user prompt is buried
+/// under long non-message prefixes.
+const SCAN_PROBE_LINE_LIMIT: usize = 512;
+
+/// Default Claude transcript store roots: `$CLAUDE_CONFIG_DIR/projects` when
+/// set, plus the `~/.claude/projects` fallback. Existing directories only — a
+/// missing store simply means "no local sessions".
+pub fn claude_external_session_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(config_dir) = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        roots.push(config_dir.join("projects"));
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
+        roots.push(PathBuf::from(home).join(".claude").join("projects"));
+    }
+    roots.retain(|root| root.is_dir());
+    roots.dedup();
+    roots
+}
 const MAX_DIAGNOSTICS_PER_CANDIDATE: usize = 32;
 const MISSING_NATIVE_SESSION_ID: &str = "missing_native_session_id";
 const AMBIGUOUS_NATIVE_SESSION_ID: &str = "ambiguous_native_session_id";
@@ -82,12 +109,419 @@ pub async fn import_selected_claude_sessions(
         }
     }
 
+    // Summary scans carry no native history; materialize each selected
+    // candidate from its transcript file so the disk — not a possibly stale
+    // scan — is the source of truth for what gets imported.
+    let mut materialized = Vec::with_capacity(candidates.len());
+    let mut diagnostics = Vec::new();
+    let mut first_failure: Option<(String, String)> = None;
+    for candidate in candidates {
+        if candidate.timeline_items.is_empty()
+            && let Some(source_path) = candidate.source_path.as_deref()
+        {
+            match materialize_claude_candidate(&candidate, Path::new(source_path)) {
+                Ok(candidate) => materialized.push(candidate),
+                Err(error) => {
+                    if first_failure.is_none() {
+                        first_failure = Some((candidate.candidate_id.clone(), error.message.clone()));
+                    }
+                    diagnostics.push(
+                        VibexError::validation(
+                            "claude_import_materialize_failed",
+                            "Claude import candidate could not be read from its transcript",
+                        )
+                        .with_diagnostic("candidateId", candidate.candidate_id.clone())
+                        .with_diagnostic("error", bounded(&error.message, 160)),
+                    );
+                }
+            }
+            continue;
+        }
+        materialized.push(candidate);
+    }
+    if materialized.is_empty()
+        && let Some((candidate_id, error)) = first_failure
+    {
+        return Err(VibexError::validation(
+            "claude_import_materialize_failed",
+            "no selected Claude candidates could be read from their transcripts",
+        )
+        .with_diagnostic("candidateId", candidate_id)
+        .with_diagnostic("error", bounded(&error, 160)));
+    }
+
     manager
         .import_external_sessions(ExternalSessionImportRequest {
-            candidates,
+            candidates: materialized,
             correlation_id,
         })
         .await
+}
+
+/// Re-read a scanned candidate's transcript and return a fully materialized
+/// candidate (native ids, workspace, title, and full native history). The
+/// candidate id is deterministic given the file, so callers can keep matching
+/// the result against the selected scan summary.
+fn materialize_claude_candidate(
+    candidate: &ExternalSessionImportCandidate,
+    source_path: &Path,
+) -> VibexResult<ExternalSessionImportCandidate> {
+    let request = ClaudeSessionImportPreviewRequest {
+        paths: vec![source_path.to_path_buf()],
+        workspace_root: Some(candidate.workspace_root.clone()),
+        workspace_mode: candidate.workspace_mode,
+        provider_profile_id: candidate.provider_profile_id.clone(),
+        correlation_id: None,
+        limit: Some(1),
+    };
+    let preview = preview_claude_external_sessions(request)?;
+    let mut candidates = preview.candidates;
+    candidates
+        .iter()
+        .position(|parsed| parsed.candidate_id == candidate.candidate_id)
+        .map(|index| candidates.remove(index))
+        .or_else(|| candidates.into_iter().next())
+        .ok_or_else(|| {
+            VibexError::validation(
+                "claude_import_materialize_empty",
+                "Claude transcript no longer contains an importable session",
+            )
+            .with_diagnostic("candidateId", candidate.candidate_id.clone())
+        })
+}
+
+/// Fast multi-file scan for the import picker. Unlike the preview request it
+/// is recursive, does not stop at 200 files, and — critically — never parses a
+/// transcript to EOF: each file contributes a summary candidate whose native
+/// history is re-read from disk only if that candidate is selected for import.
+/// Results are capped at `limit`, newest transcript first.
+pub fn scan_claude_external_sessions(
+    roots: &[PathBuf],
+    workspace_mode: WorkspaceMode,
+    provider_profile_id: Option<ProviderProfileId>,
+    limit: Option<usize>,
+) -> ExternalSessionImportPreview {
+    let limit = limit.unwrap_or(DEFAULT_SCAN_LIMIT).clamp(1, MAX_SCAN_LIMIT);
+    let mut paths = Vec::new();
+    for root in roots {
+        collect_jsonl_paths_recursive_lenient(root, &mut paths);
+    }
+    if paths.len() > 1 {
+        paths.sort_by_cached_key(|path| std::cmp::Reverse(file_modified_at_ms(path).unwrap_or(0)));
+    }
+    paths.truncate(limit);
+
+    let summaries = parse_claude_summaries_parallel(&paths, workspace_mode, provider_profile_id);
+    let mut candidates = Vec::new();
+    let mut diagnostics = Vec::new();
+    for summary in summaries {
+        match summary {
+            Ok(Some(candidate)) => candidates.push(candidate),
+            Ok(None) => {}
+            Err(diagnostic) => diagnostics.push(diagnostic),
+        }
+    }
+    ExternalSessionImportPreview {
+        candidates,
+        diagnostics,
+        correlation_id: None,
+    }
+}
+
+/// Directory walk that never fails the scan: unreadable directories and
+/// vanished entries are skipped, matching the summary-cache parser semantics.
+fn collect_jsonl_paths_recursive_lenient(directory: &Path, discovered: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    let mut directories = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if file_type.is_dir() {
+            directories.push(path);
+        } else if (file_type.is_file() || (file_type.is_symlink() && path.is_file()))
+            && path.extension().is_some_and(|extension| extension == "jsonl")
+        {
+            discovered.push(path);
+        }
+    }
+    directories.sort();
+    for directory in directories {
+        collect_jsonl_paths_recursive_lenient(&directory, discovered);
+    }
+}
+
+fn parse_claude_summaries_parallel(
+    paths: &[PathBuf],
+    workspace_mode: WorkspaceMode,
+    provider_profile_id: Option<ProviderProfileId>,
+) -> Vec<Result<Option<ExternalSessionImportCandidate>, ExternalSessionImportDiagnostic>> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    if paths.len() == 1 {
+        return vec![parse_claude_summary_with_cache(
+            &paths[0],
+            workspace_mode,
+            provider_profile_id,
+        )];
+    }
+    let worker_count = MAX_SCAN_WORKERS.min(paths.len());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results = std::sync::Mutex::new(
+        Vec::<(usize, Result<Option<ExternalSessionImportCandidate>, ExternalSessionImportDiagnostic>)>::with_capacity(
+            paths.len(),
+        ),
+    );
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if index >= paths.len() {
+                        break;
+                    }
+                    let parsed = parse_claude_summary_with_cache(
+                        &paths[index],
+                        workspace_mode,
+                        provider_profile_id.clone(),
+                    );
+                    if let Ok(mut slot) = results.lock() {
+                        slot.push((index, parsed));
+                    }
+                }
+            });
+        }
+    });
+    let mut slots: Vec<_> = results.into_inner().unwrap_or_default();
+    slots.sort_by_key(|(index, _)| *index);
+    slots.into_iter().map(|(_, parsed)| parsed).collect()
+}
+
+/// Memoized summary parse keyed on `(mtime, size)` — a cache hit `stat`s the
+/// file (microseconds) instead of reading and JSON-parsing it. Rescans of a
+/// history that only grows are therefore dominated by the directory walk.
+fn parse_claude_summary_with_cache(
+    path: &Path,
+    workspace_mode: WorkspaceMode,
+    provider_profile_id: Option<ProviderProfileId>,
+) -> Result<Option<ExternalSessionImportCandidate>, ExternalSessionImportDiagnostic> {
+    let cache = claude_summary_cache();
+    let fingerprint = summary_fingerprint(path);
+
+    if let (Some(fingerprint), Ok(cache)) = (fingerprint, cache.lock())
+        && let Some(candidate) = cache.entries.get(path)
+        && candidate.fingerprint == fingerprint
+    {
+        let mut cached = candidate.candidate.clone();
+        cached.provider_profile_id = provider_profile_id;
+        return Ok(Some(cached));
+    }
+
+    let parsed = parse_claude_summary_candidate(path, workspace_mode, provider_profile_id);
+    // Only memoize positive summaries whose fingerprint survived the read:
+    // a transcript written while we parsed it stays uncached so the next
+    // scan re-reads the settled bytes.
+    if let (Some(fingerprint), Ok(Some(parsed)), Ok(mut cache)) =
+        (fingerprint, parsed.as_ref(), cache.lock())
+        && summary_fingerprint(path) == Some(fingerprint)
+        && parsed.status == ExternalSessionImportCandidateStatus::Importable
+    {
+        cache.entries.insert(
+            path.to_path_buf(),
+            CachedSummary {
+                fingerprint,
+                candidate: parsed.clone(),
+            },
+        );
+    }
+    parsed
+}
+
+/// Process-global summary cache. Keyed by transcript path and invalidated by
+/// the `(mtime, size)` fingerprint, so a rescan of a history that only grows
+/// `stat`s each file instead of re-reading and re-parsing it.
+fn claude_summary_cache() -> &'static Mutex<SummaryCache> {
+    static CACHE: OnceLock<Mutex<SummaryCache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(SummaryCache {
+            entries: HashMap::new(),
+        })
+    })
+}
+
+fn summary_fingerprint(path: &Path) -> Option<(Option<SystemTime>, u64)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.modified().ok(), metadata.len()))
+}
+
+struct SummaryCache {
+    entries: HashMap<PathBuf, CachedSummary>,
+}
+
+struct CachedSummary {
+    fingerprint: (Option<SystemTime>, u64),
+    candidate: ExternalSessionImportCandidate,
+}
+
+/// Summary-only parse: enough of the transcript to title the session and
+/// resolve its native session id and workspace — typically just the first
+/// user turn — with `timeline_items` left empty so the import path re-reads
+/// the file. `Ok(None)` marks transcripts that are not main-conversation
+/// history (sidechain subagent files), which the picker should not offer.
+fn parse_claude_summary_candidate(
+    path: &Path,
+    workspace_mode: WorkspaceMode,
+    provider_profile_id: Option<ProviderProfileId>,
+) -> Result<Option<ExternalSessionImportCandidate>, ExternalSessionImportDiagnostic> {
+    let Ok(file) = File::open(path) else {
+        return Err(diagnostic(
+            "claude_import_file_unreadable",
+            "Claude session transcript could not be read",
+            vec![detail("pathHash", stable_hash_hex(path.display().to_string()))],
+        ));
+    };
+    let mut state = ScanState {
+        native_session_ids: BTreeSet::new(),
+        workspace_root: None,
+        first_user_text: None,
+        summary_text: None,
+        has_content: false,
+        first_sidechain_flag: None,
+        updated_at_ms: file_modified_at_ms(path),
+    };
+    for (line_index, line) in BufReader::new(file).lines().enumerate() {
+        if state.scan_is_complete() || line_index >= SCAN_PROBE_LINE_LIMIT {
+            break;
+        }
+        let Ok(line) = line else {
+            break;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        state.ingest_summary_record(&value);
+    }
+    // Subagent transcripts carry the parent conversation's sidechain flag;
+    // they are internal implementation detail, not user-facing sessions.
+    if state.first_sidechain_flag == Some(true) {
+        return Ok(None);
+    }
+    let (native_session_id, continuation_status, continuation_reason) =
+        continuation_from_ids(&state.native_session_ids);
+    let workspace_root = state
+        .workspace_root
+        .filter(|value| has_text(value))
+        .unwrap_or_else(|| "/tmp/vibex-claude-import".to_string());
+    let status = if state.has_content
+        || continuation_status == ExternalSessionContinuationStatus::Resumable
+    {
+        ExternalSessionImportCandidateStatus::Importable
+    } else {
+        ExternalSessionImportCandidateStatus::Blocked
+    };
+    Ok(Some(ExternalSessionImportCandidate {
+        candidate_id: candidate_id(path, native_session_id.as_deref()),
+        source: ExternalSessionImportSource::Claude,
+        agent_id: vibex_core::AgentId::parse("claude").expect("builtin Claude Agent id"),
+        provider_kind: ProviderKind::Claude,
+        provider_profile_id,
+        workspace_root,
+        additional_workspace_roots: Vec::new(),
+        workspace_mode,
+        title: title_for(
+            path,
+            native_session_id.as_deref(),
+            state
+                .first_user_text
+                .as_deref()
+                .or(state.summary_text.as_deref()),
+        ),
+        native_session_id,
+        native_thread_id: None,
+        native_resume_token: None,
+        continuation_status,
+        continuation_reason,
+        updated_at_ms: state.updated_at_ms,
+        session_config_state: None,
+        status,
+        already_imported: false,
+        redaction_state: TimelineRedactionState::None,
+        timeline_items: Vec::new(),
+        diagnostics: Vec::new(),
+        source_path: Some(path.display().to_string()),
+    }))
+}
+
+struct ScanState {
+    native_session_ids: BTreeSet<String>,
+    workspace_root: Option<String>,
+    first_user_text: Option<String>,
+    summary_text: Option<String>,
+    has_content: bool,
+    first_sidechain_flag: Option<bool>,
+    updated_at_ms: Option<i64>,
+}
+
+impl ScanState {
+    fn ingest_summary_record(&mut self, value: &serde_json::Value) {
+        if let Some(session_id) = text_field(value, "sessionId").filter(|value| has_text(value)) {
+            self.native_session_ids.insert(session_id.to_string());
+        }
+        if self.workspace_root.is_none() {
+            self.workspace_root = text_field(value, "cwd")
+                .filter(|value| has_text(value))
+                .map(ToOwned::to_owned);
+        }
+        if self.first_sidechain_flag.is_none()
+            && let Some(flag) = value.get("isSidechain").and_then(serde_json::Value::as_bool)
+        {
+            self.first_sidechain_flag = Some(flag);
+        }
+        if text_field(value, "type") == Some("summary")
+            && self.summary_text.is_none()
+            && let Some(summary) = text_field(value, "summary").filter(|value| has_text(value))
+        {
+            self.summary_text = Some(bounded(summary, 80));
+            return;
+        }
+        if self.has_content {
+            return;
+        }
+        let record_type = text_field(value, "type").unwrap_or("missing");
+        let Some(message) = value.get("message") else {
+            return;
+        };
+        let role = text_field(message, "role").or(match record_type {
+            "user" => Some("user"),
+            "assistant" => Some("assistant"),
+            _ => None,
+        });
+        match role {
+            Some("user") => {
+                self.has_content = true;
+                if self.first_user_text.is_none()
+                    && value.get("isMeta").and_then(serde_json::Value::as_bool) != Some(true)
+                    && let Some(text) = extract_message_text(message).filter(|value| has_text(value))
+                {
+                    self.first_user_text = title_from_user_text(&text);
+                }
+            }
+            Some("assistant") => {
+                self.has_content = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn scan_is_complete(&self) -> bool {
+        self.native_session_ids.len() == 1
+            && self.workspace_root.is_some()
+            && self.first_user_text.is_some()
+    }
 }
 
 fn discover_jsonl_paths(paths: &[PathBuf], limit: Option<usize>) -> VibexResult<Vec<PathBuf>> {
@@ -226,7 +660,7 @@ fn parse_claude_jsonl_candidate(
         .filter(|value| has_text(value))
         .unwrap_or_else(|| "/tmp/vibex-claude-import".to_string());
     let candidate_id = candidate_id(path, native_session_id.as_deref());
-    let title = title_for(path, native_session_id.as_deref());
+    let title = title_for(path, native_session_id.as_deref(), None);
     let status = if state.timeline_items.is_empty() {
         ExternalSessionImportCandidateStatus::Blocked
     } else {
@@ -255,6 +689,7 @@ fn parse_claude_jsonl_candidate(
         redaction_state: TimelineRedactionState::None,
         timeline_items: state.timeline_items,
         diagnostics: state.diagnostics,
+        source_path: Some(path.display().to_string()),
     })
 }
 
@@ -560,11 +995,11 @@ fn file_modified_at_ms(path: &Path) -> Option<i64> {
     path.metadata()
         .ok()
         .and_then(|metadata| metadata.modified().ok())
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .and_then(|modified| modified.duration_since(SystemTime::UNIX_EPOCH).ok())
         .and_then(|duration| i64::try_from(duration.as_millis()).ok())
         .or_else(|| {
             SystemTime::now()
-                .duration_since(UNIX_EPOCH)
+                .duration_since(SystemTime::UNIX_EPOCH)
                 .ok()
                 .and_then(|duration| i64::try_from(duration.as_millis()).ok())
         })
@@ -580,7 +1015,10 @@ fn candidate_id(path: &Path, native_session_id: Option<&str>) -> String {
     }
 }
 
-fn title_for(path: &Path, native_session_id: Option<&str>) -> String {
+fn title_for(path: &Path, native_session_id: Option<&str>, first_user_text: Option<&str>) -> String {
+    if let Some(text) = first_user_text {
+        return format!("Imported Claude: {}", text);
+    }
     if let Some(session_id) = native_session_id {
         return format!("Imported Claude session {}", redacted_prefix(session_id));
     }
@@ -589,6 +1027,38 @@ fn title_for(path: &Path, native_session_id: Option<&str>) -> String {
         .and_then(|stem| stem.to_str())
         .unwrap_or("jsonl");
     format!("Imported Claude session {}", bounded(stem, 24))
+}
+
+/// Derive a readable row title from the first user prompt: flatten to the
+/// first non-empty line and drop wrapper tags like `<command-message>` or
+/// `<system-reminder>` blocks so scanned rows read like chat titles.
+fn title_from_user_text(text: &str) -> Option<String> {
+    let mut cleaned = text.trim();
+    while cleaned.starts_with('<') {
+        let Some(tag_end) = cleaned.find('>') else {
+            break;
+        };
+        let tag = &cleaned[1..tag_end];
+        let tag_name = tag
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches('/');
+        if tag_name.is_empty() {
+            break;
+        }
+        let rest = &cleaned[tag_end + 1..];
+        let close = format!("</{}>", tag_name);
+        cleaned = match rest.rfind(&close) {
+            Some(position) => rest[..position].trim(),
+            None => rest.trim(),
+        };
+    }
+    cleaned
+        .lines()
+        .map(str::trim)
+        .find(|line| has_text(line))
+        .map(|line| bounded(line, 80))
 }
 
 fn redacted_prefix(value: &str) -> String {
@@ -881,5 +1351,142 @@ mod tests {
 
     fn unique_temp_dir(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("{label}-{}", vibex_core::RequestId::new().as_str()))
+    }
+
+    fn write_claude_session(path: &Path, session_id: &str, cwd: &str, user_text: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let user = serde_json::json!({
+            "type": "user",
+            "sessionId": session_id,
+            "cwd": cwd,
+            "message": {"role": "user", "content": [{"type": "text", "text": user_text}]}
+        });
+        let assistant = serde_json::json!({
+            "type": "assistant",
+            "sessionId": session_id,
+            "cwd": cwd,
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "Reply text"}]}
+        });
+        std::fs::write(
+            path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&user).unwrap(),
+                serde_json::to_string(&assistant).unwrap()
+            ),
+        )
+        .unwrap();
+    }
+
+    fn set_mtime(path: &Path, seconds: u64) {
+        let file = File::options().write(true).open(path).unwrap();
+        file.set_modified(
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn scan_orders_newest_first_and_skips_sidechain_transcripts() {
+        let root = unique_temp_dir("vibex-claude-scan-order");
+        write_claude_session(
+            &root.join("-tmp-project-b/sessions-b.jsonl"),
+            "session-b",
+            "/tmp/project-b",
+            "Second session prompt",
+        );
+        write_claude_session(
+            &root.join("-tmp-project-a/sessions-a.jsonl"),
+            "session-a",
+            "/tmp/project-a",
+            "First session prompt",
+        );
+        set_mtime(&root.join("-tmp-project-a/sessions-a.jsonl"), 1_000);
+        set_mtime(&root.join("-tmp-project-b/sessions-b.jsonl"), 2_000);
+
+        let sidechain_path = root.join("-tmp-project-b/agent-sidechain.jsonl");
+        std::fs::write(
+            &sidechain_path,
+            serde_json::to_string(&serde_json::json!({
+                "type": "user",
+                "isSidechain": true,
+                "sessionId": "session-sidechain",
+                "cwd": "/tmp/project-b",
+                "message": {"role": "user", "content": "sidechain work"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        set_mtime(&sidechain_path, 3_000);
+
+        let preview = scan_claude_external_sessions(&[root.clone()], WorkspaceMode::CurrentCheckout, None, None);
+
+        assert_eq!(preview.candidates.len(), 2);
+        assert_eq!(preview.candidates[0].native_session_id.as_deref(), Some("session-b"));
+        assert_eq!(preview.candidates[1].native_session_id.as_deref(), Some("session-a"));
+        for candidate in &preview.candidates {
+            assert_eq!(candidate.timeline_items.len(), 0, "summary scan stays light");
+            assert!(candidate.source_path.is_some());
+            assert_eq!(candidate.status, ExternalSessionImportCandidateStatus::Importable);
+            assert_eq!(candidate.source, ExternalSessionImportSource::Claude);
+        }
+        assert_eq!(preview.candidates[0].title, "Imported Claude: Second session prompt");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn scan_summary_cache_skips_reparse_unchanged_files() {
+        let root = unique_temp_dir("vibex-claude-scan-cache");
+        let path = root.join("cached-session.jsonl");
+        write_claude_session(&path, "session-cache", "/tmp/project-cache", "Cached prompt");
+
+        let first = scan_claude_external_sessions(&[root.clone()], WorkspaceMode::CurrentCheckout, None, None);
+        assert_eq!(first.candidates.len(), 1);
+        let fingerprint = summary_fingerprint(&path);
+
+        // Same fingerprint: the memoized summary must round-trip unchanged.
+        let second = parse_claude_summary_with_cache(&path, WorkspaceMode::CurrentCheckout, None).unwrap();
+        assert_eq!(second.as_ref().map(|c| c.candidate_id.clone()), Some(first.candidates[0].candidate_id.clone()));
+        assert_eq!(summary_fingerprint(&path), fingerprint);
+
+        // Mutating content invalidates the cache entry.
+        write_claude_session(&path, "session-cache-2", "/tmp/project-cache", "Changed prompt");
+        let third = parse_claude_summary_with_cache(&path, WorkspaceMode::CurrentCheckout, None).unwrap();
+        assert_ne!(third.and_then(|c| c.native_session_id), Some("session-cache".to_string()));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn scan_uses_summary_record_as_title_fallback() {
+        let root = unique_temp_dir("vibex-claude-scan-summary");
+        let path = root.join("summarized.jsonl");
+        let summary = serde_json::json!({
+            "type": "summary",
+            "summary": "Refactor the importer pipeline",
+            "leafUuid": "leaf-1"
+        });
+        let assistant = serde_json::json!({
+            "type": "assistant",
+            "sessionId": "session-summary",
+            "cwd": "/tmp/project-summary",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "Working"}]}
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&summary).unwrap(),
+                serde_json::to_string(&assistant).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let preview = scan_claude_external_sessions(&[root.clone()], WorkspaceMode::CurrentCheckout, None, None);
+        assert_eq!(preview.candidates.len(), 1);
+        assert_eq!(preview.candidates[0].title, "Imported Claude: Refactor the importer pipeline");
+        std::fs::remove_dir_all(root).ok();
     }
 }

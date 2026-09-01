@@ -19581,6 +19581,7 @@ fn normalize_session_list_candidates(
                 redaction_state: TimelineRedactionState::None,
                 timeline_items: Vec::new(),
                 diagnostics: Vec::new(),
+                source_path: None,
             }
         })
         .collect()

@@ -125,6 +125,12 @@ pub struct ExternalSessionImportCandidate {
     /// parity fixtures and older local data.
     pub timeline_items: Vec<ExternalSessionImportTimelineItem>,
     pub diagnostics: Vec<ExternalSessionImportDiagnostic>,
+    /// Local transcript file the candidate was scanned from. Summary scans
+    /// leave `timeline_items` empty and materialize the native history from
+    /// this path at import time, so a scan never holds every payload in
+    /// memory. `None` for online ACP candidates and legacy wire data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,6 +160,8 @@ struct ExternalSessionImportCandidateWire {
     redaction_state: TimelineRedactionState,
     timeline_items: Vec<ExternalSessionImportTimelineItem>,
     diagnostics: Vec<ExternalSessionImportDiagnostic>,
+    #[serde(default)]
+    source_path: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for ExternalSessionImportCandidate {
@@ -187,6 +195,7 @@ impl<'de> Deserialize<'de> for ExternalSessionImportCandidate {
             redaction_state: wire.redaction_state,
             timeline_items: wire.timeline_items,
             diagnostics: wire.diagnostics,
+            source_path: wire.source_path,
         })
     }
 }
@@ -278,6 +287,7 @@ mod tests {
                 timestamp_ms: Some(1),
             }],
             diagnostics: Vec::new(),
+            source_path: None,
         };
 
         let json = serde_json::to_value(&candidate).unwrap();
@@ -301,5 +311,43 @@ mod tests {
         let legacy_decoded: ExternalSessionImportCandidate =
             serde_json::from_value(legacy_json).unwrap();
         assert_eq!(legacy_decoded.agent_id, AgentId::parse("codex").unwrap());
+    }
+
+    #[test]
+    fn external_session_import_candidate_round_trips_optional_source_path() {
+        let base = || ExternalSessionImportCandidate {
+            candidate_id: "codex:path:abc".to_string(),
+            source: ExternalSessionImportSource::Codex,
+            agent_id: AgentId::parse("codex").unwrap(),
+            provider_kind: ProviderKind::Codex,
+            provider_profile_id: None,
+            workspace_root: "/tmp/vibex-import".to_string(),
+            additional_workspace_roots: Vec::new(),
+            workspace_mode: WorkspaceMode::CurrentCheckout,
+            title: "Scan".to_string(),
+            native_session_id: None,
+            native_thread_id: Some("thread-1".to_string()),
+            native_resume_token: None,
+            continuation_status: ExternalSessionContinuationStatus::Resumable,
+            continuation_reason: None,
+            updated_at_ms: Some(1),
+            session_config_state: None,
+            status: ExternalSessionImportCandidateStatus::Importable,
+            already_imported: false,
+            redaction_state: TimelineRedactionState::None,
+            timeline_items: Vec::new(),
+            diagnostics: Vec::new(),
+            source_path: None,
+        };
+
+        let without = serde_json::to_value(base()).unwrap();
+        assert!(without.get("sourcePath").is_none());
+        let decoded: ExternalSessionImportCandidate = serde_json::from_value(without).unwrap();
+        assert_eq!(decoded.source_path, None);
+
+        let mut with = serde_json::to_value(base()).unwrap();
+        with["sourcePath"] = serde_json::Value::String("/tmp/session.jsonl".to_string());
+        let decoded: ExternalSessionImportCandidate = serde_json::from_value(with).unwrap();
+        assert_eq!(decoded.source_path.as_deref(), Some("/tmp/session.jsonl"));
     }
 }

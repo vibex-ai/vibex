@@ -75,6 +75,7 @@ use vibex_core::{
     AttachRuntimeRequest, CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest,
     CreateAgentSessionRequest, DetachRuntimeRequest, ElicitationField, ElicitationFieldKind,
     ElicitationRequest, ElicitationResolutionAction, ExternalSessionImportCandidateStatus,
+    ExternalSessionImportDiagnostic,
     ExternalSessionImportPreviewRequest, ExternalSessionImportRequest, ExternalSessionImportSource,
     FetchTimelineRequest, FileEntryKind, FileOperationKind, FileOperationPatchFormat,
     FileTreeRequest, ForkAgentSessionRequest, GetMessageSubmissionRequest,
@@ -15224,14 +15225,14 @@ impl VibexWorkbench {
                     },
                     match locale {
                         locale::ResolvedLocale::En => format!(
-                            "Scan ACP sessions under {compact_root}, then import selected history."
+                            "Scan local Codex, Claude, and ACP sessions under {compact_root}, then import selected history."
                         ),
-                        locale::ResolvedLocale::ZhCn => {
-                            format!("扫描 {compact_root} 下的 ACP 会话，然后导入选中的历史记录。")
-                        }
-                        locale::ResolvedLocale::ZhTw => {
-                            format!("掃描 {compact_root} 下的 ACP 會話，然後匯入選取的歷史記錄。")
-                        }
+                        locale::ResolvedLocale::ZhCn => format!(
+                            "扫描 {compact_root} 下的本地 Codex、Claude 和 ACP 会话，然后导入选中的历史记录。"
+                        ),
+                        locale::ResolvedLocale::ZhTw => format!(
+                            "掃描 {compact_root} 下的本機 Codex、Claude 和 ACP 會話，然後匯入選取的歷史記錄。"
+                        ),
                     },
                 )
             }
@@ -15239,15 +15240,15 @@ impl VibexWorkbench {
                 locale::text("External session import", "外部会话导入", "外部會話匯入")
                     .to_string(),
                 locale::text(
-                    "Scan local ACP sessions from every enabled Agent, then import selected native history.",
-                    "扫描已启用 Agent 的本地 ACP 会话，然后导入选中的原生历史记录。",
-                    "掃描已啟用 Agent 的本機 ACP 會話，然後匯入選取的原生歷史記錄。",
+                    "Scan local Codex, Claude, and ACP sessions, then import selected native history.",
+                    "扫描本地 Codex、Claude 和 ACP 会话，然后导入选中的原生历史记录。",
+                    "掃描本機 Codex、Claude 和 ACP 會話，然後匯入選取的原生歷史記錄。",
                 )
                 .to_string(),
             ),
         };
         let viewport = window.viewport_size();
-        let dialog_width = (f32::from(viewport.width) - 32.0).clamp(280.0, 672.0);
+        let dialog_width = (f32::from(viewport.width) - 32.0).clamp(280.0, 760.0);
         let dialog_max_height = (f32::from(viewport.height) - 32.0).clamp(240.0, 672.0);
         let on_close_workbench = cx.weak_entity();
         window.open_dialog(cx, move |dialog, _, cx| {
@@ -42597,15 +42598,21 @@ fn mobile_pair_icon(hovered: bool, cx: &App) -> AnyElement {
 #[derive(Clone, Copy)]
 struct ExternalImportText {
     search_placeholder: &'static str,
-    scan_sessions: &'static str,
     scanning: &'static str,
+    scan_again: &'static str,
+    preparing_scan: &'static str,
+    import_running: &'static str,
     no_sessions: &'static str,
     no_matches: &'static str,
-    select_all: &'static str,
+    scan_failed: &'static str,
+    import_failed: &'static str,
+    expand_all: &'static str,
+    collapse_all: &'static str,
     clear_selection: &'static str,
     import_selected: &'static str,
+    close: &'static str,
+    all_sources: &'static str,
     profile_linked: &'static str,
-    native_history: &'static str,
     already_imported: &'static str,
     resumable: &'static str,
     read_only: &'static str,
@@ -42614,46 +42621,64 @@ struct ExternalImportText {
 fn external_import_text(locale: locale::ResolvedLocale) -> ExternalImportText {
     match locale {
         locale::ResolvedLocale::En => ExternalImportText {
-            search_placeholder: "Search sessions, agents, or project directories",
-            scan_sessions: "Scan ACP sessions",
-            scanning: "Scanning ACP sessions...",
-            no_sessions: "No ACP sessions found",
+            search_placeholder: "Search sessions or project directories",
+            scanning: "Scanning local sessions...",
+            scan_again: "Rescan",
+            preparing_scan: "Preparing scan...",
+            import_running: "Importing selected sessions...",
+            no_sessions: "No local sessions found",
             no_matches: "No sessions match the current search",
-            select_all: "Select all",
-            clear_selection: "Clear selection",
+            scan_failed: "Scan failed",
+            import_failed: "Import failed",
+            expand_all: "Expand all",
+            collapse_all: "Collapse all",
+            clear_selection: "Clear",
             import_selected: "Import selected",
+            close: "Close",
+            all_sources: "All",
             profile_linked: "profile",
-            native_history: "native history",
             already_imported: "already imported",
             resumable: "resumable",
             read_only: "read-only",
         },
         locale::ResolvedLocale::ZhCn => ExternalImportText {
-            search_placeholder: "搜索会话、Agent 或项目目录",
-            scan_sessions: "扫描 ACP 会话",
-            scanning: "正在扫描 ACP 会话...",
-            no_sessions: "未找到 ACP 会话",
+            search_placeholder: "搜索会话或项目目录",
+            scanning: "正在扫描本地会话...",
+            scan_again: "重新扫描",
+            preparing_scan: "正在准备扫描...",
+            import_running: "正在导入选中的会话...",
+            no_sessions: "未找到本地会话",
             no_matches: "没有匹配当前搜索的会话",
-            select_all: "全选",
-            clear_selection: "清空选择",
+            scan_failed: "扫描失败",
+            import_failed: "导入失败",
+            expand_all: "全部展开",
+            collapse_all: "全部折叠",
+            clear_selection: "清空",
             import_selected: "导入选中项",
+            close: "关闭",
+            all_sources: "全部",
             profile_linked: "配置",
-            native_history: "原生历史",
             already_imported: "已导入",
             resumable: "可继续",
             read_only: "只读",
         },
         locale::ResolvedLocale::ZhTw => ExternalImportText {
-            search_placeholder: "搜尋會話、Agent 或專案目錄",
-            scan_sessions: "掃描 ACP 會話",
-            scanning: "正在掃描 ACP 會話...",
-            no_sessions: "找不到 ACP 會話",
+            search_placeholder: "搜尋會話或專案目錄",
+            scanning: "正在掃描本機會話...",
+            scan_again: "重新掃描",
+            preparing_scan: "正在準備掃描...",
+            import_running: "正在匯入選取的會話...",
+            no_sessions: "找不到本機會話",
             no_matches: "沒有符合目前搜尋的會話",
-            select_all: "全選",
-            clear_selection: "清除選取",
+            scan_failed: "掃描失敗",
+            import_failed: "匯入失敗",
+            expand_all: "全部展開",
+            collapse_all: "全部摺疊",
+            clear_selection: "清除",
             import_selected: "匯入選取項",
+            close: "關閉",
+            all_sources: "全部",
             profile_linked: "設定",
-            native_history: "原生歷史",
             already_imported: "已匯入",
             resumable: "可繼續",
             read_only: "唯讀",
@@ -42670,14 +42695,6 @@ fn compact_workspace_path(path: &str) -> String {
         return "~".to_string();
     }
     path.to_string()
-}
-
-fn import_source_label(source: vibex_core::ExternalSessionImportSource) -> &'static str {
-    match source {
-        vibex_core::ExternalSessionImportSource::Codex => "codex",
-        vibex_core::ExternalSessionImportSource::Claude => "claude",
-        vibex_core::ExternalSessionImportSource::Acp => "acp",
-    }
 }
 
 fn import_provider_label(kind: ProviderKind) -> &'static str {
@@ -42700,19 +42717,140 @@ fn external_session_candidate_is_importable(status: ExternalSessionImportCandida
     status == ExternalSessionImportCandidateStatus::Importable
 }
 
+fn external_session_candidate_is_selectable(
+    candidate: &vibex_core::ExternalSessionImportCandidate,
+) -> bool {
+    external_session_candidate_is_importable(candidate.status) && !candidate.already_imported
+}
+
+fn import_source_chip_kind(
+    source: vibex_core::ExternalSessionImportSource,
+) -> ExternalImportSourceChip {
+    match source {
+        vibex_core::ExternalSessionImportSource::Codex => ExternalImportSourceChip::Codex,
+        vibex_core::ExternalSessionImportSource::Claude => ExternalImportSourceChip::Claude,
+        vibex_core::ExternalSessionImportSource::Acp => ExternalImportSourceChip::Acp,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalImportSourceChip {
+    Codex,
+    Claude,
+    Acp,
+}
+
+impl ExternalImportSourceChip {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::Acp => "acp",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Claude => "Claude",
+            Self::Acp => "ACP",
+        }
+    }
+}
+
+/// One scanned workspace folder. Selection, collapsing, and filtering all
+/// operate per folder so a user can pull in a whole project's history with
+/// one click instead of ticking dozens of rows.
+#[derive(Debug, Clone)]
+struct ExternalImportCandidateFolder {
+    key: String,
+    root: String,
+    source: vibex_core::ExternalSessionImportSource,
+    candidates: Vec<vibex_core::ExternalSessionImportCandidate>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalImportFolderSelection {
+    All,
+    Some,
+    None,
+}
+
+/// Result of one concurrent scan across the ACP manager and the local
+/// Codex/Claude transcript stores.
+#[derive(Default)]
+struct MergedExternalScan {
+    candidates: Vec<vibex_core::ExternalSessionImportCandidate>,
+    diagnostics: Vec<ExternalSessionImportDiagnostic>,
+    errors: Vec<String>,
+}
+
+/// A workspace-scoped dialog only offers candidates that live inside the
+/// current workspace; path prefixes and trailing separators are normalized so
+/// `~/code/x` and `~/code/x/` agree.
+fn import_workspace_matches(candidate_root: &str, workspace_root: &str) -> bool {
+    let normalize = |value: &str| value.trim_end_matches('/').to_lowercase();
+    let candidate = normalize(candidate_root);
+    let workspace = normalize(workspace_root);
+    if workspace.is_empty() || candidate.is_empty() {
+        return true;
+    }
+    candidate == workspace || candidate.starts_with(&format!("{workspace}/"))
+}
+
+fn folder_key(source: ExternalImportSourceChip, root: &str) -> String {
+    format!("{}::{}", source.key(), compact_workspace_path(root))
+}
+
+fn folder_display_name(root: &str) -> String {
+    let trimmed = root.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return root.to_string();
+    }
+    trimmed
+        .rsplit('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+fn has_text(value: &str) -> bool {
+    !value.trim().is_empty()
+}
+
+/// Compact row timestamp: month-day with the clock on this year's sessions,
+/// a full date for anything older.
+fn format_import_row_time(timestamp_ms: i64, _locale: locale::ResolvedLocale) -> String {
+    let Some(time) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(timestamp_ms)
+        .map(|timestamp| timestamp.with_timezone(&chrono::Local))
+    else {
+        return String::new();
+    };
+    if time.format("%Y").to_string() == chrono::Local::now().format("%Y").to_string() {
+        time.format("%m-%d %H:%M").to_string()
+    } else {
+        time.format("%Y-%m-%d").to_string()
+    }
+}
+
 pub struct ExternalImportDialog {
     runtime: Option<Arc<DesktopRuntime>>,
     workbench: WeakEntity<VibexWorkbench>,
     locale_mode: LocaleMode,
     workspace: Option<(String, WorkspaceMode)>,
     search_input: Entity<InputState>,
-    preview: Option<vibex_core::ExternalSessionImportPreview>,
+    candidates: Vec<vibex_core::ExternalSessionImportCandidate>,
     selected_candidate_ids: HashSet<String>,
-    preview_pending: bool,
+    present_sources: Vec<ExternalImportSourceChip>,
+    active_source: Option<ExternalImportSourceChip>,
+    collapsed_folders: HashSet<String>,
+    scan_pending: bool,
     import_pending: bool,
-    preview_error: Option<String>,
+    scan_error: Option<String>,
     import_error: Option<String>,
-    task: Option<Task<()>>,
+    scan_task: Option<Task<()>>,
+    import_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -42740,13 +42878,17 @@ impl ExternalImportDialog {
             locale_mode,
             workspace,
             search_input: search_input.clone(),
-            preview: None,
+            candidates: Vec::new(),
             selected_candidate_ids: HashSet::new(),
-            preview_pending: false,
+            present_sources: Vec::new(),
+            active_source: None,
+            collapsed_folders: HashSet::new(),
+            scan_pending: false,
             import_pending: false,
-            preview_error: None,
+            scan_error: None,
             import_error: None,
-            task: None,
+            scan_task: None,
+            import_task: None,
             _subscriptions: vec![cx.subscribe(&search_input, |_, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
                     cx.notify();
@@ -42767,57 +42909,121 @@ impl ExternalImportDialog {
     }
 
     fn scan_sessions(&mut self, cx: &mut Context<Self>) {
-        if self.preview_pending || self.import_pending {
+        if self.scan_pending || self.import_pending {
             return;
         }
         let Some(runtime) = self.runtime.clone() else {
-            self.preview_error = Some("ACP runtime is not ready".to_string());
+            self.scan_error = Some("Agent runtime is not ready".to_string());
+            cx.notify();
             return;
         };
         let workspace_root = self.workspace.as_ref().map(|(root, _)| root.clone());
-        self.preview_pending = true;
-        self.preview_error = None;
+        self.scan_pending = true;
+        self.scan_error = None;
         self.import_error = None;
-        self.preview = None;
+        self.candidates.clear();
         self.selected_candidate_ids.clear();
+        self.collapsed_folders.clear();
+        self.active_source = None;
+        self.present_sources.clear();
+        // One scan, three sources, concurrently: ACP via the manager's
+        // `session/list`, Codex and Claude via direct local transcript store
+        // scans. Local scans are summary-only, so no transcript is parsed to
+        // EOF and rescans only `stat` unchanged files.
+        let scan_workspace_root = workspace_root.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
-                .agent()
-                .manager()
-                .preview_external_sessions(ExternalSessionImportPreviewRequest {
-                    sources: vec![ExternalSessionImportSource::Acp],
-                    workspace_root,
-                    correlation_id: None,
-                })
-                .await
-        });
-        self.task = Some(cx.spawn(
-            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let outcome = runner.await;
-                let _ = entity.update(cx, |this, cx| {
-                    this.preview_pending = false;
-                    this.task = None;
-                    match outcome {
-                        Ok(Ok(preview)) => {
-                            this.selected_candidate_ids = preview
-                                .candidates
-                                .iter()
-                                .filter(|candidate| {
-                                    external_session_candidate_is_importable(candidate.status)
-                                        && !candidate.already_imported
-                                })
-                                .map(|candidate| candidate.candidate_id.clone())
-                                .collect();
-                            this.preview = Some(preview);
-                            this.preview_error = None;
-                        }
-                        Ok(Err(error)) => {
-                            this.preview_error = Some(format!("{}: {}", error.code, error.message));
-                        }
-                        Err(error) => {
-                            this.preview_error = Some(format!("import preview failed: {error}"));
-                        }
+            let codex_roots = vibex_agent_codex::codex_external_session_roots();
+            let claude_roots = vibex_agent_claude::claude_external_session_roots();
+            let manager = runtime.agent().manager();
+            let (acp, codex, claude) = tokio::join!(
+                manager.preview_external_sessions(
+                    ExternalSessionImportPreviewRequest {
+                        sources: vec![ExternalSessionImportSource::Acp],
+                        workspace_root: scan_workspace_root,
+                        correlation_id: None,
                     }
+                ),
+                tokio::task::spawn_blocking(move || {
+                    vibex_agent_codex::scan_codex_external_sessions(
+                        &codex_roots,
+                        WorkspaceMode::CurrentCheckout,
+                        None,
+                        None,
+                    )
+                }),
+                tokio::task::spawn_blocking(move || {
+                    vibex_agent_claude::scan_claude_external_sessions(
+                        &claude_roots,
+                        WorkspaceMode::CurrentCheckout,
+                        None,
+                        None,
+                    )
+                }),
+            );
+            let mut merged = MergedExternalScan {
+                candidates: Vec::new(),
+                diagnostics: Vec::new(),
+                errors: Vec::new(),
+            };
+            match acp {
+                Ok(preview) => {
+                    merged.candidates.extend(preview.candidates);
+                    merged.diagnostics.extend(preview.diagnostics);
+                }
+                Err(error) => merged.errors.push(format!("{}: {}", error.code, error.message)),
+            }
+            for (label, outcome) in [("Codex", codex), ("Claude", claude)] {
+                match outcome {
+                    Ok(preview) => {
+                        merged.candidates.extend(preview.candidates);
+                        merged.diagnostics.extend(preview.diagnostics);
+                    }
+                    Err(join_error) => {
+                        merged.errors.push(format!("{}: {join_error}", label))
+                    }
+                }
+            }
+            merged
+        });
+        self.scan_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await.unwrap_or_else(|join_error| MergedExternalScan {
+                    errors: vec![format!("scan failed: {join_error}")],
+                    ..MergedExternalScan::default()
+                });
+                let _ = entity.update(cx, |this, cx| {
+                    this.scan_pending = false;
+                    this.scan_task = None;
+                    this.scan_error = outcome.errors.first().cloned();
+                    // A workspace-scoped dialog only offers that workspace's
+                    // history; a global dialog offers every scanned folder.
+                    this.candidates = outcome
+                        .candidates
+                        .into_iter()
+                        .filter(|candidate| {
+                            workspace_root.as_ref().is_none_or(|root| {
+                                import_workspace_matches(&candidate.workspace_root, root)
+                            })
+                        })
+                        .collect();
+                    this.selected_candidate_ids = this
+                        .candidates
+                        .iter()
+                        .filter(|candidate| external_session_candidate_is_selectable(candidate))
+                        .map(|candidate| candidate.candidate_id.clone())
+                        .collect();
+                    this.present_sources = [
+                        ExternalImportSourceChip::Codex,
+                        ExternalImportSourceChip::Claude,
+                        ExternalImportSourceChip::Acp,
+                    ]
+                    .into_iter()
+                    .filter(|chip| {
+                        this.candidates
+                            .iter()
+                            .any(|candidate| import_source_chip_kind(candidate.source) == *chip)
+                    })
+                    .collect();
                     cx.notify();
                 });
             },
@@ -42826,66 +43032,110 @@ impl ExternalImportDialog {
     }
 
     fn importable_candidates(&self) -> Vec<vibex_core::ExternalSessionImportCandidate> {
-        self.preview
-            .as_ref()
-            .map(|preview| {
-                preview
-                    .candidates
-                    .iter()
-                    .filter(|candidate| {
-                        external_session_candidate_is_importable(candidate.status)
-                            && !candidate.already_imported
-                            && self
-                                .selected_candidate_ids
-                                .contains(&candidate.candidate_id)
-                    })
-                    .cloned()
-                    .collect()
+        self.candidates
+            .iter()
+            .filter(|candidate| {
+                external_session_candidate_is_selectable(candidate)
+                    && self.selected_candidate_ids.contains(&candidate.candidate_id)
             })
-            .unwrap_or_default()
+            .cloned()
+            .collect()
     }
 
     fn all_importable_candidates(&self) -> Vec<vibex_core::ExternalSessionImportCandidate> {
-        self.preview
-            .as_ref()
-            .map(|preview| {
-                preview
-                    .candidates
-                    .iter()
-                    .filter(|candidate| {
-                        external_session_candidate_is_importable(candidate.status)
-                            && !candidate.already_imported
-                    })
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.candidates
+            .iter()
+            .filter(|candidate| external_session_candidate_is_selectable(candidate))
+            .cloned()
+            .collect()
     }
 
-    fn filtered_candidates(&self, cx: &App) -> Vec<vibex_core::ExternalSessionImportCandidate> {
+    fn visible_candidates(&self, cx: &App) -> Vec<vibex_core::ExternalSessionImportCandidate> {
         let query = self.search_input.read(cx).value().trim().to_lowercase();
-        self.preview
-            .as_ref()
-            .map(|preview| {
-                preview
-                    .candidates
-                    .iter()
-                    .filter(|candidate| {
-                        query.is_empty()
-                            || [
-                                candidate.title.as_str(),
-                                candidate.workspace_root.as_str(),
-                                candidate.agent_id.as_str(),
-                                candidate.provider_kind.to_string().as_str(),
-                                candidate.native_session_id.as_deref().unwrap_or_default(),
-                            ]
-                            .iter()
-                            .any(|value| value.to_lowercase().contains(&query))
-                    })
-                    .cloned()
-                    .collect()
+        self.candidates
+            .iter()
+            .filter(|candidate| {
+                self.active_source.is_none_or(|chip| {
+                    import_source_chip_kind(candidate.source) == chip
+                })
             })
-            .unwrap_or_default()
+            .filter(|candidate| {
+                query.is_empty()
+                    || [
+                        candidate.title.as_str(),
+                        candidate.workspace_root.as_str(),
+                        candidate.agent_id.as_str(),
+                        candidate.provider_kind.to_string().as_str(),
+                        candidate.native_session_id.as_deref().unwrap_or_default(),
+                        candidate.native_thread_id.as_deref().unwrap_or_default(),
+                    ]
+                    .iter()
+                    .any(|value| value.to_lowercase().contains(&query))
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn candidate_folders(&self, cx: &App) -> Vec<ExternalImportCandidateFolder> {
+        let mut candidates = self.visible_candidates(cx);
+        candidates.sort_by(|left, right| {
+            let left_key = (
+                left.workspace_root.clone(),
+                import_source_chip_kind(left.source).key(),
+                std::cmp::Reverse(left.updated_at_ms.unwrap_or(0)),
+            );
+            let right_key = (
+                right.workspace_root.clone(),
+                import_source_chip_kind(right.source).key(),
+                std::cmp::Reverse(right.updated_at_ms.unwrap_or(0)),
+            );
+            left_key.cmp(&right_key)
+        });
+        let mut folders: Vec<ExternalImportCandidateFolder> = Vec::new();
+        for candidate in candidates {
+            match folders.last_mut().filter(|folder| {
+                folder.root == candidate.workspace_root
+                    && folder.source == candidate.source
+            }) {
+                Some(folder) => folder.candidates.push(candidate),
+                None => folders.push(ExternalImportCandidateFolder {
+                    key: folder_key(
+                        import_source_chip_kind(candidate.source),
+                        &candidate.workspace_root,
+                    ),
+                    root: candidate.workspace_root.clone(),
+                    source: candidate.source,
+                    candidates: vec![candidate],
+                }),
+            }
+        }
+        folders
+    }
+
+    fn folder_selection_state(
+        &self,
+        folder: &ExternalImportCandidateFolder,
+    ) -> ExternalImportFolderSelection {
+        let eligible = folder
+            .candidates
+            .iter()
+            .filter(|candidate| external_session_candidate_is_selectable(candidate))
+            .count();
+        let selected = folder
+            .candidates
+            .iter()
+            .filter(|candidate| {
+                external_session_candidate_is_selectable(candidate)
+                    && self.selected_candidate_ids.contains(&candidate.candidate_id)
+            })
+            .count();
+        if eligible > 0 && selected >= eligible {
+            ExternalImportFolderSelection::All
+        } else if selected == 0 {
+            ExternalImportFolderSelection::None
+        } else {
+            ExternalImportFolderSelection::Some
+        }
     }
 
     fn set_candidate_selected(
@@ -42894,14 +43144,14 @@ impl ExternalImportDialog {
         selected: bool,
         cx: &mut Context<Self>,
     ) {
-        let eligible = self.preview.as_ref().is_some_and(|preview| {
-            preview.candidates.iter().any(|candidate| {
-                candidate.candidate_id == candidate_id
-                    && external_session_candidate_is_importable(candidate.status)
-                    && !candidate.already_imported
-            })
+        if self.import_pending || self.scan_pending {
+            return;
+        }
+        let eligible = self.candidates.iter().any(|candidate| {
+            candidate.candidate_id == candidate_id
+                && external_session_candidate_is_selectable(candidate)
         });
-        if !eligible || self.import_pending {
+        if !eligible {
             return;
         }
         if selected {
@@ -42912,15 +43162,47 @@ impl ExternalImportDialog {
         cx.notify();
     }
 
-    fn select_all_visible(&mut self, cx: &mut Context<Self>) {
-        for candidate in self.filtered_candidates(cx) {
-            if external_session_candidate_is_importable(candidate.status)
-                && !candidate.already_imported
-            {
-                self.selected_candidate_ids
-                    .insert(candidate.candidate_id.clone());
+    fn set_folder_selected(
+        &mut self,
+        folder: &ExternalImportCandidateFolder,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.import_pending || self.scan_pending {
+            return;
+        }
+        for candidate in &folder.candidates {
+            if external_session_candidate_is_selectable(candidate) {
+                if selected {
+                    self.selected_candidate_ids
+                        .insert(candidate.candidate_id.clone());
+                } else {
+                    self.selected_candidate_ids
+                        .remove(&candidate.candidate_id);
+                }
             }
         }
+        cx.notify();
+    }
+
+    fn toggle_folder_collapsed(&mut self, folder_key: &str, cx: &mut Context<Self>) {
+        if !self.collapsed_folders.remove(folder_key) {
+            self.collapsed_folders.insert(folder_key.to_string());
+        }
+        cx.notify();
+    }
+
+    fn expand_all_folders(&mut self, cx: &mut Context<Self>) {
+        self.collapsed_folders.clear();
+        cx.notify();
+    }
+
+    fn collapse_all_folders(&mut self, cx: &mut Context<Self>) {
+        self.collapsed_folders = self
+            .candidate_folders(cx)
+            .into_iter()
+            .map(|folder| folder.key)
+            .collect();
         cx.notify();
     }
 
@@ -42934,7 +43216,7 @@ impl ExternalImportDialog {
     }
 
     fn import_candidates(&mut self, window_handle: AnyWindowHandle, cx: &mut Context<Self>) {
-        if self.import_pending || self.preview_pending {
+        if self.import_pending || self.scan_pending {
             return;
         }
         let candidates = self.importable_candidates();
@@ -42944,65 +43226,109 @@ impl ExternalImportDialog {
         let Some(runtime) = self.runtime.clone() else {
             return;
         };
-        let correlation_id = self
-            .preview
-            .as_ref()
-            .and_then(|preview| preview.correlation_id.clone());
         self.import_pending = true;
         self.import_error = None;
         let workbench = self.workbench.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
-                .agent()
-                .manager()
-                .import_external_sessions(ExternalSessionImportRequest {
-                    candidates,
-                    correlation_id,
-                })
-                .await
-        });
-        self.task = Some(cx.spawn(
-            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let outcome = runner.await;
-                match outcome {
-                    Ok(Ok(result)) => {
-                        let _ = entity.update(cx, |this, cx| {
-                            this.import_pending = false;
-                            this.task = None;
-                            let selected_session_id =
-                                result.sessions.first().map(|session| session.id.clone());
-                            let workbench = workbench.clone();
-                            cx.defer(move |cx| {
-                                let _ = workbench.update(cx, |workbench, cx| {
-                                    workbench.selected_session_id = selected_session_id;
-                                    workbench.external_import_view = None;
-                                    workbench.load_agent_overview(cx);
-                                    cx.notify();
-                                });
-                                let _ = window_handle.update(cx, |_, window, cx| {
-                                    window.close_dialog(cx);
-                                });
-                            });
-                            cx.notify();
-                        });
-                    }
-                    Ok(Err(error)) => {
-                        let _ = entity.update(cx, |this, cx| {
-                            this.import_pending = false;
-                            this.task = None;
-                            this.import_error = Some(format!("{}: {}", error.code, error.message));
-                            cx.notify();
-                        });
-                    }
-                    Err(error) => {
-                        let _ = entity.update(cx, |this, cx| {
-                            this.import_pending = false;
-                            this.task = None;
-                            this.import_error = Some(format!("external import failed: {error}"));
-                            cx.notify();
-                        });
-                    }
+            let manager = runtime.agent().manager();
+            let mut acp_candidates = Vec::new();
+            let mut codex_candidates = Vec::new();
+            let mut claude_candidates = Vec::new();
+            for candidate in candidates {
+                match candidate.source {
+                    ExternalSessionImportSource::Codex => codex_candidates.push(candidate),
+                    ExternalSessionImportSource::Claude => claude_candidates.push(candidate),
+                    ExternalSessionImportSource::Acp => acp_candidates.push(candidate),
                 }
+            }
+            let mut sessions = Vec::new();
+            let mut diagnostics = Vec::new();
+            let mut failures = Vec::new();
+            if !acp_candidates.is_empty() {
+                match manager
+                    .import_external_sessions(ExternalSessionImportRequest {
+                        candidates: acp_candidates,
+                        correlation_id: None,
+                    })
+                    .await
+                {
+                    Ok(result) => {
+                        sessions.extend(result.sessions);
+                        diagnostics.extend(result.diagnostics);
+                    }
+                    Err(error) => failures.push(format!("{}: {}", error.code, error.message)),
+                }
+            }
+            // Local sources re-read their transcripts at import time, so the
+            // disk — not the last scan — decides what actually lands.
+            if !codex_candidates.is_empty() {
+                match vibex_agent_codex::import_selected_codex_sessions(
+                    &manager,
+                    codex_candidates,
+                    None,
+                )
+                .await
+                {
+                    Ok(result) => {
+                        sessions.extend(result.sessions);
+                        diagnostics.extend(result.diagnostics);
+                    }
+                    Err(error) => failures.push(format!("{}: {}", error.code, error.message)),
+                }
+            }
+            if !claude_candidates.is_empty() {
+                match vibex_agent_claude::import_selected_claude_sessions(
+                    &manager,
+                    claude_candidates,
+                    None,
+                )
+                .await
+                {
+                    Ok(result) => {
+                        sessions.extend(result.sessions);
+                        diagnostics.extend(result.diagnostics);
+                    }
+                    Err(error) => failures.push(format!("{}: {}", error.code, error.message)),
+                }
+            }
+            (sessions, diagnostics, failures)
+        });
+        self.import_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let (sessions, _diagnostics, failures) = runner.await.unwrap_or_else(|join_error| {
+                    (
+                        Vec::new(),
+                        Vec::new(),
+                        vec![format!("import failed: {join_error}")],
+                    )
+                });
+                if sessions.is_empty() {
+                    let _ = entity.update(cx, |this, cx| {
+                        this.import_pending = false;
+                        this.import_task = None;
+                        this.import_error = failures.first().cloned();
+                        cx.notify();
+                    });
+                    return;
+                }
+                let selected_session_id = sessions.first().map(|session| session.id.clone());
+                let _ = entity.update(cx, |this, cx| {
+                    this.import_pending = false;
+                    this.import_task = None;
+                    let workbench = workbench.clone();
+                    cx.defer(move |cx| {
+                        let _ = workbench.update(cx, |workbench, cx| {
+                            workbench.selected_session_id = selected_session_id;
+                            workbench.external_import_view = None;
+                            workbench.load_agent_overview(cx);
+                            cx.notify();
+                        });
+                        let _ = window_handle.update(cx, |_, window, cx| {
+                            window.close_dialog(cx);
+                        });
+                    });
+                    cx.notify();
+                });
             },
         ));
         cx.notify();
@@ -43015,17 +43341,16 @@ impl ExternalImportDialog {
         pending: bool,
         text: &ExternalImportText,
         locale: locale::ResolvedLocale,
-        cx: &Context<Self>,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
-        let blocked = candidate.status == ExternalSessionImportCandidateStatus::Blocked;
-        let can_select = external_session_candidate_is_importable(candidate.status)
-            && !candidate.already_imported;
-        let secondary_badge = |label: String, cx: &Context<Self>| {
+        let can_select = external_session_candidate_is_selectable(candidate);
+        let candidate_id = candidate.candidate_id.clone();
+        let badge = |label: String, cx: &Context<Self>| {
             div()
                 .flex_none()
                 .rounded(px(6.0))
                 .bg(cx.theme().secondary)
-                .px_2()
+                .px(px(6.0))
                 .py(px(1.0))
                 .text_xs()
                 .child(label)
@@ -43037,137 +43362,160 @@ impl ExternalImportDialog {
                 .rounded(px(6.0))
                 .border_1()
                 .border_color(cx.theme().border)
-                .px_2()
+                .px(px(6.0))
                 .py(px(1.0))
                 .text_xs()
                 .child(label)
                 .into_any_element()
         };
-        let model_badge = candidate.session_config_state.as_ref().map(|state| {
-            state
-                .current_model
-                .as_ref()
-                .map(|model| model.label.clone().unwrap_or_else(|| model.value.clone()))
-                .unwrap_or_else(|| "dynamic config".to_string())
-        });
-        let candidate_id = candidate.candidate_id.clone();
-        v_flex()
+        h_flex()
+            .id(SharedString::from(format!(
+                "external-import-row:{candidate_id}"
+            )))
             .w_full()
             .min_w_0()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py(px(5.0))
             .rounded(px(6.0))
-            .border_1()
-            .border_color(cx.theme().border)
-            .bg(theme::semantic_color("card", cx.theme().is_dark()))
-            .p_3()
-            .gap_1()
+            .when(!pending, |row| row.hover(|style| style.bg(cx.theme().secondary.opacity(0.5))))
+            .child(self.render_import_checkbox(
+                SharedString::from(format!("external-import-check:{candidate_id}")),
+                selected,
+                false,
+                !can_select || pending,
+                {
+                    let candidate_id = candidate_id.clone();
+                    let selected = !selected;
+                    move |this, cx| this.set_candidate_selected(candidate_id.clone(), selected, cx)
+                },
+                cx,
+            ))
             .child(
-                h_flex()
-                    .w_full()
+                v_flex()
+                    .flex_1()
                     .min_w_0()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
+                    .gap(px(1.0))
                     .child(
                         h_flex()
                             .min_w_0()
-                            .flex_1()
                             .gap_2()
-                            .child(
-                                Switch::new(SharedString::from(format!(
-                                    "external-import-select:{candidate_id}"
-                                )))
-                                .small()
-                                .checked(selected)
-                                .disabled(!can_select || pending)
-                                .on_click(cx.listener(
-                                    move |this, checked: &bool, _, cx| {
-                                        this.set_candidate_selected(
-                                            candidate_id.clone(),
-                                            *checked,
-                                            cx,
-                                        )
-                                    },
-                                )),
-                            )
                             .child(
                                 div()
                                     .min_w_0()
+                                    .flex_1()
                                     .truncate()
                                     .text_sm()
-                                    .font_medium()
                                     .child(candidate.title.clone()),
-                            ),
+                            )
+                            .child(if candidate.already_imported {
+                                outline_badge(text.already_imported.to_string(), cx)
+                            } else if candidate.status
+                                == ExternalSessionImportCandidateStatus::Blocked
+                            {
+                                outline_badge(
+                                    import_candidate_status_label(candidate.status).to_string(),
+                                    cx,
+                                )
+                            } else if candidate.continuation_status
+                                == vibex_core::ExternalSessionContinuationStatus::Resumable
+                            {
+                                badge(text.resumable.to_string(), cx)
+                            } else {
+                                outline_badge(text.read_only.to_string(), cx)
+                            })
+                            .when(candidate.provider_profile_id.is_some(), |row| {
+                                row.child(outline_badge(text.profile_linked.to_string(), cx))
+                            }),
                     )
-                    .child(if candidate.already_imported {
-                        outline_badge(text.already_imported.to_string(), cx)
-                    } else if blocked {
-                        outline_badge(
-                            import_candidate_status_label(candidate.status).to_string(),
-                            cx,
-                        )
-                    } else {
-                        secondary_badge(
-                            import_candidate_status_label(candidate.status).to_string(),
-                            cx,
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .truncate()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(format!(
-                        "{} · {} · {}",
-                        import_source_label(candidate.source),
-                        import_provider_label(candidate.provider_kind),
-                        text.native_history
-                    )),
-            )
-            .child(
-                h_flex()
-                    .flex_wrap()
-                    .gap(px(6.0))
                     .child(
-                        if candidate.continuation_status
-                            == vibex_core::ExternalSessionContinuationStatus::Resumable
-                        {
-                            secondary_badge(text.resumable.to_string(), cx)
-                        } else {
-                            outline_badge(text.read_only.to_string(), cx)
-                        },
-                    )
-                    .when(candidate.provider_profile_id.is_some(), |this| {
-                        this.child(outline_badge(text.profile_linked.to_string(), cx))
-                    })
-                    .when_some(model_badge, |this, label| {
-                        this.child(outline_badge(label, cx))
-                    }),
+                        h_flex()
+                            .min_w_0()
+                            .gap_1p5()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .child(import_provider_label(candidate.provider_kind).to_string()),
+                            )
+                            .when(
+                                candidate.continuation_reason.as_deref().is_some_and(has_text),
+                                |row| {
+                                    row.child(div().flex_none().child("·"))
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .truncate()
+                                                .child(
+                                                    candidate
+                                                        .continuation_reason
+                                                        .clone()
+                                                        .unwrap_or_default(),
+                                                ),
+                                        )
+                                },
+                            ),
+                    ),
             )
             .child(
                 div()
-                    .truncate()
+                    .flex_none()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(compact_workspace_path(&candidate.workspace_root)),
+                    .child(match candidate.updated_at_ms {
+                        Some(updated_at) => format_import_row_time(updated_at, locale),
+                        None => String::new(),
+                    }),
             )
-            .when_some(candidate.continuation_reason.clone(), |this, reason| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(reason),
-                )
-            })
-            .when_some(candidate.updated_at_ms, |this, updated_at| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(format_timeline_hover_time(updated_at, locale)),
-                )
-            })
             .into_any_element()
+    }
+
+    fn render_import_checkbox(
+        &self,
+        id: SharedString,
+        checked: bool,
+        partial: bool,
+        disabled: bool,
+        on_toggle: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut checkbox = div()
+            .id(id)
+            .size(px(16.0))
+            .flex_none()
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(cx.theme().border)
+            .flex()
+            .items_center()
+            .justify_center();
+        if checked {
+            checkbox = checkbox
+                .bg(cx.theme().primary)
+                .border_color(cx.theme().primary)
+                .child(
+                    Icon::new(IconName::Check)
+                        .size(px(12.0))
+                        .text_color(cx.theme().primary_foreground),
+                );
+        } else if partial {
+            checkbox = checkbox.child(
+                Icon::new(IconName::Minus)
+                    .size(px(12.0))
+                    .text_color(cx.theme().muted_foreground),
+            );
+        }
+        if disabled {
+            checkbox = checkbox.opacity(0.5);
+        } else {
+            checkbox = checkbox
+                .cursor_pointer()
+                .hover(|style| style.border_color(cx.theme().primary))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| on_toggle(this, cx)));
+        }
+        checkbox.into_any_element()
     }
 }
 
@@ -43176,92 +43524,182 @@ impl Render for ExternalImportDialog {
         let locale = self.resolved_locale(cx);
         let text = external_import_text(locale);
         let viewport = window.viewport_size();
-        let body_height = (f32::from(viewport.height) - 32.0).clamp(240.0, 672.0) - 120.0;
+        let body_height = (f32::from(viewport.height) - 32.0).clamp(240.0, 672.0) - 140.0;
         let importable = self.all_importable_candidates();
         let selected_count = self.selected_candidate_count();
-        let filtered = self.filtered_candidates(cx);
-        let pending = self.preview_pending || self.import_pending;
-        let mut groups: BTreeMap<(String, String), Vec<_>> = BTreeMap::new();
-        for candidate in filtered {
-            groups
-                .entry((
-                    candidate.agent_id.as_str().to_string(),
-                    candidate.workspace_root.clone(),
-                ))
-                .or_default()
-                .push(candidate);
-        }
-        let group_elements = groups
-            .into_iter()
-            .flat_map(|((agent_id, workspace_root), candidates)| {
-                let heading = h_flex()
-                    .w_full()
-                    .min_w_0()
+        let pending = self.scan_pending || self.import_pending;
+        let query = !self.search_input.read(cx).value().trim().is_empty();
+        let folders = self.candidate_folders(cx);
+        let folder_count = folders.len();
+        let visible_count: usize = folders.iter().map(|folder| folder.candidates.len()).sum();
+        let all_collapsed = folder_count > 0
+            && folders.iter().all(|f| self.collapsed_folders.contains(&f.key));
+        let active_source = self.active_source;
+        let present_sources = self.present_sources.clone();
+
+        let mut list_elements: Vec<AnyElement> = Vec::new();
+        if folders.is_empty() {
+            let empty_title = if self.scan_pending {
+                text.scanning
+            } else if self.scan_error.is_some() {
+                text.scan_failed
+            } else if query {
+                text.no_matches
+            } else {
+                text.no_sessions
+            };
+            list_elements.push(
+                v_flex()
                     .items_center()
-                    .justify_between()
+                    .justify_center()
+                    .py_10()
+                    .px_6()
                     .gap_2()
-                    .pt_2()
-                    .pb_1()
                     .child(
-                        h_flex()
-                            .min_w_0()
-                            .gap_2()
-                            .child(Icon::new(IconName::Folder).size(px(14.0)))
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_xs()
-                                    .font_medium()
-                                    .child(agent_id),
-                            ),
+                        Icon::new(IconName::Inbox)
+                            .size(px(28.0))
+                            .text_color(cx.theme().muted_foreground),
                     )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(compact_workspace_path(&workspace_root)),
-                    );
-                let rows = candidates.into_iter().map(|candidate| {
+                    .child(div().text_sm().child(empty_title))
+                    .into_any_element(),
+            );
+        } else {
+            for folder in folders {
+                let selection = self.folder_selection_state(&folder);
+                let eligible_count = folder
+                    .candidates
+                    .iter()
+                    .filter(|candidate| external_session_candidate_is_selectable(candidate))
+                    .count();
+                let selected_in_folder = folder
+                    .candidates
+                    .iter()
+                    .filter(|candidate| {
+                        external_session_candidate_is_selectable(candidate)
+                            && self
+                                .selected_candidate_ids
+                                .contains(&candidate.candidate_id)
+                    })
+                    .count();
+                let folder_collapsed = self.collapsed_folders.contains(&folder.key);
+                let header_checkbox_id =
+                    SharedString::from(format!("external-import-folder-check:{}", folder.key));
+                let chevron_folder_key = folder.key.clone();
+                let checkbox_folder = folder.clone();
+                let checkbox_select = selection != ExternalImportFolderSelection::All;
+                list_elements.push(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .items_center()
+                        .gap_2()
+                        .pt_2()
+                        .pb_1()
+                        .px_1()
+                        .child(self.render_import_checkbox(
+                            header_checkbox_id,
+                            selection == ExternalImportFolderSelection::All,
+                            selection == ExternalImportFolderSelection::Some,
+                            pending || eligible_count == 0,
+                            move |this, cx| {
+                                this.set_folder_selected(&checkbox_folder, checkbox_select, cx)
+                            },
+                            cx,
+                        ))
+                        .child(
+                            Icon::new(if folder_collapsed {
+                                IconName::Folder
+                            } else {
+                                IconName::FolderOpen
+                            })
+                            .size(px(14.0))
+                            .text_color(cx.theme().muted_foreground),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap(px(1.0))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_sm()
+                                        .font_medium()
+                                        .child(format!(
+                                            "{} · {}",
+                                            import_source_chip_kind(folder.source).label(),
+                                            folder_display_name(&folder.root),
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(compact_workspace_path(&folder.root)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!("{selected_in_folder}/{eligible_count}")),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "external-import-folder-toggle:{}",
+                                folder.key
+                            )))
+                            .ghost()
+                            .xsmall()
+                            .icon(if folder_collapsed {
+                                IconName::ChevronRight
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .disabled(pending)
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.toggle_folder_collapsed(&chevron_folder_key, cx)
+                            })),
+                        )
+                        .into_any_element(),
+                );
+                if folder_collapsed {
+                    continue;
+                }
+                for candidate in &folder.candidates {
                     let selected = self
                         .selected_candidate_ids
                         .contains(&candidate.candidate_id);
-                    self.render_candidate_card(&candidate, selected, pending, &text, locale, cx)
-                });
-                std::iter::once(heading.into_any_element())
-                    .chain(rows)
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let list_empty_label = if self.preview_pending {
-            text.scanning
-        } else if self.preview.is_some() && group_elements.is_empty() {
-            if self.search_input.read(cx).value().trim().is_empty() {
-                text.no_sessions
-            } else {
-                text.no_matches
+                    list_elements.push(self.render_candidate_card(
+                        candidate, selected, pending, &text, locale, cx,
+                    ));
+                }
             }
-        } else {
-            text.no_sessions
-        };
-        let selected_summary = match locale {
-            locale::ResolvedLocale::En => {
-                format!("{selected_count} selected · {} available", importable.len())
-            }
-            locale::ResolvedLocale::ZhCn => {
-                format!("已选 {selected_count} 项 · 可导入 {} 项", importable.len())
-            }
-            locale::ResolvedLocale::ZhTw => {
-                format!("已選 {selected_count} 項 · 可匯入 {} 項", importable.len())
-            }
+        }
+
+        let footer_summary = match locale {
+            locale::ResolvedLocale::En => format!(
+                "{folder_count} folders · {visible_count} sessions · {} importable · {selected_count} selected",
+                importable.len()
+            ),
+            locale::ResolvedLocale::ZhCn => format!(
+                "{folder_count} 个目录 · {visible_count} 个会话 · {} 项可导入 · 已选 {selected_count} 项",
+                importable.len()
+            ),
+            locale::ResolvedLocale::ZhTw => format!(
+                "{folder_count} 個目錄 · {visible_count} 個會話 · {} 項可匯入 · 已選 {selected_count} 項",
+                importable.len()
+            ),
         };
         v_flex()
             .w_full()
             .max_h(px(body_height))
             .min_h_0()
-            .gap_3()
+            .gap_2()
             .child(
                 h_flex()
                     .w_full()
@@ -43269,30 +43707,109 @@ impl Render for ExternalImportDialog {
                     .gap_2()
                     .child(
                         Input::new(&self.search_input)
-                            .w_full()
+                            .flex_1()
                             .rounded(px(8.0))
                             .border_color(cx.theme().input)
                             .bg(cx.theme().background),
                     )
                     .child(
-                        Button::new("external-import-scan")
-                            .secondary()
-                            .icon(IconName::Search)
-                            .label(if self.preview_pending {
-                                text.scanning
+                        Button::new("external-import-expand-collapse-all")
+                            .ghost()
+                            .small()
+                            .icon(IconName::ChevronsUpDown)
+                            .tooltip(if all_collapsed {
+                                text.expand_all
                             } else {
-                                text.scan_sessions
+                                text.collapse_all
                             })
-                            .loading(self.preview_pending)
+                            .disabled(pending || folder_count == 0)
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                if this.collapsed_folders.is_empty() {
+                                    this.collapse_all_folders(cx);
+                                } else {
+                                    this.expand_all_folders(cx);
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new("external-import-clear-selection")
+                            .ghost()
+                            .small()
+                            .icon(IconName::Close)
+                            .tooltip(text.clear_selection)
+                            .disabled(selected_count == 0 || pending)
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.clear_selection(cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("external-import-scan")
+                            .ghost()
+                            .small()
+                            .icon(IconName::LoaderCircle)
+                            .loading(self.scan_pending)
+                            .tooltip(if self.scan_pending {
+                                text.preparing_scan
+                            } else {
+                                text.scan_again
+                            })
                             .disabled(pending)
-                            .on_click(cx.listener(|this, _, _, cx| this.scan_sessions(cx))),
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.scan_sessions(cx)
+                            })),
                     ),
             )
-            .when_some(self.preview_error.clone(), |this, error| {
-                this.child(div().text_xs().text_color(cx.theme().danger).child(error))
+            .when(present_sources.len() > 1, |this| {
+                let chips: Vec<(String, SharedString, bool, Option<ExternalImportSourceChip>)> =
+                    std::iter::once((
+                        "all".to_string(),
+                        SharedString::from(text.all_sources),
+                        active_source.is_none(),
+                        None,
+                    ))
+                    .chain(present_sources.iter().map(|chip| {
+                        (
+                            chip.key().to_string(),
+                            SharedString::from(chip.label()),
+                            active_source == Some(*chip),
+                            Some(*chip),
+                        )
+                    }))
+                    .collect();
+                this.child(
+                    h_flex().flex_wrap().gap_1().children(
+                        chips.into_iter().map(|(key, label, active, chip)| {
+                            Button::new(SharedString::from(format!(
+                                "external-import-source:{key}"
+                            )))
+                            .xsmall()
+                            .label(label)
+                            .when(active, |button| button.secondary())
+                            .when(!active, |button| button.ghost())
+                            .disabled(pending)
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.active_source = chip;
+                                cx.notify();
+                            }))
+                        }),
+                    ),
+                )
+            })
+            .when_some(self.scan_error.clone(), |this, error| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().danger)
+                        .child(format!("{}: {}", text.scan_failed, error)),
+                )
             })
             .when_some(self.import_error.clone(), |this, error| {
-                this.child(div().text_xs().text_color(cx.theme().danger).child(error))
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().danger)
+                        .child(format!("{}: {}", text.import_failed, error)),
+                )
             })
             .child(
                 v_flex()
@@ -43304,20 +43821,9 @@ impl Render for ExternalImportDialog {
                     .rounded(px(8.0))
                     .border_1()
                     .border_color(cx.theme().border)
-                    .map(|this| {
-                        this.p_2().gap_2().children(if group_elements.is_empty() {
-                            vec![
-                                div()
-                                    .p_3()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(list_empty_label)
-                                    .into_any_element(),
-                            ]
-                        } else {
-                            group_elements
-                        })
-                    }),
+                    .p_1()
+                    .gap_1()
+                    .children(list_elements),
             )
             .child(
                 h_flex()
@@ -43332,34 +43838,34 @@ impl Render for ExternalImportDialog {
                             .truncate()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(selected_summary),
+                            .child(footer_summary),
                     )
                     .child(
-                        Button::new("external-import-select-all")
+                        Button::new("external-import-close")
                             .ghost()
                             .small()
-                            .icon(IconName::Check)
-                            .label(text.select_all)
-                            .disabled(importable.is_empty() || pending)
-                            .on_click(cx.listener(|this, _, _, cx| this.select_all_visible(cx))),
-                    )
-                    .child(
-                        Button::new("external-import-clear-selection")
-                            .ghost()
-                            .small()
-                            .icon(IconName::Close)
-                            .label(text.clear_selection)
-                            .disabled(selected_count == 0 || pending)
-                            .on_click(cx.listener(|this, _, _, cx| this.clear_selection(cx))),
+                            .label(text.close)
+                            .disabled(self.import_pending)
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                let _ = this.workbench.update(cx, |workbench, cx| {
+                                    workbench.external_import_view = None;
+                                    cx.notify();
+                                });
+                                window.close_dialog(cx);
+                            })),
                     )
                     .child(
                         Button::new("external-import-run")
                             .primary()
-                            .icon(Icon::default().path("icons/vibex/import.svg"))
-                            .label(text.import_selected)
+                            .small()
+                            .label(if self.import_pending {
+                                text.import_running
+                            } else {
+                                text.import_selected
+                            })
                             .loading(self.import_pending)
                             .disabled(selected_count == 0 || self.import_pending)
-                            .on_click(cx.listener(|this, _, window, cx| {
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                 this.import_candidates(window.window_handle(), cx)
                             })),
                     ),
