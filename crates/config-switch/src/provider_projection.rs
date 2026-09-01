@@ -2477,6 +2477,14 @@ fn kimi_provider_type(model: &AgentConfiguredModelBinding) -> &'static str {
     }
 }
 
+/// Reasoning variants projected for ZCode model entries.
+///
+/// This mirrors the capability ZCode itself hardcodes for its always-thinking
+/// reference models (levels low/high/max with a `max` default), which is the
+/// same vocabulary such gateways advertise when they reject a request.
+const ZCODE_PROJECTED_REASONING_VARIANTS: &[&str] = &["low", "high", "max"];
+const ZCODE_PROJECTED_REASONING_DEFAULT_VARIANT: &str = "max";
+
 fn zcode_model_entry(
     provider: &ModelProviderProfile,
     model: &AgentConfiguredModelBinding,
@@ -2498,10 +2506,27 @@ fn zcode_model_entry(
             serde_json::json!({ "context": context }),
         );
     }
-    if capabilities.and_then(|value| value.reasoning) == Some(true) {
+    // ZCode derives a model's thought-level vocabulary from the `reasoning`
+    // declaration on its catalog entry. An entry without concrete variants —
+    // or with a bare `enabled` — makes ZCode fall back to a 2-state
+    // enabled/disabled vocabulary whose disabled level force-disables thinking
+    // in request options. Always-thinking gateways reject those requests with
+    // HTTP 400 — including ZCode's internal background queries (session
+    // titles, compaction), which always disable thinking — and the failure
+    // aborts the whole session. Declaring concrete variants keeps the
+    // vocabulary free of a disable-thinking level, so ZCode never emits a
+    // thinking-off option for these models. Only an explicit reasoning=false
+    // declaration opts out.
+    let reasoning_capable =
+        capabilities.is_none_or(|value| value.reasoning != Some(false));
+    if reasoning_capable {
         model_entry.insert(
             "reasoning".to_string(),
-            serde_json::json!({ "enabled": true }),
+            serde_json::json!({
+                "enabled": true,
+                "variants": ZCODE_PROJECTED_REASONING_VARIANTS,
+                "defaultVariant": ZCODE_PROJECTED_REASONING_DEFAULT_VARIANT,
+            }),
         );
     }
     serde_json::Value::Object(model_entry)
@@ -2542,10 +2567,22 @@ fn zcode_overlay(
     let group = overlay_model_group(binding, model, zcode_provider_kind);
     let mut models = serde_json::Map::new();
     if group.is_empty() {
-        models.insert(
-            model_id.to_string(),
-            serde_json::json!({ "name": model_id }),
+        // No enabled bindings to group: still project the selected model with
+        // the same reasoning declaration so the vocabulary guard holds.
+        let mut entry = serde_json::Map::new();
+        entry.insert(
+            "name".to_string(),
+            serde_json::Value::String(model_id.to_string()),
         );
+        entry.insert(
+            "reasoning".to_string(),
+            serde_json::json!({
+                "enabled": true,
+                "variants": ZCODE_PROJECTED_REASONING_VARIANTS,
+                "defaultVariant": ZCODE_PROJECTED_REASONING_DEFAULT_VARIANT,
+            }),
+        );
+        models.insert(model_id.to_string(), serde_json::Value::Object(entry));
     } else {
         for model_binding in group {
             let model_id = projection_model_id(Some(model_binding)).unwrap_or("vibex-model");
@@ -4016,6 +4053,7 @@ mod tests {
             model.wire_protocol_id = protocol.to_string();
             let overlay = deepseek_harness_overlay(
                 &provider,
+                &binding,
                 provider.endpoints.first(),
                 Some(&model),
                 "VIBEX_DEEPSEEK_HARNESS_API_KEY",
@@ -4056,6 +4094,7 @@ mod tests {
 
         let overlay = zcode_overlay(
             &provider,
+            &binding,
             provider.endpoints.first(),
             Some(&model),
             "ANTHROPIC_API_KEY",
@@ -4075,6 +4114,14 @@ mod tests {
             overlay_secret_placeholder("ANTHROPIC_API_KEY")
         );
         assert!(projected["models"]["model-a"].is_object());
+        assert_eq!(
+            projected["models"]["model-a"]["reasoning"],
+            serde_json::json!({
+                "enabled": true,
+                "variants": ["low", "high", "max"],
+                "defaultVariant": "max",
+            })
+        );
 
         let mut descriptor = fixture(ConfigOverlayStrategy::ZcodeJson).3;
         descriptor.route.agent_id = AgentId::parse("zcode").unwrap();
@@ -4088,6 +4135,62 @@ mod tests {
             projected_runtime_model_id(&provider, &descriptor, &model),
             "fake\\model-a"
         );
+    }
+
+    #[test]
+    fn zcode_overlay_projects_concrete_reasoning_variants_over_heuristic_vocabulary() {
+        // Always-thinking gateways (e.g. glm-5.3-flash endpoints) reject
+        // ZCode's 2-state thought vocabulary: applying a level synthesizes
+        // thinking-off provider options and ZCode's internal queries
+        // (session titles, compaction) then send them, which aborts the
+        // session with a non-retryable 400. Undeclared capabilities must
+        // therefore still project concrete reasoning variants so no
+        // disable-thinking level can exist, and an explicit reasoning=true
+        // declaration must do the same instead of emitting a bare `enabled`
+        // that the bridge drops.
+        for reasoning in [None, Some(true)] {
+            let (mut provider, _, binding, _) = fixture(ConfigOverlayStrategy::ZcodeJson);
+            provider.configured_models[0].capabilities.reasoning = reasoning;
+            let model = binding.configured_models[0].clone();
+
+            let overlay = zcode_overlay(
+                &provider,
+                &binding,
+                provider.endpoints.first(),
+                Some(&model),
+                "VIBEX_FAKE_API_KEY",
+            )
+            .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&overlay).unwrap();
+            assert_eq!(
+                value["provider"]["fake"]["models"]["model-a"]["reasoning"],
+                serde_json::json!({
+                    "enabled": true,
+                    "variants": ["low", "high", "max"],
+                    "defaultVariant": "max",
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn zcode_overlay_omits_reasoning_for_non_reasoning_models() {
+        let (mut provider, _, binding, _) = fixture(ConfigOverlayStrategy::ZcodeJson);
+        provider.configured_models[0].capabilities.reasoning = Some(false);
+        let model = binding.configured_models[0].clone();
+
+        let overlay = zcode_overlay(
+            &provider,
+            &binding,
+            provider.endpoints.first(),
+            Some(&model),
+            "VIBEX_FAKE_API_KEY",
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&overlay).unwrap();
+        assert!(value["provider"]["fake"]["models"]["model-a"]
+            .get("reasoning")
+            .is_none());
     }
 
     fn fixture(
@@ -5319,6 +5422,7 @@ mod tests {
 
         let content = pi_overlay(
             &provider,
+            &binding,
             Some(&endpoint),
             binding.configured_models.first(),
             "PI_API_KEY",
@@ -5333,6 +5437,7 @@ mod tests {
         provider.configured_models[0].capabilities.reasoning = Some(true);
         let content = pi_overlay(
             &provider,
+            &binding,
             Some(&endpoint),
             binding.configured_models.first(),
             "PI_API_KEY",
