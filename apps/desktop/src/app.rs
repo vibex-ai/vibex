@@ -9465,6 +9465,12 @@ impl VibexWorkbench {
             locale::ResolvedLocale::ZhTw => format!("{compaction_count} 次壓縮"),
         };
         let tokens_per_second = tokens_per_second.map(|speed| format!("{speed:.1} t/s"));
+        let session_usage = self.token_usage.as_ref();
+        let input_tokens = session_usage.and_then(|usage| usage.input_tokens);
+        let output_tokens = session_usage.and_then(|usage| usage.output_tokens);
+        let cache_rate = session_usage
+            .and_then(cache_hit_fraction)
+            .map(token_usage_percent);
         Some(
             h_flex()
                 .id("agent-generation-status")
@@ -9514,6 +9520,27 @@ impl VibexWorkbench {
                 })
                 .when(compaction_count > 0, |this| {
                     this.child(separator()).child(compaction_label)
+                })
+                .when_some(input_tokens, |this, tokens| {
+                    this.child(separator()).child(
+                        h_flex()
+                            .items_center()
+                            .gap(px(2.0))
+                            .child(Icon::new(IconName::ArrowUp).size(px(12.0)))
+                            .child(format_compact_tokens(tokens)),
+                    )
+                })
+                .when_some(output_tokens, |this, tokens| {
+                    this.child(separator()).child(
+                        h_flex()
+                            .items_center()
+                            .gap(px(2.0))
+                            .child(Icon::new(IconName::ArrowDown).size(px(12.0)))
+                            .child(format_compact_tokens(tokens)),
+                    )
+                })
+                .when_some(cache_rate, |this, rate| {
+                    this.child(separator()).child(format!("{rate}%"))
                 })
                 .when_some(tokens_per_second, |this, speed| {
                     this.child(separator()).child(speed)
@@ -57596,6 +57623,10 @@ mod tests {
             .expect("agent generation status renderer should remain inspectable");
         assert!(generation_status.contains("show_agent_generation_status"));
         assert!(generation_status.contains("self.agent_generation_stats = None"));
+        assert!(generation_status.contains("Icon::new(IconName::ArrowUp)"));
+        assert!(generation_status.contains("Icon::new(IconName::ArrowDown)"));
+        assert!(generation_status.contains("format_compact_tokens"));
+        assert!(generation_status.contains("cache_hit_fraction"));
     }
 
     #[test]
