@@ -220,6 +220,10 @@ const RIGHT_RAIL_PANEL_MAX_WIDTH: f32 = 720.0;
 const RIGHT_RAIL_PANEL_VIEWPORT_RATIO: f32 = 0.57;
 const RIGHT_PANEL_RESIZE_HANDLE_WIDTH: f32 = 12.0;
 const RIGHT_PANEL_RESIZE_KEYBOARD_STEP: f32 = 16.0;
+const COMPOSER_TERMINAL_DEFAULT_HEIGHT_PX: f32 = 288.0;
+const COMPOSER_TERMINAL_MIN_HEIGHT_PX: f32 = 160.0;
+const COMPOSER_TERMINAL_MAX_HEIGHT_INSET_PX: f32 = 224.0;
+const COMPOSER_TERMINAL_RESIZE_HANDLE_HEIGHT_PX: f32 = 10.0;
 const RIGHT_ACTIVITY_BAR_WIDTH: f32 = 40.0;
 const RIGHT_ACTIVITY_BUTTON_SIZE: f32 = 32.0;
 const RIGHT_ACTIVITY_ITEM_GAP: f32 = 4.0;
@@ -1874,6 +1878,23 @@ struct SidebarResizeDragState {
 struct SidebarResizeDrag;
 
 impl Render for SidebarResizeDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ComposerTerminalResizeDragState {
+    start_window_y: f32,
+    start_height: f32,
+    min_height: f32,
+    max_height: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ComposerTerminalResizeDrag;
+
+impl Render for ComposerTerminalResizeDrag {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         Empty
     }
@@ -4249,6 +4270,8 @@ pub struct VibexWorkbench {
     selected_composer_terminal_id: Option<TerminalId>,
     composer_terminal_mode: bool,
     composer_terminal_expanded: bool,
+    composer_terminal_height: f32,
+    composer_terminal_resize_drag: Option<ComposerTerminalResizeDragState>,
     composer_terminal_drop_target: Option<ComposerTerminalDropTarget>,
     composer_terminal_surfaces: BTreeMap<String, Entity<TerminalSurface>>,
     active_composer_terminal_surface_id: Option<String>,
@@ -4987,6 +5010,8 @@ impl VibexWorkbench {
             selected_composer_terminal_id: None,
             composer_terminal_mode: false,
             composer_terminal_expanded: false,
+            composer_terminal_height: COMPOSER_TERMINAL_DEFAULT_HEIGHT_PX,
+            composer_terminal_resize_drag: None,
             composer_terminal_drop_target: None,
             composer_terminal_surfaces: BTreeMap::new(),
             active_composer_terminal_surface_id: None,
@@ -9814,6 +9839,7 @@ impl VibexWorkbench {
         self.selected_composer_terminal_id = None;
         self.composer_terminal_mode = false;
         self.composer_terminal_expanded = false;
+        self.composer_terminal_resize_drag = None;
         self.composer_terminal_drop_target = None;
         self.composer_terminal_surfaces.clear();
         self.active_composer_terminal_surface_id = None;
@@ -19845,6 +19871,34 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    fn update_composer_terminal_resize(&mut self, window_y: f32, cx: &mut Context<Self>) {
+        let Some(drag) = self.composer_terminal_resize_drag else {
+            return;
+        };
+        // The handle sits on the terminal's top edge: dragging up grows it.
+        let height = (drag.start_height - (window_y - drag.start_window_y))
+            .round()
+            .clamp(drag.min_height, drag.max_height);
+        if (height - self.composer_terminal_height).abs() < f32::EPSILON {
+            return;
+        }
+        self.composer_terminal_height = height;
+        cx.notify();
+    }
+
+    fn finish_composer_terminal_resize(&mut self, cx: &mut Context<Self>) {
+        if self.composer_terminal_resize_drag.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn composer_terminal_height_limits(&self) -> (f32, f32) {
+        let min_height = COMPOSER_TERMINAL_MIN_HEIGHT_PX;
+        let viewport_height = self.last_visibility.layout.viewport_height as f32;
+        let max_height = (viewport_height - COMPOSER_TERMINAL_MAX_HEIGHT_INSET_PX).max(min_height);
+        (min_height, max_height)
+    }
+
     fn adjust_sidebar_width(&mut self, delta: f32, cx: &mut Context<Self>) {
         let Some((min_width, max_width)) = self.sidebar_resize_limits(self.last_visibility, cx)
         else {
@@ -28665,6 +28719,13 @@ impl VibexWorkbench {
         let runtime_controls = self.render_runtime_controls(cx);
         let conversation_find = self.render_conversation_find(cx);
         let composer = self.render_composer(cx);
+        // Terminal mode routes its own near-fullscreen expansion through the
+        // same timeline-collapse path as the input composer's expanded state.
+        let composer_fullscreen = if self.composer_terminal_mode {
+            self.composer_terminal_expanded
+        } else {
+            self.composer_expanded
+        };
         v_flex()
             .id("agent-workbench")
             .size_full()
@@ -28675,8 +28736,8 @@ impl VibexWorkbench {
             .bg(cx.theme().background)
             .child(
                 v_flex()
-                    .when(!self.composer_expanded, |this| this.flex_1())
-                    .when(self.composer_expanded, |this| this.h_0().flex_none())
+                    .when(!composer_fullscreen, |this| this.flex_1())
+                    .when(composer_fullscreen, |this| this.h_0().flex_none())
                     .min_h_0()
                     .min_w_0()
                     .overflow_hidden()
@@ -28740,7 +28801,7 @@ impl VibexWorkbench {
                     })
                     .child(timeline_surface),
             )
-            .when(timeline_bottom_control_mounted && !self.composer_expanded, |this| {
+            .when(timeline_bottom_control_mounted && !composer_fullscreen, |this| {
                 let button = Button::new("follow-agent-bottom").small().primary();
                 let button = if self.timeline_follow.unread_count > 0 {
                     button.label(match self.resolved_locale() {
@@ -29845,27 +29906,41 @@ impl VibexWorkbench {
                 )
             })
             .collect::<Vec<_>>();
-        let terminal_height = if self.composer_terminal_expanded {
-            480.0
-        } else {
-            288.0
-        };
+        let (min_terminal_height, max_terminal_height) = self.composer_terminal_height_limits();
+        let terminal_height = self
+            .composer_terminal_height
+            .clamp(min_terminal_height, max_terminal_height);
         let content_max_width = session_content_max_width(self.ui_state.session.content_width);
+        let resize_handle = if self.composer_terminal_expanded {
+            None
+        } else {
+            Some(self.render_composer_terminal_resize_handle(cx))
+        };
 
         v_flex()
             .id("agent-composer-terminal")
-            .flex_none()
+            .relative()
+            .when(!self.composer_terminal_expanded, |this| this.flex_none())
+            .when(self.composer_terminal_expanded, |this| {
+                this.flex_1().min_h_0().pt_4()
+            })
             .items_center()
             .bg(cx.theme().background)
             .px_4()
             .py_2()
+            .when_some(resize_handle, |this, handle| this.child(handle))
             .child(
                 v_flex()
                     .w_full()
                     .when_some(content_max_width, |this, max_width| {
                         this.max_w(px(max_width))
                     })
-                    .h(px(terminal_height))
+                    .when(!self.composer_terminal_expanded, |this| {
+                        this.h(px(terminal_height))
+                    })
+                    .when(self.composer_terminal_expanded, |this| {
+                        this.flex_1().min_h_0()
+                    })
                     .min_w_0()
                     .overflow_hidden()
                     .rounded(px(8.0))
@@ -30005,6 +30080,75 @@ impl VibexWorkbench {
                                 )
                             }),
                     ),
+            )
+            .into_any_element()
+    }
+
+    fn render_composer_terminal_resize_handle(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let resize_active = self.composer_terminal_resize_drag.is_some();
+        let (min_height, max_height) = self.composer_terminal_height_limits();
+        let drag_target = cx.weak_entity();
+        div()
+            .id("composer-terminal-resize-handle")
+            .role(Role::Splitter)
+            .aria_label(locale::text(
+                "Resize terminal height",
+                "调整终端高度",
+                "調整終端機高度",
+            ))
+            .aria_orientation(Orientation::Vertical)
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(px(COMPOSER_TERMINAL_RESIZE_HANDLE_HEIGHT_PX))
+            .cursor_row_resize()
+            .group("composer-terminal-resize-handle")
+            .occlude()
+            .when(resize_active, |this| {
+                this.bg(cx.theme().drag_border.opacity(0.14))
+            })
+            .hover(|style| style.bg(cx.theme().drag_border.opacity(0.10)))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _: &MouseDownEvent, window, cx| {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                }),
+            )
+            .on_drag(ComposerTerminalResizeDrag, move |_, _, window, cx| {
+                let start_window_y = f32::from(window.mouse_position().y);
+                let _ = drag_target.update(cx, |this, cx| {
+                    this.composer_terminal_resize_drag = Some(ComposerTerminalResizeDragState {
+                        start_window_y,
+                        start_height: this.composer_terminal_height.clamp(min_height, max_height),
+                        min_height,
+                        max_height,
+                    });
+                    cx.notify();
+                });
+                cx.new(|_| ComposerTerminalResizeDrag)
+            })
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.finish_composer_terminal_resize(cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.finish_composer_terminal_resize(cx)),
+            )
+            .child(
+                div()
+                    .w(px(48.0))
+                    .h(px(3.0))
+                    .rounded_full()
+                    .bg(cx.theme().border)
+                    .group_hover("composer-terminal-resize-handle", |style| {
+                        style.bg(cx.theme().drag_border.opacity(0.78))
+                    }),
             )
             .into_any_element()
     }
@@ -47622,6 +47766,12 @@ impl Render for VibexWorkbench {
                     this.update_right_panel_resize(f32::from(event.event.position.x), cx);
                 },
             ))
+            .on_drag_move(cx.listener(
+                |this, event: &DragMoveEvent<ComposerTerminalResizeDrag>, _, cx| {
+                    cx.stop_propagation();
+                    this.update_composer_terminal_resize(f32::from(event.event.position.y), cx);
+                },
+            ))
             .capture_any_mouse_down(
                 cx.listener(|this, _, _, cx| this.clear_session_search_highlight(cx)),
             )
@@ -47630,6 +47780,7 @@ impl Render for VibexWorkbench {
                 cx.listener(|this, _, _, cx| {
                     this.finish_sidebar_resize(cx);
                     this.finish_right_panel_resize(cx);
+                    this.finish_composer_terminal_resize(cx);
                 }),
             )
             .on_mouse_up_out(
@@ -47637,6 +47788,7 @@ impl Render for VibexWorkbench {
                 cx.listener(|this, _, _, cx| {
                     this.finish_sidebar_resize(cx);
                     this.finish_right_panel_resize(cx);
+                    this.finish_composer_terminal_resize(cx);
                 }),
             )
             .size_full()
@@ -47644,6 +47796,9 @@ impl Render for VibexWorkbench {
                 self.sidebar_resize_drag.is_some() || self.right_panel_resize_drag.is_some(),
                 |this| this.cursor_col_resize(),
             )
+            .when(self.composer_terminal_resize_drag.is_some(), |this| {
+                this.cursor_row_resize()
+            })
             .relative()
             .min_w_0()
             .min_h_0()
@@ -51029,6 +51184,36 @@ mod tests {
         assert!(tab.contains(".aria_selected(active)"));
         assert!(tab.contains(".bottom_0()"));
         assert!(!terminal.contains("Button::new(\"kill-composer-terminal\")"));
+    }
+
+    #[test]
+    fn composer_terminal_fullscreen_expands_like_input_composer() {
+        let source = include_str!("app.rs");
+        let terminal = source
+            .split_once("    fn render_composer_terminal(&mut self, cx: &mut Context<Self>)")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_inline_composer_attachments("))
+            .map(|(body, _)| body)
+            .expect("composer terminal renderer should remain inspectable");
+        assert!(terminal.contains("this.flex_1().min_h_0().pt_4()"));
+        assert!(terminal.contains("when_some(resize_handle"));
+        assert!(terminal.contains("composer-terminal-resize-handle"));
+        assert!(terminal.contains("ComposerTerminalResizeDrag"));
+
+        let workbench = source
+            .split_once("    fn render_agent_workbench(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_controls("))
+            .map(|(body, _)| body)
+            .expect("agent workbench renderer should remain inspectable");
+        assert!(workbench.contains("let composer_fullscreen = if self.composer_terminal_mode {"));
+        assert!(workbench.contains(".when(!composer_fullscreen, |this| this.flex_1())"));
+        assert!(workbench.contains(".when(composer_fullscreen, |this| this.h_0().flex_none())"));
+
+        let resize = source
+            .split_once("    fn update_composer_terminal_resize(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn finish_composer_terminal_resize("))
+            .map(|(body, _)| body)
+            .expect("terminal resize updater should remain inspectable");
+        assert!(resize.contains("drag.start_height - (window_y - drag.start_window_y)"));
     }
 
     #[test]
