@@ -4385,6 +4385,7 @@ pub struct VibexWorkbench {
     composer_runtime_search: Entity<InputState>,
     runtime_provider_scroll: ScrollHandle,
     runtime_provider_scroll_to_selection: bool,
+    runtime_provider_reveal_selection: Option<SessionRuntimeSelection>,
     runtime_provider_keyboard_selection: Option<SessionRuntimeSelection>,
     runtime_provider_search_focus_pending: bool,
     runtime_authentication_menu: Option<RuntimeAuthenticationMenuState>,
@@ -4717,7 +4718,7 @@ impl VibexWorkbench {
                 &new_session_runtime_search,
                 |this, _, event: &InputEvent, cx| {
                     if matches!(event, InputEvent::Change) {
-                        this.runtime_provider_keyboard_selection = None;
+                        this.clear_runtime_provider_keyboard_selection();
                     }
                     cx.notify()
                 },
@@ -4726,7 +4727,7 @@ impl VibexWorkbench {
                 &composer_runtime_search,
                 |this, _, event: &InputEvent, cx| {
                     if matches!(event, InputEvent::Change) {
-                        this.runtime_provider_keyboard_selection = None;
+                        this.clear_runtime_provider_keyboard_selection();
                     }
                     cx.notify()
                 },
@@ -5126,6 +5127,7 @@ impl VibexWorkbench {
             composer_runtime_search,
             runtime_provider_scroll: ScrollHandle::new(),
             runtime_provider_scroll_to_selection: false,
+            runtime_provider_reveal_selection: None,
             runtime_provider_keyboard_selection: None,
             runtime_provider_search_focus_pending: false,
             runtime_authentication_menu: None,
@@ -16747,7 +16749,7 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) {
         self.new_session_agent_id = Some(selection.agent_id.clone());
-        self.runtime_provider_keyboard_selection = None;
+        self.clear_runtime_provider_keyboard_selection();
         self.runtime_provider_search_focus_pending = false;
         self.new_session_runtime_menu_open = false;
         self.runtime_choice_menu_open = None;
@@ -17505,6 +17507,11 @@ impl VibexWorkbench {
         .detach();
     }
 
+    fn clear_runtime_provider_keyboard_selection(&mut self) {
+        self.runtime_provider_keyboard_selection = None;
+        self.runtime_provider_reveal_selection = None;
+    }
+
     fn choose_runtime_selection(
         &mut self,
         selection: SessionRuntimeSelection,
@@ -17513,7 +17520,7 @@ impl VibexWorkbench {
         if self.active_runtime_controls_pending() {
             return;
         }
-        self.runtime_provider_keyboard_selection = None;
+        self.clear_runtime_provider_keyboard_selection();
         self.runtime_provider_search_focus_pending = false;
         self.composer_runtime_menu_open = false;
         self.runtime_choice_menu_open = None;
@@ -17525,7 +17532,7 @@ impl VibexWorkbench {
     fn set_composer_runtime_menu_open(&mut self, open: bool, cx: &mut Context<Self>) {
         let open = open && !self.active_runtime_controls_pending();
         self.composer_runtime_menu_open = open;
-        self.runtime_provider_keyboard_selection = None;
+        self.clear_runtime_provider_keyboard_selection();
         self.runtime_provider_search_focus_pending = open;
         if open {
             self.runtime_choice_menu_open = None;
@@ -17558,7 +17565,7 @@ impl VibexWorkbench {
         self.composer_runtime_menu_agent_id = agent_id;
         self.composer_runtime_menu_auth_source = auth_source;
         self.composer_runtime_menu_view = view;
-        self.runtime_provider_keyboard_selection = None;
+        self.clear_runtime_provider_keyboard_selection();
         self.runtime_provider_search_focus_pending =
             matches!(view, ComposerRuntimeMenuView::AuthSource);
         cx.notify();
@@ -17567,7 +17574,7 @@ impl VibexWorkbench {
     fn set_new_session_runtime_menu_open(&mut self, open: bool, cx: &mut Context<Self>) {
         let open = open && !self.agent_action_pending && self.new_session_agent_id.is_some();
         self.new_session_runtime_menu_open = open;
-        self.runtime_provider_keyboard_selection = None;
+        self.clear_runtime_provider_keyboard_selection();
         self.runtime_provider_search_focus_pending = open;
         if open {
             self.runtime_choice_menu_open = None;
@@ -17600,13 +17607,13 @@ impl VibexWorkbench {
         };
         let open = open && !blocked;
         if open {
-            self.runtime_provider_keyboard_selection = None;
+            self.clear_runtime_provider_keyboard_selection();
             self.runtime_provider_search_focus_pending = false;
             self.new_session_runtime_menu_open = false;
             self.composer_runtime_menu_open = false;
             self.runtime_choice_menu_open = Some(menu_id);
         } else if self.runtime_choice_menu_open.as_deref() == Some(menu_id.as_str()) {
-            self.runtime_provider_keyboard_selection = None;
+            self.clear_runtime_provider_keyboard_selection();
             self.runtime_provider_search_focus_pending = false;
             self.runtime_choice_menu_open = None;
         }
@@ -17621,7 +17628,7 @@ impl VibexWorkbench {
     ) {
         self.new_session_runtime_menu_view = view;
         self.new_session_runtime_menu_auth_source = auth_source;
-        self.runtime_provider_keyboard_selection = None;
+        self.clear_runtime_provider_keyboard_selection();
         self.runtime_provider_search_focus_pending =
             matches!(view, ComposerRuntimeMenuView::AuthSource);
         cx.notify();
@@ -26048,7 +26055,10 @@ impl VibexWorkbench {
                     |index| wrap_runtime_provider_model_selection(index, delta, choices.len()),
                 );
                 self.runtime_provider_keyboard_selection = Some(choices[index].selection.clone());
-                self.runtime_provider_scroll_to_selection = true;
+                // Keyboard stepping reveals the newly highlighted row with the
+                // minimum scroll, so the menu never jumps around under the
+                // user's fingers.
+                self.runtime_provider_reveal_selection = Some(choices[index].selection.clone());
                 cx.notify();
                 cx.stop_propagation();
             }
@@ -26219,10 +26229,12 @@ impl VibexWorkbench {
                 });
                 let highlighted =
                     keyboard_selected || (is_selected && keyboard_selection.is_none());
-                let selected_anchor =
-                    highlighted.then(|| ScrollAnchor::for_handle(provider_scroll.clone()));
-                let reveal_anchor = selected_anchor.clone();
+                // Only the highlighted row may consume the reveal requests;
+                // otherwise the first painted row would steal them.
+                let should_reveal_row = highlighted;
                 let reveal_workbench = workbench.clone();
+                let reveal_selection = choice.selection.clone();
+                let reveal_scroll = provider_scroll.clone();
                 let selection = choice.selection;
                 let click_selection = selection.clone();
                 let icon = selection
@@ -26296,17 +26308,27 @@ impl VibexWorkbench {
                         selection.auth_source.id(),
                         runtime_model_selection_key(&selection.model)
                     ))
-                    .anchor_scroll(selected_anchor)
-                    .on_prepaint(move |_, window, cx| {
-                        if let Some(anchor) = reveal_anchor.as_ref() {
-                            let should_reveal = reveal_workbench
-                                .update(cx, |this, _| {
-                                    std::mem::take(&mut this.runtime_provider_scroll_to_selection)
-                                })
-                                .unwrap_or(false);
-                            if should_reveal {
-                                anchor.scroll_to(window, cx);
-                            }
+                    .on_prepaint(move |bounds, window, cx| {
+                        if !should_reveal_row {
+                            return;
+                        }
+                        let should_reveal = reveal_workbench
+                            .update(cx, |this, _| {
+                                this.runtime_provider_reveal_selection
+                                    .take_if(|selection| {
+                                        runtime_selection_identity_matches(
+                                            selection,
+                                            &reveal_selection,
+                                        )
+                                    })
+                                    .is_some()
+                                    || std::mem::take(
+                                        &mut this.runtime_provider_scroll_to_selection,
+                                    )
+                            })
+                            .unwrap_or(false);
+                        if should_reveal {
+                            scroll_row_into_view(&reveal_scroll, bounds, window);
                         }
                     })
                     .child(button)
@@ -26468,7 +26490,13 @@ impl VibexWorkbench {
                     .min_h_0()
                     .flex_1()
                     .track_scroll(&provider_scroll)
-                    .overflow_y_scrollbar()
+                    // `overflow_y_scrollbar()` wraps the element in a
+                    // `Scrollable` whose inner div carries its own keyed
+                    // handle, so `track_scroll` would track a handle that
+                    // never scrolls. Plain overflow keeps `provider_scroll`
+                    // as the real scroll driver for keyboard reveal.
+                    .overflow_y_scroll()
+                    .vertical_scrollbar(&provider_scroll)
                     .when(visible_groups.is_empty(), |this| {
                         this.child(runtime_menu_empty_state(cx))
                     })
@@ -41822,6 +41850,33 @@ fn runtime_auth_source_status_label(
     }
 }
 
+/// Scroll the provider/model list by the minimum amount needed to bring a row
+/// into view. `ScrollAnchor::scroll_to` aligns the anchored row to the viewport
+/// top, which makes arrow-key stepping feel like the list is jumping; a fully
+/// visible row must keep the current scroll offset untouched. Row and viewport
+/// bounds are both window coordinates captured in the same prepaint pass, so
+/// the overshoot can be read off directly. The offset is applied on the next
+/// frame because the scroll container translates its children from the handle
+/// offset that was current while this frame was being laid out.
+fn scroll_row_into_view(handle: &ScrollHandle, row_bounds: Bounds<Pixels>, window: &mut Window) {
+    let viewport = handle.bounds();
+    if viewport.size.height <= px(0.0) {
+        return;
+    }
+    let delta_y = if row_bounds.top() < viewport.top() {
+        viewport.top() - row_bounds.top()
+    } else if row_bounds.bottom() > viewport.bottom() {
+        viewport.bottom() - row_bounds.bottom()
+    } else {
+        return;
+    };
+    let offset = handle.offset();
+    let max_offset = handle.max_offset();
+    let target = point(offset.x, (offset.y + delta_y).clamp(-max_offset.y, px(0.0)));
+    let handle = handle.clone();
+    window.on_next_frame(move |_, _| handle.set_offset(target));
+}
+
 fn runtime_menu_empty_state(cx: &App) -> AnyElement {
     div()
         .size_full()
@@ -56933,7 +56988,13 @@ mod tests {
         assert!(grouped_models.contains(".child(runtime_agent_icon("));
         assert!(grouped_models.contains(".text_color(cx.theme().foreground.opacity(0.84))"));
         assert!(grouped_models.contains(".track_scroll(&provider_scroll)"));
-        assert!(grouped_models.contains(".anchor_scroll(selected_anchor)"));
+        assert!(
+            grouped_models.contains(".overflow_y_scroll()"),
+            "the grouped provider/model list must keep `provider_scroll` as the \
+             real scroll driver so keyboard reveal can move it"
+        );
+        assert!(grouped_models.contains(".vertical_scrollbar(&provider_scroll)"));
+        assert!(grouped_models.contains("scroll_row_into_view(&reveal_scroll, bounds, window)"));
         assert!(menu_opening.contains("runtime_provider_scroll_to_selection = true;"));
         assert!(grouped_models.contains("ComposerRuntimeMenuView::Agent"));
         assert!(current_session.contains("let selected = agent.id == desired.agent_id;"));
