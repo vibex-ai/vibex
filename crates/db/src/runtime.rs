@@ -4481,6 +4481,51 @@ impl MessageSubmissionRepository {
         )
     }
 
+    /// Fails a submission whose prompt dispatch did reach the provider: the
+    /// user boundary was persisted and the turn then ended in a durable
+    /// terminal error, retry exhaustion, or abnormal stop. The message was
+    /// delivered, so unlike pre-dispatch failures this records
+    /// `dispatched_at_ms`; clients present such failures through the timeline
+    /// (and auto-continue) instead of claiming the message was never sent.
+    pub fn fail_after_prompt_dispatch(
+        conn: &Connection,
+        submission_id: &MessageSubmissionId,
+        error_code: &str,
+        error_detail_redacted: Option<&str>,
+    ) -> VibexResult<()> {
+        Self::validate_error_fields(error_code, error_detail_redacted)?;
+        let now = unix_timestamp_ms();
+        let changed = conn
+            .execute(
+                "UPDATE agent_message_submissions
+                 SET status = ?2,
+                     error_code = ?3,
+                     error_detail_redacted = ?4,
+                     dispatched_at_ms = ?5,
+                     updated_at_ms = ?5
+                 WHERE submission_id = ?1 AND status = ?6",
+                params![
+                    submission_id.as_str(),
+                    enum_to_db(&MessageSubmissionStatus::Failed)?,
+                    error_code,
+                    error_detail_redacted,
+                    now,
+                    enum_to_db(&MessageSubmissionStatus::AboutToPrompt)?,
+                ],
+            )
+            .map_err(storage_err(
+                "message_submission_update_failed",
+                "failed to update message submission terminal state",
+            ))?;
+        if changed == 0 {
+            return Err(cas_conflict(
+                "message_submission_status_conflict",
+                "message submission is not in the expected status",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn mark_ambiguous(
         conn: &Connection,
         submission_id: &MessageSubmissionId,

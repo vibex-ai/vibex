@@ -846,10 +846,13 @@ impl MessageSubmissionCoordinator {
                     }
                     PersistedDispatchResult::Failed { error_code } => {
                         let conn = self.open_connection()?;
-                        MessageSubmissionRepository::fail(
+                        // Durable terminal provider output exists, so the
+                        // prompt was delivered before the turn failed: mark
+                        // the delivery boundary instead of a pre-dispatch
+                        // failure.
+                        MessageSubmissionRepository::fail_after_prompt_dispatch(
                             &conn,
                             &record.submission_id,
-                            MessageSubmissionStatus::AboutToPrompt,
                             &safe_error_code(&error_code),
                             Some(TERMINAL_PROVIDER_ERROR_DETAIL),
                         )?;
@@ -2446,6 +2449,9 @@ mod tests {
             state.error_detail_redacted.as_deref(),
             Some(PRE_DISPATCH_ERROR_DETAIL)
         );
+        // The prompt never reached the provider, so no delivery boundary is
+        // recorded for pre-dispatch failures.
+        assert!(state.dispatched_at_ms.is_none());
         assert!(!format!("{state:?}").contains(SENSITIVE_SENTINEL));
         let conn = open_database(&db_path).unwrap();
         assert_eq!(
@@ -2567,6 +2573,9 @@ mod tests {
             state.error_code.as_deref(),
             Some("provider_retry_exhausted")
         );
+        // The retry schedule was exhausted after the prompt was dispatched, so
+        // the delivery boundary must be recorded even though the turn failed.
+        assert!(state.dispatched_at_ms.is_some());
 
         cleanup_db(db_path);
     }

@@ -1218,6 +1218,15 @@ fn composer_submission_status_is_actionable(status: MessageSubmissionStatus) -> 
     )
 }
 
+/// A submission whose prompt already reached the provider and then failed in
+/// the turn itself (retry exhaustion, terminal provider error, abnormal stop)
+/// records `dispatched_at_ms`. That failure is owned by the timeline — error
+/// items plus auto-continue — so it must not surface as a "message was not
+/// sent" composer bar.
+fn composer_submission_failure_reached_provider(state: &MessageSubmissionState) -> bool {
+    state.status == MessageSubmissionStatus::Failed && state.dispatched_at_ms.is_some()
+}
+
 fn ambiguous_message_submission_notice() -> &'static str {
     locale::text(
         "There was a problem sending your message. Please try again shortly.",
@@ -13121,7 +13130,8 @@ impl VibexWorkbench {
                 state.status,
                 MessageSubmissionStatus::Completed
                     | MessageSubmissionStatus::AmbiguousPromptDispatch
-            ) {
+            ) || composer_submission_failure_reached_provider(state)
+            {
                 self.composer_submission_locators.retain(|locator| {
                     !(locator.session_id == state.session_id
                         && locator.message_idempotency_key == state.message_idempotency_key)
@@ -13148,7 +13158,7 @@ impl VibexWorkbench {
                     state.status,
                     MessageSubmissionStatus::Completed
                         | MessageSubmissionStatus::AmbiguousPromptDispatch
-                )
+                ) && !composer_submission_failure_reached_provider(state)
             })
             .collect::<Vec<_>>();
         visible.sort_by_key(|state| state.submission_sequence);
@@ -13224,6 +13234,10 @@ impl VibexWorkbench {
             // pending composer action. Only keep actionable terminal outcomes
             // visible in the composer area.
             .filter(|state| composer_submission_status_is_actionable(state.status))
+            // Post-dispatch failures were delivered; the timeline (with
+            // auto-continue) owns them, so only genuinely unsent messages
+            // surface here.
+            .filter(|state| !composer_submission_failure_reached_provider(state))
             .cloned()
             .collect::<Vec<_>>();
         if rows.is_empty() {
@@ -13235,10 +13249,7 @@ impl VibexWorkbench {
                 .min_w_0()
                 .gap(px(6.0))
                 .children(rows.into_iter().map(|state| {
-                    let terminal = matches!(
-                        state.status,
-                        MessageSubmissionStatus::Failed | MessageSubmissionStatus::Cancelled
-                    );
+                    let terminal = state.status == MessageSubmissionStatus::Cancelled;
                     let label = match state.status {
                         MessageSubmissionStatus::AwaitingRuntime
                         | MessageSubmissionStatus::ReadyToDispatch => {
@@ -48756,10 +48767,10 @@ mod tests {
         AgentCommandExecutionBehavior, AgentCommandSelectionBehavior, AgentId,
         AgentMessageDeltaPayload, AgentMessagePayload, FileOperationPayload, GitChange,
         GitChangeKind, GitWorktreeConflictFile, GitWorktreeMergeStrategy,
-        GitWorktreeOperationDetail, GitWorktreeOperationKind, PlanPayload, PlanStepPayload,
-        ProviderProfileId, ProviderProfileStatus, ReasoningPayload, RuntimeOptionAvailability,
-        SessionConfigValue, SessionRuntimeOption, TimelineItemId, TimelineRedactionState,
-        TimelineSource, TodoUpdatePayload, UserMessagePayload, WorkspaceId,
+        GitWorktreeOperationDetail, GitWorktreeOperationKind, MessageSubmissionId, PlanPayload,
+        PlanStepPayload, ProviderProfileId, ProviderProfileStatus, ReasoningPayload,
+        RuntimeOptionAvailability, SessionConfigValue, SessionRuntimeOption, TimelineItemId,
+        TimelineRedactionState, TimelineSource, TodoUpdatePayload, UserMessagePayload, WorkspaceId,
     };
 
     #[test]
@@ -54764,6 +54775,43 @@ mod tests {
         ] {
             assert!(composer_submission_status_is_actionable(status));
         }
+    }
+
+    #[test]
+    fn failed_submission_after_prompt_dispatch_does_not_render_message_not_sent() {
+        let selection = SessionRuntimeSelection::provider(
+            AgentId::parse("pi").unwrap(),
+            ProviderProfileId::parse("provider_pi_local").unwrap(),
+            "pi_model",
+        );
+        let state = |status: MessageSubmissionStatus,
+                     dispatched_at_ms: Option<i64>|
+         -> MessageSubmissionState {
+            MessageSubmissionState {
+                submission_id: MessageSubmissionId::new(),
+                session_id: VibexSessionId::parse("session_submission").unwrap(),
+                message_idempotency_key: "submission-key".to_string(),
+                submission_sequence: 1,
+                desired_runtime: selection.clone(),
+                required_switch_id: None,
+                status,
+                user_message_timeline_item_id: None,
+                error_code: None,
+                error_detail_redacted: None,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+                dispatched_at_ms,
+            }
+        };
+
+        let dispatched = state(MessageSubmissionStatus::Failed, Some(42));
+        assert!(composer_submission_failure_reached_provider(&dispatched));
+
+        let undelivered = state(MessageSubmissionStatus::Failed, None);
+        assert!(!composer_submission_failure_reached_provider(&undelivered));
+
+        let cancelled = state(MessageSubmissionStatus::Cancelled, Some(42));
+        assert!(!composer_submission_failure_reached_provider(&cancelled));
     }
 
     #[test]
