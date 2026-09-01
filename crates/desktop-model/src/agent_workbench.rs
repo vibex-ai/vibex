@@ -412,6 +412,11 @@ pub fn active_collaborations(items: &[TimelineItem]) -> Vec<ActiveCollaborationP
 /// thought chunks as individual timeline items, so the in-flight status is the
 /// accumulated run rather than the most recent fragment; joining the deltas
 /// keeps the pending indicator stable while a thinking stream grows.
+///
+/// Only the leading whitespace is trimmed: the tail has to stay verbatim so a
+/// consumer can extend the accumulation by appending the next chunk instead of
+/// rescanning the whole run, which is what keeps thinking streams off a
+/// quadratic reprojection path.
 fn accumulated_streaming_reasoning(items: &[&TimelineItem]) -> Option<String> {
     let mut chunks: Vec<&str> = Vec::new();
     for item in items.iter().rev() {
@@ -422,13 +427,9 @@ fn accumulated_streaming_reasoning(items: &[&TimelineItem]) -> Option<String> {
             _ => break,
         }
     }
-    let accumulated = chunks
-        .into_iter()
-        .rev()
-        .collect::<String>()
-        .trim()
-        .to_string();
-    (!accumulated.is_empty()).then_some(accumulated)
+    let accumulated = chunks.into_iter().rev().collect::<String>();
+    let accumulated = accumulated.trim_start();
+    (!accumulated.trim_end().is_empty()).then(|| accumulated.to_string())
 }
 
 pub fn timeline_conversation_turns(

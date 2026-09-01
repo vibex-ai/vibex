@@ -572,6 +572,28 @@ enum ComposerRuntimeMenuView {
     Model,
 }
 
+/// Keyboard navigation intent for the provider/model list, translated from the
+/// search input's own actions so the bindings owned by `Input` never win first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeProviderNav {
+    Previous,
+    Next,
+    Apply,
+    Dismiss,
+}
+
+/// Everything the provider/model keyboard handler needs to resolve the visible
+/// choice list; cloned once per action listener instead of five separate captures.
+#[derive(Clone)]
+struct RuntimeProviderNavContext {
+    agent_id: AgentId,
+    catalog: SessionRuntimeOptionCatalog,
+    selected: Option<SessionRuntimeSelection>,
+    preferred: Option<SessionRuntimeSelection>,
+    search: Entity<InputState>,
+    new_session: bool,
+}
+
 #[derive(Clone)]
 struct RuntimeAuthenticationMenuState {
     agent_id: AgentId,
@@ -2656,6 +2678,15 @@ struct AgentStreamingCacheUpdate {
     body_len: usize,
 }
 
+fn timeline_item_runtime_attribution(item: &TimelineItem) -> Option<String> {
+    item.execution_attribution.as_ref().map(|attribution| {
+        format!(
+            "{} · {} · {}",
+            attribution.agent_label, attribution.auth_source_label, attribution.model_label
+        )
+    })
+}
+
 fn agent_streaming_delta_updates(
     events: &[TimelineLiveEvent],
 ) -> Option<Vec<AgentStreamingDeltaUpdate>> {
@@ -2676,18 +2707,7 @@ fn agent_streaming_delta_updates(
             timestamp_ms: event.item.timestamp_ms,
             text: delta.text_delta.clone(),
             conclusion: delta.phase == Some(AgentMessagePhase::FinalAnswer),
-            runtime_attribution: event
-                .item
-                .execution_attribution
-                .as_ref()
-                .map(|attribution| {
-                    format!(
-                        "{} · {} · {}",
-                        attribution.agent_label,
-                        attribution.auth_source_label,
-                        attribution.model_label
-                    )
-                }),
+            runtime_attribution: timeline_item_runtime_attribution(&event.item),
         });
     }
     updates
@@ -2808,6 +2828,128 @@ fn append_agent_streaming_deltas_to_cache(
         }
         row.body.len()
     };
+    turn.item_count = turn.item_count.saturating_add(updates.len());
+    turn.ended_at_ms = updates.last().map(|update| update.timestamp_ms);
+    for row in turn
+        .user_row
+        .iter_mut()
+        .chain(turn.process_rows.iter_mut())
+        .chain(turn.conclusion_row.iter_mut())
+    {
+        row.turn_item_count = turn.item_count;
+    }
+    *state_cache = Some(StreamingRowStateCache {
+        turn_id: turn_id.clone(),
+        row_id: row_id.clone(),
+        body_len,
+    });
+    Some(AgentStreamingCacheUpdate {
+        turn_id,
+        row_id,
+        previous_body_len,
+        body_len,
+    })
+}
+
+/// Thought chunks arrive as individual timeline items, so a thinking stream
+/// would otherwise reproject the whole in-flight turn once per chunk. Mirror
+/// the agent-message streaming fast path: recognise a pure run of appended
+/// non-final reasoning deltas so the cached turn can be extended in place.
+struct AgentReasoningDeltaUpdate {
+    item_id: String,
+    sequence: i64,
+    timestamp_ms: i64,
+    text: String,
+    runtime_attribution: Option<String>,
+}
+
+fn agent_reasoning_delta_updates(
+    events: &[TimelineLiveEvent],
+) -> Option<Vec<AgentReasoningDeltaUpdate>> {
+    let mut updates = Vec::with_capacity(events.len());
+    for event in events {
+        if event.sequence != event.item.sequence || event.session_id != event.item.session_id {
+            return None;
+        }
+        let TimelinePayload::Reasoning(reasoning) = &event.item.payload else {
+            return None;
+        };
+        if reasoning.is_final {
+            return None;
+        }
+        updates.push(AgentReasoningDeltaUpdate {
+            item_id: event.item.id.to_string(),
+            sequence: event.sequence,
+            timestamp_ms: event.item.timestamp_ms,
+            text: reasoning.text.clone(),
+            runtime_attribution: timeline_item_runtime_attribution(&event.item),
+        });
+    }
+    updates
+        .windows(2)
+        .all(|pair| pair[1].sequence == pair[0].sequence.saturating_add(1))
+        .then_some(updates)
+}
+
+fn append_agent_reasoning_deltas_to_cache(
+    cache: &mut Rc<Vec<Rc<TimelineConversationTurn>>>,
+    state_cache: &mut Option<StreamingRowStateCache>,
+    reasoning_display_mode: ReasoningDisplayMode,
+    previous_end_sequence: Option<i64>,
+    updates: &[AgentReasoningDeltaUpdate],
+) -> Option<AgentStreamingCacheUpdate> {
+    let first = updates.first()?;
+    let last_turn = cache.last()?;
+    // `live_status` is only populated while the turn tail is a run of streaming
+    // reasoning, which is exactly the state this append can extend.
+    let live_status = last_turn.live_status.as_ref()?;
+    if last_turn.complete
+        || previous_end_sequence.is_none_or(|end| end.saturating_add(1) != first.sequence)
+        || updates
+            .windows(2)
+            .any(|pair| pair[1].sequence != pair[0].sequence.saturating_add(1))
+    {
+        return None;
+    }
+
+    let turn_id = last_turn.id.clone();
+    let timeline_row = (reasoning_display_mode == ReasoningDisplayMode::Timeline)
+        .then(|| {
+            last_turn.process_rows.last().filter(|row| {
+                row.kind == TimelineRowKind::Reasoning
+                    && row.streaming
+                    && row.last_sequence.saturating_add(1) == first.sequence
+                    && updates
+                        .iter()
+                        .all(|update| update.runtime_attribution == row.runtime_attribution)
+            })
+        })
+        .flatten();
+    if reasoning_display_mode == ReasoningDisplayMode::Timeline && timeline_row.is_none() {
+        return None;
+    }
+    let row_id =
+        timeline_row.map_or_else(|| format!("reasoning-live:{turn_id}"), |row| row.id.clone());
+    let previous_body_len = timeline_row.map_or_else(|| live_status.len(), |row| row.body.len());
+
+    let turns = Rc::make_mut(cache);
+    let turn = Rc::make_mut(turns.last_mut().expect("cache was checked above"));
+    if let Some(live_status) = turn.live_status.as_mut() {
+        for update in updates {
+            live_status.push_str(&update.text);
+        }
+    }
+    let mut body_len = turn.live_status.as_ref().map_or(0, String::len);
+    if reasoning_display_mode == ReasoningDisplayMode::Timeline
+        && let Some(row) = turn.process_rows.last_mut()
+    {
+        for update in updates {
+            row.body.push_str(&update.text);
+            record_timeline_row_endpoint(&mut row.item_ids, update.item_id.clone());
+            row.last_sequence = update.sequence;
+        }
+        body_len = row.body.len();
+    }
     turn.item_count = turn.item_count.saturating_add(updates.len());
     turn.ended_at_ms = updates.last().map(|update| update.timestamp_ms);
     for row in turn
@@ -4235,6 +4377,7 @@ pub struct VibexWorkbench {
     runtime_provider_scroll: ScrollHandle,
     runtime_provider_scroll_to_selection: bool,
     runtime_provider_keyboard_selection: Option<SessionRuntimeSelection>,
+    runtime_provider_search_focus_pending: bool,
     runtime_authentication_menu: Option<RuntimeAuthenticationMenuState>,
     composer_geometry: ComposerGeometry,
     runtime_choice_menu_open: Option<String>,
@@ -4975,6 +5118,7 @@ impl VibexWorkbench {
             runtime_provider_scroll: ScrollHandle::new(),
             runtime_provider_scroll_to_selection: false,
             runtime_provider_keyboard_selection: None,
+            runtime_provider_search_focus_pending: false,
             runtime_authentication_menu: None,
             composer_geometry: ComposerGeometry::default(),
             runtime_choice_menu_open: None,
@@ -10586,6 +10730,9 @@ impl VibexWorkbench {
         let streaming_updates = (!updates_existing_item)
             .then(|| agent_streaming_delta_updates(&events))
             .flatten();
+        let reasoning_updates = (!updates_existing_item && streaming_updates.is_none())
+            .then(|| agent_reasoning_delta_updates(&events))
+            .flatten();
         let changed = self.timeline.apply_live_batch(events);
         let optimistic_reconciled = changed > 0 && self.reconcile_optimistic_user_message();
         if changed > 0 {
@@ -10611,6 +10758,21 @@ impl VibexWorkbench {
                 && let Some(update) = append_agent_streaming_deltas_to_cache(
                     &mut self.conversation_turns_cache,
                     &mut self.streaming_row_state,
+                    updates,
+                )
+            {
+                self.conversation_turns_cache_key =
+                    Some(self.current_conversation_turns_cache_key());
+                self.conversation_turns_summary =
+                    ConversationTurnsSummary::from_turns(&self.conversation_turns_cache);
+                streaming_cache_update = Some(update);
+            } else if !self.timeline.needs_authoritative_refetch
+                && let Some(updates) = reasoning_updates.as_deref()
+                && let Some(update) = append_agent_reasoning_deltas_to_cache(
+                    &mut self.conversation_turns_cache,
+                    &mut self.streaming_row_state,
+                    self.ui_state.session.reasoning_display_mode,
+                    previous_end_sequence,
                     updates,
                 )
             {
@@ -10964,13 +11126,17 @@ impl VibexWorkbench {
         let Some(turn) = self.conversation_turns_cache.last().cloned() else {
             return self.rebuild_timeline_sizes();
         };
-        let Some(row) = timeline_streaming_agent_row(&turn, &update.row_id) else {
+        let state = StreamingRowStateCache {
+            turn_id: update.turn_id.clone(),
+            row_id: update.row_id.clone(),
+            body_len: update.body_len,
+        };
+        let Some(body_len) = streaming_timeline_row_body_len(&turn, &state) else {
             return self.rebuild_timeline_sizes();
         };
         if turn.id != update.turn_id
-            || row.id != update.row_id
             || update.body_len < update.previous_body_len
-            || row.body.len() != update.body_len
+            || body_len != update.body_len
             || self.timeline_row_sizes.len() != self.conversation_turns_cache.len()
         {
             return self.rebuild_timeline_sizes();
@@ -16641,6 +16807,7 @@ impl VibexWorkbench {
     ) {
         self.new_session_agent_id = Some(selection.agent_id.clone());
         self.runtime_provider_keyboard_selection = None;
+        self.runtime_provider_search_focus_pending = false;
         self.new_session_runtime_menu_open = false;
         self.runtime_choice_menu_open = None;
         self.new_session_runtime_menu_auth_source = None;
@@ -17406,6 +17573,7 @@ impl VibexWorkbench {
             return;
         }
         self.runtime_provider_keyboard_selection = None;
+        self.runtime_provider_search_focus_pending = false;
         self.composer_runtime_menu_open = false;
         self.runtime_choice_menu_open = None;
         self.composer_runtime_menu_agent_id = None;
@@ -17417,6 +17585,7 @@ impl VibexWorkbench {
         let open = open && !self.active_runtime_controls_pending();
         self.composer_runtime_menu_open = open;
         self.runtime_provider_keyboard_selection = None;
+        self.runtime_provider_search_focus_pending = open;
         if open {
             self.runtime_choice_menu_open = None;
             self.runtime_provider_scroll_to_selection = true;
@@ -17449,6 +17618,8 @@ impl VibexWorkbench {
         self.composer_runtime_menu_auth_source = auth_source;
         self.composer_runtime_menu_view = view;
         self.runtime_provider_keyboard_selection = None;
+        self.runtime_provider_search_focus_pending =
+            matches!(view, ComposerRuntimeMenuView::AuthSource);
         cx.notify();
     }
 
@@ -17456,6 +17627,7 @@ impl VibexWorkbench {
         let open = open && !self.agent_action_pending && self.new_session_agent_id.is_some();
         self.new_session_runtime_menu_open = open;
         self.runtime_provider_keyboard_selection = None;
+        self.runtime_provider_search_focus_pending = open;
         if open {
             self.runtime_choice_menu_open = None;
             self.runtime_provider_scroll_to_selection = true;
@@ -17488,11 +17660,13 @@ impl VibexWorkbench {
         let open = open && !blocked;
         if open {
             self.runtime_provider_keyboard_selection = None;
+            self.runtime_provider_search_focus_pending = false;
             self.new_session_runtime_menu_open = false;
             self.composer_runtime_menu_open = false;
             self.runtime_choice_menu_open = Some(menu_id);
         } else if self.runtime_choice_menu_open.as_deref() == Some(menu_id.as_str()) {
             self.runtime_provider_keyboard_selection = None;
+            self.runtime_provider_search_focus_pending = false;
             self.runtime_choice_menu_open = None;
         }
         cx.notify();
@@ -17506,6 +17680,9 @@ impl VibexWorkbench {
     ) {
         self.new_session_runtime_menu_view = view;
         self.new_session_runtime_menu_auth_source = auth_source;
+        self.runtime_provider_keyboard_selection = None;
+        self.runtime_provider_search_focus_pending =
+            matches!(view, ComposerRuntimeMenuView::AuthSource);
         cx.notify();
     }
 
@@ -25858,25 +26035,39 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn on_runtime_provider_model_key_down(
+    fn handle_runtime_provider_model_nav(
         &mut self,
-        event: &KeyDownEvent,
+        nav: RuntimeProviderNav,
+        context: &RuntimeProviderNavContext,
         window: &mut Window,
         cx: &mut Context<Self>,
-        agent_id: AgentId,
-        catalog: SessionRuntimeOptionCatalog,
-        selected: Option<SessionRuntimeSelection>,
-        preferred: Option<SessionRuntimeSelection>,
-        search: Entity<InputState>,
-        new_session: bool,
     ) {
+        let RuntimeProviderNavContext {
+            agent_id,
+            catalog,
+            selected,
+            preferred,
+            search,
+            new_session,
+        } = context;
+        let new_session = *new_session;
         if !search.read(cx).focus_handle(cx).is_focused(window) {
             return;
         }
+
+        if nav == RuntimeProviderNav::Dismiss {
+            if new_session {
+                self.set_new_session_runtime_menu_open(false, cx);
+            } else {
+                self.set_composer_runtime_menu_open(false, cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+
         let choices = runtime_provider_model_choices_for_query(
-            &catalog,
-            &agent_id,
+            catalog,
+            agent_id,
             search.read(cx).value().as_ref(),
             preferred.as_ref(),
             &self.ui_state.composer.runtime_selections_by_model,
@@ -25905,9 +26096,13 @@ impl VibexWorkbench {
                 })
             });
 
-        match event.keystroke.key.as_str() {
-            "up" | "down" => {
-                let delta = if event.keystroke.key == "up" { -1 } else { 1 };
+        match nav {
+            RuntimeProviderNav::Previous | RuntimeProviderNav::Next => {
+                let delta = if nav == RuntimeProviderNav::Previous {
+                    -1
+                } else {
+                    1
+                };
                 let index = current_index.map_or_else(
                     || {
                         if delta < 0 { choices.len() - 1 } else { 0 }
@@ -25916,16 +26111,15 @@ impl VibexWorkbench {
                 );
                 self.runtime_provider_keyboard_selection = Some(choices[index].selection.clone());
                 self.runtime_provider_scroll_to_selection = true;
-                search.update(cx, |input, cx| input.focus(window, cx));
                 cx.notify();
                 cx.stop_propagation();
             }
-            "enter" => {
+            RuntimeProviderNav::Apply => {
                 let selection = self
                     .runtime_provider_keyboard_selection
                     .clone()
                     .or_else(|| {
-                        selected.filter(|selection| {
+                        selected.clone().filter(|selection| {
                             choices
                                 .iter()
                                 .any(|choice| matches_selection(&choice.selection, selection))
@@ -25939,7 +26133,7 @@ impl VibexWorkbench {
                 }
                 cx.stop_propagation();
             }
-            _ => {}
+            RuntimeProviderNav::Dismiss => {}
         }
     }
 
@@ -26227,7 +26421,23 @@ impl VibexWorkbench {
                     .gap_1()
                     .mb_1()
                     .children(agent_back)
-                    .child(
+                    .child({
+                        // `Input` binds up/down/enter/escape as actions in its own key
+                        // context, and gpui dispatches bindings before key listeners, so
+                        // navigation has to be captured as those actions rather than as a
+                        // raw key-down listener. The listeners live on the search frame
+                        // itself: an extra wrapper element would sit between the flex row
+                        // and the `w_full` input and collapse the field's width.
+                        let nav_context = RuntimeProviderNavContext {
+                            agent_id: agent_id.clone(),
+                            catalog: catalog.clone(),
+                            selected: selected.cloned(),
+                            preferred: preferred.cloned(),
+                            search: search.clone(),
+                            new_session,
+                        };
+                        let focus_search = search.clone();
+                        let focus_workbench = workbench.clone();
                         div()
                             .h_full()
                             .min_w_0()
@@ -26238,44 +26448,81 @@ impl VibexWorkbench {
                             .border_1()
                             .border_color(cx.theme().border.opacity(0.70))
                             .bg(cx.theme().muted.opacity(0.45))
-                            .child({
-                                let key_agent_id = agent_id.clone();
-                                let key_catalog = catalog.clone();
-                                let key_selected = selected.cloned();
-                                let key_preferred = preferred.cloned();
-                                let key_search = search.clone();
-                                div()
-                                    .capture_key_down(cx.listener(
-                                        move |this, event: &KeyDownEvent, window, cx| {
-                                            this.on_runtime_provider_model_key_down(
-                                                event,
-                                                window,
-                                                cx,
-                                                key_agent_id.clone(),
-                                                key_catalog.clone(),
-                                                key_selected.clone(),
-                                                key_preferred.clone(),
-                                                key_search.clone(),
-                                                new_session,
-                                            )
-                                        },
-                                    ))
-                                    .child(
-                                        Input::new(&search)
-                                            .small()
-                                            .w_full()
-                                            .appearance(false)
-                                            .text_xs()
-                                            .prefix(
-                                                h_flex().h_full().items_center().child(
-                                                    Icon::new(IconName::Search)
-                                                        .small()
-                                                        .text_color(cx.theme().muted_foreground),
-                                                ),
-                                            ),
+                            .capture_action({
+                                let nav_context = nav_context.clone();
+                                cx.listener(move |this, _: &InputMoveUp, window, cx| {
+                                    this.handle_runtime_provider_model_nav(
+                                        RuntimeProviderNav::Previous,
+                                        &nav_context,
+                                        window,
+                                        cx,
                                     )
-                            }),
-                    ),
+                                })
+                            })
+                            .capture_action({
+                                let nav_context = nav_context.clone();
+                                cx.listener(move |this, _: &InputMoveDown, window, cx| {
+                                    this.handle_runtime_provider_model_nav(
+                                        RuntimeProviderNav::Next,
+                                        &nav_context,
+                                        window,
+                                        cx,
+                                    )
+                                })
+                            })
+                            .capture_action({
+                                let nav_context = nav_context.clone();
+                                cx.listener(move |this, _: &InputEnter, window, cx| {
+                                    this.handle_runtime_provider_model_nav(
+                                        RuntimeProviderNav::Apply,
+                                        &nav_context,
+                                        window,
+                                        cx,
+                                    )
+                                })
+                            })
+                            .capture_action(cx.listener(
+                                move |this, _: &InputEscape, window, cx| {
+                                    this.handle_runtime_provider_model_nav(
+                                        RuntimeProviderNav::Dismiss,
+                                        &nav_context,
+                                        window,
+                                        cx,
+                                    )
+                                },
+                            ))
+                            // The popover focuses its own panel when it opens, so the search
+                            // field has to claim focus once the provider/model layer is on
+                            // screen; without it neither typing nor arrow keys reach here.
+                            .on_prepaint(move |_, window, cx| {
+                                let claim_focus = focus_workbench
+                                    .update(cx, |this, _| {
+                                        std::mem::take(
+                                            &mut this.runtime_provider_search_focus_pending,
+                                        )
+                                    })
+                                    .unwrap_or(false);
+                                if claim_focus
+                                    && !focus_search.read(cx).focus_handle(cx).is_focused(window)
+                                {
+                                    focus_search.update(cx, |input, cx| input.focus(window, cx));
+                                }
+                            })
+                            .child(
+                                Input::new(&search)
+                                    .small()
+                                    .w_full()
+                                    .appearance(false)
+                                    .text_xs()
+                                    .prefix(
+                                        h_flex().h_full().items_center().child(
+                                            Icon::new(IconName::Search)
+                                                .small()
+                                                .text_color(cx.theme().muted_foreground),
+                                        ),
+                                    ),
+                            )
+                    }),
             )
             .child(
                 v_flex()
@@ -48510,9 +48757,9 @@ mod tests {
         AgentMessageDeltaPayload, AgentMessagePayload, FileOperationPayload, GitChange,
         GitChangeKind, GitWorktreeConflictFile, GitWorktreeMergeStrategy,
         GitWorktreeOperationDetail, GitWorktreeOperationKind, PlanPayload, PlanStepPayload,
-        ProviderProfileId, ProviderProfileStatus, RuntimeOptionAvailability, SessionConfigValue,
-        SessionRuntimeOption, TimelineItemId, TimelineRedactionState, TimelineSource,
-        TodoUpdatePayload, UserMessagePayload, WorkspaceId,
+        ProviderProfileId, ProviderProfileStatus, ReasoningPayload, RuntimeOptionAvailability,
+        SessionConfigValue, SessionRuntimeOption, TimelineItemId, TimelineRedactionState,
+        TimelineSource, TodoUpdatePayload, UserMessagePayload, WorkspaceId,
     };
 
     #[test]
@@ -48931,6 +49178,110 @@ mod tests {
         let updates = agent_streaming_delta_updates(&events).unwrap();
         assert_eq!(updates.len(), 1);
         assert!(!updates[0].conclusion);
+    }
+
+    #[test]
+    fn reasoning_delta_fast_path_matches_full_projection() {
+        for mode in [
+            ReasoningDisplayMode::Timeline,
+            ReasoningDisplayMode::LatestAtBottom,
+        ] {
+            let session_id = VibexSessionId::parse("session_reasoning_delta").unwrap();
+            let mut items = vec![
+                timeline_item_with_payload(
+                    &session_id,
+                    1,
+                    TimelineSource::User,
+                    TimelinePayload::UserMessage(UserMessagePayload {
+                        text: "question".into(),
+                        attachments: Vec::new(),
+                    }),
+                ),
+                timeline_item_with_payload(
+                    &session_id,
+                    2,
+                    TimelineSource::Agent,
+                    TimelinePayload::Reasoning(ReasoningPayload {
+                        text: "  first thought ".into(),
+                        is_final: false,
+                    }),
+                ),
+            ];
+            let mut timeline = TimelineModel::default();
+            timeline.replace_authoritative(session_id.clone(), items.clone());
+            let mut cache: Rc<Vec<Rc<TimelineConversationTurn>>> = Rc::new(
+                timeline_conversation_turns_with_reasoning_mode(
+                    &timeline.items,
+                    Some(AgentSessionState::Running),
+                    true,
+                    mode,
+                )
+                .into_iter()
+                .map(Rc::new)
+                .collect(),
+            );
+
+            let next = timeline_item_with_payload(
+                &session_id,
+                3,
+                TimelineSource::Agent,
+                TimelinePayload::Reasoning(ReasoningPayload {
+                    text: "and the next one".into(),
+                    is_final: false,
+                }),
+            );
+            let events = [TimelineLiveEvent {
+                session_id: session_id.clone(),
+                sequence: 3,
+                item: next.clone(),
+            }];
+            assert!(agent_streaming_delta_updates(&events).is_none());
+            let updates = agent_reasoning_delta_updates(&events)
+                .expect("a trailing thought chunk is an append-only reasoning delta");
+
+            let mut state_cache = None;
+            let update = append_agent_reasoning_deltas_to_cache(
+                &mut cache,
+                &mut state_cache,
+                mode,
+                Some(2),
+                &updates,
+            )
+            .expect("the streaming reasoning tail can be extended in place");
+
+            items.push(next);
+            let expected: Vec<Rc<TimelineConversationTurn>> =
+                timeline_conversation_turns_with_reasoning_mode(
+                    &items,
+                    Some(AgentSessionState::Running),
+                    true,
+                    mode,
+                )
+                .into_iter()
+                .map(Rc::new)
+                .collect();
+            assert_eq!(cache.as_ref(), &expected, "mode {mode:?}");
+
+            let turn = cache.last().expect("the appended turn stays cached");
+            assert_eq!(update.turn_id, turn.id);
+            assert_eq!(
+                streaming_timeline_row_body_len(turn, &state_cache.clone().unwrap()),
+                Some(update.body_len)
+            );
+            assert!(update.previous_body_len < update.body_len);
+
+            // A gap in the timeline tail must fall back to the full projection.
+            assert!(
+                append_agent_reasoning_deltas_to_cache(
+                    &mut cache,
+                    &mut state_cache,
+                    mode,
+                    Some(7),
+                    &updates,
+                )
+                .is_none()
+            );
+        }
     }
 
     #[test]
@@ -55870,6 +56221,26 @@ mod tests {
         assert!(grouped_models.contains("ComposerRuntimeMenuView::Authentication"));
         assert!(grouped_models.contains("load_runtime_authentication_menu("));
         assert!(grouped_models.contains("Input::new(&search)"));
+        assert!(
+            !grouped_models.contains("capture_key_down"),
+            "`Input` resolves up/down/enter as bindings before key listeners run, so the              provider/model list must navigate through captured actions"
+        );
+        assert!(grouped_models.contains("_: &InputMoveUp"));
+        assert!(grouped_models.contains("_: &InputMoveDown"));
+        assert!(grouped_models.contains("_: &InputEnter"));
+        assert!(grouped_models.contains("_: &InputEscape"));
+        assert!(grouped_models.contains("RuntimeProviderNav::Previous"));
+        assert!(grouped_models.contains("RuntimeProviderNav::Next"));
+        assert!(grouped_models.contains("RuntimeProviderNav::Apply"));
+        assert!(grouped_models.contains("RuntimeProviderNav::Dismiss"));
+        assert!(
+            grouped_models.contains("runtime_provider_search_focus_pending"),
+            "the popover focuses its own panel on open, so the search field has to claim              focus before typing or arrow keys can reach it"
+        );
+        assert!(
+            menu_opening.contains("self.runtime_provider_search_focus_pending = open;"),
+            "opening the current-session selector must hand focus to the search field"
+        );
         assert!(grouped_models.contains("runtime_model_choices("));
         assert!(grouped_models.contains("composer-runtime-provider-back-agent"));
         assert!(grouped_models.contains(".children(agent_back)"));
