@@ -14981,12 +14981,14 @@ impl VibexWorkbench {
             return;
         }
         let locale = self.resolved_locale();
+        let locale_mode = self.ui_state.appearance.locale;
         let workbench = cx.weak_entity();
         let dialog_view = cx.new(|cx| {
             ExternalImportDialog::new(
                 self.runtime.clone(),
                 workbench.clone(),
                 workspace.clone(),
+                locale_mode,
                 window,
                 cx,
             )
@@ -42362,6 +42364,7 @@ fn external_session_candidate_is_importable(status: ExternalSessionImportCandida
 pub struct ExternalImportDialog {
     runtime: Option<Arc<DesktopRuntime>>,
     workbench: WeakEntity<VibexWorkbench>,
+    locale_mode: LocaleMode,
     workspace: Option<(String, WorkspaceMode)>,
     paths_input: Entity<InputState>,
     preview: Option<vibex_core::ExternalSessionImportPreview>,
@@ -42377,13 +42380,13 @@ impl ExternalImportDialog {
         runtime: Option<Arc<DesktopRuntime>>,
         workbench: WeakEntity<VibexWorkbench>,
         workspace: Option<(String, WorkspaceMode)>,
+        locale_mode: LocaleMode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let locale_mode = workbench
-            .read_with(cx, |workbench, _| workbench.ui_state.appearance.locale)
-            .ok()
-            .unwrap_or_default();
+        // The workbench is still leased by the `update` that opens this dialog, so
+        // reading its entity here panics GPUI's entity map; take the locale as an
+        // argument the way `FoundationSettings::new` takes its UI state snapshot.
         let text = external_import_text(locale::resolve_locale(
             locale_mode,
             locale::system_locale().as_deref(),
@@ -42402,6 +42405,7 @@ impl ExternalImportDialog {
         Self {
             runtime,
             workbench,
+            locale_mode,
             workspace,
             paths_input,
             preview: None,
@@ -42414,11 +42418,11 @@ impl ExternalImportDialog {
     }
 
     fn resolved_locale(&self, cx: &App) -> locale::ResolvedLocale {
+        // Reached while rendering the dialog, where the workbench is no longer leased.
         let locale_mode = self
             .workbench
             .read_with(cx, |workbench, _| workbench.ui_state.appearance.locale)
-            .ok()
-            .unwrap_or_default();
+            .unwrap_or(self.locale_mode);
         locale::resolve_locale(locale_mode, locale::system_locale().as_deref())
     }
 
@@ -48377,6 +48381,28 @@ mod tests {
         assert!(import.contains("cx.defer(move |cx|"));
         assert!(import.contains("workbench.external_import_view = None;"));
         assert!(import.contains("window.close_dialog(cx);"));
+    }
+
+    #[test]
+    fn external_import_dialog_is_built_without_reading_the_open_workbench() {
+        // The sidebar menu opens the dialog from inside `VibexWorkbench::update`, so the
+        // workbench entity is leased: reading it back while building the dialog panicked
+        // GPUI with "cannot read VibexWorkbench while it is already being updated".
+        let source = include_str!("app.rs");
+        let constructor = source
+            .split_once("impl ExternalImportDialog {")
+            .and_then(|(_, tail)| tail.split_once("\n    fn resolved_locale("))
+            .map(|(body, _)| body)
+            .expect("external import dialog constructor should remain inspectable");
+        assert!(constructor.contains("locale_mode: LocaleMode,"));
+        assert!(!constructor.contains("read_with("));
+
+        let opener = source
+            .split_once("    fn open_external_import_dialog(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn reset_new_session_project_menu("))
+            .map(|(body, _)| body)
+            .expect("external import dialog opener should remain inspectable");
+        assert!(opener.contains("let locale_mode = self.ui_state.appearance.locale;"));
     }
 
     #[test]
