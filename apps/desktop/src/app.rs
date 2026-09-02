@@ -2146,6 +2146,7 @@ struct AgentSessionViewCacheEntry {
     timeline_scroll: VirtualListScrollHandle,
     timeline_row_sizes: Rc<Vec<Size<gpui::Pixels>>>,
     timeline_measured_turn_heights: BTreeMap<String, f32>,
+    timeline_measured_turn_layout_signatures: BTreeMap<String, u64>,
     timeline_estimated_turn_heights: BTreeMap<String, (u64, f32)>,
     conversation_turns_cache: Rc<Vec<Rc<TimelineConversationTurn>>>,
     conversation_turns_cache_key: Option<ConversationTurnsCacheKey>,
@@ -2174,6 +2175,12 @@ impl AgentSessionViewCacheEntry {
             )
             .saturating_add(
                 self.timeline_measured_turn_heights
+                    .keys()
+                    .map(String::len)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.timeline_measured_turn_layout_signatures
                     .keys()
                     .map(String::len)
                     .sum::<usize>(),
@@ -3207,6 +3214,19 @@ fn stable_streaming_timeline_height(
     } else {
         measured_height
     }
+}
+
+fn stable_streaming_timeline_height_for_layout(
+    previous_height: Option<f32>,
+    measured_height: f32,
+    preserve_streaming_extent: bool,
+    previous_layout_signature: Option<u64>,
+    current_layout_signature: Option<u64>,
+) -> f32 {
+    let preserve_streaming_extent = preserve_streaming_extent
+        && current_layout_signature.is_some()
+        && previous_layout_signature == current_layout_signature;
+    stable_streaming_timeline_height(previous_height, measured_height, preserve_streaming_extent)
 }
 
 fn timeline_layout_width_changed(previous: Option<f32>, current: Option<f32>) -> bool {
@@ -4350,6 +4370,7 @@ pub struct VibexWorkbench {
     timeline_scrollbar_interaction_active: bool,
     timeline_row_sizes: Rc<Vec<Size<gpui::Pixels>>>,
     timeline_measured_turn_heights: BTreeMap<String, f32>,
+    timeline_measured_turn_layout_signatures: BTreeMap<String, u64>,
     timeline_pending_turn_heights: BTreeMap<usize, (String, f32)>,
     timeline_estimated_turn_heights: BTreeMap<String, (u64, f32)>,
     timeline_layout_width: Option<f32>,
@@ -5091,6 +5112,7 @@ impl VibexWorkbench {
             timeline_scrollbar_interaction_active: false,
             timeline_row_sizes: Rc::new(Vec::new()),
             timeline_measured_turn_heights: BTreeMap::new(),
+            timeline_measured_turn_layout_signatures: BTreeMap::new(),
             timeline_pending_turn_heights: BTreeMap::new(),
             timeline_estimated_turn_heights: BTreeMap::new(),
             timeline_layout_width: None,
@@ -9201,6 +9223,9 @@ impl VibexWorkbench {
             timeline_measured_turn_heights: std::mem::take(
                 &mut self.timeline_measured_turn_heights,
             ),
+            timeline_measured_turn_layout_signatures: std::mem::take(
+                &mut self.timeline_measured_turn_layout_signatures,
+            ),
             timeline_estimated_turn_heights: std::mem::take(
                 &mut self.timeline_estimated_turn_heights,
             ),
@@ -9303,6 +9328,8 @@ impl VibexWorkbench {
         self.timeline_scroll = entry.timeline_scroll;
         self.timeline_row_sizes = entry.timeline_row_sizes;
         self.timeline_measured_turn_heights = entry.timeline_measured_turn_heights;
+        self.timeline_measured_turn_layout_signatures =
+            entry.timeline_measured_turn_layout_signatures;
         self.timeline_estimated_turn_heights = entry.timeline_estimated_turn_heights;
         self.timeline_markdown_sources.clear();
         self.timeline_tool_card_projections.clear();
@@ -9318,14 +9345,13 @@ impl VibexWorkbench {
         self.timeline_process_expansion = entry.timeline_process_expansion;
         self.timeline_command_expansion = entry.timeline_command_expansion;
         self.timeline_file_changes_expansion = entry.timeline_file_changes_expansion;
-        if layout_width_changed {
+        let content_width_changed = entry.content_width != self.ui_state.session.content_width;
+        let turns_cache_changed = self.conversation_turns_cache_key.as_ref()
+            != Some(&self.current_conversation_turns_cache_key());
+        if layout_width_changed || content_width_changed || turns_cache_changed {
             self.invalidate_timeline_layout_measurements();
         }
-        if layout_width_changed
-            || entry.content_width != self.ui_state.session.content_width
-            || self.conversation_turns_cache_key.as_ref()
-                != Some(&self.current_conversation_turns_cache_key())
-        {
+        if layout_width_changed || content_width_changed || turns_cache_changed {
             self.rebuild_timeline_sizes();
         }
         true
@@ -9598,9 +9624,7 @@ impl VibexWorkbench {
                         .child(format_compact_tokens(tokens)),
                 )
             })
-            .when_some(cache_rate, |this, rate| {
-                this.child(format!("{rate}%"))
-            })
+            .when_some(cache_rate, |this, rate| this.child(format!("{rate}%")))
     }
 
     fn agent_token_usage_metrics(&self) -> (Option<u64>, Option<u64>, Option<u32>) {
@@ -10045,7 +10069,7 @@ impl VibexWorkbench {
             return;
         }
         if navigation_changed && let Some(edit) = self.inline_user_message_edit.take() {
-            self.timeline_measured_turn_heights.remove(&edit.turn_id);
+            self.invalidate_timeline_turn_measurement(&edit.turn_id);
             self.rebuild_timeline_sizes();
         }
         if navigation_changed {
@@ -11060,6 +11084,8 @@ impl VibexWorkbench {
             .collect::<BTreeSet<_>>();
         self.timeline_measured_turn_heights
             .retain(|turn_id, _| active_turn_ids.contains(turn_id.as_str()));
+        self.timeline_measured_turn_layout_signatures
+            .retain(|turn_id, _| active_turn_ids.contains(turn_id.as_str()));
         self.timeline_estimated_turn_heights
             .retain(|turn_id, _| active_turn_ids.contains(turn_id.as_str()));
         let content_width = session_content_max_width(self.ui_state.session.content_width)
@@ -11083,6 +11109,7 @@ impl VibexWorkbench {
 
     fn invalidate_timeline_layout_measurements(&mut self) {
         self.timeline_measured_turn_heights.clear();
+        self.timeline_measured_turn_layout_signatures.clear();
         self.timeline_pending_turn_heights.clear();
         self.timeline_estimated_turn_heights.clear();
         self.timeline_row_sizes = Rc::new(Vec::new());
@@ -11161,7 +11188,7 @@ impl VibexWorkbench {
                 .insert(turn.id.clone(), (signature, current_height));
             return false;
         }
-        self.timeline_measured_turn_heights.remove(&turn.id);
+        self.invalidate_timeline_turn_measurement(&turn.id);
         let process_expansion = self.timeline_process_expansion.get(&turn.id).copied();
         let signature = self.timeline_turn_estimate_signature(&turn, process_expansion);
         let height = self.estimated_timeline_turn_height_projected(&turn, process_expansion);
@@ -11263,6 +11290,7 @@ impl VibexWorkbench {
     fn invalidate_timeline_render_caches(&mut self) {
         self.timeline_item_index.get_mut().invalidate();
         self.timeline_measured_turn_heights.clear();
+        self.timeline_measured_turn_layout_signatures.clear();
         self.timeline_pending_turn_heights.clear();
         self.timeline_estimated_turn_heights.clear();
         self.timeline_markdown_sources.clear();
@@ -11278,6 +11306,8 @@ impl VibexWorkbench {
 
     fn invalidate_timeline_turn_measurement(&mut self, turn_id: &str) {
         self.timeline_measured_turn_heights.remove(turn_id);
+        self.timeline_measured_turn_layout_signatures
+            .remove(turn_id);
         self.timeline_pending_turn_heights
             .retain(|_, (pending_turn_id, _)| pending_turn_id != turn_id);
     }
@@ -11296,6 +11326,135 @@ impl VibexWorkbench {
         self.timeline_estimated_turn_heights
             .insert(turn.id.clone(), (signature, height));
         height
+    }
+
+    /// Fingerprint the rendered shape of a turn without including body lengths.
+    /// Streaming text can grow every frame, while row projection changes must
+    /// invalidate a stale measured virtual-list extent so it can shrink.
+    fn timeline_turn_layout_signature(
+        &self,
+        turn: &TimelineConversationTurn,
+        process_expansion: Option<bool>,
+    ) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let process_expanded = timeline_turn_process_expanded(turn, process_expansion);
+        let conclusion_visible = timeline_turn_conclusion_row(turn).is_some();
+        let file_changes_present = self
+            .timeline_turn_file_changes
+            .get(&turn.id)
+            .is_some_and(|(_, summary)| !summary.files.is_empty());
+
+        turn.complete.hash(&mut hasher);
+        turn.failed.hash(&mut hasher);
+        turn.pending_permission.hash(&mut hasher);
+        process_expanded.hash(&mut hasher);
+        turn.user_row.is_some().hash(&mut hasher);
+        turn.live_status
+            .as_ref()
+            .map(|body| body.is_empty())
+            .hash(&mut hasher);
+        turn.conclusion_row.is_some().hash(&mut hasher);
+        conclusion_visible.hash(&mut hasher);
+        turn.runtime_attribution.is_some().hash(&mut hasher);
+        file_changes_present.hash(&mut hasher);
+        (file_changes_present
+            && self
+                .timeline_file_changes_expansion
+                .get(&turn.id)
+                .copied()
+                .unwrap_or(false))
+        .hash(&mut hasher);
+        self.ui_state
+            .session
+            .reasoning_display_mode
+            .hash(&mut hasher);
+        self.ui_state
+            .session
+            .reasoning_expanded_by_default
+            .hash(&mut hasher);
+        self.reasoning_expansion
+            .get(&format!("reasoning-live:{}", turn.id))
+            .copied()
+            .hash(&mut hasher);
+        self.ui_state
+            .session
+            .enhanced_command_execution_display
+            .hash(&mut hasher);
+        self.ui_state
+            .session
+            .enhanced_file_operation_display
+            .hash(&mut hasher);
+
+        turn.process_rows.len().hash(&mut hasher);
+        {
+            let mut hash_row_shape = |row: &TimelineRow| {
+                row.id.hash(&mut hasher);
+                std::mem::discriminant(&row.kind).hash(&mut hasher);
+                row.turn_id.is_some().hash(&mut hasher);
+                row.conclusion.hash(&mut hasher);
+                row.streaming.hash(&mut hasher);
+                row.collapsible.hash(&mut hasher);
+                row.pending_permission.hash(&mut hasher);
+                row.failed.hash(&mut hasher);
+                row.turn_failed.hash(&mut hasher);
+                row.turn_pending_permission.hash(&mut hasher);
+                row.file_path.is_some().hash(&mut hasher);
+                row.runtime_attribution.is_some().hash(&mut hasher);
+                row.body.is_empty().hash(&mut hasher);
+                row.body.contains("](").hash(&mut hasher);
+                row.title.is_empty().hash(&mut hasher);
+                row.title.len().hash(&mut hasher);
+                row.title.contains('\n').hash(&mut hasher);
+                self.reasoning_expansion
+                    .get(&row.id)
+                    .copied()
+                    .hash(&mut hasher);
+                self.timeline_command_expansion
+                    .get(&row.id)
+                    .copied()
+                    .hash(&mut hasher);
+                self.inline_user_message_edit
+                    .as_ref()
+                    .is_some_and(|edit| edit.matches(&row.id, self.selected_session_id.as_ref()))
+                    .hash(&mut hasher);
+            };
+
+            if let Some(row) = turn.user_row.as_ref() {
+                hash_row_shape(row);
+            }
+            for row in &turn.process_rows {
+                hash_row_shape(row);
+            }
+            if let Some(row) = turn.conclusion_row.as_ref() {
+                hash_row_shape(row);
+            }
+        }
+
+        for pair in turn.process_rows.windows(2) {
+            self.command_permission_rows_are_linked(&pair[0], &pair[1])
+                .hash(&mut hasher);
+        }
+
+        {
+            let mut hash_groups = |groups: &[TimelineProcessActivityGroup]| {
+                groups.len().hash(&mut hasher);
+                for group in groups {
+                    group.id.hash(&mut hasher);
+                    group.start_row.hash(&mut hasher);
+                    group.end_row.hash(&mut hasher);
+                    self.timeline_command_expansion
+                        .get(&group.id)
+                        .copied()
+                        .hash(&mut hasher);
+                }
+            };
+            hash_groups(&turn.process_activity_groups);
+            hash_groups(&turn.process_activity_groups_with_commands);
+            hash_groups(&turn.process_activity_groups_with_file_operations);
+            hash_groups(&turn.process_activity_groups_with_commands_and_file_operations);
+        }
+
+        hasher.finish()
     }
 
     /// Cheap fingerprint of every input the height estimate reads, computed in
@@ -11411,20 +11570,38 @@ impl VibexWorkbench {
         }
         let measured_height = measured_height.ceil().max(72.0);
         let previous_height = self.timeline_measured_turn_heights.get(&turn_id).copied();
+        let process_expansion = self.timeline_process_expansion.get(&turn_id).copied();
+        let layout_signature = self
+            .conversation_turns_cache
+            .get(turn_index)
+            .filter(|turn| turn.id == turn_id)
+            .map(|turn| self.timeline_turn_layout_signature(turn, process_expansion));
+        let previous_layout_signature = self
+            .timeline_measured_turn_layout_signatures
+            .get(&turn_id)
+            .copied();
         let preserve_streaming_extent = self.streaming_row_state.as_ref().is_some_and(|state| {
             state.turn_id == turn_id
                 && self
                     .conversation_turns_cache
                     .get(turn_index)
-                    .filter(|turn| turn.id == turn_id)
                     .and_then(|turn| streaming_timeline_row_body_len(turn, state))
                     .is_some_and(|body_len| body_len == state.body_len)
         });
-        let measured_height = stable_streaming_timeline_height(
+        let measured_height = stable_streaming_timeline_height_for_layout(
             previous_height,
             measured_height,
             preserve_streaming_extent,
+            previous_layout_signature,
+            layout_signature,
         );
+        if let Some(layout_signature) = layout_signature {
+            self.timeline_measured_turn_layout_signatures
+                .insert(turn_id.clone(), layout_signature);
+        } else {
+            self.timeline_measured_turn_layout_signatures
+                .remove(&turn_id);
+        }
         if previous_height.is_some_and(|current| (current - measured_height).abs() < 1.0) {
             return;
         }
@@ -16165,8 +16342,7 @@ impl VibexWorkbench {
             attachments,
             geometry: ComposerGeometry::default(),
         });
-        self.timeline_measured_turn_heights
-            .remove(&measured_turn_id);
+        self.invalidate_timeline_turn_measurement(&measured_turn_id);
         self.rebuild_timeline_sizes();
         let selection_end = initial.len();
         self.user_message_edit_input.update(cx, move |input, cx| {
@@ -16181,7 +16357,7 @@ impl VibexWorkbench {
         let Some(edit) = self.inline_user_message_edit.take() else {
             return;
         };
-        self.timeline_measured_turn_heights.remove(&edit.turn_id);
+        self.invalidate_timeline_turn_measurement(&edit.turn_id);
         self.rebuild_timeline_sizes();
         cx.notify();
     }
@@ -16248,7 +16424,7 @@ impl VibexWorkbench {
         self.set_session_turn_pending(&source_session_id, true);
         self.agent_error = None;
         if let Some(turn_id) = editing_turn_id {
-            self.timeline_measured_turn_heights.remove(&turn_id);
+            self.invalidate_timeline_turn_measurement(&turn_id);
         }
         self.rebuild_timeline_sizes();
         self.request_timeline_scroll_to_latest();
@@ -19350,7 +19526,7 @@ impl VibexWorkbench {
         for target in &matches {
             self.timeline_process_expansion
                 .insert(target.turn_id.clone(), true);
-            self.timeline_measured_turn_heights.remove(&target.turn_id);
+            self.invalidate_timeline_turn_measurement(&target.turn_id);
         }
         self.rebuild_timeline_sizes();
         let target = &matches[self.conversation_find_active_index];
@@ -19653,7 +19829,7 @@ impl VibexWorkbench {
         self.session_search_highlight_item_id = target.item_id;
         self.timeline_process_expansion
             .insert(turn_id.clone(), true);
-        self.timeline_measured_turn_heights.remove(&turn_id);
+        self.invalidate_timeline_turn_measurement(&turn_id);
         self.timeline_scroll_wheel_idle_task = None;
         self.timeline_follow.set_following_bottom(false);
         self.timeline_scroll_to_latest_pending = false;
@@ -21105,6 +21281,7 @@ impl VibexWorkbench {
         );
         theme::apply_appearance(&self.ui_state.appearance, Some(window), cx);
         self.timeline_measured_turn_heights.clear();
+        self.timeline_measured_turn_layout_signatures.clear();
         self.timeline_pending_turn_heights.clear();
         self.timeline_estimated_turn_heights.clear();
         self.rebuild_timeline_sizes();
@@ -21181,6 +21358,7 @@ impl VibexWorkbench {
         );
         apply_code_font_weight(self.ui_state.appearance.code_font.weight, cx);
         self.timeline_measured_turn_heights.clear();
+        self.timeline_measured_turn_layout_signatures.clear();
         self.timeline_pending_turn_heights.clear();
         self.timeline_estimated_turn_heights.clear();
         self.rebuild_timeline_sizes();
@@ -21203,6 +21381,7 @@ impl VibexWorkbench {
         );
         apply_code_font_weight(self.ui_state.appearance.code_font.weight, cx);
         self.timeline_measured_turn_heights.clear();
+        self.timeline_measured_turn_layout_signatures.clear();
         self.timeline_pending_turn_heights.clear();
         self.timeline_estimated_turn_heights.clear();
         self.rebuild_timeline_sizes();
@@ -51364,6 +51543,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("session view cache should remain inspectable");
         assert!(cache_entry.contains("timeline_row_sizes: Rc<Vec<Size<gpui::Pixels>>>"));
+        assert!(cache_entry.contains("timeline_measured_turn_layout_signatures"));
         assert!(cache_entry.contains("timeline_layout_width: Option<f32>"));
         assert!(
             cache_entry.contains("conversation_turns_cache: Rc<Vec<Rc<TimelineConversationTurn>>>")
@@ -51376,6 +51556,7 @@ mod tests {
             .expect("session view stashing should remain inspectable");
         assert!(stash.contains("timeline: std::mem::take(&mut self.timeline)"));
         assert!(stash.contains("&mut self.timeline_row_sizes"));
+        assert!(stash.contains("&mut self.timeline_measured_turn_layout_signatures"));
         assert!(stash.contains("timeline_layout_width: self.timeline_layout_width"));
         assert!(stash.contains("&mut self.conversation_turns_cache"));
         assert!(stash.contains("self.timeline_markdown_sources.clear();"));
@@ -51390,6 +51571,7 @@ mod tests {
         assert!(restore.contains("self.agent_session_view_cache.remove(&key)"));
         assert!(!restore.contains(".cloned()"));
         assert!(restore.contains("self.timeline_row_sizes = entry.timeline_row_sizes;"));
+        assert!(restore.contains("self.timeline_measured_turn_layout_signatures ="));
         assert!(restore.contains("cached_timeline_layout_width"));
         assert!(restore.contains("self.invalidate_timeline_layout_measurements();"));
         assert!(
@@ -53287,6 +53469,22 @@ mod tests {
     }
 
     #[test]
+    fn streaming_measurements_shrink_when_the_rendered_layout_changes() {
+        assert_eq!(
+            stable_streaming_timeline_height_for_layout(Some(220.0), 180.0, true, Some(7), Some(7),),
+            220.0
+        );
+        assert_eq!(
+            stable_streaming_timeline_height_for_layout(Some(220.0), 180.0, true, Some(7), Some(8),),
+            180.0
+        );
+        assert_eq!(
+            stable_streaming_timeline_height_for_layout(Some(220.0), 180.0, true, None, Some(7),),
+            180.0
+        );
+    }
+
+    #[test]
     fn timeline_layout_width_cache_invalidates_only_for_real_changes() {
         assert!(timeline_layout_width_changed(None, Some(800.0)));
         assert!(!timeline_layout_width_changed(Some(800.0), Some(800.9)));
@@ -53658,7 +53856,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("last-turn height refresh should remain inspectable");
         assert!(refresh.contains("let turns = self.conversation_turns_cached();"));
-        assert!(refresh.contains("self.timeline_measured_turn_heights.remove(&turn.id);"));
+        assert!(refresh.contains("self.invalidate_timeline_turn_measurement(&turn.id);"));
 
         for (renderer, next_renderer) in [
             (
@@ -57114,6 +57312,7 @@ mod tests {
         assert!(command_display.contains("self.invalidate_timeline_layout_measurements();"));
         assert!(file_operation_display.contains("self.invalidate_timeline_layout_measurements();"));
         assert!(invalidation.contains("self.timeline_measured_turn_heights.clear();"));
+        assert!(invalidation.contains("self.timeline_measured_turn_layout_signatures.clear();"));
         assert!(invalidation.contains("self.timeline_pending_turn_heights.clear();"));
         assert!(invalidation.contains("self.timeline_estimated_turn_heights.clear();"));
     }
@@ -57131,6 +57330,16 @@ mod tests {
         assert!(signature.contains("enhanced_file_operation_display"));
         assert!(signature.contains("process_activity_groups_with_commands"));
         assert!(signature.contains("process_activity_groups_with_file_operations"));
+
+        let layout_signature = source
+            .split_once("    fn timeline_turn_layout_signature(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Cheap fingerprint of every input"))
+            .map(|(body, _)| body)
+            .expect("timeline layout signature should remain inspectable");
+        assert!(layout_signature.contains("process_expanded"));
+        assert!(layout_signature.contains("row.body.is_empty()"));
+        assert!(layout_signature.contains("row.body.contains(\"](\")"));
+        assert!(!layout_signature.contains("row.body.len()"));
     }
 
     #[test]
@@ -57383,7 +57592,7 @@ mod tests {
         assert!(!begin.contains("open_dialog"));
         assert!(begin.contains("input.set_value(initial"));
         assert!(begin.contains("input.focus(window, cx)"));
-        assert!(begin.contains("remove(&measured_turn_id)"));
+        assert!(begin.contains("invalidate_timeline_turn_measurement(&measured_turn_id)"));
         assert!(begin.contains("self.session_turn_pending(&source_session_id)"));
 
         let replacement = source
