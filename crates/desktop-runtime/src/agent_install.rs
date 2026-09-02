@@ -35,7 +35,7 @@ use vibex_db::{
 };
 
 const ZCODE_ACP_PACKAGE: &str = "zcode-acp-server";
-const ZCODE_ACP_VERSION: &str = "0.11.9";
+const ZCODE_ACP_VERSION: &str = "0.17.2";
 const ZCODE_MINIMUM_NODE_VERSION: semver::Version = semver::Version::new(22, 0, 0);
 
 const ACP_REGISTRY_URL: &str =

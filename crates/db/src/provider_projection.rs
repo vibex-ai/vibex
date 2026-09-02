@@ -1225,7 +1225,7 @@ fn legacy_runtime_identity(
             ("zcode", None) if looks_managed_adapter_command(command, args, "zcode-acp-server") => {
                 (
                     "zcode-acp-server",
-                    Some("0.11.9".to_string()),
+                    Some("0.17.2".to_string()),
                     None,
                     BTreeMap::new(),
                     AgentVersionSource::Managed,

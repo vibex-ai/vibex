@@ -41,9 +41,9 @@ pub const CODEX_RUNTIME_INTEGRITY: &str = "sha512-yG3sPWNda/2YAIQIDq9MrrjoCTIQ7r
 pub const ZCODE_AGENT_ID: &str = "zcode";
 pub const ZCODE_ADAPTER_ID: &str = "zcode-acp-server";
 pub const ZCODE_ADAPTER_PACKAGE: &str = "zcode-acp-server";
-pub const ZCODE_ADAPTER_VERSION: &str = "0.11.9";
-pub const ZCODE_ADAPTER_INTEGRITY: &str = "sha512-UluUECcibzyGTH3aoz4b2TwWgxD1PQ/xNTJHCl6WTmcL6wM0+sUOF61uwzMSKQr/XTq6EuQQ3nrOeqqmCVZFOA==";
-pub const ZCODE_CONFIG_ALIAS_VERSION_REQUIREMENT: &str = "=0.11.9";
+pub const ZCODE_ADAPTER_VERSION: &str = "0.17.2";
+pub const ZCODE_ADAPTER_INTEGRITY: &str = "sha512-mIB1G6vIA+d+htr/szXt4RVx0yYPGs/Ri5UhiCMjTYk98qhVHdAqURul1iyCP4t2XcqiMpgWgel4xSEzUU4x3g==";
+pub const ZCODE_CONFIG_ALIAS_VERSION_REQUIREMENT: &str = "=0.17.2";
 pub const NPM_REGISTRY_ORIGIN: &str = "https://registry.npmjs.org";
 
 /// Three-state support value used before runtime negotiation is complete.
@@ -1120,7 +1120,7 @@ fn zcode_descriptor() -> VibexResult<AcpAgentCompatibility> {
             integrity: ZCODE_ADAPTER_INTEGRITY.to_string(),
             bin_name: ZCODE_ADAPTER_ID.to_string(),
             initialize_agent_name: ZCODE_ADAPTER_PACKAGE.to_string(),
-            node_requirement: parse_requirement(">=22", ZCODE_ADAPTER_ID)?,
+            node_requirement: parse_requirement(">=22.0.0", ZCODE_ADAPTER_ID)?,
             node_requirement_package: ZCODE_ADAPTER_PACKAGE.to_string(),
             runtime_dependencies: Vec::new(),
         },
@@ -1135,7 +1135,7 @@ fn zcode_descriptor() -> VibexResult<AcpAgentCompatibility> {
         // DesktopRuntime remains the sole remote/session authority.
         required_launch_env: vec![("ZCODE_ACP_REMOTE".to_string(), "0".to_string())],
         mcp_forwarding: CompatibilitySupport::supported(
-            "real bridge contract schema v2: zcode-acp-server@0.11.9 forwards stdio MCP descriptors",
+            "real bridge contract schema v2: zcode-acp-server@0.17.2 forwards stdio MCP descriptors",
         ),
         safe_multi_session: CompatibilitySupport::unsupported(
             "Vibex launches one managed bridge per logical session",

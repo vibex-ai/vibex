@@ -3,9 +3,9 @@
   "status": "passed",
   "claimScope": "manifest_and_contract",
   "realRuntimeVerification": "blocked",
-  "capturedAt": "2026-08-27T01:18:09.685Z",
+  "capturedAt": "2026-09-02T03:28:41.485Z",
   "source": {
-    "captureParentCommit": "6c94fd340eae6a664b7f19a899780b33cb3c0a62",
+    "captureParentCommit": "16b04034119b50b3bdd294b2dfe24a28dfd28648",
     "rustToolchain": "rustc-1.97.0",
     "sourceInputRoots": [
       "crates/core/src/acp_catalog.rs",
@@ -53,27 +53,27 @@
       "crates/vibex-ui/Cargo.toml",
       "apps/desktop/Cargo.toml"
     ],
-    "sourceInputTreeSha256": "4ab7ba8fa91176f1952358dd72a03c08678635a0c50c50fb57399e7ec695e9dc",
+    "sourceInputTreeSha256": "e49ac5d0aeeeba22e7f111e3d604a70084651eef94a660e0ab0a6ae15ddf3bc3",
     "bindings": {
       "catalog": "38e8d897562ce0c12e6ec47f6e3a55c5db1f01d99b704f5d912b0b2ee0aa4929",
-      "manifest": "a4a1ec0a20a3743c4a31939481d8f1a4f9108ffd053e947471db29216592286a",
-      "probe": "f139fad5dd54217f08b122d4386cf4432600bda3cb4dcfd54ca7532e465cf1b1",
-      "database": "1abe4a8df63fc3f909a2297737a0c3408a80cad742a8aff7c3e0accf942b14bb",
-      "remote": "b24996d2f1466dbbb89698f524d5631fc3345d3673d6ce63d9f06219025df088",
-      "ui": "78effccaaae03b8eb4a2ddcd1b24f1fef0e95dd707c66269782c7f3c10999ab6",
-      "switch": "20a2cf091c012b2ac8165cde9f361f62a0edbacd66d66620ecdbb9196fbd2a87",
-      "scripts": "40773b90ee542074b704b785e29438f046dbc3c1e3c78464a55b84e3cbc224d0",
-      "packageMetadata": "a4e23c06de51d6786c90bfad1d68cd8ea88a2cc00e7113c2fadf4f77448d73d7"
+      "manifest": "55981ca2596daf6fe24cf1c093c970cb8b0fd75d4409fb3b67ef98716a3dfa63",
+      "probe": "0b18e6ad4f0d9f6e11d047f8065c7f76a7d4ff54e0cb7b7818d2670355b1edcd",
+      "database": "ed24382868ab073a845ce444bd012b519a37b5b509001e54ff339b045cb5e9f5",
+      "remote": "1f0b1dc6bf7a30f06976e3116da319f0b03c40ce2967c5bc35852a248bac6609",
+      "ui": "c17e4f15b69763dd1835ff534385e4266349758d6884980d180bffb6691e2d42",
+      "switch": "5ec956df0c89277fbe92f7e8a82fc57b5f006afede1d03e410a01cfa87e00d2a",
+      "scripts": "9d74e8ab705a6c006b0c05a05e3d289278f2f1015499ea391a0ce7a754691b89",
+      "packageMetadata": "f93567457048eb3ac88bfa0cbd690c1944e35fc6e02cca769d1f489ab8c1306b"
     },
-    "cargoLockSha256": "1ffad260f0c4d15d53165b2672c9149103ab92cb3dc7796f69216170af364333",
+    "cargoLockSha256": "015db515abd9980a46f477516658055a276a41922c4e208dcd98789d413ab34e",
     "packageJsonSha256": "3bf13132c815037285846cd90920224559d666d9c18e15db3c1d694e7a783dfa",
-    "rolloutManifestSha256": "6ad5ed89b85b59736eaf8c1f1a5b79ee21330d8b440acdc244f888bd22d6141c"
+    "rolloutManifestSha256": "64ae0d145b571c25f5e141e5c130c7e406e7f2fc515246f355264296a15fed61"
   },
   "manifest": {
     "schemaVersion": "agent-provider-runtime-manifest.v1",
-    "totalAgents": 36,
+    "totalAgents": 37,
     "builtinCount": 3,
-    "catalogCount": 33,
+    "catalogCount": 34,
     "entries": [
       {
         "agentId": "claude",
@@ -137,6 +137,44 @@
         "evidenceState": "documented",
         "sourceEvidenceReference": "provider-config/opencode-inline-provider-v1",
         "smokeId": "builtin-provider-opencode",
+        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
+      },
+      {
+        "agentId": "zcode",
+        "catalogVersion": "0.17.2",
+        "adapterId": "zcode-acp-server",
+        "descriptorId": "projection_zcode_private_config_v1",
+        "descriptorVersion": "1",
+        "versionPolicy": {
+          "kind": "exact"
+        },
+        "capabilityMode": "replaceable_provider",
+        "runtimeHomeStrategy": "vibex_private",
+        "switchBehavior": "restart_and_resume",
+        "credentialKinds": [
+          "api_key"
+        ],
+        "modelInterfaces": [
+          {
+            "wireProtocolId": "openai_chat_completions",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "integrationKind": "direct",
+            "userSelectable": true,
+            "processScoped": true
+          },
+          {
+            "wireProtocolId": "anthropic_messages",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "integrationKind": "direct",
+            "userSelectable": true,
+            "processScoped": true
+          }
+        ],
+        "evidenceState": "documented",
+        "sourceEvidenceReference": "provider-config/zcode-environment-v1",
+        "smokeId": "builtin-provider-zcode",
         "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
@@ -405,17 +443,45 @@
         "descriptorId": "projection_deepseek_harness_runtime_v1",
         "descriptorVersion": "1",
         "versionPolicy": {
-          "kind": "exact"
+          "kind": "detected_semver",
+          "requirement": ">=0.4.15"
         },
         "capabilityMode": "replaceable_provider",
-        "runtimeHomeStrategy": "none",
-        "switchBehavior": "unverified",
-        "credentialKinds": [],
-        "modelInterfaces": [],
-        "evidenceState": "unverified",
+        "runtimeHomeStrategy": "vibex_private",
+        "switchBehavior": "restart_and_resume",
+        "credentialKinds": [
+          "api_key"
+        ],
+        "modelInterfaces": [
+          {
+            "wireProtocolId": "openai_chat_completions",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "integrationKind": "direct",
+            "userSelectable": true,
+            "processScoped": true
+          },
+          {
+            "wireProtocolId": "openai_responses",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "integrationKind": "direct",
+            "userSelectable": true,
+            "processScoped": true
+          },
+          {
+            "wireProtocolId": "anthropic_messages",
+            "sdkAdapterId": null,
+            "transport": "https",
+            "integrationKind": "direct",
+            "userSelectable": true,
+            "processScoped": true
+          }
+        ],
+        "evidenceState": "documented",
         "sourceEvidenceReference": "research/acp-agent/deepseek-harness@0.4.15",
         "smokeId": "agent-provider-deepseek-harness",
-        "capabilityDiagnosticCode": "agent_projection_auth_boundary_not_runtime_verified"
+        "capabilityDiagnosticCode": "agent_projection_runtime_verification_required"
       },
       {
         "agentId": "devin",
@@ -1238,6 +1304,41 @@
       "recordedAt": null
     },
     {
+      "agentId": "zcode",
+      "smokeId": "builtin-provider-zcode",
+      "catalogVersion": "0.17.2",
+      "descriptorId": "projection_zcode_private_config_v1",
+      "descriptorVersion": "1",
+      "versionPolicy": "exact",
+      "capabilityMode": "replaceable_provider",
+      "switchBehavior": "restart_and_resume",
+      "status": "blocked",
+      "execution": "not_run",
+      "diagnosticCode": "operator_prerequisites_unavailable",
+      "detectedIdentity": null,
+      "descriptorMatch": "not_checked",
+      "projectionFingerprint": null,
+      "facts": {
+        "binaryIdentity": "blocked",
+        "acpHandshake": "blocked",
+        "authentication": "blocked",
+        "session": "blocked",
+        "modelCatalog": "blocked",
+        "modelSelection": "blocked",
+        "providerProjection": "blocked",
+        "sessionResume": "blocked",
+        "switchCompatibility": "blocked",
+        "redaction": "blocked"
+      },
+      "redactionPassed": false,
+      "sourceSurvivedPrepareFailure": false,
+      "providerVerified": false,
+      "liveSwitchVerified": false,
+      "binaryOnlyVerified": false,
+      "sourceEvidenceReference": "provider-config/zcode-environment-v1",
+      "recordedAt": null
+    },
+    {
       "agentId": "antigravity",
       "smokeId": "agent-provider-antigravity",
       "catalogVersion": "1.0.0",
@@ -1593,12 +1694,12 @@
       "catalogVersion": "0.4.15",
       "descriptorId": "projection_deepseek_harness_runtime_v1",
       "descriptorVersion": "1",
-      "versionPolicy": "exact",
+      "versionPolicy": "detected_semver",
       "capabilityMode": "replaceable_provider",
-      "switchBehavior": "unverified",
+      "switchBehavior": "restart_and_resume",
       "status": "blocked",
       "execution": "not_run",
-      "diagnosticCode": "agent_projection_auth_boundary_not_runtime_verified",
+      "diagnosticCode": "operator_prerequisites_unavailable",
       "detectedIdentity": null,
       "descriptorMatch": "not_checked",
       "projectionFingerprint": null,
@@ -2452,8 +2553,8 @@
     "absolutePathPersisted": false
   },
   "summary": {
-    "totalAgents": 36,
-    "blockedRealSmokes": 36,
+    "totalAgents": 37,
+    "blockedRealSmokes": 37,
     "passedRealSmokes": 0,
     "providerVerifiedAgents": 0,
     "liveSwitchVerifiedAgents": 0,

@@ -404,7 +404,7 @@ environment key and the final ACP authentication decision.
 
 ### 3. Capability Notes
 
-- Verified `zcode-acp-server@0.11.9` declarations: `session/new/load/list/resume/fork`,
+- Verified `zcode-acp-server@0.17.2` declarations: `session/new/load/list/resume/fork`,
   prompt/cancel, model/mode/thought configuration, streaming Agent text and
   reasoning, tools, plans, usage updates, permissions, form elicitation, MCP,
   Skills/slash commands, file/image context, and a ZCode filesystem extension.

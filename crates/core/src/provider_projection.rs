@@ -47,7 +47,7 @@ const OPENCODE_AGENT_ID: &str = "opencode";
 const OPENCODE_ADAPTER_ID: &str = "opencode-acp";
 const ZCODE_AGENT_ID: &str = "zcode";
 const ZCODE_ADAPTER_ID: &str = "zcode-acp-server";
-pub const ZCODE_ADAPTER_VERSION: &str = "0.11.9";
+pub const ZCODE_ADAPTER_VERSION: &str = "0.17.2";
 /// Automatic provider projection remains available after an Agent upgrade
 /// once the runtime is at least the first verified version for its descriptor.
 pub const OPENCODE_COMPATIBLE_VERSION_REQUIREMENT: &str = ">=1.17.9";
@@ -1636,7 +1636,7 @@ fn zcode_projection_descriptor() -> VibexResult<AgentProviderProjectionDescripto
         evidence: ProjectionEvidenceReference {
             state: ProjectionEvidenceState::Documented,
             source_reference: Some(
-                "zcode-acp-server@0.11.9/provider-registry-and-runtime-model".to_string(),
+                "zcode-acp-server@0.17.2/provider-registry-and-runtime-model".to_string(),
             ),
             runtime_reference: None,
             diagnostic_code: Some("agent_projection_runtime_verification_required".to_string()),

@@ -14,7 +14,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export const EVIDENCE_PATH = "docs/platform/evidence/agent-provider-runtime.json";
 export const EVIDENCE_SCHEMA = "agent-provider-runtime-evidence.v1";
 export const MANIFEST_SCHEMA = "agent-provider-runtime-manifest.v1";
-export const AGENT_COUNT = 36;
+export const AGENT_COUNT = 37;
 export const BUILTIN_IDS = ["claude", "codex", "opencode"];
 export const CATALOG_AGENT_COUNT = AGENT_COUNT - BUILTIN_IDS.length;
 
