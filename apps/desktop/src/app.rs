@@ -3543,13 +3543,26 @@ fn turn_file_changes_line_counts(summary: &TurnFileChangesSummary) -> Option<(us
 }
 
 fn estimated_agent_output_tokens(turn: &TimelineConversationTurn) -> Option<u64> {
-    let output_chars = turn
-        .process_rows
-        .iter()
-        .chain(turn.conclusion_row.iter())
-        .filter(|row| row.kind == TimelineRowKind::AgentMessage)
-        .map(|row| row.body.chars().count())
-        .sum::<usize>();
+    // Reasoning deltas are model output too. In Timeline mode they stream into
+    // `process_rows`; in LatestAtBottom mode streaming reasoning rows are
+    // filtered out and the text only accumulates in `live_status`. The two
+    // sources overlap, so `live_status` is counted only when no reasoning row
+    // already carries the stream, otherwise the tail would be double-counted.
+    let mut reasoning_row_present = false;
+    let mut output_chars = 0usize;
+    for row in turn.process_rows.iter().chain(turn.conclusion_row.iter()) {
+        match row.kind {
+            TimelineRowKind::AgentMessage => output_chars += row.body.chars().count(),
+            TimelineRowKind::Reasoning => {
+                reasoning_row_present = true;
+                output_chars += row.body.chars().count();
+            }
+            _ => {}
+        }
+    }
+    if !reasoning_row_present && let Some(status) = turn.live_status.as_deref() {
+        output_chars += status.chars().count();
+    }
     (output_chars > 0).then_some((output_chars as u64).saturating_add(3) / 4)
 }
 
@@ -54206,6 +54219,33 @@ mod tests {
             agent_generation_output_tokens(&output_turn, Some(12), Some(10)),
             Some(2)
         );
+
+        let reasoning_row_turn = turn(
+            vec![row(
+                "thought",
+                TimelineRowKind::Reasoning,
+                true,
+                "thinking text",
+            )],
+            None,
+            Some("thinking text"),
+            false,
+        );
+        // Timeline mode: the reasoning body counts; the overlapping
+        // live_status stream must not be double-counted.
+        assert_eq!(
+            estimated_agent_output_tokens(&reasoning_row_turn),
+            Some(4) // ceil(13 / 4)
+        );
+
+        let live_status_turn = turn(vec![], None, Some("thinking text"), false);
+        // LatestAtBottom mode: the stream lives only in live_status.
+        assert_eq!(estimated_agent_output_tokens(&live_status_turn), Some(4));
+        assert_eq!(
+            agent_generation_output_tokens(&live_status_turn, None, None),
+            Some(4)
+        );
+
         assert_eq!(
             agent_generation_token_rate(Some(10), Some(30), Duration::from_secs(2)),
             Some(10.0)
