@@ -9390,9 +9390,35 @@ impl VibexWorkbench {
         session_running: bool,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if !self.ui_state.session.show_agent_generation_status || !session_running {
+        if !self.ui_state.session.show_agent_generation_status {
             self.agent_generation_stats = None;
             return None;
+        }
+        if !session_running {
+            self.agent_generation_stats = None;
+            let (input_tokens, output_tokens, cache_rate) = self.agent_token_usage_metrics();
+            if input_tokens.is_none() && output_tokens.is_none() && cache_rate.is_none() {
+                return None;
+            }
+            let muted_foreground = cx.theme().muted_foreground;
+            return Some(
+                h_flex()
+                    .id("agent-token-usage")
+                    .w_full()
+                    .h(px(24.0))
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .text_xs()
+                    .text_color(muted_foreground)
+                    .child(self.agent_idle_token_usage_items(
+                        muted_foreground,
+                        input_tokens,
+                        output_tokens,
+                        cache_rate,
+                    ))
+                    .into_any_element(),
+            );
         }
         let Some(turn) = self
             .conversation_turns_cache
@@ -9463,12 +9489,7 @@ impl VibexWorkbench {
             locale::ResolvedLocale::ZhTw => format!("{compaction_count} 次壓縮"),
         };
         let tokens_per_second = tokens_per_second.map(|speed| format!("{speed:.1} t/s"));
-        let session_usage = self.token_usage.as_ref();
-        let input_tokens = session_usage.and_then(|usage| usage.input_tokens);
-        let output_tokens = session_usage.and_then(|usage| usage.output_tokens);
-        let cache_rate = session_usage
-            .and_then(cache_hit_fraction)
-            .map(token_usage_percent);
+        let (input_tokens, output_tokens, cache_rate) = self.agent_token_usage_metrics();
         Some(
             h_flex()
                 .id("agent-generation-status")
@@ -9545,6 +9566,49 @@ impl VibexWorkbench {
                 })
                 .into_any_element(),
         )
+    }
+
+    fn agent_idle_token_usage_items(
+        &self,
+        muted_foreground: Hsla,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        cache_rate: Option<u32>,
+    ) -> gpui::Div {
+        h_flex()
+            .items_center()
+            .gap(px(6.0))
+            .when_some(input_tokens, |this, tokens| {
+                this.child(
+                    h_flex()
+                        .items_center()
+                        .gap(px(2.0))
+                        .text_color(muted_foreground)
+                        .child(Icon::new(IconName::ArrowUp).size(px(12.0)))
+                        .child(format_compact_tokens(tokens)),
+                )
+            })
+            .when_some(output_tokens, |this, tokens| {
+                this.child(
+                    h_flex()
+                        .items_center()
+                        .gap(px(2.0))
+                        .text_color(muted_foreground)
+                        .child(Icon::new(IconName::ArrowDown).size(px(12.0)))
+                        .child(format_compact_tokens(tokens)),
+                )
+            })
+            .when_some(cache_rate, |this, rate| {
+                this.child(format!("{rate}%"))
+            })
+    }
+
+    fn agent_token_usage_metrics(&self) -> (Option<u64>, Option<u64>, Option<u32>) {
+        let usage = self.token_usage.as_ref();
+        let input_tokens = usage.and_then(|usage| usage.input_tokens);
+        let output_tokens = usage.and_then(|usage| usage.output_tokens);
+        let cache_rate = usage.and_then(cache_hit_fraction).map(token_usage_percent);
+        (input_tokens, output_tokens, cache_rate)
     }
 
     fn selected_runtime_selection(&self) -> Option<SessionRuntimeSelection> {
@@ -56963,6 +57027,9 @@ mod tests {
             .expect("agent generation status renderer should remain inspectable");
         assert!(generation_status.contains("show_agent_generation_status"));
         assert!(generation_status.contains("self.agent_generation_stats = None"));
+        assert!(generation_status.contains("if !session_running"));
+        assert!(generation_status.contains("agent_token_usage_metrics"));
+        assert!(generation_status.contains("agent_idle_token_usage_items"));
         assert!(generation_status.contains("Icon::new(IconName::ArrowUp)"));
         assert!(generation_status.contains("Icon::new(IconName::ArrowDown)"));
         assert!(generation_status.contains("format_compact_tokens"));
