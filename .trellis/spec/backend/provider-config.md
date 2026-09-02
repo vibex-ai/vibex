@@ -2130,8 +2130,8 @@ ProviderProfile.providerOptions.entries[
   `ProviderOptions` entries directly.
 - The bundled catalog includes OpenCode plus concrete Agent presets. Managed
   Claude uses `claude-agent-acp` backed by
-  `@agentclientprotocol/claude-agent-acp@0.64.2`; managed Codex uses
-  `codex-acp` backed by `@agentclientprotocol/codex-acp@1.1.9`. The
+  `@agentclientprotocol/claude-agent-acp@0.71.0`; managed Codex uses
+  `codex-acp` backed by `@agentclientprotocol/codex-acp@1.8.0`. The
   Compatibility Registry, not UI strings or PATH guessing, owns exact managed
   versions.
 - An enabled ACP Agent may seed one typed `kind = acp` runtime profile from its
@@ -2603,7 +2603,7 @@ agent_discovery_records(
   native thread, expose credentials, or keep a child process alive. Probe
   failure keeps the configured models selectable with empty Effort metadata.
 - Managed Codex modes come from the exact adapter compatibility contract. For
-  `codex-acp@1.1.9`, typed ACP configuration publishes `read-only`, `agent`, and
+  `codex-acp@1.8.0`, typed ACP configuration publishes `read-only`, `agent`, and
   `agent-full-access`; existing managed profiles with no modes are reconciled
   to this set without changing profile identity or model defaults.
 - Catalog selections use `reasoningEffort = null` and `modeId = null` to mean
@@ -3149,16 +3149,18 @@ BridgeContractReport {
   exact adapter versions, npm integrity, trusted HTTPS registry origin, bin
   names, Node requirements, command variants, and baseline capability policies.
 - Built-in managed descriptors are exact baselines: Claude
-  `@agentclientprotocol/claude-agent-acp@0.64.2` with bin
-  `claude-agent-acp`; Codex `@agentclientprotocol/codex-acp@1.1.9` with bin
+  `@agentclientprotocol/claude-agent-acp@0.71.0` with bin
+  `claude-agent-acp`; Codex `@agentclientprotocol/codex-acp@1.8.0` with bin
   `codex-acp`.
 - Codex compatibility identity must include the exact resolved
   `@openai/codex` runtime package from the managed install lock tree, for
-  example `adapter=codex-acp@1.1.9;runtime=@openai/codex@0.146.0`.
-- `codex-acp@1.1.9` still declares `@openai/codex ^0.145.0`, which excludes
-  runtime `0.146.0` under npm's pre-1.0 caret semantics. The exact managed
-  descriptor therefore owns an explicit npm override to `0.146.0`; this is a
-  narrow versioned exception, not permission to ignore dependency ranges.
+  example `adapter=codex-acp@1.8.0;runtime=@openai/codex@0.152.1`.
+- `codex-acp@1.8.0` declares `@openai/codex ^0.152.0`, and the managed pin
+  `0.152.1` satisfies that range, so the descriptor no longer needs an npm
+  override. Registry validation rejects an override while the pin is inside
+  the declared requirement (`acp_registry_runtime_dependency_override_unnecessary`);
+  the flag returns only if a future pin falls outside the adapter's declared
+  range.
   Verification requires both the top-level runtime and every nested lock-tree
   occurrence to match the managed pin, integrity, and trusted registry source.
 - A Codex profile with an available API-key reference projects the configured
@@ -3222,15 +3224,15 @@ BridgeContractReport {
 
 ### 5. Good/Base/Bad Cases
 
-- Good: Claude `0.64.2` installs in the managed root, verifies the lock/bin
+- Good: Claude `0.71.0` installs in the managed root, verifies the lock/bin
   metadata and npm origin, passes health probe and the real contract, then
   produces activation evidence for identity
-  `adapter=claude-agent-acp@0.64.2`.
-- Good: Codex `1.1.9` resolves `@openai/codex@0.146.0`; changing that runtime
+  `adapter=claude-agent-acp@0.71.0`.
+- Good: Codex `1.8.0` resolves `@openai/codex@0.152.1`; changing that runtime
   version changes compatibility identity and invalidates stale evidence.
 - Base: `session/set_model` or `session/fork` is `not_advertised`; the contract
   report records a skip only when the descriptor marks it `when_advertised`.
-- Bad: using `codex-acp@1.1.9` alone as the compatibility identity while
+- Bad: using `codex-acp@1.8.0` alone as the compatibility identity while
   ignoring the resolved `@openai/codex` package.
 - Bad: accepting a successful adapter `--version` command without checking
   package-lock source/integrity, bin containment, runtime dependency,
@@ -3514,7 +3516,7 @@ ProviderConfigService::{
   installed Agents whose descriptors declare semantic-version compatibility
   ranges before loading runtime capabilities. Ordinary Agent catalog reads stay
   process-free.
-- Codex `0.146.0` accepts only `openai_responses`. Claude exposes no selectable
+- Codex `0.152.1` accepts only `openai_responses`. Claude exposes no selectable
   Wire API. PATH-launched OpenCode uses its detected CLI version and may expose
   only the adapter/protocol pairs registered for the matching semantic-version
   descriptor. The OpenCode inline-provider contract currently supports

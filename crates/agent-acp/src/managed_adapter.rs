@@ -1465,30 +1465,37 @@ mod tests {
         format!("{registry_origin}/{package}/-/{artifact}-{version}.tgz")
     }
 
-    const HEALTHY_SCRIPT: &str = r#"
+    /// Fixture adapter whose `--version` and initialize `agentInfo` always
+    /// report the registry's pinned Claude adapter version, so health probes
+    /// compare equal for claude descriptors.
+    fn healthy_script() -> String {
+        format!(
+            r#"
 import readline from 'node:readline';
-if (process.argv.includes('--version')) {
-  console.log('0.64.2');
+if (process.argv.includes('--version')) {{
+  console.log('{CLAUDE_ADAPTER_VERSION}');
   process.exit(0);
-}
-const rl = readline.createInterface({ input: process.stdin });
-rl.once('line', (line) => {
+}}
+const rl = readline.createInterface({{ input: process.stdin }});
+rl.once('line', (line) => {{
   const request = JSON.parse(line);
-  console.log(JSON.stringify({
+  console.log(JSON.stringify({{
     jsonrpc: '2.0', id: request.id,
-    result: {
+    result: {{
       protocolVersion: 1,
-      agentInfo: { name: '@agentclientprotocol/claude-agent-acp', version: '0.64.2' },
-      agentCapabilities: {}
+      agentInfo: {{ name: '@agentclientprotocol/claude-agent-acp', version: '{CLAUDE_ADAPTER_VERSION}' }},
+      agentCapabilities: {{}}
+    }}
+  }}));
+}});
+"#
+        )
     }
-  }));
-});
-"#;
 
     #[tokio::test]
     async fn isolated_install_is_atomic_verified_and_idempotent() {
         let temp = TempDir::new().unwrap();
-        let (store, installer) = fixture_store(&temp, HEALTHY_SCRIPT, Duration::from_secs(2));
+        let (store, installer) = fixture_store(&temp, &healthy_script(), Duration::from_secs(2));
         let descriptor = descriptor(CODEX_AGENT_ID);
         let installed = store.install(&descriptor).await.unwrap();
         assert_eq!(installer.calls.load(Ordering::Relaxed), 1);
@@ -1503,11 +1510,9 @@ rl.once('line', (line) => {
         let managed_manifest: Value =
             serde_json::from_slice(&fs::read(installed.install_root.join("package.json")).unwrap())
                 .unwrap();
-        assert_eq!(
-            managed_manifest["overrides"][descriptor.distribution.package.as_str()]
-                [CODEX_RUNTIME_PACKAGE],
-            CODEX_RUNTIME_PIN
-        );
+        // The pin satisfies the adapter's declared `^0.152.0` requirement, so
+        // the managed manifest must not carry an npm override.
+        assert_eq!(managed_manifest["overrides"], json!({}));
         assert!(installed.binary_identity.starts_with("sha256:"));
         assert!(installed.install_root.is_dir());
         assert!(
@@ -1530,7 +1535,7 @@ rl.once('line', (line) => {
         let temp = TempDir::new().unwrap();
         let installer = Arc::new(RacingInstaller {
             barrier: Arc::new(Barrier::new(2)),
-            script: HEALTHY_SCRIPT.to_string(),
+            script: healthy_script(),
         });
         let store = ManagedAcpAdapterStore::with_installer(
             temp.path().join("managed"),
@@ -1550,11 +1555,11 @@ rl.once('line', (line) => {
     #[test]
     fn inspection_rejects_integrity_and_runtime_version_mismatches() {
         let temp = TempDir::new().unwrap();
-        let (store, _) = fixture_store(&temp, HEALTHY_SCRIPT, Duration::from_secs(2));
+        let (store, _) = fixture_store(&temp, &healthy_script(), Duration::from_secs(2));
         let descriptor = descriptor(CODEX_AGENT_ID);
         let root = store.installation_root(&descriptor).unwrap();
         fs::create_dir_all(&root).unwrap();
-        write_fixture_install(&root, &descriptor, HEALTHY_SCRIPT);
+        write_fixture_install(&root, &descriptor, &healthy_script());
 
         let lock_path = root.join("package-lock.json");
         let mut lock: Value = serde_json::from_slice(&fs::read(&lock_path).unwrap()).unwrap();
@@ -1645,15 +1650,16 @@ rl.once('line', (line) => {
         use std::os::unix::fs::symlink;
 
         let temp = TempDir::new().unwrap();
-        let (store, _) = fixture_store(&temp, HEALTHY_SCRIPT, Duration::from_secs(2));
+        let healthy = healthy_script();
+        let (store, _) = fixture_store(&temp, &healthy, Duration::from_secs(2));
         let descriptor = descriptor(CLAUDE_AGENT_ID);
         let root = store.installation_root(&descriptor).unwrap();
         fs::create_dir_all(&root).unwrap();
-        write_fixture_install(&root, &descriptor, HEALTHY_SCRIPT);
+        write_fixture_install(&root, &descriptor, &healthy);
         let adapter_dir = package_directory(&root, &descriptor.distribution.package).unwrap();
         let entrypoint = adapter_dir.join("dist/index.js");
         let outside = temp.path().join("outside.js");
-        fs::write(&outside, HEALTHY_SCRIPT).unwrap();
+        fs::write(&outside, &healthy).unwrap();
         fs::remove_file(&entrypoint).unwrap();
         symlink(&outside, &entrypoint).unwrap();
 
@@ -1664,7 +1670,7 @@ rl.once('line', (line) => {
     #[tokio::test]
     async fn health_probe_checks_node_adapter_version_and_initialize() {
         let temp = TempDir::new().unwrap();
-        let (store, _) = fixture_store(&temp, HEALTHY_SCRIPT, Duration::from_secs(2));
+        let (store, _) = fixture_store(&temp, &healthy_script(), Duration::from_secs(2));
         let descriptor = descriptor(CLAUDE_AGENT_ID);
         store.install(&descriptor).await.unwrap();
         let report = store.health_probe(&descriptor).await.unwrap();
@@ -1679,7 +1685,7 @@ rl.once('line', (line) => {
 
     #[tokio::test]
     async fn health_probe_rejects_wrong_version_and_timeout() {
-        let wrong_version_script = HEALTHY_SCRIPT.replace("0.64.2", "0.64.1");
+        let wrong_version_script = healthy_script().replace(CLAUDE_ADAPTER_VERSION, "0.70.9");
         let temp = TempDir::new().unwrap();
         let (store, _) = fixture_store(&temp, &wrong_version_script, Duration::from_secs(2));
         let descriptor = descriptor(CLAUDE_AGENT_ID);
@@ -1687,12 +1693,14 @@ rl.once('line', (line) => {
         let err = store.health_probe(&descriptor).await.unwrap_err();
         assert_eq!(err.code, "acp_managed_adapter_version_mismatch");
 
-        let hanging_script = r#"
-if (process.argv.includes('--version')) { console.log('0.64.2'); process.exit(0); }
+        let hanging_script = format!(
+            r#"
+if (process.argv.includes('--version')) {{ console.log('{CLAUDE_ADAPTER_VERSION}'); process.exit(0); }}
 process.stdin.resume();
-"#;
+"#
+        );
         let temp = TempDir::new().unwrap();
-        let (store, _) = fixture_store(&temp, hanging_script, Duration::from_millis(100));
+        let (store, _) = fixture_store(&temp, &hanging_script, Duration::from_millis(100));
         store.install(&descriptor).await.unwrap();
         let err = store.health_probe(&descriptor).await.unwrap_err();
         assert_eq!(err.code, "acp_health_probe_timeout");
@@ -1700,13 +1708,15 @@ process.stdin.resume();
 
     #[tokio::test]
     async fn health_probe_reports_early_exit_and_redacts_sensitive_stderr() {
-        let script = r#"
-if (process.argv.includes('--version')) { console.log('0.64.2'); process.exit(0); }
+        let script = format!(
+            r#"
+if (process.argv.includes('--version')) {{ console.log('{CLAUDE_ADAPTER_VERSION}'); process.exit(0); }}
 console.error('token=must-not-leak');
 process.exit(7);
-"#;
+"#
+        );
         let temp = TempDir::new().unwrap();
-        let (store, _) = fixture_store(&temp, script, Duration::from_secs(2));
+        let (store, _) = fixture_store(&temp, &script, Duration::from_secs(2));
         let descriptor = descriptor(CLAUDE_AGENT_ID);
         store.install(&descriptor).await.unwrap();
         let err = store.health_probe(&descriptor).await.unwrap_err();
@@ -1718,24 +1728,26 @@ process.exit(7);
 
     #[tokio::test]
     async fn health_probe_rejects_malformed_initialize_metadata() {
-        let malformed_script = r#"
+        let malformed_script = format!(
+            r#"
 import readline from 'node:readline';
-if (process.argv.includes('--version')) { console.log('0.64.2'); process.exit(0); }
-const rl = readline.createInterface({ input: process.stdin });
-rl.once('line', (line) => {
+if (process.argv.includes('--version')) {{ console.log('{CLAUDE_ADAPTER_VERSION}'); process.exit(0); }}
+const rl = readline.createInterface({{ input: process.stdin }});
+rl.once('line', (line) => {{
   const request = JSON.parse(line);
-  console.log(JSON.stringify({
+  console.log(JSON.stringify({{
     jsonrpc: '2.0', id: request.id,
-    result: {
+    result: {{
       protocolVersion: 1,
-      agentInfo: { name: '@agentclientprotocol/claude-agent-acp', version: '0.64.2' },
+      agentInfo: {{ name: '@agentclientprotocol/claude-agent-acp', version: '{CLAUDE_ADAPTER_VERSION}' }},
       agentCapabilities: []
-    }
-  }));
-});
-"#;
+    }}
+  }}));
+}});
+"#
+        );
         let temp = TempDir::new().unwrap();
-        let (store, _) = fixture_store(&temp, malformed_script, Duration::from_secs(2));
+        let (store, _) = fixture_store(&temp, &malformed_script, Duration::from_secs(2));
         let descriptor = descriptor(CLAUDE_AGENT_ID);
         store.install(&descriptor).await.unwrap();
         let err = store.health_probe(&descriptor).await.unwrap_err();
@@ -1765,7 +1777,7 @@ rl.once('line', (line) => {
     #[tokio::test]
     async fn store_rejects_unregistered_path_escaping_adapter_ids() {
         let temp = TempDir::new().unwrap();
-        let (store, installer) = fixture_store(&temp, HEALTHY_SCRIPT, Duration::from_secs(2));
+        let (store, installer) = fixture_store(&temp, &healthy_script(), Duration::from_secs(2));
         let mut descriptor = descriptor(CLAUDE_AGENT_ID);
         descriptor.adapter_id = AcpAdapterId::parse("../../outside").unwrap();
 

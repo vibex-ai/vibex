@@ -4701,15 +4701,16 @@ fn claude_acp_preset() -> AcpProviderCatalogPreset {
     let mut preset = acp_catalog_preset(
         "claude-agent-acp",
         "Claude Code (ACP)",
-        "Claude Code through the fixed @agentclientprotocol/claude-agent-acp@0.64.2 Adapter managed by the Compatibility Registry.",
+        "Claude Code through the fixed @agentclientprotocol/claude-agent-acp@0.71.0 Adapter managed by the Compatibility Registry.",
         "claude-agent-acp",
         &[],
         &["local", "acp", "claude"],
     );
     // Session modes the pinned adapter advertises unconditionally; gated
-    // modes (auto, bypassPermissions) are discovered live by the runtime
-    // option catalog probe instead of being promised here.
-    preset.default_config.modes = ["default", "acceptEdits", "plan", "dontAsk"]
+    // modes (bypassPermissions) are discovered live by the runtime
+    // option catalog probe instead of being promised here. `auto` is part of
+    // the 0.71.0 catalog; the bridge clamps it per-model.
+    preset.default_config.modes = ["default", "acceptEdits", "plan", "auto"]
         .into_iter()
         .map(ToString::to_string)
         .collect();
@@ -4720,7 +4721,7 @@ fn codex_acp_preset() -> AcpProviderCatalogPreset {
     let mut preset = acp_catalog_preset(
         "codex-acp",
         "Codex (ACP)",
-        "Codex through the fixed @agentclientprotocol/codex-acp@1.1.9 Adapter managed by the Compatibility Registry.",
+        "Codex through the fixed @agentclientprotocol/codex-acp@1.8.0 Adapter managed by the Compatibility Registry.",
         "codex-acp",
         &[],
         &["local", "acp", "codex"],

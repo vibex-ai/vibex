@@ -19353,14 +19353,14 @@ mod tests {
         assert_eq!(identity.event_enricher, AgentEventEnricherKind::Claude);
 
         let codex = test_acp_config("/managed/node", vec!["/managed/codex-acp.js".to_string()]);
-        persist_managed_runtime(&conn, "codex", "codex-acp", "1.1.9", &codex);
+        persist_managed_runtime(&conn, "codex", "codex-acp", "1.8.0", &codex);
         let identity = client
             .effective_adapter_identity(&AgentId::parse("codex").unwrap(), &codex)
             .unwrap();
-        assert_eq!(identity.adapter_version, "1.1.9");
+        assert_eq!(identity.adapter_version, "1.8.0");
         assert_eq!(
             identity.compatibility_identity,
-            "adapter=codex-acp@1.1.9;runtime=@openai/codex@0.146.0"
+            "adapter=codex-acp@1.8.0;runtime=@openai/codex@0.152.1"
         );
         assert!(identity.exact_descriptor);
         assert_eq!(identity.event_enricher, AgentEventEnricherKind::Codex);
@@ -20108,7 +20108,7 @@ mod tests {
         let raw_output = AgentEventRawOutput::new(AgentEventRawOutputMode::Append, "ok").0;
         let codex = normalize_tool_call_snapshot(
             AgentEventEnricherKind::Codex,
-            "adapter=codex-acp@1.1.9",
+            "adapter=codex-acp@1.8.0",
             "native-command-id".to_string(),
             ToolCallStatus::Completed,
             snapshot.clone(),

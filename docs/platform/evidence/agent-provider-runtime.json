@@ -3,9 +3,9 @@
   "status": "passed",
   "claimScope": "manifest_and_contract",
   "realRuntimeVerification": "blocked",
-  "capturedAt": "2026-09-02T03:28:41.485Z",
+  "capturedAt": "2026-09-02T12:42:30.776Z",
   "source": {
-    "captureParentCommit": "16b04034119b50b3bdd294b2dfe24a28dfd28648",
+    "captureParentCommit": "8dce4a6686c2b0cf4c0c9a67dd907f89621423d0",
     "rustToolchain": "rustc-1.97.0",
     "sourceInputRoots": [
       "crates/core/src/acp_catalog.rs",
@@ -53,21 +53,21 @@
       "crates/vibex-ui/Cargo.toml",
       "apps/desktop/Cargo.toml"
     ],
-    "sourceInputTreeSha256": "e49ac5d0aeeeba22e7f111e3d604a70084651eef94a660e0ab0a6ae15ddf3bc3",
+    "sourceInputTreeSha256": "5f14684e59555f9377e302cc5f8c357b069f84c1a926dbc8950810b068136c89",
     "bindings": {
       "catalog": "38e8d897562ce0c12e6ec47f6e3a55c5db1f01d99b704f5d912b0b2ee0aa4929",
-      "manifest": "55981ca2596daf6fe24cf1c093c970cb8b0fd75d4409fb3b67ef98716a3dfa63",
-      "probe": "0b18e6ad4f0d9f6e11d047f8065c7f76a7d4ff54e0cb7b7818d2670355b1edcd",
-      "database": "ed24382868ab073a845ce444bd012b519a37b5b509001e54ff339b045cb5e9f5",
+      "manifest": "0c6d1c3326492fa74c842fb3848665eca15d37c4c684b8531f7d83797cfd2380",
+      "probe": "51f91a463b1a8eadacb42e292e0ad60436c5fb873a764b2e1af7d47cd49ce69f",
+      "database": "160e94fca51db879469c37fc54158c61a2fe93a6b729e53c08d0cf009f09e6ee",
       "remote": "1f0b1dc6bf7a30f06976e3116da319f0b03c40ce2967c5bc35852a248bac6609",
-      "ui": "c17e4f15b69763dd1835ff534385e4266349758d6884980d180bffb6691e2d42",
-      "switch": "5ec956df0c89277fbe92f7e8a82fc57b5f006afede1d03e410a01cfa87e00d2a",
+      "ui": "4a1412ec41593b0940c5eb8673fce4781d89620655a4a32d5fbddd5d64f38061",
+      "switch": "058053ebb6aed983ba1d156b59db41ad91b99e30bbee3c02e3115ddc414579de",
       "scripts": "9d74e8ab705a6c006b0c05a05e3d289278f2f1015499ea391a0ce7a754691b89",
-      "packageMetadata": "f93567457048eb3ac88bfa0cbd690c1944e35fc6e02cca769d1f489ab8c1306b"
+      "packageMetadata": "bb36ef51be32cb5f0a9d315254b765049260246d9afa49718860f2222e4e0c0e"
     },
-    "cargoLockSha256": "015db515abd9980a46f477516658055a276a41922c4e208dcd98789d413ab34e",
+    "cargoLockSha256": "2388c341d5946ce1c113b103285edcc401fa957e54ddd4e5ad865b3b5885fa14",
     "packageJsonSha256": "3bf13132c815037285846cd90920224559d666d9c18e15db3c1d694e7a783dfa",
-    "rolloutManifestSha256": "64ae0d145b571c25f5e141e5c130c7e406e7f2fc515246f355264296a15fed61"
+    "rolloutManifestSha256": "c430500281070f883a0fe324c67127f7e6868ea46cc3e13b8ff997f8d90af6cc"
   },
   "manifest": {
     "schemaVersion": "agent-provider-runtime-manifest.v1",
@@ -77,7 +77,7 @@
     "entries": [
       {
         "agentId": "claude",
-        "catalogVersion": "0.64.2",
+        "catalogVersion": "0.71.0",
         "adapterId": "claude-agent-acp",
         "descriptorId": "projection_claude_environment_v1",
         "descriptorVersion": "1",
@@ -98,7 +98,7 @@
       },
       {
         "agentId": "codex",
-        "catalogVersion": "0.146.0",
+        "catalogVersion": "0.152.1",
         "adapterId": "codex-acp",
         "descriptorId": "projection_codex_stable_home_v1",
         "descriptorVersion": "1",
@@ -1201,7 +1201,7 @@
     {
       "agentId": "claude",
       "smokeId": "builtin-provider-claude",
-      "catalogVersion": "0.64.2",
+      "catalogVersion": "0.71.0",
       "descriptorId": "projection_claude_environment_v1",
       "descriptorVersion": "1",
       "versionPolicy": "exact",
@@ -1236,7 +1236,7 @@
     {
       "agentId": "codex",
       "smokeId": "builtin-provider-codex",
-      "catalogVersion": "0.146.0",
+      "catalogVersion": "0.152.1",
       "descriptorId": "projection_codex_stable_home_v1",
       "descriptorVersion": "1",
       "versionPolicy": "exact",

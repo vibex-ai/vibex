@@ -34,15 +34,15 @@ pub const ZCODE_PROJECTION_DESCRIPTOR_ID: &str = "projection_zcode_private_confi
 
 const CLAUDE_AGENT_ID: &str = "claude";
 const CLAUDE_ADAPTER_ID: &str = "claude-agent-acp";
-const CLAUDE_ADAPTER_VERSION: &str = "0.64.2";
-pub const CLAUDE_COMPATIBLE_ADAPTER_VERSION_REQUIREMENT: &str = ">=0.64.2";
+const CLAUDE_ADAPTER_VERSION: &str = "0.71.0";
+pub const CLAUDE_COMPATIBLE_ADAPTER_VERSION_REQUIREMENT: &str = ">=0.71.0";
 const CODEX_AGENT_ID: &str = "codex";
 const CODEX_ADAPTER_ID: &str = "codex-acp";
-const CODEX_ADAPTER_VERSION: &str = "1.1.9";
-pub const CODEX_COMPATIBLE_ADAPTER_VERSION_REQUIREMENT: &str = ">=1.1.9";
+const CODEX_ADAPTER_VERSION: &str = "1.8.0";
+pub const CODEX_COMPATIBLE_ADAPTER_VERSION_REQUIREMENT: &str = ">=1.8.0";
 #[cfg(test)]
 const CODEX_RUNTIME_PACKAGE: &str = "@openai/codex";
-const CODEX_RUNTIME_VERSION: &str = "0.146.0";
+const CODEX_RUNTIME_VERSION: &str = "0.152.1";
 const OPENCODE_AGENT_ID: &str = "opencode";
 const OPENCODE_ADAPTER_ID: &str = "opencode-acp";
 const ZCODE_AGENT_ID: &str = "zcode";
@@ -2048,7 +2048,7 @@ mod tests {
         );
 
         let mut upgraded_codex = builtin_identity("codex");
-        upgraded_codex.adapter_version = Some("1.1.13".to_string());
+        upgraded_codex.adapter_version = Some("1.8.13".to_string());
         upgraded_codex.agent_version = None;
         upgraded_codex.runtime_dependencies.clear();
         assert_eq!(
@@ -2057,7 +2057,7 @@ mod tests {
         );
 
         let mut mismatch = builtin_identity("codex");
-        mismatch.adapter_version = Some("1.1.8".to_string());
+        mismatch.adapter_version = Some("1.7.9".to_string());
         let resolution = registry.resolve(&mismatch).unwrap();
         assert_eq!(
             resolution.match_kind,

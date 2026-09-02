@@ -6,7 +6,7 @@
       "payload": {
         "type": "tool_call",
         "data": {
-          "toolCallId": "acp_event_4f189d2e4054cab8fb873e330ab84866",
+          "toolCallId": "acp_event_93ae8957e7106bbe2514623eebe1f0c8",
           "toolName": "lookup_docs",
           "status": "completed",
           "summary": "Lookup docs",
@@ -28,7 +28,7 @@
           }
         }
       },
-      "providerCorrelationId": "acp_event_5fed9dcd1a9e507a2178a7e887698f32",
+      "providerCorrelationId": "acp_event_ae41298d5bb95da5f83558324fa0ff9b",
       "redactionState": "none"
     },
     {
@@ -58,7 +58,7 @@
           }
         }
       },
-      "providerCorrelationId": "acp_event_102ce2056068bf37e8e8352fcf002840",
+      "providerCorrelationId": "acp_event_c36424f4f400422fce03e2d49a79d31a",
       "redactionState": "none"
     },
     {
@@ -88,7 +88,7 @@
           }
         }
       },
-      "providerCorrelationId": "acp_event_102ce2056068bf37e8e8352fcf002840",
+      "providerCorrelationId": "acp_event_c36424f4f400422fce03e2d49a79d31a",
       "redactionState": "none"
     },
     {
@@ -122,7 +122,7 @@
           }
         }
       },
-      "providerCorrelationId": "acp_event_b27250d37467b811d01d6091212245f7",
+      "providerCorrelationId": "acp_event_264ead16c89a4e80b0d19b13819bdda3",
       "redactionState": "none"
     },
     {
@@ -156,7 +156,7 @@
           }
         }
       },
-      "providerCorrelationId": "acp_event_08d14563730f5f10eb83fa456ddcc628",
+      "providerCorrelationId": "acp_event_076cf6c18e186fb2b993a09d5c341257",
       "redactionState": "none"
     },
     {
@@ -190,7 +190,7 @@
           }
         }
       },
-      "providerCorrelationId": "acp_event_ebeadb1de2f59db2000e6b63cf8b7419",
+      "providerCorrelationId": "acp_event_545c615047a73407531df467181cba14",
       "redactionState": "none"
     },
     {
@@ -216,7 +216,7 @@
           }
         }
       },
-      "providerCorrelationId": "acp_event_b285629ed6ac6cfad3e2c45908f8fb45",
+      "providerCorrelationId": "acp_event_537ad4176cb85a2ec373961d65f82399",
       "redactionState": "none"
     },
     {
@@ -247,7 +247,7 @@
           }
         }
       },
-      "providerCorrelationId": "acp_event_cda60d3d54d7003ad9c14c6e0e58dcc2",
+      "providerCorrelationId": "acp_event_48cc6c6c287f35add745a1c1890f1d53",
       "redactionState": "none"
     },
     {
@@ -274,7 +274,7 @@
           }
         }
       },
-      "providerCorrelationId": "acp_event_0d452fde5d75785c63ee6dbf432a8244",
+      "providerCorrelationId": "acp_event_7c834e21187bf8e1f5867cd47f065464",
       "redactionState": "none"
     },
     {
@@ -303,7 +303,7 @@
           }
         }
       },
-      "providerCorrelationId": "acp_event_288f7fd5ccbbc278fc92671f1b754b7c",
+      "providerCorrelationId": "acp_event_6346ea3b1f7907c90da7f3a78cd749c7",
       "redactionState": "none"
     },
     {
@@ -312,7 +312,7 @@
       "payload": {
         "type": "tool_call",
         "data": {
-          "toolCallId": "acp_event_a41b02bc40f071a65fc6ed59894866d7",
+          "toolCallId": "acp_event_0a2cd84324583c40771ed70d3dc89f1e",
           "toolName": "command_execution",
           "status": "completed",
           "summary": "Ambiguous command marker",
@@ -329,7 +329,7 @@
           }
         }
       },
-      "providerCorrelationId": "acp_event_d4845dcc79f29f546abd00e6ef0bb8b2",
+      "providerCorrelationId": "acp_event_4b9b3ece96c02e1672e18f98538d19c5",
       "redactionState": "none"
     }
   ]

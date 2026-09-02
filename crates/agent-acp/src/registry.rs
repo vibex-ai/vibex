@@ -23,20 +23,20 @@ use crate::protocol::{
 pub const CLAUDE_AGENT_ID: &str = "claude";
 pub const CLAUDE_ADAPTER_ID: &str = "claude-agent-acp";
 pub const CLAUDE_ADAPTER_PACKAGE: &str = "@agentclientprotocol/claude-agent-acp";
-pub const CLAUDE_ADAPTER_VERSION: &str = "0.64.2";
-pub const CLAUDE_ADAPTER_INTEGRITY: &str = "sha512-REZ6FxfUF//GqGMqCEHfHLuuzd2ZJwupgfBmIQIm5gcMrkppuhrRlThwbn2RNasCWoMSnqRMHvnXDpl/HctM/g==";
-pub const CLAUDE_CONFIG_ALIAS_VERSION_REQUIREMENT: &str = ">=0.64.2";
+pub const CLAUDE_ADAPTER_VERSION: &str = "0.71.0";
+pub const CLAUDE_ADAPTER_INTEGRITY: &str = "sha512-fX9AmmsVzke02EH0mnD6CsVWiCsoIw3C9GagUgRMlRG2MnzztCKgziWlWqA00trChfq0vsDN6jYmNDk85hjWEw==";
+pub const CLAUDE_CONFIG_ALIAS_VERSION_REQUIREMENT: &str = ">=0.71.0";
 
 pub const CODEX_AGENT_ID: &str = "codex";
 pub const CODEX_ADAPTER_ID: &str = "codex-acp";
 pub const CODEX_ADAPTER_PACKAGE: &str = "@agentclientprotocol/codex-acp";
-pub const CODEX_ADAPTER_VERSION: &str = "1.1.9";
-pub const CODEX_ADAPTER_INTEGRITY: &str = "sha512-T78vetAQJ+XpP+0zT18ceEPTD10tqYvouDh0ht7mpCQjXuW3Vm5MzcuMRJMVBA2MwfCvGFXfOhGA7ogMSeOpFQ==";
-pub const CODEX_CONFIG_ALIAS_VERSION_REQUIREMENT: &str = "=1.1.9";
+pub const CODEX_ADAPTER_VERSION: &str = "1.8.0";
+pub const CODEX_ADAPTER_INTEGRITY: &str = "sha512-F/wgzhlPOmLN9H6iEUNeV4W0RC1aL9YG2tDBZT3QuiNM7vj2ku00BDb08oVkxO2+FOsmE71XHcMmVWA2rKx8ug==";
+pub const CODEX_CONFIG_ALIAS_VERSION_REQUIREMENT: &str = "=1.8.0";
 pub const CODEX_RUNTIME_PACKAGE: &str = "@openai/codex";
-pub const CODEX_RUNTIME_DECLARED_REQUIREMENT: &str = "^0.145.0";
-pub const CODEX_RUNTIME_PIN: &str = "0.146.0";
-pub const CODEX_RUNTIME_INTEGRITY: &str = "sha512-yG3sPWNda/2YAIQIDq9MrrjoCTIQ7rxYM5IasrG3VBcuhCLTkgeg/JzqmJq1V98RE4MJ5jCxDXXQlOjrditFRw==";
+pub const CODEX_RUNTIME_DECLARED_REQUIREMENT: &str = "^0.152.0";
+pub const CODEX_RUNTIME_PIN: &str = "0.152.1";
+pub const CODEX_RUNTIME_INTEGRITY: &str = "sha512-dSwQzl6JgsFe8L9i8xUnwRz9Vy8gn4UvXFU9xq2IJ1eC7zsSttqQ2SGq49ZZIjEyZQ0LZjCs6Bvtxort2Iyebg==";
 
 pub const ZCODE_AGENT_ID: &str = "zcode";
 pub const ZCODE_ADAPTER_ID: &str = "zcode-acp-server";
@@ -937,7 +937,7 @@ fn claude_descriptor() -> VibexResult<AcpAgentCompatibility> {
         }],
         required_launch_env: Vec::new(),
         mcp_forwarding: CompatibilitySupport::supported(
-            "real bridge contract schema v2: claude-agent-acp@0.64.2",
+            "real bridge contract schema v2: claude-agent-acp@0.71.0",
         ),
         safe_multi_session: CompatibilitySupport::unsupported(
             "no exact-version multi-session contract evidence",
@@ -1006,7 +1006,7 @@ fn codex_descriptor() -> VibexResult<AcpAgentCompatibility> {
         )?,
         managed_pin: parse_version(CODEX_RUNTIME_PIN, CODEX_RUNTIME_PACKAGE)?,
         integrity: CODEX_RUNTIME_INTEGRITY.to_string(),
-        override_declared_requirement: true,
+        override_declared_requirement: false,
         include_in_compatibility_identity: true,
     };
     let runtime_versions = BTreeMap::from([(
@@ -1043,7 +1043,7 @@ fn codex_descriptor() -> VibexResult<AcpAgentCompatibility> {
             "true".to_string(),
         )],
         mcp_forwarding: CompatibilitySupport::supported(
-            "real bridge contract schema v2: codex-acp@1.1.9 + @openai/codex@0.146.0",
+            "real bridge contract schema v2: codex-acp@1.8.0 + @openai/codex@0.152.1",
         ),
         safe_multi_session: CompatibilitySupport::unsupported(
             "no exact-version multi-session contract evidence",
@@ -1188,20 +1188,23 @@ fn zcode_descriptor() -> VibexResult<AcpAgentCompatibility> {
 /// These tables mirror what the exact registry-managed adapter version
 /// advertises at runtime; they exist so selectors and validation keep working
 /// when a live probe is unavailable. Conditional values the adapter may
-/// refuse (root-gated `bypassPermissions`, model-gated `auto`/`xhigh`) are
-/// only listed in the `known_*` acceptance sets, never in the fallbacks.
+/// refuse (root-gated `bypassPermissions`, model-gated `xhigh`) are only
+/// listed in the `known_*` acceptance sets, never in the fallbacks. `auto` is
+/// advertised unconditionally since 0.71.0: the bridge clamps it to
+/// `acceptEdits` itself when the selected model lacks support.
+/// `dontAsk` was removed from the 0.71.0 mode catalog and is no longer
+/// selectable even though the bridge's parser still recognizes the id.
 mod pinned {
     pub const CLAUDE_FALLBACK_MODES: &[(&str, &str)] = &[
         ("default", "Manual"),
         ("acceptEdits", "Accept Edits"),
         ("plan", "Plan Mode"),
-        ("dontAsk", "Don't Ask"),
+        ("auto", "Auto"),
     ];
     pub const CLAUDE_KNOWN_MODES: &[&str] = &[
         "default",
         "acceptEdits",
         "plan",
-        "dontAsk",
         "auto",
         "bypassPermissions",
     ];
@@ -1313,7 +1316,7 @@ mod tests {
                 .iter()
                 .map(|mode| mode.value.as_str())
                 .collect::<Vec<_>>(),
-            vec!["default", "acceptEdits", "plan", "dontAsk"]
+            vec!["default", "acceptEdits", "plan", "auto"]
         );
         let fallback_efforts = fallback_reasoning_efforts(&claude);
         assert_eq!(
@@ -1393,9 +1396,9 @@ mod tests {
         );
         assert_eq!(codex.route_key().adapter_id.as_str(), CODEX_ADAPTER_ID);
         let runtime = &codex.distribution.runtime_dependencies[0];
-        assert_eq!(runtime.declared_requirement.to_string(), "^0.145.0");
-        assert_eq!(runtime.managed_pin, Version::parse("0.146.0").unwrap());
-        assert!(runtime.override_declared_requirement);
+        assert_eq!(runtime.declared_requirement.to_string(), "^0.152.0");
+        assert_eq!(runtime.managed_pin, Version::parse("0.152.1").unwrap());
+        assert!(!runtime.override_declared_requirement);
         assert_eq!(
             registry
                 .route_key(&AgentId::parse(CLAUDE_AGENT_ID).unwrap())
@@ -1448,9 +1451,24 @@ mod tests {
             .for_agent(&AgentId::parse(CODEX_AGENT_ID).unwrap())
             .unwrap()
             .clone();
+        // 0.153.0 sits outside the adapter's declared `^0.152.0` requirement,
+        // so pinning it requires the explicit override flag.
+        descriptor.distribution.runtime_dependencies[0].managed_pin =
+            Version::parse("0.153.0").unwrap();
         descriptor.distribution.runtime_dependencies[0].override_declared_requirement = false;
         let error = descriptor.validate().unwrap_err();
         assert_eq!(error.code, "acp_registry_runtime_dependency_pin_invalid");
+
+        // Conversely, an in-range pin must not carry the override flag: it is
+        // only meaningful outside the declared requirement.
+        descriptor.distribution.runtime_dependencies[0].managed_pin =
+            Version::parse(CODEX_RUNTIME_PIN).unwrap();
+        descriptor.distribution.runtime_dependencies[0].override_declared_requirement = true;
+        let error = descriptor.validate().unwrap_err();
+        assert_eq!(
+            error.code,
+            "acp_registry_runtime_dependency_override_unnecessary"
+        );
     }
 
     #[test]
@@ -1485,7 +1503,7 @@ mod tests {
             .clone();
         assert_eq!(
             codex.expected_compatibility_identity().as_str(),
-            "adapter=codex-acp@1.1.9;runtime=@openai/codex@0.146.0"
+            "adapter=codex-acp@1.8.0;runtime=@openai/codex@0.152.1"
         );
 
         let changed = AdapterCompatibilityIdentity::new(
@@ -1513,13 +1531,13 @@ mod tests {
             )
         };
 
-        let below = identity_for("0.64.1");
+        let below = identity_for("0.70.9");
         assert!(
             claude
-                .config_option_aliases_for_runtime("0.64.1", below.as_str())
+                .config_option_aliases_for_runtime("0.70.9", below.as_str())
                 .is_none()
         );
-        for version in ["0.64.2", "0.65.0"] {
+        for version in ["0.71.0", "0.72.0"] {
             let identity = identity_for(version);
             let aliases = claude
                 .config_option_aliases_for_runtime(version, identity.as_str())
@@ -1531,7 +1549,7 @@ mod tests {
             );
         }
 
-        let newer = identity_for("0.65.0");
+        let newer = identity_for("0.72.0");
         assert!(claude.quirks_for_identity(&newer).is_empty());
         assert_eq!(claude.event_enricher_for_identity(&newer), None);
     }
@@ -1550,7 +1568,7 @@ mod tests {
         );
         assert!(
             codex
-                .config_option_aliases_for_runtime("1.1.9", exact.as_str())
+                .config_option_aliases_for_runtime("1.8.0", exact.as_str())
                 .is_some()
         );
 
@@ -1561,7 +1579,7 @@ mod tests {
         );
         assert!(
             codex
-                .config_option_aliases_for_runtime("1.1.9", incomplete_identity.as_str())
+                .config_option_aliases_for_runtime("1.8.0", incomplete_identity.as_str())
                 .is_none()
         );
 

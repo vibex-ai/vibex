@@ -1209,7 +1209,7 @@ fn legacy_runtime_identity(
             {
                 (
                     "claude-agent-acp",
-                    Some("0.64.2".to_string()),
+                    Some("0.71.0".to_string()),
                     None,
                     BTreeMap::new(),
                     AgentVersionSource::Managed,
@@ -1217,9 +1217,9 @@ fn legacy_runtime_identity(
             }
             ("codex", None) if looks_managed_adapter_command(command, args, "codex-acp") => (
                 "codex-acp",
-                Some("1.1.9".to_string()),
-                Some("0.146.0".to_string()),
-                BTreeMap::from([("@openai/codex".to_string(), "0.146.0".to_string())]),
+                Some("1.8.0".to_string()),
+                Some("0.152.1".to_string()),
+                BTreeMap::from([("@openai/codex".to_string(), "0.152.1".to_string())]),
                 AgentVersionSource::Managed,
             ),
             ("zcode", None) if looks_managed_adapter_command(command, args, "zcode-acp-server") => {
@@ -2047,14 +2047,14 @@ mod tests {
             &conn,
             "claude",
             "claude-acp",
-            "0.65.0",
+            "0.72.0",
             claude_command,
             claude_args.clone(),
         );
         let claude_profile = ProviderProfile::local_default(ProviderKind::Claude);
         let claude_identity =
             legacy_runtime_identity(&conn, &claude_profile, claude_command, &claude_args).unwrap();
-        assert_eq!(claude_identity.adapter_version.as_deref(), Some("0.65.0"));
+        assert_eq!(claude_identity.adapter_version.as_deref(), Some("0.72.0"));
         assert_eq!(
             registry.resolve(&claude_identity).unwrap().match_kind,
             ProjectionDescriptorMatch::SemverRange
@@ -2066,14 +2066,14 @@ mod tests {
             &conn,
             "codex",
             "codex-acp",
-            "1.1.13",
+            "1.8.13",
             codex_command,
             codex_args.clone(),
         );
         let codex_profile = ProviderProfile::local_default(ProviderKind::Codex);
         let codex_identity =
             legacy_runtime_identity(&conn, &codex_profile, codex_command, &codex_args).unwrap();
-        assert_eq!(codex_identity.adapter_version.as_deref(), Some("1.1.13"));
+        assert_eq!(codex_identity.adapter_version.as_deref(), Some("1.8.13"));
         assert!(codex_identity.runtime_dependencies.is_empty());
         assert_eq!(
             registry.resolve(&codex_identity).unwrap().match_kind,
