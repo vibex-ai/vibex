@@ -277,6 +277,8 @@ const AGENT_SESSION_VIEW_CACHE_LIMIT: usize = 12;
 const AGENT_SESSION_VIEW_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const TIMELINE_MARKDOWN_SOURCE_CACHE_LIMIT: usize = 32;
 const TIMELINE_MARKDOWN_SOURCE_CACHE_BYTES: usize = 2 * 1024 * 1024;
+const TIMELINE_REASONING_SUMMARY_CACHE_LIMIT: usize = 64;
+const TIMELINE_REASONING_SUMMARY_CACHE_BYTES: usize = 2 * 1024 * 1024;
 const TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 const TIMELINE_STREAMING_MARKDOWN_REFRESH_BYTES: usize = 8 * 1024;
 const AGENT_THINKING_SHIMMER_DURATION: Duration = Duration::from_secs(12);
@@ -1148,6 +1150,72 @@ fn insert_bounded_timeline_projection<T>(
 struct TimelineMarkdownSourceSnapshot {
     source: Arc<str>,
     refreshed_at: Instant,
+}
+
+#[derive(Clone)]
+struct AgentReasoningSummary {
+    plain: Arc<str>,
+    preview: Arc<str>,
+    tooltip: Arc<str>,
+    has_more: bool,
+}
+
+// Collapsed reasoning rows sit inside an animated GPUI subtree. Keep their
+// parsed projection outside the render closure so shimmer repaints do not
+// reparse the streaming Markdown source.
+#[derive(Clone)]
+struct TimelineReasoningSummarySnapshot {
+    source_len: usize,
+    source_ptr: usize,
+    summary: AgentReasoningSummary,
+}
+
+fn timeline_reasoning_summary_cached(
+    cache: &mut BTreeMap<String, (i64, TimelineReasoningSummarySnapshot)>,
+    key: String,
+    sequence: i64,
+    source: &str,
+) -> AgentReasoningSummary {
+    let source_ptr = source.as_ptr() as usize;
+    if let Some((cached_sequence, snapshot)) = cache.get(&key)
+        && *cached_sequence == sequence
+        && snapshot.source_len == source.len()
+        && snapshot.source_ptr == source_ptr
+    {
+        return snapshot.summary.clone();
+    }
+
+    let (plain, _) = agent_markdown_summary(source);
+    let plain: Arc<str> = Arc::from(plain);
+    let preview: Arc<str> = Arc::from(reasoning_preview_text(&plain));
+    let tooltip: Arc<str> = Arc::from(plain.trim());
+    let summary = AgentReasoningSummary {
+        has_more: plain.chars().count() > AGENT_THINKING_LABEL_MAX_CHARS,
+        plain,
+        preview,
+        tooltip,
+    };
+    insert_bounded_timeline_projection(
+        cache,
+        key,
+        sequence,
+        TimelineReasoningSummarySnapshot {
+            source_len: source.len(),
+            source_ptr,
+            summary: summary.clone(),
+        },
+        TIMELINE_REASONING_SUMMARY_CACHE_LIMIT,
+        TIMELINE_REASONING_SUMMARY_CACHE_BYTES,
+        |snapshot| {
+            snapshot
+                .summary
+                .plain
+                .len()
+                .saturating_add(snapshot.summary.preview.len())
+                .saturating_add(snapshot.summary.tooltip.len())
+        },
+    );
+    summary
 }
 
 fn timeline_markdown_source_snapshot(
@@ -4375,6 +4443,7 @@ pub struct VibexWorkbench {
     timeline_estimated_turn_heights: BTreeMap<String, (u64, f32)>,
     timeline_layout_width: Option<f32>,
     timeline_markdown_sources: BTreeMap<String, (i64, TimelineMarkdownSourceSnapshot)>,
+    timeline_reasoning_summaries: BTreeMap<String, (i64, TimelineReasoningSummarySnapshot)>,
     timeline_tool_card_projections: BTreeMap<String, (i64, Rc<ToolCardProjection>)>,
     timeline_file_diff_previews: BTreeMap<String, (i64, Rc<AgentFileDiffPreview>)>,
     timeline_file_diff_scrolls: BTreeMap<String, gpui::ScrollHandle>,
@@ -5117,6 +5186,7 @@ impl VibexWorkbench {
             timeline_estimated_turn_heights: BTreeMap::new(),
             timeline_layout_width: None,
             timeline_markdown_sources: BTreeMap::new(),
+            timeline_reasoning_summaries: BTreeMap::new(),
             timeline_tool_card_projections: BTreeMap::new(),
             timeline_file_diff_previews: BTreeMap::new(),
             timeline_file_diff_scrolls: BTreeMap::new(),
@@ -9248,6 +9318,7 @@ impl VibexWorkbench {
         };
         entry.estimated_resident_bytes = entry.calculate_estimated_resident_bytes();
         self.timeline_markdown_sources.clear();
+        self.timeline_reasoning_summaries.clear();
         self.timeline_tool_card_projections.clear();
         self.timeline_file_diff_previews.clear();
         self.timeline_file_diff_scrolls.clear();
@@ -9332,6 +9403,7 @@ impl VibexWorkbench {
             entry.timeline_measured_turn_layout_signatures;
         self.timeline_estimated_turn_heights = entry.timeline_estimated_turn_heights;
         self.timeline_markdown_sources.clear();
+        self.timeline_reasoning_summaries.clear();
         self.timeline_tool_card_projections.clear();
         self.timeline_file_diff_previews.clear();
         self.timeline_file_diff_scrolls.clear();
@@ -11294,6 +11366,7 @@ impl VibexWorkbench {
         self.timeline_pending_turn_heights.clear();
         self.timeline_estimated_turn_heights.clear();
         self.timeline_markdown_sources.clear();
+        self.timeline_reasoning_summaries.clear();
         self.timeline_tool_card_projections.clear();
         self.timeline_file_diff_previews.clear();
         self.timeline_file_diff_scrolls.clear();
@@ -33960,9 +34033,6 @@ impl VibexWorkbench {
     ) -> AnyElement {
         let row_id = format!("reasoning-live:{}", turn.id);
         let expanded = self.reasoning_row_expanded(&row_id);
-        let plain = agent_markdown_summary(body).0;
-        let preview = reasoning_preview_text(&plain);
-        let has_more = plain.chars().count() > AGENT_THINKING_LABEL_MAX_CHARS;
         let tooltip = self.strings().agent_expand_process;
         let turn_id = turn.id.clone();
         if expanded {
@@ -34004,7 +34074,15 @@ impl VibexWorkbench {
                 cx,
             );
         }
-        let content = render_agent_thinking_indicator(&row_id, &preview, plain.trim(), cx);
+        let sequence = i64::try_from(self.active_timeline().revision).unwrap_or(i64::MAX);
+        let summary = timeline_reasoning_summary_cached(
+            &mut self.timeline_reasoning_summaries,
+            row_id.clone(),
+            sequence,
+            body,
+        );
+        let content =
+            render_agent_thinking_indicator(&row_id, &summary.preview, &summary.tooltip, cx);
         let toggle_id = row_id.clone();
         let mut container = h_flex()
             .id(row_id.clone())
@@ -34013,7 +34091,7 @@ impl VibexWorkbench {
             .items_center()
             .gap_1()
             .child(content);
-        if has_more {
+        if summary.has_more {
             container = container
                 .cursor_pointer()
                 .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
@@ -34032,10 +34110,6 @@ impl VibexWorkbench {
         let row_id = row.id.clone();
         let turn_id = row.turn_id.clone();
         let expanded = self.reasoning_row_expanded(&row_id);
-        let plain = agent_markdown_summary(&row.body).0;
-        let preview = reasoning_preview_text(&plain);
-        let has_more = plain.chars().count() > AGENT_THINKING_LABEL_MAX_CHARS;
-        let disclosure_visible = has_more;
         if expanded {
             let search_query = self
                 .session_search_highlight_query_for_rows(std::slice::from_ref(row))
@@ -34074,8 +34148,15 @@ impl VibexWorkbench {
             return self
                 .render_expanded_reasoning_layout(row_id, turn_id, first_line, remaining, cx);
         }
+        let summary = timeline_reasoning_summary_cached(
+            &mut self.timeline_reasoning_summaries,
+            row_id.clone(),
+            row.last_sequence,
+            &row.body,
+        );
+        let disclosure_visible = summary.has_more;
         let content = if row.streaming {
-            render_agent_thinking_indicator(&row_id, &preview, plain.trim(), cx)
+            render_agent_thinking_indicator(&row_id, &summary.preview, &summary.tooltip, cx)
         } else {
             div()
                 .id(format!("reasoning-preview:{row_id}"))
@@ -34083,7 +34164,7 @@ impl VibexWorkbench {
                 .truncate()
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
-                .child(preview)
+                .child(summary.preview.to_string())
                 .into_any_element()
         };
         let tooltip = self.strings().agent_expand_process;
@@ -39706,8 +39787,7 @@ fn render_agent_thinking_indicator(
 ) -> AnyElement {
     let base = cx.theme().muted_foreground.opacity(0.75);
     let glow = cx.theme().foreground;
-    let label = truncate_agent_thinking_label(label);
-    let character_count = label.chars().count();
+    let label: SharedString = truncate_agent_thinking_label(label).into();
     let tooltip = tooltip.to_string();
     let element_id = format!("agent-thinking-{turn_id}");
     let animation_id = format!("{element_id}-animation");
@@ -39731,18 +39811,12 @@ fn render_agent_thinking_indicator(
                     Animation::new(AGENT_THINKING_SHIMMER_DURATION).repeat(),
                     move |this, delta| {
                         let scan_position = shimmer_scan_position(delta, 0.0, 1.0);
-                        this.child(h_flex().flex_none().whitespace_nowrap().children(
-                            label.chars().enumerate().map(|(index, character)| {
-                                let position = if character_count > 1 {
-                                    index as f32 / (character_count - 1) as f32
-                                } else {
-                                    0.5
-                                };
-                                div().flex_none().child(character.to_string()).text_color(
-                                    shimmer_color(base, glow, position, scan_position, 0.42),
-                                )
-                            }),
-                        ))
+                        // Keep the animation on one text node. Building a GPUI
+                        // child for every glyph on every animation frame made
+                        // long streaming reasoning labels disproportionately
+                        // expensive to repaint.
+                        this.text_color(shimmer_color(base, glow, 0.5, scan_position, 0.42))
+                            .child(label.clone())
                     },
                 ),
         )
@@ -58864,6 +58938,71 @@ mod tests {
         )
         .1;
         assert_eq!(paths, ["src/editor.rs"]);
+    }
+
+    #[test]
+    fn reasoning_summary_cache_reuses_the_same_source_revision() {
+        let mut cache = BTreeMap::new();
+        let first = timeline_reasoning_summary_cached(
+            &mut cache,
+            "reasoning:one".into(),
+            1,
+            "Inspecting **the workspace**",
+        );
+        let second = timeline_reasoning_summary_cached(
+            &mut cache,
+            "reasoning:one".into(),
+            1,
+            "Inspecting **the workspace**",
+        );
+
+        assert!(Arc::ptr_eq(&first.plain, &second.plain));
+        assert!(Arc::ptr_eq(&first.preview, &second.preview));
+        assert!(Arc::ptr_eq(&first.tooltip, &second.tooltip));
+        assert_eq!(first.preview.as_ref(), "Inspecting the workspace");
+    }
+
+    #[test]
+    fn reasoning_summary_cache_recomputes_when_revision_or_body_changes() {
+        let mut cache = BTreeMap::new();
+        let first = timeline_reasoning_summary_cached(
+            &mut cache,
+            "reasoning:one".into(),
+            1,
+            "first reasoning update",
+        );
+        let changed_revision = timeline_reasoning_summary_cached(
+            &mut cache,
+            "reasoning:one".into(),
+            2,
+            "second reasoning update",
+        );
+        let changed_body = timeline_reasoning_summary_cached(
+            &mut cache,
+            "reasoning:one".into(),
+            2,
+            "second reasoning update with more context",
+        );
+
+        assert!(!Arc::ptr_eq(&first.plain, &changed_revision.plain));
+        assert!(!Arc::ptr_eq(&changed_revision.plain, &changed_body.plain));
+        assert_eq!(
+            changed_body.preview.as_ref(),
+            "second reasoning update with more context"
+        );
+    }
+
+    #[test]
+    fn reasoning_summary_cache_keeps_rows_with_same_revision_isolated() {
+        let mut cache = BTreeMap::new();
+        let first =
+            timeline_reasoning_summary_cached(&mut cache, "reasoning:one".into(), 1, "first row");
+        let second =
+            timeline_reasoning_summary_cached(&mut cache, "reasoning:two".into(), 1, "second row");
+
+        assert_eq!(first.preview.as_ref(), "first row");
+        assert_eq!(second.preview.as_ref(), "second row");
+        assert!(!Arc::ptr_eq(&first.plain, &second.plain));
     }
 
     #[test]

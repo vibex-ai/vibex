@@ -1080,6 +1080,10 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   entry limit and a resident-byte budget, and a single oversized active value may
   remain as the sole cached entry without allowing older entries to grow
   unbounded.
+- Collapsed reasoning previews and tooltips are derived once per stable row
+  revision and reused across animated repaints. The expanded reasoning path
+  delegates parsing to the keyed background `MarkdownView`; it must not parse
+  the same source synchronously before deciding which disclosure state to show.
 - A GPUI User bubble uses one full-width `flex + justify_end` wrapper and an
   intrinsic-width, non-shrinking bubble with a bounded maximum width. Keep its
   text body as a plain intrinsic child: do not put `min_w_0` on it and do not
