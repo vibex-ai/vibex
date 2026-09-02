@@ -34167,16 +34167,50 @@ impl VibexWorkbench {
         let tooltip = self.strings().agent_collapse_process;
         let toggle_id = row_id.clone();
         let connector_color = cx.theme().muted_foreground.opacity(0.46);
-        let mut text = v_flex().min_w_0().flex_1().child(
-            h_flex()
-                .min_w_0()
-                .items_start()
-                .gap_1()
-                .child(first_line)
-                .child(Icon::new(IconName::ChevronDown).size(px(14.0)).flex_none()),
-        );
+        let first_line_row = h_flex()
+            .min_w_0()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .size(px(16.0))
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        Icon::default()
+                            .path("icons/vibex/brain.svg")
+                            .size(px(14.0))
+                            .text_color(cx.theme().muted_foreground),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .items_center()
+                    .gap_1()
+                    .child(first_line)
+                    .child(Icon::new(IconName::ChevronDown).size(px(14.0)).flex_none()),
+            );
+        let mut content = v_flex().min_w_0().flex_1().child(first_line_row);
         if let Some(remaining) = remaining {
-            text = text.child(remaining);
+            content = content.child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_stretch()
+                    .gap_2()
+                    .child(
+                        v_flex()
+                            .w(px(16.0))
+                            .flex_none()
+                            .items_center()
+                            .child(div().w(px(1.0)).flex_1().bg(connector_color)),
+                    )
+                    .child(remaining),
+            );
         }
 
         h_flex()
@@ -34184,24 +34218,9 @@ impl VibexWorkbench {
             .w_full()
             .min_w_0()
             .items_stretch()
-            .gap_2()
             .cursor_pointer()
             .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
-            .child(
-                v_flex()
-                    .w(px(16.0))
-                    .flex_none()
-                    .items_center()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(
-                        Icon::default()
-                            .path("icons/vibex/brain.svg")
-                            .size(px(14.0))
-                            .text_color(cx.theme().muted_foreground),
-                    )
-                    .child(div().mt(px(2.0)).w(px(1.0)).flex_1().bg(connector_color)),
-            )
-            .child(text)
+            .child(content)
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.toggle_reasoning_expansion(toggle_id.clone(), turn_id.clone(), cx)
             }))
