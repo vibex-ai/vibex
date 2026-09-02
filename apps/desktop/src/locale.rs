@@ -219,7 +219,7 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             open_workspace: "Open a workspace",
             no_preview: "No preview",
             no_workspace_files: "No workspace files",
-            message_agent: "Try \"fix the failing tests\", \"explain this module\", or \"add a retry with backoff\"",
+            message_agent: "Type / for commands, @ for workspace files, $ for skills",
             agent_loading_session: "Loading session...",
             agent_start_conversation: "Start a conversation",
             agent_select_session: "Create or select a session",
@@ -232,7 +232,7 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             agent_collapse_process: "Collapse reasoning",
             new_session_slogan: "Start something new",
             new_session_description: "Create a fresh session from a project directory or a temporary workspace",
-            new_session_prompt_placeholder: "Try \"fix the failing tests in auth\" or \"explain how this project is structured\"",
+            new_session_prompt_placeholder: "Describe a task, or type / for commands, @ for files, $ for skills",
             new_session_project_label: "Project directory",
             new_session_project_placeholder: "Optional: enter or paste a project directory path",
             new_session_search_project: "Search projects...",
@@ -384,7 +384,7 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             open_workspace: "打开工作区",
             no_preview: "暂无预览",
             no_workspace_files: "暂无工作区文件",
-            message_agent: "试试：修复失败的测试、解释这个模块、给 API 加上重试逻辑",
+            message_agent: "输入 / 唤出命令，@ 引用工作区文件，$ 调用技能",
             agent_loading_session: "正在加载会话...",
             agent_start_conversation: "开始对话",
             agent_select_session: "创建或选择会话",
@@ -397,7 +397,7 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             agent_collapse_process: "收起推理过程",
             new_session_slogan: "开始新的工作",
             new_session_description: "从项目目录或临时工作区创建一个新的会话",
-            new_session_prompt_placeholder: "试试：修复 auth 模块中失败的测试，或者解释这个项目的结构",
+            new_session_prompt_placeholder: "描述你的任务，或输入 / 唤出命令、@ 引用文件、$ 调用技能",
             new_session_project_label: "项目目录",
             new_session_project_placeholder: "可选：输入或粘贴项目目录路径",
             new_session_search_project: "搜索项目...",
@@ -549,7 +549,7 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             open_workspace: "開啟工作區",
             no_preview: "暫無預覽",
             no_workspace_files: "暫無工作區檔案",
-            message_agent: "試試：修復失敗的測試、解釋這個模組、為 API 加上重試邏輯",
+            message_agent: "輸入 / 喚出命令，@ 引用工作區檔案，$ 呼叫技能",
             agent_loading_session: "正在載入會話...",
             agent_start_conversation: "開始對話",
             agent_select_session: "建立或選擇會話",
@@ -562,7 +562,7 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             agent_collapse_process: "收起推理過程",
             new_session_slogan: "開始新的工作",
             new_session_description: "從專案目錄或臨時工作區建立一個新的會話。",
-            new_session_prompt_placeholder: "試試：修復 auth 模組中失敗的測試，或者解釋這個專案的結構",
+            new_session_prompt_placeholder: "描述你的任務，或輸入 / 喚出命令、@ 引用檔案、$ 呼叫技能",
             new_session_project_label: "專案目錄",
             new_session_project_placeholder: "可選：輸入或貼上專案目錄路徑",
             new_session_search_project: "搜尋專案...",
@@ -1571,7 +1571,7 @@ mod tests {
         assert_eq!(strings(ResolvedLocale::ZhTw).undo_changes, "撤銷變更");
         assert_eq!(
             strings(ResolvedLocale::ZhCn).message_agent,
-            "试试：修复失败的测试、解释这个模块、给 API 加上重试逻辑"
+            "输入 / 唤出命令，@ 引用工作区文件，$ 调用技能"
         );
         assert_eq!(strings(ResolvedLocale::ZhTw).appearance, "外觀");
         assert_eq!(strings(ResolvedLocale::ZhCn).session_settings, "会话");
@@ -1613,15 +1613,15 @@ mod tests {
         );
         assert_eq!(
             strings(ResolvedLocale::En).new_session_prompt_placeholder,
-            "Try \"fix the failing tests in auth\" or \"explain how this project is structured\""
+            "Describe a task, or type / for commands, @ for files, $ for skills"
         );
         assert_eq!(
             strings(ResolvedLocale::ZhCn).new_session_prompt_placeholder,
-            "试试：修复 auth 模块中失败的测试，或者解释这个项目的结构"
+            "描述你的任务，或输入 / 唤出命令、@ 引用文件、$ 调用技能"
         );
         assert_eq!(
             strings(ResolvedLocale::ZhTw).new_session_prompt_placeholder,
-            "試試：修復 auth 模組中失敗的測試，或者解釋這個專案的結構"
+            "描述你的任務，或輸入 / 喚出命令、@ 引用檔案、$ 呼叫技能"
         );
     }
 
