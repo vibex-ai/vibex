@@ -33831,9 +33831,9 @@ impl VibexWorkbench {
             .id(row_id.clone())
             .w_full()
             .min_w_0()
-            .items_start()
-            .gap_2()
-            .child(div().min_w_0().flex_1().child(content));
+            .items_center()
+            .gap_1()
+            .child(content);
         if has_more {
             container = container
                 .cursor_pointer()
@@ -33901,7 +33901,6 @@ impl VibexWorkbench {
             div()
                 .id(format!("reasoning-preview:{row_id}"))
                 .min_w_0()
-                .flex_1()
                 .truncate()
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
@@ -33911,14 +33910,17 @@ impl VibexWorkbench {
         let tooltip = self.strings().agent_expand_process;
         let toggle_id = row_id.clone();
         let toggle_turn_id = turn_id.clone();
+        // Keep the disclosure chevron beside the text content instead of
+        // pushing it to the far edge of the row. The content is shrinkable, so
+        // long previews still truncate before the chevron.
         let mut container = h_flex()
             .id(format!("reasoning-row:{row_id}"))
             .w_full()
             .min_w_0()
-            .items_start()
-            .gap_2()
+            .items_center()
+            .gap_1()
             .text_color(cx.theme().muted_foreground)
-            .child(div().min_w_0().flex_1().child(content));
+            .child(content);
         if disclosure_visible {
             container = container
                 .cursor_pointer()
@@ -39530,8 +39532,10 @@ fn render_agent_thinking_indicator(
     let tooltip = tooltip.to_string();
     let element_id = format!("agent-thinking-{turn_id}");
     let animation_id = format!("{element_id}-animation");
+    // The indicator hugs its shimmer label so callers can place a disclosure
+    // chevron directly after it. Constrained rows shrink it via `min_w_0` and
+    // clip the nowrap label with `overflow_hidden`.
     h_flex()
-        .w_full()
         .min_w_0()
         .justify_start()
         .py_1()
@@ -39540,7 +39544,6 @@ fn render_agent_thinking_indicator(
                 .id(element_id)
                 .relative()
                 .min_w_0()
-                .flex_1()
                 .overflow_hidden()
                 .text_sm()
                 .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
