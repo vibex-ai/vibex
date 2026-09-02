@@ -9598,29 +9598,7 @@ impl VibexWorkbench {
         }
         if !session_running {
             self.agent_generation_stats = None;
-            let (input_tokens, output_tokens, cache_rate) = self.agent_token_usage_metrics();
-            if input_tokens.is_none() && output_tokens.is_none() && cache_rate.is_none() {
-                return None;
-            }
-            let muted_foreground = cx.theme().muted_foreground;
-            return Some(
-                h_flex()
-                    .id("agent-token-usage")
-                    .w_full()
-                    .h(px(24.0))
-                    .flex_none()
-                    .items_center()
-                    .justify_center()
-                    .text_xs()
-                    .text_color(muted_foreground)
-                    .child(self.agent_idle_token_usage_items(
-                        muted_foreground,
-                        input_tokens,
-                        output_tokens,
-                        cache_rate,
-                    ))
-                    .into_any_element(),
-            );
+            return None;
         }
         let Some(turn) = self
             .conversation_turns_cache
@@ -9768,39 +9746,6 @@ impl VibexWorkbench {
                 })
                 .into_any_element(),
         )
-    }
-
-    fn agent_idle_token_usage_items(
-        &self,
-        muted_foreground: Hsla,
-        input_tokens: Option<u64>,
-        output_tokens: Option<u64>,
-        cache_rate: Option<u32>,
-    ) -> gpui::Div {
-        h_flex()
-            .items_center()
-            .gap(px(6.0))
-            .when_some(input_tokens, |this, tokens| {
-                this.child(
-                    h_flex()
-                        .items_center()
-                        .gap(px(2.0))
-                        .text_color(muted_foreground)
-                        .child(Icon::new(IconName::ArrowUp).size(px(12.0)))
-                        .child(format_compact_tokens(tokens)),
-                )
-            })
-            .when_some(output_tokens, |this, tokens| {
-                this.child(
-                    h_flex()
-                        .items_center()
-                        .gap(px(2.0))
-                        .text_color(muted_foreground)
-                        .child(Icon::new(IconName::ArrowDown).size(px(12.0)))
-                        .child(format_compact_tokens(tokens)),
-                )
-            })
-            .when_some(cache_rate, |this, rate| this.child(format!("{rate}%")))
     }
 
     fn agent_token_usage_metrics(&self) -> (Option<u64>, Option<u64>, Option<u32>) {
@@ -57692,7 +57637,7 @@ mod tests {
         assert!(generation_status.contains("self.agent_generation_stats = None"));
         assert!(generation_status.contains("if !session_running"));
         assert!(generation_status.contains("agent_token_usage_metrics"));
-        assert!(generation_status.contains("agent_idle_token_usage_items"));
+        assert!(!generation_status.contains("agent_idle_token_usage_items"));
         assert!(generation_status.contains("Icon::new(IconName::ArrowUp)"));
         assert!(generation_status.contains("Icon::new(IconName::ArrowDown)"));
         assert!(generation_status.contains("format_compact_tokens"));
