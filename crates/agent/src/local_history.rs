@@ -75,15 +75,13 @@ enum LocalHistoryLocator {
         database: PathBuf,
         session_id: String,
     },
-    Hermes {
+    Zcode {
         database: PathBuf,
         session_id: String,
     },
-    OpenClaw {
-        transcript: PathBuf,
-        agent_id: String,
+    Hermes {
+        database: PathBuf,
         session_id: String,
-        leaf_id: String,
     },
     DeepSeek {
         session_dir: PathBuf,
@@ -136,7 +134,6 @@ fn cacheable(source: LocalHistorySource) -> bool {
             | LocalHistorySource::Codex
             | LocalHistorySource::CodeBuddy
             | LocalHistorySource::Pi
-            | LocalHistorySource::Qoder
     )
 }
 
@@ -201,9 +198,6 @@ fn source_root(source: LocalHistorySource) -> Option<PathBuf> {
         LocalHistorySource::Gemini => {
             resolve_gemini_base_dir_from(std::env::var_os("GEMINI_CLI_HOME"), Some(home.clone()))
         }
-        LocalHistorySource::OpenClaw => {
-            env_path("OPENCLAW_HOME").unwrap_or_else(|| home.join(".openclaw"))
-        }
         LocalHistorySource::Cline => {
             env_path("CLINE_DIR").unwrap_or_else(|| home.join(".cline").join("data"))
         }
@@ -228,12 +222,7 @@ fn source_root(source: LocalHistorySource) -> Option<PathBuf> {
             std::env::var_os("DSH_HOME"),
             Some(home.clone()),
         ),
-        LocalHistorySource::Qoder => resolve_qoder_config_dir_from(
-            std::env::var_os("QODER_CONFIG_DIR"),
-            std::env::var_os("QODER_CLI_HOME").or_else(|| std::env::var_os("GEMINI_CLI_HOME")),
-            std::env::var_os("QODER_CONFIG_DIR_NAME"),
-            Some(home.clone()),
-        ),
+        LocalHistorySource::Zcode => env_path("ZCODE_HOME").unwrap_or_else(|| home.join(".zcode")),
         LocalHistorySource::Antigravity => {
             resolve_antigravity_acp_dir_from(std::env::var_os("GEMINI_HOME"), Some(home))
         }
@@ -251,29 +240,6 @@ fn resolve_gemini_base_dir_from(
         .or(home_dir)
         .unwrap_or_default()
         .join(".gemini")
-}
-
-/// Qoder's explicit config directory wins over its relocated home and the
-/// optional directory-name override.
-fn resolve_qoder_config_dir_from(
-    config_dir_env: Option<OsString>,
-    cli_home_env: Option<OsString>,
-    config_dir_name_env: Option<OsString>,
-    home_dir: Option<PathBuf>,
-) -> PathBuf {
-    if let Some(config_dir) = config_dir_env.filter(|value| !value.is_empty()) {
-        return PathBuf::from(config_dir);
-    }
-    let root = cli_home_env
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or(home_dir)
-        .unwrap_or_default();
-    root.join(
-        config_dir_name_env
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| OsString::from(".qoder")),
-    )
 }
 
 /// Expand only the `~` and `~/...` forms used by the local Agent stores.
@@ -446,6 +412,7 @@ fn scan_source(root: LocalHistorySourceRoot) -> ScanBatch {
         LocalHistorySource::Gemini => scan_gemini(&root),
         LocalHistorySource::Cline => scan_cline(&root),
         LocalHistorySource::OpenCode => scan_opencode(&root),
+        LocalHistorySource::Zcode => scan_zcode(&root),
         LocalHistorySource::Hermes => scan_hermes(&root),
         LocalHistorySource::CodeBuddy => scan_codebuddy(&root),
         LocalHistorySource::Kimi => scan_kimi(&root),
@@ -453,8 +420,6 @@ fn scan_source(root: LocalHistorySourceRoot) -> ScanBatch {
         LocalHistorySource::Grok => scan_grok(&root),
         LocalHistorySource::Cursor => scan_cursor(&root),
         LocalHistorySource::DeepSeek => scan_deepseek(&root),
-        LocalHistorySource::Qoder => scan_qoder(&root),
-        LocalHistorySource::OpenClaw => scan_openclaw(&root),
         LocalHistorySource::Antigravity => scan_antigravity(&root),
     };
     if let Ok(mut cache) = locator_cache().lock() {
@@ -3817,835 +3782,214 @@ fn parse_deepseek_timeline(
 }
 
 // ---------------------------------------------------------------------------
-// Qoder CLI
+// ZCode (SQLite)
 // ---------------------------------------------------------------------------
 
-fn scan_qoder(root: &LocalHistorySourceRoot) -> ScanBatch {
+fn scan_zcode(root: &LocalHistorySourceRoot) -> ScanBatch {
     let mut batch = ScanBatch::default();
-    let projects = root_child(&root.root, "projects");
-    for project in direct_subdirs(&projects) {
-        // Qoder's top-level session is exactly one file below the encoded cwd.
-        for path in direct_files(&project)
-            .into_iter()
-            .filter(|path| is_jsonl(path))
+    let database = if root.root.is_file() {
+        root.root.clone()
+    } else {
+        root.root.join("cli").join("db").join("db.sqlite")
+    };
+    let Ok(connection) = open_readonly(&database) else {
+        return batch;
+    };
+    let Ok(mut statement) = connection.prepare(&format!(
+        "{ZCODE_SESSION_QUERY} ORDER BY s.time_created DESC"
+    )) else {
+        return batch;
+    };
+    let Ok(rows) = statement.query_map([], zcode_session_row) else {
+        return batch;
+    };
+    for row in rows.flatten().take(MAX_SESSIONS_PER_SOURCE) {
+        let (id, directory, title, created, updated, count, model, parent_id) = row;
+        // Child rows represent delegated work and are not root import choices.
+        if parent_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            || count <= 0
         {
-            let parsed = cached_file_summary(LocalHistorySource::Qoder, &path, || {
-                parse_qoder_summary(&path)
-            });
-            append_summary(
-                &mut batch,
-                LocalHistorySource::Qoder,
-                parsed,
-                LocalHistoryLocator::Transcript(path),
-            );
-            if batch.found.len() >= MAX_SESSIONS_PER_SOURCE {
-                return batch;
-            }
+            continue;
         }
+        let Some(summary) = build_summary(
+            LocalHistorySource::Zcode,
+            id.clone(),
+            title,
+            directory,
+            &database,
+            Some(timestamp_number_to_ms(created)),
+            Some(timestamp_number_to_ms(updated)),
+            count.min(u32::MAX as i64) as u32,
+            model,
+        ) else {
+            continue;
+        };
+        batch.found.push(FoundSession {
+            summary,
+            locator: LocalHistoryLocator::Zcode {
+                database: database.clone(),
+                session_id: id,
+            },
+        });
     }
     batch
 }
 
-fn qoder_records(path: &Path) -> Result<Vec<Value>, String> {
-    let mut records = Vec::new();
-    for_each_jsonl(path, |value| records.push(value))?;
-    Ok(records)
+const ZCODE_SESSION_QUERY: &str = r#"
+    SELECT
+        s.id,
+        s.directory,
+        s.title,
+        s.time_created,
+        s.time_updated,
+        COALESCE((SELECT COUNT(*) FROM message m WHERE m.session_id = s.id), 0),
+        (SELECT json_extract(m2.data, '$.modelID')
+           FROM message m2
+          WHERE m2.session_id = s.id
+            AND json_extract(m2.data, '$.role') = 'assistant'
+          ORDER BY m2.time_created DESC LIMIT 1),
+        s.parent_id
+      FROM session s
+"#;
+
+fn zcode_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ZcodeSessionRecord> {
+    Ok((
+        row.get::<_, String>(0)?,
+        row.get::<_, Option<String>>(1)?,
+        row.get::<_, Option<String>>(2)?,
+        row.get::<_, i64>(3)?,
+        row.get::<_, i64>(4)?,
+        row.get::<_, i64>(5)?,
+        row.get::<_, Option<String>>(6)?,
+        row.get::<_, Option<String>>(7)?,
+    ))
 }
 
-fn qoder_is_sidechain(value: &Value) -> bool {
-    bool_field(value, "isSidechain")
-}
+type ZcodeSessionRecord = (
+    String,
+    Option<String>,
+    Option<String>,
+    i64,
+    i64,
+    i64,
+    Option<String>,
+    Option<String>,
+);
 
-fn qoder_chain(records: &[Value]) -> Vec<Value> {
-    let append_order = records
-        .iter()
-        .enumerate()
-        .filter(|(_, record)| {
-            matches!(
-                record.get("type").and_then(Value::as_str),
-                Some("user" | "assistant")
-            ) && !qoder_is_sidechain(record)
-        })
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    let mut by_id = HashMap::new();
-    let mut has_links = false;
-    for (index, record) in records.iter().enumerate() {
-        if qoder_is_sidechain(record) {
-            continue;
-        }
-        if let Some(id) = string_field(record, "uuid") {
-            by_id.entry(id).or_insert(index);
-        }
-        has_links |= ["parentUuid", "logicalParentUuid"]
-            .iter()
-            .any(|key| string_field(record, key).is_some_and(|parent| !parent.is_empty()));
-    }
-    let tail = append_order.last().copied();
-    let newest_marker = records
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, record)| record.get("type").and_then(Value::as_str) == Some("active-leaf"));
-    if let Some((position, marker)) = newest_marker {
-        if matches!(marker.get("leafUuid"), Some(Value::Null))
-            && tail.is_none_or(|tail_index| position > tail_index)
-        {
-            return Vec::new();
-        }
-    }
-    if !has_links {
-        return append_order
-            .into_iter()
-            .map(|index| records[index].clone())
-            .collect();
-    }
-    let marker = records
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(position, record)| {
-            if record.get("type").and_then(Value::as_str) != Some("active-leaf") {
-                return None;
-            }
-            let leaf = record.get("leafUuid").and_then(Value::as_str)?;
-            by_id.get(leaf).copied().map(|index| (position, index))
-        });
-    let (leaf, chosen_by_marker) = match (marker, tail) {
-        (Some((marker_position, marker_index)), Some(tail_index)) => {
-            if marker_position > tail_index {
-                (marker_index, true)
-            } else {
-                (tail_index, false)
-            }
-        }
-        (Some((_, marker_index)), None) => (marker_index, true),
-        (None, Some(tail_index)) => (tail_index, false),
-        (None, None) => return Vec::new(),
+fn parse_zcode_summary(
+    database: &Path,
+    session_id: &str,
+) -> Result<Option<LocalHistorySessionSummary>, String> {
+    let connection = open_readonly(database).map_err(|error| error.to_string())?;
+    let query = format!("{ZCODE_SESSION_QUERY} WHERE s.id = ?1 LIMIT 1");
+    let row = connection
+        .query_row(&query, params![session_id], zcode_session_row)
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((id, directory, title, created, updated, count, model, parent_id)) = row else {
+        return Ok(None);
     };
-    let mut chain = Vec::new();
-    let mut visited = HashSet::new();
-    let mut reached_root = false;
-    let mut cursor = Some(leaf);
-    while let Some(index) = cursor {
-        if !visited.insert(index) {
-            break;
-        }
-        chain.push(index);
-        let parent = string_field(&records[index], "parentUuid")
-            .or_else(|| string_field(&records[index], "logicalParentUuid"));
-        match parent.and_then(|id| by_id.get(&id).copied()) {
-            Some(parent) => cursor = Some(parent),
-            None => {
-                reached_root = true;
-                break;
-            }
-        }
-    }
-    if !reached_root {
-        return append_order
-            .into_iter()
-            .map(|index| records[index].clone())
-            .collect();
-    }
-    chain.reverse();
-    chain.retain(|index| {
-        matches!(
-            records[*index].get("type").and_then(Value::as_str),
-            Some("user" | "assistant")
-        ) && !qoder_is_sidechain(&records[*index])
-    });
-    if chain.is_empty() || (!chosen_by_marker && chain.len() < 2 && append_order.len() > 1) {
-        return append_order
-            .into_iter()
-            .map(|index| records[index].clone())
-            .collect();
-    }
-    let on_chain = chain.iter().copied().collect::<HashSet<_>>();
-    let mut recovered = records
-        .iter()
-        .enumerate()
-        .filter(|(index, record)| {
-            !on_chain.contains(index)
-                && matches!(
-                    record.get("type").and_then(Value::as_str),
-                    Some("user" | "assistant")
-                )
-                && !qoder_is_sidechain(record)
-                && string_field(record, "sourceToolAssistantUUID").is_some_and(|issuer| {
-                    by_id
-                        .get(&issuer)
-                        .is_some_and(|index| on_chain.contains(index))
-                })
-        })
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    chain.append(&mut recovered);
-    chain.sort_unstable();
-    chain
-        .into_iter()
-        .map(|index| records[index].clone())
-        .collect()
-}
-
-fn qoder_text(record: &Value) -> String {
-    match record.get("type").and_then(Value::as_str) {
-        Some("user") => claude_user_text(record),
-        Some("assistant") => claude_assistant_text(record),
-        _ => text_string_or_parts(
-            record
-                .pointer("/message/content")
-                .or_else(|| record.get("content")),
-        ),
-    }
-}
-
-fn qoder_non_conversational_assistant(record: &Value) -> bool {
-    bool_field(record, "isSynthetic")
-        || bool_field(record, "isApiErrorMessage")
-        || record.pointer("/message/model").and_then(Value::as_str) == Some("<synthetic>")
-}
-
-fn qoder_raw_user_text(record: &Value) -> Option<String> {
-    let content = record.pointer("/message/content")?;
-    match content {
-        Value::String(text) => Some(text.clone()),
-        Value::Array(parts) => {
-            let text = parts
-                .iter()
-                .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
-                .filter_map(|part| part.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("\n");
-            (!text.trim().is_empty()).then_some(text)
-        }
-        _ => None,
-    }
-}
-
-fn qoder_slash_command(record: &Value) -> Option<String> {
-    qoder_raw_user_text(record)
+    if parent_id
         .as_deref()
-        .and_then(claude_slash_command_display)
-}
-
-fn qoder_is_meta(record: &Value) -> bool {
-    bool_field(record, "isMeta")
-}
-
-fn qoder_is_interrupt(record: &Value) -> bool {
-    claude_interrupt_marker(record)
-}
-
-fn qoder_is_furniture(record: &Value) -> bool {
-    ["isCompactSummary", "isVisibleInTranscriptOnly", "isVirtual"]
-        .iter()
-        .any(|key| bool_field(record, key))
-}
-
-fn qoder_tool_result_parts(record: &Value) -> Vec<&Value> {
-    record
-        .pointer("/message/content")
-        .and_then(Value::as_array)
-        .map(|parts| {
-            parts
-                .iter()
-                .filter(|part| {
-                    matches!(
-                        part.get("type").and_then(Value::as_str),
-                        Some("tool_result" | "tool-result" | "toolResult")
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn qoder_user_is_tool_result(record: &Value) -> bool {
-    !qoder_tool_result_parts(record).is_empty()
-}
-
-fn qoder_is_real_user(record: &Value) -> bool {
-    match record.pointer("/origin/kind").and_then(Value::as_str) {
-        Some(kind) => kind == "human",
-        None => true,
-    }
-}
-
-fn parse_qoder_summary(path: &Path) -> Result<Option<LocalHistorySessionSummary>, String> {
-    let records = qoder_records(path)?;
-    let chain = qoder_chain(&records);
-    let id = path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or_default()
-        .to_string();
-    let mut workspace = None;
-    let mut model = None;
-    let mut custom = None;
-    let mut ai = None;
-    let mut first_user = None;
-    let mut started = None;
-    let mut updated = None;
-    let mut count = 0u32;
-    for record in &chain {
-        let kind = record
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let timestamp = field_timestamp(record, "timestamp");
-        set_first_string(&mut workspace, string_field(record, "cwd"));
-        if qoder_is_meta(record) || qoder_is_interrupt(record) {
-            continue;
-        }
-        match kind {
-            "custom-title" => custom = string_field(record, "customTitle").or(custom.take()),
-            "ai-title" => ai = string_field(record, "aiTitle").or(ai.take()),
-            "runtime-config" => model = string_field(record, "model").or(model.take()),
-            "user" => {
-                if qoder_is_real_user(record) && !qoder_user_is_tool_result(record) {
-                    let text = qoder_slash_command(record).unwrap_or_else(|| qoder_text(record));
-                    if !text.is_empty() && !qoder_is_furniture(record) {
-                        count = count.saturating_add(1);
-                        set_first_string(&mut first_user, Some(title_from_text(&text)));
-                        set_first_i64(&mut started, timestamp);
-                        set_last_i64(&mut updated, timestamp);
-                    }
-                }
-            }
-            "assistant" => {
-                if !qoder_non_conversational_assistant(record) && !qoder_text(record).is_empty() {
-                    count = count.saturating_add(1);
-                    set_first_i64(&mut started, timestamp);
-                    set_last_i64(&mut updated, timestamp);
-                    set_first_string(
-                        &mut model,
-                        record
-                            .pointer("/message/model")
-                            .and_then(Value::as_str)
-                            .map(ToOwned::to_owned),
-                    );
-                }
-            }
-            _ => {}
-        }
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Ok(None);
     }
     Ok(build_summary(
-        LocalHistorySource::Qoder,
+        LocalHistorySource::Zcode,
         id,
-        custom.or(ai).or(first_user),
-        workspace,
-        path,
-        started,
-        updated,
-        count,
+        title,
+        directory,
+        database,
+        Some(timestamp_number_to_ms(created)),
+        Some(timestamp_number_to_ms(updated)),
+        count.max(0).min(u32::MAX as i64) as u32,
         model,
     ))
 }
 
-fn parse_qoder_timeline(path: &Path) -> VibexResult<Vec<LocalHistoryTimelineEntry>> {
-    let records = qoder_records(path).map_err(local_history_read_error)?;
-    let chain = qoder_chain(&records);
+fn parse_zcode_timeline(
+    database: &Path,
+    session_id: &str,
+) -> VibexResult<Vec<LocalHistoryTimelineEntry>> {
+    let connection = open_readonly(database).map_err(|error| {
+        VibexError::storage(
+            "local_history_database_unreadable",
+            "failed to open local history database",
+        )
+        .with_diagnostic("error", error.to_string())
+    })?;
+    let mut statement = connection
+        .prepare(
+            "SELECT m.data, p.data, p.time_created
+               FROM part p
+               JOIN message m ON m.id = p.message_id
+              WHERE p.session_id = ?1
+              ORDER BY p.time_created ASC, p.sequence ASC, p.id ASC",
+        )
+        .map_err(|error| {
+            VibexError::storage(
+                "local_history_timeline_query_failed",
+                "failed to query local history database",
+            )
+            .with_diagnostic("error", error.to_string())
+        })?;
+    let rows = statement
+        .query_map(params![session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|error| {
+            VibexError::storage(
+                "local_history_timeline_query_failed",
+                "failed to query local history database",
+            )
+            .with_diagnostic("error", error.to_string())
+        })?;
     let mut timeline = Vec::new();
-    let mut pending_assistant_id: Option<String> = None;
-    for record in chain {
-        let kind = record
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let timestamp = field_timestamp(&record, "timestamp");
-        if qoder_is_meta(&record) || qoder_is_interrupt(&record) {
-            continue;
-        }
-        match kind {
-            "user" if qoder_is_real_user(&record) => {
-                let slash = qoder_slash_command(&record);
-                if qoder_user_is_tool_result(&record) {
-                    for part in qoder_tool_result_parts(&record) {
-                        timeline.push(tool_entry(
-                            string_field(part, "tool_use_id")
-                                .or_else(|| string_field(part, "toolCallId")),
-                            Some("tool result".to_string()),
-                            None,
-                            json_preview(part.get("content")),
-                            bool_field(part, "is_error") || bool_field(part, "isError"),
-                            timestamp,
-                        ));
-                    }
-                } else if qoder_is_furniture(&record) {
-                    if let Some(entry) =
-                        system_entry(slash.unwrap_or_else(|| qoder_text(&record)), timestamp)
-                    {
-                        timeline.push(entry);
-                    }
-                } else if let Some(entry) =
-                    user_entry(slash.unwrap_or_else(|| qoder_text(&record)), timestamp)
-                {
-                    timeline.push(entry);
-                }
-            }
-            "assistant" if !qoder_non_conversational_assistant(&record) => {
-                let text = qoder_text(&record);
-                let message_id = record.pointer("/message/id").and_then(Value::as_str);
-                let merge = message_id.is_some()
-                    && pending_assistant_id.as_deref() == message_id
-                    && matches!(
-                        timeline.last(),
-                        Some(LocalHistoryTimelineEntry {
-                            payload: TimelinePayload::AgentMessage(_),
-                            ..
-                        })
-                    );
-                if merge {
-                    if let Some(LocalHistoryTimelineEntry {
-                        payload: TimelinePayload::AgentMessage(payload),
-                        ..
-                    }) = timeline.last_mut()
-                    {
-                        if !text.trim().is_empty() {
-                            if !payload.text.is_empty() {
-                                payload.text.push('\n');
-                            }
-                            payload.text.push_str(&bounded_text(&text, MAX_TEXT_CHARS));
-                        }
-                    }
-                } else if let Some(entry) = agent_entry(text, timestamp) {
-                    timeline.push(entry);
-                }
-                for part in record
-                    .pointer("/message/content")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                {
-                    match part.get("type").and_then(Value::as_str) {
-                        Some("thinking" | "reasoning") => {
-                            if let Some(entry) = reasoning_entry(
-                                string_field(part, "thinking")
-                                    .or_else(|| string_field(part, "text"))
-                                    .unwrap_or_default(),
-                                timestamp,
-                            ) {
-                                timeline.push(entry);
-                            }
-                        }
-                        Some("tool_use" | "tool-use") => timeline.push(tool_entry(
-                            string_field(part, "id"),
-                            string_field(part, "name"),
-                            json_preview(part.get("input")),
-                            None,
-                            false,
-                            timestamp,
-                        )),
-                        _ => {}
-                    }
-                }
-                pending_assistant_id = message_id.map(ToOwned::to_owned);
-            }
-            _ => {
-                pending_assistant_id = None;
-            }
-        }
-    }
-    require_timeline(timeline)
-}
-
-// ---------------------------------------------------------------------------
-// OpenClaw
-// ---------------------------------------------------------------------------
-
-fn scan_openclaw(root: &LocalHistorySourceRoot) -> ScanBatch {
-    let mut batch = ScanBatch::default();
-    let agents = root_child(&root.root, "agents");
-    for agent_dir in direct_subdirs(&agents) {
-        let Some(agent_id) = agent_dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(ToOwned::to_owned)
-        else {
+    for row in rows.flatten() {
+        let Ok(message) = serde_json::from_str::<Value>(&row.0) else {
             continue;
         };
-        let sessions_dir = agent_dir.join("sessions");
-        let index = openclaw_index(&sessions_dir.join("sessions.json"));
-        let mut grouped: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
-        for path in direct_files(&sessions_dir) {
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            if name == "sessions.json" || !name.contains(".jsonl") {
-                continue;
-            }
-            let base = name.split(".jsonl").next().unwrap_or(name).to_string();
-            grouped.entry(base).or_default().push(path);
-        }
-        for (session_id, mut paths) in grouped {
-            paths.sort();
-            let records = openclaw_records(&paths);
-            for leaf in openclaw_leaves(&records) {
-                let external_id = format!("{agent_id}/{session_id}/{leaf}");
-                let summary = parse_openclaw_summary(
-                    &agent_id,
-                    &session_id,
-                    &external_id,
-                    &records,
-                    &index,
-                    &paths[0],
-                    &leaf,
-                );
-                if let Some(summary) = summary {
-                    batch.found.push(FoundSession {
-                        summary,
-                        locator: LocalHistoryLocator::OpenClaw {
-                            transcript: paths[0].clone(),
-                            agent_id: agent_id.clone(),
-                            session_id: session_id.clone(),
-                            leaf_id: leaf,
-                        },
-                    });
-                }
-                if batch.found.len() >= MAX_SESSIONS_PER_SOURCE {
-                    return batch;
-                }
-            }
-        }
-    }
-    batch
-}
-
-fn openclaw_index(path: &Path) -> HashMap<String, Value> {
-    let Ok(value) = json_file(path) else {
-        return HashMap::new();
-    };
-    let mut index = HashMap::new();
-    if let Some(object) = value.as_object() {
-        for (key, value) in object {
-            index.insert(key.clone(), value.clone());
-        }
-    }
-    index
-}
-
-fn openclaw_records(paths: &[PathBuf]) -> Vec<Value> {
-    let mut records = Vec::new();
-    for path in paths {
-        let _ = for_each_jsonl(path, |value| records.push(value));
-    }
-    records
-}
-
-fn openclaw_message(record: &Value) -> &Value {
-    record.get("message").unwrap_or(record)
-}
-
-fn openclaw_parent_id(record: &Value) -> Option<String> {
-    string_field(record, "parentId").or_else(|| string_field(record, "parent_id"))
-}
-
-fn openclaw_record_id(record: &Value, _index: usize) -> String {
-    string_field(record, "id").unwrap_or_default()
-}
-
-fn openclaw_leaves(records: &[Value]) -> Vec<String> {
-    let mut ids = Vec::new();
-    let mut parents = HashSet::new();
-    for (index, record) in records.iter().enumerate() {
-        if record.get("type").and_then(Value::as_str) == Some("session") {
+        let Ok(part) = serde_json::from_str::<Value>(&row.1) else {
             continue;
-        }
-        let id = openclaw_record_id(record, index);
-        if id.is_empty() {
-            continue;
-        }
-        ids.push(id.clone());
-        if let Some(parent) = openclaw_parent_id(record) {
-            parents.insert(parent);
-        }
-    }
-    let mut leaves = ids
-        .into_iter()
-        .filter(|id| !parents.contains(id))
-        .collect::<Vec<_>>();
-    leaves
-}
-
-fn openclaw_chain(records: &[Value], leaf_id: &str) -> Vec<Value> {
-    let mut by_id = HashMap::new();
-    for (index, record) in records.iter().enumerate() {
-        let id = openclaw_record_id(record, index);
-        if !id.is_empty() && record.get("type").and_then(Value::as_str) != Some("session") {
-            by_id.insert(id, index);
-        }
-    }
-    let mut index = by_id.get(leaf_id).copied();
-    let mut chain = Vec::new();
-    let mut visited = HashSet::new();
-    while let Some(current) = index {
-        if !visited.insert(current) {
-            // A cycle cannot identify a trustworthy ancestor chain. Returning
-            // an empty chain makes the caller omit the malformed branch rather
-            // than mixing unrelated records in append order.
-            return Vec::new();
-        }
-        let record = &records[current];
-        chain.push(record.clone());
-        let parent = openclaw_parent_id(record);
-        index = parent
-            .as_deref()
-            .and_then(|parent| by_id.get(parent).copied());
-        if parent.is_some() && index.is_none() {
-            // A missing parent is a truncated or corrupt branch. Do not
-            // recover it by appending every branch in the file.
-            return Vec::new();
-        }
-    }
-    chain.reverse();
-    chain
-}
-
-fn openclaw_session_cwd(records: &[Value]) -> Option<String> {
-    records.iter().find_map(|record| {
-        (record.get("type").and_then(Value::as_str) == Some("session"))
-            .then(|| string_field(record, "cwd"))
-            .flatten()
-    })
-}
-
-fn openclaw_content_text(message: &Value) -> String {
-    let text = text_string_or_parts(message.get("content"));
-    match message.get("role").and_then(Value::as_str) {
-        Some("user") => strip_openclaw_user_prefix(&text),
-        Some("assistant") | Some("model") => strip_openclaw_reply_prefix(&text),
-        _ => text,
-    }
-}
-
-fn openclaw_tool_result_output(message: &Value) -> Option<String> {
-    let output = text_string_or_parts(message.get("content"));
-    (!output.trim().is_empty()).then_some(output)
-}
-
-fn openclaw_working_directory(message: &Value) -> Option<String> {
-    let text = text_string_or_parts(message.get("content"));
-    let marker = "[Working directory:";
-    let start = text.find(marker)? + marker.len();
-    let end = text[start..].find(']')? + start;
-    let raw = text[start..end].trim();
-    if raw.is_empty() {
-        return None;
-    }
-    if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return Some(home.join(rest).to_string_lossy().into_owned());
-        }
-    }
-    Some(raw.to_string())
-}
-
-fn strip_openclaw_user_prefix(value: &str) -> String {
-    let mut text = value.trim().to_string();
-    if let Some(rest) = text.strip_prefix("Sender (untrusted metadata):") {
-        let candidate = rest.trim_start();
-        // Match the source format's fenced metadata block. If the block is
-        // incomplete, preserve it instead of deleting potentially meaningful
-        // user text from a truncated record.
-        if let Some(start) = candidate.find("```") {
-            if let Some(end_rel) = candidate[start + 3..].find("```") {
-                text = candidate[start + 3 + end_rel + 3..]
-                    .trim_start()
-                    .to_string();
-            }
-        }
-    }
-    // OpenClaw prefixes the user payload with a timestamp and, in some
-    // deployments, a working-directory marker. The timestamp vocabulary is
-    // intentionally open-ended, so remove any first bracketed prefix rather
-    // than attempting to recognize dates or paths ourselves.
-    if let Some(rest) = text.strip_prefix('[')
-        && let Some(end) = rest.find(']')
-    {
-        text = rest[end + 1..].trim_start().to_string();
-    }
-    if let Some(rest) = text.strip_prefix("[Working directory:")
-        && let Some(end) = rest.find(']')
-    {
-        text = rest[end + 1..].trim_start().to_string();
-    }
-    text.trim().to_string()
-}
-
-fn strip_openclaw_reply_prefix(value: &str) -> String {
-    value
-        .trim_start()
-        .strip_prefix("[[reply_to_current]]")
-        .unwrap_or(value)
-        .trim_start()
-        .to_string()
-}
-
-fn openclaw_summary_meta<'a>(
-    index: &'a HashMap<String, Value>,
-    session_id: &str,
-) -> Option<&'a Value> {
-    index
-        .get(session_id)
-        .or_else(|| index.get(&format!("{session_id}:main")))
-        .or_else(|| {
-            index.values().find(|value| {
-                string_field(value, "sessionId")
-                    .or_else(|| string_field(value, "session_id"))
-                    .as_deref()
-                    == Some(session_id)
-            })
-        })
-}
-
-fn parse_openclaw_summary(
-    agent_id: &str,
-    session_id: &str,
-    external_id: &str,
-    records: &[Value],
-    index: &HashMap<String, Value>,
-    source_path: &Path,
-    leaf_id: &str,
-) -> Option<LocalHistorySessionSummary> {
-    let chain = openclaw_chain(records, leaf_id);
-    let metadata = openclaw_summary_meta(index, session_id);
-    let mut workspace = metadata
-        .and_then(|value| string_field(value, "cwd").or_else(|| string_field(value, "workspace")));
-    set_first_string(&mut workspace, openclaw_session_cwd(records));
-    let mut title = metadata
-        .and_then(|value| string_field(value, "title").or_else(|| string_field(value, "name")));
-    let mut model = metadata.and_then(|value| string_field(value, "model"));
-    let mut first_user = None;
-    let mut started = metadata.and_then(|value| field_timestamp(value, "createdAt"));
-    let mut updated = metadata.and_then(|value| field_timestamp(value, "updatedAt"));
-    let mut count = 0u32;
-    for record in &chain {
-        let message = openclaw_message(record);
-        let role = message
-            .get("role")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let timestamp =
-            field_timestamp(record, "timestamp").or_else(|| field_timestamp(message, "timestamp"));
-        match role {
-            "user" => {
-                let text = openclaw_content_text(message);
-                if let Some(directory) = openclaw_working_directory(message) {
-                    workspace = Some(directory);
-                }
-                if !text.is_empty() {
-                    count = count.saturating_add(1);
-                    set_first_string(&mut first_user, Some(title_from_text(&text)));
-                    set_first_i64(&mut started, timestamp);
-                    set_last_i64(&mut updated, timestamp);
-                }
-            }
-            "assistant" | "model" => {
-                if !openclaw_content_text(message).is_empty() {
-                    count = count.saturating_add(1);
-                    set_first_i64(&mut started, timestamp);
-                    set_last_i64(&mut updated, timestamp);
-                }
-                set_first_string(&mut model, string_field(message, "model"));
-            }
-            _ => {}
-        }
-        set_first_string(&mut workspace, string_field(record, "cwd"));
-    }
-    let _ = agent_id;
-    build_summary(
-        LocalHistorySource::OpenClaw,
-        external_id.to_string(),
-        title.take().or(first_user),
-        workspace,
-        source_path,
-        started,
-        updated,
-        count,
-        model,
-    )
-}
-
-fn parse_openclaw_timeline(
-    path: &Path,
-    leaf_id: &str,
-) -> VibexResult<Vec<LocalHistoryTimelineEntry>> {
-    // A selected locator points at the primary file. Reset segments are read as
-    // sibling files so a reset cannot hide the earlier parent chain.
-    let Some(parent) = path.parent() else {
-        return Err(VibexError::validation(
-            "local_history_session_not_found",
-            "selected local history session is no longer available",
-        ));
-    };
-    let base = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .split(".jsonl")
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    let mut paths = direct_files(parent)
-        .into_iter()
-        .filter(|candidate| {
-            candidate
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(&format!("{base}.jsonl")))
-        })
-        .collect::<Vec<_>>();
-    paths.sort();
-    let records = openclaw_records(&paths);
-    let chain = openclaw_chain(&records, leaf_id);
-    let mut timeline = Vec::new();
-    for record in chain {
-        let message = openclaw_message(&record);
-        let role = message
-            .get("role")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let timestamp =
-            field_timestamp(&record, "timestamp").or_else(|| field_timestamp(message, "timestamp"));
-        match role {
-            "user" => {
-                if let Some(entry) = user_entry(openclaw_content_text(message), timestamp) {
+        };
+        let timestamp = Some(timestamp_number_to_ms(row.2));
+        let role = message.get("role").and_then(Value::as_str);
+        match (role, string_field(&part, "type").as_deref()) {
+            (Some("user"), Some("text")) => {
+                if let Some(entry) = user_entry(text_string_or_parts(part.get("text")), timestamp) {
                     timeline.push(entry);
                 }
             }
-            "assistant" | "model" => {
-                if let Some(entry) = agent_entry(openclaw_content_text(message), timestamp) {
-                    timeline.push(entry);
-                }
-                for part in message
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
+            (Some("assistant" | "model"), Some("text")) => {
+                if let Some(entry) = agent_entry(text_string_or_parts(part.get("text")), timestamp)
                 {
-                    if part.get("type").and_then(Value::as_str) == Some("toolCall")
-                        || part.get("type").and_then(Value::as_str) == Some("tool_use")
-                    {
-                        timeline.push(tool_entry(
-                            string_field(part, "id").or_else(|| string_field(part, "toolCallId")),
-                            string_field(part, "name").or_else(|| string_field(part, "toolName")),
-                            json_preview(part.get("arguments").or_else(|| part.get("input"))),
-                            None,
-                            false,
-                            timestamp,
-                        ));
-                    }
+                    timeline.push(entry);
                 }
             }
-            "tool" | "toolResult" => timeline.push(tool_entry(
-                string_field(message, "toolCallId"),
-                string_field(message, "toolName").or_else(|| Some("tool result".to_string())),
-                None,
-                openclaw_tool_result_output(message),
-                bool_field(message, "isError"),
-                timestamp,
-            )),
+            (Some("assistant" | "model"), Some("reasoning")) => {
+                if let Some(entry) =
+                    reasoning_entry(text_string_or_parts(part.get("text")), timestamp)
+                {
+                    timeline.push(entry);
+                }
+            }
+            (Some("assistant" | "model"), Some("tool")) => {
+                timeline.push(tool_entry(
+                    string_field(&part, "callID"),
+                    string_field(&part, "tool"),
+                    json_preview(part.pointer("/state/input")),
+                    json_preview(part.pointer("/state/output")),
+                    part.pointer("/state/status").and_then(Value::as_str) == Some("error"),
+                    timestamp,
+                ));
+            }
             _ => {}
         }
     }
@@ -6246,12 +5590,6 @@ fn materialize_with_locator(
                 parse_grok_timeline(path)?,
             )
         }
-        (LocalHistorySource::Qoder, LocalHistoryLocator::Transcript(path)) => (
-            parse_qoder_summary(path)
-                .map_err(materialize_error)?
-                .ok_or_else(not_found)?,
-            parse_qoder_timeline(path)?,
-        ),
         (
             LocalHistorySource::DeepSeek,
             LocalHistoryLocator::DeepSeek {
@@ -6276,40 +5614,17 @@ fn materialize_with_locator(
             )
         }
         (
-            LocalHistorySource::OpenClaw,
-            LocalHistoryLocator::OpenClaw {
-                transcript,
-                agent_id,
+            LocalHistorySource::Zcode,
+            LocalHistoryLocator::Zcode {
+                database,
                 session_id,
-                leaf_id,
             },
-        ) => {
-            let parent = transcript.parent().ok_or_else(not_found)?;
-            let mut paths = direct_files(parent)
-                .into_iter()
-                .filter(|path| {
-                    path.file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.starts_with(&format!("{session_id}.jsonl")))
-                })
-                .collect::<Vec<_>>();
-            paths.sort();
-            let records = openclaw_records(&paths);
-            let index = openclaw_index(&parent.join("sessions.json"));
-            (
-                parse_openclaw_summary(
-                    agent_id,
-                    session_id,
-                    &selection.external_id,
-                    &records,
-                    &index,
-                    transcript,
-                    leaf_id,
-                )
+        ) => (
+            parse_zcode_summary(database, session_id)
+                .map_err(materialize_error)?
                 .ok_or_else(not_found)?,
-                parse_openclaw_timeline(transcript, leaf_id)?,
-            )
-        }
+            parse_zcode_timeline(database, session_id)?,
+        ),
         (
             LocalHistorySource::Cursor,
             LocalHistoryLocator::Cursor {
@@ -6448,29 +5763,6 @@ mod tests {
         assert_eq!(
             resolve_gemini_base_dir_from(None, Some(home.clone())),
             PathBuf::from("/home/demo/.gemini")
-        );
-
-        assert_eq!(
-            resolve_qoder_config_dir_from(
-                Some(OsString::from("/explicit")),
-                Some(OsString::from("/relocated")),
-                Some(OsString::from(".other")),
-                Some(home.clone()),
-            ),
-            PathBuf::from("/explicit")
-        );
-        assert_eq!(
-            resolve_qoder_config_dir_from(
-                None,
-                Some(OsString::from("/relocated")),
-                Some(OsString::from(".other")),
-                Some(home.clone()),
-            ),
-            PathBuf::from("/relocated/.other")
-        );
-        assert_eq!(
-            resolve_qoder_config_dir_from(None, None, None, Some(home.clone())),
-            PathBuf::from("/home/demo/.qoder")
         );
 
         assert_eq!(
@@ -6746,132 +6038,128 @@ mod tests {
     }
 
     #[test]
-    fn openclaw_prefixes_and_session_header_cwd_are_normalized() {
-        assert_eq!(
-            strip_openclaw_user_prefix("[opaque source metadata] Hello"),
-            "Hello"
-        );
-        assert_eq!(
-            strip_openclaw_user_prefix(
-                "Sender (untrusted metadata):\n```json\n{}\n```\n\n[Tue 2026-03-17] Hello"
-            ),
-            "Hello"
-        );
-        assert_eq!(
-            strip_openclaw_reply_prefix("[[reply_to_current]] answer"),
-            "answer"
-        );
-
-        let records = vec![
-            serde_json::json!({
-                "type": "session",
-                "cwd": "/header/workspace",
-            }),
-            serde_json::json!({
-                "type": "message",
-                "id": "u1",
-                "parentId": null,
-                "timestamp": "2026-01-01T00:00:00Z",
-                "message": {
-                    "role": "user",
-                    "content": [{"type": "text", "text": "[opaque] Hello"}]
-                }
-            }),
-            serde_json::json!({
-                "type": "message",
-                "id": "a1",
-                "parentId": "u1",
-                "timestamp": "2026-01-01T00:00:01Z",
-                "message": {
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": "[[reply_to_current]] Hi"}]
-                }
-            }),
-        ];
-        let summary = parse_openclaw_summary(
-            "agent",
-            "session",
-            "agent/session/a1",
-            &records,
-            &HashMap::new(),
-            Path::new("session.jsonl"),
-            "a1",
-        )
-        .expect("summary");
-        assert_eq!(summary.title, "Hello");
-        assert_eq!(summary.workspace_root.as_deref(), Some("/header/workspace"));
-        assert_eq!(summary.message_count, 2);
-        assert_eq!(
-            openclaw_tool_result_output(&serde_json::json!({
-                "content": [{"type": "text", "text": "one"}, {"type": "text", "text": "two"}]
-            }))
-            .as_deref(),
-            Some("one\ntwo")
-        );
-    }
-
-    #[test]
-    fn openclaw_dangling_parents_and_cycles_never_fallback_to_append_order() {
-        let dangling = vec![serde_json::json!({
-            "type": "message",
-            "id": "leaf",
-            "parentId": "vanished",
-            "message": {"role": "user", "content": [{"type": "text", "text": "leaf"}]}
-        })];
-        assert!(openclaw_chain(&dangling, "leaf").is_empty());
-
-        let cycle = vec![
-            serde_json::json!({"type": "message", "id": "a", "parentId": "b", "message": {"role": "user", "content": [{"type": "text", "text": "a"}]}}),
-            serde_json::json!({"type": "message", "id": "b", "parentId": "a", "message": {"role": "assistant", "content": [{"type": "text", "text": "b"}]}}),
-        ];
-        assert!(openclaw_leaves(&cycle).is_empty());
-        assert!(openclaw_chain(&cycle, "a").is_empty());
-    }
-
-    #[test]
-    fn openclaw_reset_segments_are_merged_into_one_branch() {
+    fn zcode_sqlite_sessions_scan_and_materialize_parts() {
         let temp = tempfile::tempdir().unwrap();
-        let sessions = temp.path().join("agents").join("main").join("sessions");
-        fs::create_dir_all(&sessions).unwrap();
-        fs::write(
-            sessions.join("session-1.jsonl"),
+        let database = temp.path().join("cli").join("db").join("db.sqlite");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE session (
+                    id text primary key,
+                    parent_id text,
+                    directory text not null,
+                    title text not null,
+                    time_created integer not null,
+                    time_updated integer not null
+                );
+                CREATE TABLE message (
+                    id text primary key,
+                    session_id text not null,
+                    time_created integer not null,
+                    data text not null
+                );
+                CREATE TABLE part (
+                    id text primary key,
+                    message_id text not null,
+                    session_id text not null,
+                    time_created integer not null,
+                    sequence integer,
+                    data text not null
+                );",
+            )
+            .unwrap();
+        let message_data = |role: &str, model: Option<&str>| {
             serde_json::json!({
-                "type": "session", "cwd": "/reset/work"
+                "role": role,
+                "modelID": model,
             })
             .to_string()
-                + "\n"
-                + &serde_json::json!({
-                    "type": "message", "id": "u1", "parentId": null,
-                    "timestamp": "2026-01-01T00:00:00Z",
-                    "message": {"role": "user", "content": [{"type": "text", "text": "first"}]}
-                })
-                .to_string()
-                + "\n",
-        )
-        .unwrap();
-        fs::write(
-            sessions.join("session-1.jsonl.reset.002"),
+        };
+        connection
+            .execute(
+                "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated)
+                 VALUES ('sess_root', NULL, '/work/repo', 'root session', 1700000000000, 1700000003000),
+                        ('sess_child', 'sess_root', '/work/repo', 'delegated', 1700000001000, 1700000001500)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO message (id, session_id, time_created, data)
+                 VALUES ('m1', 'sess_root', 1700000000000, ?1),
+                        ('m2', 'sess_root', 1700000001000, ?2)",
+                params![
+                    message_data("user", None),
+                    message_data("assistant", Some("GLM-5")),
+                ],
+            )
+            .unwrap();
+        let parts = vec![
+            serde_json::json!({"type": "text", "text": "hello"}),
+            serde_json::json!({"type": "reasoning", "text": "thinking"}),
+            serde_json::json!({"type": "text", "text": "answer"}),
             serde_json::json!({
-                "type": "message", "id": "a1", "parentId": "u1",
-                "timestamp": "2026-01-01T00:00:01Z",
-                "message": {"role": "assistant", "content": [{"type": "text", "text": "second"}]}
-            })
-            .to_string()
-                + "\n",
-        )
-        .unwrap();
+                "type": "tool",
+                "callID": "call-1",
+                "tool": "Bash",
+                "state": {
+                    "status": "completed",
+                    "input": {"command": "ls"},
+                    "output": "ok"
+                }
+            }),
+            serde_json::json!({"type": "step-start"}),
+        ];
+        for (index, data) in parts.iter().enumerate() {
+            connection
+                .execute(
+                    "INSERT INTO part (id, message_id, session_id, time_created, sequence, data)
+                     VALUES (?1, ?2, 'sess_root', ?3, ?4, ?5)",
+                    params![
+                        format!("p{index}"),
+                        if index == 0 { "m1" } else { "m2" },
+                        1700000000000i64 + index as i64 * 100,
+                        index as i64,
+                        data.to_string(),
+                    ],
+                )
+                .unwrap();
+        }
 
         let roots = vec![LocalHistorySourceRoot {
-            source: LocalHistorySource::OpenClaw,
+            source: LocalHistorySource::Zcode,
             root: temp.path().to_path_buf(),
         }];
         let scan = scan_local_history_from(&roots, &[]);
         assert_eq!(scan.total_sessions, 1);
-        assert_eq!(scan.folders[0].sessions[0].summary.message_count, 2);
-        let selection: LocalHistorySelection =
-            scan.folders[0].sessions[0].summary.key.clone().into();
+        let summary = &scan.folders[0].sessions[0].summary;
+        assert_eq!(summary.title, "root session");
+        assert_eq!(summary.workspace_root.as_deref(), Some("/work/repo"));
+        assert_eq!(summary.message_count, 2);
+        assert_eq!(summary.model.as_deref(), Some("GLM-5"));
+
+        let selection: LocalHistorySelection = summary.key.clone().into();
         let materialized = materialize_local_history_from(&selection, &roots).unwrap();
-        assert_eq!(materialized.timeline.len(), 2);
+        assert_eq!(materialized.timeline.len(), 4);
+        assert!(matches!(
+            &materialized.timeline[0].payload,
+            TimelinePayload::UserMessage(_)
+        ));
+        assert!(matches!(
+            &materialized.timeline[1].payload,
+            TimelinePayload::Reasoning(_)
+        ));
+        assert!(matches!(
+            &materialized.timeline[2].payload,
+            TimelinePayload::AgentMessage(_)
+        ));
+        let TimelinePayload::ToolCall(tool) = &materialized.timeline[3].payload else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tool.tool_call_id, "call-1");
+        assert_eq!(tool.tool_name, "Bash");
+        assert_eq!(tool.status, ToolCallStatus::Completed);
     }
 
     fn append_pb_varint(value: u64, out: &mut Vec<u8>) {

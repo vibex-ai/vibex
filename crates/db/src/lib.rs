@@ -23,16 +23,17 @@ use vibex_core::{
     GitWorktreeOperationCheckpoint, GitWorktreeOperationDetail, GitWorktreeOperationRecord,
     GitWorktreeOperationStatus, GitWorktreeReadinessRecord, GitWorktreeReconciliationState, Hook,
     HookCreateRequest, HookId, HookInstallPreview, HookInstallState, LocalHistoryImportRecord,
-    LocalHistoryKey, LocalHistoryMaterializedSession, McpServer, McpServerAgentMatrix,
-    McpServerCreateRequest, McpServerId, McpServerProviderMatrix, McpServerSecretReference,
-    McpServerStatus, PermissionActionDetail, PermissionRequest, PermissionRequestStatus,
-    PermissionResolution, PermissionResponseKind, PermissionResponseOption, ProjectId,
-    ProjectRecord, Prompt, PromptCreateRequest, PromptId, PromptStatus,
-    ProviderCapabilityProbeResult, ProviderHealthProbeResult, ProviderInjectionPreview,
-    ProviderInjectionPreviewRequest, ProviderKind, ProviderNativeExportApplyResult,
-    ProviderNativeExportFilePlan, ProviderNativeExportListRequest, ProviderNativeExportPreview,
-    ProviderNativeExportRecordSummary, ProviderNativeExportRollbackResult, ProviderNetworkDefaults,
-    ProviderOptions, ProviderPermissionDefaults, ProviderProfile, ProviderProfileCreateRequest,
+    LocalHistoryKey, LocalHistoryMaterializedSession, LocalHistorySource, McpServer,
+    McpServerAgentMatrix, McpServerCreateRequest, McpServerId, McpServerProviderMatrix,
+    McpServerSecretReference, McpServerStatus, PermissionActionDetail, PermissionRequest,
+    PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
+    PermissionResponseOption, ProjectId, ProjectRecord, Prompt, PromptCreateRequest, PromptId,
+    PromptStatus, ProviderCapabilityProbeResult, ProviderHealthProbeResult,
+    ProviderInjectionPreview, ProviderInjectionPreviewRequest, ProviderKind,
+    ProviderNativeExportApplyResult, ProviderNativeExportFilePlan, ProviderNativeExportListRequest,
+    ProviderNativeExportPreview, ProviderNativeExportRecordSummary,
+    ProviderNativeExportRollbackResult, ProviderNetworkDefaults, ProviderOptions,
+    ProviderPermissionDefaults, ProviderProfile, ProviderProfileCreateRequest,
     ProviderProfileDefaultScope, ProviderProfileDefaultSelection, ProviderProfileId,
     ProviderProfileSetDefaultRequest, ProviderProfileStatus, ProviderSandboxDefaults,
     ProviderSecretReference, ProviderUsageRecord, ProviderUsageWindow, RedactedDiagnostic,
@@ -2986,23 +2987,31 @@ impl LocalHistoryImportRepository {
             ))?;
         let rows = statement
             .query_map([], |row| {
-                Ok(LocalHistoryImportRecord {
-                    key: LocalHistoryKey {
-                        source: enum_from_db_sql(row.get(0)?)?,
-                        external_id: row.get(1)?,
-                    },
-                    session_id: parse_id_sql(row.get(2)?, VibexSessionId::parse)?,
-                    deleted: row.get::<_, Option<i64>>(3)?.is_some(),
+                // Sources retired from the catalog (for example `openclaw`)
+                // may still exist in databases written by older builds. Skip
+                // those rows instead of failing the entire scan.
+                let source = row.get::<_, String>(0)?;
+                Ok(match enum_from_db::<LocalHistorySource>(source) {
+                    Ok(source) => Some(LocalHistoryImportRecord {
+                        key: LocalHistoryKey {
+                            source,
+                            external_id: row.get(1)?,
+                        },
+                        session_id: parse_id_sql(row.get(2)?, VibexSessionId::parse)?,
+                        deleted: row.get::<_, Option<i64>>(3)?.is_some(),
+                    }),
+                    Err(_) => None,
                 })
             })
             .map_err(storage_err(
                 "local_history_import_list_query_failed",
                 "failed to query local history imports",
             ))?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(storage_err(
+        let records = rows.collect::<Result<Vec<_>, _>>().map_err(storage_err(
             "local_history_import_list_decode_failed",
             "failed to decode local history imports",
-        ))
+        ))?;
+        Ok(records.into_iter().flatten().collect())
     }
 
     /// Reserves the source-owned key and writes its Vibex session plus timeline

@@ -15,7 +15,6 @@ pub enum LocalHistorySource {
     Codex,
     OpenCode,
     Gemini,
-    OpenClaw,
     Cline,
     Hermes,
     CodeBuddy,
@@ -24,17 +23,16 @@ pub enum LocalHistorySource {
     Grok,
     Cursor,
     DeepSeek,
-    Qoder,
+    Zcode,
     Antigravity,
 }
 
 impl LocalHistorySource {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 14] = [
         Self::Claude,
         Self::Codex,
         Self::OpenCode,
         Self::Gemini,
-        Self::OpenClaw,
         Self::Cline,
         Self::Hermes,
         Self::CodeBuddy,
@@ -43,7 +41,7 @@ impl LocalHistorySource {
         Self::Grok,
         Self::Cursor,
         Self::DeepSeek,
-        Self::Qoder,
+        Self::Zcode,
         Self::Antigravity,
     ];
 
@@ -53,7 +51,6 @@ impl LocalHistorySource {
             Self::Codex => "codex",
             Self::OpenCode => "opencode",
             Self::Gemini => "gemini",
-            Self::OpenClaw => "openclaw",
             Self::Cline => "cline",
             Self::Hermes => "hermes",
             Self::CodeBuddy => "codebuddy",
@@ -62,7 +59,7 @@ impl LocalHistorySource {
             Self::Grok => "grok",
             Self::Cursor => "cursor",
             Self::DeepSeek => "deepseek",
-            Self::Qoder => "qoder",
+            Self::Zcode => "zcode",
             Self::Antigravity => "antigravity",
         }
     }
@@ -73,7 +70,6 @@ impl LocalHistorySource {
             Self::Codex => "Codex",
             Self::OpenCode => "OpenCode",
             Self::Gemini => "Gemini CLI",
-            Self::OpenClaw => "OpenClaw",
             Self::Cline => "Cline",
             Self::Hermes => "Hermes",
             Self::CodeBuddy => "CodeBuddy Code",
@@ -82,7 +78,7 @@ impl LocalHistorySource {
             Self::Grok => "Grok",
             Self::Cursor => "Cursor",
             Self::DeepSeek => "DeepSeek Harness",
-            Self::Qoder => "Qoder CLI",
+            Self::Zcode => "ZCode",
             Self::Antigravity => "Google Antigravity",
         }
     }
@@ -93,7 +89,6 @@ impl LocalHistorySource {
             Self::Codex => "codex",
             Self::OpenCode => "opencode",
             Self::Gemini => "gemini",
-            Self::OpenClaw => "openclaw",
             Self::Cline => "cline",
             Self::Hermes => "hermes",
             Self::CodeBuddy => "codebuddy-code",
@@ -102,7 +97,7 @@ impl LocalHistorySource {
             Self::Grok => "grok",
             Self::Cursor => "cursor",
             Self::DeepSeek => "deepseek-harness",
-            Self::Qoder => "qoder",
+            Self::Zcode => "zcode",
             Self::Antigravity => "antigravity",
         };
         AgentId::parse(value).expect("built-in local history Agent ids are valid")
@@ -270,7 +265,10 @@ mod tests {
             LocalHistorySource::DeepSeek.agent_id().as_str(),
             "deepseek-harness"
         );
-        assert_eq!(LocalHistorySource::ALL.len(), 15);
+        assert_eq!(LocalHistorySource::Zcode.key(), "zcode");
+        assert_eq!(LocalHistorySource::Zcode.label(), "ZCode");
+        assert_eq!(LocalHistorySource::Zcode.agent_id().as_str(), "zcode");
+        assert_eq!(LocalHistorySource::ALL.len(), 14);
     }
 
     #[test]
