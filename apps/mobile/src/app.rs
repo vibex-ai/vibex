@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -66,6 +66,9 @@ const TIMELINE_NEAR_BOTTOM_PX: f32 = 96.0;
 const TIMELINE_LIST_OVERDRAW_PX: f32 = 800.0;
 const TIMELINE_TURN_ESTIMATED_HEIGHT_PX: f32 = 180.0;
 const TIMELINE_ACTION_BUTTON_SIZE_PX: f32 = 32.0;
+const TIMELINE_EVENT_BATCH_LIMIT: usize = 256;
+const TIMELINE_EVENT_COALESCE_DELAY: Duration = Duration::from_millis(16);
+const TIMELINE_MARKDOWN_VIEW_CACHE_LIMIT: usize = 64;
 const TIMELINE_RUNTIME_LABEL_MAX_CHARS: usize = 48;
 const TIMELINE_SHIMMER_DURATION: Duration = Duration::from_secs(12);
 const TIMELINE_SHIMMER_SCAN_PASSES: f32 = 10.0;
@@ -395,6 +398,8 @@ pub struct MobileApp {
     workbench_open: bool,
     composer_input: Entity<TextInput>,
     timeline_turns: Arc<Vec<TimelineConversationTurn>>,
+    timeline_markdown_views:
+        RefCell<BTreeMap<String, (Entity<markdown::MarkdownView>, u64, Arc<str>)>>,
     pending_user_message: Option<PendingMobileUserMessage>,
     timeline_metadata_tip: Option<TimelineMetadataTip>,
     attachment_preview: Option<MobileAttachmentPreview>,
@@ -549,6 +554,7 @@ impl MobileApp {
                 )
             }),
             timeline_turns: Arc::new(Vec::new()),
+            timeline_markdown_views: RefCell::new(BTreeMap::new()),
             pending_user_message: None,
             timeline_metadata_tip: None,
             attachment_preview: None,
@@ -873,6 +879,7 @@ impl MobileApp {
                 self.reset_sidebar_ui(cx);
                 self.workspaces.clear();
                 self.workspace_summaries.clear();
+                self.timeline_markdown_views.borrow_mut().clear();
                 self.pending_workbench_surface = None;
                 self.clear_overlay();
                 self.pending_user_message = None;
@@ -986,60 +993,18 @@ impl MobileApp {
         let mut receiver = crate::background_connection::subscribe_ui_events();
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             while let Some(event) = receiver.next().await {
+                let mut events = vec![event];
+                cx.background_executor()
+                    .timer(TIMELINE_EVENT_COALESCE_DELAY)
+                    .await;
+                while events.len() < TIMELINE_EVENT_BATCH_LIMIT {
+                    match receiver.try_recv() {
+                        Ok(event) => events.push(event),
+                        Err(_) => break,
+                    }
+                }
                 let needs_refetch = entity
-                    .update(cx, |this, cx| {
-                        let sidebar_needs_refresh = sidebar_refresh_required(&event);
-                        if let BackendEvent::Notification(notification) = &event {
-                            let selected = this.controller.as_ref().and_then(|controller| {
-                                controller.state.selected_session_id.as_ref()
-                            });
-                            if should_present_agent_notification(
-                                this.app_backgrounded,
-                                this.workbench_open,
-                                selected,
-                                &notification.session_id,
-                            ) {
-                                notifications::present(notification);
-                            }
-                        }
-                        let should_follow = this.timeline_is_near_bottom();
-                        let decision = this
-                            .controller
-                            .as_mut()
-                            .map(|controller| controller.apply_event(event));
-                        match decision {
-                            Some(AgentEventDecision::Applied) => {
-                                this.notice = None;
-                                this.rebuild_timeline_turns();
-                                let turn_count = this.timeline_turns.len();
-                                if turn_count > 0 {
-                                    this.timeline_list
-                                        .remeasure_items(turn_count - 1..turn_count);
-                                }
-                                if should_follow {
-                                    this.timeline_list.scroll_to_end();
-                                }
-                            }
-                            Some(AgentEventDecision::Disconnected) if !this.app_backgrounded => {
-                                this.notice = Some(
-                                    locale::text(
-                                        "Desktop connection lost",
-                                        "桌面端连接已断开",
-                                        "桌面版連線已中斷",
-                                    )
-                                    .to_string(),
-                                );
-                            }
-                            _ => {}
-                        }
-                        if sidebar_needs_refresh {
-                            this.refresh_sessions(cx);
-                            this.refresh_workspaces(cx);
-                            this.refresh_sidebar_organization(cx);
-                        }
-                        cx.notify();
-                        decision == Some(AgentEventDecision::NeedsAuthoritativeRefetch)
-                    })
+                    .update(cx, |this, cx| this.apply_event_batch(events, cx))
                     .unwrap_or(false);
                 if needs_refetch {
                     let _ = entity.update(cx, |this, cx| this.reload_selected_session(cx));
@@ -1047,6 +1012,86 @@ impl MobileApp {
             }
         });
         self.event_consumer_task = Some(task);
+    }
+
+    fn apply_event_batch(&mut self, events: Vec<BackendEvent>, cx: &mut Context<Self>) -> bool {
+        let should_follow = self.timeline_is_near_bottom();
+        let mut timeline_changed = false;
+        let mut sidebar_needs_refresh = false;
+        let mut needs_refetch = false;
+        let mut needs_repaint = false;
+
+        for event in events {
+            sidebar_needs_refresh |= sidebar_refresh_required(&event);
+            if let BackendEvent::Notification(notification) = &event {
+                let selected = self
+                    .controller
+                    .as_ref()
+                    .and_then(|controller| controller.state.selected_session_id.as_ref());
+                if should_present_agent_notification(
+                    self.app_backgrounded,
+                    self.workbench_open,
+                    selected,
+                    &notification.session_id,
+                ) {
+                    notifications::present(notification);
+                }
+            }
+
+            let rebuild_timeline = matches!(
+                &event,
+                BackendEvent::Timeline(_) | BackendEvent::SessionUpdated(_)
+            );
+            let decision = self
+                .controller
+                .as_mut()
+                .map(|controller| controller.apply_event(event));
+            match decision {
+                Some(AgentEventDecision::Applied) => {
+                    self.notice = None;
+                    timeline_changed |= rebuild_timeline;
+                    needs_repaint = true;
+                }
+                Some(AgentEventDecision::NeedsAuthoritativeRefetch) => {
+                    needs_refetch = true;
+                    needs_repaint = true;
+                }
+                Some(AgentEventDecision::Disconnected) if !self.app_backgrounded => {
+                    self.notice = Some(
+                        locale::text(
+                            "Desktop connection lost",
+                            "桌面端连接已断开",
+                            "桌面版連線已中斷",
+                        )
+                        .to_string(),
+                    );
+                    needs_repaint = true;
+                }
+                _ => {}
+            }
+        }
+
+        if timeline_changed {
+            self.rebuild_timeline_turns();
+            let turn_count = self.timeline_turns.len();
+            if turn_count > 0 {
+                self.timeline_list
+                    .remeasure_items(turn_count - 1..turn_count);
+            }
+            if should_follow {
+                self.timeline_list.scroll_to_end();
+            }
+        }
+        if sidebar_needs_refresh {
+            self.refresh_sessions(cx);
+            self.refresh_workspaces(cx);
+            self.refresh_sidebar_organization(cx);
+            needs_repaint = true;
+        }
+        if needs_repaint {
+            cx.notify();
+        }
+        needs_refetch
     }
 
     fn stop_connection_tasks(&mut self) {
@@ -2360,6 +2405,7 @@ impl MobileApp {
                                 controller.state.runtime_selection.clear();
                             }
                             this.timeline_turns = Arc::new(Vec::new());
+                            this.timeline_markdown_views.borrow_mut().clear();
                             this.pending_user_message = None;
                             this.timeline_metadata_tip = None;
                             this.attachment_preview = None;
@@ -2546,6 +2592,7 @@ impl MobileApp {
         self.expanded_timeline_rows.clear();
         self.collapsed_timeline_rows.clear();
         self.expanded_approval.clear();
+        self.timeline_markdown_views.borrow_mut().clear();
         self.timeline_turns = Arc::new(Vec::new());
         self.timeline_list.reset(0);
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
@@ -3519,6 +3566,7 @@ impl MobileApp {
         crate::background_connection::disconnect();
         self.backend = None;
         self.controller = None;
+        self.timeline_markdown_views.borrow_mut().clear();
         self.pending_workbench_surface = None;
         if let Some(workbench) = self.workbench.take() {
             workbench.update(cx, |workbench, _| workbench.suspend());
@@ -4464,6 +4512,7 @@ impl MobileApp {
             workbench.update(cx, |workbench, _| workbench.suspend());
         }
         self.controller = None;
+        self.timeline_markdown_views.borrow_mut().clear();
         self.mode = RootMode::Pairing;
         self.timeline_turns = Arc::new(Vec::new());
         self.pending_user_message = None;
@@ -7277,6 +7326,43 @@ impl MobileApp {
             .into_any_element()
     }
 
+    fn render_markdown_view(
+        &self,
+        key: String,
+        row: &TimelineRow,
+        cx: &mut Context<Self>,
+    ) -> Entity<markdown::MarkdownView> {
+        let revision = row.last_sequence.max(0) as u64;
+        let live_row = row.id.starts_with("reasoning-live:");
+        let mut views = self.timeline_markdown_views.borrow_mut();
+        if let Some((view, cached_revision, cached_source)) = views.get_mut(&key) {
+            let source = if *cached_revision == revision
+                && ((!live_row && cached_source.len() == row.body.len())
+                    || (live_row && cached_source.as_ref() == row.body.as_str()))
+            {
+                cached_source.clone()
+            } else {
+                Arc::<str>::from(row.body.as_str())
+            };
+            *cached_revision = revision;
+            *cached_source = source.clone();
+            let view = view.clone();
+            drop(views);
+            view.update(cx, |view, cx| view.set_source(source, revision, cx));
+            return view;
+        }
+
+        let source = Arc::<str>::from(row.body.as_str());
+        let view = cx.new(|cx| markdown::render(source.clone(), revision, cx));
+        if views.len() >= TIMELINE_MARKDOWN_VIEW_CACHE_LIMIT
+            && let Some(evicted) = views.keys().next().cloned()
+        {
+            views.remove(&evicted);
+        }
+        views.insert(key, (view.clone(), revision, source));
+        view
+    }
+
     fn render_agent_message_row(
         &self,
         turn: &TimelineConversationTurn,
@@ -7291,7 +7377,7 @@ impl MobileApp {
             .flex()
             .flex_col()
             .gap_2()
-            .child(markdown::render(&row.body, row.last_sequence.max(0) as u64))
+            .child(self.render_markdown_view(format!("markdown:{}", row.id), row, cx))
             .when_some(
                 conversation_conclusion
                     .then(|| self.render_agent_answer_metadata(turn, row, cx))
@@ -7711,7 +7797,7 @@ impl MobileApp {
                         .min_w_0()
                         .text_size(px(theme::FONT_CAPTION))
                         .text_color(theme::text_secondary())
-                        .child(markdown::render(&row.body, row.last_sequence.max(0) as u64)),
+                        .child(self.render_markdown_view(format!("thought:{}", row.id), row, cx)),
                 )
             })
             .into_any_element()
@@ -13814,9 +13900,15 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn stop_connection_tasks("))
             .map(|(body, _)| body)
             .expect("mobile event stream should remain inspectable");
-        assert!(stream.contains("this.refresh_sessions(cx);"));
-        assert!(stream.contains("this.refresh_workspaces(cx);"));
-        assert!(stream.contains("this.refresh_sidebar_organization(cx);"));
+        let batch = source
+            .split_once("    fn apply_event_batch(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn stop_connection_tasks("))
+            .map(|(body, _)| body)
+            .expect("mobile event batch should remain inspectable");
+        let event_handling = format!("{stream}\n{batch}");
+        assert!(event_handling.contains("self.refresh_sessions(cx);"));
+        assert!(event_handling.contains("self.refresh_workspaces(cx);"));
+        assert!(event_handling.contains("self.refresh_sidebar_organization(cx);"));
 
         let workspaces = source
             .split_once("    fn refresh_workspaces(")
@@ -13825,6 +13917,28 @@ mod tests {
             .expect("workspace refresh should remain inspectable");
         assert!(workspaces.contains("workspace_sync_busy"));
         assert!(workspaces.contains("workspace_sync_queued"));
+    }
+
+    #[test]
+    fn timeline_stream_batches_before_rebuilding_and_measuring() {
+        let source = include_str!("app.rs");
+        let stream = source
+            .split_once("    fn start_event_stream(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn apply_event_batch("))
+            .map(|(body, _)| body)
+            .expect("mobile event stream should remain inspectable");
+        let batch = source
+            .split_once("    fn apply_event_batch(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn stop_connection_tasks("))
+            .map(|(body, _)| body)
+            .expect("mobile event batch should remain inspectable");
+
+        assert!(stream.contains("TIMELINE_EVENT_COALESCE_DELAY"));
+        assert!(stream.contains("TIMELINE_EVENT_BATCH_LIMIT"));
+        assert!(batch.contains("self.rebuild_timeline_turns();"));
+        assert!(batch.contains("remeasure_items"));
+        assert!(batch.contains("if timeline_changed"));
+        assert!(batch.contains("BackendEvent::Timeline(_) | BackendEvent::SessionUpdated(_)"));
     }
 
     #[test]

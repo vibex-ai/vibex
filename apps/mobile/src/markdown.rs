@@ -1,24 +1,134 @@
+use std::sync::Arc;
+
 use gpui::{
-    AnyElement, Div, IntoElement as _, ParentElement as _, Styled as _, div,
-    prelude::FluentBuilder as _, px, rgb,
+    AnyElement, AppContext as _, Context, IntoElement, ParentElement as _, Render, Styled as _,
+    Task, WeakEntity, Window, div, prelude::FluentBuilder as _, px, rgb,
 };
 use vibex_markdown::{
-    Block, BlockNode, MarkdownInput, MarkdownSurface, parse_markdown, plain_text,
+    Block, BlockNode, MarkdownDocument, MarkdownInput, MarkdownSurface, parse_markdown, plain_text,
+    utf8_prefix,
 };
 
 use crate::theme;
 
-pub fn render(source: &str, revision: u64) -> Div {
-    let document =
-        parse_markdown(MarkdownInput::new(source, "", revision).surface(MarkdownSurface::Agent));
-    div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .text_size(px(13.0))
-        .line_height(px(19.0))
-        .text_color(theme::text_secondary())
-        .children(render_blocks(&document.blocks, 0))
+const PENDING_RENDER_MAX_BYTES: usize = 16 * 1024;
+const PARSE_COALESCE_DELAY: std::time::Duration = std::time::Duration::from_millis(16);
+
+pub struct MarkdownView {
+    source: Arc<str>,
+    revision: u64,
+    document: Arc<MarkdownDocument>,
+    parse_generation: u64,
+    parse_task: Option<Task<()>>,
+}
+
+impl MarkdownView {
+    pub fn new(source: Arc<str>, revision: u64, cx: &mut Context<Self>) -> Self {
+        let input = markdown_input(source.clone(), revision);
+        let mut this = Self {
+            source,
+            revision,
+            document: pending_document(&input),
+            parse_generation: 1,
+            parse_task: None,
+        };
+        this.queue_background_parse(input, 1, cx);
+        this
+    }
+
+    pub fn set_source(&mut self, source: Arc<str>, revision: u64, cx: &mut Context<Self>) {
+        if self.revision == revision && self.source.as_ref() == source.as_ref() {
+            return;
+        }
+        self.source = source.clone();
+        self.revision = revision;
+        self.parse_generation = self.parse_generation.saturating_add(1).max(1);
+        let generation = self.parse_generation;
+        let input = markdown_input(source, revision);
+        self.document = pending_document(&input);
+        self.queue_background_parse(input, generation, cx);
+        cx.notify();
+    }
+
+    fn queue_background_parse(
+        &mut self,
+        input: MarkdownInput,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if self.parse_task.is_some() {
+            return;
+        }
+        let background = cx.background_executor().clone();
+        let parse = cx.background_spawn(async move {
+            background.timer(PARSE_COALESCE_DELAY).await;
+            Arc::new(parse_markdown(input))
+        });
+        self.parse_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let document = parse.await;
+            let _ = entity.update(cx, |this, cx| {
+                this.parse_task = None;
+                if this.parse_generation == generation
+                    && this.revision == document.revision
+                    && this.source.as_ref() == document.source.as_ref()
+                {
+                    this.document = document;
+                    cx.notify();
+                } else {
+                    let latest = markdown_input(this.source.clone(), this.revision);
+                    let latest_generation = this.parse_generation;
+                    this.queue_background_parse(latest, latest_generation, cx);
+                }
+            });
+        }));
+    }
+}
+
+pub fn render(source: Arc<str>, revision: u64, cx: &mut Context<MarkdownView>) -> MarkdownView {
+    MarkdownView::new(source, revision, cx)
+}
+
+impl Render for MarkdownView {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .text_size(px(13.0))
+            .line_height(px(19.0))
+            .text_color(theme::text_secondary())
+            .children(render_blocks(&self.document.blocks, 0))
+    }
+}
+
+fn markdown_input(source: Arc<str>, revision: u64) -> MarkdownInput {
+    MarkdownInput::new(source, "", revision).surface(MarkdownSurface::Agent)
+}
+
+fn pending_document(input: &MarkdownInput) -> Arc<MarkdownDocument> {
+    let mut fallback = input.clone();
+    fallback.source = Arc::from(utf8_prefix(&input.source, PENDING_RENDER_MAX_BYTES));
+    Arc::new(MarkdownDocument::literal(
+        &fallback,
+        "mobile_markdown_parse_pending",
+        "Markdown parsing is running in the background",
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_document_caps_large_source_without_splitting_utf8() {
+        let source = "😀".repeat(PENDING_RENDER_MAX_BYTES / 4 + 1);
+        let input = markdown_input(Arc::from(source.as_str()), 1);
+        let document = pending_document(&input);
+
+        assert!(document.source.len() <= PENDING_RENDER_MAX_BYTES);
+        assert!(document.source.len() < source.len());
+        assert!(source.is_char_boundary(document.source.len()));
+    }
 }
 
 fn render_blocks(blocks: &[BlockNode], depth: usize) -> Vec<AnyElement> {
