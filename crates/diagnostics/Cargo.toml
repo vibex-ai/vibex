@@ -12,8 +12,6 @@ serde_json.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 vibex-agent = { path = "../agent" }
-vibex-agent-claude = { path = "../agent-claude" }
-vibex-agent-codex = { path = "../agent-codex" }
 vibex-config-switch = { path = "../config-switch" }
 vibex-core = { path = "../core" }
 vibex-db = { path = "../db" }

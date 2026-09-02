@@ -34,8 +34,6 @@ url.workspace = true
 rfd = { version = "0.17.2", default-features = false, features = ["wayland", "xdg-portal"] }
 vibex-agent = { path = "../../crates/agent" }
 vibex-agent-acp = { path = "../../crates/agent-acp" }
-vibex-agent-claude = { path = "../../crates/agent-claude" }
-vibex-agent-codex = { path = "../../crates/agent-codex" }
 vibex-app-update = { path = "../../crates/app-update" }
 vibex-config-switch = { path = "../../crates/config-switch" }
 vibex-content = { path = "../../crates/content" }

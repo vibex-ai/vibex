@@ -18,14 +18,11 @@ use vibex_core::{
     AgentSessionState, AgentUsageCounterOrigin, AgentUsageExecutionContext,
     AgentUsageStreamAttribution, BindingState, CancelAgentDelegationRequest,
     ContinueAgentTurnRequest, CreateAgentDelegationRequest, CreateAgentSessionRequest,
-    ElicitationRequest, ExternalSessionContinuationStatus, ExternalSessionImportCandidate,
-    ExternalSessionImportCandidateStatus, ExternalSessionImportDiagnostic,
-    ExternalSessionImportPreview, ExternalSessionImportPreviewRequest,
-    ExternalSessionImportRequest, ExternalSessionImportResult, ExternalSessionImportSource,
-    ExternalSessionImportedTimelineCount, FetchTimelineRequest, ForkAgentSessionRequest,
-    McpSecretTarget, McpServer, McpServerSecretReference, McpServerTransportKind,
-    MessageAttachment, MessageSubmissionId, PermissionRequest, ProjectId, PromptKind, PromptStatus,
-    ProviderBinding, ProviderBindingMetadata, ProviderCapabilities, ProviderCapabilitiesResponse,
+    ElicitationRequest, FetchTimelineRequest, ForkAgentSessionRequest, LocalHistoryImportResult,
+    LocalHistoryScanResult, LocalHistorySelection, LocalHistoryTimelineEntry, McpSecretTarget,
+    McpServer, McpServerSecretReference, McpServerTransportKind, MessageAttachment,
+    MessageSubmissionId, PermissionRequest, ProjectId, PromptKind, PromptStatus, ProviderBinding,
+    ProviderBindingMetadata, ProviderCapabilities, ProviderCapabilitiesResponse,
     ProviderDefaultScopeKind, ProviderKind, ProviderNativeBinding, ProviderProfile,
     ProviderProfileDefaultScope, ProviderProfileId, ProviderProfileStatus,
     RenameAgentSessionRequest, ResolveElicitationRequest, ResolvePermissionRequest, RetryPhase,
@@ -41,10 +38,10 @@ use vibex_db::{
     AgentAuthContextRepository, AgentAuthenticationOperationRepository, AgentConfigRepository,
     AgentDefaultModelProviderProfileRepository, AgentDelegationRepository,
     AgentDelegationReservation, AgentSessionRuntimeRepository, DbConnection, ElicitationRepository,
-    McpServerRepository, MessageSubmissionRepository, PermissionRepository, PromptRepository,
-    ProviderProfileRepository, RuntimeBindingRepository, RuntimeSwitchRepository,
-    SessionRepository, SkillRepository, TimelineAppend, TimelineRepository, WorkspaceRepository,
-    apply_migrations, open_database,
+    LocalHistoryImportRepository, LocalHistoryImportWrite, McpServerRepository,
+    MessageSubmissionRepository, PermissionRepository, PromptRepository, ProviderProfileRepository,
+    RuntimeBindingRepository, RuntimeSwitchRepository, SessionRepository, SkillRepository,
+    TimelineAppend, TimelineRepository, WorkspaceRepository, apply_migrations, open_database,
 };
 
 use crate::adapter::{
@@ -69,6 +66,7 @@ const MAX_AGENT_DELEGATION_TITLE_CHARS: usize = 160;
 const MAX_AGENT_DELEGATION_SUMMARY_CHARS: usize = 480;
 const MAX_AGENT_DELEGATION_IDEMPOTENCY_KEY_CHARS: usize = 160;
 const AGENT_DELEGATION_OBSERVE_INTERVAL: Duration = Duration::from_millis(400);
+static LOCAL_HISTORY_IMPORT_GUARD: OnceLock<AsyncMutex<()>> = OnceLock::new();
 pub const PROVIDER_SELECTED_MODEL_METADATA_KEY: &str = "selectedModel";
 pub const PROVIDER_SELECTED_REASONING_EFFORT_METADATA_KEY: &str = "selectedReasoningEffort";
 
@@ -1548,359 +1546,173 @@ impl AgentManager {
         )
     }
 
-    pub async fn preview_external_sessions(
-        &self,
-        request: ExternalSessionImportPreviewRequest,
-    ) -> VibexResult<ExternalSessionImportPreview> {
-        let mut candidates = Vec::new();
-        let mut diagnostics = Vec::new();
-        if !request.sources.contains(&ExternalSessionImportSource::Acp) {
-            return Ok(ExternalSessionImportPreview {
-                candidates,
-                diagnostics,
-                correlation_id: request.correlation_id,
-            });
-        }
-
-        let profiles = {
+    /// Scans every registered local Agent history source concurrently. The
+    /// SQLite provenance index is read before the scan so the returned rows
+    /// expose New/Imported/Deleted state without reparsing old timelines.
+    pub async fn scan_local_history(&self) -> VibexResult<LocalHistoryScanResult> {
+        let imported = {
             let conn = self.open_migrated()?;
-            ProviderProfileRepository::list(&conn)?
-                .into_iter()
-                .filter(|profile| {
-                    profile.kind == ProviderKind::Acp
-                        && profile.status == ProviderProfileStatus::Enabled
-                })
-                .collect::<Vec<_>>()
+            LocalHistoryImportRepository::list(&conn)?
         };
-
-        for profile in profiles {
-            let provider = match self
-                .route_for_agent(&profile.agent_id)
-                .and_then(|route| self.runtime(&route))
-            {
-                Ok(provider) => provider,
-                Err(error) => {
-                    diagnostics.push(import_preview_diagnostic(
-                        ExternalSessionImportSource::Acp,
-                        Some(&profile.id),
-                        error,
-                    ));
-                    continue;
-                }
-            };
-            match provider
-                .list_import_candidates(&profile.id, request.workspace_root.as_deref())
-                .await
-            {
-                Ok(mut listed) => candidates.append(&mut listed),
-                Err(error) => diagnostics.push(import_preview_diagnostic(
-                    ExternalSessionImportSource::Acp,
-                    Some(&profile.id),
-                    error,
-                )),
-            }
-        }
-
-        // `session/list` is queried once per configured ACP profile. Mark
-        // native sessions that already have a durable binding so rescanning is
-        // idempotent and the UI can hide them from the importable count.
-        let imported_bindings = self.imported_native_session_keys()?;
-        let mut seen = HashSet::new();
-        candidates.retain_mut(|candidate| {
-            let profile_key = candidate
-                .provider_profile_id
-                .as_ref()
-                .map(|profile| profile.as_str().to_string())
-                .unwrap_or_default();
-            let native_key = candidate
-                .native_session_id
-                .as_deref()
-                .filter(|native_id| has_text(native_id))
-                .map(ToString::to_string)
-                .unwrap_or_else(|| format!("candidate:{}", candidate.candidate_id));
-            let key = (
-                candidate.agent_id.as_str().to_string(),
-                profile_key,
-                native_key,
-            );
-            if !seen.insert(key.clone()) {
-                return false;
-            }
-            candidate.already_imported = imported_bindings.contains(&key);
-            true
-        });
-
-        Ok(ExternalSessionImportPreview {
-            candidates,
-            diagnostics,
-            correlation_id: request.correlation_id,
+        let roots = crate::local_history::local_history_source_roots();
+        tokio::task::spawn_blocking(move || {
+            Ok(crate::local_history::scan_local_history_from(
+                &roots, &imported,
+            ))
         })
+        .await
+        .map_err(|error| {
+            VibexError::process(
+                "local_history_scan_worker_failed",
+                "local history scan worker failed",
+            )
+            .with_diagnostic("error", error.to_string())
+        })?
     }
 
-    pub async fn import_external_sessions(
+    /// Re-scans and materializes selected local history before importing. A
+    /// process guard avoids duplicate work in one desktop process; the unique
+    /// source/external-id index remains the durable cross-process fence.
+    pub async fn import_local_history(
         &self,
-        request: ExternalSessionImportRequest,
-    ) -> VibexResult<ExternalSessionImportResult> {
-        let mut sessions = Vec::new();
-        let mut imported_timeline_counts = Vec::new();
-        let mut diagnostics = Vec::new();
-        let mut imported_keys = self.imported_native_session_keys()?;
+        selections: Vec<LocalHistorySelection>,
+    ) -> VibexResult<LocalHistoryImportResult> {
+        if selections.is_empty() {
+            return Err(VibexError::validation(
+                "local_history_selection_empty",
+                "at least one local history session must be selected",
+            ));
+        }
+        let guard = LOCAL_HISTORY_IMPORT_GUARD.get_or_init(|| AsyncMutex::new(()));
+        let _guard = guard.try_lock().map_err(|_| {
+            VibexError::conflict(
+                "local_history_import_in_progress",
+                "a local history import is already in progress",
+            )
+        })?;
 
-        for candidate in request.candidates {
-            self.validate_import_candidate(&candidate)?;
-            diagnostics.extend(candidate.diagnostics.clone());
-
-            let mut conn = self.open_migrated()?;
-            let acp_profile = if candidate.source == ExternalSessionImportSource::Acp {
-                let profile_id = candidate.provider_profile_id.clone().ok_or_else(|| {
-                    VibexError::validation(
-                        "external_session_import_provider_profile_missing",
-                        "ACP native session import requires a Provider Profile",
-                    )
-                })?;
-                let profile =
-                    ProviderProfileRepository::get(&conn, &profile_id)?.ok_or_else(|| {
-                        VibexError::validation(
-                            "provider_profile_not_found",
-                            "Provider Profile was not found for ACP session import",
-                        )
-                    })?;
-                if profile.agent_id != candidate.agent_id
-                    || profile.kind != ProviderKind::Acp
-                    || profile.status != ProviderProfileStatus::Enabled
-                {
-                    return Err(VibexError::validation(
-                        "provider_profile_route_mismatch",
-                        "Provider Profile is not enabled for the imported ACP Agent",
-                    ));
-                }
-                Some(profile)
-            } else {
-                None
-            };
-            let (_project, workspace) = WorkspaceRepository::ensure(
-                &conn,
-                &candidate.workspace_root,
-                candidate.workspace_mode,
-            )?;
-            if candidate.source == ExternalSessionImportSource::Acp {
-                let profile = acp_profile
-                    .as_ref()
-                    .expect("ACP profile was validated above");
-                let profile_id = profile.id.clone();
-                let native_session_id =
-                    candidate.native_session_id.as_deref().ok_or_else(|| {
-                        VibexError::validation(
-                            "external_session_import_native_session_id_missing",
-                            "ACP native session import requires a native session id",
-                        )
-                    })?;
-                let key = (
-                    candidate.agent_id.as_str().to_string(),
-                    profile_id.as_str().to_string(),
-                    native_session_id.to_string(),
-                );
-                if !imported_keys.insert(key) {
-                    continue;
-                }
-                let desired = self.import_runtime_selection(&candidate, &profile, &workspace)?;
-                let now = unix_timestamp_ms();
-                let session = AgentSession {
-                    id: VibexSessionId::new(),
-                    title: candidate.title.clone(),
-                    project_id: workspace.project_id.clone(),
-                    workspace_id: workspace.id.clone(),
-                    workspace_root: workspace.root_path.clone(),
-                    workspace_mode: workspace.mode,
-                    agent_id: candidate.agent_id.clone(),
-                    state: AgentSessionState::Initializing,
-                    safety: AgentSessionSafety::workspace_write_ask_on_risk(),
-                    created_at_ms: now,
-                    updated_at_ms: now,
-                    last_message_at_ms: now,
-                    archived_at_ms: None,
-                    deleted_at_ms: None,
-                };
-                TimelineRepository::insert_session_and_append_many(&mut conn, &session, &[])?;
-                self.append_system_notice(
-                    &mut conn,
-                    &session.id,
-                    imported_session_notice(&candidate),
-                    SystemNoticeLevel::Info,
-                )?;
-                drop(conn);
-
-                let runtime_selection = self
-                    .runtime_selection
-                    .get()
-                    .and_then(Weak::upgrade)
-                    .ok_or_else(|| {
-                        VibexError::process(
-                            "runtime_selection_service_unavailable",
-                            "ACP runtime selection service is not installed",
-                        )
-                    })?;
-                let initialization = runtime_selection
-                    .initialize_imported_session(
-                        &session.id,
-                        desired,
-                        native_session_id,
-                        &candidate.additional_workspace_roots,
-                    )
-                    .await;
-                let (_initialization_state, initial_events) = match initialization {
-                    Ok(initialization) => initialization,
-                    Err(error) => {
-                        let mut conn = self.open_migrated()?;
-                        SessionRepository::update_state(
-                            &conn,
-                            &session.id,
-                            AgentSessionState::Error,
-                        )?;
-                        self.append_provider_error(&mut conn, &session.id, &error)?;
-                        return Err(error);
-                    }
-                };
-                let mut conn = self.open_migrated()?;
-                let coalesce_after_sequence =
-                    TimelineRepository::latest_sequence(&conn, &session.id)?;
-                let mut imported_count = 0_u32;
-                let mut needs_input = false;
-                for event in initial_events {
-                    if event.session_title.is_some() {
-                        // ACP session titles are metadata, not empty timeline
-                        // rows. The candidate title was already persisted.
-                        continue;
-                    }
-                    if let TimelinePayload::PermissionRequest(permission) = &event.payload {
-                        PermissionRepository::insert_request(&conn, permission)?;
-                        needs_input = true;
-                    }
-                    if let TimelinePayload::ElicitationRequest(elicitation) = &event.payload {
-                        ElicitationRepository::insert_request(&conn, elicitation)?;
-                        needs_input = true;
-                    }
-                    let item = self.append_provider_event(
-                        &mut conn,
-                        &session.id,
-                        event,
-                        coalesce_after_sequence,
-                        None,
-                    )?;
-                    self.publish_attention_notification(&item);
-                    imported_count = imported_count.saturating_add(1);
-                }
-                self.transition(&conn, &session, AgentSessionState::Idle)?;
-                if needs_input {
-                    SessionRepository::update_state(
-                        &conn,
-                        &session.id,
-                        AgentSessionState::NeedsInput,
-                    )?;
-                }
-                self.append_system_notice(
-                    &mut conn,
-                    &session.id,
-                    "Agent session is ready",
-                    SystemNoticeLevel::Info,
-                )?;
-                let loaded = SessionRepository::get(&conn, &session.id)?.ok_or_else(|| {
-                    VibexError::storage(
-                        "session_missing_after_import",
-                        "imported session could not be reloaded",
-                    )
-                })?;
-                imported_timeline_counts.push(ExternalSessionImportedTimelineCount {
-                    session_id: loaded.id.clone(),
-                    count: imported_count,
-                });
-                sessions.push(loaded);
+        let mut unique = HashSet::new();
+        let mut result = LocalHistoryImportResult {
+            sessions: Vec::new(),
+            already_imported: 0,
+            not_found: 0,
+            failed: 0,
+            errors: Vec::new(),
+        };
+        let roots = crate::local_history::local_history_source_roots();
+        for selection in selections {
+            if !unique.insert(selection.clone()) {
                 continue;
             }
-
-            let agent_id = candidate
-                .provider_profile_id
-                .as_ref()
-                .and_then(|profile_id| {
-                    ProviderProfileRepository::get(&conn, profile_id)
-                        .ok()
-                        .flatten()
-                })
-                .map(|profile| profile.agent_id)
-                .unwrap_or_else(|| candidate.agent_id.clone());
-            let now = unix_timestamp_ms();
-            let session = AgentSession {
-                id: VibexSessionId::new(),
-                title: candidate.title.clone(),
-                project_id: workspace.project_id.clone(),
-                workspace_id: workspace.id.clone(),
-                workspace_root: workspace.root_path.clone(),
-                workspace_mode: workspace.mode,
-                agent_id,
-                state: AgentSessionState::Idle,
-                safety: AgentSessionSafety::workspace_write_ask_on_risk(),
-                created_at_ms: now,
-                updated_at_ms: now,
-                last_message_at_ms: now,
-                archived_at_ms: None,
-                deleted_at_ms: None,
+            let materialized = match tokio::task::spawn_blocking({
+                let selection = selection.clone();
+                let roots = roots.clone();
+                move || crate::local_history::materialize_local_history_from(&selection, &roots)
+            })
+            .await
+            {
+                Ok(Ok(materialized)) => materialized,
+                Ok(Err(error)) if error.code == "local_history_session_not_found" => {
+                    result.not_found = result.not_found.saturating_add(1);
+                    continue;
+                }
+                Ok(Err(error)) => {
+                    result.failed = result.failed.saturating_add(1);
+                    if result.errors.len() < 32 {
+                        result.errors.push(error.message);
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    result.failed = result.failed.saturating_add(1);
+                    if result.errors.len() < 32 {
+                        result.errors.push(format!(
+                            "local history materialization worker failed: {error}"
+                        ));
+                    }
+                    continue;
+                }
             };
-            let mut timeline_inputs = vec![TimelineAppend {
-                source: TimelineSource::System,
-                payload: TimelinePayload::SystemNotice(SystemNoticePayload {
-                    level: SystemNoticeLevel::Info,
-                    message: imported_session_notice(&candidate),
-                }),
-                timestamp_ms: None,
-                correlation_id: request.correlation_id.clone(),
-                provider_correlation_id: None,
-                redaction_state: TimelineRedactionState::None,
-                execution_attribution: None,
-            }];
-            for imported_item in &candidate.timeline_items {
-                timeline_inputs.push(TimelineAppend {
-                    source: imported_item.source,
-                    payload: imported_item.payload.clone(),
-                    timestamp_ms: None,
-                    correlation_id: request.correlation_id.clone(),
-                    provider_correlation_id: imported_item.provider_correlation_id.clone(),
-                    redaction_state: imported_item.redaction_state,
-                    execution_attribution: None,
-                });
+            let workspace_root = materialized
+                .summary
+                .workspace_root
+                .clone()
+                .unwrap_or_default();
+            if workspace_root.trim().is_empty() {
+                result.not_found = result.not_found.saturating_add(1);
+                continue;
             }
-            let appended = TimelineRepository::insert_session_and_append_many(
+            let mut conn = self.open_migrated()?;
+            let (_project, workspace) = match WorkspaceRepository::ensure(
+                &conn,
+                &workspace_root,
+                vibex_core::WorkspaceMode::CurrentCheckout,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    result.failed = result.failed.saturating_add(1);
+                    if result.errors.len() < 32 {
+                        result.errors.push(error.message);
+                    }
+                    continue;
+                }
+            };
+            let mut materialized = materialized;
+            materialized.timeline.insert(
+                0,
+                LocalHistoryTimelineEntry {
+                    source: TimelineSource::System,
+                    payload: TimelinePayload::SystemNotice(SystemNoticePayload {
+                        level: SystemNoticeLevel::Info,
+                        message: format!(
+                            "Imported {} local session history as read-only",
+                            selection.source.label()
+                        ),
+                    }),
+                    timestamp_ms: materialized.summary.started_at_ms,
+                },
+            );
+            let now = unix_timestamp_ms();
+            let mut session = crate::local_history::session_shell_for_materialized(
+                &materialized,
+                workspace.project_id.clone(),
+                workspace.id.clone(),
+                now,
+            );
+            session.workspace_root = workspace.root_path.clone();
+            session.workspace_mode = workspace.mode;
+            match LocalHistoryImportRepository::insert_materialized(
                 &mut conn,
                 &session,
-                &timeline_inputs,
-            )?;
-            for item in &appended {
-                let _ = self.live_events.send(TimelineLiveEvent {
-                    session_id: session.id.clone(),
-                    sequence: item.sequence,
-                    item: item.clone(),
-                });
+                &materialized,
+            ) {
+                Ok(LocalHistoryImportWrite::Imported(items)) => {
+                    for item in items {
+                        let _ = self.publish_timeline_item(item);
+                    }
+                    if let Some(loaded) = SessionRepository::get(&conn, &session.id)? {
+                        self.publish_root_session_update(&conn, loaded.clone());
+                        result.sessions.push(loaded);
+                    }
+                }
+                Ok(LocalHistoryImportWrite::Existing(existing)) => {
+                    result.already_imported = result.already_imported.saturating_add(1);
+                    if !existing.deleted {
+                        if let Some(loaded) = SessionRepository::get(&conn, &existing.session_id)? {
+                            result.sessions.push(loaded);
+                        }
+                    }
+                }
+                Err(error) => {
+                    result.failed = result.failed.saturating_add(1);
+                    if result.errors.len() < 32 {
+                        result.errors.push(error.message);
+                    }
+                }
             }
-
-            let loaded = SessionRepository::get(&conn, &session.id)?.ok_or_else(|| {
-                VibexError::storage(
-                    "session_missing_after_import",
-                    "imported session could not be reloaded",
-                )
-            })?;
-            imported_timeline_counts.push(ExternalSessionImportedTimelineCount {
-                session_id: loaded.id.clone(),
-                count: appended.len() as u32,
-            });
-            sessions.push(loaded);
         }
-
-        Ok(ExternalSessionImportResult {
-            sessions,
-            imported_timeline_counts,
-            diagnostics,
-        })
+        Ok(result)
     }
-
     pub async fn send_message(
         &self,
         request: SendAgentMessageRequest,
@@ -3664,182 +3476,6 @@ impl AgentManager {
         provider.logout_agent(request).await
     }
 
-    fn validate_import_candidate(
-        &self,
-        candidate: &ExternalSessionImportCandidate,
-    ) -> VibexResult<()> {
-        if candidate.candidate_id.trim().is_empty() {
-            return Err(VibexError::validation(
-                "external_session_import_candidate_id_empty",
-                "external session import candidate id must not be empty",
-            ));
-        }
-        if candidate.title.trim().is_empty() {
-            return Err(VibexError::validation(
-                "external_session_import_title_empty",
-                "external session import title must not be empty",
-            ));
-        }
-        if candidate.workspace_root.trim().is_empty() {
-            return Err(VibexError::validation(
-                "external_session_import_workspace_root_empty",
-                "external session import workspace root must not be empty",
-            ));
-        }
-        if candidate.source == ExternalSessionImportSource::Acp
-            && !candidate.native_session_id.as_deref().is_some_and(has_text)
-        {
-            return Err(VibexError::validation(
-                "external_session_import_native_session_id_missing",
-                "ACP native session import requires a native session id",
-            )
-            .with_diagnostic("candidateId", &candidate.candidate_id));
-        }
-        if candidate.source == ExternalSessionImportSource::Acp {
-            let workspace_root = Path::new(candidate.workspace_root.trim());
-            if !workspace_root.is_absolute() {
-                return Err(VibexError::validation(
-                    "external_session_import_workspace_root_not_absolute",
-                    "external session import workspace root must be an absolute path",
-                )
-                .with_diagnostic("candidateId", &candidate.candidate_id));
-            }
-            let metadata = std::fs::metadata(workspace_root).map_err(|error| {
-                VibexError::validation(
-                    "external_session_import_workspace_root_unavailable",
-                    "external session import workspace root does not exist",
-                )
-                .with_diagnostic("candidateId", &candidate.candidate_id)
-                .with_diagnostic("error", error.to_string())
-            })?;
-            if !metadata.is_dir() {
-                return Err(VibexError::validation(
-                    "external_session_import_workspace_root_not_directory",
-                    "external session import workspace root must be a directory",
-                )
-                .with_diagnostic("candidateId", &candidate.candidate_id));
-            }
-        }
-        if candidate.status != ExternalSessionImportCandidateStatus::Importable {
-            return Err(VibexError::validation(
-                "external_session_import_candidate_not_importable",
-                "external session import candidate is not marked importable",
-            )
-            .with_diagnostic("candidateId", &candidate.candidate_id));
-        }
-        if candidate.provider_kind != candidate.source.provider_kind() {
-            return Err(VibexError::validation(
-                "external_session_import_provider_mismatch",
-                "external session import source does not match provider kind",
-            )
-            .with_diagnostic("candidateId", &candidate.candidate_id)
-            .with_diagnostic("source", candidate.source.to_string())
-            .with_diagnostic("providerKind", candidate.provider_kind.to_string()));
-        }
-        if candidate.continuation_status == ExternalSessionContinuationStatus::Resumable {
-            let has_resume_handle = match candidate.provider_kind {
-                ProviderKind::Codex => candidate.native_thread_id.as_deref().is_some_and(has_text),
-                ProviderKind::Claude => {
-                    candidate.native_session_id.as_deref().is_some_and(has_text)
-                }
-                ProviderKind::Acp => candidate.native_session_id.as_deref().is_some_and(has_text),
-            };
-            if !has_resume_handle {
-                return Err(VibexError::validation(
-                    "external_session_import_resumable_handle_missing",
-                    "resumable external session import requires a stable native resume handle",
-                )
-                .with_diagnostic("candidateId", &candidate.candidate_id)
-                .with_diagnostic("providerKind", candidate.provider_kind.to_string()));
-            }
-        }
-        Ok(())
-    }
-
-    fn imported_native_session_keys(&self) -> VibexResult<HashSet<(String, String, String)>> {
-        let conn = self.open_migrated()?;
-        let mut keys = HashSet::new();
-        for session in SessionRepository::list(&conn, true)? {
-            for binding in RuntimeBindingRepository::list_by_session(&conn, &session.id)? {
-                let Some(native_session_id) = binding.native_session_id else {
-                    continue;
-                };
-                let Some(provider_profile_id) = binding.auth_source.provider_profile_id() else {
-                    continue;
-                };
-                keys.insert((
-                    binding.agent_id.as_str().to_string(),
-                    provider_profile_id.as_str().to_string(),
-                    native_session_id,
-                ));
-            }
-        }
-        Ok(keys)
-    }
-
-    fn import_runtime_selection(
-        &self,
-        candidate: &ExternalSessionImportCandidate,
-        profile: &ProviderProfile,
-        _workspace: &vibex_core::WorkspaceRecord,
-    ) -> VibexResult<SessionRuntimeSelection> {
-        let model_id = candidate
-            .session_config_state
-            .as_ref()
-            .and_then(|state| state.current_model.as_ref())
-            .map(|model| model.value.trim())
-            .filter(|model| !model.is_empty())
-            .or_else(|| {
-                profile
-                    .default_model
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|model| !model.is_empty())
-            })
-            .or_else(|| {
-                profile
-                    .configured_models
-                    .iter()
-                    .find(|model| model.enabled && !model.id.trim().is_empty())
-                    .map(|model| model.id.trim())
-            })
-            .or_else(|| {
-                [
-                    profile.small_model.as_deref(),
-                    profile.large_model.as_deref(),
-                ]
-                .into_iter()
-                .flatten()
-                .map(str::trim)
-                .find(|model| !model.is_empty())
-            })
-            .ok_or_else(|| {
-                VibexError::validation(
-                    "runtime_selection_model_required",
-                    "ACP imported session has no configured model",
-                )
-                .with_diagnostic("providerProfileId", profile.id.as_str())
-            })?;
-        Ok(SessionRuntimeSelection {
-            agent_id: candidate.agent_id.clone(),
-            auth_source: vibex_core::RuntimeAuthSource::provider_profile(profile.id.clone()),
-            model: RuntimeModelSelection::explicit(model_id.to_string()),
-            reasoning_effort: profile
-                .reasoning_effort
-                .as_deref()
-                .map(str::trim)
-                .filter(|effort| !effort.is_empty())
-                .map(str::to_string),
-            mode_id: candidate
-                .session_config_state
-                .as_ref()
-                .and_then(|state| state.current_mode.as_ref())
-                .map(|mode| mode.value.trim().to_string())
-                .filter(|mode| !mode.is_empty()),
-            config_values: Default::default(),
-        })
-    }
-
     fn configured_models_for_profile(
         &self,
         provider_profile_id: Option<&ProviderProfileId>,
@@ -4855,10 +4491,6 @@ fn fork_timeline_appends(items: &[TimelineItem]) -> Vec<TimelineAppend> {
         .collect()
 }
 
-fn has_text(value: &str) -> bool {
-    !value.trim().is_empty()
-}
-
 fn normalize_model_names(models: impl IntoIterator<Item = Option<String>>) -> Vec<String> {
     let mut normalized = Vec::new();
     for model in models.into_iter().flatten() {
@@ -5362,53 +4994,6 @@ fn filter_and_limit_command_entries(
     });
     if let Some(limit) = limit {
         entries.truncate(limit as usize);
-    }
-}
-
-fn import_preview_diagnostic(
-    source: ExternalSessionImportSource,
-    provider_profile_id: Option<&ProviderProfileId>,
-    error: VibexError,
-) -> ExternalSessionImportDiagnostic {
-    let mut redacted_details = vec![
-        ProviderBindingMetadata {
-            key: "category".to_string(),
-            value: format!("{:?}", error.category),
-        },
-        ProviderBindingMetadata {
-            key: "code".to_string(),
-            value: error.code.clone(),
-        },
-    ];
-    if let Some(provider_profile_id) = provider_profile_id {
-        redacted_details.push(ProviderBindingMetadata {
-            key: "providerProfileId".to_string(),
-            value: provider_profile_id.as_str().to_string(),
-        });
-    }
-    ExternalSessionImportDiagnostic {
-        code: error.code,
-        message: error.message,
-        source,
-        redacted_details,
-    }
-}
-
-fn imported_session_notice(candidate: &ExternalSessionImportCandidate) -> String {
-    match candidate.continuation_status {
-        ExternalSessionContinuationStatus::Resumable => format!(
-            "Imported {} session history. This session can continue through the native provider.",
-            candidate.source
-        ),
-        ExternalSessionContinuationStatus::ReadOnly => format!(
-            "Imported {} session history as read-only. {}",
-            candidate.source,
-            candidate
-                .continuation_reason
-                .as_deref()
-                .filter(|value| has_text(value))
-                .unwrap_or("No stable native resume handle was available.")
-        ),
     }
 }
 

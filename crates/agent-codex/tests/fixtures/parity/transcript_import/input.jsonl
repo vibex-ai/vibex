@@ -1,4 +1,0 @@
-{"type":"session_meta","timestamp":"2026-07-11T00:00:00Z","payload":{"id":"codex-thread-parity-1","cwd":"/home/user/workspace/demo","cli_version":"parity-fixture","source":"synthetic"}}
-{"type":"response_item","timestamp":"2026-07-11T00:00:01Z","payload":{"type":"message","id":"item-user-1","role":"user","content":[{"type":"input_text","text":"Summarize the repository layout"}]}}
-{"type":"response_item","timestamp":"2026-07-11T00:00:02Z","payload":{"type":"reasoning","id":"item-reasoning-1","summary":"Check the crates directory first"}}
-{"type":"response_item","timestamp":"2026-07-11T00:00:03Z","payload":{"type":"message","id":"item-assistant-1","role":"assistant","content":[{"type":"output_text","text":"The workspace contains agent crates plus a shared core crate."}]}}

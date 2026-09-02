@@ -9,11 +9,18 @@ repository.workspace = true
 [dependencies]
 async-trait.workspace = true
 base64.workspace = true
+chrono = "0.4.45"
+dirs = "6"
+rusqlite = { version = "0.37", features = ["bundled"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+zstd = "0.13"
 vibex-config-switch = { path = "../config-switch" }
 vibex-core = { path = "../core" }
 vibex-db = { path = "../db" }
+
+[dev-dependencies]
+tempfile = "3"

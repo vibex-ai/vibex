@@ -36,14 +36,13 @@ use vibex_core::{
     AgentEventRawExtension, AgentLogoutRequest, AgentMessageDeltaPayload, AgentMessagePayload,
     AgentMessagePhase, AgentModelCapabilities, AgentModelListResponse, AgentModelListSource,
     AgentReasoningEffort, AgentRetryPayload, AgentSessionConfigProbe, AgentSessionSafety,
-    AgentUsageCounterOrigin, AgentUsageExecutionContext, ElicitationRequest,
-    ExternalSessionImportCandidate, MessageSubmissionId, PermissionActionDetail, PermissionRequest,
-    PermissionRequestStatus, PermissionResponseKind, PermissionResponseOption,
-    PermissionRiskCategory, PlanPayload, PlanStepPayload, ProviderBinding, ProviderBindingMetadata,
-    ProviderCapabilities, ProviderCapabilitySummary, ProviderKind, ProviderNativeBinding,
-    ProviderProfileId, ProviderRunCapabilityProbesRequest, ProviderSessionConfigOption,
-    ProviderSessionConfigValue, ReasoningPayload, RequestId, RetryKind, RetryPhase,
-    SessionRuntimeConfigMutationRequest, SessionRuntimeConfigMutationResult,
+    AgentUsageCounterOrigin, AgentUsageExecutionContext, ElicitationRequest, MessageSubmissionId,
+    PermissionActionDetail, PermissionRequest, PermissionRequestStatus, PermissionResponseKind,
+    PermissionResponseOption, PermissionRiskCategory, PlanPayload, PlanStepPayload,
+    ProviderBinding, ProviderBindingMetadata, ProviderCapabilities, ProviderCapabilitySummary,
+    ProviderKind, ProviderNativeBinding, ProviderProfileId, ProviderRunCapabilityProbesRequest,
+    ProviderSessionConfigOption, ProviderSessionConfigValue, ReasoningPayload, RequestId,
+    RetryKind, RetryPhase, SessionRuntimeConfigMutationRequest, SessionRuntimeConfigMutationResult,
     SessionRuntimeSelection, SystemNoticeLevel, SystemNoticePayload, TimelineErrorPayload,
     TimelinePayload, TimelineRedactionState, ToolCallPayload, ToolCallStatus, UserMessagePayload,
     VibexError, VibexResult, VibexSessionId, unix_timestamp_ms,
@@ -464,38 +463,6 @@ pub trait AcpClient: Send + Sync {
 
     async fn resume_session(&self, binding: ProviderBinding) -> VibexResult<AcpSession>;
 
-    async fn list_sessions(
-        &self,
-        _provider_profile_id: &ProviderProfileId,
-        _workspace_root: Option<&str>,
-    ) -> VibexResult<Vec<ExternalSessionImportCandidate>> {
-        Err(VibexError::capability(
-            "acp_session_list_unsupported",
-            "ACP native session listing is not supported by this adapter",
-        ))
-    }
-
-    async fn import_session(&self, request: AcpImportSessionRequest) -> VibexResult<AcpSession> {
-        let binding = ProviderBinding {
-            session_id: request.session_id,
-            provider_kind: ProviderKind::Acp,
-            auth_source: vibex_core::RuntimeAuthSource::provider_profile(
-                request.provider_profile_id,
-            ),
-            auth_source_revision: 0,
-            native: ProviderNativeBinding {
-                native_session_id: request.native_session_id,
-                native_thread_id: None,
-                native_resume_token: None,
-                session_config_state: None,
-                redacted_metadata: Vec::new(),
-            },
-            created_at_ms: unix_timestamp_ms(),
-            updated_at_ms: unix_timestamp_ms(),
-        };
-        self.resume_session(binding).await
-    }
-
     async fn send_turn(&self, request: AcpSendTurnRequest) -> VibexResult<AcpTurn>;
 
     async fn prepare_turn_execution(
@@ -612,16 +579,6 @@ impl DisabledAcpClient {
     pub fn new() -> Self {
         Self
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct AcpImportSessionRequest {
-    pub session_id: VibexSessionId,
-    pub provider_profile_id: ProviderProfileId,
-    pub native_session_id: Option<String>,
-    pub workspace_root: String,
-    pub additional_workspace_roots: Vec<String>,
-    pub runtime_resources: ProviderRuntimeResources,
 }
 
 #[async_trait]
@@ -2336,58 +2293,6 @@ impl AgentProvider for AcpAgentProvider {
                 usage_counter_origin: request.usage_counter_origin,
                 usage_event_sender: request.usage_event_sender.clone(),
             })
-            .await
-    }
-
-    async fn import_session(
-        &self,
-        request: ProviderCreateRequest,
-        candidate: ExternalSessionImportCandidate,
-    ) -> VibexResult<ProviderSessionHandle> {
-        let profile_revision = match self.config_service.as_ref() {
-            Some(service) => service
-                .get_profile(&request.provider_profile_id)?
-                .map(|profile| profile.updated_at_ms)
-                .ok_or_else(|| {
-                    VibexError::validation(
-                        "provider_profile_not_found",
-                        "Provider Profile was not found while importing the ACP binding",
-                    )
-                })?,
-            None => 0,
-        };
-        let capabilities = self.capabilities_for_profile(Some(&request.provider_profile_id));
-        let acp_session = self
-            .client
-            .import_session(AcpImportSessionRequest {
-                session_id: request.session_id.clone(),
-                provider_profile_id: request.provider_profile_id.clone(),
-                native_session_id: candidate.native_session_id.clone(),
-                workspace_root: request.workspace_root,
-                additional_workspace_roots: candidate.additional_workspace_roots.clone(),
-                runtime_resources: request.runtime_resources,
-            })
-            .await?;
-        Ok(ProviderSessionHandle {
-            binding: provider_binding(
-                request.session_id,
-                vibex_core::RuntimeAuthSource::provider_profile(request.provider_profile_id),
-                profile_revision,
-                acp_session,
-                None,
-                None,
-            ),
-            capabilities,
-        })
-    }
-
-    async fn list_import_candidates(
-        &self,
-        provider_profile_id: &ProviderProfileId,
-        workspace_root: Option<&str>,
-    ) -> VibexResult<Vec<ExternalSessionImportCandidate>> {
-        self.client
-            .list_sessions(provider_profile_id, workspace_root)
             .await
     }
 

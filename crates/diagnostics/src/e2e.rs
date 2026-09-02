@@ -9,14 +9,6 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use vibex_agent::{AgentManager, ScheduledTaskRunner};
-use vibex_agent_claude::{
-    ClaudeSessionImportPreviewRequest, import_selected_claude_sessions,
-    preview_claude_external_sessions,
-};
-use vibex_agent_codex::{
-    CodexSessionImportPreviewRequest, import_selected_codex_sessions,
-    preview_codex_external_sessions,
-};
 use vibex_config_switch::ProviderConfigService;
 use vibex_core::{
     AcpAdapterId, AcpProviderProfileCreateRequest, AgentCommandDiscoverRequest,
@@ -376,7 +368,6 @@ async fn run_e2e_regression_harness_in(root: &Path) -> VibexResult<E2eRegression
             scheduled_task_visibility(root)
         })
         .await,
-        capture_e2e_check("import_fixture_smoke", || import_fixture_smoke(root)).await,
     ];
 
     let has_failure = checks
@@ -955,77 +946,6 @@ async fn scheduled_task_visibility(root: &Path) -> VibexResult<E2eRegressionChec
     })
 }
 
-async fn import_fixture_smoke(root: &Path) -> VibexResult<E2eRegressionCheck> {
-    let db_path = root.join("import-fixtures.db");
-    let workspace_root = root.join("import-workspace");
-    fs::create_dir_all(&workspace_root).map_err(storage_io("e2e_import_workspace_failed"))?;
-    let manager = e2e_agent_manager(&db_path)?;
-
-    let codex_preview = preview_codex_external_sessions(CodexSessionImportPreviewRequest {
-        paths: vec![
-            workspace_root_path()
-                .join("crates")
-                .join("agent-codex")
-                .join("tests")
-                .join("fixtures")
-                .join("codex_resumable.jsonl"),
-        ],
-        workspace_root: Some(workspace_root.display().to_string()),
-        workspace_mode: WorkspaceMode::CurrentCheckout,
-        provider_profile_id: None,
-        correlation_id: None,
-        limit: Some(1),
-    })?;
-    let codex_import =
-        import_selected_codex_sessions(&manager, codex_preview.candidates.clone(), None).await?;
-
-    let claude_preview = preview_claude_external_sessions(ClaudeSessionImportPreviewRequest {
-        paths: vec![
-            workspace_root_path()
-                .join("crates")
-                .join("agent-claude")
-                .join("tests")
-                .join("fixtures")
-                .join("claude_resumable.jsonl"),
-        ],
-        workspace_root: Some(workspace_root.display().to_string()),
-        workspace_mode: WorkspaceMode::CurrentCheckout,
-        provider_profile_id: None,
-        correlation_id: None,
-        limit: Some(1),
-    })?;
-    let claude_import =
-        import_selected_claude_sessions(&manager, claude_preview.candidates.clone(), None).await?;
-
-    let candidate_count = codex_preview.candidates.len() + claude_preview.candidates.len();
-    let imported_count = codex_import.sessions.len() + claude_import.sessions.len();
-    let timeline_count: u64 = codex_import
-        .imported_timeline_counts
-        .iter()
-        .chain(claude_import.imported_timeline_counts.iter())
-        .map(|count| u64::from(count.count))
-        .sum();
-    let status = if candidate_count == 2 && imported_count == 2 && timeline_count > 0 {
-        E2eRegressionCheckStatus::Pass
-    } else {
-        E2eRegressionCheckStatus::Fail
-    };
-
-    Ok(E2eRegressionCheck {
-        name: "import_fixture_smoke".to_string(),
-        status,
-        classification: classification_for_status(status),
-        fixture_size: fixture_size([
-            ("sources", 2),
-            ("preview_candidates", candidate_count as u64),
-            ("imported_sessions", imported_count as u64),
-        ]),
-        output_count: timeline_count,
-        notes: "Codex and Claude fixture-backed import preview/import contracts completed"
-            .to_string(),
-    })
-}
-
 async fn dispatch_handshake(dispatcher: &RemoteDispatcher) -> VibexResult<RemoteHandshakeResponse> {
     let request = RemoteRequestEnvelope::new(RemoteOperationKind::Handshake)
         .with_payload(serde_json::json!({"clientName": "e2e-regression", "clientVersion": "0"}));
@@ -1231,14 +1151,6 @@ fn e2e_regression_root() -> PathBuf {
     ))
 }
 
-fn workspace_root_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("diagnostics crate must live under crates/")
-        .to_path_buf()
-}
-
 fn fixture_size(items: impl IntoIterator<Item = (&'static str, u64)>) -> BTreeMap<String, u64> {
     items
         .into_iter()
@@ -1293,12 +1205,11 @@ mod tests {
     async fn e2e_regression_output_is_bounded_and_redacted() {
         let result = run_e2e_regression_harness().await.unwrap();
         assert!(!result.has_blocker());
-        assert_eq!(result.checks.len(), 5);
+        assert_eq!(result.checks.len(), 4);
 
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("agent_command_protocol"));
         assert!(json.contains("remote_web_workbench"));
-        assert!(json.contains("import_fixture_smoke"));
         assert_e2e_regression_output_redacted(&json).unwrap();
         assert!(!json.contains("e2e-regression-"));
         assert!(!json.contains("remote-workbench-workspace"));

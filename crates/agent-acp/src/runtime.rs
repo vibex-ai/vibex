@@ -33,7 +33,6 @@ use agent_client_protocol_schema::v1::{
     StringFormat as AcpStringFormat,
 };
 use async_trait::async_trait;
-use chrono::DateTime;
 use command_group::AsyncCommandGroup;
 use command_group::AsyncGroupChild;
 use serde_json::{Value, json};
@@ -83,13 +82,11 @@ use vibex_core::{
     AgentUsageExecutionStatusUpdate, AgentUsageObservation, AgentUsageObservationSource,
     AgentUsageTokenValues, BindingState, ElicitationAnswerValue, ElicitationField,
     ElicitationFieldKind, ElicitationOption, ElicitationRequest, ElicitationRequestStatus,
-    ElicitationResolutionAction, ElicitationStringFormat, ExternalSessionContinuationStatus,
-    ExternalSessionImportCandidate, ExternalSessionImportCandidateStatus,
-    ExternalSessionImportSource, MAX_AGENT_USAGE_TOKEN_VALUE, NativeStateHomeId,
-    PermissionActionDetail, PermissionRequest, PermissionRequestStatus, PermissionResponseKind,
-    PermissionResponseOption, PermissionRiskCategory, PlanStepPayload, PlanStepStatus,
-    ProjectionDescriptorMatch, ProviderBinding, ProviderBindingMetadata, ProviderKind,
-    ProviderModelWireApi, ProviderNativeBinding, ProviderProfile, ProviderProfileId,
+    ElicitationResolutionAction, ElicitationStringFormat, MAX_AGENT_USAGE_TOKEN_VALUE,
+    NativeStateHomeId, PermissionActionDetail, PermissionRequest, PermissionRequestStatus,
+    PermissionResponseKind, PermissionResponseOption, PermissionRiskCategory, PlanStepPayload,
+    PlanStepStatus, ProjectionDescriptorMatch, ProviderBinding, ProviderBindingMetadata,
+    ProviderKind, ProviderModelWireApi, ProviderNativeBinding, ProviderProfile, ProviderProfileId,
     ProviderProfileStatus, ProviderSecretBackend, ProviderSessionConfigOption,
     ProviderSessionConfigOptionKind, ProviderSessionConfigState, ProviderSessionConfigValue,
     RequestId, RetryKind, RetryPhase, RuntimeAttachmentSnapshot, RuntimeAttachmentStatus,
@@ -100,10 +97,11 @@ use vibex_core::{
     SessionRuntimeConfigApplyStatus, SessionRuntimeConfigFieldOutcome,
     SessionRuntimeConfigMutationRequest, SessionRuntimeConfigMutationResult,
     SessionRuntimeConfigPatch, SessionRuntimeConfigState, SessionRuntimeSelection,
-    SystemNoticeLevel, TerminalAuthActionDescriptor, TerminalId, TimelineRedactionState,
-    ToolCallStatus, TransportKind, VibexError, VibexResult, VibexSessionId, WorkspaceMode,
-    agent_usage_reporting_contract, unix_timestamp_ms,
+    SystemNoticeLevel, TerminalAuthActionDescriptor, TerminalId, ToolCallStatus, TransportKind,
+    VibexError, VibexResult, VibexSessionId, agent_usage_reporting_contract, unix_timestamp_ms,
 };
+#[cfg(test)]
+use vibex_core::{TimelineRedactionState, WorkspaceMode};
 use vibex_db::{
     AgentAuthContextRepository, AgentAuthModelCatalogRepository,
     AgentAuthenticationOperationRepository, AgentModelProviderBindingRepository,
@@ -156,10 +154,9 @@ use crate::session_restore::{
 use crate::spawn_config::{ProcessSpawnConfigSnapshot, secret_reference_version};
 use crate::{
     AcpClient, AcpCreateSessionRequest, AcpElicitationResolution, AcpEvent,
-    AcpImportSessionRequest, AcpPermissionResolution, AcpRuntimeCommand, AcpRuntimeSessionProbe,
-    AcpSendTurnRequest, AcpSession, AcpTurn, bounded_session_content,
-    infer_permission_risk_category, looks_sensitive, redact_summary, redacted_args,
-    redacted_args_summary,
+    AcpPermissionResolution, AcpRuntimeCommand, AcpRuntimeSessionProbe, AcpSendTurnRequest,
+    AcpSession, AcpTurn, bounded_session_content, infer_permission_risk_category, looks_sensitive,
+    redact_summary, redacted_args, redacted_args_summary,
 };
 use crate::{
     AgentEventInput, AgentEventInputSource, ClaudeBackgroundWorkRegistry, ClaudeTranscriptEvent,
@@ -297,7 +294,6 @@ pub(crate) const PROBE_ENV: &[(&str, &str)] = &[
 const IGNORED_SESSION_UPDATE_KINDS: &[&str] = &["user_message_chunk", "current_model_update"];
 const ACP_SESSION_REPLAY_EVENT_LIMIT: usize = 512;
 const ACP_SESSION_REPLAY_BYTES_LIMIT: usize = 4 * 1024 * 1024;
-const ACP_SESSION_LIST_PAGE_LIMIT: usize = 128;
 
 #[derive(Debug, Clone)]
 struct AcpRpcFailure {
@@ -830,29 +826,6 @@ fn acp_fs_write_roots(cwd: &Path, env_overlays: &[(String, String)]) -> Vec<Path
         }
     }
     roots
-}
-
-fn normalize_additional_workspace_roots(cwd: &Path, roots: &[String]) -> VibexResult<Vec<PathBuf>> {
-    let mut seen = BTreeSet::new();
-    let mut normalized = Vec::new();
-    for raw in roots {
-        let value = raw.trim();
-        if value.is_empty() {
-            continue;
-        }
-        let path = PathBuf::from(value);
-        if !path.is_absolute() {
-            return Err(VibexError::validation(
-                "acp_additional_workspace_relative",
-                "ACP additional workspace roots must be absolute paths",
-            ));
-        }
-        if path == cwd || !seen.insert(path.clone()) {
-            continue;
-        }
-        normalized.push(path);
-    }
-    Ok(normalized)
 }
 
 fn mcp_servers_json(mcp_servers: &[AcpMcpServerDescriptor]) -> Value {
@@ -6146,17 +6119,6 @@ impl AcpProcess {
         });
     }
 
-    fn add_fs_write_roots(&self, roots: &[PathBuf]) {
-        let Ok(mut writable_roots) = self.fs_write_roots.lock() else {
-            return;
-        };
-        for root in roots {
-            if !writable_roots.contains(root) {
-                writable_roots.push(root.clone());
-            }
-        }
-    }
-
     fn handle_terminal_create(self: &Arc<Self>, rpc_id: Value, params: &Value) {
         let admission = self.with_routed_params(
             params,
@@ -8342,100 +8304,6 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
             binding,
             selection,
             initial_events: Vec::new(),
-        })
-    }
-
-    async fn resolve_imported(
-        &self,
-        session_id: &VibexSessionId,
-        selection: &SessionRuntimeSelection,
-        native_session_id: &str,
-        additional_workspace_roots: &[String],
-    ) -> VibexResult<ResolvedInitialRuntimeSelection> {
-        let native_session_id = native_session_id.trim();
-        if native_session_id.is_empty() {
-            return Err(VibexError::validation(
-                "acp_import_session_id_missing",
-                "ACP import requires a native session id",
-            ));
-        }
-        let context = self.target_context(session_id, selection)?;
-        let provider_profile_id = selection.provider_profile_id().cloned().ok_or_else(|| {
-            VibexError::validation(
-                "acp_import_provider_profile_missing",
-                "ACP native session import requires a Provider Profile",
-            )
-        })?;
-
-        // `AcpRuntimeClient::import_session` owns process startup, capability
-        // probing, native `session/load`, and attachment registration. Reuse
-        // that boundary here so imported sessions enter the same attachment
-        // registry as newly-created and restored sessions.
-        let acp_session = self
-            .client
-            .import_session(AcpImportSessionRequest {
-                session_id: session_id.clone(),
-                provider_profile_id,
-                native_session_id: Some(native_session_id.to_string()),
-                workspace_root: context.cwd.to_string_lossy().into_owned(),
-                additional_workspace_roots: additional_workspace_roots.to_vec(),
-                runtime_resources: context.runtime_resources.clone(),
-            })
-            .await?;
-
-        let attachment = self.client.current_attachment(session_id).ok_or_else(|| {
-            VibexError::conflict(
-                "runtime_selection_import_attachment_missing",
-                "ACP import loaded a native session without registering an attachment",
-            )
-        })?;
-        if attachment.state()? != SessionAttachmentState::Committed {
-            return Err(VibexError::conflict(
-                "runtime_selection_import_attachment_uncommitted",
-                "ACP imported session attachment is not committed",
-            ));
-        }
-        if attachment.fence().native_session_id != native_session_id {
-            return Err(VibexError::conflict(
-                "runtime_selection_import_native_session_mismatch",
-                "ACP imported attachment does not match the requested native session",
-            ));
-        }
-
-        // The native session may report the model it was created with. Keep
-        // that value in the product selection so the first durable binding is
-        // internally consistent even when the profile's default changed.
-        let mut effective_selection = selection.clone();
-        if let Some(model_id) = attachment
-            .payload()
-            .runtime_config_state()
-            .effective_model
-            .filter(|model| !model.trim().is_empty())
-        {
-            effective_selection.model = RuntimeModelSelection::explicit(model_id);
-        }
-        let adapter_id = self
-            .client
-            .route_key_for_agent(&effective_selection.agent_id)
-            .adapter_id;
-        let binding = self.build_runtime_binding_for_attachment(
-            session_id,
-            &effective_selection,
-            &adapter_id,
-            BindingState::Current,
-            None,
-            &context,
-            &attachment.payload().lease,
-            &attachment,
-        )?;
-        Ok(ResolvedInitialRuntimeSelection {
-            binding,
-            selection: effective_selection,
-            initial_events: acp_session
-                .history_events
-                .into_iter()
-                .map(|event| crate::map_acp_event(session_id.clone(), event))
-                .collect(),
         })
     }
 
@@ -17215,201 +17083,6 @@ impl AcpClient for AcpRuntimeClient {
         }))
     }
 
-    async fn list_sessions(
-        &self,
-        provider_profile_id: &ProviderProfileId,
-        workspace_root: Option<&str>,
-    ) -> VibexResult<Vec<ExternalSessionImportCandidate>> {
-        let config = self.profile_config(provider_profile_id)?;
-        let profile = self
-            .config_service
-            .get_profile(provider_profile_id)?
-            .ok_or_else(|| {
-                VibexError::validation(
-                    "provider_profile_not_found",
-                    "Provider Profile was not found for ACP session listing",
-                )
-            })?;
-        let cwd = Self::resolve_probe_cwd(&config, workspace_root)?;
-        let list_cwd = workspace_root
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .filter(|value| {
-                let path = Path::new(value);
-                path.is_absolute() && path.exists()
-            })
-            .map(|_| cwd.clone());
-        let probe_resources = ProviderRuntimeResources::default();
-        let auth_source = RuntimeAuthSource::provider_profile(provider_profile_id.clone());
-        let env_unsets = Vec::new();
-        let process = self
-            .spawn_process(
-                AcpProcessInstanceId::new(),
-                AcpProcessLaunch {
-                    auth_source: &auth_source,
-                    auth_source_revision: profile.updated_at_ms,
-                    agent_id: &profile.agent_id,
-                    config: &config,
-                    cwd: &cwd,
-                    runtime_resources: &probe_resources,
-                    env_unsets: &env_unsets,
-                    purpose: AcpProcessPurpose::Probe,
-                    process_strategy_effective: AcpProcessStrategy::PerSession,
-                    pool_fallback_reason: None,
-                },
-                None,
-                None,
-                None,
-            )
-            .await?;
-
-        let result = async {
-            self.initialize_process(&process).await?;
-            let supports_list_sessions = process
-                .shared
-                .lock()
-                .map(|shared| shared.supports_list_sessions)
-                .unwrap_or(false);
-            if !supports_list_sessions {
-                return Err(VibexError::capability(
-                    "acp_session_list_unsupported",
-                    "ACP native session listing is not supported by this provider",
-                ));
-            }
-            let mut cursor: Option<String> = None;
-            let mut candidates = Vec::new();
-            for _ in 0..ACP_SESSION_LIST_PAGE_LIMIT {
-                let mut params = json!({});
-                if let Some(list_cwd) = list_cwd.as_ref() {
-                    params["cwd"] = Value::String(list_cwd.display().to_string());
-                }
-                if let Some(cursor) = cursor.as_deref() {
-                    params["cursor"] = Value::String(cursor.to_string());
-                }
-                let response = process
-                    .request(
-                        AcpOperation::SessionList.method(),
-                        params,
-                        ACP_PROBE_TIMEOUT,
-                    )
-                    .await?;
-                candidates.extend(normalize_session_list_candidates(
-                    &response,
-                    provider_profile_id,
-                    &profile.agent_id,
-                    &cwd,
-                ));
-                let next_cursor = response
-                    .get("nextCursor")
-                    .or_else(|| response.get("next_cursor"))
-                    .and_then(value_to_string)
-                    .and_then(|cursor| sanitize_config_string(&cursor));
-                let Some(next_cursor) = next_cursor else {
-                    return Ok(candidates);
-                };
-                if cursor.as_deref() == Some(next_cursor.as_str()) {
-                    return Ok(candidates);
-                }
-                cursor = Some(next_cursor);
-            }
-            Err(VibexError::provider(
-                "acp_session_list_page_limit_exceeded",
-                "ACP native session listing exceeded the page limit",
-            ))
-        }
-        .await;
-
-        process.shutdown().await;
-        result
-    }
-
-    async fn import_session(&self, request: AcpImportSessionRequest) -> VibexResult<AcpSession> {
-        let native_session_id = request
-            .native_session_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                VibexError::validation(
-                    "acp_import_session_id_missing",
-                    "ACP import requires a native session id",
-                )
-            })?
-            .to_string();
-        let operation_lock = self.session_operation_lock(&request.session_id)?;
-        let _operation_guard = operation_lock.lock().await;
-        if let Some(current) = self.current_attachment(&request.session_id) {
-            self.detach_attachment(current.fence()).await;
-        }
-        self.detach_stale_attachment(&request.session_id).await;
-        let config = self.profile_config(&request.provider_profile_id)?;
-        let profile = self
-            .config_service
-            .get_profile(&request.provider_profile_id)?
-            .ok_or_else(|| {
-                VibexError::validation(
-                    "provider_profile_not_found",
-                    "Provider Profile was not found for ACP session import",
-                )
-            })?;
-        let auth_source = RuntimeAuthSource::provider_profile(request.provider_profile_id.clone());
-        let identity = self.attachment_identity_candidate(
-            &request.session_id,
-            &auth_source,
-            profile.updated_at_ms,
-        )?;
-        let cwd = Self::resolve_workspace_cwd(&config, &request.workspace_root)?;
-        let additional_directories =
-            normalize_additional_workspace_roots(&cwd, &request.additional_workspace_roots)?;
-        let env_unsets = Vec::new();
-        let lease = self
-            .acquire_initialized_process(AcpProcessLaunch {
-                auth_source: &auth_source,
-                auth_source_revision: profile.updated_at_ms,
-                agent_id: &profile.agent_id,
-                config: &config,
-                cwd: &cwd,
-                runtime_resources: &request.runtime_resources,
-                env_unsets: &env_unsets,
-                purpose: AcpProcessPurpose::Session,
-                process_strategy_effective: AcpProcessStrategy::PerSession,
-                pool_fallback_reason: Some("acp_import_uses_dedicated_process".to_string()),
-            })
-            .await?;
-        let requested_native_session_id = native_session_id.clone();
-        let additional_directories_for_load = additional_directories.clone();
-        let attachment = self
-            .acquire_attachment(
-                request.session_id.clone(),
-                identity,
-                lease,
-                Some(native_session_id),
-                AttachmentActivationMode::Immediate,
-                move |process| async move {
-                    process.add_fs_write_roots(&additional_directories_for_load);
-                    let supports_load_session = process
-                        .shared
-                        .lock()
-                        .map(|shared| shared.supports_load_session)
-                        .unwrap_or(false);
-                    if !supports_load_session {
-                        return Err(VibexError::capability(
-                            "acp_session_load_unsupported",
-                            "ACP native session loading is not supported by this provider",
-                        ));
-                    }
-                    self.load_existing_session_for_attachment_with_directories(
-                        &process,
-                        &requested_native_session_id,
-                        &additional_directories_for_load,
-                    )
-                    .await
-                },
-            )
-            .await?;
-        Ok(attachment.payload().acp_session())
-    }
-
     async fn send_turn(&self, request: AcpSendTurnRequest) -> VibexResult<AcpTurn> {
         // Serialize prompt admission with session-config mutations and
         // attachment replacement. The guard is released immediately after
@@ -19461,172 +19134,6 @@ fn sanitize_config_string(value: &str) -> Option<String> {
     } else {
         Some(value)
     }
-}
-
-fn normalize_session_list_candidates(
-    response: &Value,
-    provider_profile_id: &ProviderProfileId,
-    agent_id: &AgentId,
-    fallback_workspace_root: &Path,
-) -> Vec<ExternalSessionImportCandidate> {
-    let sessions = response
-        .get("sessions")
-        .and_then(Value::as_array)
-        .or_else(|| response.as_array());
-    let Some(sessions) = sessions else {
-        return Vec::new();
-    };
-
-    sessions
-        .iter()
-        .enumerate()
-        .map(|(index, session)| {
-            let native_session_id = session
-                .get("sessionId")
-                .or_else(|| session.get("id"))
-                .and_then(value_to_string)
-                .and_then(|value| sanitize_config_string(&value));
-            let title = session
-                .get("title")
-                .or_else(|| session.get("name"))
-                .and_then(Value::as_str)
-                .and_then(sanitize_config_string)
-                .unwrap_or_else(|| {
-                    native_session_id
-                        .as_deref()
-                        .map(|id| format!("ACP session {id}"))
-                        .unwrap_or_else(|| format!("ACP session {}", index + 1))
-                });
-            let workspace_root = session
-                .get("cwd")
-                .or_else(|| session.get("workspaceRoot"))
-                .and_then(Value::as_str)
-                .and_then(sanitize_config_string)
-                .unwrap_or_else(|| fallback_workspace_root.display().to_string());
-            let additional_workspace_roots =
-                session_additional_workspace_roots(session, &workspace_root);
-            let read_only = session
-                .get("readOnly")
-                .or_else(|| session.get("read_only"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let continuation_status = if native_session_id.is_some() && !read_only {
-                ExternalSessionContinuationStatus::Resumable
-            } else {
-                ExternalSessionContinuationStatus::ReadOnly
-            };
-            let continuation_reason = if native_session_id.is_none() {
-                Some("native session id is unavailable".to_string())
-            } else if read_only {
-                Some("native session is marked read-only".to_string())
-            } else {
-                None
-            };
-            let status = if continuation_status == ExternalSessionContinuationStatus::Resumable {
-                ExternalSessionImportCandidateStatus::Importable
-            } else if native_session_id.is_some() {
-                ExternalSessionImportCandidateStatus::Partial
-            } else {
-                ExternalSessionImportCandidateStatus::Blocked
-            };
-            // Native session ids are only unique within one Agent/Profile.
-            // Include both routing dimensions so the desktop multi-select UI
-            // cannot alias equal ids returned by different ACP profiles.
-            let candidate_id = native_session_id
-                .as_deref()
-                .map(|id| {
-                    format!(
-                        "acp:{}:{}:session:{}",
-                        agent_id.as_str(),
-                        provider_profile_id.as_str(),
-                        id
-                    )
-                })
-                .unwrap_or_else(|| {
-                    format!(
-                        "acp:{}:{}:list:{}",
-                        agent_id.as_str(),
-                        provider_profile_id.as_str(),
-                        index
-                    )
-                });
-
-            ExternalSessionImportCandidate {
-                candidate_id,
-                source: ExternalSessionImportSource::Acp,
-                agent_id: agent_id.clone(),
-                provider_kind: ProviderKind::Acp,
-                provider_profile_id: Some(provider_profile_id.clone()),
-                workspace_root,
-                additional_workspace_roots,
-                workspace_mode: WorkspaceMode::CurrentCheckout,
-                title,
-                native_session_id,
-                native_thread_id: None,
-                native_resume_token: None,
-                continuation_status,
-                continuation_reason,
-                updated_at_ms: session_updated_at_ms(session),
-                session_config_state: extract_provider_session_config_state(
-                    session,
-                    None,
-                    Some(provider_profile_id),
-                    session
-                        .get("sessionId")
-                        .or_else(|| session.get("id"))
-                        .and_then(Value::as_str),
-                ),
-                status,
-                already_imported: false,
-                redaction_state: TimelineRedactionState::None,
-                timeline_items: Vec::new(),
-                diagnostics: Vec::new(),
-                source_path: None,
-            }
-        })
-        .collect()
-}
-
-fn session_updated_at_ms(session: &Value) -> Option<i64> {
-    session
-        .get("updatedAt")
-        .or_else(|| session.get("updatedAtMs"))
-        .or_else(|| session.get("updated_at_ms"))
-        .and_then(|value| {
-            value.as_i64().or_else(|| {
-                value.as_str().and_then(|text| {
-                    let text = text.trim();
-                    text.parse::<i64>().ok().or_else(|| {
-                        DateTime::parse_from_rfc3339(text)
-                            .ok()
-                            .map(|timestamp| timestamp.timestamp_millis())
-                    })
-                })
-            })
-        })
-}
-
-fn session_additional_workspace_roots(session: &Value, cwd: &str) -> Vec<String> {
-    let Some(values) = session
-        .get("additionalDirectories")
-        .or_else(|| session.get("additional_directories"))
-        .or_else(|| session.get("additionalWorkspaceRoots"))
-        .and_then(Value::as_array)
-    else {
-        return Vec::new();
-    };
-    let cwd = Path::new(cwd);
-    let mut seen = BTreeSet::new();
-    values
-        .iter()
-        .filter_map(Value::as_str)
-        .filter_map(sanitize_config_string)
-        .map(|value| value.trim().to_string())
-        .filter(|value| {
-            let path = Path::new(value);
-            path.is_absolute() && path != cwd && seen.insert(value.clone())
-        })
-        .collect()
 }
 
 fn runtime_prompt_content(text: &str, attachments: &[ProviderTurnAttachment]) -> Vec<Value> {
@@ -22906,97 +22413,6 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
                 && option.values.len() == 2
         }));
         assert_eq!(state.source, "native_session_config");
-    }
-
-    #[test]
-    fn normalizes_acp_session_list_candidates() {
-        let profile_id = ProviderProfileId::new();
-        let fallback_root = PathBuf::from("/tmp/vibex-acp-list");
-        let response = json!({
-            "sessions": [
-                {
-                    "sessionId": "native-1",
-                    "title": "Existing ACP session",
-                    "workspaceRoot": "/tmp/workspace-one",
-                    "additionalDirectories": [
-                        "/tmp/workspace-extra",
-                        "/tmp/workspace-one",
-                        "/tmp/workspace-extra"
-                    ],
-                    "updatedAtMs": 42,
-                    "models": {
-                        "availableModels": [{ "modelId": "mock/model-1" }],
-                        "currentModelId": "mock/model-1"
-                    }
-                },
-                {
-                    "id": "native-2",
-                    "name": "Read only ACP session",
-                    "cwd": "/tmp/workspace-two",
-                    "readOnly": true
-                },
-                {
-                    "name": "Missing id"
-                }
-            ]
-        });
-
-        let agent_id = AgentId::parse("fixture").unwrap();
-        let candidates =
-            normalize_session_list_candidates(&response, &profile_id, &agent_id, &fallback_root);
-
-        assert_eq!(candidates.len(), 3);
-        assert_eq!(
-            candidates[0].candidate_id,
-            format!("acp:fixture:{}:session:native-1", profile_id)
-        );
-        assert_eq!(candidates[0].source, ExternalSessionImportSource::Acp);
-        assert_eq!(candidates[0].agent_id, agent_id);
-        assert_eq!(candidates[0].provider_kind, ProviderKind::Acp);
-        assert_eq!(
-            candidates[0].provider_profile_id.as_ref(),
-            Some(&profile_id)
-        );
-        assert_eq!(candidates[0].workspace_root, "/tmp/workspace-one");
-        assert_eq!(
-            candidates[0].additional_workspace_roots,
-            vec!["/tmp/workspace-extra".to_string()]
-        );
-        assert_eq!(
-            candidates[0].continuation_status,
-            ExternalSessionContinuationStatus::Resumable
-        );
-        assert_eq!(
-            candidates[0].status,
-            ExternalSessionImportCandidateStatus::Importable
-        );
-        assert_eq!(candidates[0].updated_at_ms, Some(42));
-        assert!(candidates[0].session_config_state.is_some());
-        assert_eq!(
-            candidates[1].continuation_status,
-            ExternalSessionContinuationStatus::ReadOnly
-        );
-        assert_eq!(
-            candidates[1].status,
-            ExternalSessionImportCandidateStatus::Partial
-        );
-        assert_eq!(
-            candidates[2].status,
-            ExternalSessionImportCandidateStatus::Blocked
-        );
-        assert_eq!(candidates[2].workspace_root, "/tmp/vibex-acp-list");
-    }
-
-    #[test]
-    fn session_updated_at_ms_accepts_rfc3339_and_legacy_numbers() {
-        assert_eq!(
-            session_updated_at_ms(&json!({ "updatedAt": "2026-01-02T03:04:05.678Z" })),
-            Some(1_767_323_045_678)
-        );
-        assert_eq!(
-            session_updated_at_ms(&json!({ "updatedAtMs": "42" })),
-            Some(42)
-        );
     }
 
     #[test]
@@ -34093,76 +33509,6 @@ for line in sys.stdin:
         assert!(response.diagnostics.iter().any(|diagnostic| {
             diagnostic.key == "modelCapabilities" && diagnostic.value == "codex_app_server"
         }));
-        fixture.cleanup();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn mock_acp_agent_lists_and_imports_native_session() {
-        let Some(fixture) = MockAcpFixture::create("list-import") else {
-            return;
-        };
-        let client = fixture.client();
-
-        let candidates = client
-            .list_sessions(
-                &fixture.profile_id,
-                Some(fixture.workspace.to_string_lossy().as_ref()),
-            )
-            .await
-            .unwrap();
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(
-            candidates[0].native_session_id.as_deref(),
-            Some("mock-import-session")
-        );
-        assert_eq!(
-            candidates[0].continuation_status,
-            ExternalSessionContinuationStatus::Resumable
-        );
-        assert_eq!(candidates[0].updated_at_ms, Some(123));
-
-        let session_id = VibexSessionId::new();
-        let session = client
-            .import_session(AcpImportSessionRequest {
-                session_id: session_id.clone(),
-                provider_profile_id: fixture.profile_id.clone(),
-                native_session_id: Some("mock-import-session".to_string()),
-                workspace_root: fixture.workspace.display().to_string(),
-                additional_workspace_roots: Vec::new(),
-                runtime_resources: fixture_mcp_resources(),
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(
-            session.native_session_id.as_deref(),
-            Some("mock-import-session")
-        );
-        let load_session = find_logged_request(&fixture.request_log(), "session/load");
-        assert_eq!(
-            load_session["params"]["mcpServers"][0]["name"],
-            json!("Filesystem")
-        );
-        let config = session
-            .session_config_state
-            .as_ref()
-            .expect("load config state");
-        assert_eq!(config.current_model.as_ref().unwrap().value, "mock/model-2");
-        assert_eq!(config.current_mode.as_ref().unwrap().value, "review");
-        assert!(
-            config
-                .options
-                .iter()
-                .any(|option| option.id == "reviewDepth")
-        );
-        client
-            .close_session(&test_binding_for(
-                &session_id,
-                &fixture.profile_id,
-                &session,
-            ))
-            .await
-            .unwrap();
         fixture.cleanup();
     }
 

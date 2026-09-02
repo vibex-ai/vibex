@@ -2243,136 +2243,123 @@ manager.send_message(SendAgentMessageRequest {
 The scheduled run goes through the same provider-neutral Agent boundary as a
 manual user turn.
 
-## Scenario: Phase 7 External Session Import Foundation
+## Scenario: Local Agent History Import
 
 ### 1. Scope / Trigger
 
-- Trigger: Phase 7 adds provider-neutral external Claude/Codex session import
-  contracts and storage/service foundation.
-- Provider-specific native history discovery/parsing is outside this foundation.
-  Import callers pass normalized `ExternalSessionImportCandidate` records.
+- Trigger: the desktop picker requests a fresh inventory of locally persisted
+  Agent sessions.
+- The inventory covers the fifteen registered `LocalHistorySource` values. Each
+  source has a fixed, documented layout; scanners never recurse through an
+  arbitrary Agent home.
+- Scanning is metadata-only. Transcript and database payloads are re-read only
+  after the user selects a session for import.
 
 ### 2. Signatures
 
 Core protocol types generated from `crates/core`:
 
 ```text
-ExternalSessionImportPreviewRequest
-ExternalSessionImportPreview
-ExternalSessionImportCandidate
-ExternalSessionImportRequest
-ExternalSessionImportResult
-ExternalSessionContinuationStatus = resumable | read_only
-ExternalSessionImportCandidateStatus = importable | partial | blocked
+LocalHistorySource
+LocalHistoryKey
+LocalHistorySessionSummary
+LocalHistoryScanSession
+LocalHistoryScanFolder
+LocalHistoryScanDiagnostic
+LocalHistoryScanResult
+LocalHistorySelection
+LocalHistoryTimelineEntry
+LocalHistoryMaterializedSession
+LocalHistoryImportRecord
+LocalHistoryImportResult
+LocalHistoryImportStatus = new | imported | deleted
 ```
 
 Agent service boundary:
 
 ```text
-AgentManager::import_external_sessions(ExternalSessionImportRequest)
-  -> ExternalSessionImportResult
+AgentManager::scan_local_history()
+  -> LocalHistoryScanResult
+AgentManager::import_local_history(Vec<LocalHistorySelection>)
+  -> LocalHistoryImportResult
 ```
 
 ### 3. Contracts
 
-- Imported sessions receive new Vibex-owned `AgentSession.id` values and a
-  concrete `agent_id`, but no current `RuntimeBinding` or desired/effective
-  runtime selection. Native ids in the import candidate are bounded provenance
-  evidence only and are not copied into online runtime authority.
-- Offline parsers may mark a candidate `resumable` only when they recover one
-  stable historical handle (`nativeThreadId` for Codex or `nativeSessionId` for
-  Claude). After the ACP-only cutover, importing that candidate is still a
-  read-only transcript operation until a future explicit ACP materialization
-  contract creates a durable selection and binding.
-- Import notices/diagnostics may include bounded values for `importSource`,
-  `nativeHistoryImported`, `nativeHistoryImportVersion`,
-  `importContinuationStatus`, and `importContinuationReason`; they never make
-  those fields online route inputs.
-- Imported timeline rows are normalized `TimelinePayload` records and must be
-  appended through `TimelineRepository` sequence assignment. The import service
-  prepends a system notice so imported sessions are visibly distinguishable from
-  live Vibex-created sessions.
-- Online operations reject transcript-only sessions before appending a user
-  item or starting an Adapter because authoritative runtime selection/binding
-  state is absent. They must not synthesize state from import provenance.
+- `LocalHistoryKey { source, external_id }` is the only stable identity exposed
+  by a scanner. The id is bounded provenance and is never used as a Vibex
+  runtime id.
+- A scan runs one bounded source worker per registered source. It returns
+  workspace-grouped summaries, import status, aggregate counts, and at most a
+  bounded number of diagnostics. Missing stores are normal empty results.
+- File summaries may use a short-lived fingerprint cache. SQLite stores are
+  opened read-only. A locator cache records the exact file or row found during
+  the scan, but it is only an optimization and is never authoritative state.
+- Import revalidates each selection, re-reads the source through its
+  source-specific locator, normalizes recognized user/assistant/reasoning/tool
+  records into `LocalHistoryTimelineEntry`, and rejects a changed key.
+- `LocalHistoryImportRepository` persists one provenance row per key. A unique
+  source/id constraint makes retries idempotent; an atomic transaction inserts
+  the new Vibex session, timeline rows, and provenance record together.
+- Imported sessions receive a new Vibex `AgentSession.id` and remain idle until
+  the user configures a normal runtime route. Native files, database handles,
+  and raw provider payloads never enter runtime selection state.
 
 ### 4. Validation & Error Matrix
 
-- Candidate not marked `importable` ->
-  `validation/external_session_import_candidate_not_importable`.
-- Candidate source/provider mismatch ->
-  `validation/external_session_import_provider_mismatch`.
-- Resumable candidate missing the provider-specific native handle ->
-  `validation/external_session_import_resumable_handle_missing`.
-- Transcript-only imported session send -> bounded missing runtime
-  selection/binding error; zero Timeline or Adapter side effects.
+- Empty or unknown selection id ->
+  `validation/local_history_session_not_found` (no database writes).
+- Source root unavailable ->
+  `validation/local_history_source_unavailable`.
+- A selected file or database disappears after scanning ->
+  `validation/local_history_session_not_found`.
+- A selected database cannot be opened or queried -> bounded storage error;
+  scanning records a `LocalHistoryScanDiagnostic` without paths or payloads.
+- A key already present in provenance -> `already_imported` in the batch result;
+  no duplicate session or timeline rows are created.
 
 ### 5. Good/Base/Bad Cases
 
-- Good: a normalized Codex candidate with `nativeThreadId` may report
-  `resumable` evidence in preview, imports its sanitized Timeline into a new
-  Logical Session, and remains read-only because no ACP RuntimeBinding exists.
-- Base: a normalized candidate without a stable resume handle imports as
-  `read_only`, remains listable/fetchable, and preserves imported timeline
-  content.
-- Bad: import code reads real native Claude/Codex history files in deterministic
-  tests, exposes raw native payloads in generated protocol types, or silently
-  starts an unrelated native session for read-only history.
+- Good: a scan lists a session under its normalized workspace, the picker selects
+  it, and import re-reads the same source before one transaction persists the
+  timeline.
+- Base: a source has no local store, or a session has no workspace; the result
+  stays usable and reports the unassigned count without fabricating a path.
+- Bad: a scanner recursively searches an entire home directory, imports native
+  ids as Vibex session ids, writes to a source database, or trusts stale summary
+  content instead of re-reading the locator.
 
 ### 6. Tests Required
 
-- Core serde/binding tests for external import DTOs.
-- Agent service tests for resumable provenance, absence of RuntimeBinding,
-  fail-closed online operations, imported timeline ordering, and list/fetch
-  through existing session APIs.
-- Default checks must not require real Claude/Codex auth, CLIs, or native
-  session files.
+- Core serde and identity tests for all source and scan/import DTOs.
+- Agent parser tests for each source's documented layout, bounded traversal,
+  workspace grouping, title/model/timestamp extraction, and malformed-record
+  handling.
+- Database tests for provenance uniqueness, deleted-state reconciliation,
+  atomic timeline insertion, and retry behavior.
+- Desktop tests cover filters, workspace collapse/expand, selection counts,
+  import result states, and scan diagnostics without requiring real Agent homes.
+- Default checks must not require Agent authentication, live processes, or real
+  user session files.
 
-### 7. Codex JSONL Import Boundary
+### 7. Source-Specific JSONL Boundary
 
-- Codex-native JSONL discovery/parsing belongs in the Codex adapter crate, not
-  in core DTOs, UI code, remote APIs, or shared Agent storage.
-- The parser may decode only recognized bounded fields from native JSONL:
-  `session_meta.payload.id` for `nativeThreadId`, safe workspace metadata, and
-  supported message/reasoning content that becomes explicit imported timeline
-  items.
-- Codex imports are `resumable` only when exactly one stable native thread id is
-  recovered. Missing or ambiguous native ids must produce `read_only` candidates
-  with bounded reasons such as `missing_native_thread_id` or
-  `ambiguous_native_thread_id`.
-- Malformed and unsupported JSONL records must produce bounded diagnostics with
-  metadata such as line number, record type, item type, role, or hashed path.
-  Diagnostics must not include raw JSONL, prompt text, tool payloads, terminal
-  output, environment values, tokens, or native config blobs.
-- Selected Codex import must delegate normalized candidates to
-  `AgentManager::import_external_sessions`; provider-specific import code must
-  not duplicate database writes or create a second session storage path.
+- JSONL scanners decode only recognized, bounded fields and keep source-specific
+  parsing inside `crates/agent`; core DTOs and the desktop UI receive only
+  normalized summaries and timeline entries.
+- Graph-shaped logs select the active branch before counting messages. Reset or
+  archived segments are included only when their source layout documents them.
+- Malformed records are skipped during scanning when possible; selected-session
+  failures are returned as bounded storage errors. Diagnostics never include raw
+  JSONL, prompts, tool payloads, terminal output, environment values, or tokens.
 
-### 8. Claude JSONL Import Boundary
+### 8. Transcript Safety Boundary
 
-- Claude-native JSONL discovery/parsing belongs in the Claude adapter crate,
-  not in core DTOs, UI code, remote APIs, or shared Agent storage.
-- The parser may decode only recognized bounded fields from native JSONL:
-  top-level `sessionId` for `nativeSessionId`, safe workspace metadata such as
-  `cwd`, and supported `message.role` / `message.content` blocks that become
-  explicit imported timeline items.
-- Claude imports are `resumable` only when exactly one stable native session id
-  is recovered. Missing or ambiguous native ids must produce `read_only`
-  candidates with bounded reasons such as `missing_native_session_id` or
-  `ambiguous_native_session_id`.
-- Malformed and unsupported JSONL records must produce bounded diagnostics with
-  metadata such as line number, record type, item type, role, or hashed path.
-  Diagnostics must not include raw JSONL, prompt text, tool payloads, terminal
-  output, environment values, tokens, or native config blobs.
-- Imported Claude user/assistant text may appear only as explicit imported
-  timeline payloads. Tool-use and tool-result payloads should use bounded
-  summaries and must not import raw tool input/output by default.
-- Selected Claude import must delegate normalized candidates to
-  `AgentManager::import_external_sessions`; provider-specific import code must
-  not duplicate database writes or create a second session storage path.
-- Claude import code must not register an online provider, create a durable
-  binding, or call a Native SDK. Any future continuation must enter through an
-  explicit ACP selection/switch contract.
+- User, assistant, reasoning, and tool records become explicit normalized
+  timeline payloads. Text and tool previews are bounded before persistence.
+- Import never registers an online provider, creates a runtime binding, or
+  starts a native process. Imported sessions remain ordinary idle Vibex sessions
+  until the user configures a route.
 
 ## Scenario: Phase 10 Automation Graph Runtime
 

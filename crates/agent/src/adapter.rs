@@ -14,10 +14,10 @@ use vibex_core::{
     AgentLogoutRequest, AgentModelListResponse, AgentModelListSource, AgentSessionConfigProbe,
     AgentSessionSafety, AgentUsageCounterOrigin, AgentUsageExecution, AgentUsageExecutionContext,
     AgentUsageExecutionStatusUpdate, AgentUsageObservation, ElicitationResolution,
-    ExternalSessionImportCandidate, MessageAttachment, MessageSubmissionId, PermissionResolution,
-    ProviderBinding, ProviderBindingMetadata, ProviderCapabilities, ProviderKind,
-    ProviderProfileId, RuntimeBindingId, SessionRuntimeSelection, TimelinePayload,
-    TimelineRedactionState, TimelineSource, VibexError, VibexResult, VibexSessionId,
+    MessageAttachment, MessageSubmissionId, PermissionResolution, ProviderBinding,
+    ProviderBindingMetadata, ProviderCapabilities, ProviderKind, ProviderProfileId,
+    RuntimeBindingId, SessionRuntimeSelection, TimelinePayload, TimelineRedactionState,
+    TimelineSource, VibexError, VibexResult, VibexSessionId,
 };
 
 #[derive(Debug, Clone)]
@@ -564,28 +564,6 @@ pub trait AgentProvider: Send + Sync {
         _request: &ProviderTurnRequest,
     ) -> VibexResult<Option<ProviderTurnExecutionIdentity>> {
         Ok(None)
-    }
-
-    async fn list_import_candidates(
-        &self,
-        _provider_profile_id: &ProviderProfileId,
-        _workspace_root: Option<&str>,
-    ) -> VibexResult<Vec<ExternalSessionImportCandidate>> {
-        Err(VibexError::capability(
-            "provider_native_session_list_unsupported",
-            "this provider does not support native session listing",
-        ))
-    }
-
-    async fn import_session(
-        &self,
-        _request: ProviderCreateRequest,
-        _candidate: ExternalSessionImportCandidate,
-    ) -> VibexResult<ProviderSessionHandle> {
-        Err(VibexError::capability(
-            "provider_native_session_import_unsupported",
-            "this provider does not support native session import",
-        ))
     }
 
     async fn send_turn(

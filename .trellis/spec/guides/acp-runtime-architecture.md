@@ -111,7 +111,7 @@ configuration, not hardcoded per Agent
 | Terminal tools | `terminal` | **off** (`terminal_tools`) | Terminal host behind the permission system |
 | Terminal auth | `auth.terminal` | **off** (`terminal_auth`) | Login terminal action, never a timeline token |
 | Session config options | `session/new` + config update | on when the Agent reports options | Provider-neutral session config state |
-| Session list / import | `session/list`, `session/load` | capability-gated | External session import candidates |
+| Session list / import | `session/list`, `session/load` | capability-gated | Local history scan and import picker |
 | MCP forwarding | `session/new.mcpServers` | per profile matrix | Enabled MCP descriptors only |
 | Redacted debug log | n/a (local) | redacted | Bounded ring buffer of incoming/outgoing/stderr |
 

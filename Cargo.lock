@@ -9780,14 +9780,19 @@ version = "0.1.0-rc.1"
 dependencies = [
  "async-trait",
  "base64",
+ "chrono",
+ "dirs",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "tokio",
  "tracing",
  "vibex-config-switch",
  "vibex-core",
  "vibex-db",
+ "zstd",
 ]
 
 [[package]]
@@ -9974,8 +9979,6 @@ dependencies = [
  "url",
  "vibex-agent",
  "vibex-agent-acp",
- "vibex-agent-claude",
- "vibex-agent-codex",
  "vibex-app-update",
  "vibex-backend",
  "vibex-config-switch",
@@ -10058,8 +10061,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "vibex-agent",
- "vibex-agent-claude",
- "vibex-agent-codex",
  "vibex-config-switch",
  "vibex-core",
  "vibex-db",

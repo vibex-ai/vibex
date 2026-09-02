@@ -2181,6 +2181,7 @@ mod tests {
                 "51:custom_acp_agent_definitions",
                 "52:agent_delegations",
                 "53:agent_session_title_lock",
+                "54:local_history_import_index",
             ]
         );
         assert_eq!(

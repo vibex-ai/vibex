@@ -2517,8 +2517,7 @@ fn zcode_model_entry(
     // vocabulary free of a disable-thinking level, so ZCode never emits a
     // thinking-off option for these models. Only an explicit reasoning=false
     // declaration opts out.
-    let reasoning_capable =
-        capabilities.is_none_or(|value| value.reasoning != Some(false));
+    let reasoning_capable = capabilities.is_none_or(|value| value.reasoning != Some(false));
     if reasoning_capable {
         model_entry.insert(
             "reasoning".to_string(),
@@ -4188,9 +4187,11 @@ mod tests {
         )
         .unwrap();
         let value: serde_json::Value = serde_json::from_str(&overlay).unwrap();
-        assert!(value["provider"]["fake"]["models"]["model-a"]
-            .get("reasoning")
-            .is_none());
+        assert!(
+            value["provider"]["fake"]["models"]["model-a"]
+                .get("reasoning")
+                .is_none()
+        );
     }
 
     fn fixture(

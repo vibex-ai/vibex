@@ -22,17 +22,17 @@ use vibex_core::{
     GitManagedWorktreeRecord, GitManagedWorktreeStatus, GitWorktreeDiagnostic,
     GitWorktreeOperationCheckpoint, GitWorktreeOperationDetail, GitWorktreeOperationRecord,
     GitWorktreeOperationStatus, GitWorktreeReadinessRecord, GitWorktreeReconciliationState, Hook,
-    HookCreateRequest, HookId, HookInstallPreview, HookInstallState, McpServer,
-    McpServerAgentMatrix, McpServerCreateRequest, McpServerId, McpServerProviderMatrix,
-    McpServerSecretReference, McpServerStatus, PermissionActionDetail, PermissionRequest,
-    PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
-    PermissionResponseOption, ProjectId, ProjectRecord, Prompt, PromptCreateRequest, PromptId,
-    PromptStatus, ProviderCapabilityProbeResult, ProviderHealthProbeResult,
-    ProviderInjectionPreview, ProviderInjectionPreviewRequest, ProviderKind,
-    ProviderNativeExportApplyResult, ProviderNativeExportFilePlan, ProviderNativeExportListRequest,
-    ProviderNativeExportPreview, ProviderNativeExportRecordSummary,
-    ProviderNativeExportRollbackResult, ProviderNetworkDefaults, ProviderOptions,
-    ProviderPermissionDefaults, ProviderProfile, ProviderProfileCreateRequest,
+    HookCreateRequest, HookId, HookInstallPreview, HookInstallState, LocalHistoryImportRecord,
+    LocalHistoryKey, LocalHistoryMaterializedSession, McpServer, McpServerAgentMatrix,
+    McpServerCreateRequest, McpServerId, McpServerProviderMatrix, McpServerSecretReference,
+    McpServerStatus, PermissionActionDetail, PermissionRequest, PermissionRequestStatus,
+    PermissionResolution, PermissionResponseKind, PermissionResponseOption, ProjectId,
+    ProjectRecord, Prompt, PromptCreateRequest, PromptId, PromptStatus,
+    ProviderCapabilityProbeResult, ProviderHealthProbeResult, ProviderInjectionPreview,
+    ProviderInjectionPreviewRequest, ProviderKind, ProviderNativeExportApplyResult,
+    ProviderNativeExportFilePlan, ProviderNativeExportListRequest, ProviderNativeExportPreview,
+    ProviderNativeExportRecordSummary, ProviderNativeExportRollbackResult, ProviderNetworkDefaults,
+    ProviderOptions, ProviderPermissionDefaults, ProviderProfile, ProviderProfileCreateRequest,
     ProviderProfileDefaultScope, ProviderProfileDefaultSelection, ProviderProfileId,
     ProviderProfileSetDefaultRequest, ProviderProfileStatus, ProviderSandboxDefaults,
     ProviderSecretReference, ProviderUsageRecord, ProviderUsageWindow, RedactedDiagnostic,
@@ -74,7 +74,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 53;
+pub const CURRENT_SCHEMA_VERSION: i64 = 54;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -1848,6 +1848,14 @@ pub struct DatabaseSmokeResult {
 
 pub struct WorkspaceRepository;
 pub struct SessionRepository;
+pub struct LocalHistoryImportRepository;
+
+/// Result of atomically persisting one selected local history session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalHistoryImportWrite {
+    Imported(Vec<TimelineItem>),
+    Existing(LocalHistoryImportRecord),
+}
 pub struct AgentDelegationRepository;
 /// Result of atomically reserving a child-session creation slot. A retry gets
 /// the durable delegation and must not create another child session.
@@ -2953,6 +2961,148 @@ impl SessionRepository {
             "failed to delete session",
         ))?;
         Ok(())
+    }
+}
+
+impl LocalHistoryImportRepository {
+    /// Lists every durable local-history provenance key. Soft-deleted sessions
+    /// remain visible to scanner reconciliation so a deleted row is never
+    /// mistaken for a fresh importable history entry.
+    pub fn list(conn: &Connection) -> VibexResult<Vec<LocalHistoryImportRecord>> {
+        let mut statement = conn
+            .prepare(
+                "
+                SELECT imports.source, imports.external_id, imports.session_id,
+                       sessions.deleted_at_ms
+                FROM local_history_imports AS imports
+                LEFT JOIN agent_sessions AS sessions
+                    ON sessions.session_id = imports.session_id
+                ORDER BY imports.source, imports.external_id
+                ",
+            )
+            .map_err(storage_err(
+                "local_history_import_list_prepare_failed",
+                "failed to prepare local history import lookup",
+            ))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(LocalHistoryImportRecord {
+                    key: LocalHistoryKey {
+                        source: enum_from_db_sql(row.get(0)?)?,
+                        external_id: row.get(1)?,
+                    },
+                    session_id: parse_id_sql(row.get(2)?, VibexSessionId::parse)?,
+                    deleted: row.get::<_, Option<i64>>(3)?.is_some(),
+                })
+            })
+            .map_err(storage_err(
+                "local_history_import_list_query_failed",
+                "failed to query local history imports",
+            ))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(storage_err(
+            "local_history_import_list_decode_failed",
+            "failed to decode local history imports",
+        ))
+    }
+
+    /// Reserves the source-owned key and writes its Vibex session plus timeline
+    /// in one immediate transaction. The unique key is the durable duplicate
+    /// fence when two desktop actions race the same selected history.
+    pub fn insert_materialized(
+        conn: &mut Connection,
+        session: &AgentSession,
+        materialized: &LocalHistoryMaterializedSession,
+    ) -> VibexResult<LocalHistoryImportWrite> {
+        let key = &materialized.summary.key;
+        if !key.is_valid() {
+            return Err(VibexError::validation(
+                "local_history_import_external_id_empty",
+                "local history import requires a stable external id",
+            ));
+        }
+        if session.agent_id != materialized.summary.agent_id {
+            return Err(VibexError::validation(
+                "local_history_import_agent_mismatch",
+                "local history materialization does not match its target Agent",
+            ));
+        }
+
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "local_history_import_transaction_failed",
+                "failed to start local history import transaction",
+            ))?;
+        let source = enum_to_db(&key.source)?;
+        let reserved = tx
+            .execute(
+                "
+                INSERT OR IGNORE INTO local_history_imports (
+                    source, external_id, session_id, imported_at_ms
+                ) VALUES (?1, ?2, ?3, ?4)
+                ",
+                params![
+                    source,
+                    key.external_id.trim(),
+                    session.id.as_str(),
+                    unix_timestamp_ms(),
+                ],
+            )
+            .map_err(storage_err(
+                "local_history_import_reserve_failed",
+                "failed to reserve local history import",
+            ))?;
+
+        if reserved == 0 {
+            let existing = tx
+                .query_row(
+                    "
+                    SELECT imports.session_id, sessions.deleted_at_ms
+                    FROM local_history_imports AS imports
+                    LEFT JOIN agent_sessions AS sessions
+                        ON sessions.session_id = imports.session_id
+                    WHERE imports.source = ?1 AND imports.external_id = ?2
+                    ",
+                    params![enum_to_db(&key.source)?, key.external_id.trim()],
+                    |row| {
+                        Ok(LocalHistoryImportRecord {
+                            key: key.clone(),
+                            session_id: parse_id_sql(row.get(0)?, VibexSessionId::parse)?,
+                            deleted: row.get::<_, Option<i64>>(1)?.is_some(),
+                        })
+                    },
+                )
+                .map_err(storage_err(
+                    "local_history_import_existing_lookup_failed",
+                    "failed to lookup existing local history import",
+                ))?;
+            tx.commit().map_err(storage_err(
+                "local_history_import_existing_commit_failed",
+                "failed to complete local history import lookup",
+            ))?;
+            return Ok(LocalHistoryImportWrite::Existing(existing));
+        }
+
+        SessionRepository::insert(&tx, session)?;
+        let mut appended = Vec::with_capacity(materialized.timeline.len());
+        for entry in &materialized.timeline {
+            appended.push(append_timeline_in_transaction(
+                &tx,
+                &session.id,
+                entry.source,
+                entry.payload.clone(),
+                entry.timestamp_ms,
+                None,
+                None,
+                TimelineRedactionState::None,
+                None,
+            )?);
+        }
+        tx.commit().map_err(storage_err(
+            "local_history_import_commit_failed",
+            "failed to commit local history import",
+        ))?;
+        Ok(LocalHistoryImportWrite::Imported(appended))
     }
 }
 
@@ -8058,8 +8208,8 @@ impl TimelineRepository {
         items: &[TimelineAppend],
     ) -> VibexResult<Vec<TimelineItem>> {
         let tx = conn.transaction().map_err(storage_err(
-            "session_import_transaction_failed",
-            "failed to start session import transaction",
+            "session_transaction_failed",
+            "failed to start session transaction",
         ))?;
         SessionRepository::insert(&tx, session)?;
 
@@ -8079,8 +8229,8 @@ impl TimelineRepository {
         }
 
         tx.commit().map_err(storage_err(
-            "session_import_transaction_commit_failed",
-            "failed to commit session import transaction",
+            "session_transaction_commit_failed",
+            "failed to commit session transaction",
         ))?;
         Ok(appended)
     }
@@ -10424,6 +10574,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_custom_acp_agent_definitions(conn, &mut applied)?;
     apply_agent_delegations(conn, &mut applied)?;
     apply_session_title_lock(conn, &mut applied)?;
+    apply_local_history_import_index(conn, &mut applied)?;
 
     // Seed compatibility Profiles before the v37 backfill while no caller
     // transaction is active. Repository reads may run inside a transaction and
@@ -10431,6 +10582,47 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     ProviderProfileRepository::ensure_local_defaults(conn)?;
     ProviderProjectionCompatibilityRepository::backfill_legacy_profiles(conn)?;
     Ok(applied)
+}
+
+fn apply_local_history_import_index(
+    conn: &mut Connection,
+    applied: &mut Vec<String>,
+) -> VibexResult<()> {
+    const VERSION: i64 = 54;
+    const NAME: &str = "local_history_import_index";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS local_history_imports (
+            source TEXT NOT NULL,
+            external_id TEXT NOT NULL,
+            session_id TEXT NOT NULL
+                REFERENCES agent_sessions(session_id)
+                ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+            imported_at_ms INTEGER NOT NULL,
+            PRIMARY KEY(source, external_id),
+            UNIQUE(session_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_local_history_imports_session
+            ON local_history_imports(session_id);
+        ",
+    )
+    .map_err(storage_err(
+        "migration_apply_failed",
+        "failed to create local history import index",
+    ))?;
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record local history import migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
 }
 
 fn apply_custom_acp_agent_definitions(
@@ -13795,7 +13987,8 @@ mod tests {
                 "50:mcp_server_env_and_headers",
                 "51:custom_acp_agent_definitions",
                 "52:agent_delegations",
-                "53:agent_session_title_lock"
+                "53:agent_session_title_lock",
+                "54:local_history_import_index"
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -13933,6 +14126,7 @@ mod tests {
                 "51:custom_acp_agent_definitions",
                 "52:agent_delegations",
                 "53:agent_session_title_lock",
+                "54:local_history_import_index",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -14050,7 +14244,8 @@ mod tests {
                 "50:mcp_server_env_and_headers",
                 "51:custom_acp_agent_definitions",
                 "52:agent_delegations",
-                "53:agent_session_title_lock"
+                "53:agent_session_title_lock",
+                "54:local_history_import_index"
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -14206,7 +14401,8 @@ mod tests {
                 "50:mcp_server_env_and_headers",
                 "51:custom_acp_agent_definitions",
                 "52:agent_delegations",
-                "53:agent_session_title_lock"
+                "53:agent_session_title_lock",
+                "54:local_history_import_index"
             ]
         );
         assert_eq!(
@@ -15618,7 +15814,8 @@ mod tests {
                 "50:mcp_server_env_and_headers",
                 "51:custom_acp_agent_definitions",
                 "52:agent_delegations",
-                "53:agent_session_title_lock"
+                "53:agent_session_title_lock",
+                "54:local_history_import_index"
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)

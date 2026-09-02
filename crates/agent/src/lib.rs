@@ -4,6 +4,7 @@ pub mod adapter;
 pub mod automation;
 pub mod context_bridge;
 pub mod delegation;
+pub mod local_history;
 pub mod manager;
 pub mod message_submission;
 pub mod observability;
@@ -29,6 +30,11 @@ pub use automation::{AutomationGraphRunner, DEFAULT_AUTOMATION_STALE_AFTER_MS};
 pub use context_bridge::{CONTEXT_BRIDGE_VERSION, ContextBridgeService, PreparedContextBridge};
 pub use delegation::{
     AGENT_DELEGATION_MCP_SERVER_ID, run_delegation_mcp_stdio, start_delegation_broker,
+};
+pub use local_history::{
+    LocalHistorySourceRoot, local_history_source_roots, materialize_local_history,
+    materialize_local_history_from, scan_local_history, scan_local_history_from,
+    session_shell_for_materialized,
 };
 pub use manager::{
     AgentDelegationToolConfig, AgentManager, PROVIDER_SELECTED_MODEL_METADATA_KEY,

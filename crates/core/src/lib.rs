@@ -18,6 +18,7 @@ pub mod event;
 pub mod file;
 pub mod git;
 pub mod ids;
+pub mod local_history;
 pub mod permission;
 pub mod provider;
 pub mod provider_projection;
@@ -26,7 +27,6 @@ pub mod remote;
 pub mod remote_v2;
 pub mod runtime;
 pub mod scheduled_task;
-pub mod session_import;
 pub mod terminal;
 pub mod time;
 pub mod timeline;
@@ -156,6 +156,12 @@ pub use ids::{
     RuntimeProcessId, RuntimeStreamId, RuntimeSwitchId, RuntimeSwitchOperationId, ScheduledTaskId,
     ScheduledTaskRunId, SkillId, TerminalId, TimelineItemId, UsageExecutionId, VibexSessionId,
     WorkspaceId,
+};
+pub use local_history::{
+    LocalHistoryImportRecord, LocalHistoryImportResult, LocalHistoryImportStatus, LocalHistoryKey,
+    LocalHistoryMaterializedSession, LocalHistoryScanDiagnostic, LocalHistoryScanFolder,
+    LocalHistoryScanResult, LocalHistoryScanSession, LocalHistorySelection,
+    LocalHistorySessionSummary, LocalHistorySource, LocalHistoryTimelineEntry,
 };
 pub use permission::{
     PermissionActionDetail, PermissionMode, PermissionRequest, PermissionRequestStatus,
@@ -359,16 +365,6 @@ pub use scheduled_task::{
     ScheduledTaskRun, ScheduledTaskRunCreateRequest, ScheduledTaskRunListRequest,
     ScheduledTaskRunStatus, ScheduledTaskRunTrigger, ScheduledTaskRunUpdateRequest,
     ScheduledTaskSchedule, ScheduledTaskStatus, ScheduledTaskUpdateRequest,
-};
-pub use session_import::{
-    ExternalSessionContinuationStatus, ExternalSessionImportCandidate,
-    ExternalSessionImportCandidateStatus, ExternalSessionImportDiagnostic,
-    ExternalSessionImportPreview, ExternalSessionImportPreviewRequest,
-    ExternalSessionImportRequest, ExternalSessionImportResult, ExternalSessionImportSource,
-    ExternalSessionImportTimelineItem, ExternalSessionImportedTimelineCount,
-    IMPORT_METADATA_CANDIDATE_ID, IMPORT_METADATA_CONTINUATION_REASON,
-    IMPORT_METADATA_CONTINUATION_STATUS, IMPORT_METADATA_NATIVE_HISTORY_IMPORT_VERSION,
-    IMPORT_METADATA_NATIVE_HISTORY_IMPORTED, IMPORT_METADATA_SOURCE, IMPORT_METADATA_VERSION,
 };
 pub use terminal::{
     TerminalAuthActionDescriptor, TerminalCreateRequest, TerminalOutputChunk,
