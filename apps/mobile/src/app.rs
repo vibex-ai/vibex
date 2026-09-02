@@ -544,7 +544,11 @@ impl MobileApp {
             workbench_open: false,
             composer_input: cx.new(|cx| {
                 TextInput::new(
-                    locale::text("Message Vibex", "发送消息给 Vibex", "傳送訊息給 Vibex"),
+                    locale::text(
+                        "Try \"fix the failing tests\" or \"explain this module\"",
+                        "试试：修复失败的测试、解释这个模块",
+                        "試試：修復失敗的測試、解釋這個模組",
+                    ),
                     cx,
                 )
             }),
