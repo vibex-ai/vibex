@@ -8,7 +8,10 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -1167,20 +1170,35 @@ struct AgentReasoningSummary {
 struct TimelineReasoningSummarySnapshot {
     source_len: usize,
     source_ptr: usize,
+    refreshed_at: Instant,
     summary: AgentReasoningSummary,
 }
 
-fn timeline_reasoning_summary_cached(
+fn timeline_reasoning_summary_cached_at(
     cache: &mut BTreeMap<String, (i64, TimelineReasoningSummarySnapshot)>,
     key: String,
     sequence: i64,
     source: &str,
+    allow_throttle: bool,
+    now: Instant,
 ) -> AgentReasoningSummary {
     let source_ptr = source.as_ptr() as usize;
     if let Some((cached_sequence, snapshot)) = cache.get(&key)
         && *cached_sequence == sequence
         && snapshot.source_len == source.len()
         && snapshot.source_ptr == source_ptr
+    {
+        return snapshot.summary.clone();
+    }
+
+    if allow_throttle
+        && let Some((_, snapshot)) = cache.get(&key)
+        && source.len() > snapshot.source_len
+        && source_ptr == snapshot.source_ptr
+        && now.saturating_duration_since(snapshot.refreshed_at)
+            < TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL
+        && source.len().saturating_sub(snapshot.source_len)
+            < TIMELINE_STREAMING_MARKDOWN_REFRESH_BYTES
     {
         return snapshot.summary.clone();
     }
@@ -1202,6 +1220,7 @@ fn timeline_reasoning_summary_cached(
         TimelineReasoningSummarySnapshot {
             source_len: source.len(),
             source_ptr,
+            refreshed_at: now,
             summary: summary.clone(),
         },
         TIMELINE_REASONING_SUMMARY_CACHE_LIMIT,
@@ -1216,6 +1235,16 @@ fn timeline_reasoning_summary_cached(
         },
     );
     summary
+}
+
+#[cfg(test)]
+fn timeline_reasoning_summary_cached(
+    cache: &mut BTreeMap<String, (i64, TimelineReasoningSummarySnapshot)>,
+    key: String,
+    sequence: i64,
+    source: &str,
+) -> AgentReasoningSummary {
+    timeline_reasoning_summary_cached_at(cache, key, sequence, source, false, Instant::now())
 }
 
 fn timeline_markdown_source_snapshot(
@@ -2068,6 +2097,52 @@ fn agent_projection_should_repaint(active_tab: &str, changed: bool) -> bool {
     changed && active_tab == "agent"
 }
 
+fn should_defer_timeline_streaming_work(active_tab: &str, new_session_open: bool) -> bool {
+    active_tab != "agent" || new_session_open
+}
+
+fn timeline_live_event_is_streaming_only(event: &TimelineLiveEvent) -> bool {
+    if !timeline_live_event_is_well_formed(event) {
+        return false;
+    }
+    match &event.item.payload {
+        TimelinePayload::AgentMessageDelta(_) => true,
+        TimelinePayload::Reasoning(reasoning) => !reasoning.is_final,
+        _ => false,
+    }
+}
+
+/// Session snapshots also carry the latest timeline timestamp. That timestamp
+/// changes for every streamed item, but it does not change the sidebar shape.
+/// Keep the comparison focused on fields that can affect the sidebar so a
+/// hidden workbench does not repaint for every reasoning chunk.
+fn session_snapshot_sidebar_changed(previous: Option<&AgentSession>, next: &AgentSession) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+    previous.id != next.id
+        || previous.title != next.title
+        || previous.project_id != next.project_id
+        || previous.workspace_id != next.workspace_id
+        || previous.workspace_root != next.workspace_root
+        || previous.workspace_mode != next.workspace_mode
+        || previous.agent_id != next.agent_id
+        || previous.state != next.state
+        || previous.created_at_ms != next.created_at_ms
+        || previous.archived_at_ms != next.archived_at_ms
+        || previous.deleted_at_ms != next.deleted_at_ms
+}
+
+fn session_update_should_repaint(
+    active_tab: &str,
+    new_session_open: bool,
+    snapshot_changed: bool,
+    sidebar_changed: bool,
+) -> bool {
+    sidebar_changed
+        || (!should_defer_timeline_streaming_work(active_tab, new_session_open) && snapshot_changed)
+}
+
 fn timeline_batch_should_repaint(
     active_tab: &str,
     unread_changed: bool,
@@ -2769,12 +2844,30 @@ fn timeline_item_runtime_attribution(item: &TimelineItem) -> Option<String> {
     })
 }
 
+fn timeline_live_event_is_well_formed(event: &TimelineLiveEvent) -> bool {
+    event.sequence == event.item.sequence && event.session_id == event.item.session_id
+}
+
+fn timeline_live_event_updates_sidebar_timestamp(event: &TimelineLiveEvent) -> bool {
+    if !timeline_live_event_is_well_formed(event) {
+        return false;
+    }
+    match &event.item.payload {
+        // Streaming deltas are presentation buffers. Updating the sidebar's
+        // sort key for every chunk makes unrelated sessions repaint while the
+        // active Agent is thinking or writing.
+        TimelinePayload::AgentMessageDelta(_) => false,
+        TimelinePayload::Reasoning(reasoning) => reasoning.is_final,
+        _ => true,
+    }
+}
+
 fn agent_streaming_delta_updates(
     events: &[TimelineLiveEvent],
 ) -> Option<Vec<AgentStreamingDeltaUpdate>> {
     let mut updates = Vec::with_capacity(events.len());
     for event in events {
-        if event.sequence != event.item.sequence || event.session_id != event.item.session_id {
+        if !timeline_live_event_is_well_formed(event) {
             return None;
         }
         let TimelinePayload::AgentMessageDelta(delta) = &event.item.payload else {
@@ -2819,8 +2912,7 @@ fn update_unread_agent_completions(
     let previous_len = unread_session_ids.len();
     for event in events {
         if selected_session_id == Some(&event.session_id)
-            || event.sequence != event.item.sequence
-            || event.session_id != event.item.session_id
+            || !timeline_live_event_is_well_formed(event)
         {
             continue;
         }
@@ -2950,7 +3042,7 @@ fn agent_reasoning_delta_updates(
 ) -> Option<Vec<AgentReasoningDeltaUpdate>> {
     let mut updates = Vec::with_capacity(events.len());
     for event in events {
-        if event.sequence != event.item.sequence || event.session_id != event.item.session_id {
+        if !timeline_live_event_is_well_formed(event) {
             return None;
         }
         let TimelinePayload::Reasoning(reasoning) = &event.item.payload else {
@@ -4452,6 +4544,7 @@ pub struct VibexWorkbench {
     conversation_turns_cache_key: Option<ConversationTurnsCacheKey>,
     conversation_turns_summary: ConversationTurnsSummary,
     streaming_row_state: Option<StreamingRowStateCache>,
+    agent_streaming_surface_visible: Arc<AtomicBool>,
     turn_preview_rail_visible: bool,
     turn_preview_active_index: Option<usize>,
     agent_session_view_cache: BTreeMap<String, AgentSessionViewCacheEntry>,
@@ -5010,6 +5103,8 @@ impl VibexWorkbench {
             workbench_route(&ui_state, selected_session_id.as_ref()),
             WORKBENCH_NAVIGATION_LIMIT,
         );
+        let agent_streaming_surface_visible =
+            Arc::new(AtomicBool::new(ui_state.workbench.active_tab == "agent"));
         let mut new_session_workspace = NewSessionWorkspaceState::default();
         new_session_workspace.clear(
             RequestId::new().to_string(),
@@ -5195,6 +5290,7 @@ impl VibexWorkbench {
             conversation_turns_cache_key: None,
             conversation_turns_summary: ConversationTurnsSummary::default(),
             streaming_row_state: None,
+            agent_streaming_surface_visible,
             turn_preview_rail_visible: false,
             turn_preview_active_index: None,
             agent_session_view_cache: BTreeMap::new(),
@@ -5808,6 +5904,7 @@ impl VibexWorkbench {
             eprintln!("vibex-fonts: {error}");
         }
         self.ui_state = state;
+        self.sync_agent_streaming_surface_visibility();
         if let Some(config) = self.config.as_ref() {
             self.ui_state.desktop_behavior.launch_at_login =
                 launch_at_login_enabled(&config.application_id);
@@ -6028,8 +6125,14 @@ impl VibexWorkbench {
     fn attach_event_stream(&mut self, runtime: Arc<DesktopRuntime>, cx: &mut Context<Self>) {
         let mut events = runtime.subscribe();
         let (signal_tx, mut signal_rx) = mpsc::channel(RUNTIME_UI_SIGNAL_QUEUE_CAPACITY);
+        let agent_streaming_surface_visible = self.agent_streaming_surface_visible.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             while let Ok(event) = events.recv().await {
+                if !agent_streaming_surface_visible.load(Ordering::Acquire)
+                    && matches!(&event, DesktopEvent::Timeline(event) if timeline_live_event_is_streaming_only(event))
+                {
+                    continue;
+                }
                 let shutdown = matches!(&event, DesktopEvent::Shutdown);
                 let signal = if shutdown {
                     RuntimeUiSignal::Shutdown
@@ -6366,6 +6469,7 @@ impl VibexWorkbench {
                                 this.initial_new_session_setup_pending =
                                     this.new_session_open && !this.new_session_draft_initialized;
                             }
+                            this.sync_agent_streaming_surface_visibility();
                             if this.new_session_open {
                                 // The overview may finish after the user has opened the
                                 // New Session home. Reconcile its data, but never let the
@@ -6862,11 +6966,11 @@ impl VibexWorkbench {
             return;
         }
         let session = self.reconcile_pending_new_session_title(session);
-        let snapshot_changed = self
+        let previous_session = self
             .sessions
             .iter()
-            .find(|existing| existing.id == session.id)
-            .is_none_or(|existing| existing != &session);
+            .find(|existing| existing.id == session.id);
+        let sidebar_changed = session_snapshot_sidebar_changed(previous_session, &session);
         let auto_continue_enabled = self
             .ui_state
             .session
@@ -6899,7 +7003,7 @@ impl VibexWorkbench {
             }
             self.sessions.insert(0, session);
         }
-        if snapshot_changed {
+        if sidebar_changed {
             self.invalidate_sidebar_projection_cache();
         }
     }
@@ -10102,6 +10206,7 @@ impl VibexWorkbench {
         self.clear_sidebar_move_selection();
         self.new_session_open = false;
         self.new_session_error = None;
+        self.sync_agent_streaming_surface_visibility();
         if mark_agent_session_read(&mut self.unread_agent_completion_session_ids, &session_id) {
             self.publish_sidebar_invalidation();
         }
@@ -10133,6 +10238,14 @@ impl VibexWorkbench {
                     cx,
                 )
             });
+        }
+        if !navigation_changed
+            && !should_defer_timeline_streaming_work(
+                &self.ui_state.workbench.active_tab,
+                self.new_session_open,
+            )
+        {
+            self.refresh_deferred_child_agent_timelines(cx);
         }
         if self.selected_session_id.as_ref() == Some(&session_id)
             && self.timeline.session_id.as_ref() == Some(&session_id)
@@ -10320,15 +10433,25 @@ impl VibexWorkbench {
                                     cx,
                                 );
                             }
-                            this.rebuild_timeline_sizes();
-                            this.start_agent_poll(
-                                poll_runtime.clone(),
-                                session_id.clone(),
-                                workspace_id.clone(),
-                                generation,
-                                this.timeline.authoritative_end_sequence.or(Some(0)),
-                                cx,
-                            );
+                            if !should_defer_timeline_streaming_work(
+                                &this.ui_state.workbench.active_tab,
+                                this.new_session_open,
+                            ) {
+                                this.rebuild_timeline_sizes();
+                            }
+                            if !should_defer_timeline_streaming_work(
+                                &this.ui_state.workbench.active_tab,
+                                this.new_session_open,
+                            ) {
+                                this.start_agent_poll(
+                                    poll_runtime.clone(),
+                                    session_id.clone(),
+                                    workspace_id.clone(),
+                                    generation,
+                                    this.timeline.authoritative_end_sequence.or(Some(0)),
+                                    cx,
+                                );
+                            }
                             let search_jump_applied = this.apply_pending_session_search_jump(cx);
                             if !search_jump_applied && this.timeline_follow.following_bottom {
                                 this.request_timeline_scroll_to_latest();
@@ -10494,6 +10617,32 @@ impl VibexWorkbench {
             self.ensure_child_agent_timeline(session_id, true, cx);
         }
         changed
+    }
+
+    fn defer_child_agent_timeline_events(&mut self, events: &[TimelineLiveEvent]) {
+        for event in events {
+            if !timeline_live_event_is_well_formed(event) {
+                continue;
+            }
+            if let Some(state) = self
+                .child_agent_timelines
+                .get_mut(event.session_id.as_str())
+            {
+                state.timeline.mark_lagged();
+            }
+        }
+    }
+
+    fn refresh_deferred_child_agent_timelines(&mut self, cx: &mut Context<Self>) {
+        let reloads = self
+            .child_agent_timelines
+            .values()
+            .filter(|state| state.timeline.needs_authoritative_refetch && !state.loading)
+            .filter_map(|state| state.timeline.session_id.clone())
+            .collect::<Vec<_>>();
+        for session_id in reloads {
+            self.ensure_child_agent_timeline(session_id, true, cx);
+        }
     }
 
     fn toggle_child_agent_delegation(
@@ -10794,14 +10943,19 @@ impl VibexWorkbench {
                                     cx,
                                 ),
                                 AgentPollSignal::Session(session) => {
+                                    let previous_session = this
+                                        .sessions
+                                        .iter()
+                                        .find(|existing| existing.id == session.id);
+                                    let sidebar_changed = session_snapshot_sidebar_changed(
+                                        previous_session,
+                                        &session,
+                                    );
                                     let selected_projection_changed = this
                                         .selected_session_id
                                         .as_ref()
                                         .is_some_and(|selected| selected == &session.id)
-                                        && this
-                                            .sessions
-                                            .iter()
-                                            .find(|existing| existing.id == session.id)
+                                        && previous_session
                                             .is_none_or(|existing| existing.state != session.state);
                                     let changed = this
                                         .sessions
@@ -10811,14 +10965,28 @@ impl VibexWorkbench {
                                     if changed {
                                         let session_id = session.id.clone();
                                         this.upsert_session_snapshot(session);
-                                        this.reconcile_sidebar_state();
-                                        this.sync_auto_continue_for_session(&session_id, cx);
-                                        this.publish_sidebar_invalidation();
+                                        if sidebar_changed {
+                                            this.reconcile_sidebar_state();
+                                            this.publish_sidebar_invalidation();
+                                        }
+                                        if selected_projection_changed {
+                                            this.sync_auto_continue_for_session(&session_id, cx);
+                                        }
                                     }
-                                    if selected_projection_changed {
+                                    if selected_projection_changed
+                                        && !should_defer_timeline_streaming_work(
+                                            &this.ui_state.workbench.active_tab,
+                                            this.new_session_open,
+                                        )
+                                    {
                                         this.refresh_last_timeline_size();
                                     }
-                                    changed
+                                    session_update_should_repaint(
+                                        &this.ui_state.workbench.active_tab,
+                                        this.new_session_open,
+                                        changed,
+                                        sidebar_changed,
+                                    )
                                 }
                                 AgentPollSignal::RuntimeSelection(state) => {
                                     let changed = this.apply_runtime_selection_state(
@@ -10874,13 +11042,18 @@ impl VibexWorkbench {
         events: Vec<TimelineLiveEvent>,
         cx: &mut Context<Self>,
     ) -> bool {
+        let defer_streaming_work = should_defer_timeline_streaming_work(
+            &self.ui_state.workbench.active_tab,
+            self.new_session_open,
+        );
         self.notify_for_timeline_events(&events);
         let mut sidebar_changed = false;
         for event in &events {
-            if let Some(session) = self
-                .sessions
-                .iter_mut()
-                .find(|session| session.id == event.session_id)
+            if timeline_live_event_updates_sidebar_timestamp(event)
+                && let Some(session) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.id == event.session_id)
                 && event.item.timestamp_ms > session.last_message_at_ms
             {
                 session.last_message_at_ms = event.item.timestamp_ms;
@@ -10899,6 +11072,25 @@ impl VibexWorkbench {
             self.publish_sidebar_invalidation();
         }
         let selected_session_id = self.selected_session_id.clone();
+        if defer_streaming_work {
+            if selected_session_id.as_ref().is_some_and(|selected| {
+                events.iter().any(|event| {
+                    timeline_live_event_is_well_formed(event) && event.session_id == *selected
+                })
+            }) {
+                // The authoritative timeline is deliberately left untouched
+                // while its surface is hidden. Reconcile it once the Agent
+                // tab is selected again instead of projecting each chunk.
+                self.timeline.mark_lagged();
+            }
+            self.defer_child_agent_timeline_events(&events);
+            return timeline_batch_should_repaint(
+                &self.ui_state.workbench.active_tab,
+                unread_changed || sidebar_changed,
+                false,
+                false,
+            );
+        }
         let child_timeline_changed =
             self.apply_child_agent_timeline_events(selected_session_id.as_ref(), &events, cx);
         let Some(selected_session_id) = selected_session_id else {
@@ -11052,15 +11244,16 @@ impl VibexWorkbench {
         match event {
             DesktopEvent::Timeline(event) => self.apply_live_timeline_batch(vec![event], cx),
             DesktopEvent::SessionUpdated(session) => {
+                let previous_session = self
+                    .sessions
+                    .iter()
+                    .find(|existing| existing.id == session.id);
+                let sidebar_changed = session_snapshot_sidebar_changed(previous_session, &session);
                 let selected_projection_changed = self
                     .selected_session_id
                     .as_ref()
                     .is_some_and(|selected| selected == &session.id)
-                    && self
-                        .sessions
-                        .iter()
-                        .find(|existing| existing.id == session.id)
-                        .is_none_or(|existing| existing.state != session.state);
+                    && previous_session.is_none_or(|existing| existing.state != session.state);
                 let changed = self
                     .sessions
                     .iter()
@@ -11069,13 +11262,27 @@ impl VibexWorkbench {
                 if changed {
                     let session_id = session.id.clone();
                     self.upsert_session_snapshot(session);
-                    self.reconcile_sidebar_state();
-                    self.sync_auto_continue_for_session(&session_id, cx);
+                    if sidebar_changed {
+                        self.reconcile_sidebar_state();
+                    }
+                    if selected_projection_changed {
+                        self.sync_auto_continue_for_session(&session_id, cx);
+                    }
                 }
-                if selected_projection_changed {
+                if selected_projection_changed
+                    && !should_defer_timeline_streaming_work(
+                        &self.ui_state.workbench.active_tab,
+                        self.new_session_open,
+                    )
+                {
                     self.refresh_last_timeline_size();
                 }
-                changed
+                session_update_should_repaint(
+                    &self.ui_state.workbench.active_tab,
+                    self.new_session_open,
+                    changed,
+                    sidebar_changed,
+                )
             }
             DesktopEvent::Runtime(event) => {
                 let changed = self
@@ -11118,6 +11325,10 @@ impl VibexWorkbench {
                 skipped,
                 refetch,
             } => {
+                let defer_streaming_work = should_defer_timeline_streaming_work(
+                    &self.ui_state.workbench.active_tab,
+                    self.new_session_open,
+                );
                 self.runtime_note = Some(format!(
                     "{stream:?} stream lagged by {skipped}; authoritative refetch required"
                 ));
@@ -11131,7 +11342,9 @@ impl VibexWorkbench {
                 }
                 if refetch.timeline || refetch.runtime_selection {
                     self.timeline.mark_lagged();
-                    self.refresh_selected_agent_timeline(cx);
+                    if !defer_streaming_work {
+                        self.refresh_selected_agent_timeline(cx);
+                    }
                 }
                 if refetch.usage {
                     let visible = self.ui_state.workbench.active_tab == "usage";
@@ -16594,6 +16807,7 @@ impl VibexWorkbench {
         }
         let initialize_draft = !self.new_session_draft_initialized;
         self.new_session_open = true;
+        self.sync_agent_streaming_surface_visibility();
         self.new_session_runtime_menu_open = false;
         self.runtime_choice_menu_open = None;
         self.new_session_runtime_menu_view = ComposerRuntimeMenuView::AuthSource;
@@ -16809,6 +17023,7 @@ impl VibexWorkbench {
                 self.queue_agent_ui_state();
             }
             self.new_session_open = true;
+            self.sync_agent_streaming_surface_visibility();
             self.new_session_input
                 .update(cx, |input, cx| input.focus(window, cx));
             self.sync_composer_command_entry(ComposerTarget::NewSession, cx);
@@ -20064,6 +20279,26 @@ impl VibexWorkbench {
         self.ui_state.terminal.selected_terminal_id = state.selected_terminal_id;
     }
 
+    fn sync_agent_streaming_surface_visibility(&mut self) {
+        let visible = self.ui_state.workbench.active_tab == "agent" && !self.new_session_open;
+        let was_visible = self
+            .agent_streaming_surface_visible
+            .swap(visible, Ordering::Release);
+        if visible != was_visible {
+            // The event bridge may discard presentation-only chunks while the
+            // Agent surface is hidden. Force one authoritative catch-up when
+            // the surface changes visibility in either direction so startup
+            // on a non-Agent tab is covered as well.
+            self.timeline.mark_lagged();
+            for state in self.child_agent_timelines.values_mut() {
+                state.timeline.mark_lagged();
+            }
+        }
+        if !visible {
+            self.agent_poll_task = None;
+        }
+    }
+
     fn current_workbench_route(&self) -> WorkbenchRoute {
         let mut route = workbench_route(&self.ui_state, self.selected_session_id.as_ref());
         route.usage_session_id = self
@@ -20098,6 +20333,7 @@ impl VibexWorkbench {
             "usage" => "usage".to_string(),
             _ => "agent".to_string(),
         };
+        self.sync_agent_streaming_surface_visibility();
         if self.ui_state.workbench.active_tab != "agent" {
             self.clear_suggestions();
         }
@@ -21116,6 +21352,7 @@ impl VibexWorkbench {
         self.sync_current_navigation_entry();
         self.usage_session_filter = None;
         self.ui_state.workbench.active_tab = "management".to_string();
+        self.sync_agent_streaming_surface_visibility();
         self.queue_ui_state();
         if let Some(runtime) = self.runtime.clone() {
             self.management_view.update(cx, |management, cx| {
@@ -21145,6 +21382,7 @@ impl VibexWorkbench {
         self.sync_current_navigation_entry();
         self.ui_state.workbench.active_tab = "usage".to_string();
         self.usage_session_filter = session_filter.clone();
+        self.sync_agent_streaming_surface_visibility();
         self.queue_ui_state();
         self.usage_view
             .update(cx, |usage, cx| usage.activate(session_filter, cx));
@@ -34075,11 +34313,13 @@ impl VibexWorkbench {
             );
         }
         let sequence = i64::try_from(self.active_timeline().revision).unwrap_or(i64::MAX);
-        let summary = timeline_reasoning_summary_cached(
+        let summary = timeline_reasoning_summary_cached_at(
             &mut self.timeline_reasoning_summaries,
             row_id.clone(),
             sequence,
             body,
+            true,
+            Instant::now(),
         );
         let content =
             render_agent_thinking_indicator(&row_id, &summary.preview, &summary.tooltip, cx);
@@ -34148,11 +34388,13 @@ impl VibexWorkbench {
             return self
                 .render_expanded_reasoning_layout(row_id, turn_id, first_line, remaining, cx);
         }
-        let summary = timeline_reasoning_summary_cached(
+        let summary = timeline_reasoning_summary_cached_at(
             &mut self.timeline_reasoning_summaries,
             row_id.clone(),
             row.last_sequence,
             &row.body,
+            row.streaming,
+            Instant::now(),
         );
         let disclosure_visible = summary.has_more;
         let content = if row.streaming {
@@ -51691,6 +51933,147 @@ mod tests {
     }
 
     #[test]
+    fn hidden_timeline_streaming_work_waits_for_the_agent_surface() {
+        assert!(!should_defer_timeline_streaming_work("agent", false));
+        assert!(should_defer_timeline_streaming_work("agent", true));
+        assert!(should_defer_timeline_streaming_work("usage", false));
+        assert!(should_defer_timeline_streaming_work("management", false));
+
+        let session_id = VibexSessionId::new();
+        let valid_item = indexed_timeline_item(&session_id, 1, "valid");
+        let valid_event = TimelineLiveEvent {
+            session_id: session_id.clone(),
+            sequence: valid_item.sequence,
+            item: valid_item.clone(),
+        };
+        assert!(timeline_live_event_is_well_formed(&valid_event));
+        assert!(timeline_live_event_updates_sidebar_timestamp(&valid_event));
+        let streaming_item = timeline_item_with_payload(
+            &session_id,
+            2,
+            TimelineSource::Agent,
+            TimelinePayload::Reasoning(ReasoningPayload {
+                text: "thinking".into(),
+                is_final: false,
+            }),
+        );
+        let streaming_event = TimelineLiveEvent {
+            session_id: session_id.clone(),
+            sequence: streaming_item.sequence,
+            item: streaming_item,
+        };
+        assert!(!timeline_live_event_updates_sidebar_timestamp(
+            &streaming_event
+        ));
+        assert!(timeline_live_event_is_streaming_only(&streaming_event));
+        let final_reasoning_item = timeline_item_with_payload(
+            &session_id,
+            3,
+            TimelineSource::Agent,
+            TimelinePayload::Reasoning(ReasoningPayload {
+                text: "done".into(),
+                is_final: true,
+            }),
+        );
+        assert!(timeline_live_event_updates_sidebar_timestamp(
+            &TimelineLiveEvent {
+                session_id: session_id.clone(),
+                sequence: final_reasoning_item.sequence,
+                item: final_reasoning_item,
+            }
+        ));
+        let delta_item = timeline_item_with_payload(
+            &session_id,
+            4,
+            TimelineSource::Agent,
+            TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                text_delta: "answer".into(),
+                chunk_index: 0,
+                phase: Some(AgentMessagePhase::FinalAnswer),
+            }),
+        );
+        assert!(!timeline_live_event_updates_sidebar_timestamp(
+            &TimelineLiveEvent {
+                session_id: session_id.clone(),
+                sequence: delta_item.sequence,
+                item: delta_item,
+            }
+        ));
+        assert!(timeline_live_event_is_streaming_only(&TimelineLiveEvent {
+            session_id: session_id.clone(),
+            sequence: 4,
+            item: timeline_item_with_payload(
+                &session_id,
+                4,
+                TimelineSource::Agent,
+                TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                    text_delta: "answer".into(),
+                    chunk_index: 0,
+                    phase: Some(AgentMessagePhase::FinalAnswer),
+                }),
+            ),
+        }));
+        let mut mismatched_item = valid_item;
+        mismatched_item.session_id = VibexSessionId::new();
+        assert!(!timeline_live_event_updates_sidebar_timestamp(
+            &TimelineLiveEvent {
+                session_id,
+                sequence: mismatched_item.sequence,
+                item: mismatched_item,
+            }
+        ));
+
+        assert!(session_update_should_repaint("agent", false, true, false));
+        assert!(!session_update_should_repaint("usage", false, true, false));
+        assert!(session_update_should_repaint("usage", false, false, true));
+        assert!(!session_update_should_repaint(
+            "management",
+            true,
+            true,
+            false
+        ));
+
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: "Streaming session".into(),
+            project_id: ProjectId::new(),
+            workspace_id: WorkspaceId::new(),
+            workspace_root: "/tmp/vibex-streaming-session".into(),
+            workspace_mode: WorkspaceMode::CurrentCheckout,
+            agent_id: AgentId::parse("codex").unwrap(),
+            state: AgentSessionState::Running,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            last_message_at_ms: 2,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        let mut timestamp_only_update = session.clone();
+        timestamp_only_update.updated_at_ms = 3;
+        timestamp_only_update.last_message_at_ms = 4;
+        assert!(!session_snapshot_sidebar_changed(
+            Some(&session),
+            &timestamp_only_update
+        ));
+        let mut state_update = timestamp_only_update;
+        state_update.state = AgentSessionState::Idle;
+        assert!(session_snapshot_sidebar_changed(
+            Some(&session),
+            &state_update
+        ));
+
+        let source = include_str!("app.rs");
+        let event_bridge = source
+            .split_once("    fn attach_event_stream(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn load_agent_overview("))
+            .map(|(body, _)| body)
+            .expect("desktop event bridge should remain inspectable");
+        assert!(event_bridge.contains("agent_streaming_surface_visible.load"));
+        assert!(event_bridge.contains("timeline_live_event_is_streaming_only(event)"));
+    }
+
+    #[test]
     fn background_session_events_do_not_repaint_the_selected_workbench() {
         let source = include_str!("app.rs");
         let event_bridge = source
@@ -51716,6 +52099,11 @@ mod tests {
         assert!(
             timeline_batch.contains(".filter(|event| event.session_id == selected_session_id)")
         );
+        assert!(timeline_batch.contains("should_defer_timeline_streaming_work"));
+        assert!(timeline_batch.contains("timeline_live_event_is_well_formed"));
+        assert!(timeline_batch.contains("timeline_live_event_updates_sidebar_timestamp"));
+        assert!(timeline_batch.contains("self.timeline.mark_lagged();"));
+        assert!(timeline_batch.contains("self.defer_child_agent_timeline_events(&events);"));
         assert!(!timeline_batch.contains("cx.notify();"));
 
         let event_handler = source
@@ -58989,6 +59377,47 @@ mod tests {
         assert_eq!(
             changed_body.preview.as_ref(),
             "second reasoning update with more context"
+        );
+    }
+
+    #[test]
+    fn streaming_reasoning_summary_cache_throttles_small_appends() {
+        let mut cache = BTreeMap::new();
+        let started_at = Instant::now();
+        let mut source = String::with_capacity(256);
+        source.push_str("first reasoning update");
+        let first = timeline_reasoning_summary_cached_at(
+            &mut cache,
+            "reasoning:one".into(),
+            1,
+            &source,
+            true,
+            started_at,
+        );
+        source.push_str(" with more context");
+        let throttled = timeline_reasoning_summary_cached_at(
+            &mut cache,
+            "reasoning:one".into(),
+            2,
+            &source,
+            true,
+            started_at + TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL / 2,
+        );
+        assert!(Arc::ptr_eq(&first.plain, &throttled.plain));
+        assert_eq!(throttled.preview.as_ref(), "first reasoning update");
+
+        let refreshed = timeline_reasoning_summary_cached_at(
+            &mut cache,
+            "reasoning:one".into(),
+            2,
+            &source,
+            true,
+            started_at + TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL,
+        );
+        assert!(!Arc::ptr_eq(&first.plain, &refreshed.plain));
+        assert_eq!(
+            refreshed.preview.as_ref(),
+            "first reasoning update with more context"
         );
     }
 
