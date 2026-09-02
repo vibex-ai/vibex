@@ -99,6 +99,11 @@ pub struct SwitchIntent {
     pub requested_policy: RuntimeSwitchPolicy,
     pub active_work_policy: RuntimeSwitchActiveWorkPolicy,
     pub requested_session_config: Option<serde_json::Value>,
+    /// Native provider session id the initial materialization should fork
+    /// from instead of opening a fresh `session/new`. Carried only by
+    /// session-creation switches whose fork point is the tip of the source
+    /// timeline; `None` keeps the plain fresh-session path.
+    pub fork_native_session_id: Option<String>,
     pub created_at_ms: i64,
 }
 
@@ -127,6 +132,10 @@ impl fmt::Debug for SwitchIntent {
                 "has_requested_session_config",
                 &self.requested_session_config.is_some(),
             )
+            .field(
+                "has_fork_native_session_id",
+                &self.fork_native_session_id.is_some(),
+            )
             .field("created_at_ms", &self.created_at_ms)
             .finish()
     }
@@ -137,6 +146,8 @@ impl fmt::Debug for SwitchIntent {
 struct DurableRequestedConfig {
     effective_selection: SessionRuntimeSelection,
     session_config: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fork_native_session_id: Option<String>,
 }
 
 impl SwitchIntent {
@@ -183,6 +194,7 @@ impl SwitchIntent {
                 .unwrap_or(RuntimeSwitchPolicy::Automatic),
             active_work_policy,
             requested_session_config: durable.session_config,
+            fork_native_session_id: durable.fork_native_session_id,
             created_at_ms: record.created_at_ms,
         })
     }
@@ -625,9 +637,18 @@ impl RuntimeSwitchCoordinator {
         target_selection: &SessionRuntimeSelection,
         session_config: Option<serde_json::Value>,
     ) -> VibexResult<serde_json::Value> {
+        Self::encode_requested_config_with_fork_origin(target_selection, session_config, None)
+    }
+
+    pub fn encode_requested_config_with_fork_origin(
+        target_selection: &SessionRuntimeSelection,
+        session_config: Option<serde_json::Value>,
+        fork_native_session_id: Option<String>,
+    ) -> VibexResult<serde_json::Value> {
         serde_json::to_value(DurableRequestedConfig {
             effective_selection: target_selection.clone(),
             session_config,
+            fork_native_session_id,
         })
         .map_err(|_| {
             VibexError::validation(
@@ -2954,6 +2975,7 @@ mod tests {
             let durable_config = serde_json::to_value(DurableRequestedConfig {
                 effective_selection: self.selection.clone(),
                 session_config: Some(serde_json::json!({"model": "model-next"})),
+                fork_native_session_id: None,
             })
             .unwrap();
             let mut conn = self.connection();
@@ -4402,5 +4424,35 @@ mod tests {
             "requested runtime switch changed while claiming",
         );
         assert!(!is_retryable_requested_claim_error(&conflict));
+    }
+
+    #[test]
+    fn durable_requested_config_round_trips_fork_origin() {
+        let selection = SessionRuntimeSelection::provider(
+            AgentId::parse("codex").unwrap(),
+            ProviderProfileId::new(),
+            "gpt-5",
+        );
+        let encoded = RuntimeSwitchCoordinator::encode_requested_config_with_fork_origin(
+            &selection,
+            None,
+            Some("thread-abc".to_string()),
+        )
+        .unwrap();
+        assert_eq!(encoded["forkNativeSessionId"], "thread-abc");
+
+        let durable: DurableRequestedConfig = serde_json::from_value(encoded).unwrap();
+        assert_eq!(
+            durable.fork_native_session_id.as_deref(),
+            Some("thread-abc")
+        );
+
+        // Payloads persisted before the field existed must decode without a
+        // fork origin.
+        let legacy = serde_json::json!({
+            "effectiveSelection": serde_json::to_value(&selection).unwrap(),
+        });
+        let durable: DurableRequestedConfig = serde_json::from_value(legacy).unwrap();
+        assert_eq!(durable.fork_native_session_id, None);
     }
 }

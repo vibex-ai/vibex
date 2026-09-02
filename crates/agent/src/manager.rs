@@ -561,6 +561,7 @@ impl AgentManager {
             |_| {},
             InitialRuntimeMaterialization::WaitForReady,
             Some(session_id),
+            None,
         )
         .await
     }
@@ -579,6 +580,7 @@ impl AgentManager {
             |_| {},
             InitialRuntimeMaterialization::Deferred,
             None,
+            None,
         )
         .await
     }
@@ -594,6 +596,7 @@ impl AgentManager {
             |_| {},
             InitialRuntimeMaterialization::Deferred,
             Some(session_id),
+            None,
         )
         .await
     }
@@ -603,7 +606,7 @@ impl AgentManager {
         request: CreateAgentSessionRequest,
         initial_timeline: Vec<TimelineAppend>,
     ) -> VibexResult<AgentSession> {
-        self.create_session_with_timeline_callback(request, initial_timeline, |_| {})
+        self.create_session_with_timeline_callback(request, initial_timeline, |_| {}, None)
             .await
     }
 
@@ -612,6 +615,7 @@ impl AgentManager {
         request: CreateAgentSessionRequest,
         initial_timeline: Vec<TimelineAppend>,
         on_created: F,
+        fork_native_session_id: Option<String>,
     ) -> VibexResult<AgentSession>
     where
         F: FnOnce(AgentSession) + Send,
@@ -622,6 +626,7 @@ impl AgentManager {
             on_created,
             InitialRuntimeMaterialization::WaitForReady,
             None,
+            fork_native_session_id,
         )
         .await
     }
@@ -633,6 +638,7 @@ impl AgentManager {
         on_created: F,
         materialization: InitialRuntimeMaterialization,
         requested_session_id: Option<VibexSessionId>,
+        fork_native_session_id: Option<String>,
     ) -> VibexResult<AgentSession>
     where
         F: FnOnce(AgentSession) + Send,
@@ -774,12 +780,12 @@ impl AgentManager {
         let initialization = match materialization {
             InitialRuntimeMaterialization::WaitForReady => {
                 runtime_selection
-                    .initialize_new_session(&session.id, desired)
+                    .initialize_new_session(&session.id, desired, fork_native_session_id)
                     .await
             }
             InitialRuntimeMaterialization::Deferred => {
                 runtime_selection
-                    .initialize_new_session_deferred(&session.id, desired)
+                    .initialize_new_session_deferred(&session.id, desired, fork_native_session_id)
                     .await
             }
         };
@@ -894,6 +900,23 @@ impl AgentManager {
         } else {
             TimelineRepository::fetch_range(&conn, &source.id, 1, request.through_sequence)?
         };
+        // A native provider fork (ACP `session/fork`) copies the provider's
+        // live context, so it can only express a fork point at the tip of the
+        // source timeline. Mid-timeline forks keep the fresh-session fallback.
+        let fork_native_session_id = if request.through_sequence == source_end_sequence {
+            runtime_state
+                .current_binding_id
+                .as_ref()
+                .and_then(|binding_id| {
+                    RuntimeBindingRepository::get(&conn, binding_id)
+                        .ok()
+                        .flatten()
+                })
+                .and_then(|binding| binding.native_session_id)
+                .filter(|native| !native.trim().is_empty())
+        } else {
+            None
+        };
         drop(conn);
 
         self.create_session_with_timeline_callback(
@@ -906,6 +929,7 @@ impl AgentManager {
             },
             fork_timeline_appends(&source_items),
             on_created,
+            fork_native_session_id,
         )
         .await
     }
@@ -1992,7 +2016,10 @@ impl AgentManager {
         request: AgentCommandExecuteRequest,
     ) -> VibexResult<AgentCommandExecuteResult> {
         match request.source_kind {
-            AgentCommandSourceKind::Provider => self.execute_provider_command(request).await,
+            AgentCommandSourceKind::Provider => {
+                self.execute_provider_command(request, AgentTurnDisplayPolicy::USER_AUTHORED)
+                    .await
+            }
             AgentCommandSourceKind::Prompt => self.execute_prompt_command(request).await,
             AgentCommandSourceKind::ClientBuiltin => Err(VibexError::capability(
                 "client_builtin_command_unregistered",
@@ -2010,6 +2037,7 @@ impl AgentManager {
     async fn execute_provider_command(
         &self,
         request: AgentCommandExecuteRequest,
+        display: AgentTurnDisplayPolicy,
     ) -> VibexResult<AgentCommandExecuteResult> {
         if request.trigger != AgentCommandTrigger::Slash {
             return Err(VibexError::validation(
@@ -2085,7 +2113,7 @@ impl AgentManager {
         let items = self
             .run_agent_turn(
                 send_request,
-                AgentTurnDisplayPolicy::USER_AUTHORED,
+                display,
                 ContextBridgeTurnBehavior::PreservePending,
                 None,
                 move |provider, handle, turn_request| {
@@ -3157,7 +3185,7 @@ impl AgentManager {
     }
 
     pub async fn rename_session(
-        &self,
+        self: &Arc<Self>,
         request: RenameAgentSessionRequest,
     ) -> VibexResult<AgentSession> {
         let title = request.title.trim();
@@ -3171,7 +3199,67 @@ impl AgentManager {
         let conn = self.open_migrated()?;
         let session = SessionRepository::update_title(&conn, &request.session_id, title)?;
         self.publish_root_session_update(&conn, session.clone());
+        drop(conn);
+
+        // Best-effort provider rename forwarding. ACP defines no
+        // `session/rename` RPC: agents that support renaming their own session
+        // expose a `/rename` slash command instead, so the new title is
+        // forwarded as an internal turn when the live session advertises one.
+        // The local rename above is authoritative — it is committed first and
+        // locks the title, and the internal display policy ignores provider
+        // title pushes from the forwarding turn. Forwarding failures are
+        // logged and never affect the rename result.
+        let manager = self.clone();
+        let session_id = request.session_id.clone();
+        let command_text = format!("/rename {title}");
+        tokio::spawn(async move {
+            if let Err(error) = manager
+                .forward_provider_session_rename(&session_id, command_text)
+                .await
+            {
+                tracing::debug!(
+                    session_id = session_id.as_str(),
+                    error_code = error.code.as_str(),
+                    "provider session rename forwarding skipped"
+                );
+            }
+        });
         Ok(session)
+    }
+
+    /// Forwards a local session rename to the provider as a `/rename`
+    /// internal turn. Only sessions whose provider advertises the `rename`
+    /// slash command accept it; everything else returns an error that the
+    /// caller treats as a no-op.
+    async fn forward_provider_session_rename(
+        self: &Arc<Self>,
+        session_id: &VibexSessionId,
+        command_text: String,
+    ) -> VibexResult<()> {
+        let command_name = slash_command_name(&command_text)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "provider_command_text_invalid",
+                    "provider command text must begin with a slash command name",
+                )
+            })?;
+        let request = AgentCommandExecuteRequest {
+            session_id: session_id.clone(),
+            command_id: None,
+            trigger: AgentCommandTrigger::Slash,
+            source_kind: AgentCommandSourceKind::Provider,
+            command_text,
+            command_name: Some(command_name),
+            arguments: None,
+            prompt_id: None,
+            attachments: Vec::new(),
+            reasoning_effort: None,
+            correlation_id: None,
+        };
+        self.execute_provider_command(request, AgentTurnDisplayPolicy::INTERNAL)
+            .await?;
+        Ok(())
     }
 
     pub async fn delete_session(&self, session_id: &VibexSessionId) -> VibexResult<()> {
@@ -6222,7 +6310,7 @@ mod tests {
     #[tokio::test]
     async fn automatic_session_title_updates_broadcast_once_and_respect_manual_titles() {
         let db_path = temp_db_path("automatic-session-title-updates");
-        let manager = AgentManager::new(&db_path).unwrap();
+        let manager = Arc::new(AgentManager::new(&db_path).unwrap());
         let mut updates = manager.subscribe_session_updates();
         let conn = manager.open_migrated().unwrap();
         let workspace_root = temp_workspace_path("automatic-session-title-updates");
@@ -7511,7 +7599,7 @@ mod tests {
         let db_path = temp_db_path("delegation-session-ownership");
         let workspace_root = temp_workspace_path("delegation-session-ownership");
         fs::create_dir_all(&workspace_root).unwrap();
-        let manager = AgentManager::new(&db_path).unwrap();
+        let manager = Arc::new(AgentManager::new(&db_path).unwrap());
         let mut conn = manager.open_migrated().unwrap();
         let (project, workspace) =
             WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
@@ -7655,6 +7743,50 @@ mod tests {
             recovered.error_code.as_deref(),
             Some("agent_delegation_child_session_missing")
         );
+
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn rename_session_persists_locked_title_without_provider_route() {
+        let db_path = temp_db_path("rename-session-persists-locked-title");
+        let manager = Arc::new(AgentManager::new(&db_path).unwrap());
+        let conn = manager.open_migrated().unwrap();
+        let workspace_root = temp_workspace_path("rename-session-persists-locked-title");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let session = insert_session(
+            &conn,
+            "opencode session",
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            AgentId::parse("opencode").unwrap(),
+            AgentSessionState::Idle,
+        );
+        drop(conn);
+
+        let mut updates = manager.subscribe_session_updates();
+        let renamed = manager
+            .rename_session(RenameAgentSessionRequest {
+                session_id: session.id.clone(),
+                title: "  Release plan  ".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(renamed.title, "Release plan");
+        assert_eq!(updates.try_recv().unwrap().id, session.id);
+
+        // No ACP runtime route is registered for this session, so the
+        // best-effort provider rename forwarding must fail silently while the
+        // local rename stays authoritative.
+        let conn = manager.open_migrated().unwrap();
+        let stored = SessionRepository::get(&conn, &session.id).unwrap().unwrap();
+        assert_eq!(stored.title, "Release plan");
+        drop(conn);
 
         cleanup_db(&db_path);
         let _ = fs::remove_dir_all(workspace_root);

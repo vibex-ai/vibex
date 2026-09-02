@@ -132,9 +132,9 @@ use crate::protocol::{
     self, AcpDecodedPayload, AcpOperation, AcpOperationStability, AcpWireEncoding, CapabilitySource,
 };
 use crate::registry::{
-    AcpCompatibilityRegistry, AgentEventEnricherKind, CLAUDE_AGENT_ID, CapabilitySupport,
-    ModelSelectionStrategy, RestorePolicy, TranscriptStrategy, known_reasoning_effort_values,
-    known_session_mode_values,
+    AcpCompatibilityRegistry, AgentEventEnricherKind, CLAUDE_AGENT_ID, CODEX_AGENT_ID,
+    CapabilitySupport, ModelSelectionStrategy, RestorePolicy, TranscriptStrategy,
+    known_reasoning_effort_values, known_session_mode_values,
 };
 use crate::session_attachment_registry::{
     SessionAttachmentAcquireKey, SessionAttachmentAcquireOutput, SessionAttachmentAcquireResult,
@@ -156,7 +156,7 @@ use crate::{
     AcpClient, AcpCreateSessionRequest, AcpElicitationResolution, AcpEvent,
     AcpPermissionResolution, AcpRuntimeCommand, AcpRuntimeSessionProbe, AcpSendTurnRequest,
     AcpSession, AcpTurn, bounded_session_content, infer_permission_risk_category, looks_sensitive,
-    redact_summary, redacted_args, redacted_args_summary,
+    plan_codex_fork, redact_summary, redacted_args, redacted_args_summary,
 };
 use crate::{
     AgentEventInput, AgentEventInputSource, ClaudeBackgroundWorkRegistry, ClaudeTranscriptEvent,
@@ -667,6 +667,14 @@ fn parse_operation_capability(
 
 fn build_session_new_params(cwd: &Path, mcp_servers: &[AcpMcpServerDescriptor]) -> Value {
     protocol::build_session_new_params(cwd, mcp_servers_json(mcp_servers))
+}
+
+fn build_session_fork_params(
+    native_session_id: &str,
+    cwd: &Path,
+    mcp_servers: &[AcpMcpServerDescriptor],
+) -> Value {
+    protocol::build_session_fork_params(native_session_id, cwd, mcp_servers_json(mcp_servers))
 }
 
 fn build_session_load_params(
@@ -2135,6 +2143,7 @@ struct ProcessShared {
     agent_name: Option<String>,
     agent_version: Option<String>,
     supports_load_session: bool,
+    supports_fork_session: bool,
     supports_resume_session: bool,
     supports_list_sessions: bool,
     /// `agentCapabilities.mcpCapabilities.http` / `.sse`. Stdio is mandatory
@@ -7692,6 +7701,7 @@ impl AcpRuntimeSwitchBridge {
             requested_policy: RuntimeSwitchPolicy::PreferResume,
             active_work_policy: RuntimeSwitchActiveWorkPolicy::default(),
             requested_session_config: None,
+            fork_native_session_id: None,
             created_at_ms: unix_timestamp_ms(),
         };
         let prepared = match self
@@ -8412,6 +8422,17 @@ impl SwitchTargetExecutor for AcpRuntimeSwitchBridge {
         };
         let attachment = match strategy {
             RuntimeSwitchStrategy::RestartFreshAndBridge => {
+                let fork_native_session_id = intent
+                    .fork_native_session_id
+                    .clone()
+                    .filter(|native| !native.trim().is_empty());
+                // Best-effort native fork: the provider copies its live
+                // context into a new ACP session so the fresh binding starts
+                // fully primed. The fork attempt and the plain `session/new`
+                // fallback share one attachment acquisition so a failed fork
+                // cannot strand the freshly spawned process lease; the
+                // app-level timeline replay carries the same context either
+                // way.
                 self.client
                     .acquire_attachment(
                         intent.session_id.clone(),
@@ -8420,7 +8441,30 @@ impl SwitchTargetExecutor for AcpRuntimeSwitchBridge {
                         None,
                         AttachmentActivationMode::Prepared,
                         move |process| async move {
-                            self.client.open_new_session_for_attachment(&process).await
+                            if let Some(source_native_session_id) = fork_native_session_id.as_deref()
+                            {
+                                match self
+                                    .client
+                                    .fork_new_session_for_attachment(
+                                        &process,
+                                        source_native_session_id,
+                                        generation,
+                                    )
+                                    .await
+                                {
+                                    Ok(opened) => return Ok(opened),
+                                    Err(fork_error) => {
+                                        tracing::warn!(
+                                            session_id = intent.session_id.as_str(),
+                                            error_code = fork_error.code.as_str(),
+                                            "native session fork failed; falling back to session/new"
+                                        );
+                                    }
+                                }
+                            }
+                            self.client
+                                .open_new_session_for_attachment(&process)
+                                .await
                         },
                     )
                     .await
@@ -12362,6 +12406,43 @@ impl AcpRuntimeClient {
                 },
             );
         }
+        let supports_fork_session = result
+            .get("agentCapabilities")
+            .and_then(|capabilities| capabilities.get("sessionCapabilities"))
+            .and_then(|capabilities| capabilities.get("fork"))
+            .is_some();
+        if supports_fork_session {
+            // Codex advertises fork through a versioned `_meta` extension on
+            // top of the pinned adapter identity; other agents accept the
+            // plain `{ sessionId, cwd, mcpServers }` shape.
+            let codex_fork_extension = process.agent_id.as_str() == CODEX_AGENT_ID
+                && self
+                    .compatibility_registry
+                    .for_agent(&process.agent_id)
+                    .is_some_and(|descriptor| {
+                        descriptor.expected_compatibility_identity().to_string()
+                            == process.compatibility_identity
+                    });
+            operation_evidence.insert(
+                AcpOperation::SessionFork,
+                SessionConfigOperationEvidence {
+                    support: CapabilitySupport::Supported,
+                    source: CapabilitySource::NegotiatedRuntime,
+                    encoding: if codex_fork_extension {
+                        AcpWireEncoding::VersionedRaw
+                    } else {
+                        AcpWireEncoding::Typed
+                    },
+                    stability: if codex_fork_extension {
+                        AcpOperationStability::VersionedUnstable
+                    } else {
+                        AcpOperationStability::CapabilityGated
+                    },
+                    compatibility_identity: process.compatibility_identity.clone(),
+                    activation_generation: 0,
+                },
+            );
+        }
         if let Some(descriptor) = self.compatibility_registry.for_agent(&process.agent_id)
             && descriptor.expected_compatibility_identity().to_string()
                 == process.compatibility_identity
@@ -12398,6 +12479,7 @@ impl AcpRuntimeClient {
             shared.protocol_version = protocol_version;
             shared.supports_load_session = supports_load_session;
             shared.supports_resume_session = supports_resume_session;
+            shared.supports_fork_session = supports_fork_session;
             shared.supports_list_sessions = supports_list_sessions;
             shared.supports_mcp_http = supports_mcp_http;
             shared.supports_mcp_sse = supports_mcp_sse;
@@ -12518,6 +12600,107 @@ impl AcpRuntimeClient {
             native_session_id,
             state,
             registration_barrier,
+            replay_params: Vec::new(),
+        })
+    }
+
+    async fn fork_new_session_for_attachment(
+        &self,
+        process: &Arc<AcpProcess>,
+        source_native_session_id: &str,
+        generation: i64,
+    ) -> VibexResult<OpenedAcpSession> {
+        let started = Instant::now();
+        let result = self
+            .fork_new_session_for_attachment_inner(process, source_native_session_id, generation)
+            .await;
+        self.record_session_open(
+            process,
+            RuntimeMetricOperation::New,
+            started,
+            result.as_ref().err(),
+        );
+        result
+    }
+
+    async fn fork_new_session_for_attachment_inner(
+        &self,
+        process: &Arc<AcpProcess>,
+        source_native_session_id: &str,
+        generation: i64,
+    ) -> VibexResult<OpenedAcpSession> {
+        let evidence = process
+            .operation_evidence(generation)
+            .get(&AcpOperation::SessionFork)
+            .cloned();
+        let Some(evidence) = evidence else {
+            return Err(VibexError::capability(
+                "acp_session_fork_not_advertised",
+                "ACP agent did not advertise session fork support",
+            ));
+        };
+        if !evidence.supported_for(&process.compatibility_identity, generation) {
+            return Err(VibexError::capability(
+                "acp_session_fork_not_advertised",
+                "ACP session fork support is not negotiated for this activation",
+            ));
+        }
+        let params = if evidence.encoding == AcpWireEncoding::VersionedRaw {
+            plan_codex_fork(
+                Some(&evidence),
+                &process.compatibility_identity,
+                generation,
+                source_native_session_id,
+            )
+            .map(|plan| plan.params)
+            .ok_or_else(|| {
+                VibexError::capability(
+                    "acp_session_fork_not_advertised",
+                    "codex session fork plan rejected the negotiated fork evidence",
+                )
+            })?
+        } else {
+            build_session_fork_params(
+                source_native_session_id,
+                &process.workspace_root,
+                &process.wire_mcp_servers(),
+            )
+        };
+        let (result, registration_barrier) = process
+            .request_with_registration_barrier(
+                AcpOperation::SessionFork.method(),
+                params,
+                self.handshake_timeout,
+            )
+            .await?;
+        let native_session_id = result
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                VibexError::provider(
+                    "acp_session_fork_invalid",
+                    "ACP session/fork response did not include a session id",
+                )
+            })?
+            .to_string();
+        let mut state = AcpAttachmentShared::default();
+        apply_session_state_to_attachment(
+            &mut state,
+            &process.agent_id,
+            process.auth_source.provider_profile_id(),
+            &native_session_id,
+            &result,
+        );
+        if let Some(commands) = process.take_pending_available_commands(&native_session_id) {
+            state.available_commands = commands;
+        }
+        apply_startup_model_to_attachment_state(process, &mut state);
+        Ok(OpenedAcpSession {
+            native_session_id,
+            state,
+            registration_barrier: Some(registration_barrier),
             replay_params: Vec::new(),
         })
     }
@@ -23104,6 +23287,7 @@ def send_stream_error(session_id, small, message):
 
 
 session_counter = 0
+fork_counter = 0
 pending_prompt_id = None
 request_log_path = os.environ.get("VIBEX_MOCK_ACP_REQUEST_LOG")
 set_model_mode = os.environ.get("VIBEX_MOCK_ACP_SET_MODEL_MODE", "supported")
@@ -23115,6 +23299,7 @@ prompt_mode = os.environ.get("VIBEX_MOCK_ACP_PROMPT_MODE", "success")
 fs_paths = {}
 restore_mode = os.environ.get("VIBEX_MOCK_ACP_RESTORE_MODE", "success")
 advertise_resume = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_RESUME") == "true"
+advertise_fork = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_FORK") == "true"
 advertise_auth = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_LOGIN") == "true"
 authenticate_hangs = os.environ.get("VIBEX_MOCK_ACP_LOGIN_HANG") == "true"
 initialize_mode = os.environ.get("VIBEX_MOCK_ACP_INITIALIZE_MODE", "success")
@@ -23176,6 +23361,10 @@ for line in sys.stdin:
         }
         if advertise_resume:
             capabilities["sessionCapabilities"] = {"resume": {}}
+        if advertise_fork:
+            if "sessionCapabilities" not in capabilities:
+                capabilities["sessionCapabilities"] = {}
+            capabilities["sessionCapabilities"]["fork"] = {}
         if advertise_auth:
             capabilities["auth"] = {"logout": {}}
         result = {
@@ -23559,6 +23748,41 @@ for line in sys.stdin:
                     },
                 },
             })
+    elif method == "session/fork":
+        fork_mode = control_value("fork_mode", "success")
+        if fork_mode == "failure":
+            send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32000, "message": "mock session/fork failure"}})
+            continue
+        fork_counter += 1
+        session_id = "mock-forked-" + str(fork_counter)
+        send({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [
+                        {"name": "fork-command", "description": "Forked session"}
+                    ],
+                },
+            },
+        })
+        send({
+            "jsonrpc": "2.0",
+            "id": mid,
+            "result": {
+                "sessionId": session_id,
+                "models": {
+                    "availableModels": [{"modelId": model_1}],
+                    "currentModelId": model_1,
+                },
+                "modes": {
+                    "availableModes": [{"id": "build", "label": "Build"}],
+                    "currentModeId": "build",
+                },
+            },
+        })
     elif method == "session/load":
         restore_mode = control_value("restore_mode", restore_mode)
         session_id = msg.get("params", {}).get("sessionId", "mock-import-session")
@@ -24415,6 +24639,35 @@ for line in sys.stdin:
 
         fn set_prompt_mode(&self, mode: &str) {
             self.set_control_value("prompt_mode", mode);
+        }
+
+        /// Adds the mock fork-capability env before any process spawn, so the
+        /// next initialize advertises `sessionCapabilities.fork`.
+        fn set_advertise_fork(&self) {
+            let service = self.service();
+            let mut config = service
+                .get_acp_profile_config(self.profile_id.clone())
+                .unwrap();
+            if config
+                .env
+                .iter()
+                .any(|entry| entry.key == "VIBEX_MOCK_ACP_ADVERTISE_FORK")
+            {
+                return;
+            }
+            config.env.push(vibex_core::AcpProviderEnvReference {
+                key: "VIBEX_MOCK_ACP_ADVERTISE_FORK".to_string(),
+                source: AcpProviderEnvSource::Literal,
+                value: Some("true".to_string()),
+                secret_lookup_key: None,
+                redacted_hint: "mock fork capability".to_string(),
+            });
+            service
+                .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                    provider_profile_id: self.profile_id.clone(),
+                    config,
+                })
+                .unwrap();
         }
 
         fn set_restore_mode(&self, mode: &str, advertise_resume: bool) {
@@ -25300,12 +25553,24 @@ for line in sys.stdin:
     }
 
     async fn runtime_switch_fixture(label: &str) -> Option<RuntimeSwitchFixture> {
-        runtime_switch_fixture_with_model_prefix(label, None).await
+        runtime_switch_fixture_with_options(label, None, false).await
+    }
+
+    async fn runtime_switch_fixture_with_fork(label: &str) -> Option<RuntimeSwitchFixture> {
+        runtime_switch_fixture_with_options(label, None, true).await
     }
 
     async fn runtime_switch_fixture_with_model_prefix(
         label: &str,
         model_prefix: Option<&str>,
+    ) -> Option<RuntimeSwitchFixture> {
+        runtime_switch_fixture_with_options(label, model_prefix, false).await
+    }
+
+    async fn runtime_switch_fixture_with_options(
+        label: &str,
+        model_prefix: Option<&str>,
+        advertise_fork: bool,
     ) -> Option<RuntimeSwitchFixture> {
         use vibex_agent::{
             MessageSubmissionCoordinator, MessageSubmissionCoordinatorConfig,
@@ -25342,6 +25607,9 @@ for line in sys.stdin:
             .unwrap();
         if let Some(model_prefix) = model_prefix {
             fixture.set_model_prefix(model_prefix);
+        }
+        if advertise_fork {
+            fixture.set_advertise_fork();
         }
 
         let observability = Arc::new(RuntimeObservability::new());
@@ -26026,6 +26294,7 @@ for line in sys.stdin:
                 })
                 .unwrap(),
             ),
+            fork_native_session_id: None,
             created_at_ms: unix_timestamp_ms(),
         }
     }
@@ -27656,6 +27925,163 @@ for line in sys.stdin:
             warm_source.state().unwrap(),
             SessionAttachmentState::Inactive
         );
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn runtime_switch_fresh_bridge_forks_native_session_when_advertised() {
+        let Some(fixture) = runtime_switch_fixture_with_fork("fresh-bridge-native-fork").await
+        else {
+            return;
+        };
+        fixture.fixture.set_control_value("fork_mode", "success");
+        let target_binding_id = RuntimeBindingId::new();
+        let mut intent = switch_intent(
+            &fixture,
+            target_binding_id.clone(),
+            "mock/model-2",
+            "review",
+        );
+        intent.fork_native_session_id = Some("mock-session-1".to_string());
+        let process = fixture
+            .bridge
+            .ensure_process(&intent, &switch_operation("spawn"))
+            .await
+            .unwrap();
+        let prepared = fixture
+            .bridge
+            .restore_or_create_session(
+                &intent,
+                &process,
+                RuntimeSwitchStrategy::RestartFreshAndBridge,
+                &switch_operation("create"),
+            )
+            .await
+            .unwrap();
+
+        let log = fixture.fixture.request_log();
+        assert_eq!(logged_request_count(&log, "session/fork"), 1);
+        let fork_request = find_logged_request(&log, "session/fork");
+        assert_eq!(fork_request["params"]["sessionId"], "mock-session-1");
+        assert_eq!(
+            fork_request["params"]["cwd"],
+            fixture.fixture.workspace.display().to_string()
+        );
+        // A successful fork must not fall back to `session/new`.
+        let fork_index = log
+            .iter()
+            .position(|entry| entry["method"] == "session/fork")
+            .unwrap();
+        assert!(
+            log.iter()
+                .enumerate()
+                .all(|(index, entry)| entry["method"] != "session/new" || index < fork_index)
+        );
+        assert_eq!(
+            prepared.binding.native_session_id.as_deref(),
+            Some("mock-forked-1")
+        );
+        assert_eq!(prepared.restore_result, None);
+
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn runtime_switch_fresh_bridge_falls_back_when_fork_fails() {
+        let Some(fixture) = runtime_switch_fixture_with_fork("fresh-bridge-fork-fallback").await
+        else {
+            return;
+        };
+        fixture.fixture.set_control_value("fork_mode", "failure");
+        let target_binding_id = RuntimeBindingId::new();
+        let mut intent = switch_intent(
+            &fixture,
+            target_binding_id.clone(),
+            "mock/model-2",
+            "review",
+        );
+        intent.fork_native_session_id = Some("mock-session-1".to_string());
+        let process = fixture
+            .bridge
+            .ensure_process(&intent, &switch_operation("spawn"))
+            .await
+            .unwrap();
+        let prepared = fixture
+            .bridge
+            .restore_or_create_session(
+                &intent,
+                &process,
+                RuntimeSwitchStrategy::RestartFreshAndBridge,
+                &switch_operation("create"),
+            )
+            .await
+            .unwrap();
+
+        let log = fixture.fixture.request_log();
+        assert_eq!(logged_request_count(&log, "session/fork"), 1);
+        let fork_request = find_logged_request(&log, "session/fork");
+        assert_eq!(fork_request["params"]["sessionId"], "mock-session-1");
+        // The fallback must open a fresh session after the failed fork.
+        let fork_index = log
+            .iter()
+            .position(|entry| entry["method"] == "session/fork")
+            .unwrap();
+        assert!(
+            log.iter()
+                .enumerate()
+                .any(|(index, entry)| entry["method"] == "session/new" && index > fork_index)
+        );
+        assert_ne!(
+            prepared.binding.native_session_id.as_deref(),
+            Some("mock-forked-1")
+        );
+
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn runtime_switch_fresh_bridge_skips_fork_without_capability() {
+        let Some(fixture) = runtime_switch_fixture("fresh-bridge-fork-ungated").await else {
+            return;
+        };
+        let target_binding_id = RuntimeBindingId::new();
+        let mut intent = switch_intent(
+            &fixture,
+            target_binding_id.clone(),
+            "mock/model-2",
+            "review",
+        );
+        intent.fork_native_session_id = Some("mock-session-1".to_string());
+        let process = fixture
+            .bridge
+            .ensure_process(&intent, &switch_operation("spawn"))
+            .await
+            .unwrap();
+        let _prepared = fixture
+            .bridge
+            .restore_or_create_session(
+                &intent,
+                &process,
+                RuntimeSwitchStrategy::RestartFreshAndBridge,
+                &switch_operation("create"),
+            )
+            .await
+            .unwrap();
+
+        let log = fixture.fixture.request_log();
+        // Without negotiated fork evidence the intent must never reach the
+        // provider as `session/fork`.
+        assert_eq!(logged_request_count(&log, "session/fork"), 0);
+
         drop(fixture.manager);
         drop(fixture.bridge);
         drop(fixture.client);

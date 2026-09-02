@@ -816,6 +816,23 @@ pub(crate) fn build_session_resume_params(
     params
 }
 
+/// Build `session/fork` params with the same shape as `session/resume`:
+/// `{ sessionId, cwd, mcpServers }`. Fork is not part of the pinned
+/// agent-client-protocol schema yet, so the params are assembled directly;
+/// Codex dialects override this via the versioned `_meta` extension in
+/// [`crate::codex::plan_codex_fork`].
+pub(crate) fn build_session_fork_params(
+    native_session_id: &str,
+    cwd: &Path,
+    mcp_servers: Value,
+) -> Value {
+    json!({
+        "sessionId": native_session_id,
+        "cwd": cwd.display().to_string(),
+        "mcpServers": mcp_servers,
+    })
+}
+
 /// Build `session/prompt` params through the typed `PromptRequest`.
 ///
 /// The runtime assembles content blocks as JSON values; they are decoded into
