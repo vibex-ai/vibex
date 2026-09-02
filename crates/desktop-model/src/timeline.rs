@@ -36,11 +36,18 @@ impl TimelineModel {
         session_id: VibexSessionId,
         items: impl IntoIterator<Item = TimelineItem>,
     ) {
-        self.session_id = Some(session_id.clone());
-        self.items = normalize_items(session_id, items);
+        let normalized_items = normalize_items(session_id.clone(), items);
+        let content_changed =
+            self.session_id.as_ref() != Some(&session_id) || self.items != normalized_items;
+        self.session_id = Some(session_id);
+        if content_changed {
+            self.items = normalized_items;
+        }
         self.authoritative_end_sequence = self.items.last().map(|item| item.sequence);
         self.needs_authoritative_refetch = false;
-        self.revision = self.revision.wrapping_add(1);
+        if content_changed {
+            self.revision = self.revision.wrapping_add(1);
+        }
     }
 
     pub fn apply_live(&mut self, event: TimelineLiveEvent) -> bool {
@@ -418,6 +425,28 @@ mod tests {
             0
         );
         assert_eq!(model.revision, revision);
+    }
+
+    #[test]
+    fn identical_authoritative_replace_keeps_revision_and_clears_refetch() {
+        let session = VibexSessionId::parse("session_idempotent").unwrap();
+        let item = item(
+            &session,
+            1,
+            TimelinePayload::AgentMessage(AgentMessagePayload {
+                text: "done".into(),
+                is_final: true,
+            }),
+        );
+        let mut model = TimelineModel::default();
+        model.replace_authoritative(session.clone(), [item.clone()]);
+        let revision = model.revision;
+        model.mark_lagged();
+
+        model.replace_authoritative(session, [item]);
+
+        assert_eq!(model.revision, revision);
+        assert!(!model.needs_authoritative_refetch);
     }
 
     #[test]

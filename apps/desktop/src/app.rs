@@ -2112,6 +2112,24 @@ fn timeline_live_event_is_streaming_only(event: &TimelineLiveEvent) -> bool {
     }
 }
 
+fn timeline_batch_requires_auto_continue_refresh(events: &[TimelineLiveEvent]) -> bool {
+    events.iter().any(|event| {
+        if !timeline_live_event_is_well_formed(event) {
+            return false;
+        }
+        match &event.item.payload {
+            // Non-final reasoning arrives while the provider is still running.
+            // The authoritative idle/error snapshot refreshes the completion
+            // status once the turn settles, without scanning the history for
+            // every thought chunk. Agent-message deltas remain refreshable
+            // because a trailing answer delta can change the latest outcome.
+            TimelinePayload::AgentMessageDelta(_) => true,
+            TimelinePayload::Reasoning(reasoning) => reasoning.is_final,
+            _ => true,
+        }
+    })
+}
+
 /// Session snapshots also carry the latest timeline timestamp. That timestamp
 /// changes for every streamed item, but it does not change the sidebar shape.
 /// Keep the comparison focused on fields that can affect the sidebar so a
@@ -2833,6 +2851,7 @@ struct AgentStreamingCacheUpdate {
     row_id: String,
     previous_body_len: usize,
     body_len: usize,
+    output_char_delta: usize,
 }
 
 fn timeline_item_runtime_attribution(item: &TimelineItem) -> Option<String> {
@@ -2982,6 +3001,10 @@ fn append_agent_streaming_deltas_to_cache(
     let turn_id = last_turn.id.clone();
     let row_id = last_row.id.clone();
     let previous_body_len = last_row.body.len();
+    let output_char_delta = updates
+        .iter()
+        .map(|update| update.text.chars().count())
+        .sum();
 
     let turns = Rc::make_mut(cache);
     let turn = Rc::make_mut(turns.last_mut().expect("cache was checked above"));
@@ -3022,6 +3045,7 @@ fn append_agent_streaming_deltas_to_cache(
         row_id,
         previous_body_len,
         body_len,
+        output_char_delta,
     })
 }
 
@@ -3105,6 +3129,10 @@ fn append_agent_reasoning_deltas_to_cache(
     let row_id =
         timeline_row.map_or_else(|| format!("reasoning-live:{turn_id}"), |row| row.id.clone());
     let previous_body_len = timeline_row.map_or_else(|| live_status.len(), |row| row.body.len());
+    let output_char_delta = updates
+        .iter()
+        .map(|update| update.text.chars().count())
+        .sum();
 
     let turns = Rc::make_mut(cache);
     let turn = Rc::make_mut(turns.last_mut().expect("cache was checked above"));
@@ -3144,6 +3172,7 @@ fn append_agent_reasoning_deltas_to_cache(
         row_id,
         previous_body_len,
         body_len,
+        output_char_delta,
     })
 }
 
@@ -3416,17 +3445,26 @@ struct AgentGenerationStats {
     turn_id: String,
     started_at_ms: i64,
     output_token_baseline: Option<u64>,
+    estimated_output_chars: Option<usize>,
+    compaction_count: Option<usize>,
     last_generated_tokens: Option<u64>,
     last_token_sample_at: Instant,
     tokens_per_second: Option<f32>,
 }
 
 impl AgentGenerationStats {
-    fn new(turn_id: String, started_at_ms: i64, output_token_baseline: Option<u64>) -> Self {
+    fn new(
+        turn_id: String,
+        started_at_ms: i64,
+        output_token_baseline: Option<u64>,
+        compaction_count: usize,
+    ) -> Self {
         Self {
             turn_id,
             started_at_ms,
             output_token_baseline,
+            estimated_output_chars: None,
+            compaction_count: Some(compaction_count),
             last_generated_tokens: None,
             last_token_sample_at: Instant::now(),
             tokens_per_second: None,
@@ -3518,17 +3556,27 @@ fn agent_generation_compaction_count(
                 projected_end_sequence.max(item.sequence)
             })
     };
-    timeline_items
+    let start_index = timeline_items.partition_point(|item| item.sequence < start_sequence);
+    let end_index = timeline_items.partition_point(|item| item.sequence <= end_sequence);
+    timeline_items[start_index..end_index]
         .iter()
         .filter(|item| {
-            item.sequence >= start_sequence
-                && item.sequence <= end_sequence
-                && matches!(
-                    &item.payload,
-                    TimelinePayload::SystemNotice(notice) if notice.is_context_compaction()
-                )
+            matches!(
+                &item.payload,
+                TimelinePayload::SystemNotice(notice) if notice.is_context_compaction()
+            )
         })
         .count()
+}
+
+fn timeline_turn_file_changes_cache_sequence(turn: &TimelineConversationTurn) -> i64 {
+    turn.process_rows
+        .iter()
+        .chain(turn.conclusion_row.iter())
+        .filter(|row| row.kind == TimelineRowKind::FileOperation)
+        .map(|row| row.last_sequence)
+        .max()
+        .unwrap_or_default()
 }
 
 fn turn_file_changes_line_counts(summary: &TurnFileChangesSummary) -> Option<(usize, usize)> {
@@ -3542,30 +3590,37 @@ fn turn_file_changes_line_counts(summary: &TurnFileChangesSummary) -> Option<(us
         ))
 }
 
-fn estimated_agent_output_tokens(turn: &TimelineConversationTurn) -> Option<u64> {
+fn estimated_agent_output_chars(turn: &TimelineConversationTurn) -> Option<usize> {
     // Reasoning deltas are model output too. In Timeline mode they stream into
     // `process_rows`; in LatestAtBottom mode streaming reasoning rows are
     // filtered out and the text only accumulates in `live_status`. The two
     // sources overlap, so `live_status` is counted only when no reasoning row
     // already carries the stream, otherwise the tail would be double-counted.
-    let mut reasoning_row_present = false;
+    let mut streaming_reasoning_row_present = false;
     let mut output_chars = 0usize;
     for row in turn.process_rows.iter().chain(turn.conclusion_row.iter()) {
         match row.kind {
             TimelineRowKind::AgentMessage => output_chars += row.body.chars().count(),
             TimelineRowKind::Reasoning => {
-                reasoning_row_present = true;
+                streaming_reasoning_row_present |= row.streaming;
                 output_chars += row.body.chars().count();
             }
             _ => {}
         }
     }
-    if !reasoning_row_present && let Some(status) = turn.live_status.as_deref() {
+    if !streaming_reasoning_row_present && let Some(status) = turn.live_status.as_deref() {
         output_chars += status.chars().count();
     }
-    (output_chars > 0).then_some((output_chars as u64).saturating_add(3) / 4)
+    (output_chars > 0).then_some(output_chars)
 }
 
+#[cfg(test)]
+fn estimated_agent_output_tokens(turn: &TimelineConversationTurn) -> Option<u64> {
+    estimated_agent_output_chars(turn)
+        .map(|output_chars| (output_chars as u64).saturating_add(3) / 4)
+}
+
+#[cfg(test)]
 fn agent_generation_output_tokens(
     turn: &TimelineConversationTurn,
     output_tokens: Option<u64>,
@@ -9574,18 +9629,48 @@ impl VibexWorkbench {
             .as_ref()
             .is_none_or(|stats| stats.turn_id != turn.id);
         if should_reset {
+            let compaction_count = agent_generation_compaction_count(turn, &self.timeline.items);
             self.agent_generation_stats = Some(AgentGenerationStats::new(
                 turn.id.clone(),
                 turn.started_at_ms,
                 output_tokens,
+                compaction_count,
             ));
         }
+
+        let refreshed_compaction_count = self
+            .agent_generation_stats
+            .as_ref()
+            .filter(|stats| stats.turn_id == turn.id)
+            .and_then(|stats| {
+                stats
+                    .compaction_count
+                    .is_none()
+                    .then(|| agent_generation_compaction_count(turn, &self.timeline.items))
+            });
 
         let Some(stats) = self.agent_generation_stats.as_mut() else {
             return;
         };
-        let generated_tokens =
-            agent_generation_output_tokens(turn, output_tokens, stats.output_token_baseline);
+        if let Some(compaction_count) = refreshed_compaction_count {
+            stats.compaction_count = Some(compaction_count);
+        }
+        let reported_tokens = match (output_tokens, stats.output_token_baseline) {
+            (Some(current), Some(baseline)) => {
+                current.checked_sub(baseline).filter(|tokens| *tokens > 0)
+            }
+            (Some(current), None) if current > 0 => Some(current),
+            _ => None,
+        };
+        let generated_tokens = if let Some(reported_tokens) = reported_tokens {
+            Some(reported_tokens)
+        } else {
+            let estimated_output_chars = stats
+                .estimated_output_chars
+                .get_or_insert_with(|| estimated_agent_output_chars(turn).unwrap_or_default());
+            (*estimated_output_chars > 0)
+                .then_some((*estimated_output_chars as u64).saturating_add(3) / 4)
+        };
         if generated_tokens == stats.last_generated_tokens {
             return;
         }
@@ -9598,6 +9683,31 @@ impl VibexWorkbench {
         }
         stats.last_generated_tokens = generated_tokens;
         stats.last_token_sample_at = now;
+    }
+
+    fn record_agent_generation_streaming_delta(&mut self, update: &AgentStreamingCacheUpdate) {
+        let Some(stats) = self.agent_generation_stats.as_mut() else {
+            return;
+        };
+        if stats.turn_id != update.turn_id {
+            return;
+        }
+        if let Some(estimated_output_chars) = stats.estimated_output_chars.as_mut() {
+            *estimated_output_chars =
+                estimated_output_chars.saturating_add(update.output_char_delta);
+        }
+    }
+
+    fn invalidate_agent_generation_output_estimate(&mut self) {
+        if let Some(stats) = self.agent_generation_stats.as_mut() {
+            stats.estimated_output_chars = None;
+        }
+    }
+
+    fn invalidate_agent_generation_compaction_count(&mut self) {
+        if let Some(stats) = self.agent_generation_stats.as_mut() {
+            stats.compaction_count = None;
+        }
     }
 
     fn render_agent_generation_status(
@@ -9633,7 +9743,11 @@ impl VibexWorkbench {
         let phase_label = agent_generation_phase_label(phase, locale);
         let duration = format_compact_duration(started_at_ms, None);
         let tool_count = agent_generation_tool_call_count(&turn);
-        let compaction_count = agent_generation_compaction_count(&turn, &self.timeline.items);
+        let compaction_count = self
+            .agent_generation_stats
+            .as_ref()
+            .and_then(|stats| stats.compaction_count)
+            .unwrap_or_default();
         let mut file_changes = self.agent_turn_file_changes_cached(&turn).as_ref().clone();
         if let Some(session) = self.selected_session().cloned()
             && let Some(status) = self.code_workbench.read(cx).git_status()
@@ -10372,6 +10486,8 @@ impl VibexWorkbench {
                                 || this.timeline.items != items;
                             if content_changed {
                                 this.invalidate_timeline_render_caches();
+                                this.invalidate_agent_generation_output_estimate();
+                                this.invalidate_agent_generation_compaction_count();
                             }
                             this.timeline
                                 .replace_authoritative(session_id.clone(), items);
@@ -11061,6 +11177,20 @@ impl VibexWorkbench {
         if events.is_empty() {
             return unread_changed || sidebar_changed || child_timeline_changed;
         }
+        let output_stream_changed = events.iter().any(|event| {
+            matches!(
+                &event.item.payload,
+                TimelinePayload::AgentMessageDelta(_)
+                    | TimelinePayload::AgentMessage(_)
+                    | TimelinePayload::Reasoning(_)
+            )
+        });
+        let compaction_count_changed = events.iter().any(|event| {
+            matches!(
+                &event.item.payload,
+                TimelinePayload::SystemNotice(notice) if notice.is_context_compaction()
+            )
+        });
 
         let previous_end_sequence = self.timeline.authoritative_end_sequence;
         let updates_existing_item = previous_end_sequence
@@ -11077,14 +11207,16 @@ impl VibexWorkbench {
         let reasoning_updates = (!updates_existing_item && streaming_updates.is_none())
             .then(|| agent_reasoning_delta_updates(&events))
             .flatten();
+        let auto_continue_refresh = timeline_batch_requires_auto_continue_refresh(&events);
         let changed = self.timeline.apply_live_batch(events);
         let optimistic_reconciled = changed > 0 && self.reconcile_optimistic_user_message();
         if changed > 0 {
-            if let Some(session_updated_at_ms) = self
-                .sessions
-                .iter()
-                .find(|session| session.id == selected_session_id)
-                .map(|session| session.updated_at_ms)
+            if auto_continue_refresh
+                && let Some(session_updated_at_ms) = self
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == selected_session_id)
+                    .map(|session| session.updated_at_ms)
             {
                 let ended_normally = latest_timeline_turn_ended_normally(&self.timeline.items);
                 self.cache_auto_continue_turn_status(
@@ -11125,6 +11257,14 @@ impl VibexWorkbench {
                 self.conversation_turns_summary =
                     ConversationTurnsSummary::from_turns(&self.conversation_turns_cache);
                 streaming_cache_update = Some(update);
+            }
+            if let Some(update) = streaming_cache_update.as_ref() {
+                self.record_agent_generation_streaming_delta(update);
+            } else if output_stream_changed {
+                self.invalidate_agent_generation_output_estimate();
+            }
+            if updates_existing_item || compaction_count_changed {
+                self.invalidate_agent_generation_compaction_count();
             }
             if !self.timeline_follow.following_bottom {
                 let appended_messages = timeline_agent_message_count_after_sequence(
@@ -33134,9 +33274,10 @@ impl VibexWorkbench {
         &mut self,
         turn: &TimelineConversationTurn,
     ) -> Rc<TurnFileChangesSummary> {
-        let sequence = timeline_turn_sequence_range(turn)
-            .map(|(_, end)| end)
-            .unwrap_or_default();
+        // Reasoning chunks advance the turn's end sequence but cannot change
+        // its file summary. Key this cache by the latest file-operation row so
+        // thought streaming reuses the existing diff projection.
+        let sequence = timeline_turn_file_changes_cache_sequence(turn);
         if let Some((cached_sequence, summary)) = self.timeline_turn_file_changes.get(&turn.id)
             && *cached_sequence == sequence
         {
@@ -49386,6 +49527,7 @@ mod tests {
         assert_eq!(cache[1].conclusion_row.as_ref().unwrap().body, "streaming");
         assert_eq!(update.previous_body_len, "stream".len());
         assert_eq!(update.body_len, "streaming".len());
+        assert_eq!(update.output_char_delta, "ing".chars().count());
         assert_eq!(state_cache.as_ref().unwrap().body_len, "streaming".len());
 
         let body_before_gap = cache[1].conclusion_row.as_ref().unwrap().body.clone();
@@ -51943,6 +52085,9 @@ mod tests {
             &streaming_event
         ));
         assert!(timeline_live_event_is_streaming_only(&streaming_event));
+        assert!(!timeline_batch_requires_auto_continue_refresh(
+            std::slice::from_ref(&streaming_event)
+        ));
         let final_reasoning_item = timeline_item_with_payload(
             &session_id,
             3,
@@ -51959,6 +52104,21 @@ mod tests {
                 item: final_reasoning_item,
             }
         ));
+        assert!(timeline_batch_requires_auto_continue_refresh(&[
+            TimelineLiveEvent {
+                session_id: session_id.clone(),
+                sequence: 3,
+                item: timeline_item_with_payload(
+                    &session_id,
+                    3,
+                    TimelineSource::Agent,
+                    TimelinePayload::Reasoning(ReasoningPayload {
+                        text: "done".into(),
+                        is_final: true,
+                    }),
+                ),
+            },
+        ]));
         let delta_item = timeline_item_with_payload(
             &session_id,
             4,
@@ -51990,6 +52150,22 @@ mod tests {
                 }),
             ),
         }));
+        assert!(timeline_batch_requires_auto_continue_refresh(&[
+            TimelineLiveEvent {
+                session_id: session_id.clone(),
+                sequence: 4,
+                item: timeline_item_with_payload(
+                    &session_id,
+                    4,
+                    TimelineSource::Agent,
+                    TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                        text_delta: "answer".into(),
+                        chunk_index: 0,
+                        phase: Some(AgentMessagePhase::FinalAnswer),
+                    }),
+                ),
+            },
+        ]));
         let mut mismatched_item = valid_item;
         mismatched_item.session_id = VibexSessionId::new();
         assert!(!timeline_live_event_updates_sidebar_timestamp(
@@ -54134,6 +54310,22 @@ mod tests {
         );
         assert_eq!(agent_generation_tool_call_count(&activity_turn), 2);
 
+        let mut file_change_turn = turn(
+            vec![
+                row("file", TimelineRowKind::FileOperation, false, "edit"),
+                row("thought", TimelineRowKind::Reasoning, true, "working"),
+            ],
+            None,
+            Some("working"),
+            false,
+        );
+        file_change_turn.process_rows[0].last_sequence = 7;
+        file_change_turn.process_rows[1].last_sequence = 8;
+        assert_eq!(
+            timeline_turn_file_changes_cache_sequence(&file_change_turn),
+            7
+        );
+
         let compaction_turn = turn(
             vec![row(
                 "reasoning",
@@ -54236,6 +54428,22 @@ mod tests {
         assert_eq!(
             estimated_agent_output_tokens(&reasoning_row_turn),
             Some(4) // ceil(13 / 4)
+        );
+
+        let completed_reasoning_with_live_status = turn(
+            vec![row(
+                "completed-thought",
+                TimelineRowKind::Reasoning,
+                false,
+                "old",
+            )],
+            None,
+            Some("new"),
+            false,
+        );
+        assert_eq!(
+            estimated_agent_output_tokens(&completed_reasoning_with_live_status),
+            Some(2) // ceil(6 / 4)
         );
 
         let live_status_turn = turn(vec![], None, Some("thinking text"), false);
