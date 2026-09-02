@@ -15245,7 +15245,9 @@ impl VibexWorkbench {
         };
         let viewport = window.viewport_size();
         let dialog_width = (f32::from(viewport.width) - 32.0).clamp(280.0, 760.0);
-        let dialog_max_height = (f32::from(viewport.height) - 32.0).clamp(240.0, 672.0);
+        // The picker root reserves its session list with `flex_1`, so the
+        // dialog needs a definite height rather than an intrinsic max-height.
+        let dialog_height = (f32::from(viewport.height) - 32.0).clamp(1.0, 672.0);
         window.open_dialog(cx, move |dialog, _, cx| {
             let is_dark = cx.theme().is_dark();
             let popover = theme::semantic_color("popover", is_dark);
@@ -15254,7 +15256,7 @@ impl VibexWorkbench {
                 .title(title.clone())
                 .w(px(dialog_width))
                 .max_w(px(dialog_width))
-                .max_h(px(dialog_max_height))
+                .h(px(dialog_height))
                 .rounded(px(14.0))
                 .bg(popover)
                 .text_color(popover_foreground)

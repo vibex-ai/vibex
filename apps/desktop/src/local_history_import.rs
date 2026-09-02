@@ -923,16 +923,7 @@ impl Render for LocalHistoryImportDialog {
             && folders
                 .iter()
                 .all(|(folder, _)| self.collapsed.contains(&folder.workspace_root));
-        let present_sources = self
-            .scan
-            .as_ref()
-            .map(|scan| {
-                scan.folders
-                    .iter()
-                    .flat_map(|folder| folder.sources.iter().copied())
-                    .collect::<HashSet<_>>()
-            })
-            .unwrap_or_default();
+        let present_sources = present_sources(self.scan.as_ref());
         let body_height = (f32::from(window.viewport_size().height) - 180.0).clamp(220.0, 560.0);
         let list = if folders.is_empty() {
             let empty = self
@@ -1189,6 +1180,20 @@ impl Render for LocalHistoryImportDialog {
     }
 }
 
+fn present_sources(scan: Option<&LocalHistoryScanResult>) -> Vec<LocalHistorySource> {
+    let Some(scan) = scan else {
+        return Vec::new();
+    };
+    LocalHistorySource::ALL
+        .into_iter()
+        .filter(|source| {
+            scan.folders
+                .iter()
+                .any(|folder| folder.sources.contains(source))
+        })
+        .collect()
+}
+
 trait ScanSessionStatusExt {
     fn status_is_imported(&self) -> bool;
     fn status_is_deleted(&self) -> bool;
@@ -1321,5 +1326,42 @@ fn relative_time(timestamp_ms: Option<i64>, locale: ResolvedLocale) -> String {
                 format!("{} 天前", minutes / 1_440)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn present_sources_follows_the_stable_registry_order() {
+        let scan = LocalHistoryScanResult {
+            folders: vec![
+                LocalHistoryScanFolder {
+                    workspace_root: "/workspace/one".to_string(),
+                    sources: vec![LocalHistorySource::CodeBuddy, LocalHistorySource::Codex],
+                    sessions: Vec::new(),
+                },
+                LocalHistoryScanFolder {
+                    workspace_root: "/workspace/two".to_string(),
+                    sources: vec![LocalHistorySource::OpenCode, LocalHistorySource::Claude],
+                    sessions: Vec::new(),
+                },
+            ],
+            total_sessions: 0,
+            importable_count: 0,
+            unassigned_count: 0,
+            diagnostics: Vec::new(),
+        };
+
+        assert_eq!(
+            present_sources(Some(&scan)),
+            vec![
+                LocalHistorySource::Claude,
+                LocalHistorySource::Codex,
+                LocalHistorySource::OpenCode,
+                LocalHistorySource::CodeBuddy,
+            ]
+        );
     }
 }
