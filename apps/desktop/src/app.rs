@@ -4545,9 +4545,12 @@ pub struct VibexWorkbench {
     sessions: Vec<AgentSession>,
     optimistically_removed_session_ids: BTreeSet<String>,
     pending_session_deletion_ids: BTreeSet<String>,
+    optimistically_removed_project_ids: BTreeSet<String>,
+    pending_project_deletion_ids: BTreeSet<String>,
     pending_worktree_rename_ids: BTreeSet<String>,
     pending_worktree_deletion_ids: BTreeSet<String>,
     optimistic_session_deletion_reconciliation_pending: bool,
+    optimistic_project_deletion_reconciliation_pending: bool,
     sidebar_state: SidebarState,
     sidebar_projection_revision: u64,
     sidebar_projection_cache: Option<SidebarProjectionCache>,
@@ -5298,9 +5301,12 @@ impl VibexWorkbench {
             sessions: Vec::new(),
             optimistically_removed_session_ids: BTreeSet::new(),
             pending_session_deletion_ids: BTreeSet::new(),
+            optimistically_removed_project_ids: BTreeSet::new(),
+            pending_project_deletion_ids: BTreeSet::new(),
             pending_worktree_rename_ids: BTreeSet::new(),
             pending_worktree_deletion_ids: BTreeSet::new(),
             optimistic_session_deletion_reconciliation_pending: false,
+            optimistic_project_deletion_reconciliation_pending: false,
             sidebar_state,
             sidebar_projection_revision: 0,
             sidebar_projection_cache: None,
@@ -6411,6 +6417,8 @@ impl VibexWorkbench {
         let generation = self.agent_overview_generation;
         let reconciles_optimistic_session_deletions =
             self.optimistic_session_deletion_reconciliation_pending;
+        let reconciles_optimistic_project_deletions =
+            self.optimistic_project_deletion_reconciliation_pending;
         // A provider mutation makes every in-flight enriched catalog stale.
         self.agent_catalog_generation = self.agent_catalog_generation.wrapping_add(1);
         let catalog_generation = self.agent_catalog_generation;
@@ -6425,7 +6433,7 @@ impl VibexWorkbench {
             } else {
                 backend.agent().list_sessions(false).await?
             };
-            let workspaces = backend
+            let workspaces: Vec<(ProjectRecord, WorkspaceRecord)> = backend
                 .workspace()
                 .list_workspaces()
                 .await?
@@ -6466,6 +6474,23 @@ impl VibexWorkbench {
                                     })
                                     .collect()
                             };
+                            // A project deleted optimistically (and its
+                            // sessions) stays hidden while the authoritative
+                            // deletion is still in flight. Once the deletion
+                            // settles, the reconciliation flag lets the
+                            // backend's authoritative rows win again — either
+                            // confirming the deletion or restoring the rows
+                            // after a failure.
+                            if reconciles_optimistic_project_deletions {
+                                this.optimistic_project_deletion_reconciliation_pending = false;
+                                this.optimistically_removed_project_ids.clear();
+                            } else if !this.optimistically_removed_project_ids.is_empty() {
+                                sessions.retain(|session| {
+                                    !this
+                                        .optimistically_removed_project_ids
+                                        .contains(session.project_id.as_str())
+                                });
+                            }
                             let pending_session =
                                 this.pending_new_session.as_ref().and_then(|pending| {
                                     this.sessions
@@ -6543,6 +6568,20 @@ impl VibexWorkbench {
                             this.auto_continue_paused_session_ids.retain(|session_id| {
                                 this.auto_continue_session_ids.contains(session_id)
                             });
+                            let workspaces = if reconciles_optimistic_project_deletions
+                                || this.optimistically_removed_project_ids.is_empty()
+                            {
+                                workspaces
+                            } else {
+                                workspaces
+                                    .into_iter()
+                                    .filter(|(project, _)| {
+                                        !this
+                                            .optimistically_removed_project_ids
+                                            .contains(project.id.as_str())
+                                    })
+                                    .collect()
+                            };
                             this.workspaces = workspaces;
                             let auto_continue_sessions = this
                                 .sessions
@@ -6699,13 +6738,33 @@ impl VibexWorkbench {
                     this.workspace_context_task = None;
                     match outcome {
                         Ok(Ok((summaries, contexts))) => {
-                            let workspaces = summaries
+                            let workspaces: Vec<(ProjectRecord, WorkspaceRecord)> = summaries
                                 .into_iter()
                                 .map(|summary| (summary.project, summary.workspace))
                                 .collect();
+                            // This refresh may have been captured before an
+                            // optimistic project deletion, so its snapshot
+                            // must not resurrect the removed rows.
+                            let workspaces = if this.optimistically_removed_project_ids.is_empty() {
+                                workspaces
+                            } else {
+                                workspaces
+                                    .into_iter()
+                                    .filter(|(project, _)| {
+                                        !this
+                                            .optimistically_removed_project_ids
+                                            .contains(project.id.as_str())
+                                    })
+                                    .collect()
+                            };
                             let workspaces_changed = this.workspaces != workspaces;
                             this.workspaces = workspaces;
                             this.workspace_contexts = contexts;
+                            this.workspace_contexts.retain(|workspace_id, _| {
+                                this.workspaces
+                                    .iter()
+                                    .any(|(_, workspace)| workspace.id.as_str() == workspace_id)
+                            });
                             this.reconcile_sidebar_state();
                             if workspaces_changed {
                                 this.publish_sidebar_invalidation();
@@ -7079,6 +7138,9 @@ impl VibexWorkbench {
         if self
             .optimistically_removed_session_ids
             .contains(session.id.as_str())
+            || self
+                .optimistically_removed_project_ids
+                .contains(session.project_id.as_str())
         {
             return;
         }
@@ -10004,12 +10066,10 @@ impl VibexWorkbench {
     }
 
     fn selected_session_runtime_uninitialized(&self) -> bool {
-        self.selected_session_id
-            .as_ref()
-            .is_some_and(|session_id| {
-                self.runtime_selection_uninitialized_sessions
-                    .contains(session_id.as_str())
-            })
+        self.selected_session_id.as_ref().is_some_and(|session_id| {
+            self.runtime_selection_uninitialized_sessions
+                .contains(session_id.as_str())
+        })
     }
 
     fn fallback_runtime_selection_for_uninitialized(&self) -> Option<SessionRuntimeSelection> {
@@ -18301,7 +18361,9 @@ impl VibexWorkbench {
         selection: SessionRuntimeSelection,
         cx: &mut Context<Self>,
     ) {
-        let (Some(runtime), Some(session_id)) = (self.runtime.clone(), self.selected_session_id.clone()) else {
+        let (Some(runtime), Some(session_id)) =
+            (self.runtime.clone(), self.selected_session_id.clone())
+        else {
             return;
         };
         let session_key = session_id.as_str().to_string();
@@ -18349,8 +18411,7 @@ impl VibexWorkbench {
                             }
                         }
                         Ok(Err(error)) => {
-                            this.optimistic_runtime_selections
-                                .remove(&session_key);
+                            this.optimistic_runtime_selections.remove(&session_key);
                             if active {
                                 this.agent_error =
                                     Some(format!("{}: {}", error.code, error.message));
@@ -18359,9 +18420,8 @@ impl VibexWorkbench {
                         Err(error) => {
                             this.optimistic_runtime_selections.remove(&session_key);
                             if active {
-                                this.agent_error = Some(format!(
-                                    "runtime initialization failed: {error}"
-                                ));
+                                this.agent_error =
+                                    Some(format!("runtime initialization failed: {error}"));
                             }
                         }
                     }
@@ -19970,18 +20030,131 @@ impl VibexWorkbench {
     }
 
     fn delete_project(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
-        if self.agent_action_pending {
+        let project_key = project_id.as_str().to_string();
+        if !self
+            .pending_project_deletion_ids
+            .insert(project_key.clone())
+        {
             return;
         }
         let Some(runtime) = self.runtime.clone() else {
+            self.pending_project_deletion_ids.remove(&project_key);
             return;
         };
-        self.agent_action_pending = true;
+        // The sidebar drops the project (and its sessions) in the same
+        // transaction that schedules the authoritative deletion, so the row
+        // disappears immediately instead of waiting for the database commit
+        // plus the overview reload.
+        self.optimistically_remove_project(project_id.as_str());
         let generation = self.session_generation;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             runtime.workspace().delete_project(&project_id)
         });
-        self.finish_session_mutation(generation, runner, cx);
+        self.finish_project_deletion(generation, project_key, runner, cx);
+    }
+
+    fn finish_project_deletion(
+        &mut self,
+        generation: u64,
+        project_key: String,
+        runner: Task<Result<Result<(), vibex_core::VibexError>, tokio::task::JoinError>>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.pending_project_deletion_ids.remove(&project_key);
+                    let active = this.session_generation == generation;
+                    let should_reconcile = this.pending_project_deletion_ids.is_empty();
+                    if should_reconcile {
+                        // The cascade also removed the project's sessions
+                        // server-side, so the authoritative overview is the
+                        // reconciliation point for both optimistic sets. A
+                        // failed deletion restores every removed row here.
+                        this.optimistic_project_deletion_reconciliation_pending = true;
+                        this.optimistic_session_deletion_reconciliation_pending = true;
+                        this.load_agent_overview(cx);
+                        this.refresh_workspace_contexts(cx);
+                    }
+                    match outcome {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) if active => {
+                            this.agent_error = Some(format!("{}: {}", error.code, error.message));
+                        }
+                        Err(error) if active => {
+                            this.agent_error = Some(format!("project deletion failed: {error}"));
+                        }
+                        Ok(Err(_)) | Err(_) => {}
+                    }
+                    cx.notify();
+                });
+            },
+        )
+        .detach();
+    }
+
+    fn optimistically_remove_project(&mut self, project_id: &str) {
+        self.agent_overview_generation = self.agent_overview_generation.wrapping_add(1);
+        self.optimistically_removed_project_ids
+            .insert(project_id.to_string());
+        let workspace_ids = self
+            .workspaces
+            .iter()
+            .filter(|(project, _)| project.id.as_str() == project_id)
+            .map(|(_, workspace)| workspace.id.clone())
+            .collect::<Vec<_>>();
+        let removed_session_ids = self
+            .sessions
+            .iter()
+            .filter(|session| session.project_id.as_str() == project_id)
+            .map(|session| session.id.as_str().to_string())
+            .collect::<BTreeSet<_>>();
+        self.workspaces
+            .retain(|(project, _)| project.id.as_str() != project_id);
+        if !removed_session_ids.is_empty() {
+            self.optimistically_remove_sessions(&removed_session_ids);
+        }
+        for workspace_id in &workspace_ids {
+            self.workspace_contexts.remove(workspace_id.as_str());
+            self.ui_state
+                .sidebar
+                .collapsed_workspace_ids
+                .remove(workspace_id.as_str());
+            self.ui_state
+                .sidebar
+                .worktree_titles
+                .remove(workspace_id.as_str());
+            if self.ui_state.workbench.selected_workspace_id.as_deref()
+                == Some(workspace_id.as_str())
+            {
+                self.ui_state.workbench.selected_workspace_id = None;
+            }
+        }
+        let folder_ids = self
+            .ui_state
+            .sidebar
+            .organization
+            .folders
+            .iter()
+            .filter(|(_, folder)| folder.project_id.as_deref() == Some(project_id))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for folder_id in folder_ids {
+            self.ui_state.sidebar.organization.delete_folder(&folder_id);
+        }
+        self.ui_state.sidebar.project_appearances.remove(project_id);
+        self.ui_state
+            .sidebar
+            .project_location_preferences
+            .remove(project_id);
+        self.auto_continue_default_project_ids.remove(project_id);
+        if self.sidebar_project_appearance_popover.as_deref() == Some(project_id) {
+            self.sidebar_project_appearance_popover = None;
+        }
+        self.reconcile_sidebar_state();
+        self.queue_agent_ui_state();
+        self.publish_sidebar_invalidation();
     }
 
     fn finish_optimistic_session_deletion(
@@ -20018,36 +20191,6 @@ impl VibexWorkbench {
             },
         )
         .detach();
-    }
-
-    fn finish_session_mutation(
-        &mut self,
-        generation: u64,
-        runner: Task<Result<Result<(), vibex_core::VibexError>, tokio::task::JoinError>>,
-        cx: &mut Context<Self>,
-    ) {
-        self.agent_action_task = Some(cx.spawn(
-            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let outcome = runner.await;
-                let _ = entity.update(cx, |this, cx| {
-                    this.agent_action_pending = false;
-                    let active = this.session_generation == generation;
-                    match outcome {
-                        Ok(Ok(())) => {
-                            this.load_agent_overview(cx);
-                        }
-                        Ok(Err(error)) if active => {
-                            this.agent_error = Some(format!("{}: {}", error.code, error.message));
-                        }
-                        Err(error) if active => {
-                            this.agent_error = Some(format!("session mutation failed: {error}"));
-                        }
-                        Ok(Err(_)) | Err(_) => {}
-                    }
-                    cx.notify();
-                });
-            },
-        ));
     }
 
     fn conversation_find_matches(&self, cx: &App) -> Vec<SessionSearchTarget> {
@@ -37727,44 +37870,40 @@ impl VibexWorkbench {
                     "启用此 Agent 后即可开始使用",
                     "啟用此 Agent 後即可開始使用",
                 );
-                let cascade = Button::new("composer-runtime-initialize")
-                    .xsmall()
-                    .ghost()
-                    .h(px(32.0))
-                    .px_2()
-                    .tooltip(enable_label)
-                    .child(
-                        h_flex()
-                            .gap_1p5()
-                            .child(
-                                Icon::new(IconName::Info)
-                                    .size(px(14.0))
-                                    .text_color(theme::semantic_color(
-                                        "warning",
-                                        cx.theme().is_dark(),
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().foreground.opacity(0.72))
-                                    .child(enable_label),
-                            ),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(selection) = this.selected_runtime_selection() {
-                            this.initialize_uninitialized_session_runtime(selection, cx);
-                        }
-                        if let Some(agent_id) = this
-                            .selected_session_id
-                            .as_ref()
-                            .and_then(|session_id| this.session_agent_id(session_id))
-                        {
-                            this.open_agent_auth_management(agent_id, cx);
-                        }
-                        cx.notify();
-                    }))
-                    .into_any_element();
+                let cascade =
+                    Button::new("composer-runtime-initialize")
+                        .xsmall()
+                        .ghost()
+                        .h(px(32.0))
+                        .px_2()
+                        .tooltip(enable_label)
+                        .child(
+                            h_flex()
+                                .gap_1p5()
+                                .child(Icon::new(IconName::Info).size(px(14.0)).text_color(
+                                    theme::semantic_color("warning", cx.theme().is_dark()),
+                                ))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().foreground.opacity(0.72))
+                                        .child(enable_label),
+                                ),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(selection) = this.selected_runtime_selection() {
+                                this.initialize_uninitialized_session_runtime(selection, cx);
+                            }
+                            if let Some(agent_id) = this
+                                .selected_session_id
+                                .as_ref()
+                                .and_then(|session_id| this.session_agent_id(session_id))
+                            {
+                                this.open_agent_auth_management(agent_id, cx);
+                            }
+                            cx.notify();
+                        }))
+                        .into_any_element();
                 (cascade, Vec::new())
             } else {
                 (Empty.into_any_element(), Vec::new())
@@ -40573,11 +40712,7 @@ fn render_reasoning_first_line_layout(
         );
     }
 
-    h_flex()
-        .w_full()
-        .min_w_0()
-        .items_stretch()
-        .child(content)
+    h_flex().w_full().min_w_0().items_stretch().child(content)
 }
 
 fn render_agent_thinking_indicator(
@@ -52303,7 +52438,7 @@ mod tests {
 
         let completion = source
             .split_once("    fn finish_optimistic_session_deletion(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn finish_session_mutation("))
+            .and_then(|(_, tail)| tail.split_once("\n    fn conversation_find_matches("))
             .map(|(body, _)| body)
             .expect("optimistic deletion completion should remain inspectable");
         assert!(completion.contains(".detach();"));
@@ -52417,18 +52552,11 @@ mod tests {
     #[test]
     fn session_mutation_completions_release_the_action_lock_before_generation_fencing() {
         let source = include_str!("app.rs");
-        let mutation_completions = [
-            (
-                "    fn rename_session(",
-                "\n    fn confirm_delete_session(",
-                "session rename",
-            ),
-            (
-                "    fn finish_session_mutation(",
-                "\n    fn open_session_search(",
-                "session mutation",
-            ),
-        ];
+        let mutation_completions = [(
+            "    fn rename_session(",
+            "\n    fn confirm_delete_session(",
+            "session rename",
+        )];
 
         for (start, end, label) in mutation_completions {
             let completion = source
@@ -60771,10 +60899,7 @@ mod tests {
                     .w_full()
                     .min_w_0()
                     .on_prepaint(move |bounds, _, _| {
-                        measured.set((
-                            f32::from(bounds.size.width),
-                            f32::from(bounds.size.height),
-                        ));
+                        measured.set((f32::from(bounds.size.width), f32::from(bounds.size.height)));
                     })
                     .child(render_reasoning_first_line_layout(
                         gpui::hsla(0.0, 0.0, 0.6, 1.0),
