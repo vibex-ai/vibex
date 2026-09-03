@@ -20,7 +20,6 @@ use gpui_component::{
     popover::Popover,
     scroll::ScrollableElement as _,
     spinner::Spinner,
-    switch::Switch,
     v_flex,
 };
 use vibex_core::{
@@ -57,7 +56,6 @@ enum FolderSelection {
 struct ImportText {
     search: &'static str,
     scanning: &'static str,
-    scanning_hint: &'static str,
     empty: &'static str,
     empty_hint: &'static str,
     no_matches: &'static str,
@@ -66,11 +64,9 @@ struct ImportText {
     retry: &'static str,
     rescan: &'static str,
     all_agents: &'static str,
-    only_importable: &'static str,
     select_all: &'static str,
     expand_all: &'static str,
     collapse_all: &'static str,
-    selected: &'static str,
     projects: &'static str,
     imported_count: &'static str,
     imported: &'static str,
@@ -81,6 +77,7 @@ struct ImportText {
     continue_import: &'static str,
     close: &'static str,
     import_button: &'static str,
+    sessions: &'static str,
     agent_filter: &'static str,
     messages: &'static str,
     importing: &'static str,
@@ -93,7 +90,6 @@ fn text(locale: ResolvedLocale) -> ImportText {
         ResolvedLocale::En => ImportText {
             search: "Search sessions or project directories",
             scanning: "Scanning local Agent sessions...",
-            scanning_hint: "Walking each local session store. Large histories may take a moment.",
             empty: "No local sessions found",
             empty_hint: "Run an Agent session first, then scan again.",
             no_matches: "No sessions match the current filters",
@@ -102,11 +98,9 @@ fn text(locale: ResolvedLocale) -> ImportText {
             retry: "Retry",
             rescan: "Rescan",
             all_agents: "All Agents",
-            only_importable: "Only importable",
             select_all: "Select all",
             expand_all: "Expand all",
             collapse_all: "Collapse all",
-            selected: "selected",
             projects: "projects",
             imported_count: "sessions imported",
             imported: "Imported",
@@ -117,6 +111,7 @@ fn text(locale: ResolvedLocale) -> ImportText {
             continue_import: "Continue importing",
             close: "Close",
             import_button: "Import",
+            sessions: "sessions",
             agent_filter: "Agents",
             messages: "messages",
             importing: "Importing...",
@@ -126,7 +121,6 @@ fn text(locale: ResolvedLocale) -> ImportText {
         ResolvedLocale::ZhCn => ImportText {
             search: "搜索会话或项目目录",
             scanning: "正在扫描本地 Agent 会话...",
-            scanning_hint: "正在遍历各 Agent 的本地会话存储，大型历史记录可能需要一些时间。",
             empty: "未找到本地会话",
             empty_hint: "先运行一次 Agent 会话，然后重新扫描。",
             no_matches: "没有匹配当前筛选条件的会话",
@@ -135,11 +129,9 @@ fn text(locale: ResolvedLocale) -> ImportText {
             retry: "重试",
             rescan: "重新扫描",
             all_agents: "全部 Agent",
-            only_importable: "仅显示可导入",
             select_all: "全选",
             expand_all: "全部展开",
             collapse_all: "全部折叠",
-            selected: "已选",
             projects: "个项目",
             imported_count: "个会话已导入",
             imported: "已导入",
@@ -150,6 +142,7 @@ fn text(locale: ResolvedLocale) -> ImportText {
             continue_import: "继续导入",
             close: "关闭",
             import_button: "导入",
+            sessions: "个会话",
             agent_filter: "个 Agent",
             messages: "条消息",
             importing: "正在导入...",
@@ -159,7 +152,6 @@ fn text(locale: ResolvedLocale) -> ImportText {
         ResolvedLocale::ZhTw => ImportText {
             search: "搜尋會話或專案目錄",
             scanning: "正在掃描本機 Agent 會話...",
-            scanning_hint: "正在遍歷各 Agent 的本機會話儲存，大型歷史記錄可能需要一些時間。",
             empty: "找不到本機會話",
             empty_hint: "先執行一次 Agent 會話，然後重新掃描。",
             no_matches: "沒有符合目前篩選條件的會話",
@@ -168,11 +160,9 @@ fn text(locale: ResolvedLocale) -> ImportText {
             retry: "重試",
             rescan: "重新掃描",
             all_agents: "全部 Agent",
-            only_importable: "僅顯示可匯入",
             select_all: "全選",
             expand_all: "全部展開",
             collapse_all: "全部摺疊",
-            selected: "已選",
             projects: "個專案",
             imported_count: "個會話已匯入",
             imported: "已匯入",
@@ -183,6 +173,7 @@ fn text(locale: ResolvedLocale) -> ImportText {
             continue_import: "繼續匯入",
             close: "關閉",
             import_button: "匯入",
+            sessions: "個會話",
             agent_filter: "個 Agent",
             messages: "則訊息",
             importing: "正在匯入...",
@@ -202,8 +193,10 @@ pub struct LocalHistoryImportDialog {
     scan: Option<LocalHistoryScanResult>,
     selected: HashSet<LocalHistorySelection>,
     collapsed: HashSet<String>,
-    source_filter: HashSet<LocalHistorySource>,
-    only_importable: bool,
+    /// Agent filter. `None` means unfiltered ("All Agents"); a `Some` set is
+    /// the explicit selection and may be empty, which shows no sessions — so
+    /// every agent can be unchecked instead of snapping back to "all".
+    source_filter: Option<HashSet<LocalHistorySource>>,
     phase: ImportPhase,
     scan_error: Option<String>,
     import_error: Option<String>,
@@ -236,8 +229,7 @@ impl LocalHistoryImportDialog {
             scan: None,
             selected: HashSet::new(),
             collapsed: HashSet::new(),
-            source_filter: HashSet::new(),
-            only_importable: false,
+            source_filter: None,
             phase: ImportPhase::Scanning,
             scan_error: None,
             import_error: None,
@@ -277,7 +269,7 @@ impl LocalHistoryImportDialog {
         self.scan = None;
         self.selected.clear();
         self.collapsed.clear();
-        self.source_filter.clear();
+        self.source_filter = None;
         let focus_workspace = self.focus_workspace.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             runtime.agent().manager().scan_local_history().await
@@ -330,6 +322,9 @@ impl LocalHistoryImportDialog {
         cx.notify();
     }
 
+    /// Folders with only importable (scanned as new) sessions. Sessions that
+    /// were already imported or have disappeared on disk are never shown — the
+    /// picker is an import worklist, not a history browser.
     fn visible_folders(
         &self,
         cx: &App,
@@ -343,12 +338,11 @@ impl LocalHistoryImportDialog {
             let mut sessions = folder
                 .sessions
                 .iter()
+                .filter(|session| session.status == LocalHistoryImportStatus::New)
                 .filter(|session| {
-                    self.source_filter.is_empty()
-                        || self.source_filter.contains(&session.summary.key.source)
-                })
-                .filter(|session| {
-                    !self.only_importable || session.status == LocalHistoryImportStatus::New
+                    self.source_filter
+                        .as_ref()
+                        .is_none_or(|filter| filter.contains(&session.summary.key.source))
                 })
                 .filter(|session| {
                     query.is_empty()
@@ -442,28 +436,42 @@ impl LocalHistoryImportDialog {
     }
 
     fn filtered_sources(&self) -> Vec<LocalHistorySource> {
-        if self.source_filter.is_empty() {
-            return self.present_sources();
+        match self.source_filter.as_ref() {
+            None => self.present_sources(),
+            Some(filter) => self
+                .present_sources()
+                .into_iter()
+                .filter(|source| filter.contains(source))
+                .collect(),
         }
-        self.present_sources()
-            .into_iter()
-            .filter(|source| self.source_filter.contains(source))
-            .collect()
     }
 
+    /// Toggle one agent in the filter. `None` expands to the full set on the
+    /// first interaction, so individual agents can be unchecked one by one —
+    /// including the last one, which leaves an empty selection (no sessions
+    /// match) instead of snapping back to "all agents".
     fn toggle_source(&mut self, source: LocalHistorySource, cx: &mut Context<Self>) {
         if self.phase != ImportPhase::Ready {
             return;
         }
-        if self.source_filter.is_empty() {
-            self.source_filter = self.present_sources().into_iter().collect();
+        if self.source_filter.is_none() {
+            self.source_filter = Some(self.present_sources().into_iter().collect());
         }
-        if !self.source_filter.remove(&source) {
-            self.source_filter.insert(source);
+        let Some(filter) = self.source_filter.as_mut() else {
+            unreachable!("source_filter was just initialized above");
+        };
+        if !filter.remove(&source) {
+            filter.insert(source);
         }
-        if self.source_filter.len() == self.present_sources().len() {
-            self.source_filter.clear();
+        cx.notify();
+    }
+
+    /// Select every agent in one go: back to the unfiltered "All Agents" state.
+    fn select_all_sources(&mut self, cx: &mut Context<Self>) {
+        if self.phase != ImportPhase::Ready {
+            return;
         }
+        self.source_filter = None;
         cx.notify();
     }
 
@@ -848,7 +856,7 @@ impl LocalHistoryImportDialog {
     ) -> impl IntoElement {
         let strings = text(self.locale());
         let filtered_sources = self.filtered_sources();
-        let filter_active = !self.source_filter.is_empty();
+        let filter_active = self.source_filter.is_some();
         let trigger_label = if !filter_active {
             strings.all_agents.to_string()
         } else {
@@ -882,7 +890,7 @@ impl LocalHistoryImportDialog {
                 !filter_active,
                 false,
                 false,
-                |this, cx| this.clear_source_filter(cx),
+                |this, cx| this.select_all_sources(cx),
                 cx,
             ))
             .child(
@@ -900,12 +908,15 @@ impl LocalHistoryImportDialog {
                         .text_color(cx.theme().primary),
                 )
             })
-            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.clear_source_filter(cx)));
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.select_all_sources(cx)));
         let source_rows = present_sources
             .iter()
             .copied()
             .map(|source| {
-                let checked = !filter_active || self.source_filter.contains(&source);
+                let checked = self
+                    .source_filter
+                    .as_ref()
+                    .is_none_or(|filter| filter.contains(&source));
                 let source_key = source.key().to_string();
                 h_flex()
                     .id(SharedString::from(format!(
@@ -983,6 +994,10 @@ impl LocalHistoryImportDialog {
         } else {
             cx.theme().muted.opacity(0.12)
         };
+        let all_collapsed = !folders.is_empty()
+            && folders
+                .iter()
+                .all(|(folder, _)| self.collapsed.contains(&folder.workspace_root));
         let mut row = h_flex()
             .id("local-history-master-row")
             .w_full()
@@ -1025,6 +1040,27 @@ impl LocalHistoryImportDialog {
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(self.project_totals_summary()),
+            )
+            .child(
+                Button::new("local-history-collapse-all")
+                    .ghost()
+                    .small()
+                    .icon(IconName::ChevronsUpDown)
+                    .tooltip(if all_collapsed {
+                        strings.expand_all
+                    } else {
+                        strings.collapse_all
+                    })
+                    .disabled(pending || folders.is_empty())
+                    .on_click(cx.listener({
+                        let folders = folders.to_vec();
+                        move |this, _: &ClickEvent, _, cx| {
+                            // The whole row toggles select-all on click; keep
+                            // the expand/collapse button from bubbling into it.
+                            cx.stop_propagation();
+                            this.toggle_collapse_all(&folders, cx)
+                        }
+                    })),
             );
         if interactive {
             row = row
@@ -1033,14 +1069,6 @@ impl LocalHistoryImportDialog {
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_all_visible(cx)));
         }
         row.into_any_element()
-    }
-
-    fn clear_source_filter(&mut self, cx: &mut Context<Self>) {
-        if self.phase != ImportPhase::Ready {
-            return;
-        }
-        self.source_filter.clear();
-        cx.notify();
     }
 
     /// Total projects and already-imported sessions across the whole scan,
@@ -1067,45 +1095,31 @@ impl LocalHistoryImportDialog {
 
     /// Action bar rendered in the dialog's fixed footer slot, outside the
     /// scrollable body, so the Import button is always reachable.
-    pub fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    pub fn render_footer(&self, _cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let strings = text(self.locale());
         let pending = self.phase == ImportPhase::Importing;
         let selected_count = self.selected.len();
-        h_flex()
-            .w_full()
-            .items_center()
-            .gap_2()
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_xs()
-                    .text_color(if selected_count > 0 {
-                        cx.theme().foreground
-                    } else {
-                        cx.theme().muted_foreground
-                    })
-                    .child(format!("{} {}", selected_count, strings.selected)),
-            )
-            .child(
-                Button::new("local-history-import")
-                    .primary()
-                    .small()
-                    .loading(pending)
-                    .label(if pending {
-                        strings.importing
-                    } else {
-                        strings.import_button
-                    })
-                    .disabled(pending || selected_count == 0 || self.phase != ImportPhase::Ready)
-                    .on_click({
-                        let this = self.weak_self.clone();
-                        move |_, _, cx| {
-                            let _ = this.update(cx, |dialog, cx| dialog.import_selected(cx));
-                        }
-                    }),
-            )
+        h_flex().w_full().items_center().justify_end().child(
+            Button::new("local-history-import")
+                .primary()
+                .small()
+                .loading(pending)
+                .label(if pending {
+                    strings.importing.to_string()
+                } else {
+                    format!(
+                        "{} {} {}",
+                        strings.import_button, selected_count, strings.sessions
+                    )
+                })
+                .disabled(pending || selected_count == 0 || self.phase != ImportPhase::Ready)
+                .on_click({
+                    let this = self.weak_self.clone();
+                    move |_, _, cx| {
+                        let _ = this.update(cx, |dialog, cx| dialog.import_selected(cx));
+                    }
+                }),
+        )
     }
 }
 
@@ -1122,15 +1136,7 @@ impl Render for LocalHistoryImportDialog {
                     .gap_3()
                     .p_8()
                     .child(Spinner::new())
-                    .child(div().text_sm().font_medium().child(strings.scanning))
-                    .child(
-                        div()
-                            .max_w(px(360.0))
-                            .text_center()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(strings.scanning_hint),
-                    );
+                    .child(div().text_sm().font_medium().child(strings.scanning));
             }
             ImportPhase::Error => {
                 return v_flex()
@@ -1244,10 +1250,6 @@ impl Render for LocalHistoryImportDialog {
 
         let pending = self.phase == ImportPhase::Importing;
         let folders = self.visible_folders(cx);
-        let all_collapsed = !folders.is_empty()
-            && folders
-                .iter()
-                .all(|(folder, _)| self.collapsed.contains(&folder.workspace_root));
         let present_sources = present_sources(self.scan.as_ref());
         let list = if folders.is_empty() {
             let empty = self
@@ -1324,40 +1326,6 @@ impl Render for LocalHistoryImportDialog {
                     .when(present_sources.len() > 1, |view| {
                         view.child(self.render_agent_filter(&present_sources, pending, cx))
                     })
-                    .child(
-                        Switch::new("local-history-only-importable")
-                            .small()
-                            .checked(self.only_importable)
-                            .on_click(cx.listener(|this, checked, _, cx| {
-                                this.only_importable = *checked;
-                                cx.notify();
-                            }))
-                            .tooltip(strings.only_importable),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(strings.only_importable),
-                    )
-                    .child(
-                        Button::new("local-history-collapse-all")
-                            .ghost()
-                            .small()
-                            .icon(IconName::ChevronsUpDown)
-                            .tooltip(if all_collapsed {
-                                strings.expand_all
-                            } else {
-                                strings.collapse_all
-                            })
-                            .disabled(pending || folders.is_empty())
-                            .on_click(cx.listener({
-                                let folders = folders.clone();
-                                move |this, _: &ClickEvent, _, cx| {
-                                    this.toggle_collapse_all(&folders, cx)
-                                }
-                            })),
-                    )
                     .child(
                         Button::new("local-history-rescan")
                             .ghost()

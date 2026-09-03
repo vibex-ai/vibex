@@ -16088,7 +16088,19 @@ impl VibexWorkbench {
                 .border_color(popover_foreground.opacity(0.10))
                 .overlay(true)
                 .overlay_closable(true)
-                .content(move |content, _, _| content.child(content_view.clone()))
+                .content(move |content, _, _| {
+                    // `min_h_0` + `overflow_hidden` are load-bearing: the dialog
+                    // content column is a `flex_1` item without a minimum, so
+                    // taffy would otherwise grow it to its min-content height
+                    // (the full session list), clip the overflow inside the
+                    // dialog, and leave the bottom rows unreachable even with
+                    // the list's own scrollbar bottomed out.
+                    content
+                        .min_h_0()
+                        .overflow_hidden()
+                        .pt(px(4.0))
+                        .child(content_view.clone())
+                })
                 .footer(footer)
         });
         cx.notify();
