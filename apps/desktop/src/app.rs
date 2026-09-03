@@ -26241,7 +26241,8 @@ impl VibexWorkbench {
                                     .when(
                                         state_label.is_none()
                                             && !has_unread_completion
-                                            && !session_has_error,
+                                            && !session_has_error
+                                            && !auto_continue_paused,
                                         |this| this.child(time_label),
                                     )
                                 },
@@ -54240,7 +54241,7 @@ mod tests {
         assert!(!sidebar_session.contains(".child(strings.sidebar_state_error)"));
         assert!(sidebar_session.contains("&& !session_has_error\n                                    && display_state != AgentSessionState::Idle"));
         assert!(sidebar_session.contains(
-            "&& !session_has_error,\n                                        |this| this.child(time_label)"
+            "&& !session_has_error\n                                            && !auto_continue_paused,\n                                        |this| this.child(time_label)"
         ));
         assert!(sidebar_session.contains(
             ".when(session_has_error, |this| {\n                                this.child(sidebar_status_dot(cx.theme().danger))"
@@ -54251,7 +54252,7 @@ mod tests {
         assert!(sidebar_session.contains("sidebar-session-actions-{session_id_string}"));
         assert!(sidebar_session.contains(".group_hover(&hover_group, |style| style.visible())"));
         assert!(sidebar_session.contains(
-            "state_label.is_none()\n                                            && !has_unread_completion\n                                            && !session_has_error"
+            "state_label.is_none()\n                                            && !has_unread_completion\n                                            && !session_has_error\n                                            && !auto_continue_paused"
         ));
     }
 
