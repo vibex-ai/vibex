@@ -2850,6 +2850,21 @@ fn refresh_conversation_turns_cache_incrementally(
     true
 }
 
+/// Keep the virtual-list renderer pointed at the current projection without
+/// keeping an `Rc` alias alive while a streaming turn is mutated. The alias is
+/// detached for the duration of the append so `Rc::make_mut` can update the
+/// active turn in place instead of cloning its growing body.
+fn with_detached_conversation_turns_render_cache<T>(
+    cache: &mut Rc<Vec<Rc<TimelineConversationTurn>>>,
+    render_cache: &Rc<RefCell<Rc<Vec<Rc<TimelineConversationTurn>>>>>,
+    update: impl FnOnce(&mut Rc<Vec<Rc<TimelineConversationTurn>>>) -> T,
+) -> T {
+    *render_cache.borrow_mut() = Rc::new(Vec::new());
+    let result = update(cache);
+    *render_cache.borrow_mut() = cache.clone();
+    result
+}
+
 struct AgentStreamingDeltaUpdate {
     item_id: String,
     sequence: i64,
@@ -4637,6 +4652,7 @@ pub struct VibexWorkbench {
     timeline_file_diff_scrolls: BTreeMap<String, gpui::ScrollHandle>,
     timeline_turn_file_changes: BTreeMap<String, (i64, Rc<TurnFileChangesSummary>)>,
     conversation_turns_cache: Rc<Vec<Rc<TimelineConversationTurn>>>,
+    conversation_turns_render_cache: Rc<RefCell<Rc<Vec<Rc<TimelineConversationTurn>>>>>,
     conversation_turns_cache_key: Option<ConversationTurnsCacheKey>,
     conversation_turns_summary: ConversationTurnsSummary,
     streaming_row_state: Option<StreamingRowStateCache>,
@@ -5392,6 +5408,7 @@ impl VibexWorkbench {
             timeline_file_diff_scrolls: BTreeMap::new(),
             timeline_turn_file_changes: BTreeMap::new(),
             conversation_turns_cache: Rc::new(Vec::new()),
+            conversation_turns_render_cache: Rc::new(RefCell::new(Rc::new(Vec::new()))),
             conversation_turns_cache_key: None,
             conversation_turns_summary: ConversationTurnsSummary::default(),
             streaming_row_state: None,
@@ -9604,6 +9621,7 @@ impl VibexWorkbench {
         {
             return;
         }
+        *self.conversation_turns_render_cache.borrow_mut() = Rc::new(Vec::new());
         let mut entry = AgentSessionViewCacheEntry {
             estimated_resident_bytes: 0,
             timeline: std::mem::take(&mut self.timeline),
@@ -9740,6 +9758,7 @@ impl VibexWorkbench {
         self.conversation_turns_cache_key = entry.conversation_turns_cache_key;
         self.conversation_turns_summary = entry.conversation_turns_summary;
         self.streaming_row_state = entry.streaming_row_state;
+        self.sync_conversation_turns_render_cache();
         self.collapsed_timeline_rows = entry.collapsed_timeline_rows;
         self.reasoning_expansion = entry.reasoning_expansion;
         self.timeline_process_expansion = entry.timeline_process_expansion;
@@ -10424,6 +10443,10 @@ impl VibexWorkbench {
         }
     }
 
+    fn sync_conversation_turns_render_cache(&self) {
+        *self.conversation_turns_render_cache.borrow_mut() = self.conversation_turns_cache.clone();
+    }
+
     fn conversation_turns_cached(&mut self) -> Rc<Vec<Rc<TimelineConversationTurn>>> {
         let key = self.current_conversation_turns_cache_key();
         if self.conversation_turns_cache_key.as_ref() != Some(&key) {
@@ -10445,6 +10468,7 @@ impl VibexWorkbench {
             let turns = self.conversation_turns_cache.as_slice();
             self.conversation_turns_summary = ConversationTurnsSummary::from_turns(turns);
             self.conversation_turns_cache_key = Some(key);
+            self.sync_conversation_turns_render_cache();
         }
         self.conversation_turns_cache.clone()
     }
@@ -11451,10 +11475,16 @@ impl VibexWorkbench {
                 self.invalidate_timeline_render_caches();
             } else if !self.timeline.needs_authoritative_refetch
                 && let Some(updates) = streaming_updates.as_deref()
-                && let Some(update) = append_agent_streaming_deltas_to_cache(
+                && let Some(update) = with_detached_conversation_turns_render_cache(
                     &mut self.conversation_turns_cache,
-                    &mut self.streaming_row_state,
-                    updates,
+                    &self.conversation_turns_render_cache,
+                    |cache| {
+                        append_agent_streaming_deltas_to_cache(
+                            cache,
+                            &mut self.streaming_row_state,
+                            updates,
+                        )
+                    },
                 )
             {
                 self.conversation_turns_cache_key =
@@ -11464,12 +11494,18 @@ impl VibexWorkbench {
                 streaming_cache_update = Some(update);
             } else if !self.timeline.needs_authoritative_refetch
                 && let Some(updates) = reasoning_updates.as_deref()
-                && let Some(update) = append_agent_reasoning_deltas_to_cache(
+                && let Some(update) = with_detached_conversation_turns_render_cache(
                     &mut self.conversation_turns_cache,
-                    &mut self.streaming_row_state,
-                    self.ui_state.session.reasoning_display_mode,
-                    previous_end_sequence,
-                    updates,
+                    &self.conversation_turns_render_cache,
+                    |cache| {
+                        append_agent_reasoning_deltas_to_cache(
+                            cache,
+                            &mut self.streaming_row_state,
+                            self.ui_state.session.reasoning_display_mode,
+                            previous_end_sequence,
+                            updates,
+                        )
+                    },
                 )
             {
                 self.conversation_turns_cache_key =
@@ -11906,6 +11942,7 @@ impl VibexWorkbench {
         self.conversation_turns_cache_key = None;
         self.conversation_turns_summary = ConversationTurnsSummary::default();
         self.streaming_row_state = None;
+        self.sync_conversation_turns_render_cache();
     }
 
     fn invalidate_timeline_turn_measurement(&mut self, turn_id: &str) {
@@ -29963,7 +30000,7 @@ impl VibexWorkbench {
         }
         let turns_summary = self.conversation_turns_summary;
         self.sync_timeline_duration_tick(turns_summary.has_incomplete_turn, cx);
-        let rendered_turns = turns.clone();
+        let rendered_turns = self.conversation_turns_render_cache.clone();
         let row_sizes = self.timeline_row_sizes.clone();
         let rendered_row_sizes = row_sizes.clone();
         let strings = self.strings();
@@ -30052,6 +30089,7 @@ impl VibexWorkbench {
                                 "agent-timeline-turns",
                                 row_sizes,
                                 move |this, visible_range, window, cx| {
+                                    let rendered_turns = rendered_turns.borrow().clone();
                                     let turn_count = rendered_turns.len();
                                     visible_range
                                         .filter_map(|index| {
@@ -49852,6 +49890,8 @@ mod tests {
                 .map(Rc::new)
                 .collect(),
             );
+            let render_cache = Rc::new(RefCell::new(cache.clone()));
+            let active_turn_ptr = Rc::as_ptr(cache.last().expect("reasoning turn is cached"));
 
             let next = timeline_item_with_payload(
                 &session_id,
@@ -49872,14 +49912,29 @@ mod tests {
                 .expect("a trailing thought chunk is an append-only reasoning delta");
 
             let mut state_cache = None;
-            let update = append_agent_reasoning_deltas_to_cache(
-                &mut cache,
-                &mut state_cache,
-                mode,
-                Some(2),
-                &updates,
-            )
-            .expect("the streaming reasoning tail can be extended in place");
+            let update =
+                with_detached_conversation_turns_render_cache(&mut cache, &render_cache, |cache| {
+                    append_agent_reasoning_deltas_to_cache(
+                        cache,
+                        &mut state_cache,
+                        mode,
+                        Some(2),
+                        &updates,
+                    )
+                })
+                .expect("the streaming reasoning tail can be extended in place");
+            assert_eq!(
+                active_turn_ptr,
+                Rc::as_ptr(cache.last().expect("appended turn stays cached")),
+                "streaming append must reuse the active turn allocation"
+            );
+            assert!(Rc::ptr_eq(
+                &render_cache
+                    .borrow()
+                    .last()
+                    .expect("render cache stays synchronized"),
+                cache.last().expect("appended turn stays cached")
+            ));
 
             items.push(next);
             let expected: Vec<Rc<TimelineConversationTurn>> =
