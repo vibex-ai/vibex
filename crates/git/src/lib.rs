@@ -115,8 +115,14 @@ pub fn status(
     let detached = branch.is_none();
     let short_commit = run_git_optional(&root, &["rev-parse", "--short", "HEAD"])?
         .map(|value| value.trim().to_string());
-    let porcelain = run_git(&root, &["status", "--porcelain=v1"])?;
-    let changes = enrich_status_changes(&root, parse_porcelain(&porcelain))?;
+    let porcelain = run_git(
+        &root,
+        // `-z` is load-bearing: the line-based porcelain format C-quotes any
+        // path containing spaces or non-ASCII bytes, which would leave the
+        // parsed paths unusable as git pathspecs for staging and committing.
+        &["status", "--porcelain=v1", "-z"],
+    )?;
+    let changes = enrich_status_changes(&root, parse_porcelain(&root, &porcelain))?;
     let staged_count = changes.iter().filter(|change| change.staged).count() as u32;
     let unstaged_count = changes.iter().filter(|change| change.unstaged).count() as u32;
     let untracked_count = changes
@@ -1488,18 +1494,24 @@ pub fn commit(
     }
     if !paths.is_empty() {
         let status_before = status(workspace_id.clone(), &root)?;
-        let selected_untracked = paths
+        // Selected paths can reference work-tree changes git would not include
+        // in a plain commit: untracked files (and untracked directories
+        // reported with a trailing slash) must be staged first, otherwise the
+        // pathspec-based commit fails. Staging here makes the intent explicit:
+        // checking a file in the workbench panel means "add it and commit it".
+        let untracked_paths = status_before
+            .changes
             .iter()
-            .filter(|path| {
-                status_before
-                    .changes
-                    .iter()
-                    .any(|change| change.path == **path && change.kind == GitChangeKind::Untracked)
-            })
+            .filter(|change| change.kind == GitChangeKind::Untracked)
+            .map(|change| normalize_repo_path(&change.path))
+            .collect::<std::collections::HashSet<_>>();
+        let stageable = paths
+            .iter()
+            .filter(|path| untracked_paths.contains(&normalize_repo_path(path)))
             .cloned()
             .collect::<Vec<_>>();
-        if !selected_untracked.is_empty() {
-            run_git_paths(&root, &["add"], &selected_untracked)?;
+        if !stageable.is_empty() {
+            run_git_paths(&root, &["add"], &stageable)?;
         }
     }
     let output = commit_output(&root, message, &paths, request.amend)?;
@@ -1574,26 +1586,85 @@ fn repo_root(repo_path: &Path) -> VibexResult<PathBuf> {
     ))
 }
 
-fn parse_porcelain(porcelain: &str) -> Vec<GitChange> {
-    porcelain
-        .lines()
-        .filter(|line| line.len() >= 3)
-        .map(|line| {
-            let bytes = line.as_bytes();
-            let x = bytes[0] as char;
-            let y = bytes[1] as char;
-            let raw_path = line[3..].to_string();
-            let (path, original_path) = parse_porcelain_path(raw_path);
-            let kind = change_kind(x, y);
-            GitChange {
-                path,
-                original_path,
-                kind,
-                staged: x != ' ' && x != '?',
-                unstaged: y != ' ' || x == '?',
-                additions: 0,
-                deletions: 0,
-            }
+fn parse_porcelain(root: &Path, porcelain: &str) -> Vec<GitChange> {
+    // `-z` records are NUL separated as `XY <path>`; rename and copy entries
+    // are followed by a second NUL-separated field carrying the original path.
+    let mut records = porcelain.split('\0').peekable();
+    let mut changes = Vec::new();
+    while let Some(record) = records.next() {
+        if record.len() < 4 {
+            continue;
+        }
+        let bytes = record.as_bytes();
+        let x = bytes[0] as char;
+        let y = bytes[1] as char;
+        let path = record[3..].to_string();
+        let original_path = if x == 'R' || x == 'C' {
+            records.next().map(str::to_string)
+        } else {
+            None
+        };
+        if x == '?' && y == '?' {
+            // `git status` collapses untracked directories to `dir/`; the
+            // working tree needs one change per file so each file can be
+            // staged and committed individually.
+            changes.extend(expand_untracked_directory(root, &path));
+            continue;
+        }
+        let kind = change_kind(x, y);
+        changes.push(GitChange {
+            path,
+            original_path,
+            kind,
+            staged: x != ' ' && x != '?',
+            unstaged: y != ' ' || x == '?',
+            additions: 0,
+            deletions: 0,
+        });
+    }
+    changes
+}
+
+fn expand_untracked_directory(root: &Path, raw_path: &str) -> Vec<GitChange> {
+    let Some(directory) = raw_path.strip_suffix('/') else {
+        return vec![GitChange {
+            path: raw_path.to_string(),
+            original_path: None,
+            kind: GitChangeKind::Untracked,
+            staged: false,
+            unstaged: true,
+            additions: 0,
+            deletions: 0,
+        }];
+    };
+    // `-z` keeps every path unquoted and new-line separated even when a
+    // repository contains quoted or newline-bearing names.
+    let Ok(output) = git_command()
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "--others", "--exclude-standard", "-z", "--"])
+        .arg(directory)
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let Ok(stdout) = String::from_utf8(output.stdout) else {
+        return Vec::new();
+    };
+    stdout
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(|path| GitChange {
+            path: path.to_string(),
+            original_path: None,
+            kind: GitChangeKind::Untracked,
+            staged: false,
+            unstaged: true,
+            additions: 0,
+            deletions: 0,
         })
         .collect()
 }
@@ -1621,8 +1692,11 @@ fn status_numstat(root: &Path) -> VibexResult<HashMap<String, (u32, u32)>> {
         &run_git_owned(
             root,
             &[
+                "-c".to_string(),
+                "core.quotePath=false".to_string(),
                 "diff".to_string(),
                 "--numstat".to_string(),
+                "-z".to_string(),
                 "-M".to_string(),
             ],
         )?,
@@ -1632,9 +1706,12 @@ fn status_numstat(root: &Path) -> VibexResult<HashMap<String, (u32, u32)>> {
         &run_git_owned(
             root,
             &[
+                "-c".to_string(),
+                "core.quotePath=false".to_string(),
                 "diff".to_string(),
                 "--cached".to_string(),
                 "--numstat".to_string(),
+                "-z".to_string(),
                 "-M".to_string(),
             ],
         )?,
@@ -1643,15 +1720,27 @@ fn status_numstat(root: &Path) -> VibexResult<HashMap<String, (u32, u32)>> {
 }
 
 fn merge_status_numstat(stats: &mut HashMap<String, (u32, u32)>, output: &str) {
-    for line in output.lines() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() < 3 {
+    // `-z` records are NUL separated as `additions\tdeletions\tpath` (renames
+    // add a second NUL-separated field with the original path).
+    let mut records = output.split('\0');
+    while let Some(counts) = records.next() {
+        if counts.is_empty() {
             continue;
         }
-        let path = if parts.len() >= 4 { parts[3] } else { parts[2] };
+        let mut fields = counts.split('\t');
+        let (Some(additions), Some(deletions)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let Some(path) = fields.next() else {
+            continue;
+        };
+        // Consume the rename/copy source path so the next record starts clean.
+        if fields.next().is_none() {
+            records.next();
+        }
         let entry = stats.entry(path.to_string()).or_insert((0, 0));
-        entry.0 += parse_numstat_count(parts[0]);
-        entry.1 += parse_numstat_count(parts[1]);
+        entry.0 += parse_numstat_count(additions);
+        entry.1 += parse_numstat_count(deletions);
     }
 }
 
@@ -1670,14 +1759,6 @@ fn count_untracked_file_lines(root: &Path, path: &str) -> u32 {
         return 0;
     }
     content.lines().count() as u32
-}
-
-fn parse_porcelain_path(raw_path: String) -> (String, Option<String>) {
-    if let Some((from, to)) = raw_path.split_once(" -> ") {
-        (to.to_string(), Some(from.to_string()))
-    } else {
-        (raw_path, None)
-    }
 }
 
 fn change_kind(x: char, y: char) -> GitChangeKind {
@@ -1926,7 +2007,17 @@ fn is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> VibexResult<boo
 }
 
 fn is_untracked(root: &Path, path: &str) -> VibexResult<bool> {
-    let porcelain = run_git(root, &["status", "--porcelain=v1", "--", path])?;
+    let porcelain = run_git(
+        root,
+        &[
+            "-c",
+            "core.quotePath=false",
+            "status",
+            "--porcelain=v1",
+            "--",
+            path,
+        ],
+    )?;
     Ok(porcelain.lines().any(|line| line.starts_with("?? ")))
 }
 
@@ -2731,6 +2822,14 @@ fn validate_paths(paths: &[String]) -> VibexResult<Vec<String>> {
     Ok(paths.to_vec())
 }
 
+fn normalize_repo_path(path: &str) -> String {
+    path.trim()
+        .replace('\\', "/")
+        .trim_matches('/')
+        .trim_start_matches("./")
+        .to_string()
+}
+
 fn validate_git_path(path: &str) -> VibexResult<()> {
     if path.trim().is_empty() {
         return Err(VibexError::validation(
@@ -2913,6 +3012,106 @@ mod tests {
         let committed_files =
             run_git(&root, &["show", "--name-only", "--format=", "HEAD"]).unwrap();
         assert!(committed_files.lines().any(|line| line == "new.txt"));
+        assert!(!status(WorkspaceId::new(), &root).unwrap().dirty);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn status_reports_untracked_directory_files_without_quoting() {
+        let root = temp_repo("status-untracked-quoting");
+        std::fs::create_dir_all(&root).unwrap();
+        init_repo_with_commit(&root, "README.md", "hello\n", "initial");
+        std::fs::create_dir_all(root.join("新目录")).unwrap();
+        std::fs::write(root.join("新目录/新文件.txt"), "内容\n").unwrap();
+        std::fs::write(root.join("b c.txt"), "spaces\n").unwrap();
+
+        let summary = status(WorkspaceId::new(), &root).unwrap();
+        let paths = summary
+            .changes
+            .iter()
+            .map(|change| change.path.as_str())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"新目录/新文件.txt"));
+        assert!(paths.contains(&"b c.txt"));
+        assert!(!paths.iter().any(|path| path.contains('"')));
+        assert!(!paths.iter().any(|path| path.ends_with('/')));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn selected_untracked_directory_file_is_added_before_commit() {
+        let root = temp_repo("selected-untracked-directory");
+        std::fs::create_dir_all(&root).unwrap();
+        init_repo_with_commit(&root, "README.md", "hello\n", "initial");
+        std::fs::create_dir_all(root.join("新目录")).unwrap();
+        std::fs::write(root.join("新目录/新文件.txt"), "内容\n").unwrap();
+
+        let workspace_id = WorkspaceId::new();
+        commit(
+            workspace_id.clone(),
+            &root,
+            &GitCommitRequest {
+                workspace_id,
+                message: "add untracked directory file".to_string(),
+                paths: vec!["新目录/新文件.txt".to_string()],
+                amend: false,
+                push_after: false,
+            },
+        )
+        .unwrap();
+
+        let committed_files = run_git(
+            &root,
+            &[
+                "-c",
+                "core.quotePath=false",
+                "show",
+                "--name-only",
+                "--format=",
+                "HEAD",
+            ],
+        )
+        .unwrap();
+        assert!(
+            committed_files
+                .lines()
+                .any(|line| line == "新目录/新文件.txt")
+        );
+        assert!(!status(WorkspaceId::new(), &root).unwrap().dirty);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn selected_unstaged_and_untracked_paths_are_staged_before_commit() {
+        let root = temp_repo("selected-unstaged-commit");
+        std::fs::create_dir_all(&root).unwrap();
+        init_repo_with_commit(&root, "a.txt", "one\n", "initial");
+        std::fs::write(root.join("a.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(root.join("new.txt"), "new\n").unwrap();
+
+        let workspace_id = WorkspaceId::new();
+        commit(
+            workspace_id.clone(),
+            &root,
+            &GitCommitRequest {
+                workspace_id,
+                message: "commit unstaged and untracked".to_string(),
+                paths: vec!["a.txt".to_string(), "new.txt".to_string()],
+                amend: false,
+                push_after: false,
+            },
+        )
+        .unwrap();
+
+        let committed_files =
+            run_git(&root, &["show", "--name-only", "--format=", "HEAD"]).unwrap();
+        assert!(committed_files.lines().any(|line| line == "a.txt"));
+        assert!(committed_files.lines().any(|line| line == "new.txt"));
+        let head_a = run_git(&root, &["show", "HEAD:a.txt"]).unwrap();
+        assert_eq!(head_a, "one\ntwo\n");
         assert!(!status(WorkspaceId::new(), &root).unwrap().dirty);
 
         let _ = std::fs::remove_dir_all(root);

@@ -14497,6 +14497,51 @@ mod tests {
     }
 
     #[test]
+    fn untracked_change_rows_project_selection_states_like_tracked_rows() {
+        let workspace_id = WorkspaceId::new();
+        let changes = vec![GitChange {
+            path: "b.txt".to_string(),
+            original_path: None,
+            kind: GitChangeKind::Untracked,
+            staged: false,
+            unstaged: true,
+            additions: 1,
+            deletions: 0,
+        }];
+        let mut git = GitWorkbenchState::default();
+        git.reset_workspace(workspace_id.clone());
+        let ticket = git.begin_query(GitQueryKind::Status, "status").unwrap();
+        assert!(git.apply_status(
+            &ticket,
+            GitStatusSummary {
+                workspace_id,
+                repo_path: ".".to_string(),
+                branch: Some("main".to_string()),
+                short_commit: Some("abc123".to_string()),
+                detached: false,
+                dirty: true,
+                staged_count: 0,
+                unstaged_count: 1,
+                untracked_count: 1,
+                changes,
+                captured_at_ms: 1,
+            },
+        ));
+
+        let projection =
+            right_rail_git_projection(&git, false, false, UniformListScrollHandle::new());
+        assert_eq!(projection.selected_count, 1);
+        assert_eq!(
+            projection.selection_state("b.txt"),
+            GitPathSelectionState::Checked
+        );
+        assert!(git.select_path("b.txt", false));
+        assert_eq!(git.selected_change_paths(), Vec::<String>::new());
+        assert!(git.select_path("b.txt", true));
+        assert_eq!(git.selected_change_paths(), vec!["b.txt"]);
+    }
+
+    #[test]
     fn git_tree_selection_states_use_full_status_when_directories_are_collapsed() {
         let workspace_id = WorkspaceId::new();
         let changes = vec![
