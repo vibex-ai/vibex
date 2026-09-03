@@ -176,6 +176,8 @@ struct ForkSessionNotification;
 
 struct AmbiguousMessageSubmissionNotification;
 
+struct PersistenceNotification;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReleaseChannel {
     Preview,
@@ -1339,6 +1341,24 @@ fn render_top_centered_notification_layer(window: &Window, cx: &App) -> impl Int
         .flex()
         .justify_center()
         .child(Root::read(window, cx).notification.clone())
+}
+
+impl VibexWorkbench {
+    fn present_persistence_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(note) = self.persistence_note.take() else {
+            return;
+        };
+        window.defer(cx, move |window, cx| {
+            Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
+            window.push_notification(
+                Notification::info(locale::localize_ui_message(&note))
+                    .id::<PersistenceNotification>()
+                    .autohide(true)
+                    .on_click(|_, _, _| {}),
+                cx,
+            );
+        });
+    }
 }
 
 fn runtime_status_banner_is_visible(status: SessionRuntimeSelectionStatus) -> bool {
@@ -48369,6 +48389,7 @@ fn startup_loading_overlay(show_loading_indicator: bool, cx: &App) -> AnyElement
 
 impl Render for VibexWorkbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.present_persistence_note(window, cx);
         if self.initial_new_session_setup_pending {
             self.initial_new_session_setup_pending = false;
             let workbench = cx.weak_entity();
@@ -48568,18 +48589,6 @@ impl Render for VibexWorkbench {
                 self.ui_state.appearance.interface_font.weight as f32,
             ))
             .child(self.render_title_bar(window, cx))
-            .when_some(self.persistence_note.clone(), |this, note| {
-                this.child(
-                    div()
-                        .flex_none()
-                        .px_3()
-                        .py_1()
-                        .text_xs()
-                        .bg(cx.theme().warning.opacity(0.12))
-                        .text_color(cx.theme().warning_foreground)
-                        .child(locale::localize_ui_message(&note)),
-                )
-            })
             .child(content)
             .children(inline_composer_attachments)
             .when_some(floating_sidebar, |this, sidebar| this.child(sidebar))
@@ -55659,6 +55668,30 @@ mod tests {
         assert!(!renderer.contains("AmbiguousPromptDispatch"));
         assert!(!renderer.contains("发送结果不确定"));
         assert!(!renderer.contains("Review the Timeline before sending again"));
+    }
+
+    #[test]
+    fn persistence_notes_use_top_light_notifications_instead_of_a_page_banner() {
+        let source = include_str!("app.rs");
+        let presenter = source
+            .split_once("    fn present_persistence_note(")
+            .and_then(|(_, tail)| tail.split_once("\n    }\n}"))
+            .map(|(body, _)| body)
+            .expect("persistence note presenter should remain inspectable");
+        assert!(presenter.contains("self.persistence_note.take()"));
+        assert!(presenter.contains("Notification::info(locale::localize_ui_message(&note))"));
+        assert!(presenter.contains(".id::<PersistenceNotification>()"));
+        assert!(presenter.contains(".autohide(true)"));
+        assert!(presenter.contains(".on_click(|_, _, _| {})"));
+        assert!(presenter.contains("Anchor::TopCenter"));
+
+        let render = source
+            .split_once("impl Render for VibexWorkbench")
+            .and_then(|(_, tail)| tail.split_once("\n}\n\npub fn bind_foundation_keys"))
+            .map(|(body, _)| body)
+            .expect("workbench renderer should remain inspectable");
+        assert!(render.contains("self.present_persistence_note(window, cx);"));
+        assert!(!render.contains(".when_some(self.persistence_note.clone()"));
     }
 
     #[test]
