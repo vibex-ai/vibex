@@ -24681,7 +24681,15 @@ impl VibexWorkbench {
         let project_id = group.project.id.clone();
         let project_id_string = project_id.as_str().to_string();
         let project_name = group.project.name.clone();
-        let worktree_count = group.workspaces.len();
+        // The badge next to the project title reports the project's total
+        // session count, summed across every workspace (worktree) it owns.
+        // Per-workspace summaries ignore the active search filter, so the
+        // badge keeps reporting the real total while sessions are filtered.
+        let project_session_count = group
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.agent_summary.total)
+            .sum::<usize>();
         let Some(current_workspace) = group
             .workspaces
             .iter()
@@ -24799,7 +24807,7 @@ impl VibexWorkbench {
             project_logo_trigger,
             cx,
         );
-        let worktree_count_badge = div()
+        let project_session_count_badge = div()
             .size(px(20.0))
             .flex_none()
             .rounded_full()
@@ -24810,7 +24818,7 @@ impl VibexWorkbench {
             .font_medium()
             .bg(cx.theme().muted.opacity(0.55))
             .text_color(cx.theme().muted_foreground)
-            .child(worktree_count.to_string());
+            .child(project_session_count.to_string());
         let context_menu_hover_entity = cx.weak_entity();
         let context_menu_project_id = project_id_string.clone();
         let drag_target_project_id = project_id_string.clone();
@@ -24972,7 +24980,7 @@ impl VibexWorkbench {
                                     .font_semibold()
                                     .child(project_name.clone()),
                             )
-                            .child(worktree_count_badge),
+                            .child(project_session_count_badge),
                     ),
             )
             .when(self.sidebar_batch_mode, |this| {
@@ -52167,8 +52175,9 @@ mod tests {
             .expect("the project action button should expose a menu");
         assert!(project[row_menu..].contains("Self::build_sidebar_project_menu("));
         assert!(project[action_menu..].contains("Self::build_sidebar_project_menu("));
-        assert!(project.contains("let worktree_count = group.workspaces.len();"));
-        assert!(project.contains("let worktree_count_badge = div()"));
+        assert!(project.contains("let project_session_count = group"));
+        assert!(project.contains("workspace.agent_summary.total"));
+        assert!(project.contains("let project_session_count_badge = div()"));
         assert!(project.contains(".rounded_full()"));
     }
 
