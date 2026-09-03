@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <strong>Run your Agents. Own your workspace. Ship the change.</strong><br />
+  <strong>Your agents. Your workspace. Your control—from prompt to commit, desktop to mobile.</strong><br />
   A native, local-first AI coding workbench for Agent-powered software development.
 </p>
 

@@ -8,7 +8,7 @@
 </h1>
 
 <p align="center">
-  <strong>运行你的 Agent, 掌控你的工作区, 交付改动。</strong><br />
+  <strong>你的 Agent, 你的工作区, 你的掌控——从提示词到提交, 从桌面到移动端。</strong><br />
   面向 Agent 驱动软件开发的原生、本地优先 AI 编程工作台。
 </p>
 
