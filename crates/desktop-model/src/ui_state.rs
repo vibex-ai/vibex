@@ -463,6 +463,12 @@ pub struct SessionUiState {
     pub auto_continue_project_ids: BTreeSet<String>,
     #[serde(default)]
     pub auto_continue_session_overrides: BTreeMap<String, bool>,
+    /// Sessions whose auto-continue is suspended by an explicit user action
+    /// (pause button or session stop). The persisted auto-continue preference
+    /// is untouched; the suspension survives restarts and clears when the user
+    /// resumes it or sends a new message.
+    #[serde(default)]
+    pub auto_continue_paused_session_ids: BTreeSet<String>,
 }
 
 impl Default for SessionUiState {
@@ -477,6 +483,7 @@ impl Default for SessionUiState {
             enhanced_file_operation_display: true,
             auto_continue_project_ids: BTreeSet::new(),
             auto_continue_session_overrides: BTreeMap::new(),
+            auto_continue_paused_session_ids: BTreeSet::new(),
         }
     }
 }
@@ -776,6 +783,7 @@ impl DesktopUiStateV1 {
             80,
         );
         normalize_set(&mut self.session.auto_continue_project_ids, 1_000);
+        normalize_set(&mut self.session.auto_continue_paused_session_ids, 1_000);
         self.session.auto_continue_session_overrides =
             std::mem::take(&mut self.session.auto_continue_session_overrides)
                 .into_iter()
@@ -844,6 +852,9 @@ impl DesktopUiStateV1 {
         self.session
             .auto_continue_session_overrides
             .retain(|id, _| references.session_ids.contains(id));
+        self.session
+            .auto_continue_paused_session_ids
+            .retain(|id| references.session_ids.contains(id));
         self.terminal
             .tab_order
             .retain(|id| references.terminal_ids.contains(id));
@@ -1548,6 +1559,7 @@ mod tests {
         session.remove("reasoningExpandedByDefault");
         session.remove("autoContinueProjectIds");
         session.remove("autoContinueSessionOverrides");
+        session.remove("autoContinuePausedSessionIds");
 
         let decoded = decode_and_migrate(&serde_json::to_vec(&value).unwrap()).unwrap();
 
@@ -1561,6 +1573,7 @@ mod tests {
         assert!(!decoded.session.reasoning_expanded_by_default);
         assert!(decoded.session.auto_continue_project_ids.is_empty());
         assert!(decoded.session.auto_continue_session_overrides.is_empty());
+        assert!(decoded.session.auto_continue_paused_session_ids.is_empty());
     }
 
     #[test]
@@ -1732,6 +1745,14 @@ mod tests {
             .session
             .auto_continue_session_overrides
             .insert("session_stale".into(), true);
+        state
+            .session
+            .auto_continue_paused_session_ids
+            .insert(" session_paused ".into());
+        state
+            .session
+            .auto_continue_paused_session_ids
+            .insert("session_paused_stale".into());
 
         state.normalize().unwrap();
         assert!(
@@ -1754,10 +1775,20 @@ mod tests {
                 .get("session_disabled"),
             Some(&false)
         );
+        assert!(
+            state
+                .session
+                .auto_continue_paused_session_ids
+                .contains("session_paused")
+        );
 
         state.cleanup_stale_ids(&UiStateReferences {
             project_ids: BTreeSet::from(["project_kept".into()]),
-            session_ids: BTreeSet::from(["session_enabled".into(), "session_disabled".into()]),
+            session_ids: BTreeSet::from([
+                "session_enabled".into(),
+                "session_disabled".into(),
+                "session_paused".into(),
+            ]),
             ..UiStateReferences::default()
         });
         assert_eq!(
@@ -1770,6 +1801,10 @@ mod tests {
                 ("session_disabled".into(), false),
                 ("session_enabled".into(), true),
             ])
+        );
+        assert_eq!(
+            state.session.auto_continue_paused_session_ids,
+            BTreeSet::from(["session_paused".into()])
         );
     }
 

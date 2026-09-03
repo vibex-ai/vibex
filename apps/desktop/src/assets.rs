@@ -303,6 +303,10 @@ const VIBEX_ASSETS: &[(&str, &[u8])] = &[
         )),
     ),
     (
+        "icons/vibex/pause.svg",
+        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/pause.svg")),
+    ),
+    (
         "icons/vibex/trash-2.svg",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),

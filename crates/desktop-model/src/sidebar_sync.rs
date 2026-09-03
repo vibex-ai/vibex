@@ -39,6 +39,7 @@ pub struct SidebarOrganizationView {
     pub auto_continue_project_ids: BTreeSet<String>,
     pub auto_continue_session_overrides: BTreeMap<String, bool>,
     pub auto_continue_session_ids: BTreeSet<String>,
+    pub auto_continue_paused_session_ids: BTreeSet<String>,
     pub unread_session_ids: BTreeSet<String>,
 }
 
@@ -165,6 +166,11 @@ impl SidebarOrganizationView {
             auto_continue_project_ids: self.auto_continue_project_ids.iter().cloned().collect(),
             auto_continue_session_overrides: self.auto_continue_session_overrides.clone(),
             auto_continue_session_ids: self.auto_continue_session_ids.iter().cloned().collect(),
+            auto_continue_paused_session_ids: self
+                .auto_continue_paused_session_ids
+                .iter()
+                .cloned()
+                .collect(),
             unread_session_ids: self.unread_session_ids.iter().cloned().collect(),
         }
     }
@@ -248,6 +254,11 @@ impl SidebarOrganizationView {
             auto_continue_project_ids: snapshot.auto_continue_project_ids.iter().cloned().collect(),
             auto_continue_session_overrides: snapshot.auto_continue_session_overrides.clone(),
             auto_continue_session_ids: snapshot.auto_continue_session_ids.iter().cloned().collect(),
+            auto_continue_paused_session_ids: snapshot
+                .auto_continue_paused_session_ids
+                .iter()
+                .cloned()
+                .collect(),
             unread_session_ids: snapshot.unread_session_ids.iter().cloned().collect(),
         }
     }
@@ -438,6 +449,9 @@ impl SidebarOrganizationView {
                 }
                 self.auto_continue_session_overrides
                     .insert(session_id.clone(), *enabled);
+                // An explicit enable/disable always clears a pause; the
+                // suspension is only set by pausing or stopping a session.
+                self.auto_continue_paused_session_ids.remove(session_id);
                 SidebarMutationEffect::NAVIGATION
             }
             RemoteSidebarOrganizationMutation::SetWorktreeTitle {

@@ -3967,12 +3967,14 @@ fn auto_continue_should_start(
     current_turn_paused: bool,
     handled_turn_updated_at_ms: Option<i64>,
     session_updated_at_ms: i64,
+    paused: bool,
 ) -> bool {
     enabled
         && agent_session_turn_requires_continuation(session_state, latest_turn_ended_normally)
         && !session_turn_pending
         && !current_turn_paused
         && handled_turn_updated_at_ms != Some(session_updated_at_ms)
+        && !paused
 }
 
 fn restored_auto_continue_session_ids(state: &SessionUiState) -> BTreeSet<String> {
@@ -4693,6 +4695,7 @@ pub struct VibexWorkbench {
     agent_turn_pending: bool,
     auto_continue_default_project_ids: BTreeSet<String>,
     auto_continue_session_ids: BTreeSet<String>,
+    auto_continue_paused_session_ids: BTreeSet<String>,
     auto_continue_paused_turn_session_ids: BTreeSet<String>,
     auto_continue_handled_turns: BTreeMap<String, i64>,
     auto_continue_turn_statuses: BTreeMap<String, AutoContinueTurnStatus>,
@@ -4777,6 +4780,8 @@ impl VibexWorkbench {
         }
         let auto_continue_default_project_ids = ui_state.session.auto_continue_project_ids.clone();
         let auto_continue_session_ids = restored_auto_continue_session_ids(&ui_state.session);
+        let auto_continue_paused_session_ids =
+            ui_state.session.auto_continue_paused_session_ids.clone();
         let initial_locale = locale::apply_locale(ui_state.appearance.locale);
         match vibex_desktop_runtime::network_proxy::initialize(&ui_state.network_proxy) {
             Ok(normalized) => ui_state.network_proxy = normalized,
@@ -5441,6 +5446,7 @@ impl VibexWorkbench {
             agent_turn_pending: false,
             auto_continue_default_project_ids,
             auto_continue_session_ids,
+            auto_continue_paused_session_ids,
             auto_continue_paused_turn_session_ids: BTreeSet::new(),
             auto_continue_handled_turns: BTreeMap::new(),
             auto_continue_turn_statuses: BTreeMap::new(),
@@ -5812,6 +5818,7 @@ impl VibexWorkbench {
                 .auto_continue_session_overrides
                 .clone(),
             auto_continue_session_ids: self.auto_continue_session_ids.clone(),
+            auto_continue_paused_session_ids: self.auto_continue_paused_session_ids.clone(),
             unread_session_ids: self.unread_agent_completion_session_ids.clone(),
         };
         // Keep the remote order complete even when a newly-created Worktree has
@@ -5889,6 +5896,10 @@ impl VibexWorkbench {
                             self.ui_state.session.auto_continue_session_overrides =
                                 view.auto_continue_session_overrides.clone();
                             self.auto_continue_session_ids = view.auto_continue_session_ids.clone();
+                            self.auto_continue_paused_session_ids =
+                                view.auto_continue_paused_session_ids.clone();
+                            self.ui_state.session.auto_continue_paused_session_ids =
+                                view.auto_continue_paused_session_ids.clone();
                             self.queue_agent_ui_state();
                             self.queue_ui_state();
                         }
@@ -5951,6 +5962,8 @@ impl VibexWorkbench {
         }
         let auto_continue_default_project_ids = state.session.auto_continue_project_ids.clone();
         let auto_continue_session_ids = restored_auto_continue_session_ids(&state.session);
+        let auto_continue_paused_session_ids =
+            state.session.auto_continue_paused_session_ids.clone();
         let selected_session_id = state
             .workbench
             .selected_session_id
@@ -5983,6 +5996,7 @@ impl VibexWorkbench {
         }
         self.auto_continue_default_project_ids = auto_continue_default_project_ids;
         self.auto_continue_session_ids = auto_continue_session_ids;
+        self.auto_continue_paused_session_ids = auto_continue_paused_session_ids;
         self.sidebar_state.row_order = self.ui_state.sidebar.session_order.clone();
         self.sidebar_state.pinned_ids = self.ui_state.sidebar.pinned_session_ids.clone();
         self.sidebar_state.collapsed_ids = self.ui_state.sidebar.collapsed_project_ids.clone();
@@ -6500,6 +6514,11 @@ impl VibexWorkbench {
                                 })
                                 .map(|session| session.id.as_str().to_string())
                                 .collect();
+                            // A persisted pause only applies while the
+                            // auto-continue preference itself is still on.
+                            this.auto_continue_paused_session_ids.retain(|session_id| {
+                                this.auto_continue_session_ids.contains(session_id)
+                            });
                             this.workspaces = workspaces;
                             let auto_continue_sessions = this
                                 .sessions
@@ -6872,6 +6891,8 @@ impl VibexWorkbench {
             self.composer_queue_edit_geometry.input_bounds = None;
         }
         self.auto_continue_session_ids
+            .retain(|id| valid_session_ids.contains(id));
+        self.auto_continue_paused_session_ids
             .retain(|id| valid_session_ids.contains(id));
         self.auto_continue_paused_turn_session_ids
             .retain(|id| valid_session_ids.contains(id));
@@ -7300,18 +7321,26 @@ impl VibexWorkbench {
             self.auto_continue_paused_turn_session_ids
                 .remove(session_id.as_str());
             self.auto_continue_handled_turns.remove(session_id.as_str());
+            self.auto_continue_paused_session_ids
+                .remove(session_id.as_str());
             self.sync_auto_continue_for_session(&session_id, cx);
         } else {
             self.auto_continue_session_ids.remove(session_id.as_str());
             self.auto_continue_paused_turn_session_ids
                 .remove(session_id.as_str());
             self.auto_continue_handled_turns.remove(session_id.as_str());
+            self.auto_continue_paused_session_ids
+                .remove(session_id.as_str());
             self.cancel_auto_continue_countdown(&session_id);
         }
         self.ui_state
             .session
             .auto_continue_session_overrides
             .insert(session_id.as_str().to_string(), enabled);
+        self.ui_state
+            .session
+            .auto_continue_paused_session_ids
+            .clone_from(&self.auto_continue_paused_session_ids);
         self.queue_ui_state();
         self.publish_sidebar_invalidation();
         cx.notify();
@@ -7363,6 +7392,8 @@ impl VibexWorkbench {
                 .get(session_id.as_str())
                 .copied(),
             session_updated_at_ms,
+            self.auto_continue_paused_session_ids
+                .contains(session_id.as_str()),
         );
         if !should_start {
             self.cancel_auto_continue_countdown(session_id);
@@ -7447,6 +7478,8 @@ impl VibexWorkbench {
                     .get(session_id.as_str())
                     .copied(),
                 session.updated_at_ms,
+                self.auto_continue_paused_session_ids
+                    .contains(session_id.as_str()),
             ) && cached_status.is_some()
                 && session.updated_at_ms == countdown.session_updated_at_ms
         });
@@ -7482,9 +7515,21 @@ impl VibexWorkbench {
     }
 
     fn pause_auto_continue(&mut self, session_id: &VibexSessionId, cx: &mut Context<Self>) {
-        // A manual stop opts this session out of future automatic continuations.
-        if self.auto_continue_enabled(session_id) {
-            self.set_auto_continue_enabled(session_id.clone(), false, cx);
+        // A manual pause suspends this session's auto-continue without
+        // discarding its persisted preference: the pause survives restarts and
+        // clears only when the user resumes it or sends a new message.
+        if self.auto_continue_enabled(session_id)
+            && self
+                .auto_continue_paused_session_ids
+                .insert(session_id.as_str().to_string())
+        {
+            self.ui_state
+                .session
+                .auto_continue_paused_session_ids
+                .clone_from(&self.auto_continue_paused_session_ids);
+            self.queue_ui_state();
+            self.invalidate_sidebar_projection_cache();
+            self.publish_sidebar_invalidation();
         }
         if let Some(countdown) = self.auto_continue_countdowns.remove(session_id.as_str()) {
             self.auto_continue_paused_turn_session_ids
@@ -7496,6 +7541,27 @@ impl VibexWorkbench {
         }
         self.auto_continue_countdown_tasks
             .remove(session_id.as_str());
+        cx.notify();
+    }
+
+    /// Lifts the persisted auto-continue suspension the user installed by
+    /// pausing the countdown or stopping the session.
+    fn resume_auto_continue(&mut self, session_id: &VibexSessionId, cx: &mut Context<Self>) {
+        if !self
+            .auto_continue_paused_session_ids
+            .remove(session_id.as_str())
+        {
+            return;
+        }
+        self.ui_state
+            .session
+            .auto_continue_paused_session_ids
+            .clone_from(&self.auto_continue_paused_session_ids);
+        self.auto_continue_handled_turns.remove(session_id.as_str());
+        self.queue_ui_state();
+        self.invalidate_sidebar_projection_cache();
+        self.publish_sidebar_invalidation();
+        self.sync_auto_continue_for_session(session_id, cx);
         cx.notify();
     }
 
@@ -13174,6 +13240,12 @@ impl VibexWorkbench {
             attachments: attachments.clone(),
         });
         self.set_session_turn_pending(&session_id, true);
+        // The new user turn reactivates the session, so a pause that the user
+        // installed while stopping or pausing auto-continue is lifted again —
+        // unless the auto-continue preference itself was turned off.
+        if self.auto_continue_enabled(&session_id) {
+            self.resume_auto_continue(&session_id, cx);
+        }
         if let Some(optimistic_message) = optimistic_message {
             self.install_optimistic_user_message(optimistic_message);
         }
@@ -16307,11 +16379,10 @@ impl VibexWorkbench {
         else {
             return;
         };
-        // An explicit user interrupt cancels this session's persisted
-        // auto-continue preference until the user enables it again.
-        if self.auto_continue_enabled(&session_id) {
-            self.set_auto_continue_enabled(session_id.clone(), false, cx);
-        }
+        // An explicit user interrupt suspends this session's auto-continue
+        // without discarding its persisted preference. The pause survives
+        // restarts and clears when the user resumes it or sends a new message.
+        self.pause_auto_continue(&session_id, cx);
         self.notification_suppressed_session_ids
             .insert(session_id.as_str().to_string());
         let has_queued_messages = self
@@ -16473,6 +16544,10 @@ impl VibexWorkbench {
         self.notification_suppressed_session_ids
             .remove(session_id.as_str());
         self.set_session_turn_pending(&session_id, true);
+        // An explicit manual continuation is also a user reactivation.
+        if self.auto_continue_enabled(&session_id) {
+            self.resume_auto_continue(&session_id, cx);
+        }
         if self.selected_session_id.as_ref() == Some(&session_id) {
             self.agent_error = None;
         }
@@ -22102,6 +22177,7 @@ impl VibexWorkbench {
     fn clear_auto_continue_preference_state(&mut self) {
         self.auto_continue_default_project_ids.clear();
         self.auto_continue_session_ids.clear();
+        self.auto_continue_paused_session_ids.clear();
         self.auto_continue_paused_turn_session_ids.clear();
         self.auto_continue_handled_turns.clear();
         self.auto_continue_turn_statuses.clear();
@@ -22112,6 +22188,10 @@ impl VibexWorkbench {
         self.ui_state
             .session
             .auto_continue_session_overrides
+            .clear();
+        self.ui_state
+            .session
+            .auto_continue_paused_session_ids
             .clear();
     }
 
@@ -22165,6 +22245,8 @@ impl VibexWorkbench {
 
         let auto_continue_default_project_ids = snapshot.session.auto_continue_project_ids.clone();
         let auto_continue_session_ids = restored_auto_continue_session_ids(&snapshot.session);
+        let auto_continue_paused_session_ids =
+            snapshot.session.auto_continue_paused_session_ids.clone();
         let selected_session_id = snapshot
             .workbench
             .selected_session_id
@@ -22196,6 +22278,7 @@ impl VibexWorkbench {
         self.ui_state.network_proxy = restored_proxy;
         self.auto_continue_default_project_ids = auto_continue_default_project_ids;
         self.auto_continue_session_ids = auto_continue_session_ids;
+        self.auto_continue_paused_session_ids = auto_continue_paused_session_ids;
         self.sidebar_state.row_order = self.ui_state.sidebar.session_order.clone();
         self.sidebar_state.pinned_ids = self.ui_state.sidebar.pinned_session_ids.clone();
         self.sidebar_state.collapsed_ids = self.ui_state.sidebar.collapsed_project_ids.clone();
@@ -25677,7 +25760,12 @@ impl VibexWorkbench {
             .pending_session_deletion_ids
             .contains(session.id.as_str());
         let auto_continue_enabled = self.auto_continue_enabled(&session.id);
+        let auto_continue_paused = self
+            .auto_continue_paused_session_ids
+            .contains(session.id.as_str());
         let auto_continue_label = locale::text("Auto continue", "自动继续", "自動繼續");
+        let auto_continue_paused_label =
+            locale::text("Auto continue paused", "自动继续已暂停", "自動繼續已暫停");
         let pin_label = if pinned {
             strings.sidebar_unpin
         } else {
@@ -25935,13 +26023,17 @@ impl VibexWorkbench {
                             .update(cx, |this, _| this.retain_sidebar_hover_preview());
                         let auto_continue_entity = context_entity.clone();
                         let auto_continue_id = context_auto_continue_id.clone();
+                        let resume_auto_continue_entity = context_entity.clone();
+                        let resume_auto_continue_id = context_auto_continue_id.clone();
+                        let resume_auto_continue_label =
+                            locale::text("Resume auto continue", "恢复自动继续", "恢復自動繼續");
                         let pin_entity = context_entity.clone();
                         let pin_id = context_pin_id.clone();
                         let rename_entity = context_entity.clone();
                         let rename_id = context_rename_id.clone();
                         let delete_entity = context_entity.clone();
                         let delete_id = context_delete_id.clone();
-                        menu.item(
+                        let mut menu = menu.item(
                             PopupMenuItem::new(auto_continue_label)
                                 .checked(auto_continue_enabled)
                                 .on_click(move |_, _, cx| {
@@ -25953,7 +26045,18 @@ impl VibexWorkbench {
                                         )
                                     });
                                 }),
-                        )
+                        );
+                        if auto_continue_paused {
+                            menu = menu.item(
+                                PopupMenuItem::new(resume_auto_continue_label)
+                                    .on_click(move |_, _, cx| {
+                                        let _ = resume_auto_continue_entity.update(cx, |this, cx| {
+                                            this.resume_auto_continue(&resume_auto_continue_id, cx)
+                                        });
+                                    }),
+                            );
+                        }
+                        menu
                         .separator()
                         .item(
                             PopupMenuItem::new(pin_label)
@@ -26055,6 +26158,25 @@ impl VibexWorkbench {
                                             sidebar_icon("icons/vibex/pin.svg")
                                                 .size(px(14.0))
                                                 .text_color(cx.theme().warning),
+                                        ),
+                                )
+                            })
+                            .when(auto_continue_paused, |this| {
+                                this.child(
+                                    div()
+                                        .id(format!(
+                                            "sidebar-session-auto-continue-paused-{session_id_string}"
+                                        ))
+                                        .flex_none()
+                                        .group_hover(&hover_group, |style| style.invisible())
+                                        .tooltip(move |window, cx| {
+                                            Tooltip::new(auto_continue_paused_label)
+                                                .build(window, cx)
+                                        })
+                                        .child(
+                                            sidebar_icon("icons/vibex/pause.svg")
+                                                .size(px(14.0))
+                                                .text_color(cx.theme().muted_foreground),
                                         ),
                                 )
                             })
@@ -54911,6 +55033,7 @@ mod tests {
             .expect("continuation completion should remain session-fenced");
         assert!(clear < completion_fence);
         assert!(continuation.contains("composer_queue_ready_after_continuation_session_ids"));
+        assert!(continuation.contains("self.resume_auto_continue(&session_id, cx);"));
         assert!(source.contains("flush_composer_queue_dispatches_after_continuation"));
     }
 
@@ -54923,7 +55046,8 @@ mod tests {
             false,
             false,
             None,
-            42
+            42,
+            false
         ));
         assert!(!auto_continue_should_start(
             true,
@@ -54932,7 +55056,8 @@ mod tests {
             false,
             false,
             None,
-            42
+            42,
+            false
         ));
         assert!(auto_continue_should_start(
             true,
@@ -54941,7 +55066,8 @@ mod tests {
             false,
             false,
             None,
-            42
+            42,
+            false
         ));
         assert!(!auto_continue_should_start(
             true,
@@ -54950,7 +55076,8 @@ mod tests {
             false,
             false,
             None,
-            42
+            42,
+            false
         ));
         assert!(!auto_continue_should_start(
             false,
@@ -54959,7 +55086,8 @@ mod tests {
             false,
             false,
             None,
-            42
+            42,
+            false
         ));
         assert!(!auto_continue_should_start(
             true,
@@ -54968,7 +55096,8 @@ mod tests {
             true,
             false,
             None,
-            42
+            42,
+            false
         ));
         assert!(!auto_continue_should_start(
             true,
@@ -54977,7 +55106,8 @@ mod tests {
             false,
             true,
             None,
-            42
+            42,
+            false
         ));
         assert!(!auto_continue_should_start(
             true,
@@ -54986,7 +55116,8 @@ mod tests {
             false,
             false,
             Some(42),
-            42
+            42,
+            false
         ));
         assert!(auto_continue_should_start(
             true,
@@ -54995,7 +55126,18 @@ mod tests {
             false,
             false,
             Some(41),
-            42
+            42,
+            false
+        ));
+        assert!(!auto_continue_should_start(
+            true,
+            AgentSessionState::Error,
+            Some(false),
+            false,
+            false,
+            Some(41),
+            42,
+            true
         ));
     }
 
@@ -55058,6 +55200,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("auto-continue state should remain inspectable");
         assert!(state.contains("auto_continue_session_ids"));
+        assert!(state.contains("auto_continue_paused_session_ids"));
         assert!(state.contains("auto_continue_paused_turn_session_ids"));
         assert!(state.contains("auto_continue_turn_statuses"));
         assert!(state.contains("probe_auto_continue_turn_status"));
@@ -55066,22 +55209,26 @@ mod tests {
         assert!(state.contains("this.tick_auto_continue_countdown"));
         assert!(state.contains("self.pause_auto_continue(&session_id, cx);"));
         assert!(state.contains("self.continue_session_by_id("));
+        assert!(state.contains("fn resume_auto_continue("));
 
         let pause = source
             .split_once("    fn pause_auto_continue(")
             .and_then(|(_, tail)| tail.split_once("\n    fn activate_continue_button("))
             .map(|(body, _)| body)
             .expect("manual auto-continue pause should remain inspectable");
-        assert!(pause.contains("self.set_auto_continue_enabled(session_id.clone(), false, cx)"));
+        // Pausing suspends auto-continue while keeping the persisted
+        // preference: a restart must not silently resume the countdown.
+        assert!(pause.contains("auto_continue_paused_session_ids"));
+        assert!(!pause.contains("set_auto_continue_enabled"));
+        assert!(pause.contains("fn resume_auto_continue("));
 
         let interrupt = source
             .split_once("    fn interrupt_session_with_queue_behavior(")
             .and_then(|(_, tail)| tail.split_once("\n    fn continue_session("))
             .map(|(body, _)| body)
             .expect("manual interruption should remain inspectable");
-        assert!(
-            interrupt.contains("self.set_auto_continue_enabled(session_id.clone(), false, cx)")
-        );
+        assert!(interrupt.contains("self.pause_auto_continue(&session_id, cx)"));
+        assert!(!interrupt.contains("set_auto_continue_enabled"));
 
         let composer = source
             .split_once("    fn render_composer(")
@@ -55105,6 +55252,8 @@ mod tests {
         assert!(sidebar.contains("PopupMenuItem::new(auto_continue_label)"));
         assert!(sidebar.contains(".checked(auto_continue_enabled)"));
         assert!(sidebar.contains("this.set_auto_continue_enabled("));
+        assert!(sidebar.contains("icons/vibex/pause.svg"));
+        assert!(sidebar.contains("auto_continue_paused"));
 
         let project = source
             .split_once("    fn render_sidebar_project(")
@@ -55187,6 +55336,16 @@ mod tests {
             .find("this.sync_auto_continue_for_session(&submitted_session_id, cx);")
             .expect("auto continue should observe the reconciled error state");
         assert!(reconcile < clear_pending && clear_pending < auto_continue);
+
+        // A new user message reactivates the session, so it must clear the
+        // persisted auto-continue pause after the turn becomes pending.
+        let turn_pending = dispatch
+            .find("self.set_session_turn_pending(&session_id, true);")
+            .expect("the new turn should become pending");
+        let resume = dispatch
+            .find("self.resume_auto_continue(&session_id, cx);")
+            .expect("a new message should lift a persisted auto-continue pause");
+        assert!(turn_pending < resume);
     }
 
     #[test]

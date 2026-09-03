@@ -1956,6 +1956,11 @@ pub struct RemoteSidebarOrganizationSnapshot {
     pub auto_continue_session_overrides: std::collections::BTreeMap<String, bool>,
     #[serde(default)]
     pub auto_continue_session_ids: Vec<String>,
+    /// Sessions whose auto-continue is suspended by an explicit user action on
+    /// the Desktop. Compacts clients only render the paused badge; the
+    /// preference itself stays authoritative in `autoContinueSessionOverrides`.
+    #[serde(default)]
+    pub auto_continue_paused_session_ids: Vec<String>,
     #[serde(default)]
     pub unread_session_ids: Vec<String>,
 }
