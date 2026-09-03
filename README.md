@@ -8,6 +8,11 @@
 </h1>
 
 <p align="center">
+  <a href="README.md">English</a> &nbsp;|&nbsp;
+  <a href="README.zh-CN.md">简体中文</a>
+</p>
+
+<p align="center">
   <strong>Run your Agents. Own your workspace. Ship the change.</strong><br />
   A native, local-first AI coding workbench for Agent-powered software development.
 </p>
