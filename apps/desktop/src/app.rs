@@ -4622,6 +4622,8 @@ pub struct VibexWorkbench {
     runtime_selection: Option<AgentSessionRuntimeSelectionState>,
     optimistic_runtime_selections: BTreeMap<String, SessionRuntimeSelection>,
     runtime_selection_requests_in_flight: BTreeSet<String>,
+    runtime_selection_initializations_in_flight: BTreeSet<String>,
+    runtime_selection_uninitialized_sessions: BTreeSet<String>,
     runtime_selection_cancellations_in_flight: BTreeSet<String>,
     runtime_preference_write_fence: RuntimePreferenceWriteFence,
     token_usage: Option<AgentTokenUsage>,
@@ -5368,6 +5370,8 @@ impl VibexWorkbench {
             runtime_selection: None,
             optimistic_runtime_selections: BTreeMap::new(),
             runtime_selection_requests_in_flight: BTreeSet::new(),
+            runtime_selection_initializations_in_flight: BTreeSet::new(),
+            runtime_selection_uninitialized_sessions: BTreeSet::new(),
             runtime_selection_cancellations_in_flight: BTreeSet::new(),
             runtime_preference_write_fence: RuntimePreferenceWriteFence::default(),
             token_usage: None,
@@ -9893,6 +9897,60 @@ impl VibexWorkbench {
                     .as_ref()
                     .map(|state| state.desired.clone())
             })
+            .or_else(|| {
+                // Imported sessions predate runtime selection state. They are
+                // still usable: synthesize a choice from the catalog so the
+                // composer renders the cascade and sending initializes the
+                // session with the displayed selection.
+                if self
+                    .runtime_selection_uninitialized_sessions
+                    .contains(session_id.as_str())
+                {
+                    self.fallback_runtime_selection_for_uninitialized()
+                } else {
+                    None
+                }
+            })
+    }
+
+    fn selected_session_runtime_uninitialized(&self) -> bool {
+        self.selected_session_id
+            .as_ref()
+            .is_some_and(|session_id| {
+                self.runtime_selection_uninitialized_sessions
+                    .contains(session_id.as_str())
+            })
+    }
+
+    fn fallback_runtime_selection_for_uninitialized(&self) -> Option<SessionRuntimeSelection> {
+        let session_id = self.selected_session_id.as_ref()?;
+        let session = self
+            .sessions
+            .iter()
+            .find(|session| session.id == *session_id)?;
+        let agent_id = session.agent_id.clone();
+        let catalog = self.runtime_catalog.as_ref()?;
+        if let Some(selection) = self
+            .ui_state
+            .composer
+            .runtime_selections_by_agent
+            .get(&agent_id)
+            .cloned()
+            .filter(|selection| {
+                catalog.options.iter().any(|option| {
+                    option.selection.agent_id == selection.agent_id
+                        && option.selection.auth_source == selection.auth_source
+                        && option.selection.model == selection.model
+                })
+            })
+        {
+            return Some(selection);
+        }
+        catalog
+            .options
+            .iter()
+            .find(|option| option.selection.agent_id == agent_id)
+            .map(|option| option.selection.clone())
     }
 
     fn active_runtime_controls_pending(&self) -> bool {
@@ -10778,7 +10836,19 @@ impl VibexWorkbench {
                     }
                     match outcome {
                         Ok(Ok(selection)) => {
+                            this.runtime_selection_uninitialized_sessions
+                                .remove(session_id.as_str());
                             this.apply_runtime_selection_state(&session_id, selection, cx);
+                        }
+                        Ok(Err(error))
+                            if error.code == "session_runtime_selection_uninitialized" =>
+                        {
+                            // Imported sessions predate runtime selection
+                            // state; the composer offers initialization
+                            // instead of surfacing this as an error.
+                            this.runtime_selection_uninitialized_sessions
+                                .insert(session_id.as_str().to_string());
+                            this.runtime_selection = None;
                         }
                         Ok(Err(error)) => {
                             this.agent_error = Some(format!("{}: {}", error.code, error.message));
@@ -18112,7 +18182,87 @@ impl VibexWorkbench {
         self.runtime_choice_menu_open = None;
         self.composer_runtime_menu_agent_id = None;
         self.composer_runtime_menu_auth_source = None;
+        if self.selected_session_runtime_uninitialized() {
+            self.initialize_uninitialized_session_runtime(selection, cx);
+            return;
+        }
         self.request_runtime_selection(selection, false, cx);
+    }
+
+    fn initialize_uninitialized_session_runtime(
+        &mut self,
+        selection: SessionRuntimeSelection,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(runtime), Some(session_id)) = (self.runtime.clone(), self.selected_session_id.clone()) else {
+            return;
+        };
+        let session_key = session_id.as_str().to_string();
+        if !self
+            .runtime_selection_uninitialized_sessions
+            .contains(&session_key)
+            || self
+                .runtime_selection_initializations_in_flight
+                .contains(&session_key)
+        {
+            return;
+        }
+        self.optimistic_runtime_selections
+            .insert(session_key.clone(), selection.clone());
+        self.runtime_selection_initializations_in_flight
+            .insert(session_key.clone());
+        let generation = self.session_generation;
+        let requested_session_id = session_id.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            runtime
+                .agent()
+                .manager()
+                .initialize_imported_session_runtime(&session_id, selection)
+                .await
+        });
+        cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.runtime_selection_initializations_in_flight
+                        .remove(&session_key);
+                    let active = this.session_generation == generation
+                        && this.selected_session_id.as_ref() == Some(&requested_session_id);
+                    match outcome {
+                        Ok(Ok(session)) => {
+                            this.upsert_session_snapshot(session);
+                            this.reconcile_sidebar_state();
+                            if active {
+                                this.load_agent_session_projection(
+                                    this.runtime.clone().expect("runtime should stay installed"),
+                                    requested_session_id.clone(),
+                                    generation,
+                                    cx,
+                                );
+                            }
+                        }
+                        Ok(Err(error)) => {
+                            this.optimistic_runtime_selections
+                                .remove(&session_key);
+                            if active {
+                                this.agent_error =
+                                    Some(format!("{}: {}", error.code, error.message));
+                            }
+                        }
+                        Err(error) => {
+                            this.optimistic_runtime_selections.remove(&session_key);
+                            if active {
+                                this.agent_error = Some(format!(
+                                    "runtime initialization failed: {error}"
+                                ));
+                            }
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        )
+        .detach();
     }
 
     fn set_composer_runtime_menu_open(&mut self, open: bool, cx: &mut Context<Self>) {
@@ -20189,6 +20339,13 @@ impl VibexWorkbench {
     fn selected_session(&self) -> Option<&AgentSession> {
         let selected = self.selected_session_id.as_ref()?;
         self.sessions.iter().find(|session| &session.id == selected)
+    }
+
+    fn session_agent_id(&self, session_id: &VibexSessionId) -> Option<AgentId> {
+        self.sessions
+            .iter()
+            .find(|session| &session.id == session_id)
+            .map(|session| session.agent_id.clone())
     }
 
     fn toggle_session_pin(&mut self, session_id: &VibexSessionId, cx: &mut Context<Self>) {
@@ -37309,6 +37466,7 @@ impl VibexWorkbench {
         let composer_queue_visible = composer_queue.is_some();
         let input_geometry_entity = cx.weak_entity();
         let surface_geometry_entity = cx.weak_entity();
+        let session_uninitialized = self.selected_session_runtime_uninitialized();
         let (runtime_controls_cascade, runtime_controls_other) =
             if let Some((desired, catalog, projection)) = runtime_projection {
                 let cascade = self.render_composer_runtime_cascade(
@@ -37356,6 +37514,54 @@ impl VibexWorkbench {
                     ));
                 }
                 (cascade, other)
+            } else if session_uninitialized && !compact_runtime_controls {
+                // Imported sessions have no runtime selection yet. Offer the
+                // session's Agent for first activation instead of hiding the
+                // controls entirely.
+                let enable_label = locale::text(
+                    "Enable this Agent to start using it",
+                    "启用此 Agent 后即可开始使用",
+                    "啟用此 Agent 後即可開始使用",
+                );
+                let cascade = Button::new("composer-runtime-initialize")
+                    .xsmall()
+                    .ghost()
+                    .h(px(32.0))
+                    .px_2()
+                    .tooltip(enable_label)
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .child(
+                                Icon::new(IconName::Info)
+                                    .size(px(14.0))
+                                    .text_color(theme::semantic_color(
+                                        "warning",
+                                        cx.theme().is_dark(),
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().foreground.opacity(0.72))
+                                    .child(enable_label),
+                            ),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(selection) = this.selected_runtime_selection() {
+                            this.initialize_uninitialized_session_runtime(selection, cx);
+                        }
+                        if let Some(agent_id) = this
+                            .selected_session_id
+                            .as_ref()
+                            .and_then(|session_id| this.session_agent_id(session_id))
+                        {
+                            this.open_agent_auth_management(agent_id, cx);
+                        }
+                        cx.notify();
+                    }))
+                    .into_any_element();
+                (cascade, Vec::new())
             } else {
                 (Empty.into_any_element(), Vec::new())
             };

@@ -92,6 +92,15 @@ pub trait MessageRuntimeSelection: Send + Sync {
         idempotency_key: String,
         target: SessionRuntimeSelection,
     ) -> VibexResult<SwitchAgentSessionRuntimeResponse>;
+
+    /// Materializes the first runtime selection for a logical session that
+    /// predates runtime selection state (imported history). Used by queued
+    /// messages so sending works before the user touches the runtime menu.
+    async fn initialize_session_runtime(
+        &self,
+        session_id: &VibexSessionId,
+        desired: SessionRuntimeSelection,
+    ) -> VibexResult<()>;
 }
 
 #[async_trait]
@@ -138,6 +147,18 @@ impl MessageRuntimeSelection for RuntimeSelectionService {
             },
         )
         .await
+    }
+
+    async fn initialize_session_runtime(
+        &self,
+        session_id: &VibexSessionId,
+        desired: SessionRuntimeSelection,
+    ) -> VibexResult<()> {
+        // Deferred initialization lets the queued message poll on the
+        // resulting `Preparing` state; the switch watcher commits it.
+        RuntimeSelectionService::initialize_new_session_deferred(self, session_id, desired, None)
+            .await?;
+        Ok(())
     }
 }
 
@@ -504,9 +525,43 @@ impl MessageSubmissionCoordinator {
             if current.status != MessageSubmissionStatus::AwaitingRuntime {
                 return Ok(());
             }
-            let state = self
+            let state = match self
                 .runtime_selection
-                .get_selection_state(&current.session_id)?;
+                .get_selection_state(&current.session_id)
+            {
+                Ok(state) => Some(state),
+                Err(error)
+                    if error.code == "session_runtime_selection_uninitialized"
+                        && current.required_runtime_policy != RuntimeSwitchPolicy::ForceFreshSession =>
+                {
+                    // Imported sessions have no initial runtime yet: seed one
+                    // from the desired selection instead of failing the queue.
+                    match self
+                        .runtime_selection
+                        .initialize_session_runtime(
+                            &current.session_id,
+                            current.desired_runtime_selection.clone(),
+                        )
+                        .await
+                    {
+                        Ok(()) => None,
+                        Err(error)
+                            if error.code == "session_runtime_selection_partially_initialized" =>
+                        {
+                            None
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) => return Err(error),
+            };
+            let state = match state {
+                Some(state) => state,
+                None => {
+                    sleep(self.config.poll_interval).await;
+                    continue;
+                }
+            };
             if state.desired != current.desired_runtime_selection {
                 let normalized = self
                     .runtime_selection
@@ -1440,6 +1495,22 @@ mod tests {
                 current_binding_id: state.current_binding_id.clone(),
                 target_binding_id: runtime_switch.target_binding_id,
             })
+        }
+
+        async fn initialize_session_runtime(
+            &self,
+            session_id: &VibexSessionId,
+            desired: SessionRuntimeSelection,
+        ) -> VibexResult<()> {
+            let mut states = self.states.lock().unwrap();
+            let state = states.get_mut(session_id).ok_or_else(|| {
+                VibexError::validation("session_not_found", "Agent session was not found")
+            })?;
+            state.desired = desired.clone();
+            state.effective = desired;
+            state.status = SessionRuntimeSelectionStatus::Preparing;
+            state.selection_revision += 1;
+            Ok(())
         }
     }
 

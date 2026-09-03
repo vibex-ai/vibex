@@ -1737,6 +1737,36 @@ impl AgentManager {
         }
         Ok(result)
     }
+    /// Materializes the first ACP runtime for an existing Logical Session that
+    /// predates runtime selection state (for example imported local history).
+    /// The caller supplies the desired runtime; the session's Agent is aligned
+    /// with that choice and the standard initial switch state machine runs.
+    pub async fn initialize_imported_session_runtime(
+        &self,
+        session_id: &VibexSessionId,
+        desired: SessionRuntimeSelection,
+    ) -> VibexResult<AgentSession> {
+        let runtime_selection = self
+            .runtime_selection
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| {
+                VibexError::process(
+                    "runtime_selection_service_unavailable",
+                    "ACP runtime selection service is not installed",
+                )
+            })?;
+        runtime_selection
+            .initialize_new_session(session_id, desired, None)
+            .await?;
+        let conn = self.open_migrated()?;
+        let session = SessionRepository::get(&conn, session_id)?.ok_or_else(|| {
+            VibexError::validation("session_not_found", "Agent session was not found")
+        })?;
+        self.publish_root_session_update(&conn, session.clone());
+        Ok(session)
+    }
+
     pub async fn send_message(
         &self,
         request: SendAgentMessageRequest,

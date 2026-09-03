@@ -5464,7 +5464,6 @@ impl AgentSessionRuntimeRepository {
             || state.effective_runtime_selection.is_some()
             || state.runtime_selection_status.is_some()
             || state.pending_switch_id.is_some()
-            || state.current_agent_id.as_ref() != Some(&request.desired.agent_id)
         {
             return Err(cas_conflict(
                 "runtime_selection_initial_enqueue_conflict",
@@ -5480,6 +5479,7 @@ impl AgentSessionRuntimeRepository {
                      runtime_selection_status = ?3,
                      runtime_selection_error_code = NULL,
                      selection_revision = 1,
+                     current_agent_id = ?5,
                      updated_at_ms = ?4
                  WHERE session_id = ?1
                    AND revision = 0
@@ -5489,7 +5489,6 @@ impl AgentSessionRuntimeRepository {
                    AND effective_runtime_selection_json IS NULL
                    AND runtime_selection_status IS NULL
                    AND pending_switch_id IS NULL
-                   AND current_agent_id = ?5
                    AND deleted_at_ms IS NULL",
                 params![
                     request.session_id.as_str(),
