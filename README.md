@@ -23,30 +23,9 @@
 <p align="center">
   <a href="#quick-start">Quick start</a> &nbsp;&bull;&nbsp;
   <a href="#features">Features</a> &nbsp;&bull;&nbsp;
+  <a href="#supported-agents">Supported agents</a> &nbsp;&bull;&nbsp;
   <a href="#architecture">Architecture</a> &nbsp;&bull;&nbsp;
   <a href="#development">Development</a>
-</p>
-
-<h2 align="center">Supported Agents</h2>
-
-<p align="center">
-  <a href="https://docs.anthropic.com/en/docs/claude-code"><img src="https://img.shields.io/badge/Claude%20Code-D97757?style=for-the-badge&logoColor=white&logo=claude" alt="Claude Code" />&nbsp;</a>
-  <a href="https://github.com/openai/codex"><img src="https://img.shields.io/badge/Codex-000000?style=for-the-badge&logoColor=white&logo=data:image/svg+xml;base64,PHN2ZyBmaWxsPSIjZmZmIiByb2xlPSJpbWciIHZpZXdCb3g9IjAgMCAyNCAyNCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48dGl0bGU%2BT3BlbkFJPC90aXRsZT48cGF0aCBkPSJNMjIuMjgxOSA5LjgyMTFhNS45ODQ3IDUuOTg0NyAwIDAgMC0uNTE1Ny00LjkxMDggNi4wNDYyIDYuMDQ2MiAwIDAgMC02LjUwOTgtMi45QTYuMDY1MSA2LjA2NTEgMCAwIDAgNC45ODA3IDQuMTgxOGE1Ljk4NDcgNS45ODQ3IDAgMCAwLTMuOTk3NyAyLjkgNi4wNDYyIDYuMDQ2MiAwIDAgMCAuNzQyNyA3LjA5NjYgNS45OCA1Ljk4IDAgMCAwIC41MTEgNC45MTA3IDYuMDUxIDYuMDUxIDAgMCAwIDYuNTE0NiAyLjkwMDFBNS45ODQ3IDUuOTg0NyAwIDAgMCAxMy4yNTk5IDI0YTYuMDU1NyA2LjA1NTcgMCAwIDAgNS43NzE4LTQuMjA1OCA1Ljk4OTQgNS45ODk0IDAgMCAwIDMuOTk3Ny0yLjkwMDEgNi4wNTU3IDYuMDU1NyAwIDAgMC0uNzQ3NS03LjA3Mjl6bS05LjAyMiAxMi42MDgxYTQuNDc1NSA0LjQ3NTUgMCAwIDEtMi44NzY0LTEuMDQwOGwuMTQxOS0uMDgwNCA0Ljc3ODMtMi43NTgyYS43OTQ4Ljc5NDggMCAwIDAgLjM5MjctLjY4MTN2LTYuNzM2OWwyLjAyIDEuMTY4NmEuMDcxLjA3MSAwIDAgMSAuMDM4LjA1MnY1LjU4MjZhNC41MDQgNC41MDQgMCAwIDEtNC40OTQ1IDQuNDk0NHptLTkuNjYwNy00LjEyNTRhNC40NzA4IDQuNDcwOCAwIDAgMS0uNTM0Ni0zLjAxMzdsLjE0Mi4wODUyIDQuNzgzIDIuNzU4MmEuNzcxMi43NzEyIDAgMCAwIC43ODA2IDBsNS44NDI4LTMuMzY4NXYyLjMzMjRhLjA4MDQuMDgwNCAwIDAgMS0uMDMzMi4wNjE1TDkuNzQgMTkuOTUwMmE0LjQ5OTIgNC40OTkyIDAgMCAxLTYuMTQwOC0xLjY0NjR6TTIuMzQwOCA3Ljg5NTZhNC40ODUgNC40ODUgMCAwIDEgMi4zNjU1LTEuOTcyOFYxMS42YS43NjY0Ljc2NjQgMCAwIDAgLjM4NzkuNjc2NWw1LjgxNDQgMy4zNTQzLTIuMDIwMSAxLjE2ODVhLjA3NTcuMDc1NyAwIDAgMS0uMDcxIDBsLTQuODMwMy0yLjc4NjVBNC41MDQgNC41MDQgMCAwIDEgMi4zNDA4IDcuODcyem0xNi41OTYzIDMuODU1OEwxMy4xMDM4IDguMzY0IDE1LjExOTIgNy4yYS4wNzU3LjA3NTcgMCAwIDEgLjA3MSAwbDQuODMwMyAyLjc5MTNhNC40OTQ0IDQuNDk0NCAwIDAgMS0uNjc2NSA4LjEwNDJ2LTUuNjc3MmEuNzkuNzkgMCAwIDAtLjQwNy0uNjY3em0yLjAxMDctMy4wMjMxbC0uMTQyLS4wODUyLTQuNzczNS0yLjc4MThhLjc3NTkuNzc1OSAwIDAgMC0uNzg1NCAwTDkuNDA5IDkuMjI5N1Y2Ljg5NzRhLjA2NjIuMDY2MiAwIDAgMSAuMDI4NC0uMDYxNWw0LjgzMDMtMi43ODY2YTQuNDk5MiA0LjQ5OTIgMCAwIDEgNi42ODAyIDQuNjZ6TTguMzA2NSAxMi44NjNsLTIuMDItMS4xNjM4YS4wODA0LjA4MDQgMCAwIDEtLjAzOC0uMDU2N1Y2LjA3NDJhNC40OTkyIDQuNDk5MiAwIDAgMSA3LjM3NTctMy40NTM3bC0uMTQyLjA4MDVMOC43MDQgNS40NTlhLjc5NDguNzk0OCAwIDAgMC0uMzkyNy42ODEzem0xLjA5NzYtMi4zNjU0bDIuNjAyLTEuNDk5OCAyLjYwNjkgMS40OTk4djIuOTk5NGwtMi41OTc0IDEuNDk5Ny0yLjYwNjctMS40OTk3WiIvPjwvc3ZnPg%3D%3D" alt="Codex" />&nbsp;</a>
-  <a href="https://z.ai"><img src="https://img.shields.io/badge/ZCode-1F63EC?style=for-the-badge&logoColor=white&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMCAzMCIgZmlsbD0iI2ZmZiI%2BPHBhdGggZD0iTTE1LjQ3LDcuMWwtMS4zLDEuODVjLTAuMiwwLjI5LTAuNTQsMC40Ny0wLjksMC40N2gtNy4xVjcuMDlDNi4xNiw3LjEsMTUuNDcsNy4xLDE1LjQ3LDcuMXoiLz48cG9seWdvbiBwb2ludHM9IjI0LjMsNy4xIDEzLjE0LDIyLjkxIDUuNywyMi45MSAxNi44Niw3LjEgIi8%2BPHBhdGggZD0iTTE0LjUzLDIyLjkxbDEuMzEtMS44NmMwLjItMC4yOSwwLjU0LTAuNDcsMC45LTAuNDdoNy4wOXYyLjMzSDE0LjUzeiIvPjwvc3ZnPg%3D%3D" alt="ZCode" />&nbsp;</a>
-  <a href="https://opencode.ai"><img src="https://img.shields.io/badge/OpenCode-000000?style=for-the-badge&logoColor=white&logo=opencode" alt="OpenCode" />&nbsp;</a>
-  <a href="https://antigravity.google/docs/ide/extensions"><img src="https://img.shields.io/badge/Antigravity-3589FD?style=for-the-badge&logoColor=white&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iI2ZmZiI%2BPHBhdGggZD0iTTEyIDFjLjYgNS44IDUuMiAxMC40IDExIDExLTUuOC42LTEwLjQgNS4yLTExIDExLS42LTUuOC01LjItMTAuNC0xMS0xMSA1LjgtLjYgMTAuNC01LjIgMTEtMTF6Ii8%2BPC9zdmc%2B" alt="Antigravity" />&nbsp;</a>
-  <a href="https://cline.bot/cli"><img src="https://img.shields.io/badge/Cline-18181B?style=for-the-badge&logoColor=white&logo=cline" alt="Cline" />&nbsp;</a>
-  <a href="https://www.codebuddy.cn/cli/"><img src="https://img.shields.io/badge/Codebuddy%20Code-6C4DFF?style=for-the-badge&logoColor=white&logo=codebuddy" alt="Codebuddy Code" />&nbsp;</a>
-  <a href="https://docs.cursor.com/en/cli/overview"><img src="https://img.shields.io/badge/Cursor-000000?style=for-the-badge&logoColor=white&logo=cursor" alt="Cursor" />&nbsp;</a>
-  <a href="https://geminicli.com"><img src="https://img.shields.io/badge/Gemini%20CLI-8E75B2?style=for-the-badge&logoColor=white&logo=googlegemini" alt="Gemini CLI" />&nbsp;</a>
-  <a href="https://docs.github.com/en/copilot/concepts/agents/about-copilot-cli"><img src="https://img.shields.io/badge/GitHub%20Copilot-1F2328?style=for-the-badge&logoColor=white&logo=githubcopilot" alt="GitHub Copilot" />&nbsp;</a>
-  <a href="https://cli.devin.ai/docs"><img src="https://img.shields.io/badge/Devin-0E1015?style=for-the-badge&logoColor=white&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iI2ZmZiI%2BPHJlY3QgeD0iNCIgeT0iMyIgd2lkdGg9IjQiIGhlaWdodD0iMTgiIHJ4PSIxIi8%2BPHJlY3QgeD0iMTAiIHk9IjMiIHdpZHRoPSI0IiBoZWlnaHQ9IjE4IiByeD0iMSIgdHJhbnNmb3JtPSJza2V3WCgtMTIpIiAvPjxyZWN0IHg9IjE2IiB5PSIzIiB3aWR0aD0iNCIgaGVpZ2h0PSIxOCIgcng9IjEiLz48L3N2Zz4%3D" alt="Devin" />&nbsp;</a>
-  <a href="https://docs.x.ai/build/overview"><img src="https://img.shields.io/badge/Grok-000000?style=for-the-badge&logoColor=white&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iI2ZmZiI%2BPHBhdGggZD0iTTEzIDIgMyAxNGg3bC0xIDggMTItMTRoLThsMC02eiIvPjwvc3ZnPg%3D%3D" alt="Grok" />&nbsp;</a>
-  <a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/acp"><img src="https://img.shields.io/badge/Hermes-3B3F40?style=for-the-badge&logoColor=white&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iI2ZmZiI%2BPGNpcmNsZSBjeD0iNyIgY3k9IjEyIiByPSIyLjQiLz48Y2lyY2xlIGN4PSIxMyIgY3k9IjEyIiByPSIyLjQiLz48Y2lyY2xlIGN4PSIxOSIgY3k9IjEyIiByPSIyLjQiLz48L3N2Zz4%3D" alt="Hermes" />&nbsp;</a>
-  <a href="https://github.com/MoonshotAI/kimi-cli"><img src="https://img.shields.io/badge/Kimi%20Code-000000?style=for-the-badge&logoColor=white&logo=moonshotai" alt="Kimi Code" />&nbsp;</a>
-  <a href="https://github.com/svkozak/pi-acp"><img src="https://img.shields.io/badge/Pi-09090B?style=for-the-badge&logoColor=white&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA4MDAgODAwIj48cGF0aCBmaWxsPSIjZmZmIiBmaWxsLXJ1bGU9ImV2ZW5vZGQiIGQ9Ik0xNjUuMjkgMTY1LjI5IEg1MTcuMzYgVjQwMCBINDAwIFY1MTcuMzYgSDI4Mi42NSBWNjM0LjcyIEgxNjUuMjkgWiBNMjgyLjY1IDI4Mi42NSBWNDAwIEg0MDAgVjI4Mi42NSBaIi8%2BPHBhdGggZmlsbD0iI2ZmZiIgZD0iTTUxNy4zNiA0MDAgSDYzNC43MiBWNjM0LjcyIEg1MTcuMzYgWiIvPjwvc3ZnPg%3D%3D" alt="Pi" />&nbsp;</a>
-  <a href="https://github.com/vibex-ai/deepseek-harness-acp"><img src="https://img.shields.io/badge/DeepSeek%20Harness-5786FE?style=for-the-badge&logoColor=white&logo=deepseek" alt="DeepSeek Harness" />&nbsp;</a>
-  <a href="https://agentclientprotocol.com"><img src="https://img.shields.io/badge/%2B%20Any%20ACP%20Agent-57606A?style=for-the-badge&logoColor=white&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iI2ZmZiI%2BPHBhdGggZD0iTTEyIDRhMS42IDEuNiAwIDAgMSAxLjYgMS42djQuOGg0LjhhMS42IDEuNiAwIDEgMSAwIDMuMmgtNC44djQuOGExLjYgMS42IDAgMSAxLTMuMiAwdi00LjhINS42YTEuNiAxLjYgMCAxIDEgMC0zLjJoNC44VjUuNkExLjYgMS42IDAgMCAxIDEyIDR6Ii8%2BPC9zdmc%2B" alt="+ Any ACP Agent" />&nbsp;</a>
 </p>
 
 Vibex brings Agent sessions, source code, Git, terminals, previews, and provider
@@ -93,6 +72,27 @@ wherever you are.
 Vibex uses the [Agent Client Protocol](https://agentclientprotocol.com/) (ACP)
 as the only online Agent transport. The runtime is provider-neutral: an Agent's
 identity and capabilities are kept separate from the protocol used to connect it.
+Works with **any ACP-compatible agent** — if it speaks ACP, it runs in Vibex.
+
+<p>
+  <a href="https://docs.anthropic.com/en/docs/claude-code"><kbd><img src="https://www.google.com/s2/favicons?domain=claude.com&sz=64" alt="Claude Code logo" width="16" valign="middle" /> Claude Code</kbd></a> &nbsp;
+  <a href="https://github.com/openai/codex"><kbd><img src="https://www.google.com/s2/favicons?domain=openai.com&sz=64" alt="Codex logo" width="16" valign="middle" /> Codex</kbd></a> &nbsp;
+  <a href="https://z.ai"><kbd><img src="https://www.google.com/s2/favicons?domain=z.ai&sz=64" alt="ZCode logo" width="16" valign="middle" /> ZCode</kbd></a> &nbsp;
+  <a href="https://opencode.ai"><kbd><img src="https://www.google.com/s2/favicons?domain=opencode.ai&sz=64" alt="OpenCode logo" width="16" valign="middle" /> OpenCode</kbd></a> &nbsp;
+  <a href="https://antigravity.google/docs/ide/extensions"><kbd><img src="https://www.google.com/s2/favicons?domain=antigravity.google&sz=64" alt="Antigravity logo" width="16" valign="middle" /> Antigravity</kbd></a> &nbsp;
+  <a href="https://cline.bot/cli"><kbd><img src="https://www.google.com/s2/favicons?domain=cline.bot&sz=64" alt="Cline logo" width="16" valign="middle" /> Cline</kbd></a> &nbsp;
+  <a href="https://www.codebuddy.cn/cli/"><kbd><img src="https://www.google.com/s2/favicons?domain=codebuddy.cn&sz=64" alt="Codebuddy Code logo" width="16" valign="middle" /> Codebuddy Code</kbd></a> &nbsp;
+  <a href="https://docs.cursor.com/en/cli/overview"><kbd><img src="https://www.google.com/s2/favicons?domain=cursor.com&sz=64" alt="Cursor logo" width="16" valign="middle" /> Cursor</kbd></a> &nbsp;
+  <a href="https://geminicli.com"><kbd><img src="https://www.google.com/s2/favicons?domain=gemini.google.com&sz=64" alt="Gemini CLI logo" width="16" valign="middle" /> Gemini CLI</kbd></a> &nbsp;
+  <a href="https://docs.github.com/en/copilot/concepts/agents/about-copilot-cli"><kbd><img src="https://www.google.com/s2/favicons?domain=github.com&sz=64" alt="GitHub Copilot logo" width="16" valign="middle" /> GitHub Copilot</kbd></a> &nbsp;
+  <a href="https://cli.devin.ai/docs"><kbd><img src="https://www.google.com/s2/favicons?domain=devin.ai&sz=64" alt="Devin logo" width="16" valign="middle" /> Devin</kbd></a> &nbsp;
+  <a href="https://docs.x.ai/build/overview"><kbd><img src="https://www.google.com/s2/favicons?domain=x.ai&sz=64" alt="Grok logo" width="16" valign="middle" /> Grok</kbd></a> &nbsp;
+  <a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/acp"><kbd><img src="https://www.google.com/s2/favicons?domain=nousresearch.com&sz=64" alt="Hermes logo" width="16" valign="middle" /> Hermes</kbd></a> &nbsp;
+  <a href="https://github.com/MoonshotAI/kimi-cli"><kbd><img src="https://www.google.com/s2/favicons?domain=kimi.com&sz=64" alt="Kimi Code logo" width="16" valign="middle" /> Kimi Code</kbd></a> &nbsp;
+  <a href="https://github.com/svkozak/pi-acp"><kbd><img src="https://pi.dev/favicon.svg" alt="Pi logo" width="16" valign="middle" /> Pi</kbd></a> &nbsp;
+  <a href="https://github.com/vibex-ai/deepseek-harness-acp"><kbd><img src="https://www.google.com/s2/favicons?domain=deepseek.com&sz=64" alt="DeepSeek Harness logo" width="16" valign="middle" /> DeepSeek Harness</kbd></a> &nbsp;
+  <a href="https://agentclientprotocol.com"><kbd>+ Any ACP Agent</kbd></a>
+</p>
 
 Built-in presets include **Claude Code**, **Codex**, **ZCode**, and
 **OpenCode**. The ACP catalog also includes integrations such as **Antigravity**,
