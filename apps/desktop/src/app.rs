@@ -34446,61 +34446,10 @@ impl VibexWorkbench {
     ) -> AnyElement {
         let tooltip = self.strings().agent_collapse_process;
         let toggle_id = row_id.clone();
-        let connector_color = cx.theme().muted_foreground.opacity(0.46);
-        let first_line_row = h_flex()
-            .min_w_0()
-            .items_center()
-            .gap_2()
-            .child(
-                div()
-                    .size(px(16.0))
-                    .flex_none()
-                    .items_center()
-                    .justify_center()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(
-                        Icon::default()
-                            .path("icons/vibex/brain.svg")
-                            .size(px(14.0))
-                            .text_color(cx.theme().muted_foreground),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .min_w_0()
-                    .flex_1()
-                    .items_center()
-                    .gap_1()
-                    .child(first_line)
-                    .child(Icon::new(IconName::ChevronDown).size(px(14.0)).flex_none()),
-            );
-        let mut content = v_flex().min_w_0().flex_1().child(first_line_row);
-        if let Some(remaining) = remaining {
-            content = content.child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .items_stretch()
-                    .gap_2()
-                    .child(
-                        v_flex()
-                            .w(px(16.0))
-                            .flex_none()
-                            .items_center()
-                            .child(div().w(px(1.0)).flex_1().bg(connector_color)),
-                    )
-                    .child(remaining),
-            );
-        }
-
-        h_flex()
+        render_reasoning_first_line_layout(cx.theme().muted_foreground, first_line, remaining)
             .id(row_id)
-            .w_full()
-            .min_w_0()
-            .items_stretch()
             .cursor_pointer()
             .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
-            .child(content)
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.toggle_reasoning_expansion(toggle_id.clone(), turn_id.clone(), cx)
             }))
@@ -34528,7 +34477,7 @@ impl VibexWorkbench {
                     None,
                     cx,
                 )
-                .w_auto()
+                .flex_auto()
                 .min_w_0()
                 .max_w_full()
                 .flex_shrink(1.0)
@@ -34609,7 +34558,7 @@ impl VibexWorkbench {
                     search_query.clone(),
                     cx,
                 )
-                .w_auto()
+                .flex_auto()
                 .min_w_0()
                 .max_w_full()
                 .flex_shrink(1.0)
@@ -40312,6 +40261,68 @@ fn reasoning_source_parts(source: &str) -> (&str, Option<&str>) {
         first_line,
         (!remaining.trim().is_empty()).then_some(remaining),
     )
+}
+
+/// Pure layout for the expanded reasoning row: a brain icon beside the first
+/// line (with a collapse chevron), and any remaining lines under a thin
+/// connector. Interaction handlers are attached by the caller.
+fn render_reasoning_first_line_layout(
+    icon_color: Hsla,
+    first_line: AnyElement,
+    remaining: Option<AnyElement>,
+) -> gpui::Div {
+    let connector_color = icon_color.opacity(0.46);
+    let first_line_row = h_flex()
+        .min_w_0()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .size(px(16.0))
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .text_color(icon_color)
+                .child(
+                    Icon::default()
+                        .path("icons/vibex/brain.svg")
+                        .size(px(14.0))
+                        .text_color(icon_color),
+                ),
+        )
+        .child(
+            h_flex()
+                .min_w_0()
+                .flex_1()
+                .items_center()
+                .gap_1()
+                .child(first_line)
+                .child(Icon::new(IconName::ChevronDown).size(px(14.0)).flex_none()),
+        );
+    let mut content = v_flex().min_w_0().flex_1().child(first_line_row);
+    if let Some(remaining) = remaining {
+        content = content.child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .items_stretch()
+                .gap_2()
+                .child(
+                    v_flex()
+                        .w(px(16.0))
+                        .flex_none()
+                        .items_center()
+                        .child(div().w(px(1.0)).flex_1().bg(connector_color)),
+                )
+                .child(remaining),
+        );
+    }
+
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .items_stretch()
+        .child(content)
 }
 
 fn render_agent_thinking_indicator(
@@ -60365,5 +60376,81 @@ mod tests {
         assert!(close.contains("self.session_search_generation"));
         assert!(close.contains("self.session_search_index_task = None;"));
         assert!(close.contains("self.session_search_index.clear();"));
+    }
+
+    struct ReasoningFirstLineProbe {
+        first_line_source: Arc<str>,
+        remaining_source: Option<Arc<str>>,
+        measured: Rc<Cell<(f32, f32)>>,
+    }
+
+    impl Render for ReasoningFirstLineProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let measured = self.measured.clone();
+            let first_line = MarkdownView::new(
+                "reasoning-probe:first-line",
+                MarkdownInput::new(self.first_line_source.clone(), "", 1)
+                    .surface(MarkdownSurface::Agent),
+            )
+            .presentation(MarkdownPresentation::Thought)
+            .flex_auto()
+            .min_w_0()
+            .max_w_full()
+            .flex_shrink(1.0)
+            .whitespace_normal()
+            .into_any_element();
+            let remaining = self.remaining_source.clone().map(|source| {
+                MarkdownView::new(
+                    "reasoning-probe:remaining",
+                    MarkdownInput::new(source, "", 1).surface(MarkdownSurface::Agent),
+                )
+                .presentation(MarkdownPresentation::Thought)
+                .w_full()
+                .min_w_0()
+                .into_any_element()
+            });
+            div().w(px(680.0)).child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .on_prepaint(move |bounds, _, _| {
+                        measured.set((
+                            f32::from(bounds.size.width),
+                            f32::from(bounds.size.height),
+                        ));
+                    })
+                    .child(render_reasoning_first_line_layout(
+                        gpui::hsla(0.0, 0.0, 0.6, 1.0),
+                        first_line,
+                        remaining,
+                    )),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn expanded_reasoning_first_line_stays_horizontal(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let measured = Rc::new(Cell::new((0.0_f32, 0.0_f32)));
+        let (_, cx) = cx.add_window_view(|_, _| ReasoningFirstLineProbe {
+            first_line_source: Arc::from(
+                "这是一段足够长的中文思考内容用来验证首行排版是否保持水平",
+            ),
+            remaining_source: Some(Arc::from("后续的思考内容保持正常的水平排版。")),
+            measured: measured.clone(),
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let (width, height) = measured.get();
+        assert!(
+            width > 500.0,
+            "reasoning row should span the probe width, got {width}"
+        );
+        assert!(
+            height < 120.0,
+            "first reasoning line should wrap horizontally instead of stacking one character per line, got height {height}"
+        );
     }
 }
