@@ -23206,27 +23206,32 @@ impl VibexWorkbench {
                                 .text_color(cx.theme().sidebar_foreground.opacity(0.60))
                                 .child(selected_count_label.clone())
                                 .child(
-                                    Button::new("sidebar-clear-batch")
-                                        .xsmall()
-                                        .ghost()
-                                        .compact()
-                                        .label(strings.sidebar_clear)
-                                        .disabled(selected_count == 0)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.sidebar_state.clear_selection();
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(
-                                    Button::new("sidebar-exit-batch")
-                                        .xsmall()
-                                        .ghost()
-                                        .compact()
-                                        .icon(IconName::Close)
-                                        .tooltip(strings.sidebar_exit_batch)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.toggle_sidebar_batch_mode(cx)
-                                        })),
+                                    h_flex()
+                                        .gap_1()
+                                        .flex_none()
+                                        .child(
+                                            Button::new("sidebar-clear-batch")
+                                                .xsmall()
+                                                .ghost()
+                                                .compact()
+                                                .label(strings.sidebar_clear)
+                                                .disabled(selected_count == 0)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.sidebar_state.clear_selection();
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("sidebar-exit-batch")
+                                                .xsmall()
+                                                .ghost()
+                                                .compact()
+                                                .icon(IconName::Close)
+                                                .tooltip(strings.sidebar_exit_batch)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.toggle_sidebar_batch_mode(cx)
+                                                })),
+                                        ),
                                 ),
                         )
                         .child(
@@ -58045,6 +58050,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("batch toolbar should remain inspectable");
 
+        assert!(batch.contains("h_flex()\n                                        .gap_1()\n                                        .flex_none()"));
         assert!(batch.contains("Button::new(\"sidebar-exit-batch\")"));
         assert!(batch.contains(".icon(IconName::Close)"));
         assert!(batch.contains(".tooltip(strings.sidebar_exit_batch)"));
