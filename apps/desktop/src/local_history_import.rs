@@ -195,6 +195,7 @@ fn text(locale: ResolvedLocale) -> ImportText {
 pub struct LocalHistoryImportDialog {
     runtime: Option<Arc<DesktopRuntime>>,
     workbench: WeakEntity<VibexWorkbench>,
+    weak_self: WeakEntity<Self>,
     locale_mode: LocaleMode,
     focus_workspace: Option<String>,
     search_input: Entity<InputState>,
@@ -228,6 +229,7 @@ impl LocalHistoryImportDialog {
         let mut dialog = Self {
             runtime,
             workbench,
+            weak_self: cx.weak_entity(),
             locale_mode,
             focus_workspace,
             search_input: input.clone(),
@@ -287,6 +289,13 @@ impl LocalHistoryImportDialog {
                 match outcome {
                     Ok(Ok(scan)) => {
                         this.phase = ImportPhase::Ready;
+                        // A fresh scan starts with every project collapsed so
+                        // the list opens compact; users expand what they need.
+                        this.collapsed = scan
+                            .folders
+                            .iter()
+                            .map(|folder| folder.workspace_root.clone())
+                            .collect();
                         if apply_focus && !this.focus_applied {
                             this.focus_applied = true;
                             if let Some(target) = focus_workspace.as_deref() {
@@ -1055,6 +1064,49 @@ impl LocalHistoryImportDialog {
             strings.imported_count
         )
     }
+
+    /// Action bar rendered in the dialog's fixed footer slot, outside the
+    /// scrollable body, so the Import button is always reachable.
+    pub fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let strings = text(self.locale());
+        let pending = self.phase == ImportPhase::Importing;
+        let selected_count = self.selected.len();
+        h_flex()
+            .w_full()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .text_color(if selected_count > 0 {
+                        cx.theme().foreground
+                    } else {
+                        cx.theme().muted_foreground
+                    })
+                    .child(format!("{} {}", selected_count, strings.selected)),
+            )
+            .child(
+                Button::new("local-history-import")
+                    .primary()
+                    .small()
+                    .loading(pending)
+                    .label(if pending {
+                        strings.importing
+                    } else {
+                        strings.import_button
+                    })
+                    .disabled(pending || selected_count == 0 || self.phase != ImportPhase::Ready)
+                    .on_click({
+                        let this = self.weak_self.clone();
+                        move |_, _, cx| {
+                            let _ = this.update(cx, |dialog, cx| dialog.import_selected(cx));
+                        }
+                    }),
+            )
+    }
 }
 
 impl Render for LocalHistoryImportDialog {
@@ -1192,7 +1244,6 @@ impl Render for LocalHistoryImportDialog {
 
         let pending = self.phase == ImportPhase::Importing;
         let folders = self.visible_folders(cx);
-        let selected_count = self.selected.len();
         let all_collapsed = !folders.is_empty()
             && folders
                 .iter()
@@ -1337,39 +1388,6 @@ impl Render for LocalHistoryImportDialog {
                         .child(format!("{}: {}", strings.import_failed, error)),
                 )
             })
-            .child(
-                h_flex()
-                    .w_full()
-                    .flex_none()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(if selected_count > 0 {
-                                cx.theme().foreground
-                            } else {
-                                cx.theme().muted_foreground
-                            })
-                            .child(format!("{} {}", selected_count, strings.selected)),
-                    )
-                    .child(
-                        Button::new("local-history-import")
-                            .primary()
-                            .small()
-                            .loading(pending)
-                            .label(if pending {
-                                strings.importing
-                            } else {
-                                strings.import_button
-                            })
-                            .disabled(pending || selected_count == 0)
-                            .on_click(cx.listener(|this, _, _, cx| this.import_selected(cx))),
-                    ),
-            )
     }
 }
 

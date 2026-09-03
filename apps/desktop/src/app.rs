@@ -15979,13 +15979,20 @@ impl VibexWorkbench {
         let title = self.strings().sidebar_import_sessions.to_string();
         let viewport = window.viewport_size();
         let dialog_width = (f32::from(viewport.width) - 32.0).clamp(280.0, 760.0);
-        // The picker root reserves its session list with `flex_1`, so the
-        // dialog needs a definite height rather than an intrinsic max-height.
+        // The picker body scrolls internally via its own tracked handle, while
+        // the action bar lives in the dialog footer slot, fixed below it.
         let dialog_height = (f32::from(viewport.height) - 32.0).clamp(1.0, 672.0);
+        let dialog_entity = dialog_view.downgrade();
         window.open_dialog(cx, move |dialog, _, cx| {
             let is_dark = cx.theme().is_dark();
             let popover = theme::semantic_color("popover", is_dark);
             let popover_foreground = theme::semantic_color("popover-foreground", is_dark);
+            // Rebuilt on every dialog render so the footer always reflects
+            // the picker's live selection/pending state.
+            let footer = dialog_entity
+                .update(cx, |picker, cx| picker.render_footer(cx).into_any_element())
+                .unwrap_or_else(|_| div().into_any_element());
+            let content_view = dialog_view.clone();
             dialog
                 .title(title.clone())
                 .w(px(dialog_width))
@@ -15997,7 +16004,8 @@ impl VibexWorkbench {
                 .border_color(popover_foreground.opacity(0.10))
                 .overlay(true)
                 .overlay_closable(true)
-                .child(dialog_view.clone())
+                .content(move |content, _, _| content.child(content_view.clone()))
+                .footer(footer)
         });
         cx.notify();
     }
