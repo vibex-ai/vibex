@@ -15815,14 +15815,12 @@ impl VibexWorkbench {
     fn open_local_history_import_dialog(
         &mut self,
         workspace: Option<(String, WorkspaceMode)>,
-        project_name: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if window.has_active_dialog(cx) {
             return;
         }
-        let locale = self.resolved_locale();
         let locale_mode = self.ui_state.appearance.locale;
         let focus_workspace = workspace.as_ref().map(|(root, _)| root.clone());
         let workbench = cx.weak_entity();
@@ -15836,38 +15834,7 @@ impl VibexWorkbench {
                 cx,
             )
         });
-        let (title, description) = match (&focus_workspace, &project_name) {
-            (Some(root), Some(name)) => {
-                let compact_root = root.clone();
-                (
-                    match locale {
-                        locale::ResolvedLocale::En => format!("Import sessions for {name}"),
-                        locale::ResolvedLocale::ZhCn => format!("导入 {name} 的会话"),
-                        locale::ResolvedLocale::ZhTw => format!("匯入 {name} 的會話"),
-                    },
-                    match locale {
-                        locale::ResolvedLocale::En => format!(
-                            "Scan local Agent sessions under {compact_root}, then import selected history."
-                        ),
-                        locale::ResolvedLocale::ZhCn => format!(
-                            "扫描 {compact_root} 下的本地 Agent 会话，然后导入选中的历史记录。"
-                        ),
-                        locale::ResolvedLocale::ZhTw => format!(
-                            "掃描 {compact_root} 下的本機 Agent 會話，然後匯入選取的歷史記錄。"
-                        ),
-                    },
-                )
-            }
-            _ => (
-                locale::text("Import local sessions", "导入本地会话", "匯入本機會話").to_string(),
-                locale::text(
-                    "Scan local Agent session stores, then import selected history.",
-                    "扫描本地 Agent 会话存储，然后导入选中的历史记录。",
-                    "掃描本機 Agent 會話儲存，然後匯入選取的歷史記錄。",
-                )
-                .to_string(),
-            ),
-        };
+        let title = self.strings().sidebar_import_sessions.to_string();
         let viewport = window.viewport_size();
         let dialog_width = (f32::from(viewport.width) - 32.0).clamp(280.0, 760.0);
         // The picker root reserves its session list with `flex_1`, so the
@@ -15888,13 +15855,6 @@ impl VibexWorkbench {
                 .border_color(popover_foreground.opacity(0.10))
                 .overlay(true)
                 .overlay_closable(true)
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .mb_2()
-                        .child(description.clone()),
-                )
                 .child(dialog_view.clone())
         });
         cx.notify();
@@ -23191,7 +23151,7 @@ impl VibexWorkbench {
                 .disabled(state.import_disabled)
                 .on_click(move |_, window, cx| {
                     let _ = import_entity.update(cx, |this, cx| {
-                        this.open_local_history_import_dialog(None, None, window, cx)
+                        this.open_local_history_import_dialog(None, window, cx)
                     });
                 }),
         )
@@ -23214,7 +23174,6 @@ impl VibexWorkbench {
         let auto_continue_project_id = target.project_id.clone();
         let new_folder_project_id = target.project_id.clone();
         let import_workspace = target.import_workspace.clone();
-        let import_project_name = target.project_name.clone();
         let delete_project_id = target.project_id;
         let delete_project_name = target.project_name.clone();
         let auto_continue_enabled = target.auto_continue_enabled;
@@ -23271,7 +23230,6 @@ impl VibexWorkbench {
                         let _ = import_entity.update(cx, |this, cx| {
                             this.open_local_history_import_dialog(
                                 Some(import_workspace.clone()),
-                                Some(import_project_name.clone()),
                                 window,
                                 cx,
                             )

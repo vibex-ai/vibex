@@ -8,8 +8,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use gpui::{
-    Anchor, AnyElement, App, ClickEvent, Context, Entity, IntoElement, SharedString, Subscription,
-    Task, WeakEntity, Window, div, prelude::*, px,
+    Anchor, AnyElement, App, ClickEvent, Context, Entity, IntoElement, ScrollHandle, SharedString,
+    Subscription, Task, WeakEntity, Window, div, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
@@ -51,6 +51,8 @@ enum FolderSelection {
     All,
 }
 
+/// Localized static strings for the picker. Strings that need runtime numbers
+/// (for example the totals line) are composed by dedicated helpers below.
 #[derive(Clone, Copy)]
 struct ImportText {
     search: &'static str,
@@ -69,10 +71,8 @@ struct ImportText {
     expand_all: &'static str,
     collapse_all: &'static str,
     selected: &'static str,
-    summary: &'static str,
-    importable: &'static str,
-    folders: &'static str,
-    no_folder: &'static str,
+    projects: &'static str,
+    imported_count: &'static str,
     imported: &'static str,
     already_imported: &'static str,
     not_found: &'static str,
@@ -107,10 +107,8 @@ fn text(locale: ResolvedLocale) -> ImportText {
             expand_all: "Expand all",
             collapse_all: "Collapse all",
             selected: "selected",
-            summary: "sessions",
-            importable: "importable",
-            folders: "folders",
-            no_folder: "without a workspace",
+            projects: "projects",
+            imported_count: "sessions imported",
             imported: "Imported",
             already_imported: "Already imported",
             not_found: "Not found",
@@ -142,10 +140,8 @@ fn text(locale: ResolvedLocale) -> ImportText {
             expand_all: "全部展开",
             collapse_all: "全部折叠",
             selected: "已选",
-            summary: "个会话",
-            importable: "可导入",
-            folders: "个工作区",
-            no_folder: "个无工作区",
+            projects: "个项目",
+            imported_count: "个会话已导入",
             imported: "已导入",
             already_imported: "已存在",
             not_found: "已消失",
@@ -177,10 +173,8 @@ fn text(locale: ResolvedLocale) -> ImportText {
             expand_all: "全部展開",
             collapse_all: "全部摺疊",
             selected: "已選",
-            summary: "個會話",
-            importable: "可匯入",
-            folders: "個工作區",
-            no_folder: "個無工作區",
+            projects: "個專案",
+            imported_count: "個會話已匯入",
             imported: "已匯入",
             already_imported: "已存在",
             not_found: "已消失",
@@ -216,6 +210,7 @@ pub struct LocalHistoryImportDialog {
     scan_task: Option<Task<()>>,
     import_task: Option<Task<()>>,
     focus_applied: bool,
+    list_scroll: ScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -248,6 +243,7 @@ impl LocalHistoryImportDialog {
             scan_task: None,
             import_task: None,
             focus_applied: false,
+            list_scroll: ScrollHandle::new(),
             _subscriptions: vec![cx.subscribe(&input, |_, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
                     cx.notify();
@@ -635,92 +631,91 @@ impl LocalHistoryImportDialog {
             })
             .count();
         let folder_path = folder.workspace_root.clone();
-        let mut result =
-            vec![
-                h_flex()
-                    .id(SharedString::from(format!(
-                        "local-history-folder:{folder_path}"
-                    )))
-                    .w_full()
+        let row_id = SharedString::from(format!("local-history-folder:{folder_path}"));
+        let mut row = h_flex()
+            .id(row_id)
+            .w_full()
+            .min_w_0()
+            .h(px(44.0))
+            .items_center()
+            .gap_2()
+            .px_2()
+            .rounded(px(6.0))
+            .bg(cx.theme().muted.opacity(0.24))
+            .child(self.checkbox(
+                SharedString::from(format!("local-history-folder-check:{folder_path}")),
+                selection == FolderSelection::All,
+                selection == FolderSelection::Some,
+                pending || selectable_count == 0,
+                {
+                    let sessions = sessions.to_vec();
+                    move |this, cx| this.toggle_folder(&sessions, cx)
+                },
+                cx,
+            ))
+            .child(
+                Icon::new(if collapsed {
+                    IconName::ChevronRight
+                } else {
+                    IconName::ChevronDown
+                })
+                .size(px(14.0))
+                .flex_none()
+                .text_color(cx.theme().muted_foreground),
+            )
+            .child(
+                Icon::new(if collapsed {
+                    IconName::Folder
+                } else {
+                    IconName::FolderOpen
+                })
+                .size(px(15.0))
+                .flex_none()
+                .text_color(cx.theme().muted_foreground),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .max_w(px(240.0))
+                    .truncate()
+                    .text_sm()
+                    .font_medium()
+                    .child(folder_name(&folder.workspace_root)),
+            )
+            .child(
+                div()
+                    .flex_1()
                     .min_w_0()
-                    .h(px(44.0))
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .rounded(px(6.0))
-                    .bg(cx.theme().muted.opacity(0.24))
-                    .child(self.checkbox(
-                        SharedString::from(format!("local-history-folder-check:{folder_path}")),
-                        selection == FolderSelection::All,
-                        selection == FolderSelection::Some,
-                        pending || selectable_count == 0,
-                        {
-                            let sessions = sessions.to_vec();
-                            move |this, cx| this.toggle_folder(&sessions, cx)
-                        },
-                        cx,
-                    ))
-                    .child(
-                        Button::new(SharedString::from(format!(
-                            "local-history-folder-toggle:{folder_path}"
-                        )))
-                        .ghost()
-                        .xsmall()
-                        .icon(if collapsed {
-                            IconName::ChevronRight
-                        } else {
-                            IconName::ChevronDown
-                        })
-                        .disabled(pending)
-                        .on_click(cx.listener({
-                            let folder_path = folder_path.clone();
-                            move |this, _: &ClickEvent, _, cx| {
-                                this.toggle_collapse(folder_path.clone(), cx)
-                            }
-                        })),
-                    )
-                    .child(
-                        Icon::new(if collapsed {
-                            IconName::Folder
-                        } else {
-                            IconName::FolderOpen
-                        })
-                        .size(px(15.0))
-                        .text_color(cx.theme().muted_foreground),
-                    )
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_sm()
-                                    .font_medium()
-                                    .child(folder_name(&folder.workspace_root)),
-                            )
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(compact_path(&folder.workspace_root)),
-                            ),
-                    )
-                    .child(h_flex().flex_none().gap_1().children(
-                        folder.sources.iter().take(4).map(|source| {
-                            agent_brand_icon(source.agent_id().as_str(), px(15.0), None)
-                        }),
-                    ))
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!("{selected_count}/{selectable_count}")),
-                    )
-                    .into_any_element(),
-            ];
+                    .truncate()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(compact_path(&folder.workspace_root)),
+            )
+            .child(
+                h_flex().flex_none().gap_1().children(
+                    folder
+                        .sources
+                        .iter()
+                        .take(4)
+                        .map(|source| agent_brand_icon(source.agent_id().as_str(), px(15.0), None)),
+                ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("{selected_count}/{selectable_count}")),
+            );
+        if !pending {
+            row = row
+                .cursor_pointer()
+                .hover(|style| style.bg(cx.theme().muted.opacity(0.36)))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.toggle_collapse(folder_path.clone(), cx)
+                }));
+        }
+        let mut result = vec![row.into_any_element()];
         if !collapsed {
             result.extend(
                 sessions
@@ -861,7 +856,7 @@ impl LocalHistoryImportDialog {
             .id("local-history-agent-menu")
             .w(px(224.0))
             .max_h(px(260.0))
-            .overflow_y_scrollbar()
+            .overflow_y_scroll()
             .gap_0p5();
         let all_row = h_flex()
             .id("local-history-agent-all")
@@ -1013,6 +1008,14 @@ impl LocalHistoryImportDialog {
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(strings.select_all.to_string()),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .truncate()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(self.project_totals_summary()),
             );
         if interactive {
             row = row
@@ -1030,10 +1033,32 @@ impl LocalHistoryImportDialog {
         self.source_filter.clear();
         cx.notify();
     }
+
+    /// Total projects and already-imported sessions across the whole scan,
+    /// shown at the right end of the master select-all row.
+    fn project_totals_summary(&self) -> String {
+        let Some(scan) = self.scan.as_ref() else {
+            return String::new();
+        };
+        let strings = text(self.locale());
+        let imported = scan
+            .folders
+            .iter()
+            .flat_map(|folder| folder.sessions.iter())
+            .filter(|session| session.status == LocalHistoryImportStatus::Imported)
+            .count();
+        format!(
+            "{} {} · {} {}",
+            scan.folders.len(),
+            strings.projects,
+            imported,
+            strings.imported_count
+        )
+    }
 }
 
 impl Render for LocalHistoryImportDialog {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let locale = self.locale();
         let strings = text(locale);
         match self.phase {
@@ -1125,10 +1150,11 @@ impl Render for LocalHistoryImportDialog {
                     .when(!errors.is_empty(), |view| {
                         view.child(
                             v_flex()
+                                .id("local-history-import-errors")
                                 .max_h(px(96.0))
                                 .w_full()
                                 .max_w(px(520.0))
-                                .overflow_y_scrollbar()
+                                .overflow_y_scroll()
                                 .gap_1()
                                 .p_2()
                                 .border_1()
@@ -1172,7 +1198,6 @@ impl Render for LocalHistoryImportDialog {
                 .iter()
                 .all(|(folder, _)| self.collapsed.contains(&folder.workspace_root));
         let present_sources = present_sources(self.scan.as_ref());
-        let body_height = (f32::from(window.viewport_size().height) - 180.0).clamp(220.0, 560.0);
         let list = if folders.is_empty() {
             let empty = self
                 .scan
@@ -1209,12 +1234,19 @@ impl Render for LocalHistoryImportDialog {
                 .iter()
                 .flat_map(|(folder, sessions)| self.render_folder(folder, sessions, pending, cx))
                 .collect::<Vec<_>>();
+            // Plain overflow scrolling with an explicitly tracked handle, not
+            // `overflow_y_scrollbar()`: that wrapper makes the content column
+            // auto-sized, so inside this flex chain the list would collapse to
+            // its content height, `max_h` would clip the overflow, and the
+            // scroll range (content - bounds) would be zero — leaving rows
+            // below the fold unreachable except through search.
             v_flex()
                 .id("local-history-list")
                 .flex_1()
                 .min_h_0()
-                .max_h(px(body_height))
-                .overflow_y_scrollbar()
+                .track_scroll(&self.list_scroll)
+                .overflow_y_scroll()
+                .vertical_scrollbar(&self.list_scroll)
                 .gap_1()
                 .p_1()
                 .children(rows)
@@ -1312,36 +1344,10 @@ impl Render for LocalHistoryImportDialog {
                     .items_center()
                     .gap_2()
                     .child(
-                        self.scan
-                            .as_ref()
-                            .map(|scan| {
-                                let summary = div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(format!(
-                                        "{} {} · {} {} · {} {}",
-                                        scan.total_sessions,
-                                        strings.summary,
-                                        scan.importable_count,
-                                        strings.importable,
-                                        scan.folders.len(),
-                                        strings.folders
-                                    ));
-                                summary.when(scan.unassigned_count > 0, |view| {
-                                    view.child(format!(
-                                        " · {} {}",
-                                        scan.unassigned_count, strings.no_folder
-                                    ))
-                                })
-                            })
-                            .unwrap_or_else(|| div().flex_1().child("")),
-                    )
-                    .child(
                         div()
-                            .flex_none()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
                             .text_xs()
                             .text_color(if selected_count > 0 {
                                 cx.theme().foreground
@@ -1349,14 +1355,6 @@ impl Render for LocalHistoryImportDialog {
                                 cx.theme().muted_foreground
                             })
                             .child(format!("{} {}", selected_count, strings.selected)),
-                    )
-                    .child(
-                        Button::new("local-history-close")
-                            .ghost()
-                            .small()
-                            .label(strings.close)
-                            .disabled(pending)
-                            .on_click(|_, window, cx| window.close_dialog(cx)),
                     )
                     .child(
                         Button::new("local-history-import")
