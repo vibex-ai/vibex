@@ -22944,6 +22944,17 @@ impl VibexWorkbench {
                                             this.sidebar_state.clear_selection();
                                             cx.notify();
                                         })),
+                                )
+                                .child(
+                                    Button::new("sidebar-exit-batch")
+                                        .xsmall()
+                                        .ghost()
+                                        .compact()
+                                        .icon(IconName::Close)
+                                        .tooltip(strings.sidebar_exit_batch)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.toggle_sidebar_batch_mode(cx)
+                                        })),
                                 ),
                         )
                         .child(
@@ -57534,6 +57545,26 @@ mod tests {
         assert!(session.contains(
             ".anchor_scroll(selected.then(|| self.selected_session_scroll_anchor.clone()))"
         ));
+    }
+
+    #[test]
+    fn sidebar_batch_mode_exposes_an_exit_control() {
+        let source = include_str!("app.rs");
+        let sidebar = source
+            .split_once("    fn render_agent_sidebar(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn build_sidebar_toolbar_more_menu("))
+            .map(|(body, _)| body)
+            .expect("sidebar renderer should remain inspectable");
+        let batch = sidebar
+            .split_once(".when(self.sidebar_batch_mode, |this| {")
+            .and_then(|(_, tail)| tail.split_once("\n            .child("))
+            .map(|(body, _)| body)
+            .expect("batch toolbar should remain inspectable");
+
+        assert!(batch.contains("Button::new(\"sidebar-exit-batch\")"));
+        assert!(batch.contains(".icon(IconName::Close)"));
+        assert!(batch.contains(".tooltip(strings.sidebar_exit_batch)"));
+        assert!(batch.contains("this.toggle_sidebar_batch_mode(cx)"));
     }
 
     #[test]
