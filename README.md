@@ -138,6 +138,13 @@ build graph. `pnpm check:mobile-native` validates the mobile crate and checked-i
 native project contract without claiming that an Android or iOS SDK is installed
 on the host.
 
+Tagged releases use the free GitHub-hosted native matrix in
+`.github/workflows/release.yml`: Linux `.deb`/AppImage, macOS `.dmg`, Windows
+NSIS, Android APK/AAB, and unsigned iOS simulator/XCFramework artifacts are
+collected by one aggregation job. macOS/Windows signing and mobile store upload
+are optional credentialed follow-up steps; the default pipeline does not require
+paid services or signing secrets.
+
 ## Development
 
 ### Desktop packaging

@@ -7,9 +7,11 @@ embeds the other product's assets.
 | Product | Artifact | Build command | Determinism | Required validation |
 | --- | --- | --- | --- | --- |
 | Desktop Preview | Linux `.deb`/AppImage | `pnpm package:preview` | Source, Cargo lock, PDFium lock | `pnpm check:release`, package smoke, native content gates |
-| Desktop RC/Stable | Platform package | `pnpm package:rc` / `pnpm package:stable` | Source, Cargo lock, release channel | Release runbook, signing, install and rollback evidence |
-| Android mobile | Native GPUI APK | `pnpm build:mobile:android` or `pnpm package:mobile:android` | Rust source, Cargo lock, vendor/zed revision, Gradle wrapper | `pnpm check:mobile-native`, APK/device validation, signing pipeline |
-| iOS mobile | Native GPUI app/XCFramework | `pnpm build:mobile:ios` on macOS | Rust source, Cargo lock, vendor/zed revision, XcodeGen project | `pnpm check:mobile-native`, simulator/device validation, signing pipeline |
+| Desktop RC/Stable Linux | `.deb`/AppImage | `pnpm package:rc` / `pnpm package:stable` | Source, Cargo lock, release channel, reviewed Linux PDFium | Release runbook, signing, install and rollback evidence |
+| Desktop RC/Stable macOS | `.dmg` | `node scripts/package-desktop-release.mjs --platform macos` | Source, Cargo lock, native macOS runner | Package existence and checksum; signing/notarization when credentials exist |
+| Desktop RC/Stable Windows | NSIS `.exe` | `node scripts/package-desktop-release.mjs --platform windows` | Source, Cargo lock, native Windows runner | Package existence and checksum; Authenticode when credentials exist |
+| Android mobile | Unsigned native GPUI APK + AAB | `pnpm package:mobile:android` | Rust source, Cargo lock, vendor/zed revision, Gradle wrapper, Android API 35/NDK | `pnpm check:mobile-native`, APK/AAB checksum, device validation and signing pipeline |
+| iOS mobile | Unsigned simulator app + XCFramework | `pnpm build:mobile:ios` on macOS | Rust source, Cargo lock, vendor/zed revision, XcodeGen project | `pnpm check:mobile-native`, simulator/device validation and signing pipeline |
 | Relay | Transport container | `pnpm smoke:relay:local` plus deployment scripts | Rust source and Cargo lock | Health/API smoke, TLS/NAT/operator validation |
 
 ## Mobile Packaging Rules
@@ -23,3 +25,9 @@ embeds the other product's assets.
   reconnect, approvals, composer, and route selection. A terminal-only smoke is
   not sufficient for the product session surface.
 - Signing credentials and provisioning profiles remain outside source control.
+- Tagged releases use `.github/workflows/release.yml`: native desktop jobs and
+  mobile jobs upload to the GitHub Actions artifact store, then one aggregation
+  job publishes all assets to the matching GitHub Release.
+- Standard GitHub-hosted runners are the default cost-free path for public
+  repositories. Optional updater signing is skipped unless its repository
+  variable and secrets are explicitly enabled.

@@ -63,6 +63,7 @@
     "package:preview": "node scripts/prepare-pdfium-runtime.mjs --offline && node scripts/build-channel.mjs preview && NO_STRIP=1 cargo packager --config apps/desktop/Packager.preview.toml --formats deb,appimage",
     "package:rc": "node scripts/prepare-pdfium-runtime.mjs --offline && node scripts/build-channel.mjs rc && NO_STRIP=1 cargo packager --config apps/desktop/Packager.rc.toml --formats deb,appimage",
     "package:stable": "node scripts/prepare-pdfium-runtime.mjs --offline && node scripts/build-channel.mjs stable && NO_STRIP=1 cargo packager --config apps/desktop/Packager.stable.toml --formats deb,appimage",
+    "package:desktop:release": "node scripts/package-desktop-release.mjs",
     "build:mobile:android": "bash apps/mobile/scripts/build-android.sh",
     "build:mobile:ios": "bash apps/mobile/scripts/build-ios.sh",
     "package:mobile:android": "VIBEX_MOBILE_PROFILE=release bash apps/mobile/scripts/build-android.sh",

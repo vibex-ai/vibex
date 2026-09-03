@@ -4,17 +4,22 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 PROFILE="${VIBEX_MOBILE_PROFILE:-debug}"
 RUST_FLAGS=()
-GRADLE_TASK="assembleDebug"
+GRADLE_TASKS=(assembleDebug)
 ANDROID_TARGETS=(arm64-v8a x86_64)
+GRADLE_ARGS=()
 
 if [[ "$PROFILE" == "release" ]]; then
   RUST_FLAGS+=(--release)
-  GRADLE_TASK="assembleRelease"
+  GRADLE_TASKS=(assembleRelease bundleRelease)
   ANDROID_TARGETS=(arm64-v8a)
 fi
 
 if [[ -n "${VIBEX_MOBILE_ANDROID_TARGETS:-}" ]]; then
   read -r -a ANDROID_TARGETS <<<"$VIBEX_MOBILE_ANDROID_TARGETS"
+fi
+
+if [[ -n "${VIBEX_MOBILE_VERSION:-}" ]]; then
+  GRADLE_ARGS+=("-PvibexVersion=${VIBEX_MOBILE_VERSION}")
 fi
 
 NDK_TARGET_ARGS=()
@@ -34,4 +39,4 @@ cargo ndk \
   build -p vibex-mobile --lib "${RUST_FLAGS[@]}"
 
 cd apps/mobile/android
-./gradlew "$GRADLE_TASK"
+./gradlew "${GRADLE_TASKS[@]}" "${GRADLE_ARGS[@]}"

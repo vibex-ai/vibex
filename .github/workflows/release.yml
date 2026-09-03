@@ -6,7 +6,7 @@ on:
       - "v[0-9]*"
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: publish-release-${{ github.ref }}
@@ -15,26 +15,26 @@ concurrency:
 env:
   CARGO_INCREMENTAL: "0"
   CARGO_PACKAGER_VERSION: "0.11.8"
+  CARGO_NDK_VERSION: "4.1.2"
 
 jobs:
-  linux:
-    name: Linux x86_64 release
+  release-meta:
+    name: Resolve release metadata
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      channel: ${{ steps.release.outputs.channel }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           submodules: recursive
-      - uses: pnpm/action-setup@7088e561eb65bb68695d245aa206f005ef30921d
+      - uses: pnpm/action-setup@7088e561eb65bb68695d245aa206f005ef30921d # v4.1.0
         with:
           version: 11.3.0
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
-          cache: pnpm
-      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83
-        with:
-          components: rustfmt, clippy
+      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
       - name: Resolve and verify release identity
         id: release
         shell: bash
@@ -51,65 +51,208 @@ jobs:
           node --input-type=module - "${version}" "${channel}" <<'NODE'
           import { execFileSync } from "node:child_process";
           import { readFileSync } from "node:fs";
-
           const [version, channel] = process.argv.slice(2);
-          const metadata = JSON.parse(execFileSync(
-            "cargo",
-            ["metadata", "--locked", "--no-deps", "--format-version", "1"],
-            { encoding: "utf8" }
-          ));
+          const metadata = JSON.parse(execFileSync("cargo", ["metadata", "--locked", "--no-deps", "--format-version", "1"], { encoding: "utf8" }));
           const desktop = metadata.packages.find((pkg) => pkg.name === "vibex-desktop");
-          if (desktop?.version !== version) {
-            throw new Error(`tag ${version} does not match vibex-desktop ${desktop?.version}`);
-          }
+          if (desktop?.version !== version) throw new Error(`tag ${version} does not match vibex-desktop ${desktop?.version}`);
           const packageVersion = JSON.parse(readFileSync("package.json", "utf8")).version;
-          if (packageVersion !== version) {
-            throw new Error(`tag ${version} does not match package.json ${packageVersion}`);
-          }
+          if (packageVersion !== version) throw new Error(`tag ${version} does not match package.json ${packageVersion}`);
           const packager = readFileSync(`apps/desktop/Packager.${channel}.toml`, "utf8");
-          if (!packager.includes(`version = "${version}"`)) {
-            throw new Error(`Packager.${channel}.toml does not declare version ${version}`);
-          }
+          if (!packager.includes(`version = "${version}"`)) throw new Error(`Packager.${channel}.toml does not declare version ${version}`);
           NODE
-          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
           echo "channel=${channel}" >> "${GITHUB_OUTPUT}"
+
+  desktop:
+    name: Desktop ${{ matrix.platform }}
+    needs: release-meta
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            runner: ubuntu-24.04
+          - platform: macos
+            runner: macos-14
+          - platform: windows
+            runner: windows-2022
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: recursive
+      - uses: pnpm/action-setup@7088e561eb65bb68695d245aa206f005ef30921d # v4.1.0
+        with:
+          version: 11.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+        with:
+          components: rustfmt, clippy
       - name: Install Linux native dependencies
+        if: matrix.platform == 'linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libfontconfig1-dev libvulkan1 libxkbcommon-x11-dev patchelf
       - name: Install dependencies and packager
+        shell: bash
         run: |
           pnpm install --frozen-lockfile
           cargo install cargo-packager --version "${CARGO_PACKAGER_VERSION}" --locked
       - name: Verify release contracts
-        run: |
-          pnpm check:release
-          cargo test -p vibex-app-update --locked
-      - name: Build signed-update-capable desktop
+        run: pnpm check:release
+      - name: Test updater contracts
+        if: matrix.platform == 'linux'
+        run: cargo test -p vibex-app-update --locked
+      - name: Build and package desktop artifact
         env:
+          VIBEX_UPDATE_SIGNING_ENABLED: ${{ vars.VIBEX_UPDATE_SIGNING_ENABLED || 'false' }}
           VIBEX_UPDATE_PUBLIC_KEY: ${{ vars.VIBEX_UPDATE_PUBLIC_KEY }}
+        run: >-
+          node scripts/package-desktop-release.mjs
+          --platform ${{ matrix.platform }}
+          --channel ${{ needs.release-meta.outputs.channel }}
+          --version ${{ needs.release-meta.outputs.version }}
+      - name: Upload desktop artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: desktop-${{ matrix.platform }}-${{ github.sha }}
+          path: target/release-artifacts/**
+          if-no-files-found: error
+          retention-days: 14
+
+  mobile-android:
+    name: Mobile Android release artifact
+    needs: release-meta
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+        with:
+          targets: aarch64-linux-android
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+      - name: Verify native mobile contract
+        run: node scripts/check-mobile-native.mjs
+      - name: Install Android SDK and NDK
         run: |
-          set -euo pipefail
-          test -n "${VIBEX_UPDATE_PUBLIC_KEY}"
-          node scripts/prepare-pdfium-runtime.mjs
-          node scripts/build-channel.mjs "${{ steps.release.outputs.channel }}"
-          NO_STRIP=1 cargo packager \
-            --config "apps/desktop/Packager.${{ steps.release.outputs.channel }}.toml" \
-            --formats deb,appimage
-      - name: Normalize release assets
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;27.0.12077973"
+          ndk_path="${ANDROID_HOME}/ndk/27.0.12077973"
+          {
+            echo "ANDROID_NDK_HOME=${ndk_path}"
+            echo "ANDROID_NDK_ROOT=${ndk_path}"
+          } >> "${GITHUB_ENV}"
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --version "${CARGO_NDK_VERSION}" --locked
+      - name: Build unsigned APK and AAB
+        env:
+          VIBEX_MOBILE_PROFILE: release
+          VIBEX_MOBILE_VERSION: ${{ needs.release-meta.outputs.version }}
+        run: bash apps/mobile/scripts/build-android.sh
+      - name: Normalize Android artifacts and checksums
         shell: bash
         run: |
           set -euo pipefail
-          package_dir="target/release-packages/${{ steps.release.outputs.channel }}"
-          mapfile -t debs < <(find "${package_dir}" -maxdepth 1 -type f -name '*.deb' -print)
-          mapfile -t appimages < <(find "${package_dir}" -maxdepth 1 -type f -name '*.AppImage' -print)
-          test "${#debs[@]}" -eq 1
-          test "${#appimages[@]}" -eq 1
+          output="target/mobile-android"
+          mkdir -p "${output}"
+          cp apps/mobile/android/app/build/outputs/apk/release/app-release-unsigned.apk "${output}/vibex-${{ needs.release-meta.outputs.version }}-android-arm64.apk"
+          cp apps/mobile/android/app/build/outputs/bundle/release/app-release.aab "${output}/vibex-${{ needs.release-meta.outputs.version }}-android-arm64.aab"
+          for artifact in "${output}"/*.{apk,aab}; do
+            sha256sum "${artifact}" > "${artifact}.sha256"
+          done
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mobile-android-${{ github.sha }}
+          path: target/mobile-android/**
+          if-no-files-found: error
+          retention-days: 14
+
+  mobile-ios:
+    name: Mobile iOS release artifact
+    needs: release-meta
+    runs-on: macos-14
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+        with:
+          targets: aarch64-apple-ios, aarch64-apple-ios-sim
+      - name: Verify native mobile contract
+        run: node scripts/check-mobile-native.mjs
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Build iOS XCFramework
+        env:
+          VIBEX_MOBILE_PROFILE: release
+        run: bash apps/mobile/scripts/build-ios.sh
+      - name: Build unsigned simulator app
+        run: >-
+          xcodebuild -project apps/mobile/ios/Vibex.xcodeproj
+          -scheme Vibex -sdk iphonesimulator -configuration Release
+          MARKETING_VERSION=${{ needs.release-meta.outputs.version }}
+          -derivedDataPath target/mobile-ios CODE_SIGNING_ALLOWED=NO
+          CODE_SIGNING_REQUIRED=NO build
+      - name: Normalize iOS artifacts and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="target/mobile-ios-artifacts"
+          mkdir -p "${output}"
+          ditto -c -k --sequesterRsrc --keepParent apps/mobile/ios/VibexFFI.xcframework "${output}/vibex-${{ needs.release-meta.outputs.version }}-ios-xcframework.zip"
+          ditto -c -k --sequesterRsrc --keepParent target/mobile-ios/Build/Products/Release-iphonesimulator/Vibex.app "${output}/vibex-${{ needs.release-meta.outputs.version }}-ios-simulator.app.zip"
+          for artifact in "${output}"/*.zip; do
+            shasum -a 256 "${artifact}" > "${artifact}.sha256"
+          done
+      - name: Upload iOS artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mobile-ios-${{ github.sha }}
+          path: target/mobile-ios-artifacts/**
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Aggregate and publish release
+    permissions:
+      contents: write
+    needs: [release-meta, desktop, mobile-android, mobile-ios]
+    if: ${{ always() && needs.release-meta.result == 'success' && needs.desktop.result == 'success' && needs.mobile-android.result == 'success' && needs.mobile-ios.result == 'success' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: recursive
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: "*-*-${{ github.sha }}"
+          path: target/release-downloads
+          merge-multiple: false
+      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+        with:
+          components: rustfmt
+      - name: Collect immutable release assets
+        shell: bash
+        run: |
+          set -euo pipefail
           mkdir -p target/publish
-          cp "${debs[0]}" "target/publish/vibex-${{ steps.release.outputs.version }}-linux-x86_64-deb.deb"
-          cp "${appimages[0]}" "target/publish/vibex-${{ steps.release.outputs.version }}-linux-x86_64-appimage.AppImage"
-      - name: Generate and sign update manifest
+          find target/release-downloads -type f ! -name 'release-assets.json' -exec cp {} target/publish/ \;
+          test -n "$(find target/publish -type f -not -name '*.sha256' -print -quit)"
+      - name: Generate and sign updater manifest when configured
+        if: vars.VIBEX_UPDATE_SIGNING_ENABLED == 'true'
         env:
           VIBEX_UPDATE_PUBLIC_KEY: ${{ vars.VIBEX_UPDATE_PUBLIC_KEY }}
           VIBEX_UPDATE_SIGNING_KEY: ${{ secrets.VIBEX_UPDATE_SIGNING_KEY }}
@@ -118,32 +261,57 @@ jobs:
           set -euo pipefail
           test -n "${VIBEX_UPDATE_PUBLIC_KEY}"
           test -n "${VIBEX_UPDATE_SIGNING_KEY}"
-          version="${{ steps.release.outputs.version }}"
-          tag="${{ steps.release.outputs.tag }}"
+          version="${{ needs.release-meta.outputs.version }}"
+          tag="${GITHUB_REF_NAME}"
+          channel="${{ needs.release-meta.outputs.channel }}"
           repository_url="https://github.com/vibex-ai/vibex/releases/download/${tag}"
-          generated_key="$(
-            cargo run --release --locked -p vibex-app-update --bin vibex-update-manifest -- \
-              --channel "${{ steps.release.outputs.channel }}" \
-              --version "${version}" \
-              --published-at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
-              --output target/publish/vibex-update.json \
-              --signature-output target/publish/vibex-update.json.sig \
-              --artifact "linux|x86_64|deb|system_installer|target/publish/vibex-${version}-linux-x86_64-deb.deb|${repository_url}/vibex-${version}-linux-x86_64-deb.deb" \
-              --artifact "linux|x86_64|appimage|self_replace|target/publish/vibex-${version}-linux-x86_64-appimage.AppImage|${repository_url}/vibex-${version}-linux-x86_64-appimage.AppImage"
-          )"
+          mapfile -t debs < <(find target/publish -maxdepth 1 -type f -name '*-linux-x86_64-deb.deb' -print)
+          mapfile -t appimages < <(find target/publish -maxdepth 1 -type f -name '*-linux-x86_64-appimage.AppImage' -print)
+          mapfile -t macos_apps < <(find target/publish -maxdepth 1 -type f -name '*-macos-*-app.dmg' -print)
+          mapfile -t windows_installers < <(find target/publish -maxdepth 1 -type f -name '*-windows-x86_64-nsis.exe' -print)
+          test "${#debs[@]}" -eq 1
+          test "${#appimages[@]}" -eq 1
+          test "${#macos_apps[@]}" -eq 1
+          test "${#windows_installers[@]}" -eq 1
+          macos_name="$(basename "${macos_apps[0]}")"
+          macos_arch="${macos_name##*-macos-}"
+          macos_arch="${macos_arch%-app.dmg}"
+          test -n "${macos_arch}"
+          case "${macos_arch}" in
+            aarch64) macos_manifest_arch="arm64" ;;
+            x86_64) macos_manifest_arch="x86_64" ;;
+            *) echo "unsupported macOS artifact architecture: ${macos_arch}" >&2; exit 1 ;;
+          esac
+          manifest_args=( \
+            --channel "${channel}" --version "${version}" \
+            --published-at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            --output target/publish/vibex-update.json \
+            --signature-output target/publish/vibex-update.json.sig \
+            --artifact "linux|x86_64|deb|system_installer|${debs[0]}|${repository_url}/$(basename "${debs[0]}")" \
+            --artifact "linux|x86_64|appimage|self_replace|${appimages[0]}|${repository_url}/$(basename "${appimages[0]}")" \
+            --artifact "macos|${macos_manifest_arch}|app|system_installer|${macos_apps[0]}|${repository_url}/${macos_name}" \
+            --artifact "windows|x86_64|nsis|system_installer|${windows_installers[0]}|${repository_url}/$(basename "${windows_installers[0]}")" \
+          )
+          generated_key="$(cargo run --release --locked -p vibex-app-update --bin vibex-update-manifest -- "${manifest_args[@]}")"
           test "${generated_key}" = "update_public_key=${VIBEX_UPDATE_PUBLIC_KEY}"
+      - name: Generate aggregate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd target/publish
+            find . -maxdepth 1 -type f ! -name '*.sha256' ! -name 'SHA256SUMS' -printf '%f\0' |
+              sort -z |
+              xargs -0 -n1 sha256sum
+          ) > target/publish/SHA256SUMS
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          release_flags=(--verify-tag --generate-notes)
-          if [[ "${{ steps.release.outputs.channel }}" != "stable" ]]; then
+          release_flags=(--verify-tag --generate-notes --title "Vibex ${{ needs.release-meta.outputs.version }}")
+          if [[ "${{ needs.release-meta.outputs.channel }}" != "stable" ]]; then
             release_flags+=(--prerelease)
           fi
-          gh release create \
-            "${{ steps.release.outputs.tag }}" \
-            target/publish/* \
-            "${release_flags[@]}" \
-            --title "Vibex ${{ steps.release.outputs.version }}"
+          gh release create "${GITHUB_REF_NAME}" target/publish/* "${release_flags[@]}"

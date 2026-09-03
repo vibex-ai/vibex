@@ -117,6 +117,35 @@ function validatePackaging() {
   const workflow = source(".github/workflows/release-candidate.yml");
   assert(workflow.includes("ubuntu-24.04"), "candidate workflow lost its Linux host");
   assert(workflow.includes("--formats deb,appimage"), "candidate workflow formats drifted");
+  const releaseWorkflow = source(".github/workflows/release.yml");
+  for (const required of [
+    "platform: linux",
+    "platform: macos",
+    "platform: windows",
+    "name: Desktop ${{ matrix.platform }}",
+    "mobile-android",
+    "mobile-ios",
+    "download-artifact",
+    "gh release create",
+    "package-desktop-release.mjs",
+    "VIBEX_UPDATE_SIGNING_ENABLED",
+    "CARGO_NDK_VERSION",
+    "ANDROID_NDK_HOME",
+    "ANDROID_NDK_ROOT",
+    "MARKETING_VERSION",
+    "generated_key",
+    "SHA256SUMS"
+  ]) {
+    assert(releaseWorkflow.includes(required), `publish workflow is missing ${required}`);
+  }
+  assert(
+    source("apps/mobile/scripts/build-android.sh").includes("bundleRelease"),
+    "Android release workflow must produce an AAB"
+  );
+  assert(
+    source("scripts/package-desktop-release.mjs").includes("--formats"),
+    "desktop release packager must select an explicit platform format"
+  );
 }
 
 function validateUiStateSafety() {
