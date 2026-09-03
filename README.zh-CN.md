@@ -4,12 +4,7 @@
 </p>
 
 <h1 align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="logo-white.svg" />
-    <img src="logo-black.svg" alt="Vibex" width="88" />
-  </picture>
-  <br />
-  Vibex
+  <img src="logo-wordmark-white.svg" alt="Vibex" width="168" />
 </h1>
 
 <p align="center">
