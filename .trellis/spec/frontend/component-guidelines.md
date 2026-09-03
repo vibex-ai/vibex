@@ -183,6 +183,19 @@ if hover_preview_was_open {
 Regression coverage must assert both the requested-open/drawer result and that
 hover-preview navigation enters the suppression path.
 
+Popup menus opened from a hover-preview sidebar (row context menus, ellipsis
+dropdown menus) occlude the sidebar panel, so the panel's `on_hover(false)`
+fires while the pointer is over the menu and would collapse the sidebar out
+from under it. Latch the preview open whenever such a menu is built: set a
+menu-open latch (which also cancels any pending close), subscribe to the menu
+entity's `DismissEvent` to release the latch, and guard the delayed-close
+scheduler with the latch. On dismissal, re-arm the auto-close only when the
+pointer is outside both the floating panel and the title-bar trigger strip,
+measured from `window.mouse_position()` because the panel's hover state is
+stale after occlusion. Every dismissal path (item click, Escape, click
+outside) emits `DismissEvent`, so the latch cannot stick; each sidebar menu
+builder must arm it, and source-inspection tests should assert that.
+
 Panel resize handles should stay below floating sidebars, drawers, dialogs, and
 other portaled overlays in z-index. The resize hot zone only needs to sit above
 its owning panel content; using overlay-level z-index values can make resize

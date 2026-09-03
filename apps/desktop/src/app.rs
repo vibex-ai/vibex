@@ -18,12 +18,12 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use gpui::{
     AccessibleAction, Anchor, Animation, AnimationExt as _, AnyElement, AnyWindowHandle, App,
-    Bounds, ClickEvent, ClipboardEntry, ClipboardItem, Context, Decorations, DragMoveEvent,
-    ElementId, Empty, Entity, EntityInputHandler, ExternalPaths, FocusHandle, Focusable as _,
-    FontWeight, Global, HighlightStyle, Hsla, Image, ImageFormat, IntoElement, KeyBinding,
-    KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, Orientation,
-    ParentElement as _, PathBuilder, Pixels, Render, Rgba, Role, ScrollAnchor, ScrollDelta,
-    ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, Size,
+    Bounds, ClickEvent, ClipboardEntry, ClipboardItem, Context, Decorations, DismissEvent,
+    DragMoveEvent, ElementId, Empty, Entity, EntityInputHandler, ExternalPaths, FocusHandle,
+    Focusable as _, FontWeight, Global, HighlightStyle, Hsla, Image, ImageFormat, IntoElement,
+    KeyBinding, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit,
+    Orientation, ParentElement as _, PathBuilder, Pixels, Render, Rgba, Role, ScrollAnchor,
+    ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, Size,
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _, StyledText,
     Subscription, Task, Unbind, WeakEntity, Window, WindowBackgroundAppearance, WindowBounds,
     WindowControlArea, WindowDecorations, WindowOptions, canvas, div, img, linear_color_stop,
@@ -4454,6 +4454,9 @@ pub struct VibexWorkbench {
     sidebar_hover_preview_open: bool,
     sidebar_hover_preview_suppressed_until: Option<Instant>,
     sidebar_hover_preview_close_task: Option<Task<()>>,
+    /// Set while a sidebar popup menu (context/dropdown) is open so the hover
+    /// preview does not auto-close while the pointer is over the menu.
+    sidebar_menu_hover_latch: bool,
     sidebar_context_menu_target: Option<SidebarContextMenuTarget>,
     sidebar_project_appearance_popover: Option<String>,
     sidebar_project_logo_upload_task: Option<Task<()>>,
@@ -5206,6 +5209,7 @@ impl VibexWorkbench {
             sidebar_hover_preview_open: false,
             sidebar_hover_preview_suppressed_until: None,
             sidebar_hover_preview_close_task: None,
+            sidebar_menu_hover_latch: false,
             sidebar_context_menu_target: None,
             sidebar_project_appearance_popover: None,
             sidebar_project_logo_upload_task: None,
@@ -21026,6 +21030,9 @@ impl VibexWorkbench {
     fn close_sidebar_hover_preview(&mut self) {
         self.sidebar_hover_preview_close_task = None;
         self.sidebar_hover_preview_open = false;
+        // The menu entity that armed the latch is gone; clear it so a stale
+        // latch can never keep a future preview permanently open.
+        self.sidebar_menu_hover_latch = false;
     }
 
     fn retain_sidebar_hover_preview(&mut self) {
@@ -21263,6 +21270,7 @@ impl VibexWorkbench {
         if !self.sidebar_hover_preview_open
             || self.sidebar_picker_task.is_some()
             || self.sidebar_rename_target.is_some()
+            || self.sidebar_menu_hover_latch
         {
             return;
         }
@@ -21287,6 +21295,56 @@ impl VibexWorkbench {
         } else {
             self.schedule_sidebar_hover_preview_close(cx);
         }
+    }
+
+    /// Arms the menu latch for a sidebar popup menu. While latched, the hover
+    /// preview stays open even when the pointer moves onto the popup menu
+    /// (which occludes the sidebar panel and fires `on_hover(false)`).
+    fn begin_sidebar_menu_hover(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_menu_hover_latch = true;
+        self.retain_sidebar_hover_preview();
+        cx.notify();
+    }
+
+    /// Releases the menu latch when the popup menu dismisses. Re-arms the
+    /// auto-close only when the pointer has not returned to the sidebar.
+    fn end_sidebar_menu_hover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_menu_hover_latch = false;
+        if !self.sidebar_hover_preview_open {
+            return;
+        }
+        let viewport_width = self.last_visibility.layout.viewport_width;
+        let position = window.mouse_position();
+        let over_trigger = position.x <= px(TITLE_BAR_COLLAPSED_SIDEBAR_WIDTH)
+            && position.y <= px(TITLE_BAR_HEIGHT);
+        let over_panel = position.y >= px(TITLE_BAR_HEIGHT)
+            && position.x <= px(sidebar_floating_width(viewport_width));
+        if !over_trigger && !over_panel {
+            self.schedule_sidebar_hover_preview_close(cx);
+        }
+    }
+
+    /// Subscribes to the popup menu's dismiss event so the latch is released
+    /// on every dismissal path (item click, Escape, click outside). The
+    /// subscription is detached because it is bound to the menu entity itself,
+    /// which drops when the menu closes.
+    fn hold_sidebar_hover_preview_for_menu(
+        menu: &Entity<PopupMenu>,
+        entity: &WeakEntity<Self>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let latch_entity = entity.clone();
+        let subscription = window.subscribe(
+            menu,
+            cx,
+            move |_: Entity<PopupMenu>, _: &DismissEvent, window, cx| {
+                let _ = latch_entity.update(cx, |this, cx| {
+                    this.end_sidebar_menu_hover(window, cx);
+                });
+            },
+        );
+        subscription.detach();
     }
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -22508,7 +22566,7 @@ impl VibexWorkbench {
                             .px_0()
                             .tooltip(locale::text("Session actions", "会话操作", "會話操作"))
                             .icon(IconName::Ellipsis)
-                            .dropdown_menu(move |menu, _, menu_cx| {
+                            .dropdown_menu(move |menu, window, menu_cx| {
                                 Self::build_title_session_menu(
                                     menu,
                                     session_id.clone(),
@@ -22517,6 +22575,7 @@ impl VibexWorkbench {
                                     deletion_pending,
                                     strings,
                                     entity.clone(),
+                                    window,
                                     menu_cx,
                                 )
                             })
@@ -22837,8 +22896,12 @@ impl VibexWorkbench {
         deletion_pending: bool,
         strings: Strings,
         entity: WeakEntity<Self>,
-        _cx: &mut Context<PopupMenu>,
+        window: &mut Window,
+        cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
+        let menu_entity = cx.entity();
+        let _ = entity.update(cx, |this, cx| this.begin_sidebar_menu_hover(cx));
+        Self::hold_sidebar_hover_preview_for_menu(&menu_entity, &entity, window, cx);
         let rename_entity = entity.clone();
         let pin_entity = entity.clone();
         let delete_entity = entity;
@@ -23041,11 +23104,12 @@ impl VibexWorkbench {
                                     .h(px(28.0))
                                     .icon(IconName::Ellipsis)
                                     .tooltip(locale::text("More", "更多", "更多"))
-                                    .dropdown_menu(move |menu, _, cx| {
+                                    .dropdown_menu(move |menu, window, cx| {
                                         Self::build_sidebar_toolbar_more_menu(
                                             menu,
                                             toolbar_more_entity.clone(),
                                             toolbar_more_state,
+                                            window,
                                             cx,
                                         )
                                     })
@@ -23324,10 +23388,11 @@ impl VibexWorkbench {
                                             );
                                         },
                                     ))
-                                    .context_menu(move |menu, _, cx| {
+                                    .context_menu(move |menu, window, cx| {
                                         Self::build_sidebar_root_menu(
                                             menu,
                                             root_menu_entity.clone(),
+                                            window,
                                             cx,
                                         )
                                     }),
@@ -23344,9 +23409,12 @@ impl VibexWorkbench {
         menu: PopupMenu,
         entity: WeakEntity<Self>,
         state: SidebarToolbarMoreMenuState,
+        window: &mut Window,
         cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
-        let _ = entity.update(cx, |this, _| this.retain_sidebar_hover_preview());
+        let menu_entity = cx.entity();
+        let _ = entity.update(cx, |this, cx| this.begin_sidebar_menu_hover(cx));
+        Self::hold_sidebar_hover_preview_for_menu(&menu_entity, &entity, window, cx);
         let new_folder_entity = entity.clone();
         let hierarchy_entity = entity.clone();
         let batch_entity = entity.clone();
@@ -23410,9 +23478,12 @@ impl VibexWorkbench {
         target: SidebarProjectMenuTarget,
         strings: Strings,
         entity: WeakEntity<Self>,
+        window: &mut Window,
         cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
-        let _ = entity.update(cx, |this, _| this.retain_sidebar_hover_preview());
+        let menu_entity = cx.entity();
+        let _ = entity.update(cx, |this, cx| this.begin_sidebar_menu_hover(cx));
+        Self::hold_sidebar_hover_preview_for_menu(&menu_entity, &entity, window, cx);
         let appearance_entity = entity.clone();
         let auto_continue_entity = entity.clone();
         let new_folder_entity = entity.clone();
@@ -23506,8 +23577,12 @@ impl VibexWorkbench {
         workspace_id: vibex_core::WorkspaceId,
         branch: String,
         entity: WeakEntity<Self>,
-        _cx: &mut Context<PopupMenu>,
+        window: &mut Window,
+        cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
+        let menu_entity = cx.entity();
+        let _ = entity.update(cx, |this, cx| this.begin_sidebar_menu_hover(cx));
+        Self::hold_sidebar_hover_preview_for_menu(&menu_entity, &entity, window, cx);
         let new_folder_entity = entity;
         menu.item(PopupMenuItem::label(branch)).separator().item(
             PopupMenuItem::new(locale::text(
@@ -23533,9 +23608,12 @@ impl VibexWorkbench {
     fn build_sidebar_root_menu(
         menu: PopupMenu,
         entity: WeakEntity<Self>,
+        window: &mut Window,
         cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
-        let _ = entity.update(cx, |this, _| this.retain_sidebar_hover_preview());
+        let menu_entity = cx.entity();
+        let _ = entity.update(cx, |this, cx| this.begin_sidebar_menu_hover(cx));
+        Self::hold_sidebar_hover_preview_for_menu(&menu_entity, &entity, window, cx);
         menu.item(
             PopupMenuItem::new(locale::text("New Folder", "新建文件夹", "新建資料夾"))
                 .icon(sidebar_icon("icons/vibex/folder-plus.svg"))
@@ -23561,7 +23639,9 @@ impl VibexWorkbench {
             workspace_id,
             auto_archive_after_days,
         } = target;
-        let _ = entity.update(cx, |this, _| this.retain_sidebar_hover_preview());
+        let menu_entity = cx.entity();
+        let _ = entity.update(cx, |this, cx| this.begin_sidebar_menu_hover(cx));
+        Self::hold_sidebar_hover_preview_for_menu(&menu_entity, &entity, window, cx);
         let new_folder_entity = entity.clone();
         let rename_entity = entity.clone();
         let archive_entity = entity.clone();
@@ -24823,7 +24903,7 @@ impl VibexWorkbench {
                     );
                 },
             ))
-            .context_menu(move |menu, _, cx| {
+            .context_menu(move |menu, window, cx| {
                 let _ = context_menu_hover_entity.update(cx, |this, cx| {
                     this.set_sidebar_context_menu_target(
                         SidebarContextMenuTarget::Project(context_menu_project_id.clone()),
@@ -24835,6 +24915,7 @@ impl VibexWorkbench {
                     context_menu_target.clone(),
                     strings,
                     context_menu_entity.clone(),
+                    window,
                     cx,
                 )
             })
@@ -24932,12 +25013,13 @@ impl VibexWorkbench {
                                 .h(px(24.0))
                                 .icon(IconName::Ellipsis)
                                 .tooltip(project_actions_label)
-                                .dropdown_menu(move |menu, _, cx| {
+                                .dropdown_menu(move |menu, window, cx| {
                                     Self::build_sidebar_project_menu(
                                         menu,
                                         project_menu_target.clone(),
                                         strings,
                                         menu_entity.clone(),
+                                        window,
                                         cx,
                                     )
                                 })
@@ -25367,13 +25449,14 @@ impl VibexWorkbench {
                 this.finish_sidebar_workspace_drag(&drag.project_id, &drag.workspace_id, cx);
                 cx.stop_propagation();
             }))
-            .context_menu(move |menu, _, cx| {
+            .context_menu(move |menu, window, cx| {
                 Self::build_sidebar_workspace_menu(
                     menu,
                     workspace_menu_project_id.clone(),
                     workspace_menu_workspace_id.clone(),
                     workspace_menu_branch.clone(),
                     workspace_menu_entity.clone(),
+                    window,
                     cx,
                 )
             })
@@ -26020,15 +26103,23 @@ impl VibexWorkbench {
                             this.select_session(select_session_id.clone(), cx);
                         }
                     }))
-                    .context_menu(move |menu, _, cx| {
+                    .context_menu(move |menu, window, cx| {
                         let _ = context_hover_entity.update(cx, |this, cx| {
                             this.set_sidebar_context_menu_target(
                                 SidebarContextMenuTarget::Session(context_menu_session_id.clone()),
                                 cx,
                             );
                         });
-                        let _ = context_entity
-                            .update(cx, |this, _| this.retain_sidebar_hover_preview());
+                        let menu_entity = cx.entity();
+                        let _ = context_entity.update(cx, |this, cx| {
+                            this.begin_sidebar_menu_hover(cx)
+                        });
+                        Self::hold_sidebar_hover_preview_for_menu(
+                            &menu_entity,
+                            &context_entity,
+                            window,
+                            cx,
+                        );
                         let auto_continue_entity = context_entity.clone();
                         let auto_continue_id = context_auto_continue_id.clone();
                         let resume_auto_continue_entity = context_entity.clone();
@@ -51789,6 +51880,56 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_popup_menus_latch_the_hover_preview_open() {
+        let source = include_str!("app.rs");
+        let schedule = source
+            .split_once("    fn schedule_sidebar_hover_preview_close(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn handle_sidebar_hover("))
+            .map(|(body, _)| body)
+            .expect("hover preview close scheduler should remain inspectable");
+        assert!(schedule.contains("self.sidebar_menu_hover_latch"));
+
+        let latch = source
+            .split_once("    fn begin_sidebar_menu_hover(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn toggle_sidebar("))
+            .map(|(body, _)| body)
+            .expect("sidebar menu latch should remain inspectable");
+        assert!(latch.contains("self.sidebar_menu_hover_latch = true;"));
+        assert!(latch.contains("fn hold_sidebar_hover_preview_for_menu("));
+        assert!(latch.contains("DismissEvent"));
+        assert!(latch.contains("schedule_sidebar_hover_preview_close"));
+
+        // Every sidebar popup menu builder must arm the latch so the hover
+        // preview survives the pointer moving onto the occluding menu.
+        for builder in [
+            "    fn build_title_session_menu(",
+            "    fn build_sidebar_toolbar_more_menu(",
+            "    fn build_sidebar_root_menu(",
+            "    fn build_sidebar_project_menu(",
+            "    fn build_sidebar_workspace_menu(",
+            "    fn build_sidebar_folder_menu(",
+        ] {
+            let body = source
+                .split_once(builder)
+                .and_then(|(_, tail)| tail.split_once("\n    fn "))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("{builder} should remain inspectable"));
+            assert!(
+                body.contains("begin_sidebar_menu_hover"),
+                "{builder} should latch the hover preview"
+            );
+        }
+
+        // The session-row context menu is built inline and must latch too.
+        let session_menu = source
+            .split_once("    fn render_sidebar_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_new_session_panel("))
+            .map(|(body, _)| body)
+            .expect("session row renderer should remain inspectable");
+        assert!(session_menu.contains("begin_sidebar_menu_hover"));
+    }
+
+    #[test]
     fn sidebar_session_navigation_leaves_management_without_background_navigation() {
         let source = include_str!("app.rs");
         let selection = source
@@ -52005,10 +52146,10 @@ mod tests {
             .expect("project renderer should remain inspectable");
 
         let row_menu = project
-            .find(".context_menu(move |menu, _, cx|")
+            .find(".context_menu(move |menu, window, cx|")
             .expect("the full project row should expose a context menu");
         let action_menu = project
-            .find(".dropdown_menu(move |menu, _, cx|")
+            .find(".dropdown_menu(move |menu, window, cx|")
             .expect("the project action button should expose a menu");
         assert!(project[row_menu..].contains("Self::build_sidebar_project_menu("));
         assert!(project[action_menu..].contains("Self::build_sidebar_project_menu("));
