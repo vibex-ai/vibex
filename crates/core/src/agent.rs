@@ -222,17 +222,12 @@ pub struct ForkAgentSessionRequest {
 
 /// Shared session timeline presentation preferences.  The desktop remains the
 /// authority for the inherited values; mobile may persist a local override.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentTimelineReasoningDisplayMode {
+    #[default]
     LatestAtBottom,
     Timeline,
-}
-
-impl Default for AgentTimelineReasoningDisplayMode {
-    fn default() -> Self {
-        Self::LatestAtBottom
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

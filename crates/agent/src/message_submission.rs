@@ -532,7 +532,8 @@ impl MessageSubmissionCoordinator {
                 Ok(state) => Some(state),
                 Err(error)
                     if error.code == "session_runtime_selection_uninitialized"
-                        && current.required_runtime_policy != RuntimeSwitchPolicy::ForceFreshSession =>
+                        && current.required_runtime_policy
+                            != RuntimeSwitchPolicy::ForceFreshSession =>
                 {
                     // Imported sessions have no initial runtime yet: seed one
                     // from the desired selection instead of failing the queue.

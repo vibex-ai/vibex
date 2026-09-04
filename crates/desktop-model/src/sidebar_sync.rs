@@ -593,6 +593,7 @@ pub fn sidebar_project_items(
 /// legacy `sidebar_project_items` path; detailed mode only pulls folders that
 /// explicitly belong to this workspace. Compact callers may opt into showing
 /// all project folders so older clients do not hide newly scoped folders.
+#[allow(clippy::too_many_arguments)]
 pub fn sidebar_project_items_for_workspace(
     organization: &SidebarOrganizationState,
     project_id: &str,

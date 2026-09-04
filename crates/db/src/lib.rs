@@ -11676,12 +11676,12 @@ fn compact_file_operation_for_storage(operation: &FileOperationPayload) -> FileO
         .as_ref()
         .map_or(0, String::len)
         .saturating_add(compacted.new_text.as_ref().map_or(0, String::len));
-    if let Some(patch) = patch {
-        if snapshot_bytes == 0 || patch.text.len().saturating_mul(2) < snapshot_bytes {
-            compacted.old_text = None;
-            compacted.new_text = None;
-            compacted.patch = Some(patch);
-        }
+    if let Some(patch) = patch
+        && (snapshot_bytes == 0 || patch.text.len().saturating_mul(2) < snapshot_bytes)
+    {
+        compacted.old_text = None;
+        compacted.new_text = None;
+        compacted.patch = Some(patch);
     }
     compacted
 }
