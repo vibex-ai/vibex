@@ -49017,6 +49017,8 @@ fn settings_page(
     let background = theme::semantic_color("background", is_dark);
     let foreground = theme::semantic_color("foreground", is_dark);
     let border = theme::semantic_color("border", is_dark);
+    let card = theme::semantic_color("card", is_dark);
+    let muted = theme::semantic_color("muted", is_dark);
     let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
 
     v_flex()
@@ -49030,7 +49032,7 @@ fn settings_page(
         .py_8()
         .child(
             v_flex()
-                .gap_2()
+                .gap_1()
                 .child(div().text_lg().font_semibold().child(title))
                 .child(
                     div()
@@ -49040,14 +49042,35 @@ fn settings_page(
                         .child(description),
                 ),
         )
-        .child(
+        // Group all rows in one rounded panel with inset separators so the
+        // page reads as a calm grouped list instead of a stack of dividers.
+        .child({
+            let mut panel_rows = Vec::with_capacity(rows.len().saturating_mul(2));
+            for (index, row) in rows.into_iter().enumerate() {
+                if index > 0 {
+                    panel_rows.push(
+                        div()
+                            .flex_none()
+                            .h(px(1.0))
+                            .bg(border.opacity(0.5))
+                            .into_any_element(),
+                    );
+                }
+                panel_rows.push(row);
+            }
             v_flex()
-                .gap_3()
-                .border_t_1()
-                .border_color(border.opacity(0.65))
-                .pt_5()
-                .children(rows),
-        )
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(border.opacity(0.55))
+                .bg(if is_dark {
+                    card.opacity(0.35)
+                } else {
+                    muted.opacity(0.45)
+                })
+                .px_4()
+                .py_1()
+                .children(panel_rows)
+        })
         .into_any_element()
 }
 
@@ -49059,9 +49082,7 @@ fn setting_row(
     cx: &App,
 ) -> AnyElement {
     let is_dark = cx.theme().is_dark();
-    let border = theme::semantic_color("border", is_dark);
     let primary = theme::semantic_color("primary", is_dark);
-    let primary_foreground = theme::semantic_color("primary-foreground", is_dark);
     let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
     let is_highlighted = cx
         .try_global::<SettingsRenderContext>()
@@ -49088,32 +49109,18 @@ fn setting_row(
             this.flex_row().items_center().justify_between()
         })
         .gap_4()
-        .border_b_1()
-        .border_color(border.opacity(0.65))
-        .px_0()
-        .py_4()
+        .py(px(14.0))
         .anchor_scroll(target_anchor)
+        .when(is_highlighted, |this| {
+            this.rounded(px(6.0))
+                .bg(primary.opacity(if is_dark { 0.16 } else { 0.10 }))
+        })
         .child(
             v_flex()
                 .min_w_0()
                 .flex_1()
-                .child(
-                    div()
-                        .w_auto()
-                        .self_start()
-                        .rounded(px(4.0))
-                        .px_2()
-                        .py(px(2.0))
-                        .text_sm()
-                        .font_medium()
-                        .when(is_highlighted, |this| {
-                            this.bg(primary.opacity(0.96))
-                                .border_1()
-                                .border_color(primary)
-                                .text_color(primary_foreground)
-                        })
-                        .child(title),
-                )
+                .gap_1()
+                .child(div().text_sm().font_medium().child(title))
                 .child(
                     div()
                         .text_xs()
@@ -49145,30 +49152,24 @@ fn settings_number_stepper(
     cx: &App,
 ) -> AnyElement {
     let is_dark = cx.theme().is_dark();
-    let background = theme::semantic_color("background", is_dark);
     let foreground = theme::semantic_color("foreground", is_dark);
-    let muted = theme::semantic_color("muted", is_dark);
     let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
-    let border = theme::semantic_color("border", is_dark);
+    let input = theme::semantic_color("input", is_dark);
+    let input_background = input.opacity(if is_dark { 0.30 } else { 0.20 });
 
     h_flex()
-        .h(px(32.0))
+        .h(px(28.0))
         .flex_none()
-        .rounded(px(10.0))
+        .rounded(px(8.0))
         .border_1()
-        .border_color(border)
-        .bg(muted.opacity(0.25))
+        .border_color(input.opacity(0.75))
+        .bg(input_background)
         .p(px(2.0))
-        .shadow(vec![
-            gpui::BoxShadow::new(px(0.0), px(2.0), background.opacity(0.40))
-                .blur_radius(px(4.0))
-                .inset(),
-        ])
         .child(
             Button::new(SharedString::from(format!("{id}-down")))
                 .small()
                 .ghost()
-                .rounded(px(8.0))
+                .rounded(px(6.0))
                 .icon(IconName::Minus)
                 .tooltip(decrease_label)
                 .text_color(muted_foreground)
@@ -49178,15 +49179,15 @@ fn settings_number_stepper(
         )
         .child(
             h_flex()
-                .min_w(px(64.0))
+                .min_w(px(56.0))
                 .h_full()
                 .items_center()
                 .justify_center()
                 .gap_1()
-                .px_2()
+                .px_1()
                 .text_center()
                 .text_sm()
-                .font_semibold()
+                .font_medium()
                 .child(value.to_string())
                 .when_some(suffix, |this, suffix| {
                     this.child(
@@ -49202,7 +49203,7 @@ fn settings_number_stepper(
             Button::new(SharedString::from(format!("{id}-up")))
                 .small()
                 .ghost()
-                .rounded(px(8.0))
+                .rounded(px(6.0))
                 .icon(IconName::Plus)
                 .tooltip(increase_label)
                 .text_color(muted_foreground)
@@ -58549,8 +58550,8 @@ mod tests {
         assert!(settings.contains(".when(selected"));
         assert!(settings.contains(".whitespace_normal()"));
         assert!(source.contains("let is_highlighted = cx"));
-        assert!(source.contains(".text_color(primary_foreground)"));
-        assert!(source.contains(".border_color(primary)"));
+        assert!(source.contains(".when(is_highlighted, |this| {"));
+        assert!(source.contains("primary.opacity(if is_dark { 0.16 } else { 0.10 })"));
         assert!(
             source.contains(".capture_key_down(cx.listener(Self::on_settings_search_key_down))")
         );
