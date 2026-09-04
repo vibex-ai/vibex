@@ -76,7 +76,7 @@ impl fmt::Debug for PreparedContextBridge {
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CanonicalContextBridge {
+pub(crate) struct CanonicalContextBridge {
     version: i64,
     from_sequence: i64,
     through_sequence: i64,
@@ -115,10 +115,10 @@ enum ContextBridgeRole {
     Assistant,
 }
 
-struct BuiltContextBridge {
-    projection: CanonicalContextBridge,
-    summary_sequence: i64,
-    fingerprint: String,
+pub(crate) struct BuiltContextBridge {
+    pub(crate) projection: CanonicalContextBridge,
+    pub(crate) summary_sequence: i64,
+    pub(crate) fingerprint: String,
 }
 
 impl ContextBridgeService {
@@ -271,7 +271,7 @@ impl ContextBridgeService {
         Ok(built)
     }
 
-    fn build_window(
+    pub(crate) fn build_window(
         &self,
         conn: &DbConnection,
         session_id: &VibexSessionId,

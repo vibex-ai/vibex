@@ -2392,6 +2392,17 @@ impl AgentManager {
             .as_ref()
             .map(|bridge| bridge.provider_text(&request.text))
             .unwrap_or_else(|| request.text.clone());
+        // A bridge-carrying turn is (typically) the first prompt of a fresh
+        // provider session after a runtime switch, and its text opens with the
+        // internal bridge payload rather than user prose. Providers that
+        // report their first prompt back as the session title would otherwise
+        // replace the user-visible title with that payload; the real user
+        // message above still seeds the title. Same reasoning as
+        // `AgentTurnDisplayPolicy::INTERNAL`.
+        let apply_provider_session_title = display.apply_provider_session_title
+            && !prepared_context_bridge
+                .as_ref()
+                .is_some_and(PreparedContextBridge::has_prompt_content);
         let attempt = self
             .run_provider_turn_attempt(
                 &session,
@@ -2405,7 +2416,7 @@ impl AgentManager {
                 Some(required_runtime.clone()),
                 Some(expected_execution_identity.clone()),
                 coalesce_after_sequence,
-                display.apply_provider_session_title,
+                apply_provider_session_title,
                 &runner,
             )
             .await;
@@ -2465,7 +2476,7 @@ impl AgentManager {
             .collect::<HashMap<_, _>>();
         for event in turn_result.events {
             if let Some(title) = event.session_title.as_deref() {
-                if display.apply_provider_session_title {
+                if apply_provider_session_title {
                     let _ = self.apply_auto_session_title(&session.id, title);
                 }
                 continue;
@@ -5130,9 +5141,14 @@ mod tests {
         RuntimeSwitchActiveWorkPolicy, RuntimeSwitchId, RuntimeSwitchPolicy, RuntimeSwitchStatus,
         SessionRuntimeConfigState, WorkspaceMode,
     };
-    use vibex_db::{DesiredRuntimeSwitchEnqueueRequest, WorkspaceRepository};
+    use vibex_db::{
+        ContextBridgePrepareRequest, ContextBridgeRepository, DesiredRuntimeSwitchEnqueueRequest,
+        DesiredRuntimeSwitchEnqueueResult, RequestedSwitchClaimOutcome, RuntimeBindingRepository,
+        RuntimeSwitchCommitRequest, RuntimeSwitchRepository, WorkspaceRepository,
+    };
 
     use super::*;
+    use crate::CONTEXT_BRIDGE_VERSION;
     use crate::adapter::{
         ProviderCreateRequest, ProviderSessionHandle, ProviderTurnRequest, ProviderTurnResult,
     };
@@ -5940,6 +5956,337 @@ mod tests {
                     session_id: session.id.clone(),
                     required_runtime: Some(selection),
                     text: "hello there".to_string(),
+                    attachments: Vec::new(),
+                    reasoning_effort: None,
+                    correlation_id: None,
+                },
+                AgentTurnDisplayPolicy::USER_AUTHORED,
+                ContextBridgeTurnBehavior::ConsumePending,
+                None,
+                |provider, handle, turn_request| async move {
+                    provider.send_turn(handle, turn_request).await
+                },
+            )
+            .await
+            .unwrap();
+        let conn = manager.open_migrated().unwrap();
+        assert_eq!(
+            SessionRepository::get(&conn, &session.id)
+                .unwrap()
+                .unwrap()
+                .title,
+            "provider generated title"
+        );
+        drop(conn);
+
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn bridge_carrying_turns_do_not_apply_provider_session_titles() {
+        let db_path = temp_db_path("bridge-title-suppressed");
+        let workspace_root = temp_workspace_path("bridge-title-suppressed");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let mut manager = AgentManager::new(&db_path).unwrap();
+        let mut conn = manager.open_migrated().unwrap();
+        ProviderProfileRepository::ensure_local_defaults(&conn).unwrap();
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let agent_id = AgentId::parse("bridge-title-test-agent").unwrap();
+        let adapter_id = AcpAdapterId::parse("bridge-title-test-acp").unwrap();
+        let provider_profile_id =
+            ProviderProfileId::parse(ProviderKind::Acp.local_default_profile_id().to_string())
+                .unwrap();
+        let default_title = format!("{agent_id} session");
+        let session = insert_session(
+            &conn,
+            &default_title,
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            agent_id.clone(),
+            AgentSessionState::Idle,
+        );
+        // Prior conversation content so the prepared bridge window has turns.
+        TimelineRepository::append(
+            &mut conn,
+            &session.id,
+            TimelineSource::User,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "earlier user context".into(),
+                attachments: Vec::new(),
+            }),
+            None,
+            None,
+            TimelineRedactionState::None,
+        )
+        .unwrap();
+        TimelineRepository::append(
+            &mut conn,
+            &session.id,
+            TimelineSource::Agent,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: "earlier assistant context".into(),
+                is_final: true,
+            }),
+            None,
+            None,
+            TimelineRedactionState::None,
+        )
+        .unwrap();
+
+        let source_selection = SessionRuntimeSelection::provider(
+            agent_id.clone(),
+            provider_profile_id.clone(),
+            "bridge-title-test-model",
+        );
+        let mut runtime_config = SessionRuntimeConfigState {
+            preferred_model: source_selection.model_id().map(str::to_string),
+            effective_model: source_selection.model_id().map(str::to_string),
+            ..SessionRuntimeConfigState::default()
+        };
+        runtime_config.mark_generation_if_converged(0);
+        let now = unix_timestamp_ms();
+        let source_binding = RuntimeBinding {
+            binding_id: RuntimeBindingId::new(),
+            session_id: session.id.clone(),
+            agent_id: agent_id.clone(),
+            transport_kind: TransportKind::Acp,
+            auth_source: source_selection.auth_source.clone(),
+            auth_source_revision: 1,
+            adapter_id: adapter_id.clone(),
+            adapter_version: "1.0.0".to_string(),
+            adapter_compatibility_identity: "bridge-title-test-acp@1".to_string(),
+            native_session_id: Some("native-bridge-title-source".to_string()),
+            native_state_home_id: NativeStateHomeId::new(),
+            provider_resume_identity: None,
+            process_spawn_fingerprint: "bridge-title-test-source".to_string(),
+            session_runtime_config_state: runtime_config.clone(),
+            capability_snapshot: None,
+            restore_compatibility_key: None,
+            last_context_sequence: 0,
+            last_summary_sequence: 0,
+            context_bridge_version: 0,
+            activation_generation: 0,
+            binding_state: BindingState::Current,
+            created_by_switch_id: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        AgentSessionRuntimeRepository::initialize_runtime_selection(
+            &mut conn,
+            &source_binding,
+            &source_selection,
+        )
+        .unwrap();
+
+        // Enqueue and commit a runtime switch whose target binding carries a
+        // pending context bridge, exactly like a completed agent switch.
+        let target_selection = SessionRuntimeSelection::provider(
+            agent_id.clone(),
+            provider_profile_id.clone(),
+            "bridge-title-test-model-2",
+        );
+        let target_binding_id = RuntimeBindingId::new();
+        let switch_id = RuntimeSwitchId::new();
+        let DesiredRuntimeSwitchEnqueueResult::Enqueued(switch_record) =
+            AgentSessionRuntimeRepository::enqueue_desired_switch(
+                &mut conn,
+                switch_id.clone(),
+                &DesiredRuntimeSwitchEnqueueRequest {
+                    session_id: session.id.clone(),
+                    idempotency_key: "bridge-title-switch".to_string(),
+                    expected_revision: 0,
+                    expected_selection_revision: 0,
+                    target_binding_id: target_binding_id.clone(),
+                    target_adapter_id: adapter_id.clone(),
+                    target_auth_source_revision: 1,
+                    desired: target_selection.clone(),
+                    requested_policy: RuntimeSwitchPolicy::Automatic,
+                    active_work_policy: RuntimeSwitchActiveWorkPolicy::default(),
+                    requested_session_config: RuntimeSwitchCoordinator::encode_requested_config(
+                        &target_selection,
+                        None,
+                    )
+                    .unwrap(),
+                },
+            )
+            .unwrap()
+        else {
+            panic!("changed desired selection must enqueue a switch");
+        };
+        assert_eq!(
+            RuntimeSwitchRepository::claim_requested(&mut conn, &switch_id).unwrap(),
+            RequestedSwitchClaimOutcome::Claimed
+        );
+        RuntimeSwitchRepository::advance_status(
+            &conn,
+            &switch_id,
+            RuntimeSwitchStatus::Reserved,
+            RuntimeSwitchStatus::Preparing,
+        )
+        .unwrap();
+        let mut target_binding = RuntimeBinding {
+            binding_id: target_binding_id.clone(),
+            session_id: session.id.clone(),
+            agent_id: agent_id.clone(),
+            transport_kind: TransportKind::Acp,
+            auth_source: target_selection.auth_source.clone(),
+            auth_source_revision: 1,
+            adapter_id: adapter_id.clone(),
+            adapter_version: "1.0.0".to_string(),
+            adapter_compatibility_identity: "bridge-title-test-acp@1".to_string(),
+            native_session_id: Some("native-bridge-title-target".to_string()),
+            native_state_home_id: NativeStateHomeId::new(),
+            provider_resume_identity: None,
+            process_spawn_fingerprint: "bridge-title-test-target".to_string(),
+            session_runtime_config_state: {
+                let mut config = SessionRuntimeConfigState {
+                    preferred_model: target_selection.model_id().map(str::to_string),
+                    effective_model: target_selection.model_id().map(str::to_string),
+                    ..SessionRuntimeConfigState::default()
+                };
+                config.mark_generation_if_converged(0);
+                config
+            },
+            capability_snapshot: None,
+            restore_compatibility_key: None,
+            last_context_sequence: 0,
+            last_summary_sequence: 0,
+            context_bridge_version: CONTEXT_BRIDGE_VERSION,
+            activation_generation: 1,
+            binding_state: BindingState::Preparing,
+            created_by_switch_id: Some(switch_id.clone()),
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        RuntimeBindingRepository::insert(&conn, &target_binding).unwrap();
+        let built = manager
+            .context_bridge
+            .build_window(&conn, &session.id, 0, 0, 2)
+            .unwrap();
+        ContextBridgeRepository::prepare(
+            &conn,
+            &ContextBridgePrepareRequest {
+                switch_id: switch_id.clone(),
+                session_id: session.id.clone(),
+                target_binding_id: target_binding_id.clone(),
+                from_context_sequence: 0,
+                from_summary_sequence: 0,
+                prepare_sequence: 2,
+                summary_sequence: built.summary_sequence,
+                bridge_version: CONTEXT_BRIDGE_VERSION,
+                content_fingerprint: built.fingerprint,
+            },
+        )
+        .unwrap();
+        RuntimeSwitchRepository::advance_status(
+            &conn,
+            &switch_id,
+            RuntimeSwitchStatus::Preparing,
+            RuntimeSwitchStatus::Prepared,
+        )
+        .unwrap();
+        RuntimeSwitchRepository::advance_status(
+            &conn,
+            &switch_id,
+            RuntimeSwitchStatus::Prepared,
+            RuntimeSwitchStatus::Committing,
+        )
+        .unwrap();
+        RuntimeSwitchRepository::commit(
+            &mut conn,
+            &RuntimeSwitchCommitRequest {
+                switch_id: switch_id.clone(),
+                session_id: session.id.clone(),
+                source_revision: switch_record.source_revision,
+                desired_selection_revision: switch_record.desired_selection_revision,
+                source_binding_id: Some(source_binding.binding_id.clone()),
+                target_binding_id: target_binding_id.clone(),
+                target_agent_id: agent_id.clone(),
+                effective_selection: target_selection.clone(),
+            },
+        )
+        .unwrap();
+        target_binding.binding_state = BindingState::Current;
+        drop(conn);
+
+        // Providers that report their first prompt back as the session title
+        // surface the bridge payload after an agent switch; it must never
+        // replace the session title.
+        let provider = Arc::new(TitlePushingProvider {
+            identity: ProviderTurnExecutionIdentity {
+                binding_id: target_binding_id.clone(),
+                activation_generation: target_binding.activation_generation,
+                model_id: target_selection.model_id().map(str::to_string),
+            },
+            title: Mutex::new("VIBEX_CONTEXT_BRIDGE_BEGIN poisoned title".to_string()),
+        });
+        manager
+            .register_runtime(
+                AgentRuntimeRouteKey {
+                    agent_id: agent_id.clone(),
+                    transport_kind: TransportKind::Acp,
+                    adapter_id,
+                },
+                provider.clone(),
+            )
+            .unwrap();
+
+        let bridge = manager
+            .context_bridge
+            .pending_for_turn(
+                &session.id,
+                &target_binding_id,
+                target_binding.activation_generation,
+            )
+            .unwrap()
+            .expect("switch prepared a pending context bridge");
+        assert!(bridge.has_prompt_content());
+
+        manager
+            .run_agent_turn(
+                AgentTurnRequest {
+                    session_id: session.id.clone(),
+                    required_runtime: Some(target_selection.clone()),
+                    text: "hello there".to_string(),
+                    attachments: Vec::new(),
+                    reasoning_effort: None,
+                    correlation_id: None,
+                },
+                AgentTurnDisplayPolicy::USER_AUTHORED,
+                ContextBridgeTurnBehavior::ConsumePending,
+                None,
+                |provider, handle, turn_request| async move {
+                    provider.send_turn(handle, turn_request).await
+                },
+            )
+            .await
+            .unwrap();
+
+        let conn = manager.open_migrated().unwrap();
+        // The provider-reported bridge payload is suppressed; the title keeps
+        // the seed from the real user message instead.
+        assert_eq!(
+            SessionRepository::get(&conn, &session.id)
+                .unwrap()
+                .unwrap()
+                .title,
+            "hello there"
+        );
+        drop(conn);
+
+        // A follow-up turn on the same (now consumed) bridge accepts the
+        // provider-reported title again.
+        *provider.title.lock().unwrap() = "provider generated title".to_string();
+        manager
+            .run_agent_turn(
+                AgentTurnRequest {
+                    session_id: session.id.clone(),
+                    required_runtime: Some(target_selection),
+                    text: "and again".to_string(),
                     attachments: Vec::new(),
                     reasoning_effort: None,
                     correlation_id: None,
