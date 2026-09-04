@@ -16078,6 +16078,7 @@ impl VibexWorkbench {
     fn open_local_history_import_dialog(
         &mut self,
         workspace: Option<(String, WorkspaceMode)>,
+        initial_search: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -16092,6 +16093,7 @@ impl VibexWorkbench {
                 self.runtime.clone(),
                 workbench.clone(),
                 focus_workspace.clone(),
+                initial_search.clone(),
                 locale_mode,
                 window,
                 cx,
@@ -23684,7 +23686,7 @@ impl VibexWorkbench {
                 .disabled(state.import_disabled)
                 .on_click(move |_, window, cx| {
                     let _ = import_entity.update(cx, |this, cx| {
-                        this.open_local_history_import_dialog(None, window, cx)
+                        this.open_local_history_import_dialog(None, None, window, cx)
                     });
                 }),
         )
@@ -23710,6 +23712,7 @@ impl VibexWorkbench {
         let auto_continue_project_id = target.project_id.clone();
         let new_folder_project_id = target.project_id.clone();
         let import_workspace = target.import_workspace.clone();
+        let import_project_name = target.project_name.clone();
         let delete_project_id = target.project_id;
         let delete_project_name = target.project_name.clone();
         let auto_continue_enabled = target.auto_continue_enabled;
@@ -23766,6 +23769,7 @@ impl VibexWorkbench {
                         let _ = import_entity.update(cx, |this, cx| {
                             this.open_local_history_import_dialog(
                                 Some(import_workspace.clone()),
+                                Some(import_project_name.clone()),
                                 window,
                                 cx,
                             )
@@ -52381,6 +52385,19 @@ mod tests {
         assert!(project.contains("workspace.agent_summary.total"));
         assert!(project.contains("let project_session_count_badge = div()"));
         assert!(project.contains(".rounded_full()"));
+    }
+
+    #[test]
+    fn sidebar_project_import_seeds_the_project_search_query() {
+        let source = include_str!("app.rs");
+        let menu = source
+            .split_once("    fn build_sidebar_project_menu(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn build_sidebar_workspace_menu("))
+            .map(|(body, _)| body)
+            .expect("project menu should remain inspectable");
+
+        assert!(menu.contains("let import_project_name = target.project_name.clone();"));
+        assert!(menu.contains("Some(import_project_name.clone())"));
     }
 
     #[test]

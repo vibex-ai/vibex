@@ -188,6 +188,8 @@ pub struct LocalHistoryImportDialog {
     workbench: WeakEntity<VibexWorkbench>,
     weak_self: WeakEntity<Self>,
     locale_mode: LocaleMode,
+    /// `Some` scopes a project-menu import to that workspace; `None` keeps
+    /// the toolbar import global.
     focus_workspace: Option<String>,
     search_input: Entity<InputState>,
     scan: Option<LocalHistoryScanResult>,
@@ -213,12 +215,21 @@ impl LocalHistoryImportDialog {
         runtime: Option<Arc<DesktopRuntime>>,
         workbench: WeakEntity<VibexWorkbench>,
         focus_workspace: Option<String>,
+        initial_search: Option<String>,
         locale_mode: LocaleMode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let locale = locale::resolve_locale(locale_mode, locale::system_locale().as_deref());
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder(text(locale).search));
+        let input = cx.new(|cx| {
+            let mut input = InputState::new(window, cx).placeholder(text(locale).search);
+            if let Some(initial_search) = initial_search {
+                if !initial_search.trim().is_empty() {
+                    input.set_value(initial_search, window, cx);
+                }
+            }
+            input
+        });
         let mut dialog = Self {
             runtime,
             workbench,
@@ -335,6 +346,9 @@ impl LocalHistoryImportDialog {
             return folders;
         };
         for folder in &scan.folders {
+            if !folder_matches_focus(folder, self.focus_workspace.as_deref()) {
+                continue;
+            }
             let mut sessions = folder
                 .sessions
                 .iter()
@@ -432,7 +446,7 @@ impl LocalHistoryImportDialog {
     }
 
     fn present_sources(&self) -> Vec<LocalHistorySource> {
-        present_sources(self.scan.as_ref())
+        present_sources(self.scan.as_ref(), self.focus_workspace.as_deref())
     }
 
     fn filtered_sources(&self) -> Vec<LocalHistorySource> {
@@ -1250,7 +1264,7 @@ impl Render for LocalHistoryImportDialog {
 
         let pending = self.phase == ImportPhase::Importing;
         let folders = self.visible_folders(cx);
-        let present_sources = present_sources(self.scan.as_ref());
+        let present_sources = self.present_sources();
         let list = if folders.is_empty() {
             let empty = self
                 .scan
@@ -1359,7 +1373,10 @@ impl Render for LocalHistoryImportDialog {
     }
 }
 
-fn present_sources(scan: Option<&LocalHistoryScanResult>) -> Vec<LocalHistorySource> {
+fn present_sources(
+    scan: Option<&LocalHistoryScanResult>,
+    focus_workspace: Option<&str>,
+) -> Vec<LocalHistorySource> {
     let Some(scan) = scan else {
         return Vec::new();
     };
@@ -1368,9 +1385,14 @@ fn present_sources(scan: Option<&LocalHistoryScanResult>) -> Vec<LocalHistorySou
         .filter(|source| {
             scan.folders
                 .iter()
+                .filter(|folder| folder_matches_focus(folder, focus_workspace))
                 .any(|folder| folder.sources.contains(source))
         })
         .collect()
+}
+
+fn folder_matches_focus(folder: &LocalHistoryScanFolder, focus_workspace: Option<&str>) -> bool {
+    focus_workspace.is_none_or(|target| paths_equal(&folder.workspace_root, target))
 }
 
 trait ScanSessionStatusExt {
@@ -1534,7 +1556,7 @@ mod tests {
         };
 
         assert_eq!(
-            present_sources(Some(&scan)),
+            present_sources(Some(&scan), None),
             vec![
                 LocalHistorySource::Claude,
                 LocalHistorySource::Codex,
@@ -1542,5 +1564,36 @@ mod tests {
                 LocalHistorySource::CodeBuddy,
             ]
         );
+    }
+
+    #[test]
+    fn present_sources_respects_the_focused_workspace() {
+        let scan = LocalHistoryScanResult {
+            folders: vec![
+                LocalHistoryScanFolder {
+                    workspace_root: "/workspace/one".to_string(),
+                    sources: vec![LocalHistorySource::CodeBuddy, LocalHistorySource::Codex],
+                    sessions: Vec::new(),
+                },
+                LocalHistoryScanFolder {
+                    workspace_root: "/workspace/two".to_string(),
+                    sources: vec![LocalHistorySource::OpenCode, LocalHistorySource::Claude],
+                    sessions: Vec::new(),
+                },
+            ],
+            total_sessions: 0,
+            importable_count: 0,
+            unassigned_count: 0,
+            diagnostics: Vec::new(),
+        };
+
+        assert_eq!(
+            present_sources(Some(&scan), Some("/workspace/one")),
+            vec![LocalHistorySource::Codex, LocalHistorySource::CodeBuddy]
+        );
+        assert!(!folder_matches_focus(
+            &scan.folders[1],
+            Some("/workspace/one")
+        ));
     }
 }
