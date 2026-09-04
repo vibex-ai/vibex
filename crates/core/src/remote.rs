@@ -1935,6 +1935,12 @@ pub struct RemoteSidebarOrganizationSnapshot {
     pub pinned_session_ids: Vec<String>,
     #[serde(default)]
     pub session_order: Vec<String>,
+    /// Wall-clock (ms) of the last manual session arrangement on the Desktop.
+    /// Sessions in `session_order` active after this anchor sort by recency
+    /// instead of their manual position. Older servers omit the field and
+    /// clients must treat it as `0` (every entry sorts by recency).
+    #[serde(default)]
+    pub session_order_anchored_at_ms: i64,
     /// The persisted Desktop hierarchy selector. Older servers omit this and
     /// compact clients must keep using Compact as the compatibility default.
     #[serde(default)]

@@ -1183,6 +1183,18 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
 - A session absent from persisted `SidebarState.row_order` is newly discovered.
   Sort newly discovered sessions by recency ahead of manually ordered sessions in
   the same pin band, while pinned sessions remain above unpinned sessions.
+- `SidebarUiState.session_order_anchored_at_ms` records the wall-clock of the
+  last deliberate manual session arrangement. A session listed in
+  `session_order` keeps its manual position only while inactive since that
+  anchor; a listed session whose `last_message_at_ms` postdates the anchor
+  re-sorts by recency above the frozen band, exactly like a newly discovered
+  session. Without this promotion, a long-running conversation stays frozen at
+  its stale manual position and appears to sink "to the back" while it runs.
+  The serde default (`0`) promotes every persisted entry, so legacy state
+  degrades to pure recency until the next deliberate arrangement. When a drag
+  re-snapshots the manual band, rebuild it from the order the user currently
+  sees (the projection order) instead of appending missing ids to a stale
+  band tail — appending would demote the visible top cluster to the bottom.
 - GPUI dispatches a typed `on_drag_move` callback to every rendered target that
   listens for that drag type. A row that does not contain the pointer must not
   clear the shared reorder target established by the row that does contain it.
@@ -1899,7 +1911,9 @@ SidebarOrganizationScope::{Root, Project(project_id)}
 - Root-level Session placements remain aligned with the existing sidebar Session
   projection. Folder metadata must not replace `SidebarUiState.session_order` as
   the compatibility order for ordinary drag reordering, and a newly discovered
-  Session keeps the existing new-before-manually-ordered default.
+  Session keeps the existing new-before-manually-ordered default. A listed but
+  re-activated Session (activity after `session_order_anchored_at_ms`) follows
+  the same recency promotion.
 - Project and Session drag previews reorder the rendered rows and animate toward
   the preview only when the source siblings are flat. A mixed folder tree keeps
   stable geometry and uses before/into/after indicators instead of applying a
@@ -1942,7 +1956,8 @@ SidebarOrganizationScope::{Root, Project(project_id)}
 | Inline rename loses focus with empty/duplicate input | Leave rename mode and keep the last persisted/default name. |
 | A newly created empty folder is rendered | Show exactly one row with no recursive copy below it. |
 | A Session is created after users manually ordered existing Sessions | Show the new Session before the manually ordered unpinned Sessions; retain their relative order. |
-| Two ordinary root Sessions are reordered by drag | Persist both the organization projection and legacy `session_order`, even if one representation was already in the requested order. |
+| A manually ordered Session becomes active again after `session_order_anchored_at_ms` | Surface it by recency above the frozen manual band; keep the relative order of sessions still inactive since the anchor. |
+| Two ordinary root Sessions are reordered by drag | Rebuild the legacy `session_order` band from the currently rendered order, apply the move, and anchor the freeze clock to now; persist both the organization projection and `session_order`. |
 | Folder is deleted | Promote direct children; preserve every Project/Session/folder id. |
 | Referenced Project/Session no longer exists | Remove the stale placement during cleanup/reconcile. |
 
@@ -1955,6 +1970,9 @@ SidebarOrganizationScope::{Root, Project(project_id)}
 - Good: manually reorder two root Sessions, create another Session, and keep the
   new Session ahead of the manually ordered unpinned pair without losing their
   relative order.
+- Good: resume an old manually ordered Session so it starts running; it must
+  surface above the frozen manual band while it is active, then sink back under
+  newer activity only after the next manual arrangement re-anchors the band.
 - Good: drag a nested Project back to the root or directly into a sibling folder;
   flat Project/Session siblings visibly exchange positions during the drag.
 - Base: a user with pre-feature UI state sees the unchanged flat sidebar until

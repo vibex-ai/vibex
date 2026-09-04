@@ -5848,6 +5848,7 @@ impl VibexWorkbench {
             collapsed_workspace_ids: self.ui_state.sidebar.collapsed_workspace_ids.clone(),
             pinned_session_ids: self.sidebar_state.pinned_ids.clone(),
             session_order: self.sidebar_state.row_order.clone(),
+            session_order_anchored_at_ms: self.ui_state.sidebar.session_order_anchored_at_ms,
             hierarchy_mode: self.ui_state.sidebar.hierarchy_mode,
             project_order: self.ui_state.sidebar.project_order.clone(),
             workspace_order: self.ui_state.sidebar.workspace_order.clone(),
@@ -7708,6 +7709,7 @@ impl VibexWorkbench {
             &self.workspace_contexts,
             &self.ui_state.sidebar.project_order,
             &self.sidebar_state.row_order,
+            self.ui_state.sidebar.session_order_anchored_at_ms,
             &self.ui_state.sidebar.workspace_order,
             &self.sidebar_state.pinned_ids,
             &normalized_query,
@@ -7864,6 +7866,7 @@ impl VibexWorkbench {
             &self.workspace_contexts,
             &self.ui_state.sidebar.project_order,
             &self.sidebar_state.row_order,
+            self.ui_state.sidebar.session_order_anchored_at_ms,
             &self.ui_state.sidebar.workspace_order,
             &self.sidebar_state.pinned_ids,
             "",
@@ -7914,6 +7917,7 @@ impl VibexWorkbench {
             &self.workspace_contexts,
             &self.ui_state.sidebar.project_order,
             &self.sidebar_state.row_order,
+            self.ui_state.sidebar.session_order_anchored_at_ms,
             &self.ui_state.sidebar.workspace_order,
             &self.sidebar_state.pinned_ids,
             "",
@@ -8086,6 +8090,7 @@ impl VibexWorkbench {
                     &self.workspace_contexts,
                     &self.ui_state.sidebar.project_order,
                     &self.sidebar_state.row_order,
+                    self.ui_state.sidebar.session_order_anchored_at_ms,
                     &self.ui_state.sidebar.workspace_order,
                     &self.sidebar_state.pinned_ids,
                     "",
@@ -8123,6 +8128,7 @@ impl VibexWorkbench {
                     &self.workspace_contexts,
                     &self.ui_state.sidebar.project_order,
                     &self.sidebar_state.row_order,
+                    self.ui_state.sidebar.session_order_anchored_at_ms,
                     &self.ui_state.sidebar.workspace_order,
                     &self.sidebar_state.pinned_ids,
                     "",
@@ -8811,12 +8817,16 @@ impl VibexWorkbench {
                 .all(|item| matches!(item, SidebarOrganizationItem::Session(_))) =>
             {
                 let original_order = self.sidebar_state.row_order.clone();
-                let session_ids = self
+                // Re-snapshot the manual band to the order the user currently
+                // sees before applying the move; appending missing sessions to
+                // the tail of a stale band instead would demote the visible
+                // top cluster (often the running sessions) to the bottom of
+                // the sidebar.
+                self.sidebar_state.row_order = self
                     .ordered_sidebar_session_projects()
                     .into_iter()
                     .map(|(session_id, _)| session_id)
                     .collect::<Vec<_>>();
-                complete_string_order(&mut self.sidebar_state.row_order, session_ids);
                 let moving_ids = moving
                     .iter()
                     .filter_map(|item| match item {
@@ -8833,6 +8843,9 @@ impl VibexWorkbench {
                 let changed = self.sidebar_state.row_order != original_order
                     || self.ui_state.sidebar.session_order != self.sidebar_state.row_order;
                 self.ui_state.sidebar.session_order = self.sidebar_state.row_order.clone();
+                if changed {
+                    self.ui_state.sidebar.session_order_anchored_at_ms = unix_timestamp_ms();
+                }
                 changed
             }
             _ => false,
@@ -9521,19 +9534,24 @@ impl VibexWorkbench {
         after: bool,
         cx: &mut Context<Self>,
     ) {
-        let ids = self
+        // Re-snapshot the manual band to the order the user currently sees
+        // before applying the move. Appending missing sessions to the tail of
+        // a stale band instead would demote the visible top cluster (often
+        // the running sessions) to the bottom of the sidebar.
+        let original_order = self.sidebar_state.row_order.clone();
+        self.sidebar_state.row_order = self
             .ordered_sidebar_session_projects()
             .into_iter()
             .map(|(session_id, _)| session_id)
             .collect::<Vec<_>>();
-        complete_string_order(&mut self.sidebar_state.row_order, ids);
         let changed = move_strings_relative(
             &mut self.sidebar_state.row_order,
             moving_ids,
             target_id,
             after,
-        );
+        ) || self.sidebar_state.row_order != original_order;
         if changed {
+            self.ui_state.sidebar.session_order_anchored_at_ms = unix_timestamp_ms();
             self.queue_agent_ui_state();
             self.publish_sidebar_invalidation();
         }
@@ -59739,6 +59757,7 @@ mod tests {
             &BTreeMap::new(),
             &[],
             &[],
+            0,
             &BTreeSet::new(),
             "",
         );

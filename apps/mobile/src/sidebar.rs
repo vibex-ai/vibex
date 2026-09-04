@@ -133,24 +133,36 @@ fn ordered_sessions<'a>(
     sessions: impl IntoIterator<Item = &'a AgentSession>,
     view: &SidebarOrganizationView,
 ) -> Vec<&'a AgentSession> {
+    // Mirrors the Desktop band sort: a session listed in `session_order`
+    // keeps its manual position only while inactive since
+    // `session_order_anchored_at_ms`; anything active after the anchor (or
+    // absent from the order) sorts by recency and surfaces above the frozen
+    // manual band. Pinned sessions stay in their own band above everything.
     let positions = view
         .session_order
         .iter()
         .enumerate()
         .map(|(index, id)| (id.as_str(), index))
-        .collect::<BTreeMap<_, _>>();
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let manual_position = |session: &AgentSession| -> Option<usize> {
+        positions
+            .get(session.id.as_str())
+            .filter(|_| session.last_message_at_ms < view.session_order_anchored_at_ms)
+            .copied()
+    };
     let mut sessions = sessions.into_iter().collect::<Vec<_>>();
-    sessions.sort_by_key(|session| {
-        (
-            !view.pinned_session_ids.contains(session.id.as_str()),
-            positions.contains_key(session.id.as_str()),
-            positions
-                .get(session.id.as_str())
-                .copied()
-                .unwrap_or(usize::MAX),
-            std::cmp::Reverse(session.last_message_at_ms),
-            session.id.as_str().to_string(),
-        )
+    sessions.sort_by(|left, right| {
+        (!view.pinned_session_ids.contains(left.id.as_str()))
+            .cmp(&!view.pinned_session_ids.contains(right.id.as_str()))
+            .then_with(|| match (manual_position(left), manual_position(right)) {
+                (Some(left_position), Some(right_position)) => left_position.cmp(&right_position),
+                (Some(_), None) => std::cmp::Ordering::Greater,
+                (None, Some(_)) => std::cmp::Ordering::Less,
+                (None, None) => right
+                    .last_message_at_ms
+                    .cmp(&left.last_message_at_ms)
+                    .then_with(|| left.id.as_str().cmp(right.id.as_str())),
+            })
     });
     sessions
 }
@@ -1160,6 +1172,9 @@ mod tests {
     fn unplaced_sessions_follow_desktop_new_session_order() {
         let mut view = SidebarOrganizationView::default();
         view.session_order = vec!["session_b".to_string(), "session_a".to_string()];
+        // The manual band froze b and a at their positions; the unlisted
+        // session sorts by recency ahead of the band.
+        view.session_order_anchored_at_ms = 1;
         let projects = vec![SidebarProject {
             id: "project_project".to_string(),
             label: "vibex".to_string(),

@@ -30,6 +30,9 @@ pub struct SidebarOrganizationView {
     pub collapsed_workspace_ids: BTreeSet<String>,
     pub pinned_session_ids: BTreeSet<String>,
     pub session_order: Vec<String>,
+    /// Wall-clock (ms) of the last manual session arrangement; see
+    /// [`crate::SidebarUiState::session_order_anchored_at_ms`].
+    pub session_order_anchored_at_ms: i64,
     pub hierarchy_mode: SidebarHierarchyMode,
     pub project_order: Vec<String>,
     pub workspace_order: BTreeMap<String, Vec<String>>,
@@ -125,6 +128,7 @@ impl SidebarOrganizationView {
             collapsed_workspace_ids: self.collapsed_workspace_ids.iter().cloned().collect(),
             pinned_session_ids: self.pinned_session_ids.iter().cloned().collect(),
             session_order: self.session_order.clone(),
+            session_order_anchored_at_ms: self.session_order_anchored_at_ms,
             hierarchy_mode: match self.hierarchy_mode {
                 SidebarHierarchyMode::Detailed => RemoteSidebarHierarchyMode::Detailed,
                 SidebarHierarchyMode::Compact => RemoteSidebarHierarchyMode::Compact,
@@ -210,6 +214,7 @@ impl SidebarOrganizationView {
             collapsed_workspace_ids: snapshot.collapsed_workspace_ids.iter().cloned().collect(),
             pinned_session_ids: snapshot.pinned_session_ids.iter().cloned().collect(),
             session_order: snapshot.session_order.clone(),
+            session_order_anchored_at_ms: snapshot.session_order_anchored_at_ms,
             hierarchy_mode: match snapshot.hierarchy_mode {
                 RemoteSidebarHierarchyMode::Detailed => SidebarHierarchyMode::Detailed,
                 RemoteSidebarHierarchyMode::Compact => SidebarHierarchyMode::Compact,

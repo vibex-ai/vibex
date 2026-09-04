@@ -360,6 +360,13 @@ const fn default_show_git_change_count() -> bool {
 pub struct SidebarUiState {
     pub project_order: Vec<String>,
     pub session_order: Vec<String>,
+    /// Wall-clock (ms) of the last manual session arrangement. A session in
+    /// `session_order` whose last activity predates this anchor renders at its
+    /// manual position; anything active after it sorts by recency again. The
+    /// serde default (`0`) promotes every persisted entry, so legacy state
+    /// degrades to pure recency until the next deliberate arrangement.
+    #[serde(default)]
+    pub session_order_anchored_at_ms: i64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub workspace_order: BTreeMap<String, Vec<String>>,
     pub pinned_session_ids: BTreeSet<String>,
@@ -669,6 +676,8 @@ impl DesktopUiStateV1 {
 
         normalize_ids(&mut self.sidebar.project_order, 1_000);
         normalize_ids(&mut self.sidebar.session_order, 2_000);
+        self.sidebar.session_order_anchored_at_ms =
+            self.sidebar.session_order_anchored_at_ms.clamp(0, i64::MAX);
         self.sidebar.workspace_order = std::mem::take(&mut self.sidebar.workspace_order)
             .into_iter()
             .filter_map(|(project_id, mut workspace_ids)| {
@@ -2120,6 +2129,30 @@ mod tests {
         assert!(state.terminal.selected_terminal_id.is_none());
         assert!(state.right_rail.activity_order.is_empty());
         assert!(state.preview.layout.tabs.is_empty());
+    }
+
+    #[test]
+    fn session_order_anchor_decodes_legacy_state_and_survives_a_round_trip() {
+        // A pre-anchor snapshot omits the field entirely; it must decode to
+        // the serde default so every stale manual entry sorts by recency.
+        let mut value = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
+        value
+            .get_mut("sidebar")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .remove("sessionOrderAnchoredAtMs");
+        let legacy: DesktopUiStateV1 = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.sidebar.session_order_anchored_at_ms, 0);
+
+        let mut state = DesktopUiStateV1::default();
+        state.sidebar.session_order_anchored_at_ms = -5;
+        state.normalize().unwrap();
+        assert_eq!(state.sidebar.session_order_anchored_at_ms, 0);
+
+        state.sidebar.session_order_anchored_at_ms = 1234;
+        let round_trip: DesktopUiStateV1 =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(round_trip.sidebar.session_order_anchored_at_ms, 1234);
     }
 
     #[test]

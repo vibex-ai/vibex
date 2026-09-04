@@ -734,12 +734,14 @@ pub struct SidebarProjectProjection {
     pub compact_sessions: Vec<AgentSession>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn sidebar_project_projections(
     workspaces: &[(ProjectRecord, WorkspaceRecord)],
     sessions: &[AgentSession],
     contexts: &BTreeMap<String, WorkspaceContextProjection>,
     project_order: &[String],
     session_order: &[String],
+    session_order_anchored_at_ms: i64,
     pinned_session_ids: &BTreeSet<String>,
     query: &str,
 ) -> Vec<SidebarProjectProjection> {
@@ -749,29 +751,27 @@ pub fn sidebar_project_projections(
         contexts,
         project_order,
         session_order,
+        session_order_anchored_at_ms,
         &BTreeMap::new(),
         pinned_session_ids,
         query,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn sidebar_project_projections_with_workspace_order(
     workspaces: &[(ProjectRecord, WorkspaceRecord)],
     sessions: &[AgentSession],
     contexts: &BTreeMap<String, WorkspaceContextProjection>,
     project_order: &[String],
     session_order: &[String],
+    session_order_anchored_at_ms: i64,
     workspace_order: &BTreeMap<String, Vec<String>>,
     pinned_session_ids: &BTreeSet<String>,
     query: &str,
 ) -> Vec<SidebarProjectProjection> {
     let query = query.trim().to_lowercase();
     let project_positions = project_order
-        .iter()
-        .enumerate()
-        .map(|(index, id)| (id.as_str(), index))
-        .collect::<BTreeMap<_, _>>();
-    let session_positions = session_order
         .iter()
         .enumerate()
         .map(|(index, id)| (id.as_str(), index))
@@ -880,7 +880,8 @@ pub fn sidebar_project_projections_with_workspace_order(
                     .collect::<Vec<_>>();
                 sort_sessions(
                     &mut workspace_sessions,
-                    &session_positions,
+                    session_order,
+                    session_order_anchored_at_ms,
                     pinned_session_ids,
                 );
                 let agent_summary = WorkspaceAgentSummary::from_sessions(&workspace_sessions);
@@ -936,7 +937,8 @@ pub fn sidebar_project_projections_with_workspace_order(
                 .collect::<Vec<_>>();
             sort_sessions(
                 &mut compact_sessions,
-                &session_positions,
+                session_order,
+                session_order_anchored_at_ms,
                 pinned_session_ids,
             );
             Some(SidebarProjectProjection {
@@ -949,22 +951,48 @@ pub fn sidebar_project_projections_with_workspace_order(
         .collect()
 }
 
+/// Sorts one sidebar session band. A session listed in `order` keeps its
+/// manual position only while it has been inactive since `anchored_at_ms`
+/// (the wall-clock of the last deliberate manual arrangement); a listed
+/// session active after that anchor re-sorts by recency as if newly
+/// discovered, so long-running conversations surface instead of sinking
+/// under stale manual entries. Sessions absent from `order` always sort by
+/// recency within the band. Pinned sessions stay in their own band above
+/// everything else.
 fn sort_sessions(
     sessions: &mut [AgentSession],
-    positions: &BTreeMap<&str, usize>,
+    order: &[String],
+    anchored_at_ms: i64,
     pinned: &BTreeSet<String>,
 ) {
-    sessions.sort_by_key(|session| {
-        (
-            !pinned.contains(session.id.as_str()),
-            positions.contains_key(session.id.as_str()),
-            positions
-                .get(session.id.as_str())
-                .copied()
-                .unwrap_or(usize::MAX),
-            std::cmp::Reverse(session.last_message_at_ms),
-            session.id.as_str().to_string(),
-        )
+    let manual_positions = order
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (id.as_str(), index))
+        .collect::<BTreeMap<_, _>>();
+    // `Some(position)`: listed and inactive since the anchor, so the manual
+    // position still reflects where the user put it. `None`: absent from the
+    // manual order or active after the anchor; both sort by recency.
+    let manual_position = |session: &AgentSession| -> Option<usize> {
+        manual_positions
+            .get(session.id.as_str())
+            .filter(|_| session.last_message_at_ms < anchored_at_ms)
+            .copied()
+    };
+    sessions.sort_by(|left, right| {
+        (!pinned.contains(left.id.as_str()))
+            .cmp(&!pinned.contains(right.id.as_str()))
+            .then_with(|| match (manual_position(left), manual_position(right)) {
+                (Some(left_position), Some(right_position)) => left_position.cmp(&right_position),
+                // Newly discovered or re-activated sessions surface above the
+                // frozen manual band, matching the recency stream.
+                (Some(_), None) => std::cmp::Ordering::Greater,
+                (None, Some(_)) => std::cmp::Ordering::Less,
+                (None, None) => right
+                    .last_message_at_ms
+                    .cmp(&left.last_message_at_ms)
+                    .then_with(|| left.id.as_str().cmp(right.id.as_str())),
+            })
     });
 }
 
@@ -1226,6 +1254,7 @@ mod tests {
             &BTreeMap::new(),
             &[],
             &[],
+            0,
             &BTreeSet::new(),
             "",
         );
@@ -1260,6 +1289,7 @@ mod tests {
             &BTreeMap::new(),
             &[],
             &[],
+            0,
             &workspace_order,
             &BTreeSet::new(),
             "",
@@ -1292,12 +1322,15 @@ mod tests {
         ];
         let pinned_session_ids = BTreeSet::from([pinned.id.as_str().to_string()]);
 
+        // The manual arrangement froze the listed sessions at their positions;
+        // the unlisted session sorts by recency above the frozen band.
         let projects = sidebar_project_projections(
             &[(project, checkout)],
             &[pinned, first, second, newest],
             &BTreeMap::new(),
             &[],
             &session_order,
+            5,
             &pinned_session_ids,
             "",
         );
@@ -1315,6 +1348,91 @@ mod tests {
         assert_eq!(
             titles(&projects[0].compact_sessions),
             ["Pinned", "Newest", "Second", "First"]
+        );
+    }
+
+    #[test]
+    fn sidebar_projection_reactivates_a_listed_session_that_turned_running() {
+        // A running session whose activity postdates the manual arrangement
+        // anchor must surface above the frozen manual band instead of staying
+        // at its stale manual position.
+        let project = project();
+        let checkout = workspace(&project, WorkspaceMode::CurrentCheckout, "/repo");
+        let mut stale_first = session(&checkout, "Stale First", AgentSessionState::Idle);
+        stale_first.last_message_at_ms = 100;
+        let mut stale_second = session(&checkout, "Stale Second", AgentSessionState::Idle);
+        stale_second.last_message_at_ms = 90;
+        let mut running = session(&checkout, "Running", AgentSessionState::Running);
+        running.last_message_at_ms = 200;
+        let session_order = vec![
+            stale_first.id.as_str().to_string(),
+            stale_second.id.as_str().to_string(),
+            running.id.as_str().to_string(),
+        ];
+        let anchored_at_ms = 150;
+
+        let projects = sidebar_project_projections(
+            &[(project, checkout)],
+            &[stale_first, stale_second, running],
+            &BTreeMap::new(),
+            &[],
+            &session_order,
+            anchored_at_ms,
+            &BTreeSet::new(),
+            "",
+        );
+
+        fn titles(sessions: &[AgentSession]) -> Vec<&str> {
+            sessions
+                .iter()
+                .map(|session| session.title.as_str())
+                .collect::<Vec<_>>()
+        }
+        assert_eq!(
+            titles(&projects[0].workspaces[0].sessions),
+            ["Running", "Stale First", "Stale Second"]
+        );
+    }
+
+    #[test]
+    fn sidebar_projection_keeps_manual_positions_for_inactive_listed_sessions() {
+        // Sessions listed in the manual order that stayed inactive since the
+        // anchor keep their relative manual positions even when a newer
+        // unlisted session exists.
+        let project = project();
+        let checkout = workspace(&project, WorkspaceMode::CurrentCheckout, "/repo");
+        let mut manual_a = session(&checkout, "Manual A", AgentSessionState::Idle);
+        manual_a.last_message_at_ms = 50;
+        let mut manual_b = session(&checkout, "Manual B", AgentSessionState::Idle);
+        manual_b.last_message_at_ms = 40;
+        let mut unlisted = session(&checkout, "Unlisted", AgentSessionState::Idle);
+        unlisted.last_message_at_ms = 100;
+        let session_order = vec![
+            manual_a.id.as_str().to_string(),
+            manual_b.id.as_str().to_string(),
+        ];
+        let anchored_at_ms = 60;
+
+        let projects = sidebar_project_projections(
+            &[(project, checkout)],
+            &[manual_b, manual_a, unlisted],
+            &BTreeMap::new(),
+            &[],
+            &session_order,
+            anchored_at_ms,
+            &BTreeSet::new(),
+            "",
+        );
+
+        fn titles(sessions: &[AgentSession]) -> Vec<&str> {
+            sessions
+                .iter()
+                .map(|session| session.title.as_str())
+                .collect::<Vec<_>>()
+        }
+        assert_eq!(
+            titles(&projects[0].workspaces[0].sessions),
+            ["Unlisted", "Manual A", "Manual B"]
         );
     }
 
@@ -1345,6 +1463,7 @@ mod tests {
             &BTreeMap::new(),
             &[],
             &[],
+            0,
             &BTreeSet::new(),
             "",
         );
@@ -1376,6 +1495,7 @@ mod tests {
             &BTreeMap::new(),
             &[],
             &[],
+            0,
             &BTreeSet::new(),
             "Visible",
         );
