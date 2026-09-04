@@ -49,7 +49,7 @@ use gpui_component::{
     progress::ProgressCircle,
     scroll::{ScrollableElement as _, ScrollbarAxis},
     searchable_list::SearchableListItem,
-    select::{Select, SelectEvent, SelectState},
+    select::{Select, SelectDelegate, SelectEvent, SelectState},
     spinner::Spinner,
     switch::Switch,
     tooltip::Tooltip,
@@ -46564,19 +46564,8 @@ impl FoundationSettings {
         strings: Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let is_dark = cx.theme().is_dark();
-        let input = theme::semantic_color("input", is_dark);
-        let input_background = input.opacity(if is_dark { 0.30 } else { 0.20 });
-        let language_select = div().h(px(28.0)).w(px(160.0)).child(
-            Select::new(&self.language_modes)
-                .small()
-                .h(px(28.0))
-                .rounded(px(8.0))
-                .border_color(input)
-                .bg(input_background)
-                .text_xs()
-                .placeholder(strings.system_default),
-        );
+        let language_select =
+            settings_select(&self.language_modes, Some(px(160.0)), stacked, Some(strings.system_default), cx);
         let close_to_tray_switch = Switch::new("close-to-tray")
             .small()
             .checked(desktop_behavior.close_to_tray)
@@ -46609,7 +46598,14 @@ impl FoundationSettings {
                                 this.set_network_proxy_enabled(*enabled, cx)
                             })),
                     )
-                    .child(Input::new(&self.proxy_input).w(px(260.0)).h(px(32.0))),
+                    .child(
+                        div().w(px(280.0)).child(
+                            Input::new(&self.proxy_input)
+                                .small()
+                                .h(px(28.0))
+                                .rounded(px(8.0)),
+                        ),
+                    ),
             )
             .child(
                 div()
@@ -46625,28 +46621,31 @@ impl FoundationSettings {
             );
         let startup_new_session =
             desktop_behavior.startup_destination == StartupDestination::NewSession;
-        let startup_control = h_flex()
-            .gap_1()
-            .child(
-                Button::new("startup-restore")
-                    .small()
-                    .outline()
-                    .selected(!startup_new_session)
-                    .label(locale::text("Restore", "恢复工作台", "還原工作台"))
-                    .on_click(cx.listener(|this, _, _, cx| {
+        let startup_control = settings_segmented_control(
+            vec![
+                settings_segmented_option(
+                    "startup-restore",
+                    locale::text("Restore", "恢复工作台", "還原工作台"),
+                    !startup_new_session,
+                    cx.listener(|this, _, _, cx| {
                         this.set_startup_destination(StartupDestination::RestoreWorkbench, cx)
-                    })),
-            )
-            .child(
-                Button::new("startup-new-session")
-                    .small()
-                    .outline()
-                    .selected(startup_new_session)
-                    .label(locale::text("New session", "新会话", "新會話"))
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    }),
+                    cx,
+                )
+                .into_any_element(),
+                settings_segmented_option(
+                    "startup-new-session",
+                    locale::text("New session", "新会话", "新會話"),
+                    startup_new_session,
+                    cx.listener(|this, _, _, cx| {
                         this.set_startup_destination(StartupDestination::NewSession, cx)
-                    })),
-            );
+                    }),
+                    cx,
+                )
+                .into_any_element(),
+            ],
+            cx,
+        );
         let launch_at_login = Switch::new("launch-at-login")
             .small()
             .checked(desktop_behavior.launch_at_login)
@@ -46798,116 +46797,53 @@ impl FoundationSettings {
         strings: Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let is_dark = cx.theme().is_dark();
-        let foreground = theme::semantic_color("foreground", is_dark);
-        let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
-        let muted = theme::semantic_color("muted", is_dark);
-        let input = theme::semantic_color("input", is_dark);
-        let input_background = input.opacity(if is_dark { 0.30 } else { 0.20 });
         let system_selected = appearance.theme == ModelThemeMode::System;
         let light_selected = appearance.theme == ModelThemeMode::Light;
         let dark_selected = appearance.theme == ModelThemeMode::Dark;
-        let theme_control = h_flex()
-            .h(px(24.0))
-            .flex_none()
-            .overflow_hidden()
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(input)
-            .child(
-                Button::new("theme-system")
-                    .small()
-                    .ghost()
-                    .w(px(28.0))
-                    .h_full()
-                    .rounded(px(0.0))
-                    .tooltip(strings.system)
-                    .selected(system_selected)
-                    .text_color(if system_selected {
-                        foreground
-                    } else {
-                        muted_foreground
-                    })
-                    .when(system_selected, |this| this.bg(muted))
-                    .child(
-                        Icon::default()
-                            .path("icons/vibex/monitor.svg")
-                            .size(px(12.0)),
-                    )
-                    .on_click(cx.listener(|this, _, window, cx| {
+        let theme_control = settings_segmented_control(
+            vec![
+                settings_segmented_option(
+                    "theme-system",
+                    Icon::default()
+                        .path("icons/vibex/monitor.svg")
+                        .size(px(12.0)),
+                    system_selected,
+                    cx.listener(|this, _, window, cx| {
                         this.set_theme(ModelThemeMode::System, window, cx)
-                    })),
-            )
-            .child(div().h_full().w(px(1.0)).bg(input))
-            .child(
-                Button::new("theme-light")
-                    .small()
-                    .ghost()
-                    .w(px(28.0))
-                    .h_full()
-                    .rounded(px(0.0))
-                    .tooltip(strings.light)
-                    .selected(light_selected)
-                    .text_color(if light_selected {
-                        foreground
-                    } else {
-                        muted_foreground
-                    })
-                    .when(light_selected, |this| this.bg(muted))
-                    .child(Icon::new(IconName::Sun).size(px(12.0)))
-                    .on_click(cx.listener(|this, _, window, cx| {
+                    }),
+                    cx,
+                )
+                .tooltip(strings.system)
+                .into_any_element(),
+                settings_segmented_option(
+                    "theme-light",
+                    Icon::new(IconName::Sun).size(px(12.0)),
+                    light_selected,
+                    cx.listener(|this, _, window, cx| {
                         this.set_theme(ModelThemeMode::Light, window, cx)
-                    })),
-            )
-            .child(div().h_full().w(px(1.0)).bg(input))
-            .child(
-                Button::new("theme-dark")
-                    .small()
-                    .ghost()
-                    .w(px(28.0))
-                    .h_full()
-                    .rounded(px(0.0))
-                    .tooltip(strings.dark)
-                    .selected(dark_selected)
-                    .text_color(if dark_selected {
-                        foreground
-                    } else {
-                        muted_foreground
-                    })
-                    .when(dark_selected, |this| this.bg(muted))
-                    .child(Icon::new(IconName::Moon).size(px(12.0)))
-                    .on_click(cx.listener(|this, _, window, cx| {
+                    }),
+                    cx,
+                )
+                .tooltip(strings.light)
+                .into_any_element(),
+                settings_segmented_option(
+                    "theme-dark",
+                    Icon::new(IconName::Moon).size(px(12.0)),
+                    dark_selected,
+                    cx.listener(|this, _, window, cx| {
                         this.set_theme(ModelThemeMode::Dark, window, cx)
-                    })),
-            );
-        let interface_font_select = div()
-            .h(px(28.0))
-            .when(stacked, |this| this.w_full())
-            .when(!stacked, |this| this.w(px(240.0)))
-            .child(
-                Select::new(&self.interface_fonts)
-                    .small()
-                    .h(px(28.0))
-                    .rounded(px(8.0))
-                    .border_color(input)
-                    .bg(input_background)
-                    .text_xs()
-                    .placeholder(strings.choose_interface_font),
-            );
-        let code_font_select = div()
-            .h(px(28.0))
-            .when(stacked, |this| this.w_full())
-            .when(!stacked, |this| this.w(px(240.0)))
-            .child(
-                Select::new(&self.code_fonts)
-                    .small()
-                    .h(px(28.0))
-                    .rounded(px(8.0))
-                    .border_color(input)
-                    .bg(input_background)
-                    .text_xs()
-                    .placeholder(strings.choose_code_font),
-            );
+                    }),
+                    cx,
+                )
+                .tooltip(strings.dark)
+                .into_any_element(),
+            ],
+            cx,
+        );
+        let interface_font_select =
+            settings_select(&self.interface_fonts, Some(px(240.0)), stacked, Some(strings.choose_interface_font), cx);
+        let code_font_select =
+            settings_select(&self.code_fonts, Some(px(240.0)), stacked, Some(strings.choose_code_font), cx);
         settings_page(
             strings.appearance,
             strings.appearance_description,
@@ -47069,9 +47005,6 @@ impl FoundationSettings {
         strings: Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let is_dark = cx.theme().is_dark();
-        let input = theme::semantic_color("input", is_dark);
-        let input_background = input.opacity(if is_dark { 0.30 } else { 0.20 });
         let turn_preview_rail_switch =
             Switch::new("session-turn-preview-rail")
                 .small()
@@ -47080,6 +47013,20 @@ impl FoundationSettings {
                 .on_click(cx.listener(|this, enabled, _, cx| {
                     this.set_session_turn_preview_rail(*enabled, cx)
                 }));
+        let session_content_width_select = settings_select(
+            &self.session_content_widths,
+            Some(px(144.0)),
+            stacked,
+            None::<&str>,
+            cx,
+        );
+        let reasoning_display_select = settings_select(
+            &self.reasoning_display_modes,
+            Some(px(180.0)),
+            stacked,
+            None::<&str>,
+            cx,
+        );
         let show_agent_generation_status_switch = Switch::new("show-agent-generation-status")
             .small()
             .checked(session.show_agent_generation_status)
@@ -47087,29 +47034,6 @@ impl FoundationSettings {
             .on_click(cx.listener(|this, enabled, _, cx| {
                 this.set_show_agent_generation_status(*enabled, cx)
             }));
-        let session_content_width_select = div().h(px(28.0)).w(px(144.0)).child(
-            Select::new(&self.session_content_widths)
-                .small()
-                .h(px(28.0))
-                .rounded(px(8.0))
-                .border_color(input)
-                .bg(input_background)
-                .text_xs()
-                .placeholder(strings.session_content_width_standard),
-        );
-        let reasoning_display_select = div()
-            .h(px(28.0))
-            .when(stacked, |this| this.w_full())
-            .when(!stacked, |this| this.w(px(180.0)))
-            .child(
-                Select::new(&self.reasoning_display_modes)
-                    .small()
-                    .h(px(28.0))
-                    .rounded(px(8.0))
-                    .border_color(input)
-                    .bg(input_background)
-                    .text_xs(),
-            );
         let reasoning_expanded_by_default_switch = Switch::new("reasoning-expanded-by-default")
             .small()
             .checked(session.reasoning_expanded_by_default)
@@ -47143,54 +47067,56 @@ impl FoundationSettings {
                 this.ui_state.composer.message_send_key == MessageSendKey::CommandEnter
             })
             .unwrap_or(false);
-        let queue_control = h_flex()
-            .gap_1()
-            .child(
-                Button::new("queue-automatic")
-                    .small()
-                    .outline()
-                    .selected(!queue_manual)
-                    .label(locale::text("Automatic", "自动", "自動"))
-                    .on_click(cx.listener(|this, _, _, cx| {
+        let queue_control = settings_segmented_control(
+            vec![
+                settings_segmented_option(
+                    "queue-automatic",
+                    locale::text("Automatic", "自动", "自動"),
+                    !queue_manual,
+                    cx.listener(|this, _, _, cx| {
                         this.set_queue_send_mode(ComposerQueueSendMode::Automatic, cx)
-                    })),
-            )
-            .child(
-                Button::new("queue-manual")
-                    .small()
-                    .outline()
-                    .selected(queue_manual)
-                    .label(locale::text("Manual", "手动", "手動"))
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    }),
+                    cx,
+                )
+                .into_any_element(),
+                settings_segmented_option(
+                    "queue-manual",
+                    locale::text("Manual", "手动", "手動"),
+                    queue_manual,
+                    cx.listener(|this, _, _, cx| {
                         this.set_queue_send_mode(ComposerQueueSendMode::Manual, cx)
-                    })),
-            );
-        let send_key_control = h_flex()
-            .gap_1()
-            .child(
-                Button::new("send-enter")
-                    .small()
-                    .outline()
-                    .selected(!send_command)
-                    .label("Enter")
-                    .on_click(cx.listener(|this, _, window, cx| {
+                    }),
+                    cx,
+                )
+                .into_any_element(),
+            ],
+            cx,
+        );
+        let send_key_control = settings_segmented_control(
+            vec![
+                settings_segmented_option(
+                    "send-enter",
+                    "Enter",
+                    !send_command,
+                    cx.listener(|this, _, window, cx| {
                         this.set_message_send_key(MessageSendKey::Enter, window, cx)
-                    })),
-            )
-            .child(
-                Button::new("send-command-enter")
-                    .small()
-                    .outline()
-                    .selected(send_command)
-                    .label(locale::text(
-                        "Cmd/Ctrl+Enter",
-                        "Cmd/Ctrl+Enter",
-                        "Cmd/Ctrl+Enter",
-                    ))
-                    .on_click(cx.listener(|this, _, window, cx| {
+                    }),
+                    cx,
+                )
+                .into_any_element(),
+                settings_segmented_option(
+                    "send-command-enter",
+                    locale::text("Cmd/Ctrl+Enter", "Cmd/Ctrl+Enter", "Cmd/Ctrl+Enter"),
+                    send_command,
+                    cx.listener(|this, _, window, cx| {
                         this.set_message_send_key(MessageSendKey::CommandEnter, window, cx)
-                    })),
-            );
+                    }),
+                    cx,
+                )
+                .into_any_element(),
+            ],
+            cx,
+        );
         let auto_continue = self
             .workbench
             .read_with(cx, |this, _| {
@@ -47393,58 +47319,59 @@ impl FoundationSettings {
                 this.ui_state.sidebar.project_location_preferences.len()
             })
             .unwrap_or(0);
-        let location_control = h_flex()
-            .gap_1()
-            .child(
-                Button::new("default-current-checkout")
-                    .small()
-                    .outline()
-                    .selected(
-                        workbench.default_new_session_location
-                            == NewSessionLocation::CurrentCheckout,
-                    )
-                    .label(locale::text("Current checkout", "当前检出", "目前簽出"))
-                    .on_click(cx.listener(|this, _, _, cx| {
+        let location_control = settings_segmented_control(
+            vec![
+                settings_segmented_option(
+                    "default-current-checkout",
+                    locale::text("Current checkout", "当前检出", "目前簽出"),
+                    workbench.default_new_session_location == NewSessionLocation::CurrentCheckout,
+                    cx.listener(|this, _, _, cx| {
                         this.set_default_new_session_location(
                             NewSessionLocation::CurrentCheckout,
                             cx,
                         )
-                    })),
-            )
-            .child(
-                Button::new("default-new-worktree")
-                    .small()
-                    .outline()
-                    .selected(
-                        workbench.default_new_session_location == NewSessionLocation::NewWorktree,
-                    )
-                    .label("Worktree")
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    }),
+                    cx,
+                )
+                .into_any_element(),
+                settings_segmented_option(
+                    "default-new-worktree",
+                    "Worktree",
+                    workbench.default_new_session_location == NewSessionLocation::NewWorktree,
+                    cx.listener(|this, _, _, cx| {
                         this.set_default_new_session_location(NewSessionLocation::NewWorktree, cx)
-                    })),
-            );
-        let hierarchy_control = h_flex()
-            .gap_1()
-            .child(
-                Button::new("sidebar-compact")
-                    .small()
-                    .outline()
-                    .selected(hierarchy == SidebarHierarchyMode::Compact)
-                    .label(locale::text("Session view", "会话视图", "會話視圖"))
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    }),
+                    cx,
+                )
+                .into_any_element(),
+            ],
+            cx,
+        );
+        let hierarchy_control = settings_segmented_control(
+            vec![
+                settings_segmented_option(
+                    "sidebar-compact",
+                    locale::text("Session view", "会话视图", "會話視圖"),
+                    hierarchy == SidebarHierarchyMode::Compact,
+                    cx.listener(|this, _, _, cx| {
                         this.set_sidebar_hierarchy(SidebarHierarchyMode::Compact, cx)
-                    })),
-            )
-            .child(
-                Button::new("sidebar-detailed")
-                    .small()
-                    .outline()
-                    .selected(hierarchy == SidebarHierarchyMode::Detailed)
-                    .label(locale::text("Workspace view", "工作区视图", "工作區視圖"))
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    }),
+                    cx,
+                )
+                .into_any_element(),
+                settings_segmented_option(
+                    "sidebar-detailed",
+                    locale::text("Workspace view", "工作区视图", "工作區視圖"),
+                    hierarchy == SidebarHierarchyMode::Detailed,
+                    cx.listener(|this, _, _, cx| {
                         this.set_sidebar_hierarchy(SidebarHierarchyMode::Detailed, cx)
-                    })),
-            );
+                    }),
+                    cx,
+                )
+                .into_any_element(),
+            ],
+            cx,
+        );
         let clear_overrides = Button::new("clear-project-location-overrides")
             .small()
             .outline()
@@ -47572,61 +47499,53 @@ impl FoundationSettings {
         stacked: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let input = theme::semantic_color("input", cx.theme().is_dark());
-        let shell_select = div()
-            .h(px(28.0))
-            .when(stacked, |this| this.w_full())
-            .when(!stacked, |this| this.w(px(240.0)))
-            .child(
-                Select::new(&self.terminal_shells)
-                    .small()
-                    .h(px(28.0))
-                    .rounded(px(8.0))
-                    .border_color(input)
-                    .text_xs(),
-            );
+        let shell_select =
+            settings_select(&self.terminal_shells, Some(px(240.0)), stacked, None::<&str>, cx);
         let cwd = preferences.working_directory;
-        let cwd_control = h_flex()
-            .gap_1()
-            .child(
-                Button::new("terminal-cwd-worktree")
-                    .small()
-                    .outline()
-                    .selected(cwd == TerminalWorkingDirectory::CurrentWorktree)
-                    .label(locale::text("Worktree", "工作树", "工作樹"))
-                    .on_click(cx.listener(|this, _, _, cx| {
+        let cwd_control = settings_segmented_control(
+            vec![
+                settings_segmented_option(
+                    "terminal-cwd-worktree",
+                    locale::text("Worktree", "工作树", "工作樹"),
+                    cwd == TerminalWorkingDirectory::CurrentWorktree,
+                    cx.listener(|this, _, _, cx| {
                         this.set_terminal_working_directory(
                             TerminalWorkingDirectory::CurrentWorktree,
                             cx,
                         )
-                    })),
-            )
-            .child(
-                Button::new("terminal-cwd-project")
-                    .small()
-                    .outline()
-                    .selected(cwd == TerminalWorkingDirectory::ProjectRoot)
-                    .label(locale::text("Project", "项目", "專案"))
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    }),
+                    cx,
+                )
+                .into_any_element(),
+                settings_segmented_option(
+                    "terminal-cwd-project",
+                    locale::text("Project", "项目", "專案"),
+                    cwd == TerminalWorkingDirectory::ProjectRoot,
+                    cx.listener(|this, _, _, cx| {
                         this.set_terminal_working_directory(
                             TerminalWorkingDirectory::ProjectRoot,
                             cx,
                         )
-                    })),
-            )
-            .child(
-                Button::new("terminal-cwd-file")
-                    .small()
-                    .outline()
-                    .selected(cwd == TerminalWorkingDirectory::CurrentFile)
-                    .label(locale::text("Current file", "当前文件", "目前檔案"))
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    }),
+                    cx,
+                )
+                .into_any_element(),
+                settings_segmented_option(
+                    "terminal-cwd-file",
+                    locale::text("Current file", "当前文件", "目前檔案"),
+                    cwd == TerminalWorkingDirectory::CurrentFile,
+                    cx.listener(|this, _, _, cx| {
                         this.set_terminal_working_directory(
                             TerminalWorkingDirectory::CurrentFile,
                             cx,
                         )
-                    })),
-            );
+                    }),
+                    cx,
+                )
+                .into_any_element(),
+            ],
+            cx,
+        );
         settings_page(
             locale::text("Terminal", "终端", "終端機"),
             locale::text(
@@ -47808,7 +47727,7 @@ impl FoundationSettings {
             .items_center()
             .gap_1()
             .when(storage_pending, |this| this.child(Spinner::new().xsmall()))
-            .child(div().text_xs().font_medium().child(storage_label));
+            .child(settings_value_chip(storage_label, cx));
         let open_home = home.clone();
         settings_page(
             locale::text("Data & Diagnostics", "数据与诊断", "資料與診斷"),
@@ -48205,11 +48124,10 @@ impl FoundationSettings {
                         "已安装的 Vibex 桌面版本和发布通道。",
                         "已安裝的 Vibex 桌面版本與發行通道。",
                     ),
-                    div().text_xs().font_medium().child(format!(
-                        "{} · {}",
-                        env!("CARGO_PKG_VERSION"),
-                        channel
-                    )),
+                    settings_value_chip(
+                        format!("{} · {}", env!("CARGO_PKG_VERSION"), channel),
+                        cx,
+                    ),
                     stacked,
                     cx,
                 ),
@@ -48220,11 +48138,10 @@ impl FoundationSettings {
                         "当前操作系统和架构。",
                         "目前作業系統與架構。",
                     ),
-                    div().text_xs().font_medium().child(format!(
-                        "{} · {}",
-                        std::env::consts::OS,
-                        std::env::consts::ARCH
-                    )),
+                    settings_value_chip(
+                        format!("{} · {}", std::env::consts::OS, std::env::consts::ARCH),
+                        cx,
+                    ),
                     stacked,
                     cx,
                 ),
@@ -49162,7 +49079,7 @@ fn settings_number_stepper(
         .flex_none()
         .rounded(px(8.0))
         .border_1()
-        .border_color(input.opacity(0.75))
+        .border_color(input)
         .bg(input_background)
         .p(px(2.0))
         .child(
@@ -49216,6 +49133,121 @@ fn settings_number_stepper(
 
 fn adjust_u16(value: u16, delta: i16, minimum: u16, maximum: u16) -> u16 {
     (value as i32 + delta as i32).clamp(minimum as i32, maximum as i32) as u16
+}
+
+/// One segment of a [`settings_segmented_control`]: a ghost button that pops
+/// with a card-coloured chip when selected so the control reads as one unit.
+fn settings_segmented_option(
+    id: impl Into<ElementId>,
+    label: impl IntoElement,
+    selected: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> Button {
+    let is_dark = cx.theme().is_dark();
+    let foreground = theme::semantic_color("foreground", is_dark);
+    let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
+    let card = theme::semantic_color("card", is_dark);
+    Button::new(id)
+        .small()
+        .ghost()
+        .h_full()
+        .rounded(px(6.0))
+        .selected(selected)
+        .text_color(if selected {
+            foreground
+        } else {
+            muted_foreground
+        })
+        .when(selected, |this| this.bg(card))
+        .child(label)
+        .on_click(on_click)
+}
+
+/// Groups [`settings_segmented_option`] segments into one bordered pill shell
+/// shared with the settings selects and number steppers (28px, rounded 8px).
+fn settings_segmented_control(options: Vec<AnyElement>, cx: &App) -> AnyElement {
+    let is_dark = cx.theme().is_dark();
+    let input = theme::semantic_color("input", is_dark);
+    let input_background = input.opacity(if is_dark { 0.30 } else { 0.20 });
+    let mut children = Vec::with_capacity(options.len().saturating_mul(2));
+    for (index, option) in options.into_iter().enumerate() {
+        if index > 0 {
+            children.push(
+                div()
+                    .flex_none()
+                    .h_full()
+                    .w(px(1.0))
+                    .bg(input.opacity(0.75))
+                    .into_any_element(),
+            );
+        }
+        children.push(option);
+    }
+    h_flex()
+        .h(px(28.0))
+        .flex_none()
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(input)
+        .bg(input_background)
+        .p(px(2.0))
+        .children(children)
+        .into_any_element()
+}
+
+/// Renders a settings dropdown with the shared control shell; full width when
+/// the row is stacked, otherwise `width` (or full width when `None`).
+fn settings_select<D>(
+    state: &Entity<SelectState<D>>,
+    width: Option<gpui::Pixels>,
+    stacked: bool,
+    placeholder: Option<impl Into<SharedString>>,
+    cx: &App,
+) -> AnyElement
+where
+    D: SelectDelegate + 'static,
+    <D::Item as SearchableListItem>::Value: PartialEq + Clone,
+{
+    let is_dark = cx.theme().is_dark();
+    let input = theme::semantic_color("input", is_dark);
+    let input_background = input.opacity(if is_dark { 0.30 } else { 0.20 });
+    let mut select = Select::new(state)
+        .small()
+        .h(px(28.0))
+        .rounded(px(8.0))
+        .border_color(input)
+        .bg(input_background)
+        .text_xs();
+    if let Some(placeholder) = placeholder {
+        select = select.placeholder(placeholder.into());
+    }
+    div()
+        .h(px(28.0))
+        .when(stacked || width.is_none(), |this| this.w_full())
+        .when_some(width.filter(|_| !stacked), |this, width| this.w(width))
+        .child(select)
+        .into_any_element()
+}
+
+/// Presents a read-only informational value (usage totals, versions) as a
+/// muted chip so it reads as data rather than an interactive control.
+fn settings_value_chip(text: impl Into<SharedString>, cx: &App) -> AnyElement {
+    let is_dark = cx.theme().is_dark();
+    let foreground = theme::semantic_color("foreground", is_dark);
+    let muted = theme::semantic_color("muted", is_dark);
+    div()
+        .max_w_full()
+        .rounded(px(6.0))
+        .bg(muted.opacity(0.6))
+        .px_2()
+        .py(px(3.0))
+        .text_xs()
+        .font_medium()
+        .whitespace_normal()
+        .text_color(foreground)
+        .child(text.into())
+        .into_any_element()
 }
 
 fn decode_html_data_image(html: &str) -> Option<(gpui::ImageFormat, Vec<u8>)> {
@@ -59548,12 +59580,16 @@ mod tests {
         assert!(sidebar.contains("NewSessionOpenTarget::Workspace"));
         assert!(sidebar.contains("icons/vibex/git-branch.svg"));
         assert!(
-            source.contains(".label(locale::text(\"Session view\", \"会话视图\", \"會話視圖\"))")
+            source.contains("settings_segmented_option(\n                    \"sidebar-compact\"")
         );
         assert!(
-            source.contains(
-                ".label(locale::text(\"Workspace view\", \"工作区视图\", \"工作區視圖\"))"
-            )
+            source.contains("settings_segmented_option(\n                    \"sidebar-detailed\"")
+        );
+        assert!(
+            source.contains("locale::text(\"Session view\", \"会话视图\", \"會話視圖\")")
+        );
+        assert!(
+            source.contains("locale::text(\"Workspace view\", \"工作区视图\", \"工作區視圖\")")
         );
     }
 
