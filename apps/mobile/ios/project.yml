@@ -45,8 +45,10 @@ targets:
         INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
         CLANG_ENABLE_OBJC_ARC: YES
         HEADER_SEARCH_PATHS: ["$(inherited)", "$(SRCROOT)/Headers"]
-        # QRScanner.swift imports the static library through its Clang module,
-        # and the FFI library is only built for arm64 simulators.
-        SWIFT_INCLUDE_PATHS: ["$(inherited)", "$(SRCROOT)/Headers"]
+        # QRScanner.swift imports the FFI through the Clang module that the
+        # xcframework slice carries in Headers/module.modulemap; Xcode extracts
+        # it into $(BUILT_PRODUCTS_DIR)/include. Adding extra Swift include
+        # paths here would define the module twice. The FFI library is only
+        # built for arm64 simulators.
         ARCHS: [arm64]
         OTHER_LDFLAGS: ["$(inherited)", "-ObjC", "-all_load"]
