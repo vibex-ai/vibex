@@ -72,42 +72,36 @@ Vibex 使用 [Agent Client Protocol](https://agentclientprotocol.com/) (ACP) 作
           <sub><b>Claude Code</b></sub>
         </a>
       </td>
-      
       <td align="center" valign="middle" width="135" height="84">
         <a href="https://github.com/openai/codex">
           <img src="docs/assets/agents/codex.svg" alt="Codex logo" width="28" /><br />
           <sub><b>Codex</b></sub>
         </a>
       </td>
-
       <td align="center" valign="middle" width="135" height="84">
         <a href="https://z.ai">
           <img src="docs/assets/agents/zcode.svg" alt="ZCode logo" width="28" /><br />
           <sub><b>ZCode</b></sub>
         </a>
       </td>
-    
       <td align="center" valign="middle" width="135" height="84">
         <a href="https://opencode.ai">
           <img src="docs/assets/agents/opencode.svg" alt="OpenCode logo" width="28" /><br />
           <sub><b>OpenCode</b></sub>
         </a>
       </td>
-    
       <td align="center" valign="middle" width="135" height="84">
         <a href="https://antigravity.google/docs/ide/extensions">
           <img src="docs/assets/agents/antigravity.svg" alt="Antigravity logo" width="28" /><br />
           <sub><b>Antigravity</b></sub>
         </a>
       </td>
-    
       <td align="center" valign="middle" width="135" height="84">
         <a href="https://cline.bot/cli">
           <img src="docs/assets/agents/cline.svg" alt="Cline logo" width="28" /><br />
           <sub><b>Cline</b></sub>
         </a>
       </td>
-    
     </tr>
     <tr>
       <td align="center" valign="middle" width="135" height="84">
@@ -116,42 +110,36 @@ Vibex 使用 [Agent Client Protocol](https://agentclientprotocol.com/) (ACP) 作
           <sub><b>Codebuddy Code</b></sub>
         </a>
       </td>
-    
       <td align="center" valign="middle" width="135" height="84">
         <a href="https://docs.cursor.com/en/cli/overview">
           <img src="docs/assets/agents/cursor.svg" alt="Cursor logo" width="28" /><br />
           <sub><b>Cursor</b></sub>
         </a>
       </td>
-    
       <td align="center" valign="middle" width="135" height="84">
         <a href="https://geminicli.com">
           <img src="docs/assets/agents/gemini.svg" alt="Gemini CLI logo" width="28" /><br />
           <sub><b>Gemini CLI</b></sub>
         </a>
       </td>
-    
       <td align="center" valign="middle" width="135" height="84">
         <a href="https://docs.github.com/en/copilot/concepts/agents/about-copilot-cli">
           <img src="docs/assets/agents/copilot.svg" alt="GitHub Copilot logo" width="28" /><br />
           <sub><b>GitHub Copilot</b></sub>
         </a>
       </td>
-    
       <td align="center" valign="middle" width="135" height="84">
         <a href="https://cli.devin.ai/docs">
           <img src="docs/assets/agents/devin.svg" alt="Devin logo" width="28" /><br />
           <sub><b>Devin</b></sub>
         </a>
       </td>
-    
       <td align="center" valign="middle" width="135" height="84">
         <a href="https://docs.x.ai/build/overview">
           <img src="docs/assets/agents/grok.svg" alt="Grok logo" width="28" /><br />
           <sub><b>Grok</b></sub>
         </a>
       </td>
-    
     </tr>
     <tr>
       <td align="center" valign="middle" width="135" height="84">
@@ -160,35 +148,30 @@ Vibex 使用 [Agent Client Protocol](https://agentclientprotocol.com/) (ACP) 作
           <sub><b>Hermes</b></sub>
         </a>
       </td>
-    
       <td align="center" valign="middle" width="135" height="84">
         <a href="https://github.com/MoonshotAI/kimi-cli">
           <img src="docs/assets/agents/kimi.svg" alt="Kimi Code logo" width="28" /><br />
           <sub><b>Kimi Code</b></sub>
         </a>
       </td>
-    
       <td align="center" valign="middle" width="135" height="84">
         <a href="https://github.com/svkozak/pi-acp">
           <img src="docs/assets/agents/pi.svg" alt="Pi logo" width="28" /><br />
           <sub><b>Pi</b></sub>
         </a>
       </td>
-    
       <td align="center" valign="middle" width="135" height="84">
         <a href="https://github.com/vibex-ai/deepseek-harness-acp">
           <img src="docs/assets/agents/deepseek-harness.svg" alt="DeepSeek Harness logo" width="28" /><br />
           <sub><b>DeepSeek Harness</b></sub>
         </a>
       </td>
-    
       <td align="center" valign="middle" width="135" height="84">
         <a href="https://agentclientprotocol.com">
           <img src="https://mintcdn.com/zed-685ed6d6/ZwvtxaoaZwBJrK5s/logo/dark.svg" alt="Agent Client Protocol logo" width="28" /><br />
           <sub><b>任意 ACP Agent</b></sub>
         </a>
       </td>
-    
     </tr>
   </table>
 </div>
