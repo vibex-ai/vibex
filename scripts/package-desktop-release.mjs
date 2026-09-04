@@ -15,6 +15,14 @@ import { fileURLToPath } from "node:url";
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const PLATFORMS = new Set(["linux", "macos", "windows"]);
 const CHANNELS = new Set(["preview", "rc", "stable"]);
+// Keep macOS input dimensions within cargo-packager's supported ICNS types.
+const MACOS_ICON_INPUTS = [
+  "assets/app-icons/icon-16.png",
+  "assets/app-icons/icon-32.png",
+  "assets/app-icons/icon-48.png",
+  "assets/app-icons/icon-128.png",
+  "assets/app-icons/icon-256.png"
+];
 
 function fail(message) {
   throw new Error(message);
@@ -75,6 +83,18 @@ function withField(source, field, value) {
   return source.replace(pattern, line);
 }
 
+function withIcons(source, icons) {
+  const pattern = /^icons\s*=\s*\[[\s\S]*?^\]\n/m;
+  if (!pattern.test(source)) fail("generic Packager configuration is missing icons");
+  const replacement = [
+    "icons = [",
+    ...icons.map((icon) => `  ${JSON.stringify(icon)},`),
+    "]",
+    ""
+  ].join("\n");
+  return source.replace(pattern, replacement);
+}
+
 function writePlatformConfig(platform, channel) {
   const channelConfig = read(`apps/desktop/Packager.${channel}.toml`);
   let config = read("apps/desktop/Packager.toml");
@@ -82,6 +102,7 @@ function writePlatformConfig(platform, channel) {
     config = withField(config, field, fieldValue(channelConfig, field));
   }
   if (platform === "macos") {
+    config = withIcons(config, MACOS_ICON_INPUTS);
     config = config.replace(/\n\[nsis\][\s\S]*$/, "\n");
   }
   const output = join(

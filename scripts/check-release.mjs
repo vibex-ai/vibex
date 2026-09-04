@@ -117,7 +117,23 @@ function validatePackaging() {
   const workflow = source(".github/workflows/release-candidate.yml");
   assert(workflow.includes("ubuntu-24.04"), "candidate workflow lost its Linux host");
   assert(workflow.includes("--formats deb,appimage"), "candidate workflow formats drifted");
+  for (const dependency of [
+    "libglib2.0-dev",
+    "libgtk-3-dev",
+    "libayatana-appindicator3-dev",
+    "libwebkit2gtk-4.1-dev"
+  ]) {
+    assert(workflow.includes(dependency), `candidate workflow is missing ${dependency}`);
+  }
   const releaseWorkflow = source(".github/workflows/release.yml");
+  for (const dependency of [
+    "libglib2.0-dev",
+    "libgtk-3-dev",
+    "libayatana-appindicator3-dev",
+    "libwebkit2gtk-4.1-dev"
+  ]) {
+    assert(releaseWorkflow.includes(dependency), `publish workflow is missing ${dependency}`);
+  }
   for (const required of [
     "platform: linux",
     "platform: macos",
@@ -142,8 +158,23 @@ function validatePackaging() {
     source("apps/mobile/scripts/build-android.sh").includes("bundleRelease"),
     "Android release workflow must produce an AAB"
   );
+  const iosBuildScript = source("apps/mobile/scripts/build-ios.sh");
+  assert(iosBuildScript.includes("--crate-type staticlib"), "iOS release build must emit a static library");
+  assert(iosBuildScript.includes("--lib"), "iOS release build must select the mobile library target");
+  assert(!iosBuildScript.includes("cargo build -p vibex-mobile"), "iOS release build must not link manifest crate types");
+  const desktopReleaseScript = source("scripts/package-desktop-release.mjs");
   assert(
-    source("scripts/package-desktop-release.mjs").includes("--formats"),
+    desktopReleaseScript.includes("withIcons(config, MACOS_ICON_INPUTS)"),
+    "macOS release packaging must select a supported ICNS input set"
+  );
+  for (const icon of ["icon-16.png", "icon-32.png", "icon-48.png", "icon-128.png", "icon-256.png"]) {
+    assert(
+      desktopReleaseScript.includes(`assets/app-icons/${icon}`),
+      `macOS release packaging is missing ${icon}`
+    );
+  }
+  assert(
+    desktopReleaseScript.includes("--formats"),
     "desktop release packager must select an explicit platform format"
   );
 }

@@ -27,11 +27,13 @@ resolve_staticlib() {
 
 build_staticlib() {
   local target="$1"
-  cargo build -p vibex-mobile --target "$target" "${RUST_FLAGS[@]}"
-  resolve_staticlib "$target" || {
-    cargo rustc -p vibex-mobile --target "$target" "${RUST_FLAGS[@]}" -- --crate-type staticlib
-    resolve_staticlib "$target"
-  }
+  cargo rustc \
+    -p vibex-mobile \
+    --target "$target" \
+    --lib \
+    --crate-type staticlib \
+    "${RUST_FLAGS[@]}"
+  resolve_staticlib "$target"
 }
 
 DEVICE_LIB="$(build_staticlib aarch64-apple-ios)"
@@ -53,4 +55,3 @@ command -v xcodegen >/dev/null || {
   exit 1
 }
 (cd apps/mobile/ios && xcodegen generate)
-

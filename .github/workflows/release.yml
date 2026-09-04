@@ -96,7 +96,24 @@ jobs:
         if: matrix.platform == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libfontconfig1-dev libvulkan1 libxkbcommon-x11-dev patchelf
+          sudo apt-get install -y \
+            clang \
+            g++ \
+            gcc \
+            pkg-config \
+            libfontconfig1-dev \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libvulkan1 \
+            libwayland-dev \
+            libwebkit2gtk-4.1-dev \
+            libx11-xcb-dev \
+            libxkbcommon-x11-dev \
+            libzstd-dev \
+            patchelf
       - name: Install dependencies and packager
         shell: bash
         run: |
