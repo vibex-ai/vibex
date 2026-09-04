@@ -344,6 +344,13 @@ const COMPOSER_QUEUE_HORIZONTAL_INSET: f32 = 20.0;
 const COMPOSER_QUEUE_EDIT_ROW_HEIGHT: f32 = 38.0;
 const COMPOSER_QUEUE_HEADER_HEIGHT: f32 = 36.0;
 const COMPOSER_QUEUE_ROW_HEIGHT: f32 = 28.0;
+/// Queued messages show at most this many lines outside of edit mode so a long
+/// message cannot push the queue over the rest of the interface.
+const COMPOSER_QUEUE_PREVIEW_MAX_LINES: usize = 3;
+/// text_sm (14px) at a 1.5x line height.
+const COMPOSER_QUEUE_PREVIEW_LINE_HEIGHT: f32 = 21.0;
+const COMPOSER_QUEUE_PREVIEW_MAX_HEIGHT: f32 =
+    COMPOSER_QUEUE_PREVIEW_LINE_HEIGHT * COMPOSER_QUEUE_PREVIEW_MAX_LINES as f32;
 const COMPOSER_EXTENSION_SURFACE_OPACITY: f32 = 0.90;
 const COMPOSER_PLAN_TOOLTIP_WIDTH: f32 = 360.0;
 const COMPOSER_PLAN_TOOLTIP_MAX_HEIGHT: f32 = 420.0;
@@ -13769,7 +13776,9 @@ impl VibexWorkbench {
             .flex_1()
             .flex_wrap()
             .items_center()
-            .gap_1();
+            .gap_1()
+            .max_h(px(COMPOSER_QUEUE_PREVIEW_MAX_HEIGHT))
+            .overflow_hidden();
 
         for segment in user_message_inline_segments(text, attachments) {
             match segment {
@@ -13777,9 +13786,13 @@ impl VibexWorkbench {
                     content = content.child(
                         div()
                             .min_w_0()
+                            .max_w_full()
                             .flex_shrink(1.0)
                             .text_sm()
+                            .line_height(gpui::relative(1.5))
                             .whitespace_normal()
+                            .overflow_hidden()
+                            .line_clamp(COMPOSER_QUEUE_PREVIEW_MAX_LINES)
                             .child(value),
                     );
                 }
@@ -56176,6 +56189,25 @@ mod tests {
         assert!(queue.contains(".rounded_tr(px(COMPOSER_SURFACE_RADIUS))"));
         assert!(queue.contains(".border_b_0()"));
         assert!(queue.contains(".border_b_1()"));
+    }
+
+    #[test]
+    fn composer_queue_previews_clamp_message_text_to_three_lines_outside_edit_mode() {
+        let source = include_str!("app.rs");
+        let preview = source
+            .split_once("    fn render_composer_queue_inline_content(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn delete_composer_queue_message("))
+            .map(|(body, _)| body)
+            .expect("queued message preview renderer should remain inspectable");
+        assert!(preview.contains(".line_clamp(COMPOSER_QUEUE_PREVIEW_MAX_LINES)"));
+        assert!(preview.contains(".max_h(px(COMPOSER_QUEUE_PREVIEW_MAX_HEIGHT))"));
+        assert!(preview.contains(".overflow_hidden()"));
+        // The clamp only guards the non-editing preview; editing keeps the
+        // multi-line input.
+        assert!(!preview.contains("COMPOSER_QUEUE_EDIT_ROW_HEIGHT"));
+
+        assert_eq!(COMPOSER_QUEUE_PREVIEW_MAX_LINES, 3);
+        assert_eq!(COMPOSER_QUEUE_PREVIEW_MAX_HEIGHT, 63.0);
     }
 
     #[test]
