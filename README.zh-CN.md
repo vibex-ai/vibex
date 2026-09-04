@@ -27,6 +27,10 @@
   <a href="#架构">架构</a> &nbsp;&bull;&nbsp;
   <a href="#开发">开发</a>
 </p>
+<p align="center">
+  <img src="docs/assets/showcase/desktop-zh.png" alt="Vibex 桌面应用界面展示" width="960" />
+</p>
+
 
 Vibex 将 Agent 会话、源代码、Git、终端、预览和供应商配置整合到一个专注的工作台中。桌面运行时统一管理 Agent 进程、会话历史、工作区文件、Git、PTY、供应商和权限。原生移动端可以远程监控并操控相同的会话，可选的自托管 Relay 只承载加密帧。
 

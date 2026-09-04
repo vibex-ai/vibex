@@ -27,6 +27,10 @@
   <a href="#architecture">Architecture</a> &nbsp;&bull;&nbsp;
   <a href="#development">Development</a>
 </p>
+<p align="center">
+  <img src="docs/assets/showcase/desktop-en.png" alt="Vibex desktop application interface display" width="960" />
+</p>
+
 
 Vibex brings Agent sessions, source code, Git, terminals, previews, and provider
 configuration into one focused workbench. The desktop runtime stays in control
