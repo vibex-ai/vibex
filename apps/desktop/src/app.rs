@@ -28521,7 +28521,7 @@ impl VibexWorkbench {
             .min_h_0()
             .overflow_x_hidden()
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-            .rounded(px(10.0))
+            .rounded(px(8.0))
             .bg(popover_color)
             .text_color(popover_foreground)
             .shadow(vec![
@@ -29369,6 +29369,7 @@ impl VibexWorkbench {
                                     .h(px(49.0))
                                     .flex_none()
                                     .min_w_0()
+                                    .items_center()
                                     .gap_1()
                                     .rounded(px(28.0))
                                     .border_1()
@@ -29391,10 +29392,15 @@ impl VibexWorkbench {
                             )
                             .when(!has_agent_choices, |this| {
                                 this.child(
-                                    div()
+                                    h_flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .gap_1p5()
+                                        .py_1()
                                         .text_center()
                                         .text_sm()
                                         .text_color(cx.theme().muted_foreground)
+                                        .child(Icon::new(IconName::Inbox).size(px(15.0)))
                                         .child(strings.new_session_no_agents),
                                 )
                             })
@@ -29656,11 +29662,27 @@ impl VibexWorkbench {
                                     })
                                     .when_some(self.new_session_error.clone(), |this, error| {
                                         this.child(
-                                            div()
+                                            h_flex()
                                                 .min_w_0()
+                                                .items_center()
+                                                .gap_1p5()
+                                                .rounded(px(8.0))
+                                                .border_1()
+                                                .border_color(cx.theme().danger.opacity(0.45))
+                                                .bg(cx.theme().danger.opacity(0.08))
+                                                .px_2p5()
+                                                .py_1p5()
                                                 .text_xs()
                                                 .text_color(cx.theme().danger)
-                                                .child(locale::localize_error_message(&error)),
+                                                .child(
+                                                    Icon::new(IconName::TriangleAlert)
+                                                        .size(px(14.0)),
+                                                )
+                                                .child(
+                                                    div().min_w_0().truncate().child(
+                                                        locale::localize_error_message(&error),
+                                                    ),
+                                                ),
                                         )
                                     }),
                             ),

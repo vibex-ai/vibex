@@ -62,6 +62,7 @@ use crate::gpui_ext::button_with_aria_label;
 use crate::locale::{self, ResolvedLocale};
 use crate::remote_access_pairing::open_remote_access_pairing;
 use crate::terminal_surface::TerminalSurface;
+use crate::theme;
 
 const MANAGEMENT_SIDEBAR_WIDTH: f32 = 368.0;
 const MANAGEMENT_HEADER_HEIGHT: f32 = 48.0;
@@ -7492,7 +7493,7 @@ impl ManagementCenter {
             .rounded(px(8.0))
             .border_1()
             .border_color(cx.theme().border)
-            .bg(cx.theme().muted.opacity(0.20))
+            .bg(cx.theme().muted.opacity(0.35))
             .p_1();
         for (section, label, icon) in items {
             nav = nav.child(
@@ -7532,8 +7533,22 @@ impl ManagementCenter {
             .child(
                 h_flex()
                     .min_w_0()
+                    .items_center()
                     .gap_2()
-                    .child(Icon::new(IconName::Settings2).size(px(16.0)))
+                    .child(
+                        h_flex()
+                            .size(px(24.0))
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.0))
+                            .bg(cx.theme().primary.opacity(0.08))
+                            .child(
+                                Icon::new(IconName::Settings2)
+                                    .size(px(14.0))
+                                    .text_color(cx.theme().primary),
+                            ),
+                    )
                     .child(div().truncate().text_sm().font_medium().child(copy.title)),
             )
             .into_any_element()
@@ -7669,7 +7684,7 @@ impl ManagementCenter {
                     .w_full()
                     .gap_1()
                     .overflow_hidden()
-                    .rounded(px(10.0))
+                    .rounded(px(8.0))
                     .border_1()
                     .border_color(cx.theme().border.opacity(if selected { 0.0 } else { 0.65 }))
                     .bg(if selected {
@@ -7832,7 +7847,7 @@ impl ManagementCenter {
             .items_center()
             .justify_center()
             .gap_1()
-            .rounded(px(10.0))
+            .rounded(px(8.0))
             .border_1()
             .border_color(cx.theme().border.opacity(0.70))
             .bg(if self.custom_agent_editor_open {
@@ -10585,7 +10600,7 @@ impl ManagementCenter {
                 .min_w_0()
                 .min_h(px(MANAGEMENT_PROVIDER_ROW_HEIGHT))
                 .overflow_hidden()
-                .rounded(px(14.0))
+                .rounded(px(8.0))
                 .border_1()
                 .border_color(if active_drop_after.is_some() {
                     cx.theme().drag_border
@@ -15735,15 +15750,32 @@ fn compact_empty_state(
 ) -> AnyElement {
     v_flex()
         .w_full()
-        .gap_1()
+        .items_center()
+        .justify_center()
+        .gap_1p5()
         .rounded(px(8.0))
         .border_1()
         .border_color(cx.theme().border.opacity(0.70))
         .bg(cx.theme().background.opacity(0.60))
         .p_3()
+        .text_center()
+        .child(
+            h_flex()
+                .size(px(28.0))
+                .items_center()
+                .justify_center()
+                .rounded(px(7.0))
+                .bg(cx.theme().muted.opacity(0.45))
+                .child(
+                    Icon::new(IconName::Inbox)
+                        .size(px(15.0))
+                        .text_color(cx.theme().muted_foreground),
+                ),
+        )
         .child(div().text_sm().font_medium().child(title))
         .child(
             div()
+                .max_w(px(280.0))
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
                 .child(description),
@@ -15758,16 +15790,32 @@ fn detail_empty_state(
 ) -> AnyElement {
     v_flex()
         .w_full()
-        .min_h(px(180.0))
+        .min_h(px(220.0))
         .items_center()
         .justify_center()
         .gap_2()
         .rounded(px(8.0))
         .border_1()
         .border_color(cx.theme().border)
+        .bg(theme::semantic_color("card", cx.theme().is_dark()).opacity(0.55))
+        .text_center()
+        .child(
+            h_flex()
+                .size(px(40.0))
+                .items_center()
+                .justify_center()
+                .rounded(px(10.0))
+                .bg(cx.theme().muted.opacity(0.45))
+                .child(
+                    Icon::new(IconName::Inbox)
+                        .size(px(20.0))
+                        .text_color(cx.theme().muted_foreground),
+                ),
+        )
         .child(div().text_sm().font_semibold().child(title))
         .child(
             div()
+                .max_w(px(360.0))
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
                 .child(description),
@@ -16685,7 +16733,7 @@ fn management_card_inner(
         .rounded(px(8.0))
         .border_1()
         .border_color(cx.theme().border)
-        .bg(cx.theme().background.opacity(0.75))
+        .bg(theme::semantic_color("card", cx.theme().is_dark()).opacity(0.72))
         .p_4()
         .child(if let Some(icon_path) = icon_path {
             management_module_heading(title, description, icon_path, cx)
@@ -16719,18 +16767,18 @@ fn management_module_heading(
         .gap_3()
         .child(
             div()
-                .size(px(42.0))
+                .size(px(36.0))
                 .flex_none()
                 .flex()
                 .items_center()
                 .justify_center()
                 .rounded(px(8.0))
-                .bg(cx.theme().accent.opacity(0.45))
+                .bg(cx.theme().primary.opacity(0.08))
                 .child(
                     Icon::default()
                         .path(icon_path)
-                        .size(px(22.0))
-                        .text_color(cx.theme().foreground.opacity(0.82)),
+                        .size(px(18.0))
+                        .text_color(cx.theme().primary),
                 ),
         )
         .child(
