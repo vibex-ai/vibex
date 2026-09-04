@@ -320,11 +320,22 @@ impl UsageView {
             .child(
                 h_flex()
                     .min_w_0()
+                    .items_center()
                     .gap_2()
                     .child(
-                        Icon::default()
-                            .path("icons/vibex/activity.svg")
-                            .size(px(17.0)),
+                        h_flex()
+                            .size(px(24.0))
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.0))
+                            .bg(cx.theme().primary.opacity(0.08))
+                            .child(
+                                Icon::default()
+                                    .path("icons/vibex/activity.svg")
+                                    .size(px(15.0))
+                                    .text_color(cx.theme().primary),
+                            ),
                     )
                     .child(
                         div()
@@ -374,17 +385,18 @@ impl UsageView {
         let selected_range = self.request.range;
         let mut range_control = h_flex()
             .flex_none()
-            .gap_1()
+            .gap(px(2.0))
             .rounded(px(6.0))
             .border_1()
             .border_color(cx.theme().border)
+            .bg(cx.theme().muted.opacity(0.35))
             .p(px(2.0));
         for (range, label) in ranges {
             range_control = range_control.child(
                 Button::new(SharedString::from(format!("usage-range-{range:?}")))
                     .xsmall()
                     .ghost()
-                    .h(px(28.0))
+                    .h(px(26.0))
                     .selected(range == selected_range)
                     .label(label)
                     .on_click(cx.listener(move |this, _, _, cx| this.choose_range(range, cx))),
@@ -562,7 +574,7 @@ impl UsageView {
             .grid()
             .grid_cols(columns)
             .w_full()
-            .gap_2()
+            .gap_3()
             .children([
                 summary_metric_value(
                     "total",
@@ -639,10 +651,13 @@ impl UsageView {
         };
         v_flex()
             .w_full()
+            .min_w_0()
             .gap_3()
-            .border_t_1()
-            .border_b_1()
+            .rounded_lg()
+            .border_1()
             .border_color(cx.theme().border)
+            .bg(theme::semantic_color("card", cx.theme().is_dark()).opacity(0.72))
+            .px_4()
             .py_3()
             .child(
                 h_flex()
@@ -654,7 +669,7 @@ impl UsageView {
                     .child(
                         h_flex()
                             .items_center()
-                            .gap_1()
+                            .gap_2()
                             .child(div().text_sm().font_semibold().child(locale::text(
                                 "Usage trend",
                                 "用量趋势",
@@ -780,13 +795,13 @@ impl UsageView {
             ),
         ];
         let selected = self.request.dimension;
-        let mut controls = h_flex().w_full().flex_wrap().gap_1();
+        let mut controls = h_flex().w_full().flex_wrap().gap(px(2.0));
         for (dimension, label) in dimensions {
             controls = controls.child(
                 Button::new(SharedString::from(format!("usage-dimension-{dimension:?}")))
                     .xsmall()
                     .ghost()
-                    .h(px(30.0))
+                    .h(px(28.0))
                     .selected(dimension == selected)
                     .label(label)
                     .on_click(
@@ -796,8 +811,24 @@ impl UsageView {
         }
         v_flex()
             .w_full()
-            .gap_2()
-            .child(controls)
+            .min_w_0()
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(theme::semantic_color("card", cx.theme().is_dark()).opacity(0.72))
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .w_full()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(2.0))
+                    .px_2()
+                    .py(px(6.0))
+                    .border_b_1()
+                    .border_color(cx.theme().border.opacity(0.55))
+                    .child(controls),
+            )
             .child(self.render_table(statistics.dimension_rows.as_slice(), cx))
             .into_any_element()
     }
@@ -884,8 +915,9 @@ impl UsageView {
                     )),
             );
         } else {
+            let last_index = rows.len().saturating_sub(1);
             for (index, row) in rows.iter().enumerate() {
-                body = body.child(render_table_row(index, row, cx));
+                body = body.child(render_table_row(index, row, index == last_index, cx));
             }
         }
         let wheel_scroll = self.table_scroll.clone();
@@ -911,9 +943,6 @@ impl UsageView {
                 }
                 cx.stop_propagation();
             }))
-            .border_1()
-            .border_color(cx.theme().border)
-            .rounded(px(6.0))
             .child(
                 v_flex()
                     .min_w(px(USAGE_TABLE_MIN_WIDTH))
@@ -1046,14 +1075,15 @@ impl Render for UsageView {
                 .children(status)
                 .child(self.render_toolbar(cx))
                 .child(
-                    div()
-                        .h(px(180.0))
+                    v_flex()
+                        .h(px(200.0))
                         .w_full()
-                        .flex()
                         .items_center()
                         .justify_center()
+                        .gap_2()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
+                        .child(Icon::new(IconName::Inbox).size(px(22.0)))
                         .child(locale::text(
                             "Usage is recorded from the time this feature is enabled",
                             "用量从启用此功能后开始记录",
@@ -1087,9 +1117,11 @@ impl Render for UsageView {
                 div()
                     .flex_1()
                     .min_h_0()
+                    .min_w_0()
                     .w_full()
                     .overflow_y_scrollbar()
                     .p_4()
+                    .pb_6()
                     .child(content),
             )
     }
@@ -1158,32 +1190,42 @@ fn summary_metric(
     v_flex()
         .id(SharedString::from(format!("usage-summary-{id}")))
         .min_w_0()
-        .h(px(72.0))
         .justify_center()
-        .gap_1()
+        .gap_2()
         .rounded(px(8.0))
         .border_1()
-        .border_color(cx.theme().border.opacity(0.78))
-        .bg(theme::semantic_color("card", cx.theme().is_dark()))
-        .px_3()
+        .border_color(cx.theme().border)
+        .bg(theme::semantic_color("card", cx.theme().is_dark()).opacity(0.72))
+        .px_3p5()
+        .py_3()
         .child(
             h_flex()
                 .min_w_0()
                 .items_center()
-                .gap_1()
+                .gap_1p5()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
                 .child(
-                    Icon::new(icon)
-                        .size(px(13.0))
-                        .text_color(cx.theme().primary.opacity(0.82)),
+                    h_flex()
+                        .size(px(20.0))
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(5.0))
+                        .bg(cx.theme().primary.opacity(0.08))
+                        .child(
+                            Icon::new(icon)
+                                .size(px(12.0))
+                                .text_color(cx.theme().primary.opacity(0.82)),
+                        ),
                 )
                 .child(div().min_w_0().truncate().child(label)),
         )
         .child(
             div()
                 .truncate()
-                .text_lg()
+                .text_xl()
+                .line_height(gpui::relative(1.2))
                 .font_semibold()
                 .when(unknown, |this| this.text_color(cx.theme().muted_foreground))
                 .child(value),
@@ -2238,6 +2280,7 @@ fn table_plain_header(label: &'static str, width: f32, cx: &mut Context<UsageVie
 fn render_table_row(
     index: usize,
     row: &AgentUsageDimensionRow,
+    last: bool,
     cx: &mut Context<UsageView>,
 ) -> AnyElement {
     let label_tooltip = row.label.clone();
@@ -2246,8 +2289,10 @@ fn render_table_row(
         .min_h(px(42.0))
         .w_full()
         .items_center()
-        .border_b_1()
-        .border_color(cx.theme().border.opacity(0.55))
+        .when(!last, |this| {
+            this.border_b_1()
+                .border_color(cx.theme().border.opacity(0.55))
+        })
         .when(index % 2 == 1, |this| {
             this.bg(cx.theme().muted.opacity(0.10))
         })
