@@ -11489,8 +11489,6 @@ impl VibexWorkbench {
             {
                 self.conversation_turns_cache_key =
                     Some(self.current_conversation_turns_cache_key());
-                self.conversation_turns_summary =
-                    ConversationTurnsSummary::from_turns(&self.conversation_turns_cache);
                 streaming_cache_update = Some(update);
             } else if !self.timeline.needs_authoritative_refetch
                 && let Some(updates) = reasoning_updates.as_deref()
@@ -11510,8 +11508,6 @@ impl VibexWorkbench {
             {
                 self.conversation_turns_cache_key =
                     Some(self.current_conversation_turns_cache_key());
-                self.conversation_turns_summary =
-                    ConversationTurnsSummary::from_turns(&self.conversation_turns_cache);
                 streaming_cache_update = Some(update);
             }
             if let Some(update) = streaming_cache_update.as_ref() {
@@ -50146,6 +50142,7 @@ mod tests {
         let (_, mut cache) = streaming_timeline_fixture();
         let historical_turn = cache[0].clone();
         let active_turn = cache[1].clone();
+        let summary_before = ConversationTurnsSummary::from_turns(cache.as_slice());
         let mut state_cache = None;
         let updates = [AgentStreamingDeltaUpdate {
             item_id: "timeline_streaming_5".into(),
@@ -50165,6 +50162,15 @@ mod tests {
         assert_eq!(update.body_len, "streaming".len());
         assert_eq!(update.output_char_delta, "ing".chars().count());
         assert_eq!(state_cache.as_ref().unwrap().body_len, "streaming".len());
+        let summary_after = ConversationTurnsSummary::from_turns(cache.as_slice());
+        assert_eq!(
+            summary_after.has_incomplete_turn, summary_before.has_incomplete_turn,
+            "streaming body appends must not change turn completion state"
+        );
+        assert_eq!(
+            summary_after.has_pending_permission, summary_before.has_pending_permission,
+            "streaming body appends must not change permission state"
+        );
 
         let body_before_gap = cache[1].conclusion_row.as_ref().unwrap().body.clone();
         let gap = [AgentStreamingDeltaUpdate {
@@ -50181,6 +50187,36 @@ mod tests {
         assert_eq!(
             cache[1].conclusion_row.as_ref().unwrap().body,
             body_before_gap
+        );
+    }
+
+    #[test]
+    fn streaming_cache_updates_do_not_rescan_the_turn_history() {
+        let source = include_str!("app.rs");
+        let live_batch = source
+            .split_once("    fn apply_live_timeline_batch(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn apply_desktop_event("))
+            .map(|(body, _)| body)
+            .expect("timeline event batching should remain inspectable");
+        assert_eq!(
+            live_batch
+                .matches("ConversationTurnsSummary::from_turns")
+                .count(),
+            0,
+            "append-only stream updates must retain the cached summary"
+        );
+
+        let cached = source
+            .split_once("    fn conversation_turns_cached(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn select_session("))
+            .map(|(body, _)| body)
+            .expect("conversation turn cache should remain inspectable");
+        assert_eq!(
+            cached
+                .matches("ConversationTurnsSummary::from_turns")
+                .count(),
+            1,
+            "full summary scans belong to cache rebuilds only"
         );
     }
 
