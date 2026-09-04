@@ -63,25 +63,148 @@ Vibex 面向完整的开发闭环：让 Agent 修改代码，检查它的操作�
 
 Vibex 使用 [Agent Client Protocol](https://agentclientprotocol.com/) (ACP) 作为唯一的在线 Agent 传输协议。运行时与供应商无关: Agent 的身份和能力与连接它所使用的协议彼此分离。兼容 **任何 ACP Agent**——只要说 ACP, 就能在 Vibex 中运行。
 
-<p align="center">
-  <a href="https://docs.anthropic.com/en/docs/claude-code"><kbd><img src="https://cdn.simpleicons.org/claude" alt="Claude Code logo" width="14" valign="middle" />&nbsp;Claude Code</kbd></a> &nbsp;
-  <a href="https://github.com/openai/codex"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/agents/codex-dark.svg" /><img src="docs/assets/agents/codex-light.svg" alt="Codex logo" width="14" valign="middle" /></picture>&nbsp;Codex</kbd></a> &nbsp;
-  <a href="https://z.ai"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/zdotai/ECECEC" /><img src="https://cdn.simpleicons.org/zdotai/000000" alt="ZCode logo" width="14" valign="middle" /></picture>&nbsp;ZCode</kbd></a> &nbsp;
-  <a href="https://opencode.ai"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/opencode/ECECEC" /><img src="https://cdn.simpleicons.org/opencode" alt="OpenCode logo" width="14" valign="middle" /></picture>&nbsp;OpenCode</kbd></a> &nbsp;
-  <a href="https://antigravity.google/docs/ide/extensions"><kbd><img src="docs/assets/agents/antigravity.svg" alt="Antigravity logo" width="14" valign="middle" />&nbsp;Antigravity</kbd></a> &nbsp;
-  <a href="https://cline.bot/cli"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/cline/ECECEC" /><img src="https://cdn.simpleicons.org/cline" alt="Cline logo" width="14" valign="middle" /></picture>&nbsp;Cline</kbd></a> &nbsp;
-  <a href="https://www.codebuddy.cn/cli/"><kbd><img src="https://cdn.simpleicons.org/codebuddy" alt="Codebuddy Code logo" width="14" valign="middle" />&nbsp;Codebuddy Code</kbd></a> &nbsp;
-  <a href="https://docs.cursor.com/en/cli/overview"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/cursor/ECECEC" /><img src="https://cdn.simpleicons.org/cursor" alt="Cursor logo" width="14" valign="middle" /></picture>&nbsp;Cursor</kbd></a> &nbsp;
-  <a href="https://geminicli.com"><kbd><img src="https://cdn.simpleicons.org/googlegemini" alt="Gemini CLI logo" width="14" valign="middle" />&nbsp;Gemini CLI</kbd></a> &nbsp;
-  <a href="https://docs.github.com/en/copilot/concepts/agents/about-copilot-cli"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/githubcopilot/ECECEC" /><img src="https://cdn.simpleicons.org/githubcopilot" alt="GitHub Copilot logo" width="14" valign="middle" /></picture>&nbsp;GitHub Copilot</kbd></a> &nbsp;
-  <a href="https://cli.devin.ai/docs"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/agents/devin-dark.svg" /><img src="docs/assets/agents/devin-light.svg" alt="Devin logo" width="14" valign="middle" /></picture>&nbsp;Devin</kbd></a> &nbsp;
-  <a href="https://docs.x.ai/build/overview"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/agents/grok-dark.svg" /><img src="docs/assets/agents/grok-light.svg" alt="Grok logo" width="14" valign="middle" /></picture>&nbsp;Grok</kbd></a> &nbsp;
-  <a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/acp"><kbd><img src="https://cdn.simpleicons.org/hermes" alt="Hermes logo" width="14" valign="middle" />&nbsp;Hermes</kbd></a> &nbsp;
-  <a href="https://github.com/MoonshotAI/kimi-cli"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/kimi/ECECEC" /><img src="https://cdn.simpleicons.org/kimi" alt="Kimi Code logo" width="14" valign="middle" /></picture>&nbsp;Kimi Code</kbd></a> &nbsp;
-  <a href="https://github.com/svkozak/pi-acp"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/pi/ECECEC" /><img src="https://cdn.simpleicons.org/pi" alt="Pi logo" width="14" valign="middle" /></picture>&nbsp;Pi</kbd></a> &nbsp;
-  <a href="https://github.com/vibex-ai/deepseek-harness-acp"><kbd><img src="https://cdn.simpleicons.org/deepseek" alt="DeepSeek Harness logo" width="14" valign="middle" />&nbsp;DeepSeek Harness</kbd></a> &nbsp;
-  <a href="https://agentclientprotocol.com"><kbd>+ 任意 ACP Agent</kbd></a>
-</p>
+<div align="center">
+  <table>
+    <tr>
+      <td align="center" valign="middle" width="135" height="84">
+        <a href="https://docs.anthropic.com/en/docs/claude-code">
+          <img src="https://cdn.simpleicons.org/claude" alt="Claude Code logo" width="28" /><br />
+          <sub><b>Claude Code</b></sub>
+        </a>
+      </td>
+      <td align="center" valign="middle" width="135" height="84">
+        <a href="https://github.com/openai/codex">
+          <picture>
+            <source media="(prefers-color-scheme: dark)" srcset="docs/assets/agents/codex-dark.svg" />
+            <img src="docs/assets/agents/codex-light.svg" alt="Codex logo" width="28" />
+          </picture><br />
+          <sub><b>Codex</b></sub>
+        </a>
+      </td>
+      <td align="center" valign="middle" width="135" height="84">
+        <a href="https://z.ai">
+          <picture>
+            <source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/zdotai/ECECEC" />
+            <img src="https://cdn.simpleicons.org/zdotai/000000" alt="ZCode logo" width="28" />
+          </picture><br />
+          <sub><b>ZCode</b></sub>
+        </a>
+      </td>
+      <td align="center" valign="middle" width="135" height="84">
+        <a href="https://opencode.ai">
+          <picture>
+            <source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/opencode/ECECEC" />
+            <img src="https://cdn.simpleicons.org/opencode" alt="OpenCode logo" width="28" />
+          </picture><br />
+          <sub><b>OpenCode</b></sub>
+        </a>
+      </td>
+      <td align="center" valign="middle" width="135" height="84">
+        <a href="https://antigravity.google/docs/ide/extensions">
+          <img src="docs/assets/agents/antigravity.svg" alt="Antigravity logo" width="28" /><br />
+          <sub><b>Antigravity</b></sub>
+        </a>
+      </td>
+      <td align="center" valign="middle" width="135" height="84">
+        <a href="https://cline.bot/cli">
+          <picture>
+            <source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/cline/ECECEC" />
+            <img src="https://cdn.simpleicons.org/cline" alt="Cline logo" width="28" />
+          </picture><br />
+          <sub><b>Cline</b></sub>
+        </a>
+      </td>
+    </tr>
+    <tr>
+      <td align="center" valign="middle" width="135" height="84">
+        <a href="https://www.codebuddy.cn/cli/">
+          <img src="https://cdn.simpleicons.org/codebuddy" alt="Codebuddy Code logo" width="28" /><br />
+          <sub><b>Codebuddy Code</b></sub>
+        </a>
+      </td>
+      <td align="center" valign="middle" width="135" height="84">
+        <a href="https://docs.cursor.com/en/cli/overview">
+          <picture>
+            <source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/cursor/ECECEC" />
+            <img src="https://cdn.simpleicons.org/cursor" alt="Cursor logo" width="28" />
+          </picture><br />
+          <sub><b>Cursor</b></sub>
+        </a>
+      </td>
+      <td align="center" valign="middle" width="135" height="84">
+        <a href="https://geminicli.com">
+          <img src="https://cdn.simpleicons.org/googlegemini" alt="Gemini CLI logo" width="28" /><br />
+          <sub><b>Gemini CLI</b></sub>
+        </a>
+      </td>
+      <td align="center" valign="middle" width="135" height="84">
+        <a href="https://docs.github.com/en/copilot/concepts/agents/about-copilot-cli">
+          <picture>
+            <source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/githubcopilot/ECECEC" />
+            <img src="https://cdn.simpleicons.org/githubcopilot" alt="GitHub Copilot logo" width="28" />
+          </picture><br />
+          <sub><b>GitHub Copilot</b></sub>
+        </a>
+      </td>
+      <td align="center" valign="middle" width="135" height="84">
+        <a href="https://cli.devin.ai/docs">
+          <picture>
+            <source media="(prefers-color-scheme: dark)" srcset="docs/assets/agents/devin-dark.svg" />
+            <img src="docs/assets/agents/devin-light.svg" alt="Devin logo" width="28" />
+          </picture><br />
+          <sub><b>Devin</b></sub>
+        </a>
+      </td>
+      <td align="center" valign="middle" width="135" height="84">
+        <a href="https://docs.x.ai/build/overview">
+          <picture>
+            <source media="(prefers-color-scheme: dark)" srcset="docs/assets/agents/grok-dark.svg" />
+            <img src="docs/assets/agents/grok-light.svg" alt="Grok logo" width="28" />
+          </picture><br />
+          <sub><b>Grok</b></sub>
+        </a>
+      </td>
+    </tr>
+    <tr>
+      <td align="center" valign="middle" width="135" height="84">
+        <a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/acp">
+          <img src="https://cdn.simpleicons.org/hermes" alt="Hermes logo" width="28" /><br />
+          <sub><b>Hermes</b></sub>
+        </a>
+      </td>
+      <td align="center" valign="middle" width="135" height="84">
+        <a href="https://github.com/MoonshotAI/kimi-cli">
+          <picture>
+            <source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/kimi/ECECEC" />
+            <img src="https://cdn.simpleicons.org/kimi" alt="Kimi Code logo" width="28" />
+          </picture><br />
+          <sub><b>Kimi Code</b></sub>
+        </a>
+      </td>
+      <td align="center" valign="middle" width="135" height="84">
+        <a href="https://github.com/svkozak/pi-acp">
+          <picture>
+            <source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/pi/ECECEC" />
+            <img src="https://cdn.simpleicons.org/pi" alt="Pi logo" width="28" />
+          </picture><br />
+          <sub><b>Pi</b></sub>
+        </a>
+      </td>
+      <td align="center" valign="middle" width="135" height="84">
+        <a href="https://github.com/vibex-ai/deepseek-harness-acp">
+          <img src="https://cdn.simpleicons.org/deepseek" alt="DeepSeek Harness logo" width="28" /><br />
+          <sub><b>DeepSeek Harness</b></sub>
+        </a>
+      </td>
+      <td align="center" valign="middle" width="135" height="84">
+        <a href="https://agentclientprotocol.com">
+          <img src="docs/assets/agents/acp.svg" alt="Agent Client Protocol logo" width="28" /><br />
+          <sub><b>任意 ACP Agent</b></sub>
+        </a>
+      </td>
+    </tr>
+  </table>
+</div>
 
 内置预设包括 **Claude Code**、**Codex**、**ZCode** 和 **OpenCode**。ACP 目录还包含 **Antigravity**、**Cline**、**Codebuddy Code**、**Cursor**、**Gemini CLI**、**GitHub Copilot**、**Devin**、**Grok**、**Hermes**、**Kimi Code**、**Pi**、**DeepSeek Harness** 等集成。Vibex 会根据本机已安装的运行时、供应商配置和实时能力探测结果判断可用性。
 
