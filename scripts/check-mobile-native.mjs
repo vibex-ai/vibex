@@ -37,6 +37,7 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     "apps/mobile/ios/Vibex/main.m",
     "apps/mobile/ios/Vibex/QRScanner.swift",
     "apps/mobile/ios/Headers/vibex_mobile.h",
+    "apps/mobile/ios/Headers/module.modulemap",
     "vendor/zed/crates/gpui_android/src/ime.rs",
     "vendor/zed/crates/gpui_android/src/platform.rs",
     "vendor/zed/crates/gpui_android/src/window.rs"
@@ -68,6 +69,7 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   const iosProject = read("apps/mobile/ios/project.yml");
   const iosScanner = read("apps/mobile/ios/Vibex/QRScanner.swift");
   const iosHeader = read("apps/mobile/ios/Headers/vibex_mobile.h");
+  const iosModuleMap = read("apps/mobile/ios/Headers/module.modulemap");
 
   assert(workspace.includes('"apps/mobile"'), "native_mobile_workspace_member_missing");
   assert(!workspace.includes('"apps/mobile-wasm"'), "legacy_mobile_workspace_member_present");
@@ -160,6 +162,10 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   assert(iosMain.includes("vibex_mobile_main();"), "ios_rust_entry_call_missing");
   assert(!iosMain.includes("UIApplicationMain"), "ios_host_double_enters_ui_application");
   assert(iosProject.includes("VibexFFI.xcframework"), "ios_xcframework_missing");
+  assert(iosProject.includes("SWIFT_INCLUDE_PATHS"), "ios_swift_module_include_path_missing");
+  assert(iosProject.includes("ARCHS"), "ios_arm64_arch_pin_missing");
+  assert(iosModuleMap.includes("module VibexFFI"), "ios_swift_module_declaration_missing");
+  assert(iosModuleMap.includes('header "vibex_mobile.h"'), "ios_swift_module_header_missing");
   assert(iosProject.includes("INFOPLIST_KEY_NSCameraUsageDescription"), "ios_camera_permission_missing");
   assert(iosScanner.includes("AVCaptureMetadataOutput"), "ios_qr_scanner_camera_missing");
   assert(iosScanner.includes("vibex_mobile_pairing_qr_scanned"), "ios_qr_scanner_result_bridge_missing");
@@ -240,6 +246,7 @@ function runSelfTest() {
     ["apps/mobile/ios/Vibex/main.m", source("apps/mobile/ios/Vibex/main.m")],
     ["apps/mobile/ios/Vibex/QRScanner.swift", source("apps/mobile/ios/Vibex/QRScanner.swift")],
     ["apps/mobile/ios/Headers/vibex_mobile.h", source("apps/mobile/ios/Headers/vibex_mobile.h")],
+    ["apps/mobile/ios/Headers/module.modulemap", source("apps/mobile/ios/Headers/module.modulemap")],
     ["vendor/zed/crates/gpui_android/src/ime.rs", source("vendor/zed/crates/gpui_android/src/ime.rs")],
     ["vendor/zed/crates/gpui_android/src/platform.rs", source("vendor/zed/crates/gpui_android/src/platform.rs")],
     ["vendor/zed/crates/gpui_android/src/window.rs", source("vendor/zed/crates/gpui_android/src/window.rs")]
@@ -348,6 +355,18 @@ function runSelfTest() {
     "remote_http_client_for_url(&url)?",
     "reqwest::Client::new().post(endpoint)",
     "native_mobile_checker_self_test_accepted_http_client_bypass"
+  );
+  expectRejected(
+    "apps/mobile/ios/Headers/module.modulemap",
+    "module VibexFFI",
+    "module MissingFFI",
+    "native_mobile_checker_self_test_accepted_missing_swift_module_declaration"
+  );
+  expectRejected(
+    "apps/mobile/ios/Headers/vibex_mobile.h",
+    "vibex_mobile_pairing_qr_scanned",
+    "vibex_mobile_missing_qr_scanned",
+    "native_mobile_checker_self_test_accepted_missing_ios_qr_bridge_header"
   );
 }
 

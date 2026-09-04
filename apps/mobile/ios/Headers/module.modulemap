@@ -1,0 +1,4 @@
+module VibexFFI {
+    header "vibex_mobile.h"
+    export *
+}
