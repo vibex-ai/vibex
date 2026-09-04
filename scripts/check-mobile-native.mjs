@@ -162,6 +162,10 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   assert(iosMain.includes("vibex_mobile_main();"), "ios_rust_entry_call_missing");
   assert(!iosMain.includes("UIApplicationMain"), "ios_host_double_enters_ui_application");
   assert(iosProject.includes("VibexFFI.xcframework"), "ios_xcframework_missing");
+  assert(
+    iosProject.includes('HEADER_SEARCH_PATHS: ["$(inherited)", "$(SRCROOT)"]'),
+    "ios_header_search_root_exposes_module_map"
+  );
   assert(!iosProject.includes("SWIFT_INCLUDE_PATHS"), "ios_swift_module_include_path_redundant");
   assert(iosProject.includes("ARCHS"), "ios_arm64_arch_pin_missing");
   assert(iosModuleMap.includes("module VibexFFI"), "ios_swift_module_declaration_missing");

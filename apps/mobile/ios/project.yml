@@ -44,11 +44,11 @@ targets:
         INFOPLIST_KEY_NSBonjourServices: ["_vibex._tcp"]
         INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
         CLANG_ENABLE_OBJC_ARC: YES
-        HEADER_SEARCH_PATHS: ["$(inherited)", "$(SRCROOT)/Headers"]
-        # QRScanner.swift imports the FFI through the Clang module that the
-        # xcframework slice carries in Headers/module.modulemap; Xcode extracts
-        # it into $(BUILT_PRODUCTS_DIR)/include. Adding extra Swift include
-        # paths here would define the module twice. The FFI library is only
-        # built for arm64 simulators.
+        # Keep the source headers available to the Objective-C host without
+        # making Headers/ a Clang module search root. The XCFramework carries
+        # the one VibexFFI module map that Swift imports; searching both maps
+        # defines the module twice on simulator builds.
+        HEADER_SEARCH_PATHS: ["$(inherited)", "$(SRCROOT)"]
+        # The FFI library is only built for arm64 simulators.
         ARCHS: [arm64]
         OTHER_LDFLAGS: ["$(inherited)", "-ObjC", "-all_load"]
