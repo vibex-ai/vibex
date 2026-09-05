@@ -398,6 +398,10 @@ pub struct PreviewUiState {
     pub layout: crate::PreviewState,
     #[serde(default)]
     pub editor_recovery: crate::EditorRecoverySnapshot,
+    #[serde(default)]
+    pub editor_soft_wrap: bool,
+    #[serde(default)]
+    pub editor_show_whitespaces: bool,
 }
 
 impl Default for PreviewUiState {
@@ -408,6 +412,8 @@ impl Default for PreviewUiState {
             split_sizes: vec![1.0],
             layout: crate::PreviewState::default(),
             editor_recovery: crate::EditorRecoverySnapshot::default(),
+            editor_soft_wrap: false,
+            editor_show_whitespaces: false,
         }
     }
 }
@@ -1427,6 +1433,18 @@ mod tests {
         assert_eq!(state.sidebar_width, 320.0);
         assert_eq!(state.preview_width, 520.0);
         assert_eq!(state.right_rail_width, 336.0);
+    }
+
+    #[test]
+    fn preview_editor_preferences_default_when_reading_legacy_state() {
+        let mut legacy = serde_json::to_value(PreviewUiState::default()).unwrap();
+        let preview = legacy.as_object_mut().unwrap();
+        preview.remove("editorSoftWrap");
+        preview.remove("editorShowWhitespaces");
+
+        let restored: PreviewUiState = serde_json::from_value(legacy).unwrap();
+        assert!(!restored.editor_soft_wrap);
+        assert!(!restored.editor_show_whitespaces);
     }
 
     #[test]

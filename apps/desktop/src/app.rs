@@ -5153,6 +5153,8 @@ impl VibexWorkbench {
         let restored_selected_file_path = ui_state.workbench.selected_file_path.clone();
         let restored_selected_git_path = ui_state.workbench.selected_git_path.clone();
         let restored_selected_terminal_id = ui_state.terminal.selected_terminal_id.clone();
+        let restored_editor_soft_wrap = ui_state.preview.editor_soft_wrap;
+        let restored_editor_show_whitespaces = ui_state.preview.editor_show_whitespaces;
         let restored_right_rail_mode =
             right_rail_mode_from_activity_id(ui_state.right_rail.selected_activity_id.as_deref());
         let code_font_family = ui_state
@@ -5173,6 +5175,8 @@ impl VibexWorkbench {
                 restored_selected_terminal_id,
                 code_font_family,
                 code_font_size,
+                restored_editor_soft_wrap,
+                restored_editor_show_whitespaces,
                 window,
                 cx,
             );
@@ -6064,6 +6068,8 @@ impl VibexWorkbench {
         self.appearance_reload_pending = true;
         let preview = self.ui_state.preview.layout.clone();
         let recovery = self.ui_state.preview.editor_recovery.clone();
+        let editor_soft_wrap = self.ui_state.preview.editor_soft_wrap;
+        let editor_show_whitespaces = self.ui_state.preview.editor_show_whitespaces;
         let workspace_id = self.ui_state.workbench.selected_workspace_id.clone();
         let right_rail_mode = right_rail_mode_from_activity_id(
             self.ui_state.right_rail.selected_activity_id.as_deref(),
@@ -6076,6 +6082,8 @@ impl VibexWorkbench {
                 workspace_id,
                 code_font_family,
                 code_font_size,
+                editor_soft_wrap,
+                editor_show_whitespaces,
                 cx,
             );
             workbench.right_rail_mode = right_rail_mode;
@@ -20814,6 +20822,8 @@ impl VibexWorkbench {
         if let Some(recovery) = state.recovery {
             self.ui_state.preview.editor_recovery = recovery;
         }
+        self.ui_state.preview.editor_soft_wrap = state.editor_soft_wrap;
+        self.ui_state.preview.editor_show_whitespaces = state.editor_show_whitespaces;
         self.ui_state.workbench.selected_workspace_id = state.workspace_id;
         self.ui_state.workbench.selected_file_path = state.selected_file_path;
         self.ui_state.workbench.selected_git_path = state.selected_git_path;
@@ -22566,6 +22576,8 @@ impl VibexWorkbench {
         let code_font_size = snapshot.appearance.code_font.size;
         let preview = snapshot.preview.layout.clone();
         let recovery = snapshot.preview.editor_recovery.clone();
+        let editor_soft_wrap = snapshot.preview.editor_soft_wrap;
+        let editor_show_whitespaces = snapshot.preview.editor_show_whitespaces;
         let workspace_id = snapshot.workbench.selected_workspace_id.clone();
         let right_rail_mode =
             right_rail_mode_from_activity_id(snapshot.right_rail.selected_activity_id.as_deref());
@@ -22602,6 +22614,8 @@ impl VibexWorkbench {
                 workspace_id,
                 code_font_family.clone(),
                 code_font_size,
+                editor_soft_wrap,
+                editor_show_whitespaces,
                 cx,
             );
             workbench.right_rail_mode = right_rail_mode;

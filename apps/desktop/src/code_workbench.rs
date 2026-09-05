@@ -15,7 +15,7 @@ use gpui::{
     canvas, deferred, div, img, list, point, prelude::*, px, relative, uniform_list,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath,
+    ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath, RopeExt as _,
     Selectable as _, Sizable as _, Size, StyledExt as _, Theme, WindowExt as _,
     button::{Button, ButtonRounded, ButtonVariants as _, DropdownButton},
     calendar::Date,
@@ -29,6 +29,7 @@ use gpui_component::{
     scroll::{ScrollableElement as _, ScrollbarAxis},
     searchable_list::SearchableListItem,
     select::{Select, SelectEvent, SelectState},
+    tooltip::Tooltip,
     v_flex,
 };
 use sha2::{Digest as _, Sha256};
@@ -302,6 +303,8 @@ pub enum CodeWorkbenchFixtureKind {
 pub(crate) struct CodeWorkbenchPersistedState {
     pub preview: PreviewState,
     pub recovery: Option<EditorRecoverySnapshot>,
+    pub editor_soft_wrap: bool,
+    pub editor_show_whitespaces: bool,
     pub workspace_id: Option<String>,
     pub selected_file_path: Option<String>,
     pub selected_git_path: Option<String>,
@@ -982,6 +985,8 @@ pub struct CodeWorkbench {
     recovery_persist_task: Option<Task<()>>,
     code_font_family: String,
     code_font_size: u16,
+    editor_soft_wrap: bool,
+    editor_show_whitespaces: bool,
 }
 
 impl gpui::EventEmitter<CodeWorkbenchEvent> for CodeWorkbench {}
@@ -998,6 +1003,8 @@ impl CodeWorkbench {
         selected_terminal_id: Option<String>,
         code_font_family: String,
         code_font_size: u16,
+        editor_soft_wrap: bool,
+        editor_show_whitespaces: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -1011,6 +1018,8 @@ impl CodeWorkbench {
             selected_terminal_id,
             code_font_family,
             code_font_size,
+            editor_soft_wrap,
+            editor_show_whitespaces,
             window,
             cx,
         )
@@ -1027,6 +1036,8 @@ impl CodeWorkbench {
         selected_terminal_id: Option<String>,
         code_font_family: String,
         code_font_size: u16,
+        editor_soft_wrap: bool,
+        editor_show_whitespaces: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -1119,6 +1130,8 @@ impl CodeWorkbench {
             recovery_persist_task: None,
             code_font_family,
             code_font_size,
+            editor_soft_wrap,
+            editor_show_whitespaces,
         }
     }
 
@@ -1137,6 +1150,8 @@ impl CodeWorkbench {
             None,
             crate::platform::default_code_font_family().to_string(),
             13,
+            false,
+            false,
             window,
             cx,
         );
@@ -1532,6 +1547,8 @@ impl CodeWorkbench {
         CodeWorkbenchPersistedState {
             preview,
             recovery,
+            editor_soft_wrap: self.editor_soft_wrap,
+            editor_show_whitespaces: self.editor_show_whitespaces,
             workspace_id: self
                 .workspace
                 .as_ref()
@@ -1547,6 +1564,40 @@ impl CodeWorkbench {
         self.code_font_size = size.clamp(10, 24);
         self.preview_diff_lists.clear();
         self.preview_commit_lists.clear();
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_editor_soft_wrap(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor_soft_wrap = !self.editor_soft_wrap;
+        let wrap = self.editor_soft_wrap;
+        let inputs = self
+            .editor_bindings
+            .values()
+            .map(|binding| binding.input.clone())
+            .collect::<Vec<_>>();
+        for input in inputs {
+            input.update(cx, |input, cx| input.set_soft_wrap(wrap, window, cx));
+        }
+        self.persist(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_editor_show_whitespaces(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor_show_whitespaces = !self.editor_show_whitespaces;
+        let show = self.editor_show_whitespaces;
+        let inputs = self
+            .editor_bindings
+            .values()
+            .map(|binding| binding.input.clone())
+            .collect::<Vec<_>>();
+        for input in inputs {
+            input.update(cx, |input, cx| input.set_show_whitespaces(show, window, cx));
+        }
+        self.persist(cx);
         cx.notify();
     }
 
@@ -1567,6 +1618,7 @@ impl CodeWorkbench {
         cx.notify();
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn restore_persisted_state(
         &mut self,
         mut preview: PreviewState,
@@ -1574,6 +1626,8 @@ impl CodeWorkbench {
         workspace_id: Option<String>,
         code_font_family: String,
         code_font_size: u16,
+        editor_soft_wrap: bool,
+        editor_show_whitespaces: bool,
         cx: &mut Context<Self>,
     ) {
         debug_assert!(
@@ -1604,6 +1658,8 @@ impl CodeWorkbench {
         self.restore_hydration_scheduled = false;
         self.code_font_family = code_font_family;
         self.code_font_size = code_font_size.clamp(10, 24);
+        self.editor_soft_wrap = editor_soft_wrap;
+        self.editor_show_whitespaces = editor_show_whitespaces;
         self.preview_diff_lists.clear();
         self.preview_commit_lists.clear();
         self.sync_terminal_surface_activity(cx);
@@ -3633,8 +3689,14 @@ impl CodeWorkbench {
                 .line_number(true)
                 .folding(true)
                 .replaceable(true)
+                .soft_wrap(self.editor_soft_wrap)
+                .show_whitespaces(self.editor_show_whitespaces)
+                .scroll_beyond_last_line(Some(3))
+                .cursor_surrounding_lines(Some(3))
                 .placeholder(locale::text("Loading file", "正在加载文件", "正在載入檔案"))
         });
+        self.editor_subscriptions
+            .push(cx.observe(&input, |_, _, cx| cx.notify()));
         let subscription = cx.subscribe_in(&input, window, move |this, _, event, _, cx| {
             if !matches!(event, InputEvent::Change) {
                 return;
@@ -4148,6 +4210,26 @@ impl CodeWorkbench {
             self.persist(cx);
             cx.notify();
         }
+    }
+
+    fn focus_adjacent_tab(&mut self, offset: isize, cx: &mut Context<Self>) -> bool {
+        let pane_id = self.preview.focused_pane_id.clone();
+        let tab_ids = pane_tab_ids(&self.preview.root, &pane_id).unwrap_or_default();
+        if tab_ids.is_empty() {
+            return false;
+        }
+        let active = self.preview.active_tab_id(&pane_id);
+        let current = active
+            .and_then(|active| tab_ids.iter().position(|tab_id| tab_id == active))
+            .unwrap_or(0);
+        let Some(next) = wrapped_tab_index(current, offset, tab_ids.len()) else {
+            return false;
+        };
+        let Some(tab_id) = tab_ids.get(next) else {
+            return false;
+        };
+        self.focus_tab(tab_id.clone(), cx);
+        true
     }
 
     pub(crate) fn toggle_markdown_source(&mut self, path: String, cx: &mut Context<Self>) {
@@ -5212,6 +5294,10 @@ impl CodeWorkbench {
             .iter()
             .filter_map(|id| self.preview.tabs.get(id).cloned())
             .collect::<Vec<_>>();
+        let can_close_other_tabs = active
+            .as_deref()
+            .is_some_and(|active| tabs.iter().any(|tab| tab.id != active && !tab.pinned));
+        let can_close_all_tabs = tabs.iter().any(|tab| !tab.pinned);
         let tab_scroll = self
             .preview_tab_scrolls
             .entry(pane_id.clone())
@@ -5238,6 +5324,8 @@ impl CodeWorkbench {
         let new_terminal_pane_id = pane_id.clone();
         let empty_terminal_entity = cx.weak_entity();
         let empty_terminal_pane_id = pane_id.clone();
+        let tabs_menu_entity = cx.weak_entity();
+        let tabs_menu_pane_id = pane_id.clone();
         let terminal_available = self.workspace.is_some() && self.runtime.is_some();
         let tab_group_drop_active = cx.has_active_drag()
             && self
@@ -5424,6 +5512,72 @@ impl CodeWorkbench {
                                     ),
                                 )
                             }),
+                    )
+                    .child(
+                        Button::new(format!("preview-pane-tabs-menu:{pane_id}"))
+                            .small()
+                            .ghost()
+                            .compact()
+                            .rounded(ButtonRounded::None)
+                            .h_full()
+                            .w(px(30.0))
+                            .flex_none()
+                            .icon(IconName::Ellipsis)
+                            .text_color(cx.theme().muted_foreground)
+                            .tooltip(locale::text(
+                                "Tab actions",
+                                "标签操作",
+                                "標籤操作",
+                            ))
+                            .dropdown_menu(move |menu, _, _| {
+                                let entity = tabs_menu_entity.clone();
+                                let menu_pane_id = tabs_menu_pane_id.clone();
+                                let close_all_entity = tabs_menu_entity.clone();
+                                let close_all_pane_id = tabs_menu_pane_id.clone();
+                                menu.min_w(px(208.0)).max_w(px(208.0))
+                                    .item(
+                                        PopupMenuItem::new(locale::text(
+                                            "Close other tabs",
+                                            "关闭其他标签",
+                                            "關閉其他標籤",
+                                        ))
+                                        .icon(Icon::default().path(
+                                            "icons/vibex/chevrons-right-left.svg",
+                                        ))
+                                        .disabled(!can_close_other_tabs)
+                                        .on_click(move |_, _, cx| {
+                                            let _ = entity.update(cx, |this, cx| {
+                                                let active = this
+                                                    .preview
+                                                    .active_tab_id(&menu_pane_id)
+                                                    .map(str::to_string);
+                                                if let Some(active) = active {
+                                                    this.close_other_tabs(
+                                                        active,
+                                                        menu_pane_id.clone(),
+                                                        cx,
+                                                    );
+                                                }
+                                            });
+                                        }),
+                                    )
+                                    .item(
+                                        PopupMenuItem::new(locale::text(
+                                            "Close all tabs",
+                                            "关闭所有标签",
+                                            "關閉所有標籤",
+                                        ))
+                                        .icon(Icon::default().path(
+                                            "icons/vibex/chevrons-down-up.svg",
+                                        ))
+                                        .disabled(!can_close_all_tabs)
+                                        .on_click(move |_, _, cx| {
+                                            let _ = close_all_entity.update(cx, |this, cx| {
+                                                this.close_all_tabs(close_all_pane_id.clone(), cx)
+                                            });
+                                        }),
+                                    )
+                            }),
                     ),
             )
             .child(
@@ -5601,6 +5755,7 @@ impl CodeWorkbench {
         let drag_id = tab.id.clone();
         let tab_id = tab.id.clone();
         let accessible_label = tab_accessible_label(&tab, dirty);
+        let tooltip_label = tab_tooltip(&tab.target, &label);
         let pinned = tab.pinned;
         let temporary = tab.temporary && matches!(tab.target, PreviewTarget::File { .. });
         let active_tab = active == Some(tab.id.as_str());
@@ -5648,6 +5803,7 @@ impl CodeWorkbench {
             .tab_stop(true)
             .role(Role::Button)
             .aria_label(accessible_label)
+            .tooltip(move |window, cx| Tooltip::new(tooltip_label.clone()).build(window, cx))
             .text_color(if active_tab {
                 cx.theme().foreground
             } else {
@@ -5672,6 +5828,36 @@ impl CodeWorkbench {
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
                 if event.keystroke.key == "enter" || event.keystroke.key == "space" {
                     this.focus_tab(keyboard_select_id.clone(), cx);
+                    cx.stop_propagation();
+                } else if event.keystroke.key == "arrowleft" {
+                    if this.focus_adjacent_tab(-1, cx) {
+                        cx.stop_propagation();
+                    }
+                } else if event.keystroke.key == "arrowright" {
+                    if this.focus_adjacent_tab(1, cx) {
+                        cx.stop_propagation();
+                    }
+                } else if (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
+                    && event.keystroke.key == "tab"
+                {
+                    let offset = if event.keystroke.modifiers.shift {
+                        -1
+                    } else {
+                        1
+                    };
+                    if this.focus_adjacent_tab(offset, cx) {
+                        cx.stop_propagation();
+                    }
+                } else if (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
+                    && event.keystroke.key == "pageup"
+                {
+                    if this.focus_adjacent_tab(-1, cx) {
+                        cx.stop_propagation();
+                    }
+                } else if (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
+                    && event.keystroke.key == "pagedown"
+                    && this.focus_adjacent_tab(1, cx)
+                {
                     cx.stop_propagation();
                 }
             }))
@@ -5735,6 +5921,23 @@ impl CodeWorkbench {
                 }
             }))
             .child(target_icon)
+            .when(pinned, |this| {
+                this.child(
+                    Icon::default()
+                        .path("icons/vibex/pin-filled.svg")
+                        .size(px(11.0))
+                        .text_color(cx.theme().muted_foreground),
+                )
+            })
+            .when(dirty, |this| {
+                this.child(
+                    div()
+                        .size(px(6.0))
+                        .flex_none()
+                        .rounded_full()
+                        .bg(cx.theme().warning),
+                )
+            })
             .child(
                 div()
                     .min_w_0()
@@ -5744,23 +5947,6 @@ impl CodeWorkbench {
                     .when(target_deleted, |this| this.line_through())
                     .child(label),
             )
-            .when(pinned, |this| {
-                this.child(
-                    div()
-                        .ml_1()
-                        .size(px(16.0))
-                        .flex_none()
-                        .items_center()
-                        .justify_center()
-                        .opacity(0.70)
-                        .text_color(cx.theme().muted_foreground)
-                        .child(
-                            Icon::default()
-                                .path("icons/vibex/pin-filled.svg")
-                                .size(px(12.0)),
-                        ),
-                )
-            })
             .when(!pinned, |this| {
                 this.child(
                     div()
@@ -6208,13 +6394,62 @@ impl CodeWorkbench {
                 .min_h_0()
                 .child(
                     h_flex()
-                        .h(px(34.0))
+                        .h(px(38.0))
                         .flex_none()
                         .justify_between()
+                        .gap_2()
                         .px_2()
+                        .bg(cx.theme().muted.opacity(0.18))
                         .border_b_1()
                         .border_color(cx.theme().border)
-                        .child(div().text_xs().child(path.clone()))
+                        .child(
+                            h_flex()
+                                .min_w_0()
+                                .flex_1()
+                                .gap_2()
+                                .child(file_tree_icon_sized(
+                                    file_icon_descriptor(
+                                        Path::new(&path)
+                                            .file_name()
+                                            .and_then(|name| name.to_str())
+                                            .unwrap_or(path.as_str()),
+                                        FileEntryKind::File,
+                                    )
+                                    .kind,
+                                    false,
+                                    px(15.0),
+                                    cx,
+                                ))
+                                .child(
+                                    v_flex()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .gap_0p5()
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_xs()
+                                                .font_medium()
+                                                .child(
+                                                    Path::new(&path)
+                                                        .file_name()
+                                                        .and_then(|name| name.to_str())
+                                                        .unwrap_or(path.as_str())
+                                                        .to_string(),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(path.clone()),
+                                        ),
+                                )
+                                .child(preview_badge(locale::text("Preview", "预览", "預覽"), cx)),
+                        )
                         .child(
                             Button::new(format!("edit-markdown:{path}"))
                                 .small()
@@ -6277,31 +6512,138 @@ impl CodeWorkbench {
             let markdown_path = path.clone();
             let editable = buffer.as_ref().is_some_and(|buffer| buffer.editable());
             let dirty = buffer.as_ref().is_some_and(|buffer| buffer.dirty);
+            let pending_save = buffer
+                .as_ref()
+                .is_some_and(|buffer| buffer.pending_save.is_some());
             let status = buffer
                 .as_ref()
                 .map(editor_status)
                 .unwrap_or_else(|| "Loading".to_string());
+            let file_name = Path::new(&path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(path.as_str())
+                .to_string();
+            let parent_path = relative_parent_path(&path).to_string();
+            let input_state = binding.input.read(cx);
+            let cursor = input_state.cursor_position();
+            let line_count = input_state.text().lines_len().max(1);
+            let language = buffer
+                .as_ref()
+                .and_then(|buffer| buffer.language.as_deref())
+                .unwrap_or_else(|| language_for_path(&path));
+            let encoding = buffer
+                .as_ref()
+                .map(|buffer| editor_encoding_label(buffer.encoding))
+                .unwrap_or("UTF-8");
+            let line_ending = buffer
+                .as_ref()
+                .map(|buffer| editor_line_ending_label(buffer.line_ending))
+                .unwrap_or("LF");
+            let size = buffer
+                .as_ref()
+                .map(|buffer| format_editor_bytes(buffer.size_bytes))
+                .unwrap_or_else(|| "-".to_string());
+            let external_conflict = buffer.as_ref().is_some_and(|buffer| {
+                matches!(
+                    buffer.external,
+                    EditorExternalState::Changed { .. }
+                        | EditorExternalState::VerificationRequired
+                        | EditorExternalState::Deleted
+                )
+            });
+            let soft_wrap = self.editor_soft_wrap;
+            let show_whitespaces = self.editor_show_whitespaces;
+            let soft_wrap_entity = cx.weak_entity();
+            let whitespace_entity = cx.weak_entity();
             return v_flex()
                 .size_full()
                 .min_h_0()
                 .child(
                     h_flex()
-                        .h(px(34.0))
+                        .h(px(38.0))
                         .flex_none()
                         .justify_between()
                         .gap_2()
                         .px_2()
+                        .bg(cx.theme().muted.opacity(0.18))
                         .border_b_1()
                         .border_color(cx.theme().border)
                         .child(
-                            div()
+                            h_flex()
                                 .min_w_0()
-                                .text_ellipsis()
-                                .text_xs()
-                                .child(format!("{path} - {status}")),
+                                .flex_1()
+                                .gap_2()
+                                .child(file_tree_icon_sized(
+                                    file_icon_descriptor(&file_name, FileEntryKind::File).kind,
+                                    false,
+                                    px(15.0),
+                                    cx,
+                                ))
+                                .child(
+                                    v_flex()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .gap_0p5()
+                                        .child(
+                                            h_flex()
+                                                .min_w_0()
+                                                .gap_1p5()
+                                                .child(
+                                                    div()
+                                                        .min_w_0()
+                                                        .truncate()
+                                                        .text_xs()
+                                                        .font_medium()
+                                                        .text_color(cx.theme().foreground)
+                                                        .child(file_name),
+                                                )
+                                                .when(dirty, |this| {
+                                                    this.child(
+                                                        div()
+                                                            .size(px(6.0))
+                                                            .flex_none()
+                                                            .rounded_full()
+                                                            .bg(cx.theme().warning),
+                                                    )
+                                                })
+                                                .when(external_conflict, |this| {
+                                                    this.child(
+                                                        Icon::new(IconName::TriangleAlert)
+                                                            .size(px(13.0))
+                                                            .text_color(cx.theme().warning),
+                                                    )
+                                                }),
+                                        )
+                                        .when(!parent_path.is_empty(), |this| {
+                                            this.child(
+                                                div()
+                                                    .min_w_0()
+                                                    .truncate()
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(parent_path.clone()),
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .rounded(px(4.0))
+                                        .px_1p5()
+                                        .py(px(1.0))
+                                        .text_xs()
+                                        .text_color(if external_conflict || dirty {
+                                            cx.theme().warning
+                                        } else {
+                                            cx.theme().muted_foreground
+                                        })
+                                        .child(status),
+                                ),
                         )
                         .child(
                             h_flex()
+                                .flex_none()
                                 .gap_1()
                                 .when(
                                     content_preview_kind_for_path(&path)
@@ -6312,11 +6654,11 @@ impl CodeWorkbench {
                                                 .small()
                                                 .ghost()
                                                 .compact()
-                                                .icon(IconName::File)
+                                                .icon(IconName::Eye)
                                                 .tooltip(locale::text(
-                                                    "Render Markdown",
-                                                    "渲染 Markdown",
-                                                    "呈現 Markdown",
+                                                    "Preview Markdown",
+                                                    "预览 Markdown",
+                                                    "預覽 Markdown",
                                                 ))
                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                     this.toggle_markdown_source(
@@ -6328,13 +6670,72 @@ impl CodeWorkbench {
                                     },
                                 )
                                 .child(
+                                    Button::new(format!("toggle-editor-wrap:{path}"))
+                                        .small()
+                                        .ghost()
+                                        .compact()
+                                        .selected(soft_wrap)
+                                        .icon(
+                                            Icon::default().path("icons/vibex/chevrons-right.svg"),
+                                        )
+                                        .tooltip(if soft_wrap {
+                                            locale::text(
+                                                "Disable soft wrap",
+                                                "关闭软换行",
+                                                "關閉軟換行",
+                                            )
+                                        } else {
+                                            locale::text(
+                                                "Enable soft wrap",
+                                                "开启软换行",
+                                                "開啟軟換行",
+                                            )
+                                        })
+                                        .on_click(move |_, window, cx| {
+                                            let _ = soft_wrap_entity.update(cx, |this, cx| {
+                                                this.toggle_editor_soft_wrap(window, cx)
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    Button::new(format!("toggle-editor-whitespace:{path}"))
+                                        .small()
+                                        .ghost()
+                                        .compact()
+                                        .selected(show_whitespaces)
+                                        .icon(if show_whitespaces {
+                                            IconName::Eye
+                                        } else {
+                                            IconName::EyeOff
+                                        })
+                                        .tooltip(if show_whitespaces {
+                                            locale::text(
+                                                "Hide whitespace",
+                                                "隐藏空白字符",
+                                                "隱藏空白字元",
+                                            )
+                                        } else {
+                                            locale::text(
+                                                "Show whitespace",
+                                                "显示空白字符",
+                                                "顯示空白字元",
+                                            )
+                                        })
+                                        .on_click(move |_, window, cx| {
+                                            let _ = whitespace_entity.update(cx, |this, cx| {
+                                                this.toggle_editor_show_whitespaces(window, cx)
+                                            });
+                                        }),
+                                )
+                                .child(
                                     Button::new(format!("save-editor:{path}"))
                                         .small()
                                         .ghost()
                                         .compact()
                                         .icon(IconName::Check)
+                                        .loading(pending_save)
                                         .tooltip(locale::text("Save file", "保存文件", "儲存檔案"))
-                                        .disabled(!editable || !dirty)
+                                        .disabled(!editable || !dirty || pending_save)
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.save_editor(save_path.clone(), cx)
                                         })),
@@ -6353,6 +6754,40 @@ impl CodeWorkbench {
                                 .appearance(false)
                                 .h_full()
                                 .disabled(!editable),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .h(px(26.0))
+                        .flex_none()
+                        .justify_between()
+                        .gap_2()
+                        .px_3()
+                        .border_t_1()
+                        .border_color(cx.theme().border)
+                        .bg(cx.theme().muted.opacity(0.16))
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(
+                            h_flex()
+                                .flex_none()
+                                .gap_3()
+                                .child(format!(
+                                    "Ln {}, Col {}",
+                                    cursor.line.saturating_add(1),
+                                    cursor.character.saturating_add(1)
+                                ))
+                                .child(format!("{} lines", line_count)),
+                        )
+                        .child(
+                            h_flex()
+                                .min_w_0()
+                                .justify_end()
+                                .gap_3()
+                                .child(language.to_string())
+                                .child(encoding)
+                                .child(line_ending)
+                                .child(size),
                         ),
                 )
                 .into_any_element();
@@ -6883,6 +7318,46 @@ impl Render for CodeWorkbench {
             .size_full()
             .min_w_0()
             .bg(cx.theme().background)
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                let modifiers = event.keystroke.modifiers;
+                if !(modifiers.control || modifiers.platform) || modifiers.alt {
+                    return;
+                }
+                let active_is_terminal = this
+                    .preview
+                    .active_tab_id(&this.preview.focused_pane_id)
+                    .and_then(|tab_id| this.preview.tabs.get(tab_id))
+                    .is_some_and(|tab| matches!(&tab.target, PreviewTarget::Terminal { .. }));
+                if active_is_terminal {
+                    return;
+                }
+                let offset = match event.keystroke.key.as_str() {
+                    "tab" | "pagedown" => Some(1),
+                    "pageup" => Some(-1),
+                    "w" => {
+                        let active = this
+                            .preview
+                            .active_tab_id(&this.preview.focused_pane_id)
+                            .map(str::to_string);
+                        if let Some(active) = active {
+                            this.close_tab(active, false, cx);
+                            cx.stop_propagation();
+                        }
+                        return;
+                    }
+                    _ => None,
+                };
+                if let Some(offset) = offset {
+                    let offset = if event.keystroke.modifiers.shift && event.keystroke.key == "tab" {
+                        -offset
+                    } else {
+                        offset
+                    };
+                    if this.focus_adjacent_tab(offset, cx) {
+                        cx.stop_propagation();
+                    }
+                }
+            }))
             .child(
                 h_flex()
                     .h(px(44.0))
@@ -13044,6 +13519,19 @@ fn tab_label(target: &PreviewTarget) -> String {
     }
 }
 
+fn tab_tooltip(target: &PreviewTarget, label: &str) -> String {
+    match target {
+        PreviewTarget::File { path } | PreviewTarget::GitDiff { path, .. } => {
+            if path == label {
+                path.clone()
+            } else {
+                format!("{label}\n{path}")
+            }
+        }
+        _ => label.to_string(),
+    }
+}
+
 fn git_diff_tab_id(key: &GitSelectionKey) -> String {
     format!(
         "git:{}:{}",
@@ -13290,6 +13778,38 @@ fn editor_status(buffer: &vibex_desktop_model::EditorBufferModel) -> String {
         (_, _, true, _) => locale::text("Saving", "正在保存", "正在儲存").into(),
         (_, _, _, true) => locale::text("Modified", "已修改", "已修改").into(),
         _ => locale::text("Saved", "已保存", "已儲存").into(),
+    }
+}
+
+fn editor_encoding_label(encoding: FileEncoding) -> &'static str {
+    match encoding {
+        FileEncoding::Utf8 => "UTF-8",
+        FileEncoding::Utf8Bom => "UTF-8 BOM",
+        FileEncoding::Binary => "Binary",
+    }
+}
+
+fn editor_line_ending_label(line_ending: FileLineEnding) -> &'static str {
+    match line_ending {
+        FileLineEnding::None => "No EOL",
+        FileLineEnding::Lf => "LF",
+        FileLineEnding::Crlf => "CRLF",
+        FileLineEnding::Mixed => "Mixed EOL",
+    }
+}
+
+fn format_editor_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
@@ -14289,6 +14809,10 @@ fn pane_tab_ids(node: &PreviewSplitNode, pane_id: &str) -> Option<Vec<String>> {
     }
 }
 
+fn wrapped_tab_index(current: usize, offset: isize, len: usize) -> Option<usize> {
+    (len > 0).then(|| (current as isize + offset).rem_euclid(len as isize) as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -15150,6 +15674,42 @@ mod tests {
             FileEntryKind::File
         ));
         assert!(!file_can_open_in_editor("src", FileEntryKind::Directory));
+    }
+
+    #[test]
+    fn editor_status_metadata_formats_are_stable() {
+        assert_eq!(editor_encoding_label(FileEncoding::Utf8), "UTF-8");
+        assert_eq!(editor_encoding_label(FileEncoding::Utf8Bom), "UTF-8 BOM");
+        assert_eq!(editor_encoding_label(FileEncoding::Binary), "Binary");
+        assert_eq!(editor_line_ending_label(FileLineEnding::None), "No EOL");
+        assert_eq!(editor_line_ending_label(FileLineEnding::Lf), "LF");
+        assert_eq!(editor_line_ending_label(FileLineEnding::Crlf), "CRLF");
+        assert_eq!(editor_line_ending_label(FileLineEnding::Mixed), "Mixed EOL");
+        assert_eq!(format_editor_bytes(0), "0 B");
+        assert_eq!(format_editor_bytes(999), "999 B");
+        assert_eq!(format_editor_bytes(1024), "1.0 KiB");
+        assert_eq!(format_editor_bytes(1536), "1.5 KiB");
+        assert_eq!(format_editor_bytes(1024 * 1024), "1.0 MiB");
+    }
+
+    #[test]
+    fn adjacent_tab_navigation_wraps_in_both_directions() {
+        assert_eq!(wrapped_tab_index(0, -1, 3), Some(2));
+        assert_eq!(wrapped_tab_index(2, 1, 3), Some(0));
+        assert_eq!(wrapped_tab_index(1, 4, 3), Some(2));
+        assert_eq!(wrapped_tab_index(1, -4, 3), Some(0));
+        assert_eq!(wrapped_tab_index(0, 1, 0), None);
+    }
+
+    #[test]
+    fn integrated_editor_surface_exposes_navigation_and_status_controls() {
+        let source = include_str!("code_workbench.rs");
+        assert!(source.contains(".scroll_beyond_last_line(Some(3))"));
+        assert!(source.contains(".cursor_surrounding_lines(Some(3))"));
+        assert!(source.contains(".show_whitespaces(self.editor_show_whitespaces)"));
+        assert!(source.contains("Close all tabs"));
+        assert!(source.contains("let active_is_terminal = this"));
+        assert!(source.contains("format_editor_bytes(buffer.size_bytes)"));
     }
 
     #[test]
