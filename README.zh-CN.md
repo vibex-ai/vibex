@@ -21,6 +21,8 @@
 </p>
 
 <p align="center">
+  <a href="https://vibex.peatboy.com/">网站</a> &nbsp;&bull;&nbsp;
+  <a href="https://vibex.peatboy.com/docs">文档</a> &nbsp;&bull;&nbsp;
   <a href="#快速开始">快速开始</a> &nbsp;&bull;&nbsp;
   <a href="#功能">功能</a> &nbsp;&bull;&nbsp;
   <a href="#支持的-agent">支持的 Agent</a> &nbsp;&bull;&nbsp;

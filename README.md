@@ -21,6 +21,8 @@
 </p>
 
 <p align="center">
+  <a href="https://vibex.peatboy.com/">Website</a> &nbsp;&bull;&nbsp;
+  <a href="https://vibex.peatboy.com/docs">Docs</a> &nbsp;&bull;&nbsp;
   <a href="#quick-start">Quick start</a> &nbsp;&bull;&nbsp;
   <a href="#features">Features</a> &nbsp;&bull;&nbsp;
   <a href="#supported-agents">Supported agents</a> &nbsp;&bull;&nbsp;
