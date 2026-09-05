@@ -1121,12 +1121,14 @@ mod tests {
 
     #[test]
     fn organization_placement_order_wins_over_global_session_order() {
-        let mut view = SidebarOrganizationView::default();
-        view.session_order = vec![
-            "session_c".to_string(),
-            "session_b".to_string(),
-            "session_a".to_string(),
-        ];
+        let mut view = SidebarOrganizationView {
+            session_order: vec![
+                "session_c".to_string(),
+                "session_b".to_string(),
+                "session_a".to_string(),
+            ],
+            ..SidebarOrganizationView::default()
+        };
         view.organization.placements = vec![
             vibex_desktop_model::SidebarOrganizationPlacement {
                 item: SidebarOrganizationItem::Session("session_b".to_string()),
@@ -1170,11 +1172,13 @@ mod tests {
 
     #[test]
     fn unplaced_sessions_follow_desktop_new_session_order() {
-        let mut view = SidebarOrganizationView::default();
-        view.session_order = vec!["session_b".to_string(), "session_a".to_string()];
+        let view = SidebarOrganizationView {
+            session_order: vec!["session_b".to_string(), "session_a".to_string()],
+            session_order_anchored_at_ms: 1,
+            ..SidebarOrganizationView::default()
+        };
         // The manual band froze b and a at their positions; the unlisted
         // session sorts by recency ahead of the band.
-        view.session_order_anchored_at_ms = 1;
         let projects = vec![SidebarProject {
             id: "project_project".to_string(),
             label: "vibex".to_string(),
@@ -1238,8 +1242,10 @@ mod tests {
 
     #[test]
     fn detailed_rows_group_sessions_under_their_workspace() {
-        let mut view = SidebarOrganizationView::default();
-        view.hierarchy_mode = SidebarHierarchyMode::Detailed;
+        let view = SidebarOrganizationView {
+            hierarchy_mode: SidebarHierarchyMode::Detailed,
+            ..SidebarOrganizationView::default()
+        };
         let projects = vec![SidebarProject {
             id: "project_project".to_string(),
             label: "vibex".to_string(),
@@ -1275,8 +1281,10 @@ mod tests {
 
     #[test]
     fn an_expanded_empty_worktree_has_a_placeholder_inside_its_card() {
-        let mut view = SidebarOrganizationView::default();
-        view.hierarchy_mode = SidebarHierarchyMode::Detailed;
+        let view = SidebarOrganizationView {
+            hierarchy_mode: SidebarHierarchyMode::Detailed,
+            ..SidebarOrganizationView::default()
+        };
         let projects = vec![SidebarProject {
             id: "project_project".to_string(),
             label: "vibex".to_string(),
@@ -1383,8 +1391,10 @@ mod tests {
 
     #[test]
     fn detailed_mode_falls_back_to_compact_for_a_non_git_project() {
-        let mut view = SidebarOrganizationView::default();
-        view.hierarchy_mode = SidebarHierarchyMode::Detailed;
+        let view = SidebarOrganizationView {
+            hierarchy_mode: SidebarHierarchyMode::Detailed,
+            ..SidebarOrganizationView::default()
+        };
         let projects = vec![SidebarProject {
             id: "project_project".to_string(),
             label: "plain-folder".to_string(),
@@ -1672,8 +1682,10 @@ mod tests {
 
     #[test]
     fn indents_follow_the_desktop_columns_rather_than_the_row_depth() {
-        let mut view = SidebarOrganizationView::default();
-        view.hierarchy_mode = SidebarHierarchyMode::Detailed;
+        let mut view = SidebarOrganizationView {
+            hierarchy_mode: SidebarHierarchyMode::Detailed,
+            ..SidebarOrganizationView::default()
+        };
         let projects = vec![SidebarProject {
             id: "project_project".to_string(),
             label: "vibex".to_string(),

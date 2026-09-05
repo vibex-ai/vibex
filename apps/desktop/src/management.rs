@@ -5670,15 +5670,14 @@ impl ManagementCenter {
                             }
                             _ => {}
                         }
-                        if let Some((agent_id, state)) = success.agent_install_state {
-                            if let Some(agent) = this
+                        if let Some((agent_id, state)) = success.agent_install_state
+                            && let Some(agent) = this
                                 .snapshot
                                 .agents
                                 .iter_mut()
                                 .find(|agent| agent.id == agent_id)
-                            {
-                                agent.apply_managed_install_state(state);
-                            }
+                        {
+                            agent.apply_managed_install_state(state);
                         }
                         this.apply_provider_profile_success(&success.provider_profiles);
                         this.notice = Some(success.message);
@@ -18052,7 +18051,8 @@ mod tests {
         );
         assert!(authentication.contains("agent-auth-logout-cancel"));
         assert!(authentication.contains("agent-auth-logout-confirm"));
-        for (name, body, minimum_actions) in [("installation", install, 4)] {
+        {
+            let (name, body, minimum_actions) = ("installation", install, 4);
             assert!(
                 !body.contains(".label("),
                 "{name} actions must remain icon-only"

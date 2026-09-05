@@ -115,22 +115,6 @@ fn pending_document(input: &MarkdownInput) -> Arc<MarkdownDocument> {
     ))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pending_document_caps_large_source_without_splitting_utf8() {
-        let source = "😀".repeat(PENDING_RENDER_MAX_BYTES / 4 + 1);
-        let input = markdown_input(Arc::from(source.as_str()), 1);
-        let document = pending_document(&input);
-
-        assert!(document.source.len() <= PENDING_RENDER_MAX_BYTES);
-        assert!(document.source.len() < source.len());
-        assert!(source.is_char_boundary(document.source.len()));
-    }
-}
-
 fn render_blocks(blocks: &[BlockNode], depth: usize) -> Vec<AnyElement> {
     blocks
         .iter()
@@ -349,4 +333,20 @@ fn code_block(language: Option<&str>, source: &str) -> AnyElement {
                 .child(source.to_string()),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_document_caps_large_source_without_splitting_utf8() {
+        let source = "😀".repeat(PENDING_RENDER_MAX_BYTES / 4 + 1);
+        let input = markdown_input(Arc::from(source.as_str()), 1);
+        let document = pending_document(&input);
+
+        assert!(document.source.len() <= PENDING_RENDER_MAX_BYTES);
+        assert!(document.source.len() < source.len());
+        assert!(source.is_char_boundary(document.source.len()));
+    }
 }

@@ -243,13 +243,13 @@ pub fn apply_mosaic(image: &mut RgbaImage, from: (u32, u32), to: (u32, u32)) {
                     count += 1;
                 }
             }
-            if count != 0 {
-                let color = Rgba([
-                    (sum[0] / count) as u8,
-                    (sum[1] / count) as u8,
-                    (sum[2] / count) as u8,
-                    (sum[3] / count) as u8,
-                ]);
+            if let Some(color) = sum
+                .iter()
+                .map(|channel| u32::checked_div(*channel, count).map(|value| value as u8))
+                .collect::<Option<Vec<_>>>()
+                .and_then(|channels| <[u8; 4]>::try_from(channels).ok())
+                .map(Rgba)
+            {
                 for write_y in y..y_end {
                     for write_x in x..x_end {
                         image.put_pixel(write_x, write_y, color);
@@ -340,9 +340,10 @@ fn rasterize_text_overlay(
     }
     for pixel in pixels.chunks_exact_mut(4) {
         let alpha = u16::from(pixel[3]);
-        if alpha > 0 {
-            for channel in &mut pixel[..3] {
-                *channel = ((u16::from(*channel) * 255 + alpha / 2) / alpha).min(255) as u8;
+        for channel in &mut pixel[..3] {
+            if let Some(channel_value) = (u16::from(*channel) * 255 + alpha / 2).checked_div(alpha)
+            {
+                *channel = channel_value.min(255) as u8;
             }
         }
     }

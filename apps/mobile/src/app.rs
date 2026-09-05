@@ -165,6 +165,39 @@ enum TimelineBooleanSetting {
     EnhancedFileOperationDisplay,
 }
 
+impl TimelineBooleanSetting {
+    fn row_id(self) -> &'static str {
+        match self {
+            TimelineBooleanSetting::ShowAgentGenerationStatus => "mobile-settings-show-generation",
+            TimelineBooleanSetting::ReasoningExpandedByDefault => {
+                "mobile-settings-reasoning-expanded"
+            }
+            TimelineBooleanSetting::EnhancedCommandExecutionDisplay => {
+                "mobile-settings-command-cards"
+            }
+            TimelineBooleanSetting::EnhancedFileOperationDisplay => "mobile-settings-file-cards",
+        }
+    }
+
+    fn row_icon(self) -> &'static str {
+        match self {
+            TimelineBooleanSetting::ShowAgentGenerationStatus => "icons/loader-circle.svg",
+            TimelineBooleanSetting::ReasoningExpandedByDefault => "icons/chevrons-down-up.svg",
+            TimelineBooleanSetting::EnhancedCommandExecutionDisplay => "icons/file-terminal.svg",
+            TimelineBooleanSetting::EnhancedFileOperationDisplay => "icons/file-code.svg",
+        }
+    }
+
+    fn row_title(self) -> &'static str {
+        match self {
+            TimelineBooleanSetting::ShowAgentGenerationStatus => "Agent generation status",
+            TimelineBooleanSetting::ReasoningExpandedByDefault => "Expand reasoning by default",
+            TimelineBooleanSetting::EnhancedCommandExecutionDisplay => "Command cards",
+            TimelineBooleanSetting::EnhancedFileOperationDisplay => "File edit cards",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingMobileUserMessage {
     session_id: VibexSessionId,
@@ -388,6 +421,9 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
+type TimelineMarkdownViews =
+    RefCell<BTreeMap<String, (Entity<markdown::MarkdownView>, u64, Arc<str>)>>;
+
 pub struct MobileApp {
     storage: CredentialStorage,
     mode: RootMode,
@@ -398,8 +434,7 @@ pub struct MobileApp {
     workbench_open: bool,
     composer_input: Entity<TextInput>,
     timeline_turns: Arc<Vec<TimelineConversationTurn>>,
-    timeline_markdown_views:
-        RefCell<BTreeMap<String, (Entity<markdown::MarkdownView>, u64, Arc<str>)>>,
+    timeline_markdown_views: TimelineMarkdownViews,
     pending_user_message: Option<PendingMobileUserMessage>,
     timeline_metadata_tip: Option<TimelineMetadataTip>,
     attachment_preview: Option<MobileAttachmentPreview>,
@@ -4399,11 +4434,10 @@ impl MobileApp {
     fn toggle_timeline_row(&mut self, id: String, cx: &mut Context<Self>) {
         if self.collapsed_timeline_rows.remove(&id) {
             self.expanded_timeline_rows.insert(id);
-        } else if self.expanded_timeline_rows.remove(&id) {
-            self.collapsed_timeline_rows.insert(id);
-        } else if self
-            .effective_timeline_display_settings()
-            .reasoning_expanded_by_default
+        } else if self.expanded_timeline_rows.remove(&id)
+            || self
+                .effective_timeline_display_settings()
+                .reasoning_expanded_by_default
         {
             self.collapsed_timeline_rows.insert(id);
         } else {
@@ -11896,9 +11930,6 @@ impl MobileApp {
 
     fn render_timeline_boolean_setting_row(
         &self,
-        id: &'static str,
-        icon: &'static str,
-        title: &'static str,
         value: bool,
         overridden: bool,
         setting: TimelineBooleanSetting,
@@ -11910,9 +11941,9 @@ impl MobileApp {
             timeline_setting_source_label(overridden),
         );
         settings_info_row_base(
-            id,
-            icon,
-            locale::common(title).to_string(),
+            setting.row_id(),
+            setting.row_icon(),
+            locale::common(setting.row_title()).to_string(),
             detail,
             theme::text_muted(),
         )
@@ -12203,9 +12234,6 @@ impl MobileApp {
                     )
                     .child(settings_section_heading("Session timeline"))
                     .child(self.render_timeline_boolean_setting_row(
-                        "mobile-settings-show-generation",
-                        "icons/loader-circle.svg",
-                        "Agent generation status",
                         timeline_settings.show_agent_generation_status,
                         show_generation_override,
                         TimelineBooleanSetting::ShowAgentGenerationStatus,
@@ -12217,27 +12245,18 @@ impl MobileApp {
                         cx,
                     ))
                     .child(self.render_timeline_boolean_setting_row(
-                        "mobile-settings-reasoning-expanded",
-                        "icons/chevrons-down-up.svg",
-                        "Expand reasoning by default",
                         timeline_settings.reasoning_expanded_by_default,
                         reasoning_expanded_override,
                         TimelineBooleanSetting::ReasoningExpandedByDefault,
                         cx,
                     ))
                     .child(self.render_timeline_boolean_setting_row(
-                        "mobile-settings-command-cards",
-                        "icons/file-terminal.svg",
-                        "Command cards",
                         timeline_settings.enhanced_command_execution_display,
                         command_display_override,
                         TimelineBooleanSetting::EnhancedCommandExecutionDisplay,
                         cx,
                     ))
                     .child(self.render_timeline_boolean_setting_row(
-                        "mobile-settings-file-cards",
-                        "icons/file-code.svg",
-                        "File edit cards",
                         timeline_settings.enhanced_file_operation_display,
                         file_display_override,
                         TimelineBooleanSetting::EnhancedFileOperationDisplay,
@@ -12669,12 +12688,10 @@ fn drawer_snap_target(page: DrawerPage, offset: f32, last_dx: f32, settled_targe
     let started_on_side_page = (settled_target - direction).abs() < 0.001;
     if started_on_side_page && directional_delta < -theme::DRAWER_SNAP_COMMIT_DIRECTION_THRESHOLD {
         0.0
-    } else if !started_on_side_page
-        && directional_delta > theme::DRAWER_SNAP_COMMIT_DIRECTION_THRESHOLD
-    {
-        direction
-    } else if started_on_side_page
-        && directional_delta > theme::DRAWER_SNAP_REVERSE_DIRECTION_THRESHOLD
+    } else if (!started_on_side_page
+        && directional_delta > theme::DRAWER_SNAP_COMMIT_DIRECTION_THRESHOLD)
+        || (started_on_side_page
+            && directional_delta > theme::DRAWER_SNAP_REVERSE_DIRECTION_THRESHOLD)
     {
         direction
     } else if !started_on_side_page

@@ -4001,6 +4001,7 @@ fn composer_queue_waits_for_continuation(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn auto_continue_should_start(
     enabled: bool,
     session_state: AgentSessionState,
@@ -7856,11 +7857,10 @@ impl VibexWorkbench {
                 .organization
                 .folders
                 .get_mut(&folder_id)
+                && folder.workspace_id.is_none()
             {
-                if folder.workspace_id.is_none() {
-                    folder.workspace_id = Some(workspace_id);
-                    changed = true;
-                }
+                folder.workspace_id = Some(workspace_id);
+                changed = true;
             }
         }
         changed
@@ -8917,7 +8917,7 @@ impl VibexWorkbench {
             .map(|(target_id, after)| {
                 reordered_string_ids_many(
                     &original_ids,
-                    &[drag.workspace_id.clone()],
+                    std::slice::from_ref(&drag.workspace_id),
                     target_id,
                     *after,
                 )
@@ -11815,7 +11815,7 @@ impl VibexWorkbench {
 
         (self.ui_state.session.reasoning_display_mode == ReasoningDisplayMode::LatestAtBottom)
             .then_some(())
-            .and_then(|_| turn.live_status.as_ref())
+            .and(turn.live_status.as_ref())
             .map(|body| StreamingRowStateCache {
                 turn_id: turn.id.clone(),
                 row_id: format!("reasoning-live:{}", turn.id),
@@ -15167,10 +15167,10 @@ impl VibexWorkbench {
             }
             ImageEditTool::Crop | ImageEditTool::Text => {}
         }
-        if let Some(preview) = self.attachment_image_preview.as_mut() {
-            if let Some(session) = preview.edit_session.as_mut() {
-                Arc::make_mut(session).preview(buffer);
-            }
+        if let Some(preview) = self.attachment_image_preview.as_mut()
+            && let Some(session) = preview.edit_session.as_mut()
+        {
+            Arc::make_mut(session).preview(buffer);
         }
         self.update_attachment_editor_render(cx);
     }
@@ -15194,12 +15194,10 @@ impl VibexWorkbench {
                 session.current(),
                 (gesture.start_x, gesture.start_y),
                 (gesture.current_x, gesture.current_y),
-            ) {
-                if let Some(preview) = self.attachment_image_preview.as_mut()
-                    && let Some(session) = preview.edit_session.as_mut()
-                {
-                    committed = Arc::make_mut(session).commit(cropped);
-                }
+            ) && let Some(preview) = self.attachment_image_preview.as_mut()
+                && let Some(session) = preview.edit_session.as_mut()
+            {
+                committed = Arc::make_mut(session).commit(cropped);
             }
         } else if let Some(preview) = self.attachment_image_preview.as_mut()
             && let Some(session) = preview.edit_session.as_mut()
@@ -23129,6 +23127,7 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_title_session_menu(
         menu: PopupMenu,
         session_id: VibexSessionId,
@@ -24000,6 +23999,7 @@ impl VibexWorkbench {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_sidebar_root_children(
         &mut self,
         groups: Rc<Vec<SidebarProjectProjection>>,
@@ -24087,6 +24087,7 @@ impl VibexWorkbench {
         elements
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_sidebar_project_children(
         &mut self,
         group: &SidebarProjectProjection,
@@ -32432,7 +32433,7 @@ impl VibexWorkbench {
         let runtime_attribution = if let Some(attribution) = execution_attribution.as_ref() {
             Some(self.render_timeline_runtime_header(&turn.id, attribution.clone(), cx))
         } else {
-            let runtime = turn.runtime_attribution.as_ref().map(|attribution| {
+            turn.runtime_attribution.as_ref().map(|attribution| {
                 let runtime_label = attribution
                     .split(" · ")
                     .skip(1)
@@ -32449,8 +32450,7 @@ impl VibexWorkbench {
                         runtime_label
                     })
                     .into_any_element()
-            });
-            runtime
+            })
         };
         let process_expanded = timeline_turn_process_expanded(
             turn,
@@ -33508,14 +33508,16 @@ impl VibexWorkbench {
                 })
                 .into_any_element();
         }
-        let start = compact
-            .then(|| {
+        let start = if compact {
+            {
                 snapshot
                     .rows
                     .len()
                     .saturating_sub(CHILD_AGENT_TIMELINE_PREVIEW_ROW_LIMIT)
-            })
-            .unwrap_or_default();
+            }
+        } else {
+            Default::default()
+        };
         let rows = snapshot.rows.into_iter().skip(start).collect::<Vec<_>>();
         v_flex()
             .w_full()
@@ -41343,9 +41345,7 @@ fn new_session_worktree_unavailable_reason(
             "無法檢查 Git 狀態",
         ));
     }
-    let Some(eligibility) = state.eligibility.as_ref() else {
-        return None;
-    };
+    let eligibility = state.eligibility.as_ref()?;
     match eligibility.state {
         GitProjectEligibilityState::Probing => None,
         GitProjectEligibilityState::Eligible if eligibility.is_eligible() => None,
@@ -42808,9 +42808,10 @@ fn rasterize_sidebar_project_svg(source: &Path) -> Result<image::RgbaImage, Stri
     let mut pixels = pixmap.take();
     for pixel in pixels.chunks_exact_mut(4) {
         let alpha = u16::from(pixel[3]);
-        if alpha > 0 {
-            for channel in &mut pixel[..3] {
-                *channel = ((u16::from(*channel) * 255 + alpha / 2) / alpha).min(255) as u8;
+        for channel in &mut pixel[..3] {
+            if let Some(channel_value) = (u16::from(*channel) * 255 + alpha / 2).checked_div(alpha)
+            {
+                *channel = channel_value.min(255) as u8;
             }
         }
     }
@@ -48001,11 +48002,10 @@ impl FoundationSettings {
                 total_bytes,
                 ..
             } => {
-                let percent = if total_bytes == 0 {
-                    0
-                } else {
-                    downloaded_bytes.saturating_mul(100) / total_bytes
-                };
+                let percent = downloaded_bytes
+                    .saturating_mul(100)
+                    .checked_div(total_bytes)
+                    .unwrap_or(0);
                 (
                     format!(
                         "{} / {} ({percent}%)",
@@ -50032,7 +50032,7 @@ mod tests {
                 "streaming append must reuse the active turn allocation"
             );
             assert!(Rc::ptr_eq(
-                &render_cache
+                render_cache
                     .borrow()
                     .last()
                     .expect("render cache stays synchronized"),

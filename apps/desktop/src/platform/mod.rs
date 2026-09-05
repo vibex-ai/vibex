@@ -228,9 +228,9 @@ fn launch_at_login_path(application_id: &str) -> VibexResult<PathBuf> {
                     "desktop configuration directory is unavailable",
                 )
             })?;
-        return Ok(config
+        Ok(config
             .join("autostart")
-            .join(format!("{application_id}.desktop")));
+            .join(format!("{application_id}.desktop")))
     }
     #[cfg(target_os = "macos")]
     {
@@ -315,11 +315,11 @@ pub fn send_system_notification(title: &str, body: &str) -> VibexResult<()> {
     let body = bounded_notification_text(body, 240)?;
     #[cfg(target_os = "linux")]
     {
-        return spawn_open_command(
+        spawn_open_command(
             Command::new("notify-send").args(["--app-name=Vibex", &title, &body]),
             "desktop_notification_failed",
             "failed to show a system notification",
-        );
+        )
     }
     #[cfg(target_os = "macos")]
     {

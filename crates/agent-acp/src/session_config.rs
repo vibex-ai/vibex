@@ -1044,9 +1044,11 @@ pub fn build_runtime_option_catalog(
                     }))
                 })
                 .unwrap_or_else(|| {
-                    allow_profile_modes_and_features
-                        .then(|| fallback_modes.clone())
-                        .unwrap_or_default()
+                    if allow_profile_modes_and_features {
+                        fallback_modes.clone()
+                    } else {
+                        Default::default()
+                    }
                 });
             let features = model_evidence
                 .filter(|model| model.runtime_options_complete || !model.options.is_empty())
@@ -1057,9 +1059,11 @@ pub fn build_runtime_option_catalog(
                     }))
                 })
                 .unwrap_or_else(|| {
-                    allow_profile_modes_and_features
-                        .then(|| fallback_features.clone())
-                        .unwrap_or_default()
+                    if allow_profile_modes_and_features {
+                        fallback_features.clone()
+                    } else {
+                        Default::default()
+                    }
                 });
             let feature_config_values = features
                 .iter()
@@ -1085,15 +1089,17 @@ pub fn build_runtime_option_catalog(
                     })
                     .map(catalog_reasoning_efforts)
                     .unwrap_or_else(|| {
-                        allow_profile_runtime_options
-                            .then(|| {
+                        if allow_profile_runtime_options {
+                            {
                                 catalog_reasoning_effort_values(
                                     evidence
                                         .map(|evidence| evidence.reasoning_efforts.as_slice())
                                         .unwrap_or_default(),
                                 )
-                            })
-                            .unwrap_or_default()
+                            }
+                        } else {
+                            Default::default()
+                        }
                     }),
                 modes,
                 features,

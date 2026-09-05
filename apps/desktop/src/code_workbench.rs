@@ -7570,11 +7570,11 @@ impl CodeRightRail {
         }
         if kind == FileEntryKind::Directory {
             self.clear_file_search(window, cx);
-            let _ = self.workbench.update(cx, |workbench, cx| {
+            self.workbench.update(cx, |workbench, cx| {
                 workbench.reveal_file_search_directory(path, cx);
             });
         } else {
-            let _ = self.workbench.update(cx, |workbench, cx| {
+            self.workbench.update(cx, |workbench, cx| {
                 workbench.request_preview_panel(cx);
                 workbench.open_file(path, false, window, cx);
             });

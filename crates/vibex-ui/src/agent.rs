@@ -1082,8 +1082,8 @@ impl AgentWorkflowController {
                         changed = true;
                     }
                 }
-                if self.state.selected_session_id.as_ref() == Some(&session.id) {
-                    if self
+                if self.state.selected_session_id.as_ref() == Some(&session.id)
+                    && self
                         .state
                         .active_session
                         .value
@@ -1091,10 +1091,9 @@ impl AgentWorkflowController {
                         .is_none_or(|existing| {
                             existing != &session && session_update_is_current(existing, &session)
                         })
-                    {
-                        changed = true;
-                        self.state.active_session.resolve(session);
-                    }
+                {
+                    changed = true;
+                    self.state.active_session.resolve(session);
                 }
                 if changed {
                     AgentEventDecision::Applied

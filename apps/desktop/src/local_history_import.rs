@@ -223,10 +223,10 @@ impl LocalHistoryImportDialog {
         let locale = locale::resolve_locale(locale_mode, locale::system_locale().as_deref());
         let input = cx.new(|cx| {
             let mut input = InputState::new(window, cx).placeholder(text(locale).search);
-            if let Some(initial_search) = initial_search {
-                if !initial_search.trim().is_empty() {
-                    input.set_value(initial_search, window, cx);
-                }
+            if let Some(initial_search) = initial_search
+                && !initial_search.trim().is_empty()
+            {
+                input.set_value(initial_search, window, cx);
             }
             input
         });
@@ -301,19 +301,21 @@ impl LocalHistoryImportDialog {
                             .collect();
                         if apply_focus && !this.focus_applied {
                             this.focus_applied = true;
-                            if let Some(target) = focus_workspace.as_deref() {
-                                if let Some(folder) = scan
+                            if let Some(target) = focus_workspace.as_deref()
+                                && let Some(folder) = scan
                                     .folders
                                     .iter()
                                     .find(|folder| paths_equal(&folder.workspace_root, target))
-                                {
-                                    this.selected.extend(folder.sessions.iter().filter_map(
-                                        |session| {
-                                            (session.status == LocalHistoryImportStatus::New)
-                                                .then(|| session.summary.key.clone().into())
-                                        },
-                                    ));
-                                }
+                            {
+                                this.selected.extend(
+                                    folder
+                                        .sessions
+                                        .iter()
+                                        .filter(|&session| {
+                                            session.status == LocalHistoryImportStatus::New
+                                        })
+                                        .map(|session| session.summary.key.clone().into()),
+                                );
                             }
                         }
                         this.scan = Some(scan);

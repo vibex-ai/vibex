@@ -2301,7 +2301,7 @@ impl MobileWorkbench {
         let text_color = change
             .as_ref()
             .map(git_change_text_color_mobile)
-            .unwrap_or_else(|| theme::text_primary());
+            .unwrap_or_else(theme::text_primary);
         let file_name = row
             .segments
             .last()

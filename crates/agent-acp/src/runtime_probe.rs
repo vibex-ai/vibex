@@ -634,17 +634,9 @@ impl AcpRuntimeClient {
                             "target_model_not_advertised_by_closed_catalog".to_string(),
                         ),
                     }
-                } else if selection_strategy == ModelSelectionStrategy::StartupProjection {
-                    if startup_model == Some(model) {
-                        AgentRuntimeProbeFact::passed(AgentRuntimeProbeCapability::ModelSelection)
-                    } else {
-                        AgentRuntimeProbeFact {
-                            capability: AgentRuntimeProbeCapability::ModelSelection,
-                            status: AgentRuntimeProbeFactStatus::Failed,
-                            diagnostic_code: Some("startup_model_not_applied".to_string()),
-                        }
-                    }
-                } else if is_copilot {
+                } else if selection_strategy == ModelSelectionStrategy::StartupProjection
+                    || is_copilot
+                {
                     if startup_model == Some(model) {
                         AgentRuntimeProbeFact::passed(AgentRuntimeProbeCapability::ModelSelection)
                     } else {
@@ -684,9 +676,9 @@ impl AcpRuntimeClient {
                         },
                     }
                 }
-            } else if is_copilot && startup_model.is_some() {
-                AgentRuntimeProbeFact::passed(AgentRuntimeProbeCapability::ModelSelection)
-            } else if extract_current_model_id(&session).is_some() {
+            } else if (is_copilot && startup_model.is_some())
+                || extract_current_model_id(&session).is_some()
+            {
                 AgentRuntimeProbeFact::passed(AgentRuntimeProbeCapability::ModelSelection)
             } else {
                 AgentRuntimeProbeFact {

@@ -12170,7 +12170,7 @@ impl AcpRuntimeClient {
             Vec::new()
         };
 
-        let provider_auth_method = provider_backed_auth_method(&agent_id, &auth_source);
+        let provider_auth_method = provider_backed_auth_method(&agent_id, auth_source);
         let process = Arc::new(AcpProcess {
             exit_reporter: (purpose == AcpProcessPurpose::Session).then(|| {
                 self.process_registry
@@ -18821,16 +18821,14 @@ pub(crate) fn extract_probe_reasoning_efforts(response: &Value) -> Vec<AgentReas
                 .get("category")
                 .and_then(Value::as_str)
                 .is_some_and(|category| normalize_identifier(category) == "mode")
+                && let Some(value) = config_value_from_json(option)
+                && value.value != "default"
+                && !efforts.iter().any(|existing| existing.value == value.value)
             {
-                if let Some(value) = config_value_from_json(option)
-                    && value.value != "default"
-                    && !efforts.iter().any(|existing| existing.value == value.value)
-                {
-                    efforts.push(AgentReasoningEffort {
-                        value: value.value,
-                        description: value.label,
-                    });
-                }
+                efforts.push(AgentReasoningEffort {
+                    value: value.value,
+                    description: value.label,
+                });
             }
             continue;
         };

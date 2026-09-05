@@ -22,10 +22,12 @@ use vibex_db::{
     MAX_AGENT_USAGE_QUERY_ROWS, RuntimeBindingRepository, apply_migrations, open_database,
 };
 
+type TokenUsageCacheMap = BTreeMap<(String, String), Option<AgentTokenUsage>>;
+
 #[derive(Clone)]
 pub struct AgentUsageService {
     db_path: PathBuf,
-    token_usage_cache: Arc<Mutex<BTreeMap<(String, String), Option<AgentTokenUsage>>>>,
+    token_usage_cache: Arc<Mutex<TokenUsageCacheMap>>,
 }
 
 impl AgentUsageService {
