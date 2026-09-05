@@ -14,6 +14,14 @@ embeds the other product's assets.
 | iOS mobile | Unsigned simulator app + XCFramework | `pnpm build:mobile:ios` on macOS | Rust source, Cargo lock, vendor/zed revision, XcodeGen project | `pnpm check:mobile-native`, simulator/device validation and signing pipeline |
 | Relay | Transport container | `pnpm smoke:relay:local` plus deployment scripts | Rust source and Cargo lock | Health/API smoke, TLS/NAT/operator validation |
 
+## Linux AppImage Packaging Rules
+
+- Keep `libwayland*` outside the AppImage. Wayland client, cursor, and EGL
+  libraries form a host graphics ABI boundary and must match the installed
+  Mesa or proprietary driver stack.
+- `pnpm check:release` enforces the exclusion across the Linux, Preview, RC,
+  and Stable AppImage configurations.
+
 ## Mobile Packaging Rules
 
 - `apps/mobile` contains the source-owned Android and iOS project definitions.

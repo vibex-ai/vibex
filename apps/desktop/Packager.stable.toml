@@ -44,5 +44,5 @@ section = "devel"
 files = { "packaging/dev.vibex.desktop.desktop" = "/usr/share/applications/dev.vibex.desktop.desktop" }
 
 [appimage]
-excludedLibs = ["libpdfium.so"]
+excludedLibs = ["libpdfium.so", "libwayland*"]
 files = { "packaging/dev.vibex.desktop.desktop" = "/usr/share/applications/dev.vibex.desktop.desktop" }

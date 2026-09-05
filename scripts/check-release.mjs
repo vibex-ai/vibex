@@ -8,6 +8,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const WRITE = process.argv.includes("--write");
 const SELF_TEST = process.argv.includes("--self-test");
 const EXPECTED_DEFERRED_PLATFORMS = ["macos", "windows"];
+const REQUIRED_APPIMAGE_EXCLUDED_LIBS = 'excludedLibs = ["libpdfium.so", "libwayland*"]';
 
 function path(relativePath) {
   return resolve(ROOT, relativePath);
@@ -54,6 +55,13 @@ function runCheck(name, check, classification = "deterministic") {
   }
 }
 
+function validateAppImageGraphicsBoundary(configPath, config) {
+  assert(
+    config.includes(REQUIRED_APPIMAGE_EXCLUDED_LIBS),
+    `${configPath} must leave Wayland libraries to the host graphics stack`
+  );
+}
+
 function validateStableIdentity() {
   assert(existsSync(path("apps/desktop/Cargo.toml")), "current desktop shell is missing");
   const runtime = source("crates/desktop-runtime/src/lib.rs");
@@ -76,12 +84,12 @@ function validateStableIdentity() {
 
 function validatePackaging() {
   const packageJson = readJson("package.json");
+  const appImagePackagingConfigs = ["linux", "preview", "rc", "stable"].map(
+    (name) => `apps/desktop/Packager.${name}.toml`
+  );
   const linuxPackagingConfigs = [
     "apps/desktop/Packager.toml",
-    "apps/desktop/Packager.linux.toml",
-    "apps/desktop/Packager.preview.toml",
-    "apps/desktop/Packager.rc.toml",
-    "apps/desktop/Packager.stable.toml"
+    ...appImagePackagingConfigs
   ];
   for (const configPath of linuxPackagingConfigs) {
     const config = source(configPath);
@@ -89,6 +97,9 @@ function validatePackaging() {
       config.includes("libayatana-appindicator3-1 | libappindicator3-1"),
       `${configPath} is missing its system-tray runtime dependency`
     );
+  }
+  for (const configPath of appImagePackagingConfigs) {
+    validateAppImageGraphicsBoundary(configPath, source(configPath));
   }
   const channels = [
     ["preview", "dev.vibex.desktop.preview", "Vibex Preview"],
@@ -244,6 +255,19 @@ function validateSelfTest() {
     rejected = true;
   }
   assert(rejected, "release checker self-test accepted a drifted stable package identity");
+
+  const configPath = "apps/desktop/Packager.stable.toml";
+  const missingWaylandExclusion = source(configPath).replace(
+    REQUIRED_APPIMAGE_EXCLUDED_LIBS,
+    'excludedLibs = ["libpdfium.so"]'
+  );
+  rejected = false;
+  try {
+    validateAppImageGraphicsBoundary(configPath, missingWaylandExclusion);
+  } catch {
+    rejected = true;
+  }
+  assert(rejected, "release checker self-test accepted bundled Wayland libraries");
 }
 
 const checks = [
