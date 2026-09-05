@@ -3886,12 +3886,12 @@ impl ManagementCenter {
         let center = cx.entity();
         let dialog_center = center.clone();
         let dialog_content = cx.new(|cx| ManagementProfileDialog::new(center.clone(), cx));
-        let dialog_width = (f32::from(window.viewport_size().width) - 32.0).clamp(320.0, 544.0);
-        let dialog_height = (f32::from(window.viewport_size().height) - 32.0).clamp(280.0, 544.0);
+        let dialog_width = (f32::from(window.viewport_size().width) - 32.0).clamp(360.0, 544.0);
+        let dialog_height = (f32::from(window.viewport_size().height) - 32.0).clamp(320.0, 640.0);
         let title = if self.editing_profile_id.is_some() {
-            management_locale_text("Update", "更新", "更新")
+            management_locale_text("Edit model provider", "编辑模型供应商", "編輯模型供應商")
         } else {
-            management_locale_text("Create", "创建", "建立")
+            management_locale_text("Add model provider", "添加模型供应商", "新增模型供應商")
         };
         window.open_dialog(cx, move |dialog, _, _| {
             let dialog_center = dialog_center.clone();
@@ -8292,7 +8292,7 @@ impl ManagementCenter {
                     if action == &format!("models:{profile_id}")
             )
         });
-        let mut model_rows = v_flex().w_full().gap_2();
+        let mut model_rows = v_flex().w_full().gap_1p5();
         for (index, model) in self
             .profile_configured_models
             .clone()
@@ -8308,20 +8308,25 @@ impl ManagementCenter {
                     .items_center()
                     .gap_2()
                     .rounded(px(6.0))
-                    .border_1()
-                    .border_color(cx.theme().border.opacity(0.65))
-                    .bg(cx.theme().background.opacity(0.70))
-                    .px_2()
-                    .py_2()
+                    .px_2p5()
+                    .py_1p5()
+                    .when(enabled, |row| row.bg(cx.theme().muted.opacity(0.30)))
+                    .when(!enabled, |row| {
+                        row.border_1().border_color(cx.theme().border.opacity(0.60))
+                    })
                     .child(
                         v_flex()
                             .min_w_0()
                             .flex_1()
+                            .gap_0p5()
                             .child(
                                 div()
                                     .truncate()
                                     .text_sm()
                                     .font_medium()
+                                    .when(!enabled, |title| {
+                                        title.text_color(cx.theme().muted_foreground)
+                                    })
                                     .child(model.display_name.unwrap_or_else(|| model.id.clone())),
                             )
                             .child(
@@ -8392,99 +8397,105 @@ impl ManagementCenter {
             );
         }
 
-        let model_editor = self
-            .profile_model_edit_index
-            .filter(|index| self.profile_configured_models.get(*index).is_some())
-            .map(|index| (index, self.profile_model_edit_wire_api))
-            .map(|(index, wire_api)| {
-                let mut wire_controls = h_flex().w_full().flex_wrap().gap_1();
-                let candidates = std::iter::once(None)
-                    .chain(wire_api_choices.iter().copied().map(Some))
-                    .collect::<Vec<_>>();
-                for candidate in candidates {
-                    let label = candidate.map_or_else(
-                        || management_locale_text("Inherit", "继承", "繼承").to_string(),
-                        |wire_api| {
-                            let support = self
-                                .projection_editor
-                                .wire_api_integration_kind(wire_api)
-                                .map(provider_interface_integration_label)
-                                .unwrap_or_else(|| {
-                                    management_locale_text("Unsupported", "不支持", "不支援")
-                                });
-                            format!("{} · {support}", provider_wire_api_label(wire_api))
-                        },
-                    );
-                    wire_controls = wire_controls.child(
-                        Button::new(SharedString::from(format!(
-                            "provider-model-wire-{index}-{candidate:?}"
-                        )))
-                        .small()
-                        .ghost()
-                        .selected(wire_api == candidate)
-                        .label(label)
-                        .disabled(pending)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_profile_model_wire_api(index, candidate, cx)
-                        })),
-                    );
-                }
-                v_flex()
-                    .w_full()
-                    .gap_2()
-                    .pt_3()
-                    .border_t_1()
-                    .border_color(cx.theme().border.opacity(0.70))
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_semibold()
-                            .child(management_locale_text("Edit model", "编辑模型", "編輯模型")),
-                    )
-                    .child(management_input_field(
-                        management_locale_text("Model ID", "模型 ID", "模型 ID"),
-                        &self.profile_model_edit_id,
-                        false,
-                        cx,
-                    ))
-                    .child(management_input_field(
-                        management_locale_text("Display name", "显示名称", "顯示名稱"),
-                        &self.profile_model_edit_name,
-                        false,
-                        cx,
-                    ))
-                    .when(shows_wire_api, |editor| {
-                        editor
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_medium()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(management_locale_text(
-                                        "Model API protocol",
-                                        "模型接口协议",
-                                        "模型介面協定",
-                                    )),
-                            )
-                            .child(wire_controls)
-                    })
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .justify_end()
-                            .gap_2()
-                            .child(
-                                Button::new("provider-model-edit-cancel")
-                                    .small()
-                                    .ghost()
-                                    .label(management_cancel_label())
-                                    .disabled(pending)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.close_profile_model_editor(cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("provider-model-edit-save")
+        let model_editor =
+            self.profile_model_edit_index
+                .filter(|index| self.profile_configured_models.get(*index).is_some())
+                .map(|index| (index, self.profile_model_edit_wire_api))
+                .map(|(index, wire_api)| {
+                    let mut wire_controls = h_flex().w_full().flex_wrap().gap_1();
+                    let candidates = std::iter::once(None)
+                        .chain(wire_api_choices.iter().copied().map(Some))
+                        .collect::<Vec<_>>();
+                    for candidate in candidates {
+                        let label = candidate.map_or_else(
+                            || management_locale_text("Inherit", "继承", "繼承").to_string(),
+                            |wire_api| {
+                                let support = self
+                                    .projection_editor
+                                    .wire_api_integration_kind(wire_api)
+                                    .map(provider_interface_integration_label)
+                                    .unwrap_or_else(|| {
+                                        management_locale_text("Unsupported", "不支持", "不支援")
+                                    });
+                                format!("{} · {support}", provider_wire_api_label(wire_api))
+                            },
+                        );
+                        wire_controls = wire_controls.child(
+                            Button::new(SharedString::from(format!(
+                                "provider-model-wire-{index}-{candidate:?}"
+                            )))
+                            .small()
+                            .ghost()
+                            .selected(wire_api == candidate)
+                            .label(label)
+                            .disabled(pending)
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.set_profile_model_wire_api(index, candidate, cx)
+                                },
+                            )),
+                        );
+                    }
+                    v_flex()
+                        .w_full()
+                        .gap_2p5()
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(cx.theme().primary.opacity(0.35))
+                        .bg(cx.theme().primary.opacity(0.06))
+                        .p_2p5()
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .child(div().text_sm().font_semibold().child(
+                                    management_locale_text("Edit model", "编辑模型", "編輯模型"),
+                                ))
+                                .child(
+                                    Button::new("provider-model-edit-cancel")
+                                        .xsmall()
+                                        .ghost()
+                                        .compact()
+                                        .icon(IconName::Close)
+                                        .tooltip(management_cancel_label())
+                                        .disabled(pending)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.close_profile_model_editor(cx)
+                                        })),
+                                ),
+                        )
+                        .child(management_input_field(
+                            management_locale_text("Model ID", "模型 ID", "模型 ID"),
+                            &self.profile_model_edit_id,
+                            false,
+                            cx,
+                        ))
+                        .child(management_input_field(
+                            management_locale_text("Display name", "显示名称", "顯示名稱"),
+                            &self.profile_model_edit_name,
+                            false,
+                            cx,
+                        ))
+                        .when(shows_wire_api, |editor| {
+                            editor
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_medium()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(management_locale_text(
+                                            "Model API protocol",
+                                            "模型接口协议",
+                                            "模型介面協定",
+                                        )),
+                                )
+                                .child(wire_controls)
+                        })
+                        .child(
+                            h_flex().w_full().justify_end().gap_2().child(
+                                Button::new("provider-model-edit-apply")
                                     .small()
                                     .secondary()
                                     .label(management_locale_text(
@@ -8497,17 +8508,17 @@ impl ManagementCenter {
                                         this.save_profile_model_editor(cx)
                                     })),
                             ),
-                    )
-                    .into_any_element()
-            });
+                        )
+                        .into_any_element()
+                });
 
         v_flex()
             .w_full()
-            .gap_3()
+            .gap_2p5()
             .rounded(px(8.0))
             .border_1()
             .border_color(cx.theme().border.opacity(0.70))
-            .bg(cx.theme().muted.opacity(0.25))
+            .bg(cx.theme().muted.opacity(0.18))
             .p_3()
             .child(
                 h_flex()
@@ -8517,31 +8528,31 @@ impl ManagementCenter {
                     .justify_between()
                     .gap_2()
                     .child(
-                        v_flex()
-                            .gap_1()
+                        h_flex()
+                            .min_w_0()
+                            .items_center()
+                            .gap_2()
                             .child(
                                 div()
                                     .text_sm()
                                     .font_medium()
                                     .child(management_locale_text("Models", "模型", "模型")),
                             )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(if self.profile_configured_models.is_empty() {
-                                        management_locale_text("No models", "没有模型", "沒有模型")
-                                            .to_string()
-                                    } else {
-                                        management_model_count(self.profile_configured_models.len())
-                                    }),
-                            ),
+                            .child(management_status_badge(
+                                if self.profile_configured_models.is_empty() {
+                                    management_locale_text("No models", "没有模型", "沒有模型")
+                                        .to_string()
+                                } else {
+                                    management_model_count(self.profile_configured_models.len())
+                                },
+                                cx,
+                            )),
                     )
                     .when_some(self.editing_profile_id.clone(), |header, profile_id| {
                         let agent_id = selected_agent_id.clone();
                         header.child(
                             Button::new("provider-editor-fetch-models")
-                                .small()
+                                .xsmall()
                                 .outline()
                                 .icon(IconName::Search)
                                 .label(if fetching_models {
@@ -8575,6 +8586,7 @@ impl ManagementCenter {
                         Button::new("provider-model-add")
                             .small()
                             .secondary()
+                            .icon(IconName::Plus)
                             .label(management_add_label())
                             .disabled(pending)
                             .on_click(cx.listener(|this, _, window, cx| {
@@ -8608,7 +8620,7 @@ impl ManagementCenter {
         if surface == ProjectionCredentialSurface::ApiKey {
             return v_flex()
                 .w_full()
-                .gap_1()
+                .gap_1p5()
                 .child(
                     h_flex()
                         .w_full()
@@ -8640,7 +8652,7 @@ impl ManagementCenter {
                 .into_any_element();
         }
 
-        let (title, detail) = match surface {
+        let (title, detail, icon) = match surface {
             ProjectionCredentialSurface::OAuth => (
                 "OAuth",
                 management_locale_text(
@@ -8648,6 +8660,7 @@ impl ManagementCenter {
                     "Agent 或主机认证状态",
                     "Agent 或主機驗證狀態",
                 ),
+                IconName::User,
             ),
             ProjectionCredentialSurface::Cloud => (
                 management_locale_text("Cloud credential", "云凭证", "雲端憑證"),
@@ -8656,6 +8669,7 @@ impl ManagementCenter {
                     "云端配置与凭证引用",
                     "雲端設定與憑證引用",
                 ),
+                IconName::Globe,
             ),
             ProjectionCredentialSurface::AgentManaged => (
                 management_locale_text("Agent account", "Agent 账号", "Agent 帳號"),
@@ -8664,6 +8678,7 @@ impl ManagementCenter {
                     "认证由 Agent 管理",
                     "驗證由 Agent 管理",
                 ),
+                IconName::Bot,
             ),
             ProjectionCredentialSurface::Local => (
                 management_locale_text("Local runtime", "本地运行时", "本機執行階段"),
@@ -8672,6 +8687,7 @@ impl ManagementCenter {
                     "不会投影远程凭证",
                     "不會投影遠端憑證",
                 ),
+                IconName::HardDrive,
             ),
             ProjectionCredentialSurface::ServiceMarketplace => (
                 management_locale_text("Service marketplace", "服务市场", "服務市集"),
@@ -8680,6 +8696,7 @@ impl ManagementCenter {
                     "认证由服务管理",
                     "驗證由服務管理",
                 ),
+                IconName::Network,
             ),
             ProjectionCredentialSurface::Unsupported => (
                 management_locale_text("Automatic credential", "自动凭证", "自動憑證"),
@@ -8688,25 +8705,41 @@ impl ManagementCenter {
                     "当前兼容运行时不支持或尚未验证",
                     "目前相容執行階段不支援或尚未驗證",
                 ),
+                IconName::Info,
             ),
             ProjectionCredentialSurface::ApiKey => unreachable!(),
         };
         v_flex()
             .w_full()
-            .gap_1()
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().muted.opacity(0.20))
-            .px_3()
-            .py_2()
+            .gap_1p5()
             .child(
                 h_flex()
                     .w_full()
                     .items_center()
                     .justify_between()
                     .gap_2()
-                    .child(div().text_sm().font_medium().child(title))
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .size(px(22.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .bg(cx.theme().muted.opacity(0.35))
+                                    .child(
+                                        Icon::new(icon)
+                                            .size_3()
+                                            .text_color(cx.theme().muted_foreground),
+                                    ),
+                            )
+                            .child(div().text_sm().font_medium().child(title)),
+                    )
                     .when_some(
                         self.projection_editor
                             .capability
@@ -8748,7 +8781,7 @@ impl ManagementCenter {
         let model_section =
             shows_model.then(|| self.render_profile_model_section(selected_agent_id, cx));
         let protocol_endpoints = shows_endpoint.then(|| {
-            let mut section = v_flex().w_full().gap_2();
+            let mut section = v_flex().w_full().gap_2p5();
             for (wire_api, input) in &self.profile_protocol_base_urls {
                 section = section.child(management_input_field(
                     provider_protocol_url_override_label(*wire_api),
@@ -8759,52 +8792,71 @@ impl ManagementCenter {
             }
             section.into_any_element()
         });
-        let mut form = v_flex()
-            .w_full()
-            .gap_3()
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_locale_text(
-                        "Create, update, duplicate, delete, or set defaults.",
-                        "创建、更新、复制、删除或设置默认项。",
-                        "建立、更新、複製、刪除或設定預設項。",
-                    )),
-            )
-            .child(management_input_field(
-                management_locale_text("Provider name", "供应商名称", "供應商名稱"),
-                &self.profile_name,
-                false,
-                cx,
-            ))
-            .child(management_input_field(
-                management_locale_text("Note", "备注", "備註"),
-                &self.profile_note,
-                false,
-                cx,
-            ))
-            .child(management_input_field(
-                management_locale_text("Website URL", "官网链接", "官網連結"),
-                &self.profile_website_url,
-                false,
-                cx,
-            ))
-            .child(credential_control)
-            .when(shows_endpoint, |form| {
-                form.child(management_input_field(
-                    management_locale_text(
-                        "Default API request URL",
-                        "默认 API 请求地址",
-                        "預設 API 請求位址",
-                    ),
-                    &self.profile_base_url,
+
+        // Identity: name, note, and website. Name gets the primary emphasis.
+        let identity_section = profile_editor_section(
+            management_locale_text("Basics", "基本信息", "基本資訊"),
+            None,
+            v_flex()
+                .w_full()
+                .gap_2p5()
+                .child(management_input_field(
+                    management_locale_text("Provider name", "供应商名称", "供應商名稱"),
+                    &self.profile_name,
                     false,
                     cx,
                 ))
-            })
-            .when_some(protocol_endpoints, |form, endpoints| form.child(endpoints))
-            .when_some(model_section, |form, section| form.child(section));
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_start()
+                        .gap_2p5()
+                        .child(div().flex_1().min_w_0().child(management_input_field(
+                            management_locale_text("Note", "备注", "備註"),
+                            &self.profile_note,
+                            false,
+                            cx,
+                        )))
+                        .child(div().flex_1().min_w_0().child(management_input_field(
+                            management_locale_text("Website URL", "官网链接", "官網連結"),
+                            &self.profile_website_url,
+                            false,
+                            cx,
+                        ))),
+                )
+                .into_any_element(),
+            cx,
+        );
+
+        // Connection: credential surface, base URL, and per-protocol overrides.
+        let mut connection_content = v_flex().w_full().gap_2p5().child(credential_control);
+        if shows_endpoint {
+            connection_content = connection_content.child(management_input_field(
+                management_locale_text(
+                    "Default API request URL",
+                    "默认 API 请求地址",
+                    "預設 API 請求位址",
+                ),
+                &self.profile_base_url,
+                false,
+                cx,
+            ));
+        }
+        if let Some(endpoints) = protocol_endpoints {
+            connection_content = connection_content.child(endpoints);
+        }
+        let connection_section = profile_editor_section(
+            management_locale_text("Connection & credentials", "连接与凭证", "連線與憑證"),
+            None,
+            connection_content.into_any_element(),
+            cx,
+        );
+
+        let mut form = v_flex()
+            .w_full()
+            .gap_3()
+            .child(identity_section)
+            .child(connection_section);
         if shows_api_key && self.profile_secret_loading {
             form = form.child(status_line(
                 management_locale_text(
@@ -8819,15 +8871,29 @@ impl ManagementCenter {
         }
         if shows_api_key && updating && !self.profile_secret_touched {
             form = form.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_locale_text(
-                        "Saved Secret remains unchanged until this field is edited.",
-                        "只有编辑此字段后才会修改已保存的密钥。",
-                        "只有編輯此欄位後才會修改已儲存的金鑰。",
-                    )),
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_1p5()
+                    .child(
+                        Icon::new(IconName::Info)
+                            .size_3()
+                            .text_color(cx.theme().muted_foreground),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text(
+                                "Saved Secret remains unchanged until this field is edited.",
+                                "只有编辑此字段后才会修改已保存的密钥。",
+                                "只有編輯此欄位後才會修改已儲存的金鑰。",
+                            )),
+                    ),
             );
+        }
+        if let Some(section) = model_section {
+            form = form.child(section);
         }
         if let Some(error) = self.error.clone() {
             form = form.child(status_line(
@@ -8840,7 +8906,6 @@ impl ManagementCenter {
         v_flex()
             .size_full()
             .min_h_0()
-            .gap_3()
             .child(
                 div()
                     .min_h_0()
@@ -8853,37 +8918,39 @@ impl ManagementCenter {
                 h_flex()
                     .w_full()
                     .flex_none()
+                    .items_center()
                     .justify_end()
                     .gap_2()
                     .border_t_1()
                     .border_color(cx.theme().border)
                     .pt_3()
                     .child(
+                        Button::new("provider-profile-close")
+                            .small()
+                            .ghost()
+                            .label(management_locale_text("Cancel", "取消", "取消"))
+                            .disabled(pending)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.close_profile_editor(window, cx)
+                            })),
+                    )
+                    .child(
                         Button::new("provider-profile-save")
                             .small()
                             .when(updating, |button| button.secondary())
                             .when(!updating, |button| button.primary())
                             .label(if updating {
-                                management_locale_text("Update", "更新", "更新")
+                                management_locale_text("Save changes", "保存修改", "儲存修改")
                             } else {
-                                management_locale_text("Create", "创建", "建立")
+                                management_locale_text(
+                                    "Create provider",
+                                    "创建供应商",
+                                    "新增供應商",
+                                )
                             })
                             .loading(saving)
                             .disabled(pending || self.profile_secret_loading)
                             .on_click(cx.listener(|this, _, _, cx| this.save_profile(cx))),
-                    )
-                    .child(
-                        Button::new("provider-profile-close")
-                            .small()
-                            .outline()
-                            .label(management_locale_text(
-                                "Close editor",
-                                "关闭编辑器",
-                                "關閉編輯器",
-                            ))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.close_profile_editor(window, cx)
-                            })),
                     ),
             )
             .into_any_element()
@@ -15696,6 +15763,45 @@ fn management_input_field(
                 .child(label.into()),
         )
         .child(if masked { input.mask_toggle() } else { input })
+        .into_any_element()
+}
+
+/// A labeled editor section: a muted section caption over a hairline rule,
+/// followed by the section content. Keeps long dialog forms scannable.
+fn profile_editor_section(
+    label: &'static str,
+    trailing: Option<AnyElement>,
+    content: AnyElement,
+    cx: &App,
+) -> AnyElement {
+    v_flex()
+        .w_full()
+        .min_w_0()
+        .gap_2p5()
+        .child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .font_semibold()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .h(px(1.0))
+                        .rounded_full()
+                        .bg(cx.theme().border.opacity(0.60)),
+                )
+                .children(trailing),
+        )
+        .child(content)
         .into_any_element()
 }
 
