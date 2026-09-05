@@ -1348,19 +1348,12 @@ mod tests {
                 && option.selection.model_id() == Some("second-model")
         }));
         for option in profile_options {
-            assert!(option.modes.iter().any(|mode| mode.value == "plan"));
-            assert!(
-                option
-                    .reasoning_efforts
-                    .iter()
-                    .any(|effort| effort.value == "high")
-            );
-            assert!(
-                option
-                    .features
-                    .iter()
-                    .any(|feature| feature.id == "auto_approve")
-            );
+            // Explicitly configured models must not inherit Agent fallback
+            // runtime options (provider-config.md §3); the model snapshot is
+            // what grants per-model runtime options.
+            assert!(option.modes.is_empty());
+            assert!(option.reasoning_efforts.is_empty());
+            assert!(option.features.is_empty());
             assert_ne!(
                 option.selection.model_id(),
                 Some("model-from-agent-must-not-be-used")
@@ -1376,7 +1369,7 @@ mod tests {
         let options = catalog.list().await.unwrap().options;
         assert!(options.iter().any(|option| {
             option.selection.provider_profile_id() == Some(&third_profile.id)
-                && option.modes.iter().any(|mode| mode.value == "plan")
+                && option.selection.model_id() == Some("third-model")
         }));
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         assert_eq!(catalog.snapshot_summaries().unwrap().len(), 1);
@@ -1402,12 +1395,10 @@ mod tests {
                     && option.selection.model_id() == Some("gpt-5.6-sol")
             })
             .unwrap();
-        assert!(
-            fallback_gpt
-                .reasoning_efforts
-                .iter()
-                .any(|effort| effort.value == "max")
-        );
+        // Explicitly configured models must not inherit the Agent fallback
+        // effort/mode lists before a per-model probe exists.
+        assert!(fallback_gpt.reasoning_efforts.is_empty());
+        assert!(fallback_gpt.modes.is_empty());
 
         let result = catalog.probe_profile_models(&profile.id).await.unwrap();
         assert_eq!(result.probed_models.len(), 2);
@@ -1604,16 +1595,19 @@ mod tests {
             .find(|option| option.selection.provider_profile_id() == Some(&first_profile.id))
             .unwrap();
         assert_eq!(first.selection.model_id(), Some("configured-first"));
-        assert_eq!(first.modes[0].value, "review");
-        assert_eq!(first.reasoning_efforts[0].value, "low");
+        // Live modes/efforts stay profile-level evidence, but they are not a
+        // runtime-option grant for explicitly configured models
+        // (provider-config.md §3).
+        assert!(first.modes.is_empty());
+        assert!(first.reasoning_efforts.is_empty());
         let second = catalog
             .options
             .iter()
             .find(|option| option.selection.provider_profile_id() == Some(&second_profile.id))
             .unwrap();
         assert_eq!(second.selection.model_id(), Some("configured-second"));
-        assert_eq!(second.modes[0].value, "plan");
-        assert_eq!(second.reasoning_efforts[0].value, "high");
+        assert!(second.modes.is_empty());
+        assert!(second.reasoning_efforts.is_empty());
     }
 
     #[tokio::test]
