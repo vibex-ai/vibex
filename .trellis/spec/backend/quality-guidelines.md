@@ -48,6 +48,110 @@ Integration smoke tests should cover:
 - SQLite migration startup.
 - Remote client timeline fetch and live event stream.
 
+## Scenario: Linux AppImage Host Graphics ABI
+
+### 1. Scope / Trigger
+
+- Trigger: changing Linux desktop dependencies, AppImage packager configuration,
+  the GPUI/WGPU renderer, or tagged/candidate Linux release workflows.
+- AppImage launches cross an ABI boundary between libraries captured from the
+  Ubuntu build runner and Mesa or proprietary graphics drivers installed on the
+  user's host.
+
+### 2. Signatures
+
+```text
+apps/desktop/Packager.{linux,preview,rc,stable}.toml:
+  [appimage]
+  excludedLibs = ["libpdfium.so", "libwayland*"]
+
+pnpm check:release
+node scripts/check-release.mjs --self-test
+cargo packager --config apps/desktop/Packager.<channel>.toml --formats appimage
+<artifact>.AppImage --appimage-extract
+```
+
+### 3. Contracts
+
+- Every source-owned Linux AppImage configuration excludes `libwayland*`.
+  Wayland client, cursor, and EGL libraries must come from the host and match
+  its Mesa or proprietary driver stack.
+- Do not narrow the exclusion to `libwayland-client.so.0`. Loading host client
+  code alongside bundled cursor or EGL code still creates a mixed Wayland ABI.
+- `scripts/check-release.mjs` validates all four configurations and its negative
+  self-test must reject a removed Wayland exclusion.
+- Package acceptance inspects the generated filesystem. A correct TOML file is
+  not evidence that the packager honored its exclusion glob.
+- Run the packaged artifact with disposable `HOME` and XDG directories. When a
+  non-build-runner Wayland environment is available, keep the process alive
+  through `vibex-foundation: runtime-ready`; do not treat package creation as a
+  startup smoke.
+- The host must provide the normal desktop Wayland runtime. Missing host
+  libraries are an installation prerequisite failure, not permission to bundle
+  build-runner copies beside host graphics drivers.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Any AppImage config omits `libwayland*` | `pnpm check:release` fails with the config path. |
+| The release checker accepts that omission | `node scripts/check-release.mjs --self-test` fails. |
+| Extracted `usr/lib` contains a `libwayland*` entry | Reject the artifact before upload or release. |
+| Startup resolves Wayland libraries from the AppImage | Reject the artifact as a mixed host/package graphics stack. |
+| Startup panics in EGL or reports missing `wl_*` symbols | Inspect loader resolution first; do not patch the upstream panic as the primary fix. |
+| Host does not provide the required Wayland SONAMEs | Report the missing system runtime; do not silently restore bundled Wayland libraries. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: an Ubuntu-built AppImage contains no `libwayland*`, resolves Wayland
+  libraries from an Arch/NVIDIA host, reaches `runtime-ready`, and remains live.
+- Base: the four configurations pass static checks and extraction finds no
+  matching library; the current machine lacks a second Wayland graphics stack,
+  so that unavailable smoke is reported rather than fabricated.
+- Bad: the AppImage bundles Ubuntu's `libwayland-client.so.0`, then a newer host
+  EGL driver requests `wl_display_create_queue_with_name` or
+  `wl_fixes_interface` and GPUI/WGPU aborts during EGL initialization.
+- Bad: force Vulkan-only startup or catch the `khronos-egl` panic while leaving
+  the incompatible mixed library stack in the published artifact.
+
+### 6. Tests Required
+
+- Run `pnpm check:release` and `node scripts/check-release.mjs --self-test`.
+- Build the affected channel with the pinned `cargo-packager` version, extract
+  the AppImage, and assert `find squashfs-root/usr/lib -name 'libwayland*'`
+  produces no paths.
+- On an available non-build-runner Wayland host, launch with disposable
+  `HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and `XDG_CACHE_HOME`; assert the
+  process reaches `vibex-foundation: runtime-ready` and does not exit during the
+  bounded observation.
+- When diagnosing a regression, use loader diagnostics to assert
+  `libwayland-client`, `libwayland-cursor`, and `libwayland-egl` resolve outside
+  the AppImage mount.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```toml
+[appimage]
+excludedLibs = ["libpdfium.so"]
+```
+
+```text
+cargo packager succeeded -> accept and publish the AppImage
+```
+
+#### Correct
+
+```toml
+[appimage]
+excludedLibs = ["libpdfium.so", "libwayland*"]
+```
+
+```text
+static contract -> build -> extract and inspect -> isolated Wayland startup -> publish
+```
+
 ## Scenario: Shared GPUI Backend Facade, Terminal Reset, And Safe Debug
 
 ### 1. Scope / Trigger
@@ -2023,4 +2127,3 @@ idle RSS gate = endRssKiB <= frozen process_tree_idle_end_rss_kib budget
   ]
 }
 ```
-

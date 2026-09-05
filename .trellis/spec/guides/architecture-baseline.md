@@ -170,6 +170,13 @@ directly or introduce a second authority.
 - Relay forwards encrypted payloads and has no provider, workspace, or Agent
   authorization logic.
 
+## Release Packaging Check
+
+- Linux AppImage work must identify libraries that belong to the host graphics
+  ABI and validate the generated artifact on a different graphics stack. Follow
+  the [Linux AppImage Host Graphics ABI](../backend/quality-guidelines.md#scenario-linux-appimage-host-graphics-abi)
+  contract.
+
 ## Required Gates
 
 ```bash
