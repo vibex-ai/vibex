@@ -12,7 +12,6 @@ use gpui_component::{
     dialog::DialogButtonProps,
     h_flex,
     input::{Input, InputEvent, InputState},
-    switch::Switch,
     tab::{Tab, TabBar},
     v_flex,
 };
@@ -36,7 +35,7 @@ use crate::{locale, theme};
 const PAIRING_OFFER_TTL_MS: u32 = 90_000;
 const OFFER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const QR_QUIET_ZONE_MODULES: usize = 4;
-const QR_MODULE_SCALE: usize = 4;
+const QR_MODULE_SCALE: usize = 2;
 const DIALOG_MAX_WIDTH: f32 = 760.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,27 +66,11 @@ enum RemoteAccessEntry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteAccessPage {
-    EntryList,
-    EntryDetails,
+    Setup,
+    Pairing,
 }
 
 impl RemoteAccessEntry {
-    const ALL: [Self; 4] = [
-        Self::TailscaleServe,
-        Self::Direct,
-        Self::SelfHostedRelay,
-        Self::LocalNetwork,
-    ];
-
-    fn remote_method(self) -> Option<RemoteConnectivityMethod> {
-        match self {
-            Self::TailscaleServe => Some(RemoteConnectivityMethod::TailscaleServe),
-            Self::Direct => Some(RemoteConnectivityMethod::Direct),
-            Self::SelfHostedRelay => Some(RemoteConnectivityMethod::SelfHostedRelay),
-            Self::LocalNetwork => None,
-        }
-    }
-
     fn from_remote_method(method: RemoteConnectivityMethod) -> Self {
         match method {
             RemoteConnectivityMethod::TailscaleServe => Self::TailscaleServe,
@@ -100,9 +83,7 @@ impl RemoteAccessEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RemoteAccessAction {
     Refresh,
-    ShowEntryList,
     SelectMethod(RemoteConnectivityMethod),
-    SelectConnectionEntry(RemoteAccessEntry),
     EnableMethod(RemoteConnectivityMethod),
     ConfirmTailscalePort(u16),
     DisableMethod(RemoteConnectivityMethod),
@@ -122,6 +103,9 @@ enum RemoteAccessAction {
     CancelZeroConfigPairing,
     ApproveZeroConfigPairing(RequestId),
     RejectZeroConfigPairing(RequestId),
+    ShowSetup,
+    ShowPairing,
+    ToggleLanSection,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -333,6 +317,7 @@ struct PairingViewState {
     active_offer: Option<ActivePairingOffer>,
     active_lan_window: Option<RemoteLanPairingWindowSnapshot>,
     active_zero_config_window: Option<RemoteLanPairingWindowSnapshot>,
+    lan_section_open: bool,
     pending: Option<RemoteAccessMutation>,
     error_code: Option<String>,
     notice: Option<&'static str>,
@@ -342,7 +327,7 @@ impl Default for PairingViewState {
     fn default() -> Self {
         Self {
             connectivity: None,
-            page: RemoteAccessPage::EntryList,
+            page: RemoteAccessPage::Setup,
             selected_method: RemoteConnectivityMethod::TailscaleServe,
             selected_entry: RemoteAccessEntry::TailscaleServe,
             permission: RemoteDevicePermissionLevel::ReadOnly,
@@ -350,6 +335,7 @@ impl Default for PairingViewState {
             active_offer: None,
             active_lan_window: None,
             active_zero_config_window: None,
+            lan_section_open: false,
             pending: None,
             error_code: None,
             notice: None,
@@ -362,17 +348,24 @@ impl PairingViewState {
         self.connectivity = Some(snapshot);
     }
 
-    fn show_entry_list(&mut self) {
-        self.page = RemoteAccessPage::EntryList;
+    fn show_setup(&mut self) {
+        self.page = RemoteAccessPage::Setup;
         self.error_code = None;
     }
 
-    fn select_connection_entry(&mut self, entry: RemoteAccessEntry) {
-        self.selected_entry = entry;
-        if let Some(method) = entry.remote_method() {
-            self.selected_method = method;
-        }
-        self.page = RemoteAccessPage::EntryDetails;
+    fn show_pairing(&mut self) {
+        self.page = RemoteAccessPage::Pairing;
+        self.error_code = None;
+    }
+
+    fn select_method(&mut self, method: RemoteConnectivityMethod) {
+        self.selected_method = method;
+        self.selected_entry = RemoteAccessEntry::from_remote_method(method);
+        self.error_code = None;
+    }
+
+    fn toggle_lan_section(&mut self) {
+        self.lan_section_open = !self.lan_section_open;
         self.error_code = None;
     }
 
@@ -568,17 +561,20 @@ impl RemoteAccessPairing {
     fn dispatch_action(&mut self, action: RemoteAccessAction, cx: &mut Context<Self>) {
         match action {
             RemoteAccessAction::Refresh => self.refresh(cx),
-            RemoteAccessAction::ShowEntryList => {
-                self.state.show_entry_list();
+            RemoteAccessAction::ShowSetup => {
+                self.state.show_setup();
+                cx.notify();
+            }
+            RemoteAccessAction::ShowPairing => {
+                self.state.show_pairing();
                 cx.notify();
             }
             RemoteAccessAction::SelectMethod(method) => {
-                self.state
-                    .select_connection_entry(RemoteAccessEntry::from_remote_method(method));
+                self.state.select_method(method);
                 cx.notify();
             }
-            RemoteAccessAction::SelectConnectionEntry(entry) => {
-                self.state.select_connection_entry(entry);
+            RemoteAccessAction::ToggleLanSection => {
+                self.state.toggle_lan_section();
                 cx.notify();
             }
             RemoteAccessAction::EnableMethod(method) => self.enable_method(method, cx),
@@ -674,6 +670,7 @@ impl RemoteAccessPairing {
                             if let Err(error) = this.state.install_offer(response) {
                                 this.state.error_code = Some(error.code);
                             } else {
+                                this.state.page = RemoteAccessPage::Pairing;
                                 this.schedule_offer_poll(cx);
                             }
                         }
@@ -1452,107 +1449,183 @@ impl RemoteAccessPairing {
         });
     }
 
-    fn render_connection_entry_selector(&self, cx: &mut Context<Self>) -> AnyElement {
-        v_flex()
+    fn render_hero_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (status, color) = self.remote_access_status(cx);
+        h_flex()
             .w_full()
-            .gap_2()
+            .min_w_0()
+            .items_start()
+            .justify_between()
+            .gap_3()
             .child(
                 h_flex()
-                    .w_full()
                     .min_w_0()
-                    .gap_2()
-                    .child(self.render_connection_entry_card(RemoteAccessEntry::TailscaleServe, cx))
-                    .child(self.render_connection_entry_card(RemoteAccessEntry::Direct, cx)),
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .gap_2()
+                    .items_center()
+                    .gap_3()
+                    .child(icon_tile(IconName::SquareTerminal, px(40.0), px(20.0), cx))
                     .child(
-                        self.render_connection_entry_card(RemoteAccessEntry::SelfHostedRelay, cx),
-                    )
-                    .child(self.render_connection_entry_card(RemoteAccessEntry::LocalNetwork, cx)),
+                        v_flex()
+                            .min_w_0()
+                            .gap_1()
+                            .child(div().text_lg().font_semibold().child(locale::text(
+                                "Connect a mobile device",
+                                "连接移动设备",
+                                "連接行動裝置",
+                            )))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(locale::text(
+                                        "Pair this computer with the Vibex mobile app",
+                                        "将此电脑与 Vibex 移动应用配对",
+                                        "將此電腦與 Vibex 行動應用程式配對",
+                                    )),
+                            ),
+                    ),
             )
+            .child(status_pill(status, color))
             .into_any_element()
     }
 
-    fn render_connection_entry_card(
-        &self,
-        entry: RemoteAccessEntry,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let selected = self.state.selected_entry == entry;
-        let disabled = self.has_active_pairing() && !selected;
-        let entity = cx.weak_entity();
-        let keyboard_entity = entity.clone();
-        let action = entry
-            .remote_method()
-            .map(RemoteAccessAction::SelectMethod)
-            .unwrap_or(RemoteAccessAction::SelectConnectionEntry(entry));
-        let keyboard_action = action.clone();
-        let (status, status_color) = match entry {
-            RemoteAccessEntry::LocalNetwork => {
-                if self.state.active_zero_config_window.is_some() {
-                    (
-                        locale::text("Discovering", "发现中", "探索中"),
-                        cx.theme().success,
-                    )
-                } else {
-                    (
-                        locale::text("Ready", "待开启", "待開啟"),
-                        cx.theme().muted_foreground,
-                    )
-                }
-            }
-            RemoteAccessEntry::TailscaleServe
-            | RemoteAccessEntry::Direct
-            | RemoteAccessEntry::SelfHostedRelay => {
-                let method = entry.remote_method().expect("remote entry has a method");
-                let snapshot = self
-                    .state
-                    .connectivity
-                    .as_ref()
-                    .and_then(|connectivity| connectivity.method(method));
-                let state = snapshot.map_or(RemoteMethodState::Disabled, |snapshot| snapshot.state);
-                (method_state_label(state), method_state_color(state, cx))
-            }
+    fn remote_access_status(&self, cx: &App) -> (SharedString, gpui::Hsla) {
+        let Some(snapshot) = self.state.connectivity.as_ref() else {
+            return (
+                locale::text("Checking…", "检查中…", "檢查中…").into(),
+                cx.theme().muted_foreground,
+            );
         };
-        let icon = match entry {
-            RemoteAccessEntry::LocalNetwork => IconName::Network,
-            RemoteAccessEntry::TailscaleServe
-            | RemoteAccessEntry::Direct
-            | RemoteAccessEntry::SelfHostedRelay => {
-                method_icon(entry.remote_method().expect("remote entry has a method"))
-            }
-        };
-        let label = connection_entry_label(entry);
-        let description = connection_entry_description(entry);
-        let accessibility_label = format!("{label}: {description}");
+        let online = snapshot
+            .methods
+            .iter()
+            .filter(|method| method.candidate_available)
+            .count();
+        if online > 0 {
+            let label = match locale::current_locale() {
+                locale::ResolvedLocale::En => format!("{online} online"),
+                locale::ResolvedLocale::ZhCn => format!("{online} 项在线"),
+                locale::ResolvedLocale::ZhTw => format!("{online} 項上線"),
+            };
+            return (label.into(), cx.theme().success);
+        }
+        if snapshot.desired_enabled {
+            return (
+                locale::text("Checking…", "检查中…", "檢查中…").into(),
+                cx.theme().warning,
+            );
+        }
+        (
+            locale::text("Not enabled", "未启用", "未啟用").into(),
+            cx.theme().muted_foreground,
+        )
+    }
 
-        v_flex()
-            .id(SharedString::from(format!(
-                "remote-access-entry-{}",
-                connection_entry_index(entry)
-            )))
-            .flex_1()
-            .min_w_0()
-            .min_h(px(92.0))
+    fn render_pairing_resume_strip(&self, cx: &mut Context<Self>) -> AnyElement {
+        let entity = cx.weak_entity();
+        h_flex()
+            .w_full()
+            .items_center()
             .justify_between()
             .gap_3()
             .rounded(px(8.0))
             .border_1()
+            .border_color(cx.theme().primary.opacity(0.35))
+            .bg(cx.theme().primary.opacity(0.06))
+            .px_3()
+            .py_2()
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Icon::new(IconName::Info)
+                            .size(px(14.0))
+                            .text_color(cx.theme().primary),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(locale::text(
+                                "A pairing session is already in progress",
+                                "已有配对会话正在进行",
+                                "已有配對工作階段進行中",
+                            )),
+                    ),
+            )
+            .child(
+                Button::new("resume-active-pairing")
+                    .small()
+                    .outline()
+                    .label(locale::text("Resume", "继续配对", "繼續配對"))
+                    .disabled(self.state.pending.is_some())
+                    .on_click(move |_, _, cx| {
+                        let _ = entity.update(cx, |this, cx| {
+                            this.dispatch_action(RemoteAccessAction::ShowPairing, cx)
+                        });
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_method_list(&self, cx: &mut Context<Self>) -> AnyElement {
+        v_flex()
+            .w_full()
+            .gap_2()
+            .child(self.render_method_row(RemoteConnectivityMethod::TailscaleServe, cx))
+            .child(self.render_method_row(RemoteConnectivityMethod::Direct, cx))
+            .child(self.render_method_row(RemoteConnectivityMethod::SelfHostedRelay, cx))
+            .into_any_element()
+    }
+
+    fn render_method_row(
+        &self,
+        method: RemoteConnectivityMethod,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selected = self.state.selected_method == method;
+        let disabled = self.has_active_pairing();
+        let entity = cx.weak_entity();
+        let keyboard_entity = entity.clone();
+        let action = RemoteAccessAction::SelectMethod(method);
+        let keyboard_action = action.clone();
+        let snapshot = self
+            .state
+            .connectivity
+            .as_ref()
+            .and_then(|connectivity| connectivity.method(method));
+        let state = snapshot.map_or(RemoteMethodState::Disabled, |snapshot| snapshot.state);
+        let (status, status_color) = (method_state_label(state), method_state_color(state, cx));
+        let row_id = SharedString::from(format!("remote-access-method-{}", method.wire_name()));
+        let accessibility_label = format!(
+            "{}: {}",
+            method_short_name(method),
+            method_description(method)
+        );
+
+        h_flex()
+            .id(row_id)
+            .w_full()
+            .min_w_0()
+            .items_center()
+            .gap_3()
+            .rounded(px(10.0))
+            .border_1()
             .border_color(if selected {
-                cx.theme().primary.opacity(0.72)
+                cx.theme().primary.opacity(0.55)
             } else {
                 cx.theme().border.opacity(0.72)
             })
             .bg(if selected {
-                cx.theme().primary.opacity(0.08)
+                cx.theme().primary.opacity(0.07)
             } else {
-                cx.theme().background.opacity(0.55)
+                cx.theme().background.opacity(0.4)
             })
-            .p_3()
+            .px_3()
+            .py_2()
             .cursor_pointer()
             .focusable()
             .tab_stop(!disabled)
@@ -1561,7 +1634,7 @@ impl RemoteAccessPairing {
             .aria_selected(selected)
             .hover(|style| {
                 style.bg(if selected {
-                    cx.theme().primary.opacity(0.12)
+                    cx.theme().primary.opacity(0.10)
                 } else {
                     cx.theme().accent
                 })
@@ -1571,41 +1644,43 @@ impl RemoteAccessPairing {
                     gpui::BoxShadow::new(px(0.0), px(0.0), cx.theme().ring).spread_radius(px(2.0)),
                 ])
             })
-            .when(disabled, |card| card.opacity(0.62).cursor_default())
+            .when(disabled, |row| row.opacity(0.62).cursor_default())
+            .child(radio_dot(selected, cx))
             .child(
-                h_flex()
-                    .w_full()
+                v_flex()
                     .min_w_0()
-                    .items_start()
-                    .gap_2()
+                    .flex_1()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .child(method_short_name(method)),
+                            )
+                            .when(method == RemoteConnectivityMethod::TailscaleServe, |row| {
+                                row.child(status_pill(
+                                    locale::text("Recommended", "推荐", "建議"),
+                                    cx.theme().primary,
+                                ))
+                            }),
+                    )
                     .child(
                         div()
-                            .size(px(28.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(6.0))
-                            .bg(if selected {
-                                cx.theme().primary.opacity(0.14)
-                            } else {
-                                cx.theme().muted.opacity(0.32)
-                            })
-                            .child(Icon::new(icon).size(px(15.0)).text_color(if selected {
-                                cx.theme().primary
-                            } else {
-                                cx.theme().muted_foreground
-                            })),
-                    )
-                    .child(connection_entry_card_copy(label, description, cx)),
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(method_description(method)),
+                    ),
             )
-            .child(
-                div()
-                    .text_xs()
-                    .font_medium()
-                    .text_color(status_color)
-                    .child(status),
-            )
+            .child(status_pill(status, status_color))
             .on_click(move |_, _, cx| {
                 if disabled {
                     return;
@@ -1628,6 +1703,26 @@ impl RemoteAccessPairing {
             .into_any_element()
     }
 
+    fn render_status_banner(
+        &self,
+        icon: IconName,
+        color: gpui::Hsla,
+        text: impl IntoElement,
+        _cx: &mut Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .w_full()
+            .items_center()
+            .gap_2()
+            .rounded(px(6.0))
+            .bg(color.opacity(0.08))
+            .px_3()
+            .py_2()
+            .child(Icon::new(icon).size(px(14.0)).text_color(color))
+            .child(div().min_w_0().text_xs().text_color(color).child(text))
+            .into_any_element()
+    }
+
     fn has_active_pairing(&self) -> bool {
         self.state.pending.is_some()
             || self.state.active_lan_window.is_some()
@@ -1639,22 +1734,7 @@ impl RemoteAccessPairing {
                 .is_some_and(|offer| !offer.is_terminal(unix_timestamp_ms()))
     }
 
-    fn render_connection_entry_panel(&self, cx: &mut Context<Self>) -> AnyElement {
-        match self.state.selected_entry {
-            RemoteAccessEntry::TailscaleServe => {
-                self.render_method_panel(RemoteConnectivityMethod::TailscaleServe, cx)
-            }
-            RemoteAccessEntry::Direct => {
-                self.render_method_panel(RemoteConnectivityMethod::Direct, cx)
-            }
-            RemoteAccessEntry::SelfHostedRelay => {
-                self.render_method_panel(RemoteConnectivityMethod::SelfHostedRelay, cx)
-            }
-            RemoteAccessEntry::LocalNetwork => self.render_local_network_panel(cx),
-        }
-    }
-
-    fn render_method_panel(
+    fn render_method_detail_panel(
         &self,
         method: RemoteConnectivityMethod,
         cx: &mut Context<Self>,
@@ -1667,22 +1747,21 @@ impl RemoteAccessPairing {
         let pending = self.state.pending.is_some();
         let desired_enabled = snapshot.is_some_and(|snapshot| snapshot.desired_enabled);
         let state = snapshot.map_or(RemoteMethodState::Disabled, |snapshot| snapshot.state);
-        let entity = cx.weak_entity();
-        let toggle_entity = entity.clone();
         let status_color = method_state_color(state, cx);
         let recovery = snapshot.map_or(RemoteRecoveryAction::None, |snapshot| {
             snapshot.recovery_action
         });
         let origin = snapshot.and_then(|snapshot| snapshot.origin.clone());
+        let entity = cx.weak_entity();
 
         let mut panel = v_flex()
             .w_full()
             .min_w_0()
             .gap_3()
-            .rounded(px(8.0))
+            .rounded(px(10.0))
             .border_1()
-            .border_color(cx.theme().border.opacity(0.72))
-            .bg(cx.theme().muted.opacity(0.12))
+            .border_color(cx.theme().primary.opacity(0.30))
+            .bg(cx.theme().muted.opacity(0.14))
             .p_4()
             .child(
                 h_flex()
@@ -1695,76 +1774,36 @@ impl RemoteAccessPairing {
                             .min_w_0()
                             .items_center()
                             .gap_2()
-                            .child(Icon::new(method_icon(method)).size(px(16.0)))
+                            .child(icon_tile(method_icon(method), px(28.0), px(15.0), cx))
                             .child(
-                                v_flex()
+                                div()
                                     .min_w_0()
-                                    .gap_1()
-                                    .child(
-                                        h_flex()
-                                            .flex_wrap()
-                                            .items_center()
-                                            .gap_2()
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .font_semibold()
-                                                    .child(method_label(method)),
-                                            )
-                                            .child(
-                                                div()
-                                                    .rounded(px(4.0))
-                                                    .bg(status_color.opacity(0.12))
-                                                    .px_1()
-                                                    .py(px(1.0))
-                                                    .text_xs()
-                                                    .text_color(status_color)
-                                                    .child(method_state_label(state)),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(method_description(method)),
-                                    )
-                                    .when_some(origin.clone(), |column, origin| {
-                                        column.child(
-                                            div()
-                                                .max_w(px(500.0))
-                                                .truncate()
-                                                .text_xs()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(origin),
-                                        )
-                                    }),
-                            ),
+                                    .truncate()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .child(method_short_name(method)),
+                            )
+                            .child(status_pill(method_state_label(state), status_color)),
                     )
                     .child(
-                        Switch::new(SharedString::from(format!(
-                            "remote-method-toggle-{}",
-                            method.wire_name()
-                        )))
-                        .checked(desired_enabled)
-                        .disabled(pending)
-                        .label(locale::text("Enabled", "启用", "啟用"))
-                        .on_click(move |checked, _, cx| {
-                            let _ = toggle_entity.update(cx, |this, cx| {
-                                if *checked {
-                                    this.dispatch_action(
-                                        RemoteAccessAction::EnableMethod(method),
-                                        cx,
-                                    );
-                                } else {
-                                    this.dispatch_action(
-                                        RemoteAccessAction::DisableMethod(method),
-                                        cx,
-                                    );
-                                }
-                            });
-                        }),
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(method_description(method)),
                     ),
-            );
+            )
+            .when_some(origin.clone(), |column, origin| {
+                column.child(
+                    div()
+                        .w_full()
+                        .truncate()
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(origin),
+                )
+            });
 
         if method == RemoteConnectivityMethod::Direct {
             panel = panel.child(origin_editor(
@@ -1809,7 +1848,7 @@ impl RemoteAccessPairing {
                     .items_center()
                     .justify_between()
                     .gap_2()
-                    .rounded(px(6.0))
+                    .rounded(px(8.0))
                     .bg(cx.theme().warning.opacity(0.10))
                     .px_3()
                     .py_2()
@@ -1841,115 +1880,199 @@ impl RemoteAccessPairing {
             recovery,
             RemoteRecoveryAction::None | RemoteRecoveryAction::Configure
         ) {
+            let repair_entity = entity.clone();
             panel = panel.child(
-                Button::new("repair-remote-method")
-                    .small()
-                    .outline()
-                    .icon(IconName::Redo2)
-                    .label(recovery_label(recovery))
-                    .disabled(pending)
-                    .on_click(move |_, _, cx| {
-                        let _ = entity.update(cx, |this, cx| {
-                            this.dispatch_action(RemoteAccessAction::RepairMethod(method), cx)
-                        });
-                    }),
+                h_flex()
+                    .w_full()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .rounded(px(8.0))
+                    .bg(cx.theme().danger.opacity(0.08))
+                    .px_3()
+                    .py_2()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_xs()
+                            .text_color(cx.theme().danger)
+                            .child(locale::text(
+                                "This entry needs attention",
+                                "该入口需要处理",
+                                "該入口需要處理",
+                            )),
+                    )
+                    .child(
+                        Button::new("repair-remote-method")
+                            .small()
+                            .outline()
+                            .icon(IconName::Redo2)
+                            .label(recovery_label(recovery))
+                            .disabled(pending)
+                            .on_click(move |_, _, cx| {
+                                let _ = repair_entity.update(cx, |this, cx| {
+                                    this.dispatch_action(
+                                        RemoteAccessAction::RepairMethod(method),
+                                        cx,
+                                    )
+                                });
+                            }),
+                    ),
+            );
+        }
+
+        if desired_enabled {
+            let disable_entity = entity.clone();
+            panel = panel.child(
+                Button::new(SharedString::from(format!(
+                    "disable-remote-method-{}",
+                    method.wire_name()
+                )))
+                .small()
+                .outline()
+                .icon(IconName::Pause)
+                .label(locale::text("Disable", "停用", "停用"))
+                .disabled(pending)
+                .on_click(move |_, _, cx| {
+                    let _ = disable_entity.update(cx, |this, cx| {
+                        this.dispatch_action(RemoteAccessAction::DisableMethod(method), cx)
+                    });
+                }),
+            );
+        } else if recovery != RemoteRecoveryAction::ConfirmPort
+            && (method == RemoteConnectivityMethod::TailscaleServe
+                || method == RemoteConnectivityMethod::SelfHostedRelay)
+        {
+            let enable_entity = entity.clone();
+            panel = panel.child(
+                Button::new(SharedString::from(format!(
+                    "enable-remote-method-{}",
+                    method.wire_name()
+                )))
+                .small()
+                .primary()
+                .icon(IconName::Play)
+                .label(locale::text("Enable", "启用", "啟用"))
+                .disabled(pending)
+                .on_click(move |_, _, cx| {
+                    let _ = enable_entity.update(cx, |this, cx| {
+                        this.dispatch_action(RemoteAccessAction::EnableMethod(method), cx)
+                    });
+                }),
             );
         }
         panel.into_any_element()
     }
 
-    fn render_local_network_panel(&self, cx: &mut Context<Self>) -> AnyElement {
-        let active = self.state.active_zero_config_window.is_some();
-        let status_color = if active {
-            cx.theme().success
-        } else {
-            cx.theme().muted_foreground
-        };
-        let status = if active {
-            locale::text("Discovering", "发现中", "探索中")
-        } else {
-            locale::text("Ready when needed", "按需开启", "需要時開啟")
-        };
+    fn render_local_network_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(window) = self.state.active_zero_config_window.as_ref() {
+            return self.render_lan_window(window, true, cx);
+        }
+
+        let open = self.state.lan_section_open;
+        let entity = cx.weak_entity();
+        let header_entity = entity.clone();
+        let can_start = self.state.can_start_zero_config_pairing();
 
         v_flex()
             .w_full()
             .min_w_0()
             .gap_3()
-            .rounded(px(8.0))
+            .rounded(px(10.0))
             .border_1()
-            .border_color(cx.theme().border.opacity(0.72))
-            .bg(cx.theme().muted.opacity(0.12))
+            .border_color(if open {
+                cx.theme().primary.opacity(0.35)
+            } else {
+                cx.theme().border.opacity(0.72)
+            })
+            .bg(cx.theme().muted.opacity(0.14))
             .p_4()
             .child(
                 h_flex()
+                    .id("local-network-section-toggle")
                     .w_full()
-                    .items_start()
-                    .justify_between()
+                    .min_w_0()
+                    .items_center()
                     .gap_3()
+                    .cursor_pointer()
+                    .role(Role::Button)
+                    .aria_label(locale::text(
+                        "Local network pairing",
+                        "局域网配对",
+                        "區域網路配對",
+                    ))
+                    .hover(|style| style.bg(cx.theme().accent.opacity(0.5)))
+                    .on_click(move |_, _, cx| {
+                        let _ = header_entity.update(cx, |this, cx| {
+                            this.dispatch_action(RemoteAccessAction::ToggleLanSection, cx)
+                        });
+                    })
+                    .child(icon_tile(IconName::Map, px(32.0), px(16.0), cx))
                     .child(
-                        h_flex()
+                        v_flex()
                             .min_w_0()
-                            .items_start()
-                            .gap_3()
+                            .flex_1()
+                            .gap_1()
+                            .child(div().text_sm().font_semibold().child(locale::text(
+                                "Local network pairing",
+                                "局域网配对",
+                                "區域網路配對",
+                            )))
                             .child(
                                 div()
-                                    .size(px(32.0))
-                                    .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(6.0))
-                                    .bg(cx.theme().primary.opacity(0.10))
-                                    .child(
-                                        Icon::new(IconName::Network)
-                                            .size(px(17.0))
-                                            .text_color(cx.theme().primary),
-                                    ),
-                            )
-                            .child(
-                                v_flex()
                                     .min_w_0()
-                                    .gap_1()
-                                    .child(
-                                        div().text_sm().font_semibold().child(locale::text(
-                                            "Local network",
-                                            "局域网",
-                                            "區域網路",
-                                        )),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(locale::text(
-                                                "A private HTTPS entry for devices on the same network",
-                                                "供同一网络设备使用的私有 HTTPS 入口",
-                                                "供同一網路裝置使用的私人 HTTPS 入口",
-                                            )),
-                                    ),
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(locale::text(
+                                        "Discover this computer on the same network",
+                                        "在同一网络中发现此电脑",
+                                        "在同一網路中探索此電腦",
+                                    )),
                             ),
                     )
                     .child(
-                        div()
-                            .rounded(px(4.0))
-                            .bg(status_color.opacity(0.12))
-                            .px_2()
-                            .py(px(2.0))
-                            .text_xs()
-                            .text_color(status_color)
-                            .child(status),
+                        Icon::new(if open {
+                            IconName::ChevronUp
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .size(px(16.0))
+                        .text_color(cx.theme().muted_foreground),
                     ),
             )
+            .when(open, |section| {
+                section
+                    .child(self.render_permission_selector(true, cx))
+                    .child(
+                        Button::new("start-zero-config-pairing")
+                            .primary()
+                            .w_full()
+                            .icon(IconName::Play)
+                            .label(locale::text(
+                                "Start local pairing",
+                                "开始局域网配对",
+                                "開始區域網路配對",
+                            ))
+                            .loading(matches!(
+                                self.state.pending,
+                                Some(RemoteAccessMutation::StartZeroConfigPairing)
+                            ))
+                            .disabled(!can_start)
+                            .on_click(move |_, _, cx| {
+                                let _ = entity.update(cx, |this, cx| {
+                                    this.dispatch_action(
+                                        RemoteAccessAction::StartZeroConfigPairing,
+                                        cx,
+                                    )
+                                });
+                            }),
+                    )
+            })
             .into_any_element()
-    }
-
-    fn render_pairing_section(&self, cx: &mut Context<Self>) -> AnyElement {
-        match self.state.selected_entry {
-            RemoteAccessEntry::LocalNetwork => self.render_zero_config_pairing(cx),
-            RemoteAccessEntry::TailscaleServe
-            | RemoteAccessEntry::Direct
-            | RemoteAccessEntry::SelfHostedRelay => self.render_offer(cx),
-        }
     }
 
     fn render_permission_selector(&self, zero_config: bool, cx: &mut Context<Self>) -> AnyElement {
@@ -2025,59 +2148,67 @@ impl RemoteAccessPairing {
             .into_any_element()
     }
 
-    fn render_offer(&self, cx: &mut Context<Self>) -> AnyElement {
-        let pending = self.state.pending.is_some();
-        let route_available = self.state.connectivity.as_ref().is_some_and(|snapshot| {
-            snapshot
-                .methods
-                .iter()
-                .any(|method| method.candidate_available)
-        });
+    fn render_pairing_page(&self, cx: &mut Context<Self>) -> AnyElement {
+        let entity = cx.weak_entity();
+        if let Some(offer) = self.state.active_offer.as_ref() {
+            return self.render_offer_sheet(offer, cx);
+        }
         if let Some(window) = self.state.active_lan_window.as_ref() {
             return self.render_lan_window(window, false, cx);
         }
-        let Some(offer) = self.state.active_offer.as_ref() else {
-            let entity = cx.weak_entity();
+        if let Some(window) = self.state.active_zero_config_window.as_ref() {
+            return self.render_lan_window(window, true, cx);
+        }
+        if self.state.pending.is_some() {
             return v_flex()
                 .w_full()
+                .items_center()
+                .justify_center()
                 .gap_3()
-                .child(self.render_permission_selector(false, cx))
+                .py(px(48.0))
                 .child(
-                    Button::new("create-pairing-offer")
-                        .primary()
-                        .w_full()
-                        .icon(IconName::Plus)
-                        .label(locale::text(
-                            "Generate pairing QR code",
-                            "生成配对二维码",
-                            "產生配對 QR Code",
-                        ))
-                        .loading(matches!(
-                            self.state.pending,
-                            Some(RemoteAccessMutation::CreateOffer)
-                        ))
-                        .disabled(pending || !route_available)
-                        .on_click(move |_, _, cx| {
-                            let _ = entity.update(cx, |this, cx| {
-                                this.dispatch_action(RemoteAccessAction::CreateOffer, cx)
-                            });
-                        }),
+                    Icon::new(IconName::LoaderCircle)
+                        .size(px(20.0))
+                        .text_color(cx.theme().muted_foreground),
                 )
-                .when(!route_available, |column| {
-                    column.child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(locale::text(
-                                "No validated remote entry is online",
-                                "当前没有已验证的远程入口",
-                                "目前沒有已驗證的遠端入口",
-                            )),
-                    )
-                })
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(locale::text(
+                            "Preparing the pairing window…",
+                            "正在准备配对窗口…",
+                            "正在準備配對視窗…",
+                        )),
+                )
                 .into_any_element();
-        };
+        }
+        v_flex()
+            .w_full()
+            .items_center()
+            .gap_3()
+            .py(px(48.0))
+            .child(div().text_sm().font_medium().child(locale::text(
+                "Pairing has ended",
+                "配对已结束",
+                "配對已結束",
+            )))
+            .child(
+                Button::new("pairing-ended-back")
+                    .small()
+                    .outline()
+                    .label(locale::text("Back", "返回", "返回"))
+                    .on_click(move |_, _, cx| {
+                        let _ = entity.update(cx, |this, cx| {
+                            this.dispatch_action(RemoteAccessAction::ShowSetup, cx)
+                        });
+                    }),
+            )
+            .into_any_element()
+    }
 
+    fn render_offer_sheet(&self, offer: &ActivePairingOffer, cx: &mut Context<Self>) -> AnyElement {
+        let pending = self.state.pending.is_some();
         let now_ms = unix_timestamp_ms();
         let terminal = offer.is_terminal(now_ms);
         let claimed = offer.summary.claimed_device_id.is_some();
@@ -2104,19 +2235,20 @@ impl RemoteAccessPairing {
         let regenerate_entity = entity.clone();
         let cancel_entity = entity.clone();
         let status_label = if claimed {
-            locale::text("Claimed", "已领取", "已領取")
+            locale::text("Device paired", "设备已配对", "裝置已配對")
         } else if offer.summary.canceled {
-            locale::text("Canceled", "已取消", "已取消")
+            locale::text("Offer canceled", "配对请求已取消", "配對請求已取消")
         } else if expired {
-            locale::text("Expired", "已过期", "已過期")
+            locale::text("Offer expired", "配对请求已过期", "配對請求已過期")
         } else {
-            locale::text("Ready", "等待配对", "等待配對")
+            locale::text("Scan to pair", "扫码即可配对", "掃描即可配對")
         };
-        let countdown = match locale::current_locale() {
-            locale::ResolvedLocale::En => format!("{remaining}s"),
-            locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => {
-                format!("{remaining} 秒")
-            }
+        let status_color = if claimed {
+            cx.theme().success
+        } else if terminal {
+            cx.theme().muted_foreground
+        } else {
+            cx.theme().primary
         };
 
         let entry_selector = TabBar::new("pairing-entry-selector")
@@ -2136,70 +2268,117 @@ impl RemoteAccessPairing {
                 }
             });
 
-        let offer_visual = v_flex()
+        let qr_visual = div()
+            .id("pairing-qr-secret-region")
+            .size(qr_size + px(16.0))
             .flex_none()
+            .flex()
             .items_center()
-            .gap_2()
-            .when_some(qr, |column, qr| {
-                column.child(
-                    div()
-                        .id("pairing-qr-secret-region")
-                        .size(qr_size)
-                        .flex_none()
-                        .rounded(px(6.0))
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .bg(gpui::white())
-                        .child(img(qr).size(qr_size).flex_none()),
-                )
-            })
-            .when(terminal, |column| {
-                column.child(
-                    div()
-                        .size(qr_size)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(6.0))
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .bg(cx.theme().muted.opacity(0.4))
-                        .child(
-                            Icon::new(if claimed {
-                                IconName::CircleCheck
-                            } else {
-                                IconName::CircleX
-                            })
-                            .size(px(36.0))
-                            .text_color(if claimed {
-                                cx.theme().success
-                            } else {
-                                cx.theme().muted_foreground
-                            }),
-                        ),
-                )
+            .justify_center()
+            .rounded(px(12.0))
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(gpui::white())
+            .child(if terminal {
+                div()
+                    .size(qr_size)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::new(if claimed {
+                            IconName::CircleCheck
+                        } else {
+                            IconName::CircleX
+                        })
+                        .size(px(36.0))
+                        .text_color(if claimed {
+                            cx.theme().success
+                        } else {
+                            cx.theme().muted_foreground
+                        }),
+                    )
+                    .into_any_element()
+            } else if let Some(qr) = qr {
+                img(qr).size(qr_size).flex_none().into_any_element()
+            } else {
+                div()
+                    .size(qr_size)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::new(IconName::LoaderCircle)
+                            .size(px(24.0))
+                            .text_color(cx.theme().muted_foreground),
+                    )
+                    .into_any_element()
             });
 
-        let offer_controls = v_flex()
+        let controls = v_flex()
+            .min_w(px(240.0))
             .flex_1()
             .min_w_0()
             .gap_3()
             .child(
-                h_flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(div().text_sm().font_semibold().child(status_label))
+                v_flex()
+                    .min_w_0()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .flex_wrap()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .text_base()
+                                    .font_semibold()
+                                    .text_color(status_color)
+                                    .child(status_label),
+                            )
+                            .when(!terminal, |row| {
+                                row.child(
+                                    div()
+                                        .flex_none()
+                                        .rounded_full()
+                                        .bg(cx.theme().warning.opacity(0.14))
+                                        .px_2()
+                                        .py(px(2.0))
+                                        .font_family(cx.theme().mono_font_family.clone())
+                                        .text_xs()
+                                        .font_medium()
+                                        .text_color(cx.theme().warning)
+                                        .child(countdown_label(remaining as i64)),
+                                )
+                            }),
+                    )
                     .child(
                         div()
+                            .min_w_0()
                             .text_xs()
-                            .font_semibold()
-                            .text_color(if expired {
-                                cx.theme().danger
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if claimed {
+                                locale::text(
+                                    "The mobile device is now connected",
+                                    "移动设备已连接",
+                                    "行動裝置已連線",
+                                )
+                            } else if terminal {
+                                locale::text(
+                                    "Generate a new QR code to continue",
+                                    "生成新的二维码即可继续",
+                                    "產生新的 QR Code 即可繼續",
+                                )
                             } else {
-                                cx.theme().muted_foreground
-                            })
-                            .child(countdown),
+                                locale::text(
+                                    "Open the Vibex mobile app and scan this code",
+                                    "打开 Vibex 移动应用扫描此二维码",
+                                    "開啟 Vibex 行動應用程式掃描此 QR Code",
+                                )
+                            }),
                     ),
             )
             .child(self.render_permission_selector(false, cx))
@@ -2264,17 +2443,14 @@ impl RemoteAccessPairing {
                     ),
             );
 
-        v_flex()
+        h_flex()
             .w_full()
-            .child(
-                h_flex()
-                    .w_full()
-                    .flex_wrap()
-                    .items_start()
-                    .gap_4()
-                    .child(offer_visual)
-                    .child(offer_controls),
-            )
+            .min_w_0()
+            .flex_wrap()
+            .items_start()
+            .gap_4()
+            .child(qr_visual)
+            .child(controls)
             .into_any_element()
     }
 
@@ -2305,25 +2481,26 @@ impl RemoteAccessPairing {
         };
         let pairing_title = if zero_config {
             locale::text(
-                "Local network pairing is available",
-                "局域网配对已开启",
-                "區域網路配對已開啟",
+                "Local network pairing is active",
+                "局域网配对进行中",
+                "區域網路配對進行中",
             )
         } else {
             locale::text(
-                "Nearby pairing is available",
-                "附近设备可以配对",
-                "附近裝置可以配對",
+                "Nearby pairing is active",
+                "附近设备配对进行中",
+                "附近裝置配對進行中",
             )
         };
+
         let mut column = v_flex()
             .w_full()
             .min_w_0()
             .gap_3()
-            .rounded(px(8.0))
+            .rounded(px(10.0))
             .border_1()
-            .border_color(cx.theme().border.opacity(0.72))
-            .bg(cx.theme().muted.opacity(0.12))
+            .border_color(cx.theme().success.opacity(0.45))
+            .bg(cx.theme().success.opacity(0.05))
             .p_4()
             .child(
                 h_flex()
@@ -2334,30 +2511,25 @@ impl RemoteAccessPairing {
                     .child(
                         h_flex()
                             .min_w_0()
-                            .items_start()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .size(px(30.0))
-                                    .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(6.0))
-                                    .bg(cx.theme().primary.opacity(0.10))
-                                    .child(
-                                        Icon::new(IconName::Network)
-                                            .size(px(16.0))
-                                            .text_color(cx.theme().primary),
-                                    ),
-                            )
+                            .items_center()
+                            .gap_2()
+                            .child(icon_tile(IconName::Map, px(28.0), px(15.0), cx))
                             .child(
                                 v_flex()
                                     .min_w_0()
                                     .gap_1()
-                                    .child(div().text_sm().font_semibold().child(pairing_title))
                                     .child(
                                         div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_sm()
+                                            .font_semibold()
+                                            .child(pairing_title),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
                                             .text_xs()
                                             .text_color(cx.theme().muted_foreground)
                                             .child(window.advertisement.display_name.clone()),
@@ -2366,14 +2538,20 @@ impl RemoteAccessPairing {
                     )
                     .child(
                         h_flex()
+                            .flex_none()
                             .items_center()
                             .gap_2()
                             .child(
                                 div()
+                                    .rounded_full()
+                                    .bg(cx.theme().warning.opacity(0.14))
+                                    .px_2()
+                                    .py(px(2.0))
+                                    .font_family(cx.theme().mono_font_family.clone())
                                     .text_xs()
-                                    .font_semibold()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(format!("{remaining}s")),
+                                    .font_medium()
+                                    .text_color(cx.theme().warning)
+                                    .child(countdown_label(remaining)),
                             )
                             .child(
                                 Button::new(if zero_config {
@@ -2402,18 +2580,29 @@ impl RemoteAccessPairing {
 
         if window.pending_requests.is_empty() {
             column = column.child(
-                div()
+                v_flex()
                     .w_full()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .pt_3()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(locale::text(
-                        "Waiting for a nearby device",
-                        "正在等待附近设备",
-                        "正在等待附近裝置",
-                    )),
+                    .items_center()
+                    .gap_2()
+                    .rounded(px(8.0))
+                    .bg(cx.theme().background.opacity(0.5))
+                    .px_3()
+                    .py(px(28.0))
+                    .child(
+                        Icon::new(IconName::Eye)
+                            .size(px(20.0))
+                            .text_color(cx.theme().muted_foreground),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(locale::text(
+                                "Waiting for a nearby device",
+                                "正在等待附近设备",
+                                "正在等待附近裝置",
+                            )),
+                    ),
             );
         }
         for request in &window.pending_requests {
@@ -2432,31 +2621,41 @@ impl RemoteAccessPairing {
             let approve_entity = cx.weak_entity();
             let reject_entity = approve_entity.clone();
             let request_pending = request.state == RemoteLanPairingRequestState::Pending;
-            let state_label = match request.state {
-                RemoteLanPairingRequestState::Pending => {
-                    locale::text("Confirm code", "核对代码", "核對代碼")
-                }
-                RemoteLanPairingRequestState::Approved => {
-                    locale::text("Approved", "已允许", "已允許")
-                }
-                RemoteLanPairingRequestState::Rejected => {
-                    locale::text("Rejected", "已拒绝", "已拒絕")
-                }
-                RemoteLanPairingRequestState::Expired => {
-                    locale::text("Expired", "已过期", "已過期")
-                }
-                RemoteLanPairingRequestState::Claimed => locale::text("Paired", "已配对", "已配對"),
-                RemoteLanPairingRequestState::Unknown => {
-                    locale::text("Unavailable", "不可用", "不可用")
-                }
+            let (state_label, state_color) = match request.state {
+                RemoteLanPairingRequestState::Pending => (
+                    locale::text("Awaiting confirmation", "等待确认", "等待確認"),
+                    cx.theme().warning,
+                ),
+                RemoteLanPairingRequestState::Approved => (
+                    locale::text("Approved", "已允许", "已允許"),
+                    cx.theme().success,
+                ),
+                RemoteLanPairingRequestState::Rejected => (
+                    locale::text("Rejected", "已拒绝", "已拒絕"),
+                    cx.theme().danger,
+                ),
+                RemoteLanPairingRequestState::Expired => (
+                    locale::text("Expired", "已过期", "已過期"),
+                    cx.theme().muted_foreground,
+                ),
+                RemoteLanPairingRequestState::Claimed => (
+                    locale::text("Paired", "已配对", "已配對"),
+                    cx.theme().success,
+                ),
+                RemoteLanPairingRequestState::Unknown => (
+                    locale::text("Unavailable", "不可用", "不可用"),
+                    cx.theme().muted_foreground,
+                ),
             };
             column = column.child(
                 v_flex()
                     .w_full()
-                    .gap_2()
-                    .border_t_1()
+                    .gap_3()
+                    .rounded(px(8.0))
+                    .border_1()
                     .border_color(cx.theme().border)
-                    .pt_3()
+                    .bg(cx.theme().background.opacity(0.6))
+                    .p_3()
                     .child(
                         h_flex()
                             .w_full()
@@ -2464,46 +2663,85 @@ impl RemoteAccessPairing {
                             .justify_between()
                             .gap_3()
                             .child(
-                                v_flex()
+                                h_flex()
                                     .min_w_0()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(icon_tile(IconName::CircleUser, px(32.0), px(18.0), cx))
+                                    .child(
+                                        v_flex()
+                                            .min_w_0()
+                                            .gap_1()
+                                            .child(
+                                                h_flex()
+                                                    .min_w_0()
+                                                    .flex_wrap()
+                                                    .items_center()
+                                                    .gap_2()
+                                                    .child(
+                                                        div()
+                                                            .min_w_0()
+                                                            .truncate()
+                                                            .text_sm()
+                                                            .font_semibold()
+                                                            .child(request.display_name.clone()),
+                                                    )
+                                                    .child(status_pill(state_label, state_color)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .min_w_0()
+                                                    .truncate()
+                                                    .font_family(
+                                                        cx.theme().mono_font_family.clone(),
+                                                    )
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(request.device_fingerprint.clone()),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                v_flex()
+                                    .flex_none()
+                                    .items_center()
                                     .gap_1()
                                     .child(
                                         div()
-                                            .text_sm()
+                                            .rounded(px(8.0))
+                                            .border_1()
+                                            .border_color(cx.theme().border)
+                                            .bg(gpui::white())
+                                            .px_3()
+                                            .py_1()
+                                            .font_family(cx.theme().mono_font_family.clone())
+                                            .text_xl()
                                             .font_semibold()
-                                            .child(request.display_name.clone()),
+                                            .text_color(gpui::black())
+                                            .child(format_verification_code(
+                                                &request.verification_code,
+                                            )),
                                     )
                                     .child(
                                         div()
                                             .text_xs()
                                             .text_color(cx.theme().muted_foreground)
-                                            .child(format!(
-                                                "{} {}",
-                                                locale::text("Fingerprint", "设备指纹", "裝置指紋"),
-                                                request.device_fingerprint
+                                            .child(locale::text(
+                                                "Verification code",
+                                                "核对代码",
+                                                "核對代碼",
                                             )),
                                     ),
-                            )
-                            .child(
-                                div()
-                                    .text_lg()
-                                    .font_semibold()
-                                    .child(format_verification_code(&request.verification_code)),
                             ),
                     )
-                    .child(
-                        h_flex()
-                            .flex_wrap()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(state_label),
-                            )
-                            .when(request_pending, |row| {
-                                row.child(
+                    .when(request_pending, |card| {
+                        card.child(
+                            h_flex()
+                                .w_full()
+                                .flex_wrap()
+                                .justify_end()
+                                .gap_2()
+                                .child(
                                     Button::new(format!(
                                         "approve-{}-pairing-{}",
                                         if zero_config { "zero-config" } else { "lan" },
@@ -2544,47 +2782,99 @@ impl RemoteAccessPairing {
                                             });
                                         },
                                     ),
-                                )
-                            }),
-                    ),
+                                ),
+                        )
+                    }),
             );
         }
         column.into_any_element()
     }
 
-    fn render_zero_config_pairing(&self, cx: &mut Context<Self>) -> AnyElement {
-        if let Some(window) = self.state.active_zero_config_window.as_ref() {
-            return self.render_lan_window(window, true, cx);
-        }
-
-        let can_start = self.state.can_start_zero_config_pairing();
-        let entity = cx.weak_entity();
+    fn render_setup_footer(&self, cx: &mut Context<Self>) -> AnyElement {
+        let pending = self.state.pending.is_some();
+        let route_available = self.state.connectivity.as_ref().is_some_and(|snapshot| {
+            snapshot
+                .methods
+                .iter()
+                .any(|method| method.candidate_available)
+        });
+        let desired_enabled = self
+            .state
+            .connectivity
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.desired_enabled);
+        let create_entity = cx.weak_entity();
+        let disable_entity = create_entity.clone();
 
         v_flex()
             .w_full()
             .gap_3()
-            .child(self.render_permission_selector(true, cx))
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .pt_4()
+            .child(self.render_permission_selector(false, cx))
             .child(
-                Button::new("start-zero-config-pairing")
+                Button::new("create-pairing-offer")
                     .primary()
                     .w_full()
-                    .icon(IconName::Network)
+                    .icon(IconName::SquareTerminal)
                     .label(locale::text(
-                        "Start local pairing",
-                        "开始局域网配对",
-                        "開始區域網路配對",
+                        "Generate pairing QR code",
+                        "生成配对二维码",
+                        "產生配對 QR Code",
                     ))
                     .loading(matches!(
                         self.state.pending,
-                        Some(RemoteAccessMutation::StartZeroConfigPairing)
+                        Some(RemoteAccessMutation::CreateOffer)
                     ))
-                    .disabled(!can_start)
+                    .disabled(pending || !route_available)
                     .on_click(move |_, _, cx| {
-                        let _ = entity.update(cx, |this, cx| {
-                            this.dispatch_action(RemoteAccessAction::StartZeroConfigPairing, cx)
+                        let _ = create_entity.update(cx, |this, cx| {
+                            this.dispatch_action(RemoteAccessAction::CreateOffer, cx)
                         });
                     }),
             )
+            .when(!route_available, |column| {
+                column.child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Icon::new(IconName::Info)
+                                .size(px(14.0))
+                                .text_color(cx.theme().muted_foreground),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(locale::text(
+                                    "No validated remote entry is online",
+                                    "当前没有已验证的远程入口",
+                                    "目前沒有已驗證的遠端入口",
+                                )),
+                        ),
+                )
+            })
+            .when(desired_enabled, |column| {
+                column.child(
+                    h_flex().w_full().justify_end().child(
+                        Button::new("disable-all-remote-access")
+                            .small()
+                            .ghost()
+                            .icon(IconName::Pause)
+                            .label(locale::text("Disable all", "全部停用", "全部停用"))
+                            .disabled(pending)
+                            .on_click(move |_, window, cx| {
+                                let _ = disable_entity.update(cx, |this, cx| {
+                                    this.present_disable_all_confirmation(window, cx)
+                                });
+                            }),
+                    ),
+                )
+            })
             .into_any_element()
     }
 }
@@ -2697,10 +2987,7 @@ impl Render for RemoteAccessPairingE2eDriver {
 
 impl Render for RemoteAccessPairing {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let pending = self.state.pending.is_some();
         let page = self.state.page;
-        let selected_entry = self.state.selected_entry;
-        let disable_entity = cx.weak_entity();
         let error = self.state.error_code.as_deref().map(remote_error_label);
         let notice = self.state.notice;
         let _safe_snapshot = self.state.safe_snapshot();
@@ -2708,67 +2995,95 @@ impl Render for RemoteAccessPairing {
         let popover = theme::semantic_color("popover", is_dark);
         let popover_foreground = theme::semantic_color("popover-foreground", is_dark);
 
-        let back_entity = cx.weak_entity();
-
         let page_content = match page {
-            RemoteAccessPage::EntryList => v_flex()
-                .w_full()
-                .min_w_0()
-                .gap_3()
-                .child(
-                    v_flex()
+            RemoteAccessPage::Setup => {
+                let mut column = v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_4()
+                    .child(self.render_hero_row(cx))
+                    .when(self.has_active_pairing(), |column| {
+                        column.child(self.render_pairing_resume_strip(cx))
+                    })
+                    .child(self.render_method_list(cx))
+                    .child(self.render_method_detail_panel(self.state.selected_method, cx))
+                    .child(self.render_local_network_section(cx))
+                    .child(self.render_setup_footer(cx));
+                if let Some(error) = error {
+                    column = column.child(self.render_status_banner(
+                        IconName::TriangleAlert,
+                        cx.theme().danger,
+                        error,
+                        cx,
+                    ));
+                }
+                if let Some(notice) = notice {
+                    column = column.child(self.render_status_banner(
+                        IconName::CircleCheck,
+                        cx.theme().success,
+                        notice,
+                        cx,
+                    ));
+                }
+                column.into_any_element()
+            }
+            RemoteAccessPage::Pairing => {
+                let back_entity = cx.weak_entity();
+                let mut column = v_flex().w_full().min_w_0().gap_3().child(
+                    h_flex()
+                        .w_full()
                         .min_w_0()
-                        .gap_1()
-                        .child(div().text_sm().font_semibold().child(locale::text(
-                            "Connection entry",
-                            "连接入口",
-                            "連線入口",
-                        )))
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Button::new("remote-access-pairing-back")
+                                .small()
+                                .ghost()
+                                .compact()
+                                .size(px(28.0))
+                                .px_0()
+                                .tooltip(locale::text("Back", "返回", "返回"))
+                                .child(Icon::new(IconName::ArrowLeft).size(px(17.0)))
+                                .on_click(move |_, _, cx| {
+                                    let _ = back_entity.update(cx, |this, cx| {
+                                        this.dispatch_action(RemoteAccessAction::ShowSetup, cx)
+                                    });
+                                }),
+                        )
                         .child(
                             div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
+                                .min_w_0()
+                                .flex_1()
+                                .truncate()
+                                .text_sm()
+                                .font_semibold()
                                 .child(locale::text(
-                                    "Choose where the mobile device will connect",
-                                    "选择移动设备连接到此电脑的入口",
-                                    "選擇行動裝置連線到此電腦的入口",
+                                    "Pair your mobile device",
+                                    "配对移动设备",
+                                    "配對行動裝置",
                                 )),
                         ),
-                )
-                .child(self.render_connection_entry_selector(cx))
-                .into_any_element(),
-            RemoteAccessPage::EntryDetails => v_flex()
-                .w_full()
-                .min_w_0()
-                .gap_4()
-                .child(
-                    v_flex()
-                        .w_full()
-                        .min_w_0()
-                        .gap_3()
-                        .child(step_heading(
-                            "1",
-                            locale::text("Connection settings", "连接设置", "連線設定"),
-                            connection_entry_description(selected_entry),
-                            cx,
-                        ))
-                        .child(self.render_connection_entry_panel(cx)),
-                )
-                .child(div().w_full().border_t_1().border_color(cx.theme().border))
-                .child(
-                    v_flex()
-                        .w_full()
-                        .min_w_0()
-                        .gap_3()
-                        .child(step_heading(
-                            "2",
-                            locale::text("Pair the mobile device", "配对移动设备", "配對行動裝置"),
-                            connection_entry_pairing_description(selected_entry),
-                            cx,
-                        ))
-                        .child(self.render_pairing_section(cx)),
-                )
-                .into_any_element(),
+                );
+                if let Some(error) = error {
+                    column = column.child(self.render_status_banner(
+                        IconName::TriangleAlert,
+                        cx.theme().danger,
+                        error,
+                        cx,
+                    ));
+                }
+                if let Some(notice) = notice {
+                    column = column.child(self.render_status_banner(
+                        IconName::CircleCheck,
+                        cx.theme().success,
+                        notice,
+                        cx,
+                    ));
+                }
+                column
+                    .child(self.render_pairing_page(cx))
+                    .into_any_element()
+            }
         };
 
         v_flex()
@@ -2782,109 +3097,6 @@ impl Render for RemoteAccessPairing {
             .pt_2()
             .pr_1()
             .pb_1()
-            .when(page == RemoteAccessPage::EntryDetails, |column| {
-                column.child(
-                    h_flex()
-                        .w_full()
-                        .min_w_0()
-                        .items_center()
-                        .justify_between()
-                        .gap_3()
-                        .child(
-                            h_flex()
-                                .min_w_0()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    Button::new("remote-access-entry-back")
-                                        .small()
-                                        .ghost()
-                                        .compact()
-                                        .size(px(28.0))
-                                        .px_0()
-                                        .tooltip(locale::text("Back", "返回", "返回"))
-                                        .child(Icon::new(IconName::ArrowLeft).size(px(17.0)))
-                                        .on_click(move |_, _, cx| {
-                                            let _ = back_entity.update(cx, |this, cx| {
-                                                this.dispatch_action(
-                                                    RemoteAccessAction::ShowEntryList,
-                                                    cx,
-                                                )
-                                            });
-                                        }),
-                                )
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .text_sm()
-                                        .font_semibold()
-                                        .child(connection_entry_label(selected_entry)),
-                                ),
-                        )
-                        .child(
-                            Button::new("disable-all-remote-access")
-                                .small()
-                                .outline()
-                                .icon(IconName::Pause)
-                                .label(locale::text("Disable all", "全部停用", "全部停用"))
-                                .disabled(
-                                    pending
-                                        || self
-                                            .state
-                                            .connectivity
-                                            .as_ref()
-                                            .is_none_or(|snapshot| !snapshot.desired_enabled),
-                                )
-                                .on_click(move |_, window, cx| {
-                                    let _ = disable_entity.update(cx, |this, cx| {
-                                        this.present_disable_all_confirmation(window, cx)
-                                    });
-                                }),
-                        ),
-                )
-            })
-            .when_some(error, |column, error| {
-                column.child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .gap_2()
-                        .rounded(px(6.0))
-                        .bg(cx.theme().danger.opacity(0.08))
-                        .px_3()
-                        .py_2()
-                        .child(
-                            Icon::new(IconName::TriangleAlert)
-                                .size(px(14.0))
-                                .text_color(cx.theme().danger),
-                        )
-                        .child(
-                            div()
-                                .min_w_0()
-                                .text_xs()
-                                .text_color(cx.theme().danger)
-                                .child(error),
-                        ),
-                )
-            })
-            .when_some(notice, |column, notice| {
-                column.child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .gap_2()
-                        .rounded(px(6.0))
-                        .bg(cx.theme().success.opacity(0.08))
-                        .px_3()
-                        .py_2()
-                        .child(
-                            Icon::new(IconName::CircleCheck)
-                                .size(px(14.0))
-                                .text_color(cx.theme().success),
-                        )
-                        .child(div().text_xs().text_color(cx.theme().success).child(notice)),
-                )
-            })
             .child(page_content)
     }
 }
@@ -3105,6 +3317,72 @@ fn origin_editor(
         .into_any_element()
 }
 
+fn icon_tile(icon: IconName, tile: gpui::Pixels, glyph: gpui::Pixels, cx: &App) -> gpui::Div {
+    div()
+        .size(tile)
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(8.0))
+        .bg(cx.theme().primary.opacity(0.10))
+        .child(Icon::new(icon).size(glyph).text_color(cx.theme().primary))
+}
+
+fn status_pill(label: impl Into<SharedString>, color: gpui::Hsla) -> gpui::Div {
+    div()
+        .flex_none()
+        .rounded_full()
+        .bg(color.opacity(0.12))
+        .px_2()
+        .py(px(2.0))
+        .text_xs()
+        .font_medium()
+        .text_color(color)
+        .child(label.into())
+}
+
+fn radio_dot(selected: bool, cx: &App) -> gpui::Div {
+    div()
+        .size(px(16.0))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .border_1()
+        .border_color(if selected {
+            cx.theme().primary
+        } else {
+            cx.theme().border
+        })
+        .when(selected, |dot| {
+            dot.child(div().size(px(8.0)).rounded_full().bg(cx.theme().primary))
+        })
+}
+
+fn countdown_label(seconds: i64) -> String {
+    let seconds = seconds.max(0) as u64;
+    match locale::current_locale() {
+        locale::ResolvedLocale::En => format!("{seconds}s"),
+        locale::ResolvedLocale::ZhCn | locale::ResolvedLocale::ZhTw => {
+            format!("{seconds} 秒")
+        }
+    }
+}
+
+fn method_short_name(method: RemoteConnectivityMethod) -> &'static str {
+    match method {
+        RemoteConnectivityMethod::TailscaleServe => "Tailscale Serve",
+        RemoteConnectivityMethod::Direct => {
+            locale::text("Direct HTTPS", "自管 Direct HTTPS", "自管 Direct HTTPS")
+        }
+        RemoteConnectivityMethod::SelfHostedRelay => {
+            locale::text("Self-hosted Relay", "自建 Relay", "自建 Relay")
+        }
+    }
+}
+
 fn permission_options() -> [RemoteDevicePermissionLevel; 3] {
     [
         RemoteDevicePermissionLevel::ReadOnly,
@@ -3141,123 +3419,6 @@ fn method_index(method: RemoteConnectivityMethod) -> usize {
     }
 }
 
-fn connection_entry_index(entry: RemoteAccessEntry) -> usize {
-    RemoteAccessEntry::ALL
-        .iter()
-        .position(|candidate| *candidate == entry)
-        .unwrap_or(0)
-}
-
-fn connection_entry_label(entry: RemoteAccessEntry) -> &'static str {
-    match entry {
-        RemoteAccessEntry::TailscaleServe => "Tailscale",
-        RemoteAccessEntry::Direct => "Direct",
-        RemoteAccessEntry::SelfHostedRelay => "Relay",
-        RemoteAccessEntry::LocalNetwork => locale::text("Local network", "局域网", "區域網路"),
-    }
-}
-
-fn connection_entry_description(entry: RemoteAccessEntry) -> &'static str {
-    match entry {
-        RemoteAccessEntry::TailscaleServe => locale::text(
-            "Private access through your Tailnet",
-            "通过 Tailnet 私密连接",
-            "透過 Tailnet 私密連線",
-        ),
-        RemoteAccessEntry::Direct => locale::text(
-            "Use a validated HTTPS address",
-            "使用已验证的 HTTPS 地址",
-            "使用已驗證的 HTTPS 位址",
-        ),
-        RemoteAccessEntry::SelfHostedRelay => locale::text(
-            "Route through your encrypted relay",
-            "通过自建加密 Relay 转发",
-            "透過自建加密 Relay 轉送",
-        ),
-        RemoteAccessEntry::LocalNetwork => locale::text(
-            "Discover this computer on the same network",
-            "在同一网络中发现此电脑",
-            "在同一網路中探索此電腦",
-        ),
-    }
-}
-
-fn connection_entry_card_copy(
-    label: &'static str,
-    description: &'static str,
-    cx: &App,
-) -> gpui::Div {
-    v_flex()
-        .min_w_0()
-        .flex_1()
-        .gap_1()
-        .child(div().text_sm().font_semibold().child(label))
-        .child(
-            div()
-                .min_w_0()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(description),
-        )
-}
-
-fn connection_entry_pairing_description(entry: RemoteAccessEntry) -> &'static str {
-    match entry {
-        RemoteAccessEntry::LocalNetwork => locale::text(
-            "Set the permission, then open a temporary discovery window",
-            "设置设备权限，然后开启临时发现窗口",
-            "設定裝置權限，然後開啟暫時探索視窗",
-        ),
-        RemoteAccessEntry::TailscaleServe
-        | RemoteAccessEntry::Direct
-        | RemoteAccessEntry::SelfHostedRelay => locale::text(
-            "Set the permission, then generate a one-time QR code",
-            "设置设备权限，然后生成一次性二维码",
-            "設定裝置權限，然後產生一次性 QR Code",
-        ),
-    }
-}
-
-fn step_heading(
-    step: &'static str,
-    title: &'static str,
-    description: &'static str,
-    cx: &App,
-) -> AnyElement {
-    h_flex()
-        .w_full()
-        .min_w_0()
-        .items_start()
-        .gap_3()
-        .child(
-            div()
-                .size(px(24.0))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(6.0))
-                .bg(cx.theme().primary.opacity(0.10))
-                .text_xs()
-                .font_semibold()
-                .text_color(cx.theme().primary)
-                .child(step),
-        )
-        .child(
-            v_flex()
-                .min_w_0()
-                .gap_1()
-                .child(div().text_sm().font_semibold().child(title))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(description),
-                ),
-        )
-        .into_any_element()
-}
-
 fn permission_index(permission: RemoteDevicePermissionLevel) -> usize {
     permission_options()
         .iter()
@@ -3270,22 +3431,6 @@ fn method_icon(method: RemoteConnectivityMethod) -> IconName {
         RemoteConnectivityMethod::TailscaleServe => IconName::Network,
         RemoteConnectivityMethod::Direct => IconName::Globe,
         RemoteConnectivityMethod::SelfHostedRelay => IconName::Building2,
-    }
-}
-
-fn method_label(method: RemoteConnectivityMethod) -> &'static str {
-    match method {
-        RemoteConnectivityMethod::TailscaleServe => locale::text(
-            "Tailscale Serve (recommended)",
-            "Tailscale Serve（推荐）",
-            "Tailscale Serve（建議）",
-        ),
-        RemoteConnectivityMethod::Direct => {
-            locale::text("Direct HTTPS", "自管 Direct HTTPS", "自管 Direct HTTPS")
-        }
-        RemoteConnectivityMethod::SelfHostedRelay => {
-            locale::text("Self-hosted Relay", "自建 Relay", "自建 Relay")
-        }
     }
 }
 
@@ -3453,12 +3598,8 @@ fn offer_cancel_error_allows_replacement(code: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, rc::Rc};
-
     use super::*;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-    use gpui::TestAppContext;
-    use gpui_component::ElementExt as _;
     use vibex_core::{
         DeviceId, RemotePairingCandidate, RemotePairingOffer, RemoteProtocolVersionRange,
         remote_permissions_for_level,
@@ -3506,52 +3647,6 @@ mod tests {
             gateway_running: true,
             gateway_bound_addr: None,
         }
-    }
-
-    struct ConnectionEntryCardCopyLayoutProbe {
-        measured_width: Rc<Cell<f32>>,
-    }
-
-    impl Render for ConnectionEntryCardCopyLayoutProbe {
-        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            let measured_width = self.measured_width.clone();
-            h_flex()
-                .w(px(340.0))
-                .gap_2()
-                .child(div().size(px(28.0)).flex_none())
-                .child(
-                    connection_entry_card_copy(
-                        "Tailscale",
-                        "Private access through your Tailnet",
-                        cx,
-                    )
-                    .on_prepaint(move |bounds, _, _| {
-                        measured_width.set(f32::from(bounds.size.width));
-                    }),
-                )
-        }
-    }
-
-    #[gpui::test]
-    fn connection_entry_card_copy_fills_space_beside_the_icon(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
-        let measured_width = Rc::new(Cell::new(0.0));
-        let observed_width = measured_width.clone();
-        let (_, cx) =
-            cx.add_window_view(|_, _| ConnectionEntryCardCopyLayoutProbe { measured_width });
-
-        for _ in 0..3 {
-            cx.update(|window, cx| {
-                let _ = window.draw(cx);
-            });
-            cx.run_until_parked();
-        }
-
-        assert!(
-            observed_width.get() >= 300.0,
-            "card copy width: {}",
-            observed_width.get()
-        );
     }
 
     #[test]
@@ -3815,34 +3910,28 @@ mod tests {
     }
 
     #[test]
-    fn connection_entries_keep_local_network_as_an_independent_fourth_entry() {
-        assert_eq!(RemoteAccessEntry::ALL.len(), 4);
-        assert_eq!(connection_entry_index(RemoteAccessEntry::TailscaleServe), 0);
-        assert_eq!(connection_entry_index(RemoteAccessEntry::Direct), 1);
-        assert_eq!(
-            connection_entry_index(RemoteAccessEntry::SelfHostedRelay),
-            2
-        );
-        assert_eq!(connection_entry_index(RemoteAccessEntry::LocalNetwork), 3);
-        assert!(RemoteAccessEntry::LocalNetwork.remote_method().is_none());
-    }
-
-    #[test]
-    fn connection_entry_navigation_opens_details_and_returns_to_the_list() {
+    fn method_selection_and_lan_section_toggles_stay_on_the_setup_page() {
         let mut state = PairingViewState::default();
-        assert_eq!(state.page, RemoteAccessPage::EntryList);
+        assert_eq!(state.page, RemoteAccessPage::Setup);
+        assert!(!state.lan_section_open);
 
-        state.select_connection_entry(RemoteAccessEntry::LocalNetwork);
-        assert_eq!(state.page, RemoteAccessPage::EntryDetails);
-        assert_eq!(state.selected_entry, RemoteAccessEntry::LocalNetwork);
-
-        state.show_entry_list();
-        assert_eq!(state.page, RemoteAccessPage::EntryList);
-        assert_eq!(state.selected_entry, RemoteAccessEntry::LocalNetwork);
-
-        state.select_connection_entry(RemoteAccessEntry::Direct);
-        assert_eq!(state.page, RemoteAccessPage::EntryDetails);
+        state.select_method(RemoteConnectivityMethod::Direct);
         assert_eq!(state.selected_method, RemoteConnectivityMethod::Direct);
+        assert_eq!(
+            state.selected_entry,
+            RemoteAccessEntry::from_remote_method(RemoteConnectivityMethod::Direct)
+        );
+        assert_eq!(state.page, RemoteAccessPage::Setup);
+
+        state.toggle_lan_section();
+        assert!(state.lan_section_open);
+        state.toggle_lan_section();
+        assert!(!state.lan_section_open);
+
+        state.show_pairing();
+        assert_eq!(state.page, RemoteAccessPage::Pairing);
+        state.show_setup();
+        assert_eq!(state.page, RemoteAccessPage::Setup);
     }
 
     #[test]
