@@ -3459,7 +3459,16 @@ fn deepseek_events(path: &Path) -> Result<Vec<Value>, String> {
                 .expect_err("zstd result is an error")
                 .to_string());
         }
-        String::from_utf8_lossy(&decoded).into_owned()
+        let text = String::from_utf8_lossy(&decoded).into_owned();
+        match decode_result {
+            Ok(_) => text,
+            // A torn tail frame corrupts the last partial line it touches;
+            // keep only the lines the decoder completed before the error.
+            Err(_) => match text.rfind('\n') {
+                Some(index) => text[..=index].to_string(),
+                None => String::new(),
+            },
+        }
     } else {
         String::from_utf8_lossy(&bytes).into_owned()
     };
@@ -5978,7 +5987,8 @@ mod tests {
             ),
         ]
         .join("\n");
-        let compressed_log = [
+        fs::write(session_dir.join("session.jsonl"), plain).unwrap();
+        let mut compressed_log = [
             deepseek_test_header("/compressed"),
             deepseek_test_event(
                 "user/message",
@@ -5990,9 +6000,8 @@ mod tests {
             ),
         ]
         .join("\n");
-        fs::write(session_dir.join("session.jsonl"), plain).unwrap();
+        compressed_log.push('\n');
         let first = zstd::stream::encode_all(compressed_log.as_bytes(), 0).unwrap();
-        dbg!(String::from_utf8(zstd::stream::decode_all(first.as_slice()).unwrap()).unwrap());
         let tail = zstd::stream::encode_all(
             deepseek_test_event("turn/start", 3_000, serde_json::json!({"turn": 2})).as_bytes(),
             0,
@@ -6002,7 +6011,6 @@ mod tests {
         bytes.extend_from_slice(&tail[..tail.len() / 2]);
         fs::write(session_dir.join("session.jsonl.zstd"), bytes).unwrap();
 
-        dbg!(deepseek_events(&session_dir.join("session.jsonl.zstd")));
         let parsed =
             parse_deepseek_summary(&session_dir.join("session.jsonl.zstd"), "deepseek-zstd")
                 .unwrap()
@@ -6229,7 +6237,7 @@ mod tests {
         pb_bytes(1, &args, &mut read_payload);
         pb_bytes(2, &result, &mut read_payload);
         let mut call = Vec::new();
-        pb_bytes(3, &read_payload, &mut call);
+        pb_bytes(8, &read_payload, &mut call);
         pb_string(57, "call-1", &mut call);
 
         let mut assistant = Vec::new();
@@ -6274,7 +6282,6 @@ mod tests {
         assert_eq!(summary.message_count, 2);
         let timeline = parse_cursor_timeline(&database).unwrap();
         assert_eq!(timeline.len(), 3);
-        dbg!(&timeline);
         assert!(matches!(
             &timeline[2].payload,
             TimelinePayload::ToolCall(tool)
