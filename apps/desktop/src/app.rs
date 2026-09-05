@@ -46577,8 +46577,13 @@ impl FoundationSettings {
         strings: Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let language_select =
-            settings_select(&self.language_modes, Some(px(160.0)), stacked, Some(strings.system_default), cx);
+        let language_select = settings_select(
+            &self.language_modes,
+            Some(px(160.0)),
+            stacked,
+            Some(strings.system_default),
+            cx,
+        );
         let close_to_tray_switch = Switch::new("close-to-tray")
             .small()
             .checked(desktop_behavior.close_to_tray)
@@ -46853,10 +46858,20 @@ impl FoundationSettings {
             ],
             cx,
         );
-        let interface_font_select =
-            settings_select(&self.interface_fonts, Some(px(240.0)), stacked, Some(strings.choose_interface_font), cx);
-        let code_font_select =
-            settings_select(&self.code_fonts, Some(px(240.0)), stacked, Some(strings.choose_code_font), cx);
+        let interface_font_select = settings_select(
+            &self.interface_fonts,
+            Some(px(240.0)),
+            stacked,
+            Some(strings.choose_interface_font),
+            cx,
+        );
+        let code_font_select = settings_select(
+            &self.code_fonts,
+            Some(px(240.0)),
+            stacked,
+            Some(strings.choose_code_font),
+            cx,
+        );
         settings_page(
             strings.appearance,
             strings.appearance_description,
@@ -47512,8 +47527,13 @@ impl FoundationSettings {
         stacked: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let shell_select =
-            settings_select(&self.terminal_shells, Some(px(240.0)), stacked, None::<&str>, cx);
+        let shell_select = settings_select(
+            &self.terminal_shells,
+            Some(px(240.0)),
+            stacked,
+            None::<&str>,
+            cx,
+        );
         let cwd = preferences.working_directory;
         let cwd_control = settings_segmented_control(
             vec![
@@ -48137,10 +48157,7 @@ impl FoundationSettings {
                         "已安装的 Vibex 桌面版本和发布通道。",
                         "已安裝的 Vibex 桌面版本與發行通道。",
                     ),
-                    settings_value_chip(
-                        format!("{} · {}", env!("CARGO_PKG_VERSION"), channel),
-                        cx,
-                    ),
+                    settings_value_chip(format!("{} · {}", env!("CARGO_PKG_VERSION"), channel), cx),
                     stacked,
                     cx,
                 ),
@@ -59617,9 +59634,7 @@ mod tests {
         assert!(
             source.contains("settings_segmented_option(\n                    \"sidebar-detailed\"")
         );
-        assert!(
-            source.contains("locale::text(\"Session view\", \"会话视图\", \"會話視圖\")")
-        );
+        assert!(source.contains("locale::text(\"Session view\", \"会话视图\", \"會話視圖\")"));
         assert!(
             source.contains("locale::text(\"Workspace view\", \"工作区视图\", \"工作區視圖\")")
         );
