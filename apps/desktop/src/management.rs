@@ -65,7 +65,6 @@ use crate::terminal_surface::TerminalSurface;
 use crate::theme;
 
 const MANAGEMENT_SIDEBAR_WIDTH: f32 = 368.0;
-const MANAGEMENT_HEADER_HEIGHT: f32 = 48.0;
 const MANAGEMENT_WIDE_BREAKPOINT: f32 = 1024.0;
 const MANAGEMENT_COMPACT_SIDEBAR_DEFAULT_HEIGHT: f32 = 360.0;
 const MANAGEMENT_COMPACT_SIDEBAR_MIN_HEIGHT: f32 = 192.0;
@@ -166,7 +165,6 @@ impl ManagementProfileDialog {
 
 #[derive(Clone, Copy)]
 struct ManagementCopy {
-    title: &'static str,
     agents: &'static str,
     mcp: &'static str,
     skills: &'static str,
@@ -187,7 +185,6 @@ struct ManagementCopy {
 fn management_copy() -> ManagementCopy {
     match locale::current_locale() {
         ResolvedLocale::En => ManagementCopy {
-            title: "Config Center",
             agents: "Agent",
             mcp: "MCP",
             skills: "Skills",
@@ -205,7 +202,6 @@ fn management_copy() -> ManagementCopy {
             import_skill: "Import Existing Skills",
         },
         ResolvedLocale::ZhCn => ManagementCopy {
-            title: "配置中心",
             agents: "Agent",
             mcp: "MCP",
             skills: "技能",
@@ -223,7 +219,6 @@ fn management_copy() -> ManagementCopy {
             import_skill: "导入已有技能",
         },
         ResolvedLocale::ZhTw => ManagementCopy {
-            title: "配置中心",
             agents: "Agent",
             mcp: "MCP",
             skills: "技能",
@@ -7517,42 +7512,6 @@ impl ManagementCenter {
         nav.into_any_element()
     }
 
-    fn render_header(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let copy = management_copy();
-        h_flex()
-            .w_full()
-            .h(px(MANAGEMENT_HEADER_HEIGHT))
-            .flex_none()
-            .items_center()
-            .justify_between()
-            .gap_2()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .px_3()
-            .child(
-                h_flex()
-                    .min_w_0()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        h_flex()
-                            .size(px(24.0))
-                            .flex_none()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(6.0))
-                            .bg(cx.theme().primary.opacity(0.08))
-                            .child(
-                                Icon::new(IconName::Settings2)
-                                    .size(px(14.0))
-                                    .text_color(cx.theme().primary),
-                            ),
-                    )
-                    .child(div().truncate().text_sm().font_medium().child(copy.title)),
-            )
-            .into_any_element()
-    }
-
     fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match self.navigation.active {
             ManagementSection::Agents | ManagementSection::ModelProviders => {
@@ -14824,7 +14783,6 @@ impl Render for ManagementCenter {
         let compact_sidebar_height = self
             .compact_sidebar_height
             .clamp(compact_min_height, compact_max_height);
-        let header = self.render_header(cx);
         let nav = self.render_nav(cx);
         let context_sidebar = self.render_context_sidebar(window, cx);
         let content = self.render_content(window, cx);
@@ -14843,7 +14801,6 @@ impl Render for ManagementCenter {
             .when(!wide, |sidebar| {
                 sidebar.w_full().h(px(compact_sidebar_height))
             })
-            .child(header)
             .child(
                 v_flex()
                     .min_h_0()
@@ -17200,7 +17157,7 @@ mod tests {
         let source = include_str!("management.rs");
         let renderer = source
             .split_once("    fn render_nav(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn render_header("))
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_content("))
             .map(|(body, _)| body)
             .expect("management primary navigation should remain inspectable");
 

@@ -27,7 +27,6 @@ use vibex_core::{
 
 use crate::{gpui_ext::button_with_aria_label, locale, theme};
 
-const USAGE_HEADER_HEIGHT: f32 = 48.0;
 const USAGE_CHART_HEIGHT: f32 = 176.0;
 const USAGE_CHART_AXIS_WIDTH: f32 = 48.0;
 const USAGE_HEATMAP_CELL_SIZE: f32 = 12.0;
@@ -165,7 +164,11 @@ impl UsageView {
         }
     }
 
-    fn refresh(&mut self, cx: &mut Context<Self>) {
+    pub fn is_loading(&self) -> bool {
+        self.loading
+    }
+
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
             return;
         };
@@ -303,64 +306,6 @@ impl UsageView {
             }
         }
         self.refresh(cx);
-    }
-
-    fn render_header(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let loading = self.loading;
-        h_flex()
-            .h(px(USAGE_HEADER_HEIGHT))
-            .w_full()
-            .flex_none()
-            .items_center()
-            .justify_between()
-            .gap_3()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .px_4()
-            .child(
-                h_flex()
-                    .min_w_0()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        h_flex()
-                            .size(px(24.0))
-                            .flex_none()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(6.0))
-                            .bg(cx.theme().primary.opacity(0.08))
-                            .child(
-                                Icon::default()
-                                    .path("icons/vibex/activity.svg")
-                                    .size(px(15.0))
-                                    .text_color(cx.theme().primary),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .truncate()
-                            .text_sm()
-                            .font_semibold()
-                            .child(locale::text("Usage Statistics", "用量统计", "用量統計")),
-                    ),
-            )
-            .child(
-                Button::new("usage-refresh")
-                    .small()
-                    .ghost()
-                    .compact()
-                    .size(px(30.0))
-                    .loading(loading)
-                    .tooltip(locale::text("Refresh", "刷新", "重新整理"))
-                    .child(
-                        Icon::default()
-                            .path("icons/vibex/rotate-ccw.svg")
-                            .size(px(15.0)),
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
-            )
-            .into_any_element()
     }
 
     fn render_toolbar(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -1032,7 +977,6 @@ impl UsageView {
 impl Render for UsageView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let viewport_width = f32::from(window.viewport_size().width);
-        let header = self.render_header(cx);
         let status = self.render_status(cx);
         let statistics = self.statistics.clone();
         let state = usage_content_state(
@@ -1112,7 +1056,6 @@ impl Render for UsageView {
             .min_w_0()
             .min_h_0()
             .bg(cx.theme().background)
-            .child(header)
             .child(
                 div()
                     .flex_1()

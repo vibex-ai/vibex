@@ -4534,6 +4534,7 @@ pub struct VibexWorkbench {
     management_view: Entity<ManagementCenter>,
     usage_view: Entity<UsageView>,
     usage_session_filter: Option<VibexSessionId>,
+    usage_refresh_in_flight: bool,
     session_search: Entity<InputState>,
     session_search_open: bool,
     session_search_selected_index: usize,
@@ -5215,6 +5216,14 @@ impl VibexWorkbench {
                 ManagementEvent::AgentRegistryChanged => this.load_agent_overview(cx),
             },
         ));
+        agent_subscriptions.push(cx.observe_in(&usage_view, window, |this, usage, _, cx| {
+            let next_in_flight = usage.read(cx).is_loading();
+            if this.usage_refresh_in_flight == next_in_flight {
+                return;
+            }
+            this.usage_refresh_in_flight = next_in_flight;
+            cx.notify();
+        }));
         let sidebar_state = SidebarState {
             row_order: ui_state.sidebar.session_order.clone(),
             pinned_ids: ui_state.sidebar.pinned_session_ids.clone(),
@@ -5295,6 +5304,7 @@ impl VibexWorkbench {
             management_view,
             usage_view,
             usage_session_filter: None,
+            usage_refresh_in_flight: false,
             session_search,
             session_search_open: false,
             session_search_selected_index: 0,
@@ -22791,6 +22801,9 @@ impl VibexWorkbench {
             self.settings_open,
             selected_session.is_some(),
         );
+        let management_open = self.ui_state.workbench.active_tab == "management";
+        let usage_open = self.ui_state.workbench.active_tab == "usage";
+        let usage_loading = usage_open && self.usage_refresh_in_flight;
         let session_title = selected_session
             .as_ref()
             .filter(|_| show_session_context)
@@ -23021,6 +23034,111 @@ impl VibexWorkbench {
                             .px_3()
                             .bg(cx.theme().background)
                             .text_color(cx.theme().foreground)
+                            .when(management_open, |this| {
+                                this.child(
+                                    h_flex()
+                                        .min_w_0()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            h_flex()
+                                                .size(px(24.0))
+                                                .flex_none()
+                                                .items_center()
+                                                .justify_center()
+                                                .rounded(px(6.0))
+                                                .bg(cx.theme().primary.opacity(0.08))
+                                                .child(
+                                                    Icon::new(IconName::Settings2)
+                                                        .size(px(14.0))
+                                                        .text_color(cx.theme().primary),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_sm()
+                                                .font_medium()
+                                                .child(strings.sidebar_providers),
+                                        ),
+                                )
+                            })
+                            .when(usage_open, |this| {
+                                this.child(
+                                    h_flex()
+                                        .min_w_0()
+                                        .w_full()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap_2()
+                                        .child(
+                                            h_flex()
+                                                .min_w_0()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(
+                                                    h_flex()
+                                                        .size(px(24.0))
+                                                        .flex_none()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .rounded(px(6.0))
+                                                        .bg(cx.theme().primary.opacity(0.08))
+                                                        .child(
+                                                            Icon::default()
+                                                                .path("icons/vibex/activity.svg")
+                                                                .size(px(15.0))
+                                                                .text_color(cx.theme().primary),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .min_w_0()
+                                                        .truncate()
+                                                        .text_sm()
+                                                        .font_semibold()
+                                                        .child(locale::text(
+                                                            "Usage Statistics",
+                                                            "用量统计",
+                                                            "用量統計",
+                                                        )),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("title-usage-refresh")
+                                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                    cx.stop_propagation()
+                                                })
+                                                .child(
+                                                    Button::new("usage-refresh")
+                                                        .small()
+                                                        .ghost()
+                                                        .compact()
+                                                        .size(px(28.0))
+                                                        .px_0()
+                                                        .loading(usage_loading)
+                                                        .tooltip(locale::text(
+                                                            "Refresh",
+                                                            "刷新",
+                                                            "重新整理",
+                                                        ))
+                                                        .child(
+                                                            Icon::default()
+                                                                .path("icons/vibex/rotate-ccw.svg")
+                                                                .size(px(15.0)),
+                                                        )
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.usage_view
+                                                                .update(cx, |usage, cx| {
+                                                                    usage.refresh(cx)
+                                                                });
+                                                        })),
+                                                ),
+                                        ),
+                                )
+                            })
                             .when(show_session_context, |this| {
                                 this.child(
                                     h_flex()
