@@ -172,19 +172,30 @@ jobs:
           } >> "${GITHUB_ENV}"
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --version "${CARGO_NDK_VERSION}" --locked
-      - name: Build unsigned APK and AAB
+      - name: Build Android APK and AAB
         env:
           VIBEX_MOBILE_PROFILE: release
           VIBEX_MOBILE_VERSION: ${{ needs.release-meta.outputs.version }}
         run: bash apps/mobile/scripts/build-android.sh
+      - name: Sign Android release artifacts
+        env:
+          VIBEX_ANDROID_KEYSTORE_BASE64: ${{ secrets.VIBEX_ANDROID_KEYSTORE_BASE64 }}
+          VIBEX_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.VIBEX_ANDROID_KEYSTORE_PASSWORD }}
+          VIBEX_ANDROID_KEY_PASSWORD: ${{ secrets.VIBEX_ANDROID_KEY_PASSWORD }}
+          VIBEX_ANDROID_KEY_ALIAS: ${{ vars.VIBEX_ANDROID_KEY_ALIAS || 'vibex' }}
+          VIBEX_RELEASE_CHANNEL: ${{ needs.release-meta.outputs.channel }}
+        run: |
+          bash apps/mobile/scripts/sign-android-release.sh \
+            apps/mobile/android/app/build/outputs/apk/release/app-release-unsigned.apk \
+            apps/mobile/android/app/build/outputs/bundle/release/app-release.aab \
+            target/mobile-android/vibex-${{ needs.release-meta.outputs.version }}-android-arm64.apk \
+            target/mobile-android/vibex-${{ needs.release-meta.outputs.version }}-android-arm64.aab
       - name: Normalize Android artifacts and checksums
         shell: bash
         run: |
           set -euo pipefail
           output="target/mobile-android"
           mkdir -p "${output}"
-          cp apps/mobile/android/app/build/outputs/apk/release/app-release-unsigned.apk "${output}/vibex-${{ needs.release-meta.outputs.version }}-android-arm64.apk"
-          cp apps/mobile/android/app/build/outputs/bundle/release/app-release.aab "${output}/vibex-${{ needs.release-meta.outputs.version }}-android-arm64.aab"
           for artifact in "${output}"/*.{apk,aab}; do
             sha256sum "${artifact}" > "${artifact}.sha256"
           done

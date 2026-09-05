@@ -38,6 +38,12 @@ apps/mobile/android/app/build/outputs/apk/release/app-release-unsigned.apk
 The release APK must be aligned and signed with the intended release key before
 it can be installed on a device or distributed.
 
+Tagged GitHub releases run `apps/mobile/scripts/sign-android-release.sh` before
+publishing Android artifacts. RC and preview releases use an ephemeral CI key
+when no repository key is configured; stable releases require the repository's
+release keystore secrets. The published APK is therefore installable without a
+separate signing step.
+
 Set `VIBEX_MOBILE_ANDROID_TARGETS` to a space-separated ABI list to override
 the defaults during local development.
 

@@ -165,6 +165,24 @@ function validatePackaging() {
   ]) {
     assert(releaseWorkflow.includes(required), `publish workflow is missing ${required}`);
   }
+  for (const required of [
+    "sign-android-release.sh",
+    "VIBEX_ANDROID_KEYSTORE_BASE64",
+    "VIBEX_ANDROID_KEYSTORE_PASSWORD"
+  ]) {
+    assert(releaseWorkflow.includes(required), `publish workflow is missing Android signing contract ${required}`);
+  }
+  const androidSigningScript = source("apps/mobile/scripts/sign-android-release.sh");
+  for (const required of ["apksigner", "zipalign", "jarsigner", "VIBEX_RELEASE_CHANNEL"]) {
+    assert(
+      androidSigningScript.includes(required),
+      `Android signing script is missing ${required}`
+    );
+  }
+  assert(
+    !releaseWorkflow.includes("app-release-unsigned.apk \"${output}/vibex-"),
+    "publish workflow must not publish an unsigned Android APK"
+  );
   assert(
     source("apps/mobile/scripts/build-android.sh").includes("bundleRelease"),
     "Android release workflow must produce an AAB"

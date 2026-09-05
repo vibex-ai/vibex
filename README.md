@@ -259,10 +259,11 @@ on the host.
 
 Tagged releases use the free GitHub-hosted native matrix in
 `.github/workflows/release.yml`: Linux `.deb`/AppImage, macOS `.dmg`, Windows
-NSIS, Android APK/AAB, and unsigned iOS simulator/XCFramework artifacts are
+NSIS, signed Android APK/AAB, and unsigned iOS simulator/XCFramework artifacts are
 collected by one aggregation job. macOS/Windows signing and mobile store upload
-are optional credentialed follow-up steps; the default pipeline does not require
-paid services or signing secrets.
+are optional credentialed follow-up steps; RC and preview Android packages can
+use an ephemeral CI key, while stable Android releases require a configured
+release keystore.
 
 ## Development
 
@@ -300,8 +301,9 @@ pnpm package:mobile:android
 ```
 
 Set `VIBEX_MOBILE_ANDROID_TARGETS` to a space-separated ABI list to override the
-debug defaults. The release APK is unsigned and must be aligned and signed with
-the intended release key before distribution.
+debug defaults. The local release APK is unsigned and must be aligned and signed
+with the intended release key before distribution; tagged release APKs are signed
+by the publish workflow.
 
 ### iOS
 
