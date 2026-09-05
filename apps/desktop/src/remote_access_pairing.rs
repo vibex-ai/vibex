@@ -78,12 +78,21 @@ impl RemoteAccessEntry {
             RemoteConnectivityMethod::SelfHostedRelay => Self::SelfHostedRelay,
         }
     }
+
+    fn remote_method(self) -> Option<RemoteConnectivityMethod> {
+        match self {
+            Self::TailscaleServe => Some(RemoteConnectivityMethod::TailscaleServe),
+            Self::Direct => Some(RemoteConnectivityMethod::Direct),
+            Self::SelfHostedRelay => Some(RemoteConnectivityMethod::SelfHostedRelay),
+            Self::LocalNetwork => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RemoteAccessAction {
     Refresh,
-    SelectMethod(RemoteConnectivityMethod),
+    SelectConnectionEntry(RemoteAccessEntry),
     EnableMethod(RemoteConnectivityMethod),
     ConfirmTailscalePort(u16),
     DisableMethod(RemoteConnectivityMethod),
@@ -105,7 +114,6 @@ enum RemoteAccessAction {
     RejectZeroConfigPairing(RequestId),
     ShowSetup,
     ShowPairing,
-    ToggleLanSection,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -317,7 +325,6 @@ struct PairingViewState {
     active_offer: Option<ActivePairingOffer>,
     active_lan_window: Option<RemoteLanPairingWindowSnapshot>,
     active_zero_config_window: Option<RemoteLanPairingWindowSnapshot>,
-    lan_section_open: bool,
     pending: Option<RemoteAccessMutation>,
     error_code: Option<String>,
     notice: Option<&'static str>,
@@ -335,7 +342,6 @@ impl Default for PairingViewState {
             active_offer: None,
             active_lan_window: None,
             active_zero_config_window: None,
-            lan_section_open: false,
             pending: None,
             error_code: None,
             notice: None,
@@ -358,14 +364,11 @@ impl PairingViewState {
         self.error_code = None;
     }
 
-    fn select_method(&mut self, method: RemoteConnectivityMethod) {
-        self.selected_method = method;
-        self.selected_entry = RemoteAccessEntry::from_remote_method(method);
-        self.error_code = None;
-    }
-
-    fn toggle_lan_section(&mut self) {
-        self.lan_section_open = !self.lan_section_open;
+    fn select_connection_entry(&mut self, entry: RemoteAccessEntry) {
+        if let Some(method) = entry.remote_method() {
+            self.selected_method = method;
+        }
+        self.selected_entry = entry;
         self.error_code = None;
     }
 
@@ -569,12 +572,8 @@ impl RemoteAccessPairing {
                 self.state.show_pairing();
                 cx.notify();
             }
-            RemoteAccessAction::SelectMethod(method) => {
-                self.state.select_method(method);
-                cx.notify();
-            }
-            RemoteAccessAction::ToggleLanSection => {
-                self.state.toggle_lan_section();
+            RemoteAccessAction::SelectConnectionEntry(entry) => {
+                self.state.select_connection_entry(entry);
                 cx.notify();
             }
             RemoteAccessAction::EnableMethod(method) => self.enable_method(method, cx),
@@ -1571,39 +1570,34 @@ impl RemoteAccessPairing {
             .into_any_element()
     }
 
-    fn render_method_list(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_connection_list(&self, cx: &mut Context<Self>) -> AnyElement {
         v_flex()
             .w_full()
             .gap_2()
-            .child(self.render_method_row(RemoteConnectivityMethod::TailscaleServe, cx))
-            .child(self.render_method_row(RemoteConnectivityMethod::Direct, cx))
-            .child(self.render_method_row(RemoteConnectivityMethod::SelfHostedRelay, cx))
+            .child(self.render_connection_row(RemoteAccessEntry::TailscaleServe, cx))
+            .child(self.render_connection_row(RemoteAccessEntry::Direct, cx))
+            .child(self.render_connection_row(RemoteAccessEntry::SelfHostedRelay, cx))
+            .child(self.render_connection_row(RemoteAccessEntry::LocalNetwork, cx))
             .into_any_element()
     }
 
-    fn render_method_row(
+    fn render_connection_row(
         &self,
-        method: RemoteConnectivityMethod,
+        entry: RemoteAccessEntry,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let selected = self.state.selected_method == method;
+        let selected = self.state.selected_entry == entry;
         let disabled = self.has_active_pairing();
         let entity = cx.weak_entity();
         let keyboard_entity = entity.clone();
-        let action = RemoteAccessAction::SelectMethod(method);
+        let action = RemoteAccessAction::SelectConnectionEntry(entry);
         let keyboard_action = action.clone();
-        let snapshot = self
-            .state
-            .connectivity
-            .as_ref()
-            .and_then(|connectivity| connectivity.method(method));
-        let state = snapshot.map_or(RemoteMethodState::Disabled, |snapshot| snapshot.state);
-        let (status, status_color) = (method_state_label(state), method_state_color(state, cx));
-        let row_id = SharedString::from(format!("remote-access-method-{}", method.wire_name()));
+        let (status, status_color) = self.connection_entry_status(entry, cx);
+        let row_id: SharedString = connection_entry_id(entry).into();
         let accessibility_label = format!(
             "{}: {}",
-            method_short_name(method),
-            method_description(method)
+            connection_entry_name(entry),
+            connection_entry_description(entry)
         );
 
         h_flex()
@@ -1662,9 +1656,9 @@ impl RemoteAccessPairing {
                                     .min_w_0()
                                     .text_sm()
                                     .font_semibold()
-                                    .child(method_short_name(method)),
+                                    .child(connection_entry_name(entry)),
                             )
-                            .when(method == RemoteConnectivityMethod::TailscaleServe, |row| {
+                            .when(entry == RemoteAccessEntry::TailscaleServe, |row| {
                                 row.child(status_pill(
                                     locale::text("Recommended", "推荐", "建議"),
                                     cx.theme().primary,
@@ -1677,7 +1671,7 @@ impl RemoteAccessPairing {
                             .truncate()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(method_description(method)),
+                            .child(connection_entry_description(entry)),
                     ),
             )
             .child(status_pill(status, status_color))
@@ -1734,11 +1728,50 @@ impl RemoteAccessPairing {
                 .is_some_and(|offer| !offer.is_terminal(unix_timestamp_ms()))
     }
 
-    fn render_method_detail_panel(
+    fn connection_entry_status(
         &self,
-        method: RemoteConnectivityMethod,
+        entry: RemoteAccessEntry,
+        cx: &App,
+    ) -> (&'static str, gpui::Hsla) {
+        if entry == RemoteAccessEntry::LocalNetwork {
+            if self.state.active_zero_config_window.is_some() {
+                return (
+                    locale::text("Discovering", "发现中", "發現中"),
+                    cx.theme().success,
+                );
+            }
+            return (
+                locale::text("On demand", "按需开启", "按需開啟"),
+                cx.theme().muted_foreground,
+            );
+        }
+        let Some(method) = entry.remote_method() else {
+            return (
+                method_state_label(RemoteMethodState::Disabled),
+                cx.theme().muted_foreground,
+            );
+        };
+        let state = self
+            .state
+            .connectivity
+            .as_ref()
+            .and_then(|connectivity| connectivity.method(method))
+            .map_or(RemoteMethodState::Disabled, |snapshot| snapshot.state);
+        (method_state_label(state), method_state_color(state, cx))
+    }
+
+    fn render_connection_detail_panel(
+        &self,
+        entry: RemoteAccessEntry,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if entry == RemoteAccessEntry::LocalNetwork {
+            return self.render_local_network_panel(cx);
+        }
+        let method = match entry.remote_method() {
+            Some(method) => method,
+            None => return self.render_local_network_panel(cx),
+        };
         let snapshot = self
             .state
             .connectivity
@@ -1967,15 +2000,18 @@ impl RemoteAccessPairing {
         panel.into_any_element()
     }
 
-    fn render_local_network_section(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_local_network_panel(&self, cx: &mut Context<Self>) -> AnyElement {
         if let Some(window) = self.state.active_zero_config_window.as_ref() {
             return self.render_lan_window(window, true, cx);
         }
 
-        let open = self.state.lan_section_open;
         let entity = cx.weak_entity();
-        let header_entity = entity.clone();
         let can_start = self.state.can_start_zero_config_pairing();
+        let pending_start = matches!(
+            self.state.pending,
+            Some(RemoteAccessMutation::StartZeroConfigPairing)
+        );
+        let (_, status_color) = self.connection_entry_status(RemoteAccessEntry::LocalNetwork, cx);
 
         v_flex()
             .w_full()
@@ -1983,95 +2019,63 @@ impl RemoteAccessPairing {
             .gap_3()
             .rounded(px(10.0))
             .border_1()
-            .border_color(if open {
-                cx.theme().primary.opacity(0.35)
-            } else {
-                cx.theme().border.opacity(0.72)
-            })
+            .border_color(cx.theme().primary.opacity(0.30))
             .bg(cx.theme().muted.opacity(0.14))
             .p_4()
             .child(
                 h_flex()
-                    .id("local-network-section-toggle")
                     .w_full()
-                    .min_w_0()
-                    .items_center()
+                    .items_start()
+                    .justify_between()
                     .gap_3()
-                    .cursor_pointer()
-                    .role(Role::Button)
-                    .aria_label(locale::text(
-                        "Local network pairing",
-                        "局域网配对",
-                        "區域網路配對",
-                    ))
-                    .hover(|style| style.bg(cx.theme().accent.opacity(0.5)))
-                    .on_click(move |_, _, cx| {
-                        let _ = header_entity.update(cx, |this, cx| {
-                            this.dispatch_action(RemoteAccessAction::ToggleLanSection, cx)
-                        });
-                    })
-                    .child(icon_tile(IconName::Map, px(32.0), px(16.0), cx))
                     .child(
-                        v_flex()
+                        h_flex()
                             .min_w_0()
-                            .flex_1()
-                            .gap_1()
-                            .child(div().text_sm().font_semibold().child(locale::text(
-                                "Local network pairing",
-                                "局域网配对",
-                                "區域網路配對",
-                            )))
+                            .items_center()
+                            .gap_2()
+                            .child(icon_tile(IconName::Map, px(28.0), px(15.0), cx))
                             .child(
                                 div()
                                     .min_w_0()
                                     .truncate()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(locale::text(
-                                        "Discover this computer on the same network",
-                                        "在同一网络中发现此电脑",
-                                        "在同一網路中探索此電腦",
-                                    )),
-                            ),
+                                    .text_sm()
+                                    .font_semibold()
+                                    .child(connection_entry_name(RemoteAccessEntry::LocalNetwork)),
+                            )
+                            .child(status_pill(
+                                locale::text("On demand", "按需开启", "按需開啟"),
+                                status_color,
+                            )),
                     )
                     .child(
-                        Icon::new(if open {
-                            IconName::ChevronUp
-                        } else {
-                            IconName::ChevronDown
-                        })
-                        .size(px(16.0))
-                        .text_color(cx.theme().muted_foreground),
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(connection_entry_description(
+                                RemoteAccessEntry::LocalNetwork,
+                            )),
                     ),
             )
-            .when(open, |section| {
-                section
-                    .child(self.render_permission_selector(true, cx))
-                    .child(
-                        Button::new("start-zero-config-pairing")
-                            .primary()
-                            .w_full()
-                            .icon(IconName::Play)
-                            .label(locale::text(
-                                "Start local pairing",
-                                "开始局域网配对",
-                                "開始區域網路配對",
-                            ))
-                            .loading(matches!(
-                                self.state.pending,
-                                Some(RemoteAccessMutation::StartZeroConfigPairing)
-                            ))
-                            .disabled(!can_start)
-                            .on_click(move |_, _, cx| {
-                                let _ = entity.update(cx, |this, cx| {
-                                    this.dispatch_action(
-                                        RemoteAccessAction::StartZeroConfigPairing,
-                                        cx,
-                                    )
-                                });
-                            }),
-                    )
-            })
+            .child(self.render_permission_selector(true, cx))
+            .child(
+                Button::new("start-zero-config-pairing")
+                    .primary()
+                    .w_full()
+                    .icon(IconName::Play)
+                    .label(locale::text(
+                        "Start local pairing",
+                        "开始局域网配对",
+                        "開始區域網路配對",
+                    ))
+                    .loading(pending_start)
+                    .disabled(!can_start)
+                    .on_click(move |_, _, cx| {
+                        let _ = entity.update(cx, |this, cx| {
+                            this.dispatch_action(RemoteAccessAction::StartZeroConfigPairing, cx)
+                        });
+                    }),
+            )
             .into_any_element()
     }
 
@@ -2903,7 +2907,9 @@ impl RemoteAccessPairingE2eDriver {
         let action = match action {
             RemoteAccessPairingE2eAction::Refresh => RemoteAccessAction::Refresh,
             RemoteAccessPairingE2eAction::SelectMethod { method } => {
-                RemoteAccessAction::SelectMethod(method)
+                RemoteAccessAction::SelectConnectionEntry(RemoteAccessEntry::from_remote_method(
+                    method,
+                ))
             }
             RemoteAccessPairingE2eAction::ConfigureOrigin { method, origin } => {
                 if !matches!(
@@ -2924,7 +2930,9 @@ impl RemoteAccessPairingE2eDriver {
                     RemoteConnectivityMethod::TailscaleServe => unreachable!(),
                 };
                 input.update(cx, |input, cx| input.set_value(origin, window, cx));
-                RemoteAccessAction::SelectMethod(method)
+                RemoteAccessAction::SelectConnectionEntry(RemoteAccessEntry::from_remote_method(
+                    method,
+                ))
             }
             RemoteAccessPairingE2eAction::EnableMethod { method } => {
                 RemoteAccessAction::EnableMethod(method)
@@ -3005,9 +3013,8 @@ impl Render for RemoteAccessPairing {
                     .when(self.has_active_pairing(), |column| {
                         column.child(self.render_pairing_resume_strip(cx))
                     })
-                    .child(self.render_method_list(cx))
-                    .child(self.render_method_detail_panel(self.state.selected_method, cx))
-                    .child(self.render_local_network_section(cx))
+                    .child(self.render_connection_list(cx))
+                    .child(self.render_connection_detail_panel(self.state.selected_entry, cx))
                     .child(self.render_setup_footer(cx));
                 if let Some(error) = error {
                     column = column.child(self.render_status_banner(
@@ -3380,6 +3387,31 @@ fn method_short_name(method: RemoteConnectivityMethod) -> &'static str {
         RemoteConnectivityMethod::SelfHostedRelay => {
             locale::text("Self-hosted Relay", "自建 Relay", "自建 Relay")
         }
+    }
+}
+
+fn connection_entry_name(entry: RemoteAccessEntry) -> &'static str {
+    match entry.remote_method() {
+        Some(method) => method_short_name(method),
+        None => locale::text("Local network pairing", "局域网配对", "區域網路配對"),
+    }
+}
+
+fn connection_entry_description(entry: RemoteAccessEntry) -> &'static str {
+    match entry.remote_method() {
+        Some(method) => method_description(method),
+        None => locale::text(
+            "Discover this computer on the same network",
+            "在同一网络中发现此电脑",
+            "在同一網路中探索此電腦",
+        ),
+    }
+}
+
+fn connection_entry_id(entry: RemoteAccessEntry) -> String {
+    match entry.remote_method() {
+        Some(method) => format!("remote-access-method-{}", method.wire_name()),
+        None => "remote-access-method-local-network".to_string(),
     }
 }
 
@@ -3910,23 +3942,36 @@ mod tests {
     }
 
     #[test]
-    fn method_selection_and_lan_section_toggles_stay_on_the_setup_page() {
+    fn connection_entry_selection_keeps_remote_and_lan_methods_in_one_list() {
         let mut state = PairingViewState::default();
         assert_eq!(state.page, RemoteAccessPage::Setup);
-        assert!(!state.lan_section_open);
-
-        state.select_method(RemoteConnectivityMethod::Direct);
-        assert_eq!(state.selected_method, RemoteConnectivityMethod::Direct);
         assert_eq!(
             state.selected_entry,
-            RemoteAccessEntry::from_remote_method(RemoteConnectivityMethod::Direct)
+            RemoteAccessEntry::TailscaleServe,
+            "default selection mirrors the first radio row"
         );
+
+        state.select_connection_entry(RemoteAccessEntry::Direct);
+        assert_eq!(state.selected_method, RemoteConnectivityMethod::Direct);
+        assert_eq!(state.selected_entry, RemoteAccessEntry::Direct);
         assert_eq!(state.page, RemoteAccessPage::Setup);
 
-        state.toggle_lan_section();
-        assert!(state.lan_section_open);
-        state.toggle_lan_section();
-        assert!(!state.lan_section_open);
+        state.select_connection_entry(RemoteAccessEntry::LocalNetwork);
+        assert_eq!(
+            state.selected_method,
+            RemoteConnectivityMethod::Direct,
+            "LAN rows keep the previously selected remote method intact"
+        );
+        assert_eq!(state.selected_entry, RemoteAccessEntry::LocalNetwork);
+        assert_eq!(state.page, RemoteAccessPage::Setup);
+
+        state.select_connection_entry(RemoteAccessEntry::SelfHostedRelay);
+        assert_eq!(
+            state.selected_method,
+            RemoteConnectivityMethod::SelfHostedRelay
+        );
+        assert_eq!(state.selected_entry, RemoteAccessEntry::SelfHostedRelay);
+        assert_eq!(state.page, RemoteAccessPage::Setup);
 
         state.show_pairing();
         assert_eq!(state.page, RemoteAccessPage::Pairing);
