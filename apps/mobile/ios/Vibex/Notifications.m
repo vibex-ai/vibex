@@ -1,5 +1,5 @@
 #import <UserNotifications/UserNotifications.h>
-#import "Headers/vibex_mobile.h"
+#import "vibex_mobile.h"
 
 @interface VibexNotificationDelegate : NSObject <UNUserNotificationCenterDelegate>
 @end

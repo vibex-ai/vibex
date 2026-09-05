@@ -44,11 +44,8 @@ targets:
         INFOPLIST_KEY_NSBonjourServices: ["_vibex._tcp"]
         INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
         CLANG_ENABLE_OBJC_ARC: YES
-        # Keep the source headers available to the Objective-C host without
-        # making Headers/ a Clang module search root. The XCFramework carries
-        # the one VibexFFI module map that Swift imports; searching both maps
-        # defines the module twice on simulator builds.
-        HEADER_SEARCH_PATHS: ["$(inherited)", "$(SRCROOT)"]
+        # The XCFramework supplies the header and its sole VibexFFI module map
+        # through Xcode's generated target include directory.
         # The FFI library is only built for arm64 simulators.
         ARCHS: [arm64]
         OTHER_LDFLAGS: ["$(inherited)", "-ObjC", "-all_load"]

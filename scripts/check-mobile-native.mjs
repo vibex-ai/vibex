@@ -162,10 +162,11 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   assert(iosMain.includes("vibex_mobile_main();"), "ios_rust_entry_call_missing");
   assert(!iosMain.includes("UIApplicationMain"), "ios_host_double_enters_ui_application");
   assert(iosProject.includes("VibexFFI.xcframework"), "ios_xcframework_missing");
-  assert(
-    iosProject.includes('HEADER_SEARCH_PATHS: ["$(inherited)", "$(SRCROOT)"]'),
-    "ios_header_search_root_exposes_module_map"
-  );
+  assert(!iosProject.includes("HEADER_SEARCH_PATHS"), "ios_header_search_root_exposes_module_map");
+  for (const iosSource of [iosMain, read("apps/mobile/ios/Vibex/LanDiscovery.m"), read("apps/mobile/ios/Vibex/Notifications.m")]) {
+    assert(iosSource.includes('#import "vibex_mobile.h"'), "ios_host_header_import_missing");
+    assert(!iosSource.includes('#import "Headers/vibex_mobile.h"'), "ios_source_header_path_reintroduces_module_map");
+  }
   assert(!iosProject.includes("SWIFT_INCLUDE_PATHS"), "ios_swift_module_include_path_redundant");
   assert(iosProject.includes("ARCHS"), "ios_arm64_arch_pin_missing");
   assert(iosModuleMap.includes("module VibexFFI"), "ios_swift_module_declaration_missing");
@@ -248,6 +249,8 @@ function runSelfTest() {
     ["apps/mobile/android/app/src/main/res/values/styles.xml", source("apps/mobile/android/app/src/main/res/values/styles.xml")],
     ["apps/mobile/ios/project.yml", source("apps/mobile/ios/project.yml")],
     ["apps/mobile/ios/Vibex/main.m", source("apps/mobile/ios/Vibex/main.m")],
+    ["apps/mobile/ios/Vibex/LanDiscovery.m", source("apps/mobile/ios/Vibex/LanDiscovery.m")],
+    ["apps/mobile/ios/Vibex/Notifications.m", source("apps/mobile/ios/Vibex/Notifications.m")],
     ["apps/mobile/ios/Vibex/QRScanner.swift", source("apps/mobile/ios/Vibex/QRScanner.swift")],
     ["apps/mobile/ios/Headers/vibex_mobile.h", source("apps/mobile/ios/Headers/vibex_mobile.h")],
     ["apps/mobile/ios/Headers/module.modulemap", source("apps/mobile/ios/Headers/module.modulemap")],
@@ -365,6 +368,18 @@ function runSelfTest() {
     "module VibexFFI",
     "module MissingFFI",
     "native_mobile_checker_self_test_accepted_missing_swift_module_declaration"
+  );
+  expectRejected(
+    "apps/mobile/ios/project.yml",
+    "CLANG_ENABLE_OBJC_ARC: YES",
+    'CLANG_ENABLE_OBJC_ARC: YES\n        HEADER_SEARCH_PATHS: ["$(inherited)", "$(SRCROOT)"]',
+    "native_mobile_checker_self_test_accepted_duplicate_module_map_path"
+  );
+  expectRejected(
+    "apps/mobile/ios/Vibex/main.m",
+    '#import "vibex_mobile.h"',
+    '#import "Headers/vibex_mobile.h"',
+    "native_mobile_checker_self_test_accepted_source_module_map_path"
   );
   expectRejected(
     "apps/mobile/ios/Headers/vibex_mobile.h",

@@ -1,5 +1,5 @@
 #import <Foundation/Foundation.h>
-#import "Headers/vibex_mobile.h"
+#import "vibex_mobile.h"
 #import <netdb.h>
 #import <sys/socket.h>
 
