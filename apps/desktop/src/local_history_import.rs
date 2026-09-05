@@ -81,8 +81,8 @@ struct ImportText {
     agent_filter: &'static str,
     messages: &'static str,
     importing: &'static str,
-    status_imported: &'static str,
-    status_deleted: &'static str,
+    scope_hint: &'static str,
+    no_selection: &'static str,
 }
 
 fn text(locale: ResolvedLocale) -> ImportText {
@@ -115,8 +115,8 @@ fn text(locale: ResolvedLocale) -> ImportText {
             agent_filter: "Agents",
             messages: "messages",
             importing: "Importing...",
-            status_imported: "imported",
-            status_deleted: "deleted",
+            scope_hint: "Only this project's sessions",
+            no_selection: "No sessions selected",
         },
         ResolvedLocale::ZhCn => ImportText {
             search: "搜索会话或项目目录",
@@ -146,8 +146,8 @@ fn text(locale: ResolvedLocale) -> ImportText {
             agent_filter: "个 Agent",
             messages: "条消息",
             importing: "正在导入...",
-            status_imported: "已导入",
-            status_deleted: "已删除",
+            scope_hint: "仅显示该项目的会话",
+            no_selection: "尚未选择会话",
         },
         ResolvedLocale::ZhTw => ImportText {
             search: "搜尋會話或專案目錄",
@@ -177,8 +177,8 @@ fn text(locale: ResolvedLocale) -> ImportText {
             agent_filter: "個 Agent",
             messages: "則訊息",
             importing: "正在匯入...",
-            status_imported: "已匯入",
-            status_deleted: "已刪除",
+            scope_hint: "僅顯示該專案的會話",
+            no_selection: "尚未選擇會話",
         },
     }
 }
@@ -643,13 +643,17 @@ impl LocalHistoryImportDialog {
         box_view.into_any_element()
     }
 
+    /// One project renders as a bordered card: a muted header row (checkbox,
+    /// collapse chevron, name, path, agent logos, selection count) followed by
+    /// its session rows. `overflow_hidden` clips row hover states to the card
+    /// radius.
     fn render_folder(
         &self,
         folder: &LocalHistoryScanFolder,
         sessions: &[LocalHistoryScanSession],
         pending: bool,
         cx: &mut Context<Self>,
-    ) -> Vec<AnyElement> {
+    ) -> AnyElement {
         let collapsed = self.collapsed.contains(&folder.workspace_root);
         let selection = self.folder_selection(sessions);
         let selectable_count = sessions
@@ -665,16 +669,19 @@ impl LocalHistoryImportDialog {
             .count();
         let folder_path = folder.workspace_root.clone();
         let row_id = SharedString::from(format!("local-history-folder:{folder_path}"));
-        let mut row = h_flex()
+        // The header checkbox sits at `px_3`, and session rows inset their own
+        // checkbox by the same amount (`mx_1` + `px_2`), so every checkbox in
+        // the dialog lines up in one vertical column.
+        let mut header = h_flex()
             .id(row_id)
             .w_full()
             .min_w_0()
-            .h(px(44.0))
+            .h(px(40.0))
+            .flex_none()
             .items_center()
             .gap_2()
-            .px_2()
-            .rounded(px(6.0))
-            .bg(cx.theme().muted.opacity(0.24))
+            .px_3()
+            .bg(cx.theme().muted.opacity(0.32))
             .child(self.checkbox(
                 SharedString::from(format!("local-history-folder-check:{folder_path}")),
                 selection == FolderSelection::All,
@@ -693,16 +700,6 @@ impl LocalHistoryImportDialog {
                     IconName::ChevronDown
                 })
                 .size(px(14.0))
-                .flex_none()
-                .text_color(cx.theme().muted_foreground),
-            )
-            .child(
-                Icon::new(if collapsed {
-                    IconName::Folder
-                } else {
-                    IconName::FolderOpen
-                })
-                .size(px(15.0))
                 .flex_none()
                 .text_color(cx.theme().muted_foreground),
             )
@@ -737,26 +734,35 @@ impl LocalHistoryImportDialog {
                 div()
                     .flex_none()
                     .text_xs()
+                    .font_medium()
                     .text_color(cx.theme().muted_foreground)
                     .child(format!("{selected_count}/{selectable_count}")),
             );
         if !pending {
-            row = row
+            header = header
                 .cursor_pointer()
-                .hover(|style| style.bg(cx.theme().muted.opacity(0.36)))
+                .hover(|style| style.bg(cx.theme().muted.opacity(0.5)))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.toggle_collapse(folder_path.clone(), cx)
                 }));
         }
-        let mut result = vec![row.into_any_element()];
-        if !collapsed {
-            result.extend(
-                sessions
-                    .iter()
-                    .map(|session| self.render_session(session, pending, cx)),
-            );
-        }
-        result
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .flex_none()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(cx.theme().border.opacity(0.7))
+            .overflow_hidden()
+            .child(header)
+            .when(!collapsed, |card| {
+                card.children(
+                    sessions
+                        .iter()
+                        .map(|session| self.render_session(session, pending, cx)),
+                )
+            })
+            .into_any_element()
     }
 
     fn render_session(
@@ -784,17 +790,25 @@ impl LocalHistoryImportDialog {
             .w_full()
             .min_w_0()
             .h(px(36.0))
+            .flex_none()
             .items_center()
             .gap_2()
+            .mx_1()
             .px_2()
-            .pl(px(38.0))
             .rounded(px(6.0))
             .when(selectable, |row| {
-                row.cursor_pointer()
-                    .hover(|style| style.bg(cx.theme().muted.opacity(0.36)))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.toggle_session(key_for_click.clone(), cx)
-                    }))
+                // Selected rows keep a primary tint (slightly deepened on
+                // hover) so the selection reads beyond the checkbox.
+                if checked {
+                    row.bg(cx.theme().primary.opacity(0.08))
+                        .hover(|style| style.bg(cx.theme().primary.opacity(0.14)))
+                } else {
+                    row.hover(|style| style.bg(cx.theme().muted.opacity(0.36)))
+                }
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.toggle_session(key_for_click.clone(), cx)
+                }))
             })
             .when(!selectable, |row| row.opacity(0.62))
             .child(self.checkbox(
@@ -830,19 +844,6 @@ impl LocalHistoryImportDialog {
                     .flex_none()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(summary.key.source.label()),
-            )
-            .when(session.status_is_imported(), |row| {
-                row.child(status_badge("imported", self.locale(), cx))
-            })
-            .when(session.status_is_deleted(), |row| {
-                row.child(status_badge("deleted", self.locale(), cx))
-            })
-            .child(
-                div()
-                    .flex_none()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
                     .child(format!(
                         "{} {}",
                         summary.message_count,
@@ -852,7 +853,7 @@ impl LocalHistoryImportDialog {
             .child(
                 div()
                     .flex_none()
-                    .w(px(42.0))
+                    .w(px(64.0))
                     .text_right()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
@@ -982,6 +983,9 @@ impl LocalHistoryImportDialog {
             .child(menu)
     }
 
+    /// Slim list header: master select-all checkbox (aligned with the folder
+    /// header checkboxes), selection counts, scan totals, and the expand /
+    /// collapse toggle.
     fn render_master_row(
         &self,
         folders: &[(LocalHistoryScanFolder, Vec<LocalHistoryScanSession>)],
@@ -1005,11 +1009,6 @@ impl LocalHistoryImportDialog {
         let all_selected = importable_count > 0 && selected_count == importable_count;
         let partial = selected_count > 0 && selected_count < importable_count;
         let interactive = !pending && importable_count > 0;
-        let row_bg = if interactive {
-            cx.theme().muted.opacity(0.24)
-        } else {
-            cx.theme().muted.opacity(0.12)
-        };
         let all_collapsed = !folders.is_empty()
             && folders
                 .iter()
@@ -1022,9 +1021,9 @@ impl LocalHistoryImportDialog {
             .flex_none()
             .items_center()
             .gap_2()
-            .px_2()
+            .pl(px(16.0))
+            .pr_1()
             .rounded(px(6.0))
-            .bg(row_bg)
             .child(self.checkbox(
                 SharedString::from("local-history-master-check"),
                 all_selected,
@@ -1037,18 +1036,17 @@ impl LocalHistoryImportDialog {
                 div()
                     .flex_none()
                     .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(format!("{}/{}", selected_count, importable_count)),
+                    .font_medium()
+                    .child(strings.select_all.to_string()),
             )
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
+                    .flex_none()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(strings.select_all.to_string()),
+                    .child(format!("{}/{}", selected_count, importable_count)),
             )
+            .child(div().flex_1().min_w_0())
             .child(
                 div()
                     .flex_none()
@@ -1110,32 +1108,82 @@ impl LocalHistoryImportDialog {
     }
 
     /// Action bar rendered in the dialog's fixed footer slot, outside the
-    /// scrollable body, so the Import button is always reachable.
-    pub fn render_footer(&self, _cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    /// scrollable body: a selection summary on the left and the Import action
+    /// on the right, so the primary action is always reachable. Closing stays
+    /// on the dialog chrome (title-bar close button / overlay click).
+    pub fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let strings = text(self.locale());
         let pending = self.phase == ImportPhase::Importing;
+        let ready = self.phase == ImportPhase::Ready;
         let selected_count = self.selected.len();
-        h_flex().w_full().items_center().justify_end().child(
-            Button::new("local-history-import")
-                .primary()
-                .small()
-                .loading(pending)
-                .label(if pending {
-                    strings.importing.to_string()
-                } else {
-                    format!(
-                        "{} {} {}",
-                        strings.import_button, selected_count, strings.sessions
-                    )
-                })
-                .disabled(pending || selected_count == 0 || self.phase != ImportPhase::Ready)
-                .on_click({
-                    let this = self.weak_self.clone();
-                    move |_, _, cx| {
-                        let _ = this.update(cx, |dialog, cx| dialog.import_selected(cx));
-                    }
-                }),
-        )
+        h_flex()
+            .w_full()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .items_center()
+                    .gap_1p5()
+                    .when_some(ready.then_some(selected_count), |bar, count| {
+                        if count > 0 {
+                            bar.child(
+                                div()
+                                    .flex_none()
+                                    .rounded_full()
+                                    .bg(cx.theme().primary.opacity(0.12))
+                                    .px_2()
+                                    .text_xs()
+                                    .font_medium()
+                                    .text_color(cx.theme().primary)
+                                    .child(count.to_string()),
+                            )
+                        } else {
+                            bar
+                        }
+                    })
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if selected_count == 0 {
+                                strings.no_selection.to_string()
+                            } else {
+                                format!(
+                                    "{} {} {}",
+                                    strings.import_button, selected_count, strings.sessions
+                                )
+                            }),
+                    ),
+            )
+            .child(
+                h_flex().flex_none().gap_2().child(
+                    Button::new("local-history-import")
+                        .primary()
+                        .small()
+                        .loading(pending)
+                        .label(if pending {
+                            strings.importing.to_string()
+                        } else {
+                            format!(
+                                "{} {} {}",
+                                strings.import_button, selected_count, strings.sessions
+                            )
+                        })
+                        .disabled(
+                            pending || selected_count == 0 || self.phase != ImportPhase::Ready,
+                        )
+                        .on_click({
+                            let this = self.weak_self.clone();
+                            move |_, _, cx| {
+                                let _ = this.update(cx, |dialog, cx| dialog.import_selected(cx));
+                            }
+                        }),
+                ),
+            )
     }
 }
 
@@ -1151,7 +1199,17 @@ impl Render for LocalHistoryImportDialog {
                     .justify_center()
                     .gap_3()
                     .p_8()
-                    .child(Spinner::new())
+                    .child(
+                        div()
+                            .size(px(44.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(12.0))
+                            .bg(cx.theme().muted.opacity(0.3))
+                            .child(Spinner::new()),
+                    )
                     .child(div().text_sm().font_medium().child(strings.scanning));
             }
             ImportPhase::Error => {
@@ -1161,11 +1219,11 @@ impl Render for LocalHistoryImportDialog {
                     .justify_center()
                     .gap_3()
                     .p_8()
-                    .child(
-                        Icon::new(IconName::TriangleAlert)
-                            .size(px(26.0))
-                            .text_color(cx.theme().danger),
-                    )
+                    .child(scan_state_icon(
+                        IconName::TriangleAlert,
+                        cx.theme().danger,
+                        cx,
+                    ))
                     .child(div().text_sm().font_medium().child(strings.scan_failed))
                     .when_some(self.scan_error.clone(), |view, error| {
                         view.child(
@@ -1180,6 +1238,8 @@ impl Render for LocalHistoryImportDialog {
                     .child(
                         Button::new("local-history-retry")
                             .small()
+                            .outline()
+                            .icon(IconName::LoaderCircle)
                             .label(strings.retry)
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 this.scan_sessions(true, cx)
@@ -1201,26 +1261,35 @@ impl Render for LocalHistoryImportDialog {
                     .justify_center()
                     .gap_3()
                     .p_8()
-                    .child(
-                        Icon::new(if failed == 0 {
+                    .child(scan_state_icon(
+                        if failed == 0 {
                             IconName::CircleCheck
                         } else {
                             IconName::TriangleAlert
-                        })
-                        .size(px(28.0))
-                        .text_color(if failed == 0 {
+                        },
+                        if failed == 0 {
                             cx.theme().success
                         } else {
                             cx.theme().danger
-                        }),
-                    )
+                        },
+                        cx,
+                    ))
                     .child(div().text_sm().font_medium().child(strings.done))
-                    .child(h_flex().gap_5().children([
-                        stat(strings.imported, imported),
-                        stat(strings.already_imported, already),
-                        stat(strings.not_found, not_found),
-                        stat(strings.failed, failed),
-                    ]))
+                    .child(
+                        h_flex().gap_2().children(
+                            [
+                                (strings.imported, imported, cx.theme().success),
+                                (
+                                    strings.already_imported,
+                                    already,
+                                    cx.theme().muted_foreground,
+                                ),
+                                (strings.not_found, not_found, cx.theme().muted_foreground),
+                                (strings.failed, failed, cx.theme().danger),
+                            ]
+                            .map(|(label, value, color)| import_stat(label, value, color, cx)),
+                        ),
+                    )
                     .when(!errors.is_empty(), |view| {
                         view.child(
                             v_flex()
@@ -1230,9 +1299,11 @@ impl Render for LocalHistoryImportDialog {
                                 .max_w(px(520.0))
                                 .overflow_y_scroll()
                                 .gap_1()
-                                .p_2()
+                                .rounded(px(8.0))
                                 .border_1()
                                 .border_color(cx.theme().danger.opacity(0.4))
+                                .bg(cx.theme().danger.opacity(0.06))
+                                .p_2()
                                 .children(errors.into_iter().map(|error| {
                                     div().text_xs().text_color(cx.theme().danger).child(error)
                                 })),
@@ -1279,12 +1350,12 @@ impl Render for LocalHistoryImportDialog {
                 .justify_center()
                 .gap_2()
                 .p_8()
-                .child(
-                    Icon::new(IconName::FolderOpen)
-                        .size(px(26.0))
-                        .text_color(cx.theme().muted_foreground),
-                )
-                .child(div().text_sm().child(if empty {
+                .child(scan_state_icon(
+                    IconName::FolderOpen,
+                    cx.theme().muted_foreground,
+                    cx,
+                ))
+                .child(div().text_sm().font_medium().child(if empty {
                     strings.empty
                 } else {
                     strings.no_matches
@@ -1301,7 +1372,7 @@ impl Render for LocalHistoryImportDialog {
         } else {
             let rows = folders
                 .iter()
-                .flat_map(|(folder, sessions)| self.render_folder(folder, sessions, pending, cx))
+                .map(|(folder, sessions)| self.render_folder(folder, sessions, pending, cx))
                 .collect::<Vec<_>>();
             // Plain overflow scrolling with an explicitly tracked handle, not
             // `overflow_y_scrollbar()`: that wrapper makes the content column
@@ -1316,8 +1387,8 @@ impl Render for LocalHistoryImportDialog {
                 .track_scroll(&self.list_scroll)
                 .overflow_y_scroll()
                 .vertical_scrollbar(&self.list_scroll)
-                .gap_1()
-                .p_1()
+                .gap_2()
+                .pb_1()
                 .children(rows)
                 .into_any_element()
         };
@@ -1327,17 +1398,73 @@ impl Render for LocalHistoryImportDialog {
             .h_full()
             .min_h_0()
             .gap_2()
+            .when_some(self.focus_workspace.clone(), |view, workspace| {
+                // Opened from a project's context menu: show which workspace
+                // the scan is scoped to, otherwise the filtered list looks
+                // like an incomplete scan.
+                view.child(
+                    h_flex()
+                        .w_full()
+                        .flex_none()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            h_flex()
+                                .flex_none()
+                                .items_center()
+                                .gap_1p5()
+                                .rounded(px(6.0))
+                                .border_1()
+                                .border_color(cx.theme().primary.opacity(0.35))
+                                .bg(cx.theme().primary.opacity(0.06))
+                                .px_2()
+                                .py(px(3.0))
+                                .child(
+                                    Icon::new(IconName::FolderOpen)
+                                        .size(px(13.0))
+                                        .text_color(cx.theme().primary),
+                                )
+                                .child(
+                                    div()
+                                        .max_w(px(240.0))
+                                        .truncate()
+                                        .text_xs()
+                                        .font_medium()
+                                        .text_color(cx.theme().primary)
+                                        .child(folder_name(&workspace)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(strings.scope_hint),
+                        ),
+                )
+            })
             .child(
+                // Toolbar: search field, agent filter, rescan.
                 h_flex()
                     .w_full()
                     .flex_wrap()
+                    .items_center()
                     .gap_2()
                     .child(
                         Input::new(&self.search_input)
+                            .small()
                             .flex_1()
-                            .min_w(px(180.0))
+                            .min_w(px(160.0))
                             .rounded(px(8.0))
-                            .bg(cx.theme().background),
+                            .bg(cx.theme().background)
+                            .prefix(
+                                h_flex().h_full().items_center().child(
+                                    Icon::new(IconName::Search)
+                                        .small()
+                                        .text_color(cx.theme().muted_foreground),
+                                ),
+                            ),
                     )
                     .when(present_sources.len() > 1, |view| {
                         view.child(self.render_agent_filter(&present_sources, pending, cx))
@@ -1357,20 +1484,10 @@ impl Render for LocalHistoryImportDialog {
             })
             .child(list)
             .when_some(self.scan_error.clone(), |view, error| {
-                view.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().danger)
-                        .child(format!("{}: {}", strings.scan_failed, error)),
-                )
+                view.child(error_banner(strings.scan_failed, &error, cx))
             })
             .when_some(self.import_error.clone(), |view, error| {
-                view.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().danger)
-                        .child(format!("{}: {}", strings.import_failed, error)),
-                )
+                view.child(error_banner(strings.import_failed, &error, cx))
             })
     }
 }
@@ -1397,50 +1514,75 @@ fn folder_matches_focus(folder: &LocalHistoryScanFolder, focus_workspace: Option
     focus_workspace.is_none_or(|target| paths_equal(&folder.workspace_root, target))
 }
 
-trait ScanSessionStatusExt {
-    fn status_is_imported(&self) -> bool;
-    fn status_is_deleted(&self) -> bool;
-}
-
-impl ScanSessionStatusExt for LocalHistoryScanSession {
-    fn status_is_imported(&self) -> bool {
-        self.status == LocalHistoryImportStatus::Imported
-    }
-
-    fn status_is_deleted(&self) -> bool {
-        self.status == LocalHistoryImportStatus::Deleted
-    }
-}
-
-fn status_badge(
-    status: &str,
-    locale: ResolvedLocale,
-    cx: &Context<LocalHistoryImportDialog>,
-) -> AnyElement {
-    let strings = text(locale);
-    let label = if status == "imported" {
-        strings.status_imported
-    } else {
-        strings.status_deleted
-    };
+/// Centered state icon inside a soft rounded tile, used by the error, done,
+/// and empty states.
+fn scan_state_icon(icon: IconName, color: gpui::Hsla, cx: &App) -> AnyElement {
     div()
+        .size(px(44.0))
         .flex_none()
-        .rounded(px(5.0))
-        .border_1()
-        .border_color(cx.theme().border)
-        .px(px(5.0))
-        .py(px(1.0))
-        .text_xs()
-        .child(label)
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(12.0))
+        .bg(cx.theme().muted.opacity(0.3))
+        .child(Icon::new(icon).size(px(20.0)).text_color(color))
         .into_any_element()
 }
 
-fn stat(label: &'static str, value: u32) -> AnyElement {
+fn import_stat(label: &'static str, value: u32, value_color: gpui::Hsla, cx: &App) -> AnyElement {
     v_flex()
         .items_center()
-        .gap_1()
-        .child(div().text_lg().font_medium().child(value.to_string()))
-        .child(div().text_xs().child(label))
+        .gap_0p5()
+        .min_w(px(76.0))
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(cx.theme().border.opacity(0.7))
+        .bg(cx.theme().muted.opacity(0.2))
+        .px_3()
+        .py_2()
+        .child(
+            div()
+                .text_lg()
+                .font_medium()
+                .text_color(value_color)
+                .child(value.to_string()),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(label),
+        )
+        .into_any_element()
+}
+
+fn error_banner(label: &'static str, error: &str, cx: &App) -> AnyElement {
+    h_flex()
+        .w_full()
+        .flex_none()
+        .items_center()
+        .gap_2()
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(cx.theme().danger.opacity(0.35))
+        .bg(cx.theme().danger.opacity(0.08))
+        .px_3()
+        .py_2()
+        .child(
+            Icon::new(IconName::TriangleAlert)
+                .size(px(14.0))
+                .flex_none()
+                .text_color(cx.theme().danger),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .flex_1()
+                .truncate()
+                .text_xs()
+                .text_color(cx.theme().danger)
+                .child(format!("{label}: {error}")),
+        )
         .into_any_element()
 }
 
