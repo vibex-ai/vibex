@@ -1721,10 +1721,10 @@ impl AgentManager {
                 }
                 Ok(LocalHistoryImportWrite::Existing(existing)) => {
                     result.already_imported = result.already_imported.saturating_add(1);
-                    if !existing.deleted {
-                        if let Some(loaded) = SessionRepository::get(&conn, &existing.session_id)? {
-                            result.sessions.push(loaded);
-                        }
+                    if !existing.deleted
+                        && let Some(loaded) = SessionRepository::get(&conn, &existing.session_id)?
+                    {
+                        result.sessions.push(loaded);
                     }
                 }
                 Err(error) => {
