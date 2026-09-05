@@ -34,6 +34,10 @@ pub struct SaveActiveFile;
 
 #[derive(Action, Clone, PartialEq)]
 #[action(namespace = vibex, no_json)]
+pub struct GoToLineInEditor;
+
+#[derive(Action, Clone, PartialEq)]
+#[action(namespace = vibex, no_json)]
 pub struct NavigateBack;
 
 #[derive(Action, Clone, PartialEq)]

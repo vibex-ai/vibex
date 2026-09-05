@@ -15,14 +15,14 @@ use gpui::{
     canvas, deferred, div, img, list, point, prelude::*, px, relative, uniform_list,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath, RopeExt as _,
-    Selectable as _, Sizable as _, Size, StyledExt as _, Theme, WindowExt as _,
+    ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath, Rope,
+    RopeExt as _, Selectable as _, Sizable as _, Size, StyledExt as _, Theme, WindowExt as _,
     button::{Button, ButtonRounded, ButtonVariants as _, DropdownButton},
     calendar::Date,
     date_picker::{DatePicker, DatePickerEvent, DatePickerState},
     dialog::{DialogAction, DialogClose, DialogFooter},
     h_flex,
-    input::{Input, InputEvent, InputState},
+    input::{Input, InputEvent, InputState, Position},
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem},
     notification::Notification,
     resizable::{h_resizable, resizable_panel, v_resizable},
@@ -355,6 +355,12 @@ struct PendingWorkspace {
 struct EditorBinding {
     id: u64,
     input: Entity<InputState>,
+}
+
+struct GotoLineOverlay {
+    path: String,
+    input: Entity<InputState>,
+    _subscription: Subscription,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -980,6 +986,7 @@ pub struct CodeWorkbench {
     pending_file_search_directory_reveal: Option<String>,
     preview_tab_drop_target: Option<PreviewTabDropTarget>,
     preview_pane_drop_target: Option<PreviewPaneDropTarget>,
+    goto_line: Option<GotoLineOverlay>,
     restore_hydration_scheduled: bool,
     recovery_persist_generation: u64,
     recovery_persist_task: Option<Task<()>>,
@@ -1125,6 +1132,7 @@ impl CodeWorkbench {
             pending_file_search_directory_reveal: None,
             preview_tab_drop_target: None,
             preview_pane_drop_target: None,
+            goto_line: None,
             restore_hydration_scheduled: false,
             recovery_persist_generation: 0,
             recovery_persist_task: None,
@@ -4199,7 +4207,12 @@ impl CodeWorkbench {
         }
     }
 
-    pub(crate) fn focus_tab(&mut self, tab_id: String, cx: &mut Context<Self>) {
+    pub(crate) fn focus_tab(
+        &mut self,
+        tab_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.preview.focus(&tab_id) {
             if let Some(PreviewTarget::Terminal { terminal_id }) =
                 self.preview.tabs.get(&tab_id).map(|tab| &tab.target)
@@ -4207,12 +4220,33 @@ impl CodeWorkbench {
                 self.selected_terminal_id = Some(terminal_id.clone());
             }
             self.activate_tab(&tab_id, cx);
+            self.focus_tab_editor_input(&tab_id, window, cx);
             self.persist(cx);
             cx.notify();
         }
     }
 
-    fn focus_adjacent_tab(&mut self, offset: isize, cx: &mut Context<Self>) -> bool {
+    // Switching tabs puts the keyboard where the eyes are: a file tab that
+    // becomes active receives focus so typing lands in it without an extra
+    // click. Terminal and viewer tabs manage their own focus.
+    fn focus_tab_editor_input(&self, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(PreviewTarget::File { path }) =
+            self.preview.tabs.get(tab_id).map(|tab| &tab.target)
+            && let Some(input) = self
+                .editor_bindings
+                .get(path)
+                .map(|binding| binding.input.clone())
+        {
+            input.update(cx, |input, cx| input.focus(window, cx));
+        }
+    }
+
+    fn focus_adjacent_tab(
+        &mut self,
+        offset: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let pane_id = self.preview.focused_pane_id.clone();
         let tab_ids = pane_tab_ids(&self.preview.root, &pane_id).unwrap_or_default();
         if tab_ids.is_empty() {
@@ -4228,8 +4262,34 @@ impl CodeWorkbench {
         let Some(tab_id) = tab_ids.get(next) else {
             return false;
         };
-        self.focus_tab(tab_id.clone(), cx);
+        self.focus_tab(tab_id.clone(), window, cx);
         true
+    }
+
+    /// The tab a single-tab close should hand selection to: the right
+    /// neighbor, else the left one. `None` for the last tab in a pane.
+    fn adjacent_tab_id(&self, tab_id: &str) -> Option<String> {
+        let pane_id = self
+            .preview
+            .pane_ids()
+            .into_iter()
+            .find(|pane_id| {
+                pane_tab_ids(&self.preview.root, pane_id)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|candidate| candidate == tab_id)
+            })?
+            .to_string();
+        let tab_ids = pane_tab_ids(&self.preview.root, &pane_id).unwrap_or_default();
+        let index = tab_ids.iter().position(|candidate| candidate == tab_id)?;
+        tab_ids
+            .get(index + 1)
+            .or_else(|| {
+                index
+                    .checked_sub(1)
+                    .and_then(|previous| tab_ids.get(previous))
+            })
+            .cloned()
     }
 
     pub(crate) fn toggle_markdown_source(&mut self, path: String, cx: &mut Context<Self>) {
@@ -4316,6 +4376,103 @@ impl CodeWorkbench {
         }
     }
 
+    pub(crate) fn begin_goto_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let tab_id = self.preview.active_tab_id(&self.preview.focused_pane_id);
+        let Some(path) = tab_id
+            .and_then(|tab_id| self.preview.tabs.get(tab_id))
+            .and_then(|tab| match &tab.target {
+                PreviewTarget::File { path } => Some(path.clone()),
+                _ => None,
+            })
+        else {
+            return;
+        };
+        let Some(editor_input) = self.editor_bindings.get(&path).map(|b| b.input.clone()) else {
+            return;
+        };
+        let current_line = editor_input
+            .read(cx)
+            .cursor_position()
+            .line
+            .saturating_add(1);
+        // A fresh overlay per invocation: the subscription rides on the struct
+        // so it dies with the overlay, and a stale overlay for another tab is
+        // replaced instead of being reused in the wrong editor.
+        let goto_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(locale::text("Line number", "行号", "行號"))
+        });
+        goto_input.update(cx, |input, cx| {
+            input.set_value(current_line.to_string(), window, cx);
+            let end = input.text().len();
+            input.set_selected_range(0..end, cx);
+            input.focus(window, cx);
+        });
+        let subscription =
+            cx.subscribe_in(
+                &goto_input,
+                window,
+                |this, _, event, window, cx| match event {
+                    InputEvent::PressEnter { shift: false, .. } => {
+                        this.submit_goto_line(window, cx)
+                    }
+                    InputEvent::Blur => this.cancel_goto_line(cx),
+                    _ => {}
+                },
+            );
+        self.goto_line = Some(GotoLineOverlay {
+            path,
+            input: goto_input,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    fn cancel_goto_line(&mut self, cx: &mut Context<Self>) {
+        if self.goto_line.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn submit_goto_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(overlay) = self.goto_line.take() else {
+            return;
+        };
+        let query = overlay.input.read(cx).value().trim().to_string();
+        let Some(editor_input) = self
+            .editor_bindings
+            .get(&overlay.path)
+            .map(|b| b.input.clone())
+        else {
+            cx.notify();
+            return;
+        };
+        let line_count = editor_input.read(cx).text().lines_len().max(1);
+        let Some((line, column)) = parse_goto_line_query(&query, line_count) else {
+            self.error = Some(format!("Go to line: '{query}' is not a line in this file"));
+            cx.notify();
+            return;
+        };
+        editor_input.update(cx, |input, cx| {
+            input.set_cursor_position(
+                Position::new(
+                    line.saturating_sub(1) as u32,
+                    column.saturating_sub(1) as u32,
+                ),
+                window,
+                cx,
+            );
+        });
+        // The editor lays rows out lazily, so the scroll math that centers the
+        // requested line only becomes accurate after the cursor move renders.
+        let line_for_centering = line as u32;
+        cx.on_next_frame(window, move |_, _, cx| {
+            editor_input.update(cx, |input, cx| {
+                center_input_line(input, line_for_centering, cx)
+            });
+        });
+        cx.notify();
+    }
+
     fn protected_tab_ids(&self) -> BTreeSet<String> {
         self.editors
             .dirty_paths()
@@ -4324,12 +4481,23 @@ impl CodeWorkbench {
     }
 
     pub(crate) fn close_tab(&mut self, tab_id: String, force: bool, cx: &mut Context<Self>) {
+        // Hand selection to the neighbor before the model drops the tab; the
+        // fallback in the model would otherwise pick the first tab in the pane.
+        let was_active = self.preview_active_tab_is(tab_id.as_str());
+        let neighbor = self.adjacent_tab_id(&tab_id);
         let disposition = self
             .preview
             .close_guarded(&tab_id, force, &self.protected_tab_ids());
         match disposition {
             PreviewCloseDisposition::Closed => {
                 self.cleanup_closed_tab(&tab_id, force);
+                if was_active
+                    && let Some(neighbor) = neighbor
+                    && self.preview.tabs.contains_key(&neighbor)
+                {
+                    self.preview.focus(&neighbor);
+                    self.activate_tab(&neighbor, cx);
+                }
                 self.sync_terminal_surface_activity(cx);
                 self.persist(cx);
                 self.persist_editor_recovery(cx);
@@ -4344,6 +4512,13 @@ impl CodeWorkbench {
             PreviewCloseDisposition::Missing => {}
         }
         cx.notify();
+    }
+
+    fn preview_active_tab_is(&self, tab_id: &str) -> bool {
+        self.preview
+            .pane_ids()
+            .into_iter()
+            .any(|pane_id| self.preview.active_tab_id(pane_id) == Some(tab_id))
     }
 
     pub(crate) fn toggle_pin(&mut self, tab_id: String, cx: &mut Context<Self>) {
@@ -4389,6 +4564,49 @@ impl CodeWorkbench {
                 PreviewCloseDisposition::Pinned | PreviewCloseDisposition::Protected
             )
         }) {
+            self.error = Some("Pinned or dirty tabs were kept open".into());
+        }
+        self.sync_terminal_surface_activity(cx);
+        self.persist(cx);
+        self.persist_editor_recovery(cx);
+        self.close_preview_panel_if_empty(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn close_tabs_to_side(
+        &mut self,
+        tab_id: String,
+        pane_id: String,
+        left: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab_index) = pane_tab_ids(&self.preview.root, &pane_id)
+            .unwrap_or_default()
+            .iter()
+            .position(|candidate| candidate == &tab_id)
+        else {
+            return;
+        };
+        let pane_tab_ids = pane_tab_ids(&self.preview.root, &pane_id).unwrap_or_default();
+        let candidates: Vec<String> = if left {
+            pane_tab_ids[..tab_index].to_vec()
+        } else {
+            pane_tab_ids[tab_index + 1..].to_vec()
+        };
+        let mut kept_protected = false;
+        for candidate in candidates {
+            let disposition =
+                self.preview
+                    .close_guarded(&candidate, false, &self.protected_tab_ids());
+            match disposition {
+                PreviewCloseDisposition::Closed => self.cleanup_closed_tab(&candidate, false),
+                PreviewCloseDisposition::Pinned | PreviewCloseDisposition::Protected => {
+                    kept_protected = true;
+                }
+                PreviewCloseDisposition::Missing => {}
+            }
+        }
+        if kept_protected {
             self.error = Some("Pinned or dirty tabs were kept open".into());
         }
         self.sync_terminal_surface_activity(cx);
@@ -5534,6 +5752,10 @@ impl CodeWorkbench {
                                 let menu_pane_id = tabs_menu_pane_id.clone();
                                 let close_all_entity = tabs_menu_entity.clone();
                                 let close_all_pane_id = tabs_menu_pane_id.clone();
+                                let close_left_entity = tabs_menu_entity.clone();
+                                let menu_left_pane_id = tabs_menu_pane_id.clone();
+                                let close_right_entity = tabs_menu_entity.clone();
+                                let menu_right_pane_id = tabs_menu_pane_id.clone();
                                 menu.min_w(px(208.0)).max_w(px(208.0))
                                     .item(
                                         PopupMenuItem::new(locale::text(
@@ -5574,6 +5796,55 @@ impl CodeWorkbench {
                                         .on_click(move |_, _, cx| {
                                             let _ = close_all_entity.update(cx, |this, cx| {
                                                 this.close_all_tabs(close_all_pane_id.clone(), cx)
+                                            });
+                                        }),
+                                    )
+                                    .separator()
+                                    .item(
+                                        PopupMenuItem::new(locale::text(
+                                            "Close tabs to the left",
+                                            "关闭左侧标签",
+                                            "關閉左側標籤",
+                                        ))
+                                        .icon(IconName::ChevronLeft)
+                                        .on_click(move |_, _, cx| {
+                                            let _ = close_left_entity.update(cx, |this, cx| {
+                                                let active = this
+                                                    .preview
+                                                    .active_tab_id(&menu_left_pane_id)
+                                                    .map(str::to_string);
+                                                if let Some(active) = active {
+                                                    this.close_tabs_to_side(
+                                                        active,
+                                                        menu_left_pane_id.clone(),
+                                                        true,
+                                                        cx,
+                                                    );
+                                                }
+                                            });
+                                        }),
+                                    )
+                                    .item(
+                                        PopupMenuItem::new(locale::text(
+                                            "Close tabs to the right",
+                                            "关闭右侧标签",
+                                            "關閉右側標籤",
+                                        ))
+                                        .icon(IconName::ChevronRight)
+                                        .on_click(move |_, _, cx| {
+                                            let _ = close_right_entity.update(cx, |this, cx| {
+                                                let active = this
+                                                    .preview
+                                                    .active_tab_id(&menu_right_pane_id)
+                                                    .map(str::to_string);
+                                                if let Some(active) = active {
+                                                    this.close_tabs_to_side(
+                                                        active,
+                                                        menu_right_pane_id.clone(),
+                                                        false,
+                                                        cx,
+                                                    );
+                                                }
                                             });
                                         }),
                                     )
@@ -5725,6 +5996,12 @@ impl CodeWorkbench {
                 }),
             target => tab_label(target),
         };
+        let parent_label = match &tab.target {
+            PreviewTarget::File { path } | PreviewTarget::GitDiff { path, .. } => {
+                relative_parent_path(path).to_string()
+            }
+            _ => String::new(),
+        };
         let target_icon = preview_target_icon(&tab.target, cx);
         let file_path = match &tab.target {
             PreviewTarget::File { path } | PreviewTarget::GitDiff { path, .. } => {
@@ -5736,6 +6013,14 @@ impl CodeWorkbench {
             PreviewTarget::File { path } => Some(path.clone()),
             _ => None,
         };
+        let copy_paths = file_path.as_ref().map(|path| {
+            let absolute = self
+                .workspace
+                .as_ref()
+                .map(|workspace| workspace.root.join(path))
+                .unwrap_or_else(|| PathBuf::from(path));
+            (path.clone(), absolute.to_string_lossy().to_string())
+        });
         let open_in_editor = matches!(tab.target, PreviewTarget::GitDiff { .. });
         let open_in_editor_available = file_path
             .as_deref()
@@ -5763,6 +6048,7 @@ impl CodeWorkbench {
         let pane_id = pane_id.to_string();
         let context_pane_id = pane_id.clone();
         let pane_tabs = pane_tab_ids(&self.preview.root, &pane_id).unwrap_or_default();
+        let tab_index = pane_tabs.iter().position(|candidate| candidate == &tab.id);
         let can_close_other_tabs = pane_tabs.iter().any(|candidate| {
             candidate != &tab.id
                 && self
@@ -5777,6 +6063,22 @@ impl CodeWorkbench {
                 .get(candidate)
                 .is_some_and(|candidate| !candidate.pinned)
         });
+        let can_close_left_tabs = tab_index.is_some_and(|index| {
+            pane_tabs[..index].iter().any(|candidate| {
+                self.preview
+                    .tabs
+                    .get(candidate)
+                    .is_some_and(|candidate| !candidate.pinned)
+            })
+        });
+        let can_close_right_tabs = tab_index.is_some_and(|index| {
+            pane_tabs[index + 1..].iter().any(|candidate| {
+                self.preview
+                    .tabs
+                    .get(candidate)
+                    .is_some_and(|candidate| !candidate.pinned)
+            })
+        });
         let target_id = tab.id.clone();
         let target_pane = pane_id.clone();
         let target_status = preview_tab_visual_status(&tab.target, self.git.status.as_ref());
@@ -5787,8 +6089,12 @@ impl CodeWorkbench {
             tab_id: drag_id,
             label: label.clone().into(),
         };
+        let tab_group = format!("preview-tab:{tab_id}");
+        let dot_group = tab_group.clone();
+        let close_group = tab_group.clone();
         h_flex()
             .id(format!("preview-tab:{}", tab.id))
+            .group(tab_group)
             .relative()
             .h_full()
             .flex_none()
@@ -5816,7 +6122,11 @@ impl CodeWorkbench {
             })
             .hover(|style| {
                 style
-                    .bg(cx.theme().background)
+                    .bg(if active_tab {
+                        cx.theme().background
+                    } else {
+                        cx.theme().muted.opacity(0.45)
+                    })
                     .text_color(cx.theme().foreground)
             })
             .focus_visible(|style| {
@@ -5824,17 +6134,30 @@ impl CodeWorkbench {
                     gpui::BoxShadow::new(px(0.0), px(0.0), cx.theme().ring).spread_radius(px(2.0)),
                 ])
             })
-            .on_click(cx.listener(move |this, _, _, cx| this.focus_tab(select_id.clone(), cx)))
-            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+            .on_click(
+                cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                    if event.click_count() > 1 {
+                        // A double click commits a preview tab so it stops being
+                        // replaced by the next file opened from the file tree.
+                        if temporary && !pinned {
+                            this.toggle_pin(select_id.clone(), cx);
+                        }
+                        cx.stop_propagation();
+                        return;
+                    }
+                    this.focus_tab(select_id.clone(), window, cx);
+                }),
+            )
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "enter" || event.keystroke.key == "space" {
-                    this.focus_tab(keyboard_select_id.clone(), cx);
+                    this.focus_tab(keyboard_select_id.clone(), window, cx);
                     cx.stop_propagation();
                 } else if event.keystroke.key == "arrowleft" {
-                    if this.focus_adjacent_tab(-1, cx) {
+                    if this.focus_adjacent_tab(-1, window, cx) {
                         cx.stop_propagation();
                     }
                 } else if event.keystroke.key == "arrowright" {
-                    if this.focus_adjacent_tab(1, cx) {
+                    if this.focus_adjacent_tab(1, window, cx) {
                         cx.stop_propagation();
                     }
                 } else if (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
@@ -5845,18 +6168,18 @@ impl CodeWorkbench {
                     } else {
                         1
                     };
-                    if this.focus_adjacent_tab(offset, cx) {
+                    if this.focus_adjacent_tab(offset, window, cx) {
                         cx.stop_propagation();
                     }
                 } else if (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
                     && event.keystroke.key == "pageup"
                 {
-                    if this.focus_adjacent_tab(-1, cx) {
+                    if this.focus_adjacent_tab(-1, window, cx) {
                         cx.stop_propagation();
                     }
                 } else if (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
                     && event.keystroke.key == "pagedown"
-                    && this.focus_adjacent_tab(1, cx)
+                    && this.focus_adjacent_tab(1, window, cx)
                 {
                     cx.stop_propagation();
                 }
@@ -5929,15 +6252,6 @@ impl CodeWorkbench {
                         .text_color(cx.theme().muted_foreground),
                 )
             })
-            .when(dirty, |this| {
-                this.child(
-                    div()
-                        .size(px(6.0))
-                        .flex_none()
-                        .rounded_full()
-                        .bg(cx.theme().warning),
-                )
-            })
             .child(
                 div()
                     .min_w_0()
@@ -5947,8 +6261,31 @@ impl CodeWorkbench {
                     .when(target_deleted, |this| this.line_through())
                     .child(label),
             )
+            .when_some(
+                (!parent_label.is_empty()).then_some(parent_label.clone()),
+                |this, parent_label| {
+                    this.child(
+                        div()
+                            .min_w_0()
+                            .flex_none()
+                            .max_w(px(96.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_color(cx.theme().muted_foreground.opacity(if active_tab {
+                                0.85
+                            } else {
+                                0.6
+                            }))
+                            .child(parent_label),
+                    )
+                },
+            )
             .when(!pinned, |this| {
                 this.child(
+                    // The dirty dot and the close button occupy the same end
+                    // slot: a click on the dot would close the editor out from
+                    // under unsaved work, so it turns into the close button
+                    // only while the pointer stays on the tab.
                     div()
                         .id(format!("close-preview-tab:{}", tab.id))
                         .ml_1()
@@ -5957,13 +6294,12 @@ impl CodeWorkbench {
                         .items_center()
                         .justify_center()
                         .rounded_sm()
-                        .opacity(0.60)
                         .cursor_default()
                         .focusable()
                         .tab_stop(true)
                         .role(Role::Button)
                         .aria_label(locale::text("Close tab", "关闭标签", "關閉標籤"))
-                        .hover(|style| style.bg(cx.theme().muted).opacity(1.0))
+                        .group_hover(close_group.clone(), |style| style.bg(cx.theme().muted))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.close_tab(close_click_id.clone(), false, cx);
                             cx.stop_propagation();
@@ -5981,17 +6317,41 @@ impl CodeWorkbench {
                         .on_mouse_down(MouseButton::Middle, |_, _, cx| {
                             cx.stop_propagation();
                         })
-                        .child(Icon::new(IconName::Close).size(px(12.0))),
+                        .when(dirty, |this| {
+                            this.group_hover(close_group.clone(), |style| style.invisible())
+                                .child(
+                                    div()
+                                        .group_hover(dot_group.clone(), |style| style.invisible())
+                                        .child(
+                                            div()
+                                                .size(px(6.0))
+                                                .flex_none()
+                                                .rounded_full()
+                                                .bg(cx.theme().warning),
+                                        ),
+                                )
+                        })
+                        .child(
+                            div()
+                                .absolute()
+                                .flex()
+                                .size_full()
+                                .items_center()
+                                .justify_center()
+                                .opacity(0.0)
+                                .group_hover(close_group.clone(), |style| style.opacity(1.0))
+                                .child(Icon::new(IconName::Close).size(px(12.0))),
+                        ),
                 )
             })
             .when(active_tab, |this| {
                 this.child(
                     div()
                         .absolute()
-                        .left(px(2.0))
-                        .right(px(2.0))
-                        .bottom_0()
-                        .h(px(1.0))
+                        .left_0()
+                        .right_0()
+                        .top_0()
+                        .h(px(2.0))
                         .rounded_full()
                         .bg(cx.theme().primary.opacity(0.80)),
                 )
@@ -5999,7 +6359,8 @@ impl CodeWorkbench {
             .context_menu(move |menu, window, cx| {
                 let focus_entity = context_entity.clone();
                 let focus_id = tab_id.clone();
-                let _ = focus_entity.update(cx, |this, cx| this.focus_tab(focus_id.clone(), cx));
+                let _ = focus_entity
+                    .update(cx, |this, cx| this.focus_tab(focus_id.clone(), window, cx));
                 let pin_entity = context_entity.clone();
                 let pin_id = tab_id.clone();
                 let split_right_entity = context_entity.clone();
@@ -6013,6 +6374,12 @@ impl CodeWorkbench {
                 let close_other_entity = context_entity.clone();
                 let close_other_id = tab_id.clone();
                 let close_other_pane = context_pane_id.clone();
+                let close_left_entity = context_entity.clone();
+                let close_left_id = tab_id.clone();
+                let close_left_pane = context_pane_id.clone();
+                let close_right_entity = context_entity.clone();
+                let close_right_id = tab_id.clone();
+                let close_right_pane = context_pane_id.clone();
                 let close_all_entity = context_entity.clone();
                 let close_all_pane = context_pane_id.clone();
                 let mut menu = menu
@@ -6041,6 +6408,44 @@ impl CodeWorkbench {
                                 this.close_other_tabs(
                                     close_other_id.clone(),
                                     close_other_pane.clone(),
+                                    cx,
+                                )
+                            });
+                        }),
+                    )
+                    .item(
+                        PopupMenuItem::new(locale::text(
+                            "Close tabs to the left",
+                            "关闭左侧标签",
+                            "關閉左側標籤",
+                        ))
+                        .icon(IconName::ChevronLeft)
+                        .disabled(!can_close_left_tabs)
+                        .on_click(move |_, _, cx| {
+                            let _ = close_left_entity.update(cx, |this, cx| {
+                                this.close_tabs_to_side(
+                                    close_left_id.clone(),
+                                    close_left_pane.clone(),
+                                    true,
+                                    cx,
+                                )
+                            });
+                        }),
+                    )
+                    .item(
+                        PopupMenuItem::new(locale::text(
+                            "Close tabs to the right",
+                            "关闭右侧标签",
+                            "關閉右側標籤",
+                        ))
+                        .icon(IconName::ChevronRight)
+                        .disabled(!can_close_right_tabs)
+                        .on_click(move |_, _, cx| {
+                            let _ = close_right_entity.update(cx, |this, cx| {
+                                this.close_tabs_to_side(
+                                    close_right_id.clone(),
+                                    close_right_pane.clone(),
+                                    false,
                                     cx,
                                 )
                             });
@@ -6112,6 +6517,36 @@ impl CodeWorkbench {
                                 });
                             }),
                     );
+                }
+                if let Some((relative_path, absolute_path)) = copy_paths.clone() {
+                    menu = menu
+                        .separator()
+                        .item(
+                            PopupMenuItem::new(locale::text(
+                                "Copy relative path",
+                                "复制相对路径",
+                                "複製相對路徑",
+                            ))
+                            .icon(IconName::Copy)
+                            .on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    relative_path.clone(),
+                                ));
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::new(locale::text(
+                                "Copy absolute path",
+                                "复制完整路径",
+                                "複製完整路徑",
+                            ))
+                            .icon(IconName::Copy)
+                            .on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    absolute_path.clone(),
+                                ));
+                            }),
+                        );
                 }
                 let file_open_path = file_path.clone();
                 if file_open_path.is_some() {
@@ -6528,6 +6963,8 @@ impl CodeWorkbench {
             let input_state = binding.input.read(cx);
             let cursor = input_state.cursor_position();
             let line_count = input_state.text().lines_len().max(1);
+            let selection =
+                editor_selection_summary(input_state.text(), input_state.selected_range());
             let language = buffer
                 .as_ref()
                 .and_then(|buffer| buffer.language.as_deref())
@@ -6556,9 +6993,10 @@ impl CodeWorkbench {
             let show_whitespaces = self.editor_show_whitespaces;
             let soft_wrap_entity = cx.weak_entity();
             let whitespace_entity = cx.weak_entity();
-            return v_flex()
+            let element = v_flex()
                 .size_full()
                 .min_h_0()
+                .relative()
                 .child(
                     h_flex()
                         .h(px(38.0))
@@ -6772,11 +7210,26 @@ impl CodeWorkbench {
                             h_flex()
                                 .flex_none()
                                 .gap_3()
-                                .child(format!(
-                                    "Ln {}, Col {}",
-                                    cursor.line.saturating_add(1),
-                                    cursor.character.saturating_add(1)
-                                ))
+                                .child(
+                                    Button::new(format!("editor-goto-line:{path}"))
+                                        .xsmall()
+                                        .ghost()
+                                        .compact()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .label(format!(
+                                            "Ln {}, Col {}",
+                                            cursor.line.saturating_add(1),
+                                            cursor.character.saturating_add(1)
+                                        ))
+                                        .tooltip(locale::text("Go to line", "跳转到行", "跳轉到行"))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.begin_goto_line(window, cx)
+                                        })),
+                                )
+                                .when_some(selection.clone(), |this, selection| {
+                                    this.child(div().child(selection))
+                                })
                                 .child(format!("{} lines", line_count)),
                         )
                         .child(
@@ -6789,8 +7242,57 @@ impl CodeWorkbench {
                                 .child(line_ending)
                                 .child(size),
                         ),
-                )
-                .into_any_element();
+                );
+            let element = match self
+                .goto_line
+                .as_ref()
+                .filter(|overlay| overlay.path == path)
+                .map(|overlay| overlay.input.clone())
+            {
+                Some(goto_input) => element
+                    .child(
+                        // Anchored above the status bar at the end: the jump
+                        // usually targets a lower line, and keeping the input
+                        // away from the caret leaves the target row visible.
+                        h_flex()
+                            .id("editor-goto-line-overlay")
+                            .absolute()
+                            .right_3()
+                            .bottom(px(30.0))
+                            .w(px(200.0))
+                            .flex_none()
+                            .items_center()
+                            .gap_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .bg(cx.theme().background)
+                            .px_2()
+                            .py(px(3.0))
+                            .shadow_md()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(Input::new(&goto_input).small().appearance(false)),
+                            )
+                            .child(
+                                Button::new(format!("editor-goto-cancel:{path}"))
+                                    .xsmall()
+                                    .ghost()
+                                    .compact()
+                                    .icon(IconName::Close)
+                                    .text_color(cx.theme().muted_foreground)
+                                    .tooltip(locale::text("Close", "关闭", "關閉"))
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.cancel_goto_line(cx)),
+                                    ),
+                            ),
+                    )
+                    .into_any_element(),
+                None => element.into_any_element(),
+            };
+            return element;
         }
         match self.presentations.get(&path) {
             Some(FilePresentation::Loading) => self.render_empty(
@@ -7318,7 +7820,7 @@ impl Render for CodeWorkbench {
             .size_full()
             .min_w_0()
             .bg(cx.theme().background)
-            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 let modifiers = event.keystroke.modifiers;
                 if !(modifiers.control || modifiers.platform) || modifiers.alt {
                     return;
@@ -7353,7 +7855,7 @@ impl Render for CodeWorkbench {
                     } else {
                         offset
                     };
-                    if this.focus_adjacent_tab(offset, cx) {
+                    if this.focus_adjacent_tab(offset, window, cx) {
                         cx.stop_propagation();
                     }
                 }
@@ -13410,6 +13912,46 @@ fn center_input_line(input: &mut InputState, line: u32, cx: &mut Context<InputSt
     input.set_scroll_offset(offset, cx);
 }
 
+/// Parse a "go to line" request as `line`, `line:column`, or `line,column`.
+/// Both numbers are 1-based; the line is clamped to the buffer and missing or
+/// zero columns fall back to the line start.
+fn parse_goto_line_query(query: &str, line_count: usize) -> Option<(usize, usize)> {
+    let query = query.trim();
+    if query.is_empty() {
+        return None;
+    }
+    let mut parts = query.split([':', ',']);
+    let line = parts.next()?.trim().parse::<usize>().ok()?;
+    let column = match parts.next() {
+        Some(part) => Some(part.trim().parse::<usize>().ok()?.max(1)),
+        None => None,
+    };
+    if parts.next().is_some() || line == 0 {
+        return None;
+    }
+    Some((line.min(line_count), column.unwrap_or(1)))
+}
+
+/// One-line status-bar summary of the current selection: characters plus the
+/// spanned lines. `None` while the selection is empty (a bare caret).
+fn editor_selection_summary(text: &Rope, range: std::ops::Range<usize>) -> Option<String> {
+    // Round-trip through points so both offsets land on char boundaries.
+    let start = text.point_to_offset(text.offset_to_point(range.start));
+    let end = text.point_to_offset(text.offset_to_point(range.end));
+    if start >= end {
+        return None;
+    }
+    let chars = text.slice(start..end).chars().count();
+    let first_line = text.offset_to_point(start).row;
+    let last_line = text.offset_to_point(end - 1).row;
+    let lines = last_line - first_line + 1;
+    if lines > 1 {
+        Some(format!("{chars} chars ({lines} lines)"))
+    } else {
+        Some(format!("{chars} chars selected"))
+    }
+}
+
 fn open_tool_element(tool_id: &str, size: gpui::Pixels, cx: &gpui::App) -> AnyElement {
     if let Some(icon) = open_tool_brand_icon(tool_id, size, cx.theme().foreground) {
         return icon;
@@ -14848,6 +15390,35 @@ mod tests {
         assert_eq!(rendered.frame_count(), 1);
         assert_eq!(rendered.size(0).width.0, 2);
         assert_eq!(rendered.size(0).height.0, 2);
+    }
+
+    #[test]
+    fn goto_line_queries_accept_line_and_column_and_clamp() {
+        assert_eq!(parse_goto_line_query("12", 200), Some((12, 1)));
+        assert_eq!(parse_goto_line_query("12:5", 200), Some((12, 5)));
+        assert_eq!(parse_goto_line_query(" 12,5 ", 200), Some((12, 5)));
+        assert_eq!(parse_goto_line_query("12:5:9", 200), None);
+        assert_eq!(parse_goto_line_query("0", 200), None);
+        assert_eq!(parse_goto_line_query("abc", 200), None);
+        assert_eq!(parse_goto_line_query("", 200), None);
+        assert_eq!(parse_goto_line_query("12:0", 200), Some((12, 1)));
+        // Out-of-range lines clamp to the last line the buffer actually has.
+        assert_eq!(parse_goto_line_query("9999", 200), Some((200, 1)));
+    }
+
+    #[test]
+    fn editor_selection_summary_reports_characters_and_line_span() {
+        let text = Rope::from("alpha\nbeta\ngamma");
+        let offset = |line: usize, column: usize| text.line_start_offset(line) + column;
+        assert_eq!(
+            editor_selection_summary(&text, offset(0, 1)..offset(0, 4),),
+            Some("3 chars selected".into())
+        );
+        assert_eq!(
+            editor_selection_summary(&text, offset(0, 2)..offset(2, 3),),
+            Some("12 chars (3 lines)".into())
+        );
+        assert_eq!(editor_selection_summary(&text, 4..4), None);
     }
 
     #[test]

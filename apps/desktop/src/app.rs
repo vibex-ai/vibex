@@ -139,9 +139,9 @@ use vibex_ui::{
 };
 
 use crate::actions::{
-    NavigateBack, NavigateForward, OpenConversationFind, OpenSettings, RedoImageEdit, RetryRuntime,
-    SaveActiveFile, ToggleComposerMode, TogglePreview, ToggleRightRail, ToggleSidebar,
-    UndoImageEdit,
+    GoToLineInEditor, NavigateBack, NavigateForward, OpenConversationFind, OpenSettings,
+    RedoImageEdit, RetryRuntime, SaveActiveFile, ToggleComposerMode, TogglePreview,
+    ToggleRightRail, ToggleSidebar, UndoImageEdit,
 };
 use crate::assets::{agent_brand_icon, model_brand_icon, window_icon};
 use crate::code_workbench::{
@@ -22132,6 +22132,16 @@ impl VibexWorkbench {
     fn on_save_active_file(&mut self, _: &SaveActiveFile, _: &mut Window, cx: &mut Context<Self>) {
         self.code_workbench
             .update(cx, |workbench, cx| workbench.save_active_editor(cx));
+    }
+
+    fn on_goto_line_in_editor(
+        &mut self,
+        _: &GoToLineInEditor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.code_workbench
+            .update(cx, |workbench, cx| workbench.begin_goto_line(window, cx));
     }
 
     fn set_theme(&mut self, mode: ModelThemeMode, window: &mut Window, cx: &mut Context<Self>) {
@@ -44258,6 +44268,7 @@ const FOUNDATION_SHORTCUTS: &[(&str, &str)] = &[
     ("open_conversation_find", "cmd-f"),
     ("retry_runtime", "cmd-r"),
     ("save_active_file", "cmd-s"),
+    ("goto_line_in_editor", "ctrl-g"),
     ("navigate_back", "alt-left"),
     ("navigate_forward", "alt-right"),
     ("undo_image_edit", UNDO_IMAGE_EDIT_SHORTCUT),
@@ -44289,6 +44300,7 @@ fn shortcut_action_label(action: &str) -> &'static str {
         "open_conversation_find" => "Find in conversation",
         "retry_runtime" => "Retry runtime",
         "save_active_file" => "Save active file",
+        "goto_line_in_editor" => locale::text("Go to line in editor", "跳转到行", "跳轉到行"),
         "navigate_back" => "Navigate back",
         "navigate_forward" => "Navigate forward",
         "undo_image_edit" => locale::text("Undo image edit", "撤销图片编辑", "復原圖片編輯"),
@@ -44303,7 +44315,7 @@ fn shortcut_action_group(action: &str) -> &'static str {
         "toggle_composer_mode" => locale::text("Composer", "输入框", "輸入框"),
         "open_settings" | "open_conversation_find" => "Navigation",
         "retry_runtime" => "Runtime",
-        "save_active_file" => "Editor",
+        "save_active_file" | "goto_line_in_editor" => "Editor",
         "navigate_back" | "navigate_forward" => "Navigation",
         "undo_image_edit" | "redo_image_edit" => {
             locale::text("Image editor", "图片编辑器", "圖片編輯器")
@@ -48819,6 +48831,7 @@ impl Render for VibexWorkbench {
             .on_action(cx.listener(Self::on_open_conversation_find))
             .on_action(cx.listener(Self::on_retry_runtime))
             .on_action(cx.listener(Self::on_save_active_file))
+            .on_action(cx.listener(Self::on_goto_line_in_editor))
             .on_action(cx.listener(Self::on_navigate_back))
             .on_action(cx.listener(Self::on_navigate_forward))
             .on_action(cx.listener(Self::on_undo_image_edit))
@@ -48969,6 +48982,9 @@ fn bind_action(bindings: &mut Vec<KeyBinding>, keystroke: &str, action: &str, un
         "save_active_file" | "vibex::SaveActiveFile" => {
             push!(SaveActiveFile, "vibex::SaveActiveFile")
         }
+        "goto_line_in_editor" | "vibex::GoToLineInEditor" => {
+            push!(GoToLineInEditor, "vibex::GoToLineInEditor")
+        }
         "navigate_back" | "vibex::NavigateBack" => push!(NavigateBack, "vibex::NavigateBack"),
         "navigate_forward" | "vibex::NavigateForward" => {
             push!(NavigateForward, "vibex::NavigateForward")
@@ -48989,6 +49005,7 @@ fn action_name(action: &str) -> &'static str {
         "open_conversation_find" => "vibex::OpenConversationFind",
         "retry_runtime" => "vibex::RetryRuntime",
         "save_active_file" => "vibex::SaveActiveFile",
+        "goto_line_in_editor" => "vibex::GoToLineInEditor",
         "navigate_back" => "vibex::NavigateBack",
         "navigate_forward" => "vibex::NavigateForward",
         "undo_image_edit" => "vibex::UndoImageEdit",
