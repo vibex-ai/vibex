@@ -150,29 +150,26 @@ fn cached_file_summary(
         path: path.to_path_buf(),
     };
     let before = fingerprint(path);
-    if let Some(before) = before {
-        if let Ok(cache) = summary_cache().lock() {
-            if let Some(cached) = cache
-                .get(&key)
-                .filter(|cached| cached.fingerprint == before)
-            {
-                return Ok(Some(cached.summary.clone()));
-            }
-        }
+    if let Some(before) = before
+        && let Ok(cache) = summary_cache().lock()
+        && let Some(cached) = cache
+            .get(&key)
+            .filter(|cached| cached.fingerprint == before)
+    {
+        return Ok(Some(cached.summary.clone()));
     }
     let parsed = parse()?;
-    if let (Some(before), Some(summary)) = (before, parsed.as_ref()) {
-        if fingerprint(path) == Some(before) {
-            if let Ok(mut cache) = summary_cache().lock() {
-                cache.insert(
-                    key,
-                    CachedSummary {
-                        fingerprint: before,
-                        summary: summary.clone(),
-                    },
-                );
-            }
-        }
+    if let (Some(before), Some(summary)) = (before, parsed.as_ref())
+        && fingerprint(path) == Some(before)
+        && let Ok(mut cache) = summary_cache().lock()
+    {
+        cache.insert(
+            key,
+            CachedSummary {
+                fingerprint: before,
+                summary: summary.clone(),
+            },
+        );
     }
     Ok(parsed)
 }
@@ -250,10 +247,10 @@ fn expand_home_prefix(value: &str, home_dir: Option<&Path>) -> PathBuf {
         if let Some(home) = home_dir {
             return home.to_path_buf();
         }
-    } else if let Some(rest) = value.strip_prefix("~/") {
-        if let Some(home) = home_dir {
-            return home.join(rest);
-        }
+    } else if let Some(rest) = value.strip_prefix("~/")
+        && let Some(home) = home_dir
+    {
+        return home.join(rest);
     }
     PathBuf::from(value)
 }
@@ -620,18 +617,30 @@ fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn build_summary(
+struct SummaryCandidate<'a> {
     source: LocalHistorySource,
-    external_id: impl Into<String>,
+    external_id: String,
     title: Option<String>,
     workspace_root: Option<String>,
-    source_path: &Path,
+    source_path: &'a Path,
     started_at_ms: Option<i64>,
     updated_at_ms: Option<i64>,
     message_count: u32,
     model: Option<String>,
-) -> Option<LocalHistorySessionSummary> {
-    let external_id = external_id.into();
+}
+
+fn build_summary(candidate: SummaryCandidate<'_>) -> Option<LocalHistorySessionSummary> {
+    let SummaryCandidate {
+        source,
+        external_id,
+        title,
+        workspace_root,
+        source_path,
+        started_at_ms,
+        updated_at_ms,
+        message_count,
+        model,
+    } = candidate;
     if external_id.trim().is_empty() || message_count == 0 {
         return None;
     }
@@ -668,7 +677,7 @@ fn user_entry_with_attachments(
     timestamp_ms: Option<i64>,
 ) -> Option<LocalHistoryTimelineEntry> {
     let text = bounded_text(&text, MAX_TEXT_CHARS);
-    (!text.is_empty() || !attachments.is_empty()).then(|| LocalHistoryTimelineEntry {
+    (!text.is_empty() || !attachments.is_empty()).then_some(LocalHistoryTimelineEntry {
         source: TimelineSource::User,
         payload: TimelinePayload::UserMessage(UserMessagePayload { text, attachments }),
         timestamp_ms,
@@ -677,7 +686,7 @@ fn user_entry_with_attachments(
 
 fn agent_entry(text: String, timestamp_ms: Option<i64>) -> Option<LocalHistoryTimelineEntry> {
     let text = bounded_text(&text, MAX_TEXT_CHARS);
-    (!text.is_empty()).then(|| LocalHistoryTimelineEntry {
+    (!text.is_empty()).then_some(LocalHistoryTimelineEntry {
         source: TimelineSource::Agent,
         payload: TimelinePayload::AgentMessage(AgentMessagePayload {
             text,
@@ -689,7 +698,7 @@ fn agent_entry(text: String, timestamp_ms: Option<i64>) -> Option<LocalHistoryTi
 
 fn reasoning_entry(text: String, timestamp_ms: Option<i64>) -> Option<LocalHistoryTimelineEntry> {
     let text = bounded_text(&text, MAX_TEXT_CHARS);
-    (!text.is_empty()).then(|| LocalHistoryTimelineEntry {
+    (!text.is_empty()).then_some(LocalHistoryTimelineEntry {
         source: TimelineSource::Agent,
         payload: TimelinePayload::Reasoning(ReasoningPayload {
             text,
@@ -795,10 +804,8 @@ const CLAUDE_CONTEXT_CONTINUATION_PREFIX: &str =
 fn strip_claude_system_tags(text: &str) -> Option<String> {
     let mut output = text.to_string();
     for tag in CLAUDE_SYSTEM_TAGS {
-        loop {
-            let Some(start) = output.find(&format!("<{tag}")) else {
-                break;
-            };
+        let open = format!("<{tag}");
+        while let Some(start) = output.find(&open) {
             let Some(open_end) = output[start..].find('>') else {
                 break;
             };
@@ -923,7 +930,7 @@ fn claude_interrupt_marker(value: &Value) -> bool {
 
 fn system_entry(text: String, timestamp_ms: Option<i64>) -> Option<LocalHistoryTimelineEntry> {
     let text = bounded_text(&text, MAX_TEXT_CHARS);
-    (!text.is_empty()).then(|| LocalHistoryTimelineEntry {
+    (!text.is_empty()).then_some(LocalHistoryTimelineEntry {
         source: TimelineSource::System,
         payload: TimelinePayload::SystemNotice(SystemNoticePayload {
             level: SystemNoticeLevel::Info,
@@ -1061,17 +1068,17 @@ fn parse_claude_summary(
             }
         }
     })?;
-    Ok(build_summary(
-        LocalHistorySource::Claude,
-        id.unwrap_or(fallback_id),
-        custom_title.or(ai_title).or(first_user),
-        workspace.or(fallback_workspace),
-        path,
-        started,
-        updated,
+    Ok(build_summary(SummaryCandidate {
+        source: LocalHistorySource::Claude,
+        external_id: id.unwrap_or(fallback_id),
+        title: custom_title.or(ai_title).or(first_user),
+        workspace_root: workspace.or(fallback_workspace),
+        source_path: path,
+        started_at_ms: started,
+        updated_at_ms: updated,
         message_count,
         model,
-    ))
+    }))
 }
 
 fn parse_claude_timeline(path: &Path) -> VibexResult<Vec<LocalHistoryTimelineEntry>> {
@@ -1101,10 +1108,10 @@ fn parse_claude_timeline(path: &Path) -> VibexResult<Vec<LocalHistoryTimelineEnt
                     return;
                 }
                 let text = claude_user_text(&value);
-                if !claude_tool_result_only(&value) {
-                    if let Some(entry) = user_entry(text, timestamp) {
-                        timeline.push(entry);
-                    }
+                if !claude_tool_result_only(&value)
+                    && let Some(entry) = user_entry(text, timestamp)
+                {
+                    timeline.push(entry);
                 }
                 if let Some(parts) = claude_message_content(&value).and_then(Value::as_array) {
                     for part in parts {
@@ -1294,17 +1301,17 @@ fn parse_codex_summary(path: &Path) -> Result<Option<LocalHistorySessionSummary>
             _ => {}
         }
     })?;
-    Ok(build_summary(
-        LocalHistorySource::Codex,
-        id,
+    Ok(build_summary(SummaryCandidate {
+        source: LocalHistorySource::Codex,
+        external_id: id,
         title,
-        workspace,
-        path,
-        started,
-        updated,
+        workspace_root: workspace,
+        source_path: path,
+        started_at_ms: started,
+        updated_at_ms: updated,
         message_count,
         model,
-    ))
+    }))
 }
 
 fn parse_codex_timeline(path: &Path) -> VibexResult<Vec<LocalHistoryTimelineEntry>> {
@@ -1404,10 +1411,10 @@ fn parse_gemini_document(path: &Path) -> Result<Value, String> {
                 root.insert(key.to_string(), field.clone());
             }
         }
-        if let Some(set) = object.get("$set").and_then(Value::as_object) {
-            if let Some(last_updated) = set.get("lastUpdated") {
-                root.insert("lastUpdated".to_string(), last_updated.clone());
-            }
+        if let Some(set) = object.get("$set").and_then(Value::as_object)
+            && let Some(last_updated) = set.get("lastUpdated")
+        {
+            root.insert("lastUpdated".to_string(), last_updated.clone());
         }
         if object.get("type").and_then(Value::as_str).is_none() {
             continue;
@@ -1521,17 +1528,17 @@ fn parse_gemini_summary(
             break;
         }
     }
-    Ok(build_summary(
-        LocalHistorySource::Gemini,
-        id,
-        title.or(first_user),
-        gemini_workspace(root, alias_dir),
-        path,
-        started,
-        updated,
+    Ok(build_summary(SummaryCandidate {
+        source: LocalHistorySource::Gemini,
+        external_id: id,
+        title: title.or(first_user),
+        workspace_root: gemini_workspace(root, alias_dir),
+        source_path: path,
+        started_at_ms: started,
+        updated_at_ms: updated,
         message_count,
         model,
-    ))
+    }))
 }
 
 fn parse_gemini_timeline(path: &Path) -> VibexResult<Vec<LocalHistoryTimelineEntry>> {
@@ -1547,10 +1554,10 @@ fn parse_gemini_timeline(path: &Path) -> VibexResult<Vec<LocalHistoryTimelineEnt
         match message.get("type").and_then(Value::as_str) {
             Some("user") => {
                 let text = text_string_or_parts(message.get("content"));
-                if !text.trim_start().starts_with("<session_context") {
-                    if let Some(entry) = user_entry(text, timestamp) {
-                        timeline.push(entry);
-                    }
+                if !text.trim_start().starts_with("<session_context")
+                    && let Some(entry) = user_entry(text, timestamp)
+                {
+                    timeline.push(entry);
                 }
             }
             Some("gemini" | "assistant" | "model") => {
@@ -1719,17 +1726,17 @@ fn parse_cline_summary(
                 .map(ToOwned::to_owned)
         });
     }
-    Ok(build_summary(
-        LocalHistorySource::Cline,
-        task_id,
+    Ok(build_summary(SummaryCandidate {
+        source: LocalHistorySource::Cline,
+        external_id: task_id,
         title,
-        workspace,
-        transcript,
-        started,
-        updated,
+        workspace_root: workspace,
+        source_path: transcript,
+        started_at_ms: started,
+        updated_at_ms: updated,
         message_count,
         model,
-    ))
+    }))
 }
 
 fn parse_cline_timeline(
@@ -1847,17 +1854,17 @@ fn scan_opencode(root: &LocalHistorySourceRoot) -> ScanBatch {
         {
             continue;
         }
-        let Some(summary) = build_summary(
-            LocalHistorySource::OpenCode,
-            id.clone(),
+        let Some(summary) = build_summary(SummaryCandidate {
+            source: LocalHistorySource::OpenCode,
+            external_id: id.clone(),
             title,
-            directory,
-            &database,
-            Some(timestamp_number_to_ms(created)),
-            Some(timestamp_number_to_ms(updated)),
-            count.min(u32::MAX as i64) as u32,
+            workspace_root: directory,
+            source_path: &database,
+            started_at_ms: Some(timestamp_number_to_ms(created)),
+            updated_at_ms: Some(timestamp_number_to_ms(updated)),
+            message_count: count.min(u32::MAX as i64) as u32,
             model,
-        ) else {
+        }) else {
             continue;
         };
         batch.found.push(FoundSession {
@@ -1918,17 +1925,17 @@ fn parse_opencode_summary(
     {
         return Ok(None);
     }
-    Ok(build_summary(
-        LocalHistorySource::OpenCode,
-        id,
+    Ok(build_summary(SummaryCandidate {
+        source: LocalHistorySource::OpenCode,
+        external_id: id,
         title,
-        directory,
-        database,
-        Some(timestamp_number_to_ms(created)),
-        Some(timestamp_number_to_ms(updated)),
-        count.max(0).min(u32::MAX as i64) as u32,
+        workspace_root: directory,
+        source_path: database,
+        started_at_ms: Some(timestamp_number_to_ms(created)),
+        updated_at_ms: Some(timestamp_number_to_ms(updated)),
+        message_count: count.max(0).min(u32::MAX as i64) as u32,
         model,
-    ))
+    }))
 }
 
 fn parse_opencode_timeline(
@@ -2195,17 +2202,17 @@ fn scan_hermes(root: &LocalHistorySourceRoot) -> ScanBatch {
         if count <= 0 {
             continue;
         }
-        let Some(summary) = build_summary(
-            LocalHistorySource::Hermes,
-            id.clone(),
+        let Some(summary) = build_summary(SummaryCandidate {
+            source: LocalHistorySource::Hermes,
+            external_id: id.clone(),
             title,
-            cwd,
-            &database,
-            started.map(seconds_number_to_ms),
-            ended.map(seconds_number_to_ms),
-            count.min(u32::MAX as i64) as u32,
+            workspace_root: cwd,
+            source_path: &database,
+            started_at_ms: started.map(seconds_number_to_ms),
+            updated_at_ms: ended.map(seconds_number_to_ms),
+            message_count: count.min(u32::MAX as i64) as u32,
             model,
-        ) else {
+        }) else {
             continue;
         };
         batch.found.push(FoundSession {
@@ -2257,17 +2264,17 @@ fn parse_hermes_summary(
     let Some((id, cwd, title, model, started, ended, count)) = row else {
         return Ok(None);
     };
-    Ok(build_summary(
-        LocalHistorySource::Hermes,
-        id,
+    Ok(build_summary(SummaryCandidate {
+        source: LocalHistorySource::Hermes,
+        external_id: id,
         title,
-        cwd,
-        database,
-        started.map(seconds_number_to_ms),
-        ended.map(seconds_number_to_ms),
-        count.max(0).min(u32::MAX as i64) as u32,
+        workspace_root: cwd,
+        source_path: database,
+        started_at_ms: started.map(seconds_number_to_ms),
+        updated_at_ms: ended.map(seconds_number_to_ms),
+        message_count: count.max(0).min(u32::MAX as i64) as u32,
         model,
-    ))
+    }))
 }
 
 fn parse_hermes_timeline(
@@ -2655,17 +2662,17 @@ fn parse_codebuddy_summary(path: &Path) -> Result<Option<LocalHistorySessionSumm
             _ => {}
         }
     })?;
-    Ok(build_summary(
-        LocalHistorySource::CodeBuddy,
-        id,
-        custom.or(ai).or(topic).or(first_user),
-        workspace,
-        path,
-        started,
-        updated,
+    Ok(build_summary(SummaryCandidate {
+        source: LocalHistorySource::CodeBuddy,
+        external_id: id,
+        title: custom.or(ai).or(topic).or(first_user),
+        workspace_root: workspace,
+        source_path: path,
+        started_at_ms: started,
+        updated_at_ms: updated,
         message_count,
         model,
-    ))
+    }))
 }
 
 fn parse_codebuddy_timeline(path: &Path) -> VibexResult<Vec<LocalHistoryTimelineEntry>> {
@@ -2855,17 +2862,17 @@ fn parse_kimi_summary(
     let model = read_kimi_session_log_model(session_dir)
         .or(model)
         .or(model_alias);
-    Ok(build_summary(
-        LocalHistorySource::Kimi,
-        session_id.to_string(),
+    Ok(build_summary(SummaryCandidate {
+        source: LocalHistorySource::Kimi,
+        external_id: session_id.to_string(),
         title,
-        workspace,
-        &wire,
-        started,
-        updated,
-        count,
+        workspace_root: workspace,
+        source_path: &wire,
+        started_at_ms: started,
+        updated_at_ms: updated,
+        message_count: count,
         model,
-    ))
+    }))
 }
 
 fn read_kimi_state_title(session_dir: &Path) -> Option<String> {
@@ -3047,17 +3054,17 @@ fn parse_pi_summary(path: &Path) -> Result<Option<LocalHistorySessionSummary>, S
             _ => {}
         }
     })?;
-    Ok(build_summary(
-        LocalHistorySource::Pi,
-        id,
-        title.or(first_user),
-        workspace,
-        path,
-        started,
-        updated,
-        count,
+    Ok(build_summary(SummaryCandidate {
+        source: LocalHistorySource::Pi,
+        external_id: id,
+        title: title.or(first_user),
+        workspace_root: workspace,
+        source_path: path,
+        started_at_ms: started,
+        updated_at_ms: updated,
+        message_count: count,
         model,
-    ))
+    }))
 }
 
 fn parse_pi_timeline(path: &Path) -> VibexResult<Vec<LocalHistoryTimelineEntry>> {
@@ -3275,17 +3282,17 @@ fn parse_grok_summary(
             );
         }
     })?;
-    Ok(build_summary(
-        LocalHistorySource::Grok,
-        session_id.to_string(),
-        title.take().or(first_user),
-        workspace,
-        &session_dir.join("updates.jsonl"),
-        started,
-        updated,
-        count,
+    Ok(build_summary(SummaryCandidate {
+        source: LocalHistorySource::Grok,
+        external_id: session_id.to_string(),
+        title: title.take().or(first_user),
+        workspace_root: workspace,
+        source_path: &session_dir.join("updates.jsonl"),
+        started_at_ms: started,
+        updated_at_ms: updated,
+        message_count: count,
         model,
-    ))
+    }))
 }
 
 fn parse_grok_timeline(path: &Path) -> VibexResult<Vec<LocalHistoryTimelineEntry>> {
@@ -3300,10 +3307,8 @@ fn parse_grok_timeline(path: &Path) -> VibexResult<Vec<LocalHistoryTimelineEntry
                     .and_then(|update| update.pointer("/_meta/hideFromScrollback"))
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                if !hidden {
-                    if let Some(entry) = user_entry(grok_update_text(&value), timestamp) {
-                        timeline.push(entry);
-                    }
+                if !hidden && let Some(entry) = user_entry(grok_update_text(&value), timestamp) {
+                    timeline.push(entry);
                 }
             }
             "agent_message_chunk" => {
@@ -3494,22 +3499,19 @@ fn deepseek_image_attachment(
         attachments,
         string_field(attachment, "attachmentId"),
         mime.as_deref(),
-    ) {
-        if let Some(hex) = id
-            .strip_prefix("sha256:")
-            .filter(|value| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()))
+    ) && let Some(hex) = id
+        .strip_prefix("sha256:")
+        .filter(|value| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        let object = root.join("objects").join(&hex[..2]).join(hex);
+        if let Ok(metadata) = fs::metadata(&object)
+            && metadata.len() > 0
+            && metadata.len() <= 8 * 1024 * 1024
+            && let Ok(bytes) = fs::read(object)
+            && bytes.len() <= 8 * 1024 * 1024
         {
-            let object = root.join("objects").join(&hex[..2]).join(hex);
-            if let Ok(metadata) = fs::metadata(&object) {
-                if metadata.len() > 0 && metadata.len() <= 8 * 1024 * 1024 {
-                    if let Ok(bytes) = fs::read(object) {
-                        if bytes.len() <= 8 * 1024 * 1024 {
-                            use base64::{Engine as _, engine::general_purpose::STANDARD};
-                            uri = Some(format!("data:{mime};base64,{}", STANDARD.encode(bytes)));
-                        }
-                    }
-                }
-            }
+            use base64::{Engine as _, engine::general_purpose::STANDARD};
+            uri = Some(format!("data:{mime};base64,{}", STANDARD.encode(bytes)));
         }
     }
     Some(MessageAttachment {
@@ -3674,17 +3676,17 @@ fn parse_deepseek_summary(
     if delegation_depth > 0 {
         return Ok(None);
     }
-    Ok(build_summary(
-        LocalHistorySource::DeepSeek,
-        session_id.to_string(),
-        title.or(first_user),
-        workspace,
-        path,
-        started,
-        updated,
-        count,
+    Ok(build_summary(SummaryCandidate {
+        source: LocalHistorySource::DeepSeek,
+        external_id: session_id.to_string(),
+        title: title.or(first_user),
+        workspace_root: workspace,
+        source_path: path,
+        started_at_ms: started,
+        updated_at_ms: updated,
+        message_count: count,
         model,
-    ))
+    }))
 }
 
 fn parse_deepseek_timeline(
@@ -3822,17 +3824,17 @@ fn scan_zcode(root: &LocalHistorySourceRoot) -> ScanBatch {
         {
             continue;
         }
-        let Some(summary) = build_summary(
-            LocalHistorySource::Zcode,
-            id.clone(),
+        let Some(summary) = build_summary(SummaryCandidate {
+            source: LocalHistorySource::Zcode,
+            external_id: id.clone(),
             title,
-            directory,
-            &database,
-            Some(timestamp_number_to_ms(created)),
-            Some(timestamp_number_to_ms(updated)),
-            count.min(u32::MAX as i64) as u32,
+            workspace_root: directory,
+            source_path: &database,
+            started_at_ms: Some(timestamp_number_to_ms(created)),
+            updated_at_ms: Some(timestamp_number_to_ms(updated)),
+            message_count: count.min(u32::MAX as i64) as u32,
             model,
-        ) else {
+        }) else {
             continue;
         };
         batch.found.push(FoundSession {
@@ -3906,17 +3908,17 @@ fn parse_zcode_summary(
     {
         return Ok(None);
     }
-    Ok(build_summary(
-        LocalHistorySource::Zcode,
-        id,
+    Ok(build_summary(SummaryCandidate {
+        source: LocalHistorySource::Zcode,
+        external_id: id,
         title,
-        directory,
-        database,
-        Some(timestamp_number_to_ms(created)),
-        Some(timestamp_number_to_ms(updated)),
-        count.max(0).min(u32::MAX as i64) as u32,
+        workspace_root: directory,
+        source_path: database,
+        started_at_ms: Some(timestamp_number_to_ms(created)),
+        updated_at_ms: Some(timestamp_number_to_ms(updated)),
+        message_count: count.max(0).min(u32::MAX as i64) as u32,
         model,
-    ))
+    }))
 }
 
 fn parse_zcode_timeline(
@@ -4231,25 +4233,23 @@ fn parse_cursor_store(database: &Path) -> Result<(Value, CursorExtract), String>
                     }
                     for step_id in proto::messages(&agent_turn, 2) {
                         let step = cursor_blob(&connection, &step_id)?.unwrap_or(step_id);
-                        if let Some(message) = proto::first_bytes(&step, 1) {
-                            if let Some(text) = proto::first_string(&message, 1)
+                        if let Some(message) = proto::first_bytes(&step, 1)
+                            && let Some(text) = proto::first_string(&message, 1)
                                 .filter(|text| !text.trim().is_empty())
-                            {
-                                extract.events.push(CursorEvent::Agent {
-                                    text,
-                                    timestamp: None,
-                                });
-                            }
+                        {
+                            extract.events.push(CursorEvent::Agent {
+                                text,
+                                timestamp: None,
+                            });
                         }
-                        if let Some(message) = proto::first_bytes(&step, 3) {
-                            if let Some(text) = proto::first_string(&message, 1)
+                        if let Some(message) = proto::first_bytes(&step, 3)
+                            && let Some(text) = proto::first_string(&message, 1)
                                 .filter(|text| !text.trim().is_empty())
-                            {
-                                extract.events.push(CursorEvent::Reasoning {
-                                    text,
-                                    timestamp: None,
-                                });
-                            }
+                        {
+                            extract.events.push(CursorEvent::Reasoning {
+                                text,
+                                timestamp: None,
+                            });
                         }
                         if let Some(call) = proto::first_bytes(&step, 2) {
                             if extract.workspace.is_none() && cursor_shell_cwd(&call).is_some() {
@@ -4680,10 +4680,10 @@ fn cursor_tool_event(connection: &Connection, call: &[u8]) -> CursorEvent {
                     let mut texts = Vec::new();
                     for (kind, value) in proto::fields(&success) {
                         if kind == 1 {
-                            if let Some(item) = value.bytes() {
-                                if let Some(text) = proto::first_string(item, 1) {
-                                    texts.push(text);
-                                }
+                            if let Some(item) = value.bytes()
+                                && let Some(text) = proto::first_string(item, 1)
+                            {
+                                texts.push(text);
                             }
                         } else if kind == 2 {
                             failed = value.u64() == Some(1);
@@ -4719,14 +4719,13 @@ fn cursor_tool_event(connection: &Connection, call: &[u8]) -> CursorEvent {
         19 => {
             if let Some(args) = args.as_deref() {
                 let subagent_type = proto::first_bytes(args, 3).and_then(|body| {
-                    proto::fields(&body).into_iter().find_map(|(field, _)| {
-                        Some(match field {
+                    proto::fields(&body).into_iter().next().map(|(field, _)| {
+                        str::to_string(match field {
                             1 => "generalPurpose",
                             2 => "cursor-guide",
                             3 => "best-of-n-runner",
                             _ => "subagent",
                         })
-                        .map(str::to_string)
                     })
                 });
                 input = cursor_json_object([
@@ -4897,17 +4896,17 @@ fn parse_cursor_summary(
         .iter()
         .filter(|event| matches!(event, CursorEvent::User { .. } | CursorEvent::Agent { .. }))
         .count() as u32;
-    Ok(build_summary(
-        LocalHistorySource::Cursor,
-        session_id.to_string(),
+    Ok(build_summary(SummaryCandidate {
+        source: LocalHistorySource::Cursor,
+        external_id: session_id.to_string(),
         title,
-        workspace,
-        database,
-        created,
-        updated,
-        count,
-        string_field(&meta, "lastUsedModel").or_else(|| string_field(&meta, "model")),
-    ))
+        workspace_root: workspace,
+        source_path: database,
+        started_at_ms: created,
+        updated_at_ms: updated,
+        message_count: count,
+        model: string_field(&meta, "lastUsedModel").or_else(|| string_field(&meta, "model")),
+    }))
 }
 
 fn parse_cursor_timeline(database: &Path) -> VibexResult<Vec<LocalHistoryTimelineEntry>> {
@@ -5109,7 +5108,7 @@ fn antigravity_mcp_call(name: String, args: Option<String>) -> (String, Option<S
 
 fn antigravity_tool_name(step: &[u8]) -> Option<&'static str> {
     proto::fields(step).into_iter().find_map(|(field, value)| {
-        value.bytes().and_then(|_| match field {
+        value.bytes().and(match field {
             13 => Some("grep"),
             14 => Some("view_file"),
             15 => Some("list_directory"),
@@ -5133,18 +5132,18 @@ fn antigravity_tool_outcome(step: &[u8]) -> Option<(Option<String>, bool)> {
         let Some(body) = value.bytes() else { continue };
         let outcome = match field {
             13 => {
-                let error = proto::first_string(&body, 5);
+                let error = proto::first_string(body, 5);
                 let output = error
-                    .or_else(|| proto::first_string(&body, 3))
-                    .or_else(|| proto::first_string(&body, 1));
+                    .or_else(|| proto::first_string(body, 3))
+                    .or_else(|| proto::first_string(body, 1));
                 (
                     output,
-                    status_error || proto::first_string(&body, 5).is_some(),
+                    status_error || proto::first_string(body, 5).is_some(),
                 )
             }
             14 => {
-                let path = proto::first_string(&body, 1);
-                let content = proto::first_string(&body, 4);
+                let path = proto::first_string(body, 1);
+                let content = proto::first_string(body, 4);
                 let output = match (path, content) {
                     (Some(path), Some(content)) => Some(format!("{path}\n{content}")),
                     (None, content) => content,
@@ -5153,18 +5152,18 @@ fn antigravity_tool_outcome(step: &[u8]) -> Option<(Option<String>, bool)> {
                 (output, status_error)
             }
             15 => {
-                let output = proto::messages(&body, 2)
+                let output = proto::messages(body, 2)
                     .filter_map(|entry| proto::first_string(&entry, 1))
                     .collect::<Vec<_>>()
                     .join("\n");
                 let output = (!output.is_empty())
                     .then_some(output)
-                    .or_else(|| proto::first_string(&body, 1));
+                    .or_else(|| proto::first_string(body, 1));
                 (output, status_error)
             }
             23 => {
-                let path = proto::first_string(&body, 1).unwrap_or_default();
-                let created = proto::first_u64(&body, 4).unwrap_or(0) != 0;
+                let path = proto::first_string(body, 1).unwrap_or_default();
+                let created = proto::first_u64(body, 4).unwrap_or(0) != 0;
                 (
                     Some(format!(
                         "{} {path}",
@@ -5174,7 +5173,7 @@ fn antigravity_tool_outcome(step: &[u8]) -> Option<(Option<String>, bool)> {
                 )
             }
             24 => {
-                let nested = proto::first_bytes(&body, 3).unwrap_or(body.to_vec());
+                let nested = proto::first_bytes(body, 3).unwrap_or(body.to_vec());
                 (
                     proto::first_string(&nested, 1).or_else(|| proto::first_string(&nested, 2)),
                     true,
@@ -5182,14 +5181,14 @@ fn antigravity_tool_outcome(step: &[u8]) -> Option<(Option<String>, bool)> {
             }
             28 => {
                 let command =
-                    proto::first_string(&body, 23).or_else(|| proto::first_string(&body, 1));
-                let output = proto::first_bytes(&body, 21)
+                    proto::first_string(body, 23).or_else(|| proto::first_string(body, 1));
+                let output = proto::first_bytes(body, 21)
                     .and_then(|combined| {
                         proto::first_string(&combined, 1)
                             .or_else(|| proto::first_string(&combined, 2))
                     })
-                    .or_else(|| proto::first_string(&body, 4))
-                    .or_else(|| proto::first_string(&body, 5));
+                    .or_else(|| proto::first_string(body, 4))
+                    .or_else(|| proto::first_string(body, 5));
                 let output = match (command, output) {
                     (Some(command), Some(output)) => Some(format!("$ {command}\n{output}")),
                     (Some(command), None) => Some(format!("$ {command}")),
@@ -5197,16 +5196,16 @@ fn antigravity_tool_outcome(step: &[u8]) -> Option<(Option<String>, bool)> {
                 };
                 (
                     output,
-                    status_error || proto::first_u64(&body, 6).is_some_and(|code| code != 0),
+                    status_error || proto::first_u64(body, 6).is_some_and(|code| code != 0),
                 )
             }
             40 => (
-                proto::first_string(&body, 3).or_else(|| proto::first_string(&body, 1)),
+                proto::first_string(body, 3).or_else(|| proto::first_string(body, 1)),
                 status_error,
             ),
             42 => {
-                let query = proto::first_string(&body, 1);
-                let summary = proto::first_string(&body, 5);
+                let query = proto::first_string(body, 1);
+                let summary = proto::first_string(body, 5);
                 let output = match (query, summary) {
                     (Some(query), Some(summary)) => Some(format!("{query}\n{summary}")),
                     (None, summary) => summary,
@@ -5215,12 +5214,12 @@ fn antigravity_tool_outcome(step: &[u8]) -> Option<(Option<String>, bool)> {
                 (output, status_error)
             }
             47 => {
-                let rejected = proto::first_u64(&body, 7).unwrap_or(0) != 0;
-                (proto::first_string(&body, 3), status_error || rejected)
+                let rejected = proto::first_u64(body, 7).unwrap_or(0) != 0;
+                (proto::first_string(body, 3), status_error || rejected)
             }
             98 => {
-                let path = proto::first_string(&body, 1).unwrap_or_default();
-                let instruction = proto::first_string(&body, 5).unwrap_or_default();
+                let path = proto::first_string(body, 1).unwrap_or_default();
+                let instruction = proto::first_string(body, 5).unwrap_or_default();
                 (
                     Some(if instruction.is_empty() {
                         format!("Edited {path}")
@@ -5231,7 +5230,7 @@ fn antigravity_tool_outcome(step: &[u8]) -> Option<(Option<String>, bool)> {
                 )
             }
             116 => {
-                let output = proto::messages(&body, 4).find_map(|any| {
+                let output = proto::messages(body, 4).find_map(|any| {
                     let type_url = proto::first_string(&any, 1)?;
                     if type_url.rsplit('/').next() != Some("antigravity.localharness.ToolResponse")
                     {
@@ -5294,18 +5293,16 @@ fn antigravity_projection(
         if let Some(planner) = proto::first_bytes(step, 20) {
             if let Some(text) =
                 proto::first_string(&planner, 3).filter(|text| !text.trim().is_empty())
+                && let Some(entry) = reasoning_entry(text, timestamp)
             {
-                if let Some(entry) = reasoning_entry(text, timestamp) {
-                    timeline.push(entry);
-                }
+                timeline.push(entry);
             }
             if let Some(text) =
                 proto::first_string(&planner, 1).filter(|text| !text.trim().is_empty())
+                && let Some(entry) = agent_entry(text, timestamp)
             {
-                if let Some(entry) = agent_entry(text, timestamp) {
-                    timeline.push(entry);
-                    count = count.saturating_add(1);
-                }
+                timeline.push(entry);
+                count = count.saturating_add(1);
             }
             for raw_call in proto::messages(&planner, 7) {
                 if let Some((id, raw_name, args)) = antigravity_call_from_bytes(&raw_call) {
@@ -5337,18 +5334,18 @@ fn antigravity_projection(
             let (output, failed) = outcome.unwrap_or((None, proto::first_u64(step, 4) == Some(7)));
             let mut replaced = false;
             for item in timeline.iter_mut().rev() {
-                if let TimelinePayload::ToolCall(tool) = &mut item.payload {
-                    if tool.tool_call_id == id {
-                        tool.input_summary = tool.input_summary.clone().or(input.clone());
-                        tool.output_summary = output.clone();
-                        tool.status = if failed {
-                            ToolCallStatus::Failed
-                        } else {
-                            ToolCallStatus::Completed
-                        };
-                        replaced = true;
-                        break;
-                    }
+                if let TimelinePayload::ToolCall(tool) = &mut item.payload
+                    && tool.tool_call_id == id
+                {
+                    tool.input_summary = tool.input_summary.clone().or(input.clone());
+                    tool.output_summary = output.clone();
+                    tool.status = if failed {
+                        ToolCallStatus::Failed
+                    } else {
+                        ToolCallStatus::Completed
+                    };
+                    replaced = true;
+                    break;
                 }
             }
             if !replaced {
@@ -5392,17 +5389,17 @@ fn parse_antigravity_summary(
     });
     let model =
         parsed_model.or_else(|| meta.as_ref().and_then(|value| string_field(value, "model")));
-    Ok(build_summary(
-        LocalHistorySource::Antigravity,
-        id.to_string(),
-        first_user,
-        workspace,
-        database,
-        started,
-        updated,
-        count,
+    Ok(build_summary(SummaryCandidate {
+        source: LocalHistorySource::Antigravity,
+        external_id: id.to_string(),
+        title: first_user,
+        workspace_root: workspace,
+        source_path: database,
+        started_at_ms: started,
+        updated_at_ms: updated,
+        message_count: count,
         model,
-    ))
+    }))
 }
 
 fn parse_antigravity_timeline(database: &Path) -> VibexResult<Vec<LocalHistoryTimelineEntry>> {
@@ -6103,7 +6100,7 @@ mod tests {
                 ],
             )
             .unwrap();
-        let parts = vec![
+        let parts = [
             serde_json::json!({"type": "text", "text": "hello"}),
             serde_json::json!({"type": "reasoning", "text": "thinking"}),
             serde_json::json!({"type": "text", "text": "answer"}),
@@ -6180,7 +6177,7 @@ mod tests {
     }
 
     fn pb_varint(field: u32, value: u64, out: &mut Vec<u8>) {
-        append_pb_varint((u64::from(field) << 3) | 0, out);
+        append_pb_varint(u64::from(field) << 3, out);
         append_pb_varint(value, out);
     }
 
