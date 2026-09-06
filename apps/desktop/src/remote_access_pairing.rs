@@ -3015,7 +3015,10 @@ impl Render for RemoteAccessPairing {
                     })
                     .child(self.render_connection_list(cx))
                     .child(self.render_connection_detail_panel(self.state.selected_entry, cx))
-                    .child(self.render_setup_footer(cx));
+                    .when(
+                        self.state.selected_entry != RemoteAccessEntry::LocalNetwork,
+                        |column| column.child(self.render_setup_footer(cx)),
+                    );
                 if let Some(error) = error {
                     column = column.child(self.render_status_banner(
                         IconName::TriangleAlert,
