@@ -97,9 +97,6 @@ const GIT_HISTORY_DRAWER_DEFAULT_HEIGHT: f32 = 260.0;
 const GIT_HISTORY_DRAWER_KEYBOARD_STEP: f32 = 24.0;
 const GIT_HISTORY_LOAD_MORE_THRESHOLD_PX: f32 = 192.0;
 const GIT_COMMIT_MESSAGE_HEIGHT: f32 = 80.0;
-const GIT_COMMIT_TYPES: [&str; 11] = [
-    "feat", "fix", "refactor", "test", "docs", "style", "perf", "chore", "build", "ci", "revert",
-];
 const DIFF_ROW_MIN_HEIGHT: f32 = 22.0;
 const DIFF_LIST_OVERDRAW: f32 = 512.0;
 const DIFF_LINE_VERTICAL_PADDING: f32 = 2.0;
@@ -641,7 +638,6 @@ struct CodeRightRailRevision {
     lifecycle_action_pending: bool,
     lifecycle_mutations_available: bool,
     mode: RightRailMode,
-    commit_type: String,
     amend_commit: bool,
     selected_git_path: Option<String>,
     error: Option<String>,
@@ -734,7 +730,6 @@ struct CodeRightRailProjection {
     git: CodeRightRailGitProjection,
     workspace_name: String,
     commit_message: Entity<InputState>,
-    commit_type: String,
     amend_commit: bool,
     selected_git_path: Option<String>,
     lifecycle_view: Option<WorktreeLifecycleView>,
@@ -945,7 +940,6 @@ pub struct CodeWorkbench {
     selected_git_path: Option<String>,
     selected_terminal_id: Option<String>,
     pub(crate) commit_message: Entity<InputState>,
-    pub(crate) commit_type: String,
     pub(crate) amend_commit: bool,
     commit_reset_window: Option<AnyWindowHandle>,
     pub(crate) error: Option<String>,
@@ -1057,7 +1051,7 @@ impl CodeWorkbench {
             InputState::new(window, cx)
                 .multi_line(true)
                 .rows(3)
-                .placeholder(git_commit_placeholder("feat"))
+                .placeholder(locale::text("Commit message", "提交信息", "提交訊息"))
         });
         Self {
             parent,
@@ -1091,7 +1085,6 @@ impl CodeWorkbench {
             selected_git_path,
             selected_terminal_id,
             commit_message,
-            commit_type: "feat".to_string(),
             amend_commit: false,
             commit_reset_window: None,
             error: None,
@@ -1378,7 +1371,6 @@ impl CodeWorkbench {
                     .supports(BackendOperation::GitWorktreeLifecycleMutate)
             }),
             mode: self.right_rail_mode,
-            commit_type: self.commit_type.clone(),
             amend_commit: self.amend_commit,
             selected_git_path: self.selected_git_path.clone(),
             error: self.error.clone(),
@@ -1426,7 +1418,6 @@ impl CodeWorkbench {
             ),
             workspace_name,
             commit_message: self.commit_message.clone(),
-            commit_type: self.commit_type.clone(),
             amend_commit: self.amend_commit,
             selected_git_path: self.selected_git_path.clone(),
             lifecycle_view: self.worktree_lifecycle_view(),
@@ -1611,9 +1602,12 @@ impl CodeWorkbench {
     }
 
     pub fn sync_locale(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let commit_placeholder = git_commit_placeholder(&self.commit_type);
         self.commit_message.update(cx, |input, cx| {
-            input.set_placeholder(commit_placeholder, window, cx)
+            input.set_placeholder(
+                locale::text("Commit message", "提交信息", "提交訊息"),
+                window,
+                cx,
+            )
         });
         for binding in self.editor_bindings.values() {
             binding.input.update(cx, |input, cx| {
@@ -5250,10 +5244,7 @@ impl CodeWorkbench {
         let (Some(workspace), Some(_)) = (self.workspace.clone(), self.runtime.clone()) else {
             return;
         };
-        let message = normalize_git_commit_message(
-            &self.commit_type,
-            self.commit_message.read(cx).value().as_ref(),
-        );
+        let message = self.commit_message.read(cx).value().trim().to_string();
         if message.is_empty() {
             self.error = Some("Commit message is required.".into());
             cx.notify();
@@ -11604,7 +11595,6 @@ impl CodeRightRail {
         let change_row_count = self.projection.git.change_rows.len();
         let pending_kind = self.projection.git.pending_kind;
         let commit_message = self.projection.commit_message.clone();
-        let commit_type = self.projection.commit_type.clone();
         let amend = self.projection.amend_commit;
         let selected_count = self.projection.git.selected_count;
         let scroll_handle = self.projection.git.scroll.clone();
@@ -11633,8 +11623,6 @@ impl CodeRightRail {
             });
         let lifecycle_pending = self.projection.lifecycle_action_pending;
         let lifecycle_mutations_available = self.projection.lifecycle_mutations_available;
-        let type_workbench = self.workbench.downgrade();
-        let active_type = commit_type.clone();
         let push_workbench = self.workbench.downgrade();
         let has_conflicts = conflict_context
             .as_ref()
@@ -11724,86 +11712,37 @@ impl CodeRightRail {
                     .bg(cx.theme().sidebar.opacity(0.95))
                     .p_3()
                     .child(
-                        h_flex()
-                            .gap_2()
-                            .mb_2()
-                            .child(
-                                Button::new("git-commit-type")
-                                    .small()
-                                    .outline()
-                                    .w(px(112.0))
-                                    .h(px(32.0))
-                                    .label(commit_type)
-                                    .dropdown_caret(true)
-                                    .dropdown_menu_with_anchor(
-                                        Anchor::BottomLeft,
-                                        move |mut menu, _, _| {
-                                            for candidate in GIT_COMMIT_TYPES {
-                                                let workbench = type_workbench.clone();
-                                                let value = candidate.to_string();
-                                                let checked = active_type == candidate;
-                                                menu = menu.item(
-                                                    PopupMenuItem::new(candidate)
-                                                        .checked(checked)
-                                                        .on_click(move |_, window, cx| {
-                                                            let value = value.clone();
-                                                            let placeholder =
-                                                                git_commit_placeholder(&value);
-                                                            let _ = workbench.update(
-                                                                cx,
-                                                                |workbench, cx| {
-                                                                    workbench.commit_type =
-                                                                        value.clone();
-                                                                    workbench
-                                                                        .commit_message
-                                                                        .update(cx, |input, cx| {
-                                                                            input.set_placeholder(
-                                                                                placeholder,
-                                                                                window,
-                                                                                cx,
-                                                                            )
-                                                                        });
-                                                                    cx.notify();
-                                                                },
-                                                            );
-                                                        }),
-                                                );
-                                            }
-                                            menu
-                                        },
-                                    ),
-                            )
-                            .child(
-                                Button::new("toggle-amend")
-                                    .small()
-                                    .ghost()
-                                    .compact()
-                                    .tooltip(locale::text(
-                                        "Amend last commit",
-                                        "修正上次提交",
-                                        "修正上次提交",
-                                    ))
-                                    .child(git_selection_indicator(
-                                        if amend {
-                                            GitPathSelectionState::Checked
-                                        } else {
-                                            GitPathSelectionState::Unchecked
-                                        },
-                                        cx,
-                                    ))
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().sidebar_foreground.opacity(0.70))
-                                            .child("amend"),
-                                    )
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.update_workbench(cx, |workbench, cx| {
-                                            workbench.amend_commit = !workbench.amend_commit;
-                                            cx.notify();
-                                        })
-                                    })),
-                            ),
+                        h_flex().gap_2().mb_2().child(
+                            Button::new("toggle-amend")
+                                .small()
+                                .ghost()
+                                .compact()
+                                .tooltip(locale::text(
+                                    "Amend last commit",
+                                    "修正上次提交",
+                                    "修正上次提交",
+                                ))
+                                .child(git_selection_indicator(
+                                    if amend {
+                                        GitPathSelectionState::Checked
+                                    } else {
+                                        GitPathSelectionState::Unchecked
+                                    },
+                                    cx,
+                                ))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().sidebar_foreground.opacity(0.70))
+                                        .child("amend"),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.update_workbench(cx, |workbench, cx| {
+                                        workbench.amend_commit = !workbench.amend_commit;
+                                        cx.notify();
+                                    })
+                                })),
+                        ),
                     )
                     .child(
                         Input::new(&commit_message)
@@ -13862,42 +13801,6 @@ fn git_commit_authored_at(authored_at_ms: Option<i64>) -> String {
     }
 }
 
-fn git_commit_placeholder(commit_type: &str) -> String {
-    format!("{commit_type}: commit message")
-}
-
-fn normalize_git_commit_message(commit_type: &str, message: &str) -> String {
-    let message = message.trim();
-    if message.is_empty() {
-        return String::new();
-    }
-    let lower = message.to_ascii_lowercase();
-    if GIT_COMMIT_TYPES.iter().any(|candidate| {
-        lower
-            .strip_prefix(candidate)
-            .is_some_and(conventional_commit_suffix)
-    }) {
-        message.to_string()
-    } else {
-        format!("{commit_type}: {message}")
-    }
-}
-
-fn conventional_commit_suffix(suffix: &str) -> bool {
-    let suffix = if let Some(scoped) = suffix.strip_prefix('(') {
-        let Some(end) = scoped.find(')') else {
-            return false;
-        };
-        &scoped[end + 1..]
-    } else {
-        suffix
-    };
-    let suffix = suffix.strip_prefix('!').unwrap_or(suffix);
-    suffix
-        .strip_prefix(':')
-        .is_some_and(|message| message.chars().next().is_some_and(char::is_whitespace))
-}
-
 fn file_tree_row_width_score(row: &FileExplorerRow) -> usize {
     let name_units = if row.segments.is_empty() {
         display_width_units(&row.name)
@@ -15615,7 +15518,6 @@ mod tests {
             .expect("Git changes toolbar should remain inspectable");
 
         assert!(!changes.contains("show-git-history"));
-        assert!(changes.contains(".dropdown_menu_with_anchor(\n                                        Anchor::BottomLeft,"));
         assert!(changes.contains("Anchor::BottomRight"));
         assert!(changes.contains("DropdownButton::new(\"commit-actions\")"));
         assert!(changes.contains(".with_size(Size::Size(px(36.0)))"));
@@ -16008,20 +15910,6 @@ mod tests {
             assert!(worktree_plan_error_requires_refresh(code));
         }
         assert!(!worktree_plan_error_requires_refresh("temporary_failure"));
-    }
-
-    #[test]
-    fn conventional_commit_messages_match_the_tauri_prefix_contract() {
-        assert_eq!(
-            normalize_git_commit_message("feat", "add history"),
-            "feat: add history"
-        );
-        assert_eq!(
-            normalize_git_commit_message("fix", "refactor(git)!: keep existing prefix"),
-            "refactor(git)!: keep existing prefix"
-        );
-        assert_eq!(normalize_git_commit_message("docs", "   "), "");
-        assert_eq!(git_commit_placeholder("test"), "test: commit message");
     }
 
     #[test]
