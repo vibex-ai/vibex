@@ -34330,15 +34330,18 @@ impl VibexWorkbench {
                 if !expanded {
                     return 40.0;
                 }
-                let mut height = 40.0 + 24.0 + estimated_pre_block_height(&command.command);
-                if let Some(output) = command.output_summary.as_deref() {
-                    height += 20.0 + estimated_detail_block_height(output);
-                }
+                // Terminal card body plus the cwd meta row and section padding.
+                let terminal_block = ToolCardDetailBlock::Terminal {
+                    command: command.command.clone(),
+                    cwd: None,
+                    output: command.output_summary.clone(),
+                    exit_code: command.exit_code,
+                    failed: command.status == vibex_core::CommandStatus::Failed,
+                    in_progress: command.status == vibex_core::CommandStatus::Started,
+                };
+                let mut height = 40.0 + terminal_block.estimated_height() + 24.0;
                 if command.cwd.is_some() {
-                    height += 28.0;
-                }
-                if command.exit_code.is_some() {
-                    height += 24.0;
+                    height += 20.0;
                 }
                 height
             }
@@ -34387,11 +34390,11 @@ impl VibexWorkbench {
                         .unwrap_or(false);
                 if expanded {
                     height += 8.0;
-                    for (index, (_, value)) in projection.details.iter().enumerate() {
+                    for (index, block) in projection.details.iter().enumerate() {
                         if index > 0 {
                             height += 8.0;
                         }
-                        height += estimated_detail_block_height(value);
+                        height += block.estimated_height();
                     }
                     if row.file_path.is_some() {
                         height += 28.0 + 8.0;
@@ -35489,16 +35492,14 @@ impl VibexWorkbench {
                     )),
             )
             .when(expanded, |this| {
+                let detail_blocks = projection.details.clone();
                 this.child(
-                    v_flex().w_full().min_w_0().pl_6().gap_2().children(
-                        projection
-                            .details
-                            .iter()
-                            .map(|(label, value)| {
-                                self.render_process_detail(label.clone(), value.clone(), cx)
-                            })
-                            .collect::<Vec<_>>(),
-                    ),
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .pl_6()
+                        .gap_2()
+                        .children(self.render_tool_detail_blocks(&detail_blocks, &row.id, cx)),
                 )
             })
             .when_some(row.file_path.clone().filter(|_| expanded), |this, path| {
@@ -35662,6 +35663,18 @@ impl VibexWorkbench {
                     )),
             )
             .when(expanded, |this| {
+                let detail_blocks = if command.command.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![ToolCardDetailBlock::Terminal {
+                        command: command.command.clone(),
+                        cwd: None,
+                        output: output_summary.clone(),
+                        exit_code: command.exit_code,
+                        failed,
+                        in_progress: in_progress && !waiting_for_confirmation,
+                    }]
+                };
                 this.child(
                     v_flex()
                         .w_full()
@@ -35693,31 +35706,7 @@ impl VibexWorkbench {
                                     ),
                             )
                         })
-                        .child(
-                            self.render_process_detail_value(format!("$ {}", command.command), cx),
-                        )
-                        .when_some(output_summary, |this, output| {
-                            this.child(self.render_process_detail(
-                                locale::text("Output", "输出", "輸出").to_string(),
-                                output,
-                                cx,
-                            ))
-                        })
-                        .when_some(command.exit_code, |this, exit_code| {
-                            this.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(if exit_code == 0 {
-                                        cx.theme().success
-                                    } else {
-                                        cx.theme().danger
-                                    })
-                                    .child(format!(
-                                        "{}: {exit_code}",
-                                        locale::text("Exit code", "退出码", "結束代碼")
-                                    )),
-                            )
-                        }),
+                        .children(self.render_tool_detail_blocks(&detail_blocks, &row.id, cx)),
                 )
             })
             .when_some(permission_panel, |this, panel| this.child(panel))
@@ -36315,6 +36304,372 @@ impl VibexWorkbench {
                     .child(label.to_uppercase()),
             )
             .child(self.render_process_detail_value(value, cx))
+            .into_any_element()
+    }
+
+    /// Expanded tool-activity content, projected into typed blocks so each
+    /// tool kind renders its own presentation: command execution as a
+    /// terminal card, structured input/output as labeled mono sections.
+    fn render_tool_detail_blocks(
+        &self,
+        blocks: &[ToolCardDetailBlock],
+        row_id: &str,
+        cx: &App,
+    ) -> Vec<AnyElement> {
+        blocks
+            .iter()
+            .enumerate()
+            .map(|(index, block)| match block {
+                ToolCardDetailBlock::Terminal {
+                    command,
+                    cwd,
+                    output,
+                    exit_code,
+                    failed,
+                    in_progress,
+                } => self.render_terminal_detail_card(
+                    format!("terminal:{row_id}:{index}"),
+                    command,
+                    cwd.as_deref(),
+                    output.as_deref(),
+                    *exit_code,
+                    *failed,
+                    *in_progress,
+                    cx,
+                ),
+                ToolCardDetailBlock::Search {
+                    query,
+                    result,
+                    failed,
+                } => {
+                    let field_border = if *failed {
+                        cx.theme().danger.opacity(0.32)
+                    } else {
+                        cx.theme().border.opacity(0.72)
+                    };
+                    v_flex()
+                        .min_w_0()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .min_w_0()
+                                .gap_2()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(field_border)
+                                .bg(cx.theme().muted.opacity(if cx.theme().is_dark() {
+                                    0.42
+                                } else {
+                                    0.36
+                                }))
+                                .px_2p5()
+                                .py_1p5()
+                                .child(
+                                    Icon::new(IconName::Search)
+                                        .size(px(13.0))
+                                        .flex_none()
+                                        .text_color(cx.theme().muted_foreground),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .font_family(cx.theme().mono_font_family.clone())
+                                        .font_weight(code_font_weight(cx))
+                                        .text_size(cx.theme().mono_font_size)
+                                        .text_color(cx.theme().foreground)
+                                        .child(query.clone()),
+                                ),
+                        )
+                        .children(result.iter().map(|result| {
+                            div()
+                                .min_w_0()
+                                .text_sm()
+                                .line_height(gpui::relative(1.5))
+                                .text_color(cx.theme().muted_foreground)
+                                .child(result.clone())
+                        }))
+                        .into_any_element()
+                }
+                ToolCardDetailBlock::File { path, summary } => v_flex()
+                    .min_w_0()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .gap_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(cx.theme().border.opacity(0.72))
+                            .bg(cx.theme().muted.opacity(if cx.theme().is_dark() {
+                                0.42
+                            } else {
+                                0.36
+                            }))
+                            .px_2p5()
+                            .py_1p5()
+                            .child(
+                                Icon::default()
+                                    .path("icons/vibex/file-text.svg")
+                                    .size(px(13.0))
+                                    .flex_none()
+                                    .text_color(cx.theme().muted_foreground),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .truncate()
+                                    .font_family(cx.theme().mono_font_family.clone())
+                                    .font_weight(code_font_weight(cx))
+                                    .text_size(cx.theme().mono_font_size)
+                                    .text_color(cx.theme().foreground)
+                                    .child(path.clone()),
+                            ),
+                    )
+                    .children(summary.iter().map(|summary| {
+                        div()
+                            .min_w_0()
+                            .text_sm()
+                            .line_height(gpui::relative(1.5))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(summary.clone())
+                    }))
+                    .into_any_element(),
+                ToolCardDetailBlock::Mono { label, value } => {
+                    self.render_process_detail(label.clone(), value.clone(), cx)
+                }
+                ToolCardDetailBlock::Rows { rows } => v_flex()
+                    .min_w_0()
+                    .gap_1()
+                    .children(rows.iter().map(|(key, value)| {
+                        let glyph = match key.as_str() {
+                            "completed" => Icon::new(IconName::CircleCheck)
+                                .size(px(14.0))
+                                .text_color(cx.theme().success)
+                                .into_any_element(),
+                            "failed" => Icon::new(IconName::CircleX)
+                                .size(px(14.0))
+                                .text_color(cx.theme().danger)
+                                .into_any_element(),
+                            "running" => Icon::new(IconName::LoaderCircle)
+                                .size(px(14.0))
+                                .text_color(cx.theme().accent)
+                                .into_any_element(),
+                            _ => div()
+                                .size(px(10.0))
+                                .rounded_full()
+                                .border_1()
+                                .border_color(cx.theme().muted_foreground.opacity(0.50))
+                                .into_any_element(),
+                        };
+                        h_flex()
+                            .min_w_0()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .size(px(14.0))
+                                    .child(glyph),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .text_sm()
+                                    .text_color(cx.theme().foreground)
+                                    .child(value.clone()),
+                            )
+                    }))
+                    .into_any_element(),
+                ToolCardDetailBlock::Text {
+                    label,
+                    value,
+                    accent,
+                } => v_flex()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(label.to_uppercase()),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_sm()
+                            .text_color(if *accent {
+                                cx.theme().foreground
+                            } else {
+                                cx.theme().muted_foreground
+                            })
+                            .child(value.clone()),
+                    )
+                    .into_any_element(),
+            })
+            .collect()
+    }
+
+    /// Terminal-style execution card: prompt row with the command, bounded
+    /// scrollable output body, and a cwd / exit footer.
+    #[allow(clippy::too_many_arguments)]
+    fn render_terminal_detail_card(
+        &self,
+        id: String,
+        command: &str,
+        cwd: Option<&str>,
+        output: Option<&str>,
+        exit_code: Option<i32>,
+        failed: bool,
+        in_progress: bool,
+        cx: &App,
+    ) -> AnyElement {
+        let prompt_color = if failed {
+            cx.theme().danger
+        } else {
+            cx.theme().success
+        };
+        let card_surface = cx
+            .theme()
+            .muted
+            .opacity(if cx.theme().is_dark() { 0.42 } else { 0.36 });
+        let output_surface =
+            cx.theme()
+                .background
+                .opacity(if cx.theme().is_dark() { 0.55 } else { 0.65 });
+        v_flex()
+            .id(SharedString::from(id))
+            .min_w_0()
+            .overflow_hidden()
+            .rounded_md()
+            .border_1()
+            .border_color(if failed {
+                cx.theme().danger.opacity(0.32)
+            } else {
+                cx.theme().border.opacity(0.72)
+            })
+            .bg(card_surface)
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .gap_2()
+                    .px_2p5()
+                    .py_1p5()
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .font_weight(code_font_weight(cx))
+                            .text_size(cx.theme().mono_font_size)
+                            .text_color(prompt_color)
+                            .child("$"),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .font_weight(code_font_weight(cx))
+                            .text_size(cx.theme().mono_font_size)
+                            .line_height(gpui::relative(1.5))
+                            .text_color(cx.theme().foreground)
+                            .child(command.to_string()),
+                    ),
+            )
+            .when_some(
+                output.filter(|output| !output.trim().is_empty()),
+                |this, output| {
+                    this.child(
+                        div()
+                            .min_w_0()
+                            .max_h(px(200.0))
+                            .overflow_y_scrollbar()
+                            .border_t_1()
+                            .border_color(cx.theme().border.opacity(0.52))
+                            .bg(output_surface)
+                            .px_2p5()
+                            .py_2()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .font_weight(code_font_weight(cx))
+                            .text_size(cx.theme().mono_font_size)
+                            .line_height(gpui::relative(1.45))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(output.to_string()),
+                    )
+                },
+            )
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .flex_wrap()
+                    .gap_x_3()
+                    .gap_y_1()
+                    .border_t_1()
+                    .border_color(cx.theme().border.opacity(0.52))
+                    .px_2p5()
+                    .py_1p5()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .children(cwd.map(|cwd| {
+                        h_flex()
+                            .min_w_0()
+                            .gap_1()
+                            .child(Icon::new(IconName::Folder).size(px(12.0)).flex_none())
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .font_family(cx.theme().mono_font_family.clone())
+                                    .child(cwd.to_string()),
+                            )
+                            .into_any_element()
+                    }))
+                    .children(exit_code.map(|exit_code| {
+                        h_flex()
+                            .flex_none()
+                            .gap_1()
+                            .text_color(if exit_code == 0 {
+                                cx.theme().success
+                            } else {
+                                cx.theme().danger
+                            })
+                            .child(
+                                Icon::new(if exit_code == 0 {
+                                    IconName::Check
+                                } else {
+                                    IconName::Close
+                                })
+                                .size(px(12.0))
+                                .flex_none(),
+                            )
+                            .child(
+                                div()
+                                    .font_family(cx.theme().mono_font_family.clone())
+                                    .child(format!(
+                                        "{} {exit_code}",
+                                        locale::text("exit", "退出码", "結束代碼")
+                                    )),
+                            )
+                            .into_any_element()
+                    }))
+                    .when(in_progress, |this| {
+                        this.child(
+                            h_flex()
+                                .flex_none()
+                                .gap_1()
+                                .text_color(cx.theme().accent)
+                                .child(Icon::new(IconName::LoaderCircle).size(px(12.0)).flex_none())
+                                .child(div().child(locale::text("running…", "运行中…", "執行中…"))),
+                        )
+                    }),
+            )
             .into_any_element()
     }
 
@@ -40425,9 +40780,118 @@ fn command_status_label(status: vibex_core::CommandStatus) -> &'static str {
 
 struct ToolCardProjection {
     title: String,
-    details: Vec<(String, String)>,
+    details: Vec<ToolCardDetailBlock>,
     failed: bool,
     icon: ProcessActivityIcon,
+}
+
+/// Typed expanded-content block for a tool/activity card. Each tool kind
+/// projects its own block sequence instead of a flat "label: value" dump, so
+/// command output reads like a terminal card, searches read like a query
+/// field, and structured input renders as labeled sections.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ToolCardDetailBlock {
+    /// Terminal-style execution card: prompt line, captured output body, and
+    /// a cwd / exit footer.
+    Terminal {
+        command: String,
+        cwd: Option<String>,
+        output: Option<String>,
+        exit_code: Option<i32>,
+        failed: bool,
+        in_progress: bool,
+    },
+    /// Search-field-style row with the query, plus an optional muted result
+    /// paragraph beneath it.
+    Search {
+        query: String,
+        result: Option<String>,
+        failed: bool,
+    },
+    /// File-path row with a file-type icon, plus an optional summary line.
+    File {
+        path: String,
+        summary: Option<String>,
+    },
+    /// Bounded monospace body under an uppercase label (structured tool
+    /// input/output echoes).
+    Mono { label: String, value: String },
+    /// Status-keyed rows, one line each (todo/plan step lists).
+    Rows { rows: Vec<(String, String)> },
+    /// Muted single-line field (secondary metadata such as an agent label).
+    Text {
+        label: String,
+        value: String,
+        accent: bool,
+    },
+}
+
+impl ToolCardDetailBlock {
+    fn approximate_bytes(&self) -> usize {
+        match self {
+            Self::Terminal {
+                command,
+                cwd,
+                output,
+                ..
+            } => {
+                command.len()
+                    + cwd.as_ref().map_or(0, String::len)
+                    + output.as_ref().map_or(0, String::len)
+            }
+            Self::Search { query, result, .. } => {
+                query.len() + result.as_ref().map_or(0, String::len)
+            }
+            Self::File { path, summary } => path.len() + summary.as_ref().map_or(0, String::len),
+            Self::Mono { label, value } => label.len().saturating_add(value.len()),
+            Self::Rows { rows } => rows
+                .iter()
+                .map(|(key, value)| key.len().saturating_add(value.len()))
+                .sum::<usize>(),
+            Self::Text { label, value, .. } => label.len().saturating_add(value.len()),
+        }
+    }
+
+    fn estimated_height(&self) -> f32 {
+        match self {
+            Self::Terminal {
+                command,
+                output,
+                in_progress,
+                ..
+            } => {
+                // Prompt row, cwd/exit footer, and the exit banner padding.
+                let mut height = 24.0 + 20.0 + estimated_pre_block_height(command) + 24.0;
+                if let Some(output) = output {
+                    height += 20.0 + estimated_pre_block_height(output);
+                }
+                if *in_progress {
+                    height += 24.0;
+                }
+                height
+            }
+            Self::Search { query, result, .. } => {
+                // Query truncates to one line inside the search-field row.
+                let _ = query;
+                let mut height = 36.0;
+                if let Some(result) = result {
+                    height += (estimated_wrapped_lines(result, 72) as f32) * 20.0 + 20.0;
+                }
+                height
+            }
+            Self::File { path, summary } => {
+                let _ = path;
+                let mut height = 36.0;
+                if let Some(summary) = summary {
+                    height += (estimated_wrapped_lines(summary, 72) as f32) * 20.0 + 4.0;
+                }
+                height
+            }
+            Self::Mono { value, .. } => 24.0 + estimated_pre_block_height(value),
+            Self::Rows { rows } => 24.0 + rows.len() as f32 * 24.0,
+            Self::Text { value, .. } => (estimated_wrapped_lines(value, 72) as f32) * 20.0 + 16.0,
+        }
+    }
 }
 
 impl ToolCardProjection {
@@ -40436,7 +40900,7 @@ impl ToolCardProjection {
             + self
                 .details
                 .iter()
-                .map(|(label, value)| label.len().saturating_add(value.len()))
+                .map(ToolCardDetailBlock::approximate_bytes)
                 .sum::<usize>()
     }
 }
@@ -41030,12 +41494,49 @@ fn tool_card_projection(
             } else {
                 tool.summary.clone()
             };
-            let mut details = vec![("tool".to_string(), tool.tool_name.clone())];
-            if let Some(input) = tool.input_summary.as_ref().filter(|s| !s.is_empty()) {
-                details.push(("input".to_string(), input.clone()));
+            let mut details = Vec::new();
+            let projected_input = tool
+                .input_summary
+                .as_ref()
+                .filter(|summary| !summary.is_empty())
+                .or_else(|| {
+                    tool.raw_extension
+                        .as_ref()
+                        .and_then(|extension| extension.raw_input.as_ref())
+                        .filter(|input| !input.is_empty())
+                });
+            if let Some(input) = projected_input {
+                details.push(ToolCardDetailBlock::Mono {
+                    label: locale::text("Input", "输入", "輸入").to_string(),
+                    value: input.clone(),
+                });
             }
-            if let Some(output) = tool.output_summary.as_ref().filter(|s| !s.is_empty()) {
-                details.push(("output".to_string(), output.clone()));
+            let projected_output = tool
+                .output_summary
+                .as_ref()
+                .filter(|summary| !summary.is_empty())
+                .or_else(|| {
+                    tool.raw_extension
+                        .as_ref()
+                        .and_then(|extension| extension.raw_output.as_ref())
+                        .map(|output| &output.text)
+                        .filter(|output| !output.is_empty())
+                });
+            if let Some(output) = projected_output {
+                details.push(ToolCardDetailBlock::Mono {
+                    label: locale::text("Output", "输出", "輸出").to_string(),
+                    value: output.clone(),
+                });
+            }
+            if details.is_empty()
+                && let Some(extension) = tool.raw_extension.as_ref().filter(|e| !e.meta.is_empty())
+            {
+                let rows = extension
+                    .meta
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                details.push(ToolCardDetailBlock::Rows { rows });
             }
             ToolCardProjection {
                 title,
@@ -41050,10 +41551,10 @@ fn tool_card_projection(
                 file_operation_verb(operation.operation),
                 operation.path
             ),
-            details: vec![
-                ("file".to_string(), operation.path.clone()),
-                ("summary".to_string(), operation.summary.clone()),
-            ],
+            details: vec![ToolCardDetailBlock::File {
+                path: operation.path.clone(),
+                summary: Some(operation.summary.clone()).filter(|summary| !summary.is_empty()),
+            }],
             failed: false,
             icon: match operation.operation {
                 vibex_core::FileOperationKind::Read => ProcessActivityIcon::FileRead,
@@ -41064,39 +41565,55 @@ fn tool_card_projection(
                 vibex_core::FileOperationKind::Delete => ProcessActivityIcon::FileDelete,
             },
         },
-        Some(Payload::WebSearch(search)) => {
-            let mut details = vec![("query".to_string(), search.query.clone())];
-            if let Some(result) = search.result_summary.as_ref().filter(|s| !s.is_empty()) {
-                details.push(("result".to_string(), result.clone()));
-            }
-            ToolCardProjection {
-                title: search.query.clone(),
-                details,
+        Some(Payload::WebSearch(search)) => ToolCardProjection {
+            title: search.query.clone(),
+            details: vec![ToolCardDetailBlock::Search {
+                query: search.query.clone(),
+                result: search
+                    .result_summary
+                    .clone()
+                    .filter(|result| !result.is_empty()),
                 failed: search.status == Status::Failed,
-                icon: ProcessActivityIcon::Search,
-            }
-        }
+            }],
+            failed: search.status == Status::Failed,
+            icon: ProcessActivityIcon::Search,
+        },
         Some(Payload::TodoUpdate(todo)) => ToolCardProjection {
             title: todo.title.clone(),
-            details: todo
-                .items
-                .iter()
-                .map(|item| {
-                    (
-                        plan_step_status_text(item.status).to_string(),
-                        item.title.clone(),
-                    )
-                })
-                .collect(),
+            details: vec![ToolCardDetailBlock::Rows {
+                rows: todo
+                    .items
+                    .iter()
+                    .map(|item| {
+                        (
+                            plan_step_status_text(item.status).to_string(),
+                            item.title.clone(),
+                        )
+                    })
+                    .collect(),
+            }],
             failed: false,
             icon: ProcessActivityIcon::Todo,
         },
         Some(Payload::Collaboration(collaboration)) => {
-            let mut details = vec![("action".to_string(), collaboration.action.clone())];
+            let mut details = Vec::new();
             if let Some(agent) = collaboration.agent_label.as_ref().filter(|s| !s.is_empty()) {
-                details.push(("agent".to_string(), agent.clone()));
+                details.push(ToolCardDetailBlock::Text {
+                    label: locale::text("Agent", "代理", "代理").to_string(),
+                    value: agent.clone(),
+                    accent: true,
+                });
             }
-            details.push(("summary".to_string(), collaboration.summary.clone()));
+            details.push(ToolCardDetailBlock::Text {
+                label: locale::text("Action", "动作", "動作").to_string(),
+                value: collaboration.action.clone(),
+                accent: false,
+            });
+            details.push(ToolCardDetailBlock::Text {
+                label: locale::text("Summary", "摘要", "摘要").to_string(),
+                value: collaboration.summary.clone(),
+                accent: false,
+            });
             ToolCardProjection {
                 title: if collaboration.summary.is_empty() {
                     collaboration.action.clone()
@@ -41110,15 +41627,18 @@ fn tool_card_projection(
         }
         Some(Payload::Command(command)) => {
             let mut details = Vec::new();
-            if let Some(cwd) = command.cwd.as_ref().filter(|s| !s.is_empty()) {
-                details.push(("cwd".to_string(), cwd.clone()));
-            }
-            details.push(("command".to_string(), command.command.clone()));
-            if let Some(output) = command.output_summary.as_ref().filter(|s| !s.is_empty()) {
-                details.push(("output".to_string(), output.clone()));
-            }
-            if let Some(exit_code) = command.exit_code {
-                details.push(("exit".to_string(), exit_code.to_string()));
+            if !command.command.is_empty() {
+                details.push(ToolCardDetailBlock::Terminal {
+                    command: command.command.clone(),
+                    cwd: command.cwd.clone().filter(|cwd| !cwd.is_empty()),
+                    output: command
+                        .output_summary
+                        .clone()
+                        .filter(|output| !output.is_empty()),
+                    exit_code: command.exit_code,
+                    failed: command.status == vibex_core::CommandStatus::Failed,
+                    in_progress: command.status == vibex_core::CommandStatus::Started,
+                });
             }
             ToolCardProjection {
                 title: command.command.clone(),
@@ -41130,14 +41650,25 @@ fn tool_card_projection(
         Some(Payload::ImageGeneration(image)) => {
             let mut details = Vec::new();
             if let Some(mime) = image.mime_type.as_ref().filter(|s| !s.is_empty()) {
-                details.push(("type".to_string(), mime.clone()));
+                details.push(ToolCardDetailBlock::Text {
+                    label: locale::text("Type", "类型", "類型").to_string(),
+                    value: mime.clone(),
+                    accent: false,
+                });
             }
             if let Some(reference) = image.image_reference.as_ref().filter(|s| !s.is_empty()) {
-                details.push(("reference".to_string(), reference.clone()));
+                details.push(ToolCardDetailBlock::Mono {
+                    label: locale::text("Reference", "引用", "引用").to_string(),
+                    value: reference.clone(),
+                });
             }
-            details.push(("summary".to_string(), image.summary.clone()));
+            details.push(ToolCardDetailBlock::Text {
+                label: locale::text("Summary", "摘要", "摘要").to_string(),
+                value: image.summary.clone(),
+                accent: false,
+            });
             ToolCardProjection {
-                title: "Image generation".to_string(),
+                title: locale::text("Image generation", "图像生成", "圖像生成").to_string(),
                 details,
                 failed: image.status == Status::Failed,
                 icon: ProcessActivityIcon::Image,
@@ -41148,7 +41679,11 @@ fn tool_card_projection(
             details: if row.body.is_empty() {
                 Vec::new()
             } else {
-                vec![("summary".to_string(), row.body.clone())]
+                vec![ToolCardDetailBlock::Text {
+                    label: locale::text("Summary", "摘要", "摘要").to_string(),
+                    value: row.body.clone(),
+                    accent: false,
+                }]
             },
             failed: row.failed,
             icon: match row.kind {
@@ -41179,11 +41714,6 @@ fn estimated_pre_block_height(value: &str) -> f32 {
     // Mirrors the mono detail block: 20px lines, 16px padding, 160px max height.
     // Mono 13px fits ~90 chars at the narrowest content width.
     ((estimated_wrapped_lines(value, 90) as f32) * 20.0 + 16.0).min(160.0)
-}
-
-fn estimated_detail_block_height(value: &str) -> f32 {
-    // Uppercase label line plus the bounded mono block.
-    24.0 + estimated_pre_block_height(value)
 }
 
 fn terminal_cwd_for_workspace_target(path: &str, kind: FileEntryKind) -> Option<String> {
@@ -50937,6 +51467,163 @@ mod tests {
         assert_eq!(
             generic_tool_activity_icon("mcp", "Called external integration"),
             ProcessActivityIcon::Integration
+        );
+    }
+
+    fn projection_test_row(kind: TimelineRowKind) -> TimelineRow {
+        TimelineRow {
+            id: "row:test".to_string(),
+            kind,
+            item_ids: vec!["item:test".to_string()],
+            turn_id: Some("turn:test".to_string()),
+            turn_item_count: 1,
+            turn_failed: false,
+            turn_pending_permission: false,
+            conclusion: false,
+            first_sequence: 1,
+            last_sequence: 1,
+            title: String::new(),
+            body: String::new(),
+            streaming: false,
+            collapsible: false,
+            pending_permission: false,
+            failed: false,
+            runtime_attribution: None,
+            file_path: None,
+        }
+    }
+
+    #[test]
+    fn command_payload_projects_a_terminal_detail_block() {
+        let row = projection_test_row(TimelineRowKind::Command);
+        let payload = vibex_core::TimelinePayload::Command(vibex_core::CommandPayload {
+            command: "cargo test -p vibex-desktop".to_string(),
+            cwd: Some("/repo".to_string()),
+            status: vibex_core::CommandStatus::Completed,
+            exit_code: Some(0),
+            output_summary: Some("test result: ok".to_string()),
+            raw_extension: None,
+        });
+        let projection = tool_card_projection(&row, Some(&payload));
+        assert_eq!(projection.details.len(), 1);
+        match &projection.details[0] {
+            ToolCardDetailBlock::Terminal {
+                command,
+                cwd,
+                output,
+                exit_code,
+                failed,
+                in_progress,
+            } => {
+                assert_eq!(command, "cargo test -p vibex-desktop");
+                assert_eq!(cwd.as_deref(), Some("/repo"));
+                assert_eq!(output.as_deref(), Some("test result: ok"));
+                assert_eq!(*exit_code, Some(0));
+                assert!(!failed);
+                assert!(!in_progress);
+            }
+            other => panic!("expected terminal block, got {other:?}"),
+        }
+        assert!(projection.details[0].estimated_height() > 24.0);
+    }
+
+    #[test]
+    fn tool_call_payload_projects_labeled_input_and_output_blocks() {
+        let row = projection_test_row(TimelineRowKind::ToolCall);
+        let payload = vibex_core::TimelinePayload::ToolCall(vibex_core::ToolCallPayload {
+            tool_call_id: "call:1".to_string(),
+            tool_name: "read_file".to_string(),
+            status: vibex_core::ToolCallStatus::Completed,
+            summary: "Read app.rs".to_string(),
+            input_summary: Some("{\"path\": \"app.rs\"}".to_string()),
+            output_summary: Some("fn main() {}".to_string()),
+            raw_extension: None,
+        });
+        let projection = tool_card_projection(&row, Some(&payload));
+        assert_eq!(
+            projection.details,
+            vec![
+                ToolCardDetailBlock::Mono {
+                    label: locale::text("Input", "输入", "輸入").to_string(),
+                    value: "{\"path\": \"app.rs\"}".to_string(),
+                },
+                ToolCardDetailBlock::Mono {
+                    label: locale::text("Output", "输出", "輸出").to_string(),
+                    value: "fn main() {}".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn web_search_payload_projects_a_search_field_block() {
+        let row = projection_test_row(TimelineRowKind::WebSearch);
+        let payload = vibex_core::TimelinePayload::WebSearch(vibex_core::WebSearchPayload {
+            query: "gpui scroll handling".to_string(),
+            status: vibex_core::ToolCallStatus::Completed,
+            result_summary: Some("Found 3 relevant pages.".to_string()),
+            raw_extension: None,
+        });
+        let projection = tool_card_projection(&row, Some(&payload));
+        assert_eq!(
+            projection.details,
+            vec![ToolCardDetailBlock::Search {
+                query: "gpui scroll handling".to_string(),
+                result: Some("Found 3 relevant pages.".to_string()),
+                failed: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn file_operation_payload_projects_a_file_path_block() {
+        let row = projection_test_row(TimelineRowKind::FileOperation);
+        let payload =
+            vibex_core::TimelinePayload::FileOperation(vibex_core::FileOperationPayload {
+                operation: vibex_core::FileOperationKind::Edit,
+                path: "apps/desktop/src/app.rs".to_string(),
+                summary: "Replaced the expanded detail renderer.".to_string(),
+                old_text: None,
+                new_text: None,
+                patch: None,
+                raw_extension: None,
+            });
+        let projection = tool_card_projection(&row, Some(&payload));
+        assert_eq!(
+            projection.details,
+            vec![ToolCardDetailBlock::File {
+                path: "apps/desktop/src/app.rs".to_string(),
+                summary: Some("Replaced the expanded detail renderer.".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn todo_update_payload_projects_status_rows() {
+        let row = projection_test_row(TimelineRowKind::TodoUpdate);
+        let payload = vibex_core::TimelinePayload::TodoUpdate(vibex_core::TodoUpdatePayload {
+            title: "Plan".to_string(),
+            items: vec![
+                vibex_core::PlanStepPayload {
+                    title: "Render terminal card".to_string(),
+                    status: vibex_core::PlanStepStatus::Completed,
+                },
+                vibex_core::PlanStepPayload {
+                    title: "Measure heights".to_string(),
+                    status: vibex_core::PlanStepStatus::Pending,
+                },
+            ],
+            raw_extension: None,
+        });
+        let projection = tool_card_projection(&row, Some(&payload));
+        assert_eq!(
+            projection.details,
+            vec![ToolCardDetailBlock::Rows {
+                rows: vec![
+                    ("completed".to_string(), "Render terminal card".to_string()),
+                    ("pending".to_string(), "Measure heights".to_string()),
+                ],
+            }]
         );
     }
 
