@@ -25,6 +25,12 @@ function source(relativePath) {
   return readFileSync(path(relativePath), "utf8");
 }
 
+// Windows runners check text sources out with CRLF, so multi-line contract
+// assertions must match against normalized line endings.
+function workflowSource(relativePath) {
+  return source(relativePath).split("\r\n").join("\n");
+}
+
 function sha256(relativePath) {
   return createHash("sha256").update(readFileSync(path(relativePath))).digest("hex");
 }
@@ -128,7 +134,7 @@ function validatePackaging() {
     assert(command.includes(`build-channel.mjs ${channel}`), `${channel} package command drifted`);
     assert(command.includes("--formats deb,appimage"), `${channel} package formats drifted`);
   }
-  const workflow = source(".github/workflows/release-candidate.yml");
+  const workflow = workflowSource(".github/workflows/release-candidate.yml");
   assert(workflow.includes("ubuntu-24.04"), "candidate workflow lost its Linux host");
   assert(workflow.includes("--formats deb,appimage"), "candidate workflow formats drifted");
   for (const dependency of [
@@ -139,7 +145,7 @@ function validatePackaging() {
   ]) {
     assert(workflow.includes(dependency), `candidate workflow is missing ${dependency}`);
   }
-  const releaseWorkflow = source(".github/workflows/release.yml");
+  const releaseWorkflow = workflowSource(".github/workflows/release.yml");
   for (const dependency of [
     "libglib2.0-dev",
     "libgtk-3-dev",
