@@ -33,7 +33,7 @@ pub const TOKEN_SCHEMA_VERSION: &str = "vibex-design-tokens.v1";
 pub const TOKEN_PRODUCT_VISUAL_SOURCE: &str = "apps/desktop";
 pub const TOKEN_SOURCE_PATH: &str = "crates/vibex-ui/theme/tokens.json";
 pub const TOKEN_SOURCE_SHA256: &str =
-    "a10a9aacd1c33043d6f8fdb54d12d278bd9e21cbe306cd4311e2cbdc89185824";
+    "490cd6d8f06a9ce75eeb01c635dfaa5856088727d6b894ddbbbce353b19e1479";
 pub const GPUI_REVISION: &str = "7b7bad0fbcea1ec312db104af451b7bb31146e96";
 pub const GPUI_COMPONENT_REVISION: &str = "031555662e99a1b5a549990b47f246d475b8288a";
 
@@ -531,9 +531,9 @@ pub const LIGHT_TOKENS: &[GpuiColorToken] = &[
 pub const DARK_TOKENS: &[GpuiColorToken] = &[
     GpuiColorToken {
         name: "background",
-        oklch: "0.122 0 0",
-        hex: "#060606",
-        rgb: 0x060606,
+        oklch: "0.158 0 0",
+        hex: "#0d0d0d",
+        rgb: 0x0d0d0d,
         alpha: 1.0,
     },
     GpuiColorToken {
@@ -790,9 +790,9 @@ pub const DARK_TOKENS: &[GpuiColorToken] = &[
     },
     GpuiColorToken {
         name: "sidebar",
-        oklch: "0.158 0 0",
-        hex: "#0d0d0d",
-        rgb: 0x0d0d0d,
+        oklch: "0.209 0 0",
+        hex: "#181818",
+        rgb: 0x181818,
         alpha: 1.0,
     },
     GpuiColorToken {
