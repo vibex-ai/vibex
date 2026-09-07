@@ -19,18 +19,20 @@ use vibex_backend::{
     BackendProjection, BackendResult, MutationRequest, WorkspaceBackend as _, WorkspaceSummary,
 };
 use vibex_core::{
-    AgentSessionState, AgentTimelineDisplaySettings, AgentTimelineReasoningDisplayMode,
+    AgentId, AgentSessionState, AgentTimelineDisplaySettings, AgentTimelineReasoningDisplayMode,
     ContinueAgentTurnRequest, CreateAgentSessionRequest, ElicitationFieldKind,
     ElicitationResolutionAction, ForkAgentSessionRequest, MessageAttachment, OpenWorkspaceRequest,
     PermissionResolution, PermissionResponseKind, PermissionRiskCategory,
     RemoteDeepLinkResolutionStatus, RemoteLanPairingRequestState, RemoteSidebarDropPosition,
     RemoteSidebarItemKind, RemoteSidebarItemRef, RemoteSidebarOrganizationMutation,
-    RenameAgentSessionRequest, RequestId, ResolvePermissionRequest, RuntimeOptionAvailability,
-    RuntimeSelectionInteraction, SendAgentMessageRequest, SessionRuntimeFeature,
-    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
-    SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest, TimelineItem, TimelinePayload,
-    TimelineRedactionState, TimelineSource, UserMessagePayload, VibexSessionId, WorkspaceMode,
-    WorkspaceRecord, agent_session_turn_requires_continuation, unix_timestamp_ms,
+    RenameAgentSessionRequest, RequestId, ResolvePermissionRequest, RuntimeAuthSourceAvailability,
+    RuntimeAuthSourceKind, RuntimeAuthSourceSummary, RuntimeModelSelection,
+    RuntimeOptionAvailability, RuntimeSelectionInteraction, SendAgentMessageRequest,
+    SessionRuntimeFeature, SessionRuntimeFeatureKind, SessionRuntimeOption,
+    SessionRuntimeOptionCatalog, SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest,
+    TimelineItem, TimelinePayload, TimelineRedactionState, TimelineSource, UserMessagePayload,
+    VibexSessionId, WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation,
+    unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     NewSessionLocation, ReasoningDisplayMode, RuntimeCascadeChoice, RuntimeCascadeProjection,
@@ -61,7 +63,7 @@ use crate::sidebar::{
     SidebarRow, SidebarRowInput, SidebarRowKind, SidebarWorkspace, ancestors_of, drop_target,
     folder_guides, press_is_on_trailing_actions, row_at_position, sidebar_rows, workspace_cards,
 };
-use crate::storage::{CredentialStorage, MobileTimelineDisplaySettingsOverride};
+use crate::storage::{AppSettings, CredentialStorage, MobileTimelineDisplaySettingsOverride};
 use crate::workbench::{MobileWorkbench, WorkbenchSurface};
 use crate::{locale, markdown, notifications, scanner, theme};
 
@@ -182,6 +184,14 @@ enum WorkspaceActionKind {
 enum RuntimeOptionsTarget {
     ActiveSession,
     NewSession,
+}
+
+/// The session-settings sheet drills into one Agent at a time, mirroring the
+/// desktop composer cascade (Agent list → provider-grouped model list).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeSheetMenu {
+    agent_id: AgentId,
+    agent_label: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -424,6 +434,24 @@ struct DrawerSnap {
     animation_id: u64,
 }
 
+/// The platform appearance, used to resolve the System preference.
+fn system_appearance_is_dark(cx: &App) -> bool {
+    matches!(
+        cx.window_appearance(),
+        gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+    )
+}
+
+/// Applies the mobile-owned appearance and language preferences to the
+/// process-wide resolvers. Called at startup and whenever a setting changes.
+/// Mobile settings take precedence when they exist; absent values follow the
+/// platform.
+fn apply_app_settings(settings: &AppSettings, cx: &App) {
+    theme::set_appearance_mode(settings.theme.unwrap_or_default());
+    theme::set_system_dark(system_appearance_is_dark(cx));
+    locale::set_preference(settings.language.unwrap_or_default());
+}
+
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("backspace", Backspace, Some("MobileTextInput")),
@@ -453,6 +481,12 @@ type TimelineMarkdownViews =
 
 pub struct MobileApp {
     storage: CredentialStorage,
+    /// Mobile-owned appearance and language preferences. Mobile settings take
+    /// precedence over the desktop-host values when they exist.
+    app_settings: AppSettings,
+    /// Keeps the System appearance preference in step with the platform while
+    /// the window is open; dropped when the app shuts down.
+    _appearance_subscription: Option<gpui::Subscription>,
     mode: RootMode,
     backend: Option<Arc<WebRemoteBackend>>,
     controller: Option<AgentWorkflowController>,
@@ -544,6 +578,8 @@ pub struct MobileApp {
     runtime_options_open: bool,
     runtime_options_target: RuntimeOptionsTarget,
     runtime_draft: Option<SessionRuntimeSelection>,
+    runtime_sheet_menu: Option<RuntimeSheetMenu>,
+    runtime_sheet_search: Option<Entity<TextInput>>,
     runtime_feature_inputs: BTreeMap<String, Entity<TextInput>>,
     runtime_switch_generation: u64,
     runtime_switch_busy_generation: Option<u64>,
@@ -581,9 +617,65 @@ fn timeline_action_button(
 }
 
 impl MobileApp {
-    pub fn new(data_dir: PathBuf, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// Persists a changed appearance preference, applies it, and records it on
+    /// the app so future launches restore the user's choice.
+    fn update_theme_mode(
+        &mut self,
+        mode: theme::AppearanceMode,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.app_settings.theme = Some(mode);
+        theme::set_appearance_mode(mode);
+        // The System preference follows the platform, so the observer only needs
+        // to run while the stored preference defers to the OS.
+        self._appearance_subscription = if theme::follows_system() {
+            Some(cx.observe_window_appearance(_window, |_this, _window, cx| {
+                theme::set_system_dark(system_appearance_is_dark(cx));
+                cx.notify();
+            }))
+        } else {
+            None
+        };
+        self.persist_app_settings(cx);
+    }
+
+    /// Persists a changed language preference and applies it to the process-wide
+    /// locale resolver.
+    fn update_language(
+        &mut self,
+        language: locale::LanguagePreference,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.app_settings.language = Some(language);
+        locale::set_preference(language);
+        self.persist_app_settings(cx);
+    }
+
+    fn persist_app_settings(&self, cx: &mut Context<Self>) {
+        if let Err(error) = self.storage.save_app_settings(&self.app_settings) {
+            eprintln!("mobile app settings could not be saved: {error}");
+        }
+        cx.notify();
+    }
+
+    pub fn new(data_dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let storage = CredentialStorage::new(data_dir);
         let stored = storage.load();
+        let app_settings = storage.load_app_settings().unwrap_or_else(|error| {
+            eprintln!("mobile app settings unavailable: {error}");
+            AppSettings::default()
+        });
+        apply_app_settings(&app_settings, cx);
+        let appearance_subscription = if theme::follows_system() {
+            Some(cx.observe_window_appearance(window, |_this, _window, cx| {
+                theme::set_system_dark(system_appearance_is_dark(cx));
+                cx.notify();
+            }))
+        } else {
+            None
+        };
         let stored_hosts = storage.load_hosts();
         let stored_timeline_display_settings = storage.load_timeline_display_settings_overrides();
         let mode = if matches!(stored, Ok(Some(_))) {
@@ -603,6 +695,8 @@ impl MobileApp {
         let sidebar_search_subscription = cx.observe(&sidebar_search_input, |_, _, cx| cx.notify());
         let mut app = Self {
             storage,
+            app_settings,
+            _appearance_subscription: appearance_subscription,
             mode,
             backend: None,
             controller: None,
@@ -710,6 +804,8 @@ impl MobileApp {
             runtime_options_open: false,
             runtime_options_target: RuntimeOptionsTarget::ActiveSession,
             runtime_draft: None,
+            runtime_sheet_menu: None,
+            runtime_sheet_search: None,
             runtime_feature_inputs: BTreeMap::new(),
             runtime_switch_generation: 0,
             runtime_switch_busy_generation: None,
@@ -1719,6 +1815,7 @@ impl MobileApp {
             self.runtime_options_open = false;
             self.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
             self.runtime_draft = None;
+            self.close_runtime_sheet_menu();
             self.runtime_feature_inputs.clear();
             self.runtime_switch_error = None;
             cx.notify();
@@ -1731,8 +1828,45 @@ impl MobileApp {
         self.runtime_options_open = false;
         self.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
         self.runtime_draft = None;
+        self.close_runtime_sheet_menu();
         self.runtime_feature_inputs.clear();
         self.runtime_switch_error = None;
+    }
+
+    /// Drills from the Agent list into the provider-grouped model list for one
+    /// Agent. The draft is untouched until a model row is actually chosen.
+    fn open_runtime_sheet_menu(
+        &mut self,
+        agent_id: AgentId,
+        agent_label: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.runtime_switch_busy_generation.is_some() {
+            return;
+        }
+        self.runtime_sheet_menu = Some(RuntimeSheetMenu {
+            agent_id,
+            agent_label,
+        });
+        self.runtime_sheet_search =
+            Some(cx.new(|cx| {
+                TextInput::new(locale::text("Search models", "搜索模型", "搜尋模型"), cx)
+            }));
+        cx.notify();
+    }
+
+    fn close_runtime_sheet_menu(&mut self) {
+        self.runtime_sheet_menu = None;
+        self.runtime_sheet_search = None;
+    }
+
+    fn choose_runtime_sheet_model(
+        &mut self,
+        selection: SessionRuntimeSelection,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_runtime_sheet_menu();
+        self.choose_runtime_selection(selection, cx);
     }
 
     fn choose_runtime_selection(
@@ -1866,6 +2000,7 @@ impl MobileApp {
             self.runtime_options_open = false;
             self.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
             self.runtime_draft = None;
+            self.close_runtime_sheet_menu();
             self.runtime_feature_inputs.clear();
             self.runtime_switch_error = None;
             self.notice = Some(
@@ -1931,6 +2066,7 @@ impl MobileApp {
                         this.runtime_options_open = false;
                         this.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
                         this.runtime_draft = None;
+                        this.close_runtime_sheet_menu();
                         this.runtime_feature_inputs.clear();
                         this.runtime_switch_error = None;
                         this.notice =
@@ -4841,10 +4977,10 @@ impl MobileApp {
                             div()
                                 .rounded(px(theme::RADIUS_CARD))
                                 .border_1()
-                                .border_color(rgb(theme::ACCENT_RED))
+                                .border_color(theme::accent_red())
                                 .p(px(theme::SPACING_MD))
                                 .text_size(px(theme::FONT_DETAIL))
-                                .text_color(rgb(theme::ACCENT_RED))
+                                .text_color(theme::accent_red())
                                 .child(error.message.clone()),
                         )
                     })
@@ -4924,8 +5060,8 @@ impl MobileApp {
                         .id("find-nearby-desktops")
                         .h(px(theme::TOUCH_TARGET))
                         .rounded(px(theme::RADIUS_CONTROL))
-                        .bg(rgb(theme::TEXT_PRIMARY))
-                        .text_color(rgb(theme::BG_PRIMARY))
+                        .bg(theme::text_primary())
+                        .text_color(theme::bg_primary())
                         .flex()
                         .items_center()
                         .justify_center()
@@ -4938,7 +5074,7 @@ impl MobileApp {
                             svg()
                                 .path("icons/refresh.svg")
                                 .size(px(theme::ICON_MD))
-                                .text_color(rgb(theme::BG_PRIMARY)),
+                                .text_color(theme::bg_primary()),
                         )
                         .child(locale::common("Find Desktops")),
                 )
@@ -5155,7 +5291,7 @@ impl MobileApp {
             .justify_center()
             .text_size(px(theme::FONT_DETAIL))
             .text_color(theme::text_muted())
-            .when(error, |message| message.text_color(rgb(theme::ACCENT_RED)))
+            .when(error, |message| message.text_color(theme::accent_red()))
             .child(message.into())
             .into_any_element()
     }
@@ -5190,13 +5326,13 @@ impl MobileApp {
                             .flex()
                             .items_center()
                             .gap(px(theme::SPACING_SM))
-                            .child(div().size(px(theme::ICON_STATUS)).rounded_full().bg(rgb(
+                            .child(div().size(px(theme::ICON_STATUS)).rounded_full().bg(
                                 if self.operation_busy {
-                                    theme::ACCENT_YELLOW
+                                    theme::accent_yellow()
                                 } else {
-                                    theme::ACCENT_RED
+                                    theme::accent_red()
                                 },
-                            )))
+                            ))
                             .child(div().text_color(theme::text_secondary()).child(
                                 if self.operation_busy {
                                     locale::common("Connecting to desktop...")
@@ -5214,7 +5350,7 @@ impl MobileApp {
                                 .border_color(theme::border_subtle())
                                 .bg(theme::bg_card_dim())
                                 .p(px(theme::SPACING_MD))
-                                .text_color(rgb(theme::ACCENT_RED))
+                                .text_color(theme::accent_red())
                                 .child(error.message.clone()),
                         )
                     })
@@ -5425,7 +5561,7 @@ impl MobileApp {
                                 .px_4()
                                 .py_2()
                                 .text_size(px(theme::FONT_CAPTION))
-                                .text_color(rgb(theme::ACCENT_YELLOW))
+                                .text_color(theme::accent_yellow())
                                 .child(notice.clone()),
                         )
                     })
@@ -5623,7 +5759,7 @@ impl MobileApp {
                     .active(|style| style.bg(theme::row_pressed_bg()))
                     .text_size(px(theme::FONT_BODY))
                     .text_color(if destructive {
-                        rgb(theme::ACCENT_RED).into()
+                        theme::accent_red().into()
                     } else {
                         theme::text_primary()
                     })
@@ -6097,15 +6233,15 @@ impl MobileApp {
                                     .px_4()
                                     .rounded(px(theme::RADIUS_CONTROL))
                                     .bg(if destructive {
-                                        rgb(theme::ACCENT_RED)
+                                        theme::accent_red()
                                     } else {
-                                        rgb(theme::TEXT_PRIMARY)
+                                        theme::text_primary()
                                     })
                                     .flex()
                                     .items_center()
                                     .justify_center()
                                     .text_size(px(theme::FONT_BODY))
-                                    .text_color(rgb(theme::BG_PRIMARY))
+                                    .text_color(theme::bg_primary())
                                     .when(
                                         !self.session_action_busy && can_manage_session,
                                         |button| {
@@ -6233,15 +6369,15 @@ impl MobileApp {
                                     .px_4()
                                     .rounded(px(theme::RADIUS_CONTROL))
                                     .bg(if rename {
-                                        rgb(theme::TEXT_PRIMARY)
+                                        theme::text_primary()
                                     } else {
-                                        rgb(theme::ACCENT_RED)
+                                        theme::accent_red()
                                     })
                                     .flex()
                                     .items_center()
                                     .justify_center()
                                     .cursor_pointer()
-                                    .text_color(rgb(theme::BG_PRIMARY))
+                                    .text_color(theme::bg_primary())
                                     .when(!self.workspace_action_busy, |button| {
                                         button.on_mouse_up(
                                             MouseButton::Left,
@@ -6273,12 +6409,10 @@ impl MobileApp {
             .map(|(catalog, draft)| RuntimeCascadeProjection::from_catalog(catalog, draft))
             .unwrap_or_default();
         let RuntimeCascadeProjection {
-            agents,
-            auth_sources,
-            models,
             reasoning_efforts,
             modes,
             features,
+            ..
         } = projection;
         let busy = self.runtime_switch_busy_generation.is_some();
         let selection_available = catalog.as_ref().is_some_and(|catalog| {
@@ -6295,15 +6429,6 @@ impl MobileApp {
             backend.capability_snapshot().agent.supports(operation)
         });
         let can_apply = can_switch && selection_available && !busy;
-        let selected_agent = draft.as_ref().map(|draft| draft.agent_id.to_string());
-        let selected_auth_source = draft
-            .as_ref()
-            .map(|draft| draft.auth_source.id().to_string());
-        let selected_model = draft.as_ref().map(|draft| draft.model.clone());
-        let selected_reasoning = draft
-            .as_ref()
-            .and_then(|draft| draft.reasoning_effort.clone());
-        let selected_mode = draft.as_ref().and_then(|draft| draft.mode_id.clone());
 
         div()
             .absolute()
@@ -6326,257 +6451,16 @@ impl MobileApp {
                     .bg(theme::bg_primary())
                     .flex()
                     .flex_col()
-                    .child(
-                        div()
-                            .h(px(52.0))
-                            .flex_shrink_0()
-                            .border_b_1()
-                            .border_color(theme::border_subtle())
-                            .px_4()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(px(theme::FONT_HEADING))
-                                    .text_color(theme::text_primary())
-                                    .child(locale::text(
-                                        "Runtime options",
-                                        "运行时选项",
-                                        "執行環境選項",
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .id("close-runtime-options")
-                                    .size(px(theme::TOUCH_TARGET))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .when(!busy, |button| {
-                                        button
-                                            .cursor_pointer()
-                                            .active(|style| style.opacity(0.6))
-                                            .on_mouse_up(
-                                                MouseButton::Left,
-                                                cx.listener(Self::close_runtime_options),
-                                            )
-                                    })
-                                    .child(
-                                        svg()
-                                            .path("icons/x.svg")
-                                            .size(px(theme::ICON_SM))
-                                            .text_color(theme::text_secondary()),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("runtime-options-scroll")
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .when(catalog.is_none(), |body| {
-                                body.child(
-                                    div()
-                                        .p_4()
-                                        .text_size(px(theme::FONT_CAPTION))
-                                        .text_color(theme::text_muted())
-                                        .child(locale::text(
-                                            "Loading runtime options...",
-                                            "正在加载运行时选项…",
-                                            "正在載入執行環境選項…",
-                                        )),
-                                )
-                            })
-                            .when(
-                                catalog.is_some() && draft.is_some() && !selection_available,
-                                |body| {
-                                    body.child(
-                                        div()
-                                            .mx_3()
-                                            .mt_3()
-                                            .rounded(px(theme::RADIUS_CONTROL))
-                                            .border_1()
-                                            .border_color(rgb(theme::ACCENT_YELLOW))
-                                            .bg(theme::bg_card_dim())
-                                            .p_3()
-                                            .text_size(px(theme::FONT_CAPTION))
-                                            .text_color(rgb(theme::ACCENT_YELLOW))
-                                            .child(locale::text(
-                                                "The current runtime is unavailable. Select an available option.",
-                                                "当前运行时不可用，请选择一个可用选项。",
-                                                "目前執行環境無法使用，請選擇可用選項。",
-                                            )),
-                                    )
-                                },
-                            )
-                            .when(!agents.is_empty(), |body| {
-                                body.child(runtime_section_heading(locale::text(
-                                    "Agent", "Agent", "Agent",
-                                )))
-                                .child(
-                                    div()
-                                        .px_3()
-                                        .flex()
-                                        .flex_wrap()
-                                        .gap_2()
-                                        .children(agents.into_iter().map(|choice| {
-                                            let selected = selected_agent.as_deref()
-                                                == Some(choice.value.as_str());
-                                            self.render_runtime_choice(
-                                                "agent",
-                                                choice,
-                                                selected,
-                                                cx,
-                                            )
-                                        })),
-                                )
-                            })
-                            .when(!auth_sources.is_empty(), |body| {
-                                body.child(runtime_section_heading(locale::text(
-                                    "Authentication",
-                                    "身份来源",
-                                    "身分來源",
-                                )))
-                                .child(
-                                    div()
-                                        .px_3()
-                                        .flex()
-                                        .flex_wrap()
-                                        .gap_2()
-                                        .children(auth_sources.into_iter().map(|choice| {
-                                            let selected = selected_auth_source.as_deref()
-                                                == Some(choice.value.as_str());
-                                            self.render_runtime_choice(
-                                                "authentication",
-                                                choice,
-                                                selected,
-                                                cx,
-                                            )
-                                        })),
-                                )
-                            })
-                            .when(!models.is_empty(), |body| {
-                                body.child(runtime_section_heading(locale::text(
-                                    "Model", "模型", "模型",
-                                )))
-                                .child(
-                                    div()
-                                        .px_3()
-                                        .flex()
-                                        .flex_wrap()
-                                        .gap_2()
-                                        .children(models.into_iter().map(|choice| {
-                                            let selected = selected_model.as_ref()
-                                                == Some(&choice.selection.model);
-                                            self.render_runtime_choice(
-                                                "model", choice, selected, cx,
-                                            )
-                                        })),
-                                )
-                            })
-                            .when(!reasoning_efforts.is_empty(), |body| {
-                                body.child(runtime_section_heading(locale::common("Reasoning")))
-                                    .child(
-                                        div()
-                                            .px_3()
-                                            .flex()
-                                            .flex_wrap()
-                                            .gap_2()
-                                            .child(
-                                                runtime_choice_button(
-                                                    "runtime-reasoning:default",
-                                                    locale::common("Default"),
-                                                    selected_reasoning.is_none(),
-                                                )
-                                                .when(!busy, |button| {
-                                                    button
-                                                        .cursor_pointer()
-                                                        .active(|style| {
-                                                            style.bg(theme::row_pressed_bg())
-                                                        })
-                                                        .on_mouse_up(
-                                                            MouseButton::Left,
-                                                            cx.listener(|this, _, _, cx| {
-                                                                this.choose_default_runtime_reasoning(cx)
-                                                            }),
-                                                        )
-                                                }),
-                                            )
-                                            .children(reasoning_efforts.into_iter().map(|choice| {
-                                                let selected = selected_reasoning.as_deref()
-                                                    == Some(choice.value.as_str());
-                                                self.render_runtime_choice(
-                                                    "reasoning",
-                                                    choice,
-                                                    selected,
-                                                    cx,
-                                                )
-                                            })),
-                                    )
-                            })
-                            .when(!modes.is_empty(), |body| {
-                                body.child(runtime_section_heading(locale::common("Mode")))
-                                    .child(
-                                        div()
-                                            .px_3()
-                                            .flex()
-                                            .flex_wrap()
-                                            .gap_2()
-                                            .child(
-                                                runtime_choice_button(
-                                                    "runtime-mode:default",
-                                                    locale::common("Default"),
-                                                    selected_mode.is_none(),
-                                                )
-                                                .when(!busy, |button| {
-                                                    button
-                                                        .cursor_pointer()
-                                                        .active(|style| {
-                                                            style.bg(theme::row_pressed_bg())
-                                                        })
-                                                        .on_mouse_up(
-                                                            MouseButton::Left,
-                                                            cx.listener(|this, _, _, cx| {
-                                                                this.choose_default_runtime_mode(cx)
-                                                            }),
-                                                        )
-                                                }),
-                                            )
-                                            .children(modes.into_iter().map(|choice| {
-                                                let selected = selected_mode.as_deref()
-                                                    == Some(choice.value.as_str());
-                                                self.render_runtime_choice(
-                                                    "mode", choice, selected, cx,
-                                                )
-                                            })),
-                                    )
-                            })
-                            .when(!features.is_empty(), |body| {
-                                body.child(runtime_section_heading(locale::common(
-                                    "Session options",
-                                )))
-                                .children(features.into_iter().map(|feature| {
-                                    self.render_runtime_feature(feature, cx)
-                                }))
-                            })
-                            .when_some(self.runtime_switch_error.as_ref(), |body, error| {
-                                body.child(
-                                    div()
-                                        .mx_3()
-                                        .my_3()
-                                        .rounded(px(theme::RADIUS_CONTROL))
-                                        .border_1()
-                                        .border_color(rgb(theme::ACCENT_RED))
-                                        .bg(theme::bg_card_dim())
-                                        .p_3()
-                                        .text_size(px(theme::FONT_CAPTION))
-                                        .text_color(rgb(theme::ACCENT_RED))
-                                        .child(error.message.clone()),
-                                )
-                            }),
-                    )
+                    .overflow_hidden()
+                    .child(self.render_runtime_sheet_header(busy, cx))
+                    .child(self.render_runtime_sheet_body(
+                        catalog.as_ref(),
+                        draft.as_ref(),
+                        reasoning_efforts,
+                        modes,
+                        features,
+                        cx,
+                    ))
                     .child(
                         div()
                             .flex_shrink_0()
@@ -6608,7 +6492,11 @@ impl MobileApp {
                                     if busy {
                                         locale::common("Applying...")
                                     } else {
-                                        locale::common("Apply runtime")
+                                        locale::text(
+                                            "Apply session settings",
+                                            "应用会话设置",
+                                            "套用工作階段設定",
+                                        )
                                     },
                                     true,
                                 )
@@ -6625,6 +6513,653 @@ impl MobileApp {
                             ),
                     ),
             )
+    }
+
+    /// Sheet header. Inside the model picker it becomes a breadcrumb bar
+    /// (back chevron + Agent name) like the desktop cascade navigation.
+    fn render_runtime_sheet_header(&self, busy: bool, cx: &mut Context<Self>) -> gpui::Div {
+        let menu = self.runtime_sheet_menu.clone();
+        div()
+            .h(px(52.0))
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(theme::border_subtle())
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_1()
+            .when_some(menu.clone(), |header, menu| {
+                header
+                    .child(
+                        div()
+                            .id("runtime-sheet-back")
+                            .size(px(theme::TOUCH_TARGET))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(!busy, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.close_runtime_sheet_menu();
+                                            cx.notify();
+                                        }),
+                                    )
+                            })
+                            .child(
+                                svg()
+                                    .path("icons/chevron-left.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_secondary()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex()
+                            .items_baseline()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(px(theme::FONT_HEADING))
+                                    .text_color(theme::text_primary())
+                                    .child(menu.agent_label),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(theme::FONT_CAPTION))
+                                    .text_color(theme::text_muted())
+                                    .child(locale::text("Model", "模型", "模型")),
+                            ),
+                    )
+            })
+            .when(menu.is_none(), |header| {
+                header.child(
+                    div()
+                        .px_2()
+                        .text_size(px(theme::FONT_HEADING))
+                        .text_color(theme::text_primary())
+                        .child(locale::text("Session settings", "会话设置", "工作階段設定")),
+                )
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .when(menu.is_some(), |spacer| spacer.min_w_0()),
+            )
+            .child(
+                div()
+                    .id("close-runtime-options")
+                    .size(px(theme::TOUCH_TARGET))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(!busy, |button| {
+                        button
+                            .cursor_pointer()
+                            .active(|style| style.opacity(0.6))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(Self::close_runtime_options),
+                            )
+                    })
+                    .child(
+                        svg()
+                            .path("icons/x.svg")
+                            .size(px(theme::ICON_SM))
+                            .text_color(theme::text_secondary()),
+                    ),
+            )
+    }
+
+    /// Scrollable sheet body: either the Agent cascade or the model picker.
+    fn render_runtime_sheet_body(
+        &self,
+        catalog: Option<&SessionRuntimeOptionCatalog>,
+        draft: Option<&SessionRuntimeSelection>,
+        reasoning_efforts: Vec<RuntimeCascadeChoice>,
+        modes: Vec<RuntimeCascadeChoice>,
+        features: Vec<SessionRuntimeFeature>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let busy = self.runtime_switch_busy_generation.is_some();
+        let selection_available = catalog.is_some_and(|catalog| {
+            draft.is_some_and(|draft| runtime_selection_is_available(&catalog.options, draft))
+        });
+        let mut body = div()
+            .id("runtime-options-scroll")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .pb_2();
+        if self.runtime_sheet_menu.is_some() {
+            body = body.child(self.render_runtime_model_picker(catalog, cx));
+        } else if let Some(draft) = draft {
+            body = body.child(self.render_runtime_agent_cascade(catalog, draft, cx));
+        }
+        body = body
+            .when(catalog.is_none(), |body| {
+                body.child(
+                    div()
+                        .p_4()
+                        .text_size(px(theme::FONT_CAPTION))
+                        .text_color(theme::text_muted())
+                        .child(locale::text(
+                            "Loading session settings...",
+                            "正在加载会话设置…",
+                            "正在載入工作階段設定…",
+                        )),
+                )
+            })
+            .when(
+                catalog.is_some() && draft.is_some() && !selection_available,
+                |body| {
+                    body.child(
+                        div()
+                            .mx_3()
+                            .mt_3()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(theme::accent_yellow())
+                            .bg(theme::bg_card_dim())
+                            .p_3()
+                            .text_size(px(theme::FONT_CAPTION))
+                            .text_color(theme::accent_yellow())
+                            .child(locale::text(
+                                "The current session settings are unavailable. Select an available option.",
+                                "当前会话设置不可用，请选择一个可用选项。",
+                                "目前工作階段設定無法使用，請選擇可用選項。",
+                            )),
+                    )
+                },
+            );
+        if self.runtime_sheet_menu.is_none() {
+            if let Some(draft) = draft {
+                body = body
+                    .when(!reasoning_efforts.is_empty(), |body| {
+                        body.child(runtime_section_heading(locale::common("Reasoning")))
+                            .child(
+                                div()
+                                    .px_3()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap_2()
+                                    .child(
+                                        runtime_choice_button(
+                                            "runtime-reasoning:default",
+                                            locale::common("Default"),
+                                            draft.reasoning_effort.is_none(),
+                                        )
+                                        .when(
+                                            !busy,
+                                            |button| {
+                                                button
+                                                    .cursor_pointer()
+                                                    .active(|style| {
+                                                        style.bg(theme::row_pressed_bg())
+                                                    })
+                                                    .on_mouse_up(
+                                                        MouseButton::Left,
+                                                        cx.listener(|this, _, _, cx| {
+                                                            this.choose_default_runtime_reasoning(
+                                                                cx,
+                                                            )
+                                                        }),
+                                                    )
+                                            },
+                                        ),
+                                    )
+                                    .children(reasoning_efforts.into_iter().map(|choice| {
+                                        let selected = draft.reasoning_effort.as_deref()
+                                            == Some(choice.value.as_str());
+                                        self.render_runtime_choice(
+                                            "reasoning",
+                                            choice,
+                                            selected,
+                                            cx,
+                                        )
+                                    })),
+                            )
+                    })
+                    .when(!modes.is_empty(), |body| {
+                        body.child(runtime_section_heading(locale::common("Mode")))
+                            .child(
+                                div()
+                                    .px_3()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap_2()
+                                    .child(
+                                        runtime_choice_button(
+                                            "runtime-mode:default",
+                                            locale::common("Default"),
+                                            draft.mode_id.is_none(),
+                                        )
+                                        .when(
+                                            !busy,
+                                            |button| {
+                                                button
+                                                    .cursor_pointer()
+                                                    .active(|style| {
+                                                        style.bg(theme::row_pressed_bg())
+                                                    })
+                                                    .on_mouse_up(
+                                                        MouseButton::Left,
+                                                        cx.listener(|this, _, _, cx| {
+                                                            this.choose_default_runtime_mode(cx)
+                                                        }),
+                                                    )
+                                            },
+                                        ),
+                                    )
+                                    .children(modes.into_iter().map(|choice| {
+                                        let selected =
+                                            draft.mode_id.as_deref() == Some(choice.value.as_str());
+                                        self.render_runtime_choice("mode", choice, selected, cx)
+                                    })),
+                            )
+                    });
+            }
+            body = body
+                .when(!features.is_empty(), |body| {
+                    body.child(runtime_section_heading(locale::common("Session options")))
+                        .children(
+                            features
+                                .into_iter()
+                                .map(|feature| self.render_runtime_feature(feature, cx)),
+                        )
+                })
+                .when_some(self.runtime_switch_error.as_ref(), |body, error| {
+                    body.child(
+                        div()
+                            .mx_3()
+                            .my_3()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(theme::accent_red())
+                            .bg(theme::bg_card_dim())
+                            .p_3()
+                            .text_size(px(theme::FONT_CAPTION))
+                            .text_color(theme::accent_red())
+                            .child(error.message.clone()),
+                    )
+                });
+        }
+        body.into_any_element()
+    }
+
+    /// Cascade root: an Agent list plus a summary row for the active
+    /// authentication source / model, in the desktop two-in-one style.
+    fn render_runtime_agent_cascade(
+        &self,
+        catalog: Option<&SessionRuntimeOptionCatalog>,
+        draft: &SessionRuntimeSelection,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(catalog) = catalog else {
+            return div().into_any_element();
+        };
+        let busy = self.runtime_switch_busy_generation.is_some();
+        let selected_option = matching_runtime_option(&catalog.options, draft);
+        let agent_label = selected_option
+            .map(|option| option.agent_label.clone())
+            .unwrap_or_else(|| draft.agent_id.to_string());
+        let model_label = selected_option
+            .map(|option| option.model_label.clone())
+            .unwrap_or_else(|| match &draft.model {
+                RuntimeModelSelection::Explicit { model_id } => model_id.clone(),
+                RuntimeModelSelection::AgentDefault => locale::common("Default").to_string(),
+            });
+        let auth_source_label = selected_option
+            .map(|option| option.auth_source_label.clone())
+            .unwrap_or_else(|| draft.auth_source.id().to_string());
+        let model_icon = runtime_model_icon(draft.model_id(), px(theme::ICON_SM + 2.0));
+        let agents = catalog
+            .options
+            .iter()
+            .filter(|option| option.availability == RuntimeOptionAvailability::Available)
+            .map(|option| {
+                (
+                    option.selection.agent_id.clone(),
+                    option.agent_label.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        div()
+            .child(
+                // Two-in-one summary row: current auth source / model with the
+                // model brand icon, tapping it opens the model picker directly.
+                div()
+                    .id("runtime-sheet-model")
+                    .mx_3()
+                    .mt_3()
+                    .h(px(theme::TOUCH_TARGET))
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .border_1()
+                    .border_color(theme::border_default())
+                    .bg(theme::bg_card())
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .when(!busy, |row| {
+                        row.cursor_pointer()
+                            .active(|style| style.bg(theme::row_active_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener({
+                                    let agent_id = draft.agent_id.clone();
+                                    let agent_label = agent_label.clone();
+                                    move |this, _, _, cx| {
+                                        this.open_runtime_sheet_menu(
+                                            agent_id.clone(),
+                                            agent_label.clone(),
+                                            cx,
+                                        )
+                                    }
+                                }),
+                            )
+                    })
+                    .child(model_icon)
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .justify_center()
+                            .gap(px(1.0))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(px(theme::FONT_BODY))
+                                    .text_color(theme::text_primary())
+                                    .child(model_label),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(px(theme::FONT_MICRO))
+                                    .text_color(theme::text_muted())
+                                    .child(auth_source_label),
+                            ),
+                    )
+                    .child(
+                        svg()
+                            .path("icons/chevron-right.svg")
+                            .size(px(theme::ICON_SM))
+                            .text_color(theme::text_muted()),
+                    ),
+            )
+            .when(!agents.is_empty(), |body| {
+                body.child(runtime_section_heading(locale::text(
+                    "Agent", "Agent", "Agent",
+                )))
+                .child(
+                    div()
+                        .px_2()
+                        .pb_1()
+                        .flex()
+                        .flex_col()
+                        .children(agents.into_iter().map(|(agent_id, label)| {
+                            let auth_source_count = catalog
+                                .auth_sources
+                                .iter()
+                                .filter(|source| source.agent_id == agent_id)
+                                .count();
+                            let selected = agent_id == draft.agent_id;
+                            let row_agent_id = agent_id.clone();
+                            let row_label = label.clone();
+                            runtime_sheet_row(
+                                format!("runtime-sheet-agent:{}", agent_id.as_str()),
+                                runtime_agent_icon(&agent_id, &label),
+                                label,
+                                selected,
+                                true,
+                            )
+                            .when(!busy, |row| {
+                                row.cursor_pointer()
+                                    .active(|style| style.bg(theme::row_active_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.open_runtime_sheet_menu(
+                                                row_agent_id.clone(),
+                                                row_label.clone(),
+                                                cx,
+                                            )
+                                        }),
+                                    )
+                            })
+                            .when(selected, |row| {
+                                row.child(
+                                    svg()
+                                        .path("icons/crosshair.svg")
+                                        .size(px(theme::ICON_SM))
+                                        .text_color(theme::primary()),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(theme::FONT_MICRO))
+                                    .text_color(theme::text_muted())
+                                    .child(runtime_profile_count_label(auth_source_count)),
+                            )
+                            .child(
+                                svg()
+                                    .path("icons/chevron-right.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_muted()),
+                            )
+                        })),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// Provider-grouped model picker for one Agent, mirroring the desktop
+    /// cascade: provider headings with brand/account markers and model rows
+    /// with a check icon on the active selection.
+    fn render_runtime_model_picker(
+        &self,
+        catalog: Option<&SessionRuntimeOptionCatalog>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some((menu, catalog)) = self.runtime_sheet_menu.as_ref().zip(catalog) else {
+            return div().into_any_element();
+        };
+        let busy = self.runtime_switch_busy_generation.is_some();
+        let draft = self.runtime_draft.clone();
+        let query = self
+            .runtime_sheet_search
+            .as_ref()
+            .map(|input| input.read(cx).text().trim().to_lowercase())
+            .unwrap_or_default();
+
+        let mut sources = catalog
+            .auth_sources
+            .iter()
+            .filter(|source| source.agent_id == menu.agent_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        sources.sort_by(|left, right| {
+            left.kind
+                .cmp(&right.kind)
+                .then_with(|| left.label.cmp(&right.label))
+                .then_with(|| left.source.cmp(&right.source))
+        });
+
+        let mut groups = Vec::new();
+        for source in sources {
+            let options = catalog
+                .options
+                .iter()
+                .filter(|option| {
+                    option.availability == RuntimeOptionAvailability::Available
+                        && option.selection.agent_id == menu.agent_id
+                        && option.selection.auth_source == source.source
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let source_matches = query.is_empty()
+                || source.label.to_lowercase().contains(&query)
+                || runtime_auth_source_display_label(&source)
+                    .to_lowercase()
+                    .contains(&query);
+            let models = options
+                .iter()
+                .filter(|option| {
+                    source_matches || option.model_label.to_lowercase().contains(&query)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if !source_matches && models.is_empty() {
+                continue;
+            }
+
+            let status = runtime_auth_source_status_label(
+                source.availability,
+                models.len().max(options.len()),
+            );
+            let source_id = source.source.id().to_string();
+            let (heading_icon, heading_color) = match source.kind {
+                RuntimeAuthSourceKind::ProviderProfile => {
+                    ("icons/database.svg", theme::accent_green())
+                }
+                RuntimeAuthSourceKind::AgentAccount => ("icons/user.svg", theme::accent_chart3()),
+            };
+            let group = div()
+                .child(
+                    div()
+                        .h(px(34.0))
+                        .px_4()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            svg()
+                                .path(heading_icon)
+                                .size(px(15.0))
+                                .text_color(heading_color),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .text_size(px(theme::FONT_CAPTION))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme::sidebar_foreground(0.84))
+                                .child(runtime_auth_source_display_label(&source)),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(px(theme::FONT_MICRO))
+                                .text_color(theme::text_muted())
+                                .child(status),
+                        ),
+                )
+                .children(models.into_iter().map(|option| {
+                    let selection = option.selection.clone();
+                    let is_selected = draft
+                        .as_ref()
+                        .is_some_and(|draft| runtime_option_matches(&option, draft));
+                    let model_id = selection.model_id().map(str::to_string);
+                    let row_id = format!(
+                        "runtime-sheet-model:{}:{}",
+                        source_id,
+                        runtime_model_selection_key(&selection.model)
+                    );
+                    runtime_sheet_row(
+                        row_id,
+                        runtime_model_icon(model_id.as_deref(), px(theme::ICON_SM + 2.0)),
+                        option.model_label.clone(),
+                        is_selected,
+                        false,
+                    )
+                    .pl(px(28.0))
+                    .pr_3()
+                    .when(!busy, |row| {
+                        row.cursor_pointer()
+                            .active(|style| style.bg(theme::row_active_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener({
+                                    let selection = selection.clone();
+                                    move |this, _, _, cx| {
+                                        this.choose_runtime_sheet_model(selection.clone(), cx)
+                                    }
+                                }),
+                            )
+                    })
+                    .when(is_selected, |row| {
+                        row.child(
+                            svg()
+                                .path("icons/check.svg")
+                                .size(px(theme::ICON_SM))
+                                .text_color(theme::text_primary()),
+                        )
+                    })
+                }));
+            groups.push(group);
+        }
+
+        div()
+            .pb_2()
+            .when_some(self.runtime_sheet_search.clone(), |picker, input| {
+                picker.child(
+                    div()
+                        .mx_3()
+                        .my_2()
+                        .h(px(theme::TOUCH_TARGET))
+                        .rounded(px(theme::RADIUS_CONTROL))
+                        .border_1()
+                        .border_color(theme::border_input())
+                        .bg(theme::bg_card())
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            svg()
+                                .path("icons/search.svg")
+                                .size(px(theme::ICON_SM))
+                                .text_color(theme::text_muted()),
+                        )
+                        .child(input),
+                )
+            })
+            .when(groups.is_empty(), |picker| {
+                picker.child(
+                    div()
+                        .px_4()
+                        .py(px(28.0))
+                        .text_size(px(theme::FONT_CAPTION))
+                        .text_color(theme::text_muted())
+                        .child(locale::text("No configuration", "暂无配置", "暫無配置")),
+                )
+            })
+            .children(groups)
+            .into_any_element()
     }
 
     fn render_runtime_choice(
@@ -6767,10 +7302,10 @@ impl MobileApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let status_color = match state {
-            Some(AgentSessionState::Running) => theme::ACCENT_GREEN,
-            Some(AgentSessionState::Error) => theme::ACCENT_RED,
-            Some(_) => theme::TEXT_MUTED,
-            None => theme::ACCENT_YELLOW,
+            Some(AgentSessionState::Running) => theme::accent_green(),
+            Some(AgentSessionState::Error) => theme::accent_red(),
+            Some(_) => theme::text_muted(),
+            None => theme::accent_yellow(),
         };
         div()
             .h(px(theme::HEADER_HEIGHT))
@@ -6806,17 +7341,11 @@ impl MobileApp {
                     .justify_center()
                     .gap(px(theme::SPACING_SM))
                     .child(
-                        svg()
-                            .path("brand/logo.svg")
-                            .size(px(theme::ICON_SM))
-                            .text_color(theme::text_primary()),
-                    )
-                    .child(
                         div()
                             .size(px(theme::ICON_STATUS))
                             .flex_shrink_0()
                             .rounded_full()
-                            .bg(rgb(status_color)),
+                            .bg(status_color),
                     )
                     .child(
                         div()
@@ -7985,7 +8514,7 @@ impl MobileApp {
                             .whitespace_nowrap()
                             .text_size(px(theme::FONT_CAPTION))
                             .text_color(if latest_row.failed {
-                                rgb(theme::ACCENT_RED).into()
+                                theme::accent_red().into()
                             } else {
                                 theme::text_muted()
                             })
@@ -8075,7 +8604,7 @@ impl MobileApp {
                             .whitespace_nowrap()
                             .text_size(px(theme::FONT_CAPTION))
                             .text_color(if row.failed {
-                                rgb(theme::ACCENT_RED).into()
+                                theme::accent_red().into()
                             } else {
                                 theme::text_muted()
                             })
@@ -8150,7 +8679,7 @@ impl MobileApp {
             .rounded(px(theme::RADIUS_CARD))
             .border_1()
             .border_color(if failed {
-                rgb(theme::ACCENT_RED).opacity(0.46).into()
+                theme::accent_red().opacity(0.46).into()
             } else {
                 theme::border_default()
             })
@@ -8182,7 +8711,7 @@ impl MobileApp {
                             .size(px(14.0))
                             .flex_shrink_0()
                             .text_color(if failed {
-                                rgb(theme::ACCENT_RED).into()
+                                theme::accent_red().into()
                             } else {
                                 theme::text_muted()
                             }),
@@ -8247,9 +8776,9 @@ impl MobileApp {
                                 div()
                                     .text_size(px(theme::FONT_CAPTION))
                                     .text_color(if exit_code == 0 {
-                                        rgb(theme::ACCENT_GREEN)
+                                        theme::accent_green()
                                     } else {
-                                        rgb(theme::ACCENT_RED)
+                                        theme::accent_red()
                                     })
                                     .child(format!(
                                         "{}: {exit_code}",
@@ -8396,7 +8925,7 @@ impl MobileApp {
             .rounded(px(theme::RADIUS_CARD))
             .border_1()
             .border_color(if failed {
-                rgb(theme::ACCENT_RED).opacity(0.46).into()
+                theme::accent_red().opacity(0.46).into()
             } else {
                 theme::border_default()
             })
@@ -8428,7 +8957,7 @@ impl MobileApp {
                             .size(px(14.0))
                             .flex_shrink_0()
                             .text_color(if failed {
-                                rgb(theme::ACCENT_RED).into()
+                                theme::accent_red().into()
                             } else {
                                 theme::text_muted()
                             }),
@@ -8543,9 +9072,9 @@ impl MobileApp {
             |payload| matches!(payload, TimelinePayload::Error(error) if error.recoverable),
         );
         let color = if recoverable {
-            rgb(theme::ACCENT_YELLOW)
+            theme::accent_yellow()
         } else {
-            rgb(theme::ACCENT_RED)
+            theme::accent_red()
         };
         let message = if row.body.trim().is_empty() {
             row.title.clone()
@@ -8744,7 +9273,7 @@ impl MobileApp {
                                 .path("icons/file-code.svg")
                                 .size(px(theme::ICON_SM))
                                 .flex_shrink_0()
-                                .text_color(rgb(theme::ACCENT_BLUE)),
+                                .text_color(theme::accent_blue()),
                         )
                         .child(
                             div()
@@ -8830,7 +9359,7 @@ impl MobileApp {
                     .path("icons/file-code.svg")
                     .size(px(theme::ICON_SM))
                     .flex_shrink_0()
-                    .text_color(rgb(theme::ACCENT_BLUE)),
+                    .text_color(theme::accent_blue()),
             )
             .child(
                 div()
@@ -8896,7 +9425,7 @@ impl MobileApp {
             .flex_shrink_0()
             .rounded(px(theme::RADIUS_CARD))
             .border_1()
-            .border_color(rgb(theme::ACCENT_YELLOW))
+            .border_color(theme::accent_yellow())
             .bg(theme::bg_card())
             .p_3()
             .flex()
@@ -8920,7 +9449,7 @@ impl MobileApp {
                         div()
                             .flex_shrink_0()
                             .text_size(px(theme::FONT_MICRO))
-                            .text_color(rgb(theme::ACCENT_YELLOW))
+                            .text_color(theme::accent_yellow())
                             .child(permission_risk_label(approval.risk_category)),
                     ),
             )
@@ -9052,9 +9581,9 @@ impl MobileApp {
                                 .flex()
                                 .items_center()
                                 .rounded(px(theme::RADIUS_CONTROL))
-                                .bg(rgb(theme::TEXT_PRIMARY))
+                                .bg(theme::text_primary())
                                 .text_size(px(theme::FONT_BODY))
-                                .text_color(rgb(theme::BG_PRIMARY))
+                                .text_color(theme::bg_primary())
                                 .cursor_pointer()
                                 .on_mouse_up(
                                     MouseButton::Left,
@@ -9106,7 +9635,7 @@ impl MobileApp {
                             .rounded(px(theme::RADIUS_CONTROL))
                             .border_1()
                             .border_color(if selected {
-                                rgb(theme::TEXT_PRIMARY).into()
+                                theme::text_primary().into()
                             } else {
                                 theme::border_default()
                             })
@@ -9167,7 +9696,7 @@ impl MobileApp {
                                     .rounded(px(theme::RADIUS_CONTROL))
                                     .border_1()
                                     .border_color(if selected {
-                                        rgb(theme::TEXT_PRIMARY).into()
+                                        theme::text_primary().into()
                                     } else {
                                         theme::border_default()
                                     })
@@ -9211,7 +9740,7 @@ impl MobileApp {
                             .rounded(px(theme::RADIUS_CONTROL))
                             .border_1()
                             .border_color(if selected {
-                                rgb(theme::TEXT_PRIMARY).into()
+                                theme::text_primary().into()
                             } else {
                                 theme::border_default()
                             })
@@ -9237,7 +9766,7 @@ impl MobileApp {
                     .into_any_element(),
                 ElicitationFieldKind::Unsupported { schema_type } => div()
                     .text_size(px(theme::FONT_CAPTION))
-                    .text_color(rgb(theme::ACCENT_RED))
+                    .text_color(theme::accent_red())
                     .child(format!(
                         "{}: {schema_type}",
                         locale::text(
@@ -9285,7 +9814,7 @@ impl MobileApp {
             .max_h(px(430.0))
             .rounded(px(theme::RADIUS_CARD))
             .border_1()
-            .border_color(rgb(theme::ACCENT_BLUE))
+            .border_color(theme::accent_blue())
             .bg(theme::bg_card())
             .p_3()
             .flex()
@@ -9356,11 +9885,11 @@ impl MobileApp {
                             .h(px(theme::TOUCH_TARGET))
                             .px_4()
                             .rounded(px(theme::RADIUS_CONTROL))
-                            .bg(rgb(theme::TEXT_PRIMARY))
+                            .bg(theme::text_primary())
                             .flex()
                             .items_center()
                             .text_size(px(theme::FONT_BODY))
-                            .text_color(rgb(theme::BG_PRIMARY))
+                            .text_color(theme::bg_primary())
                             .when(!pending, |button| {
                                 button.cursor_pointer().on_mouse_up(
                                     MouseButton::Left,
@@ -9430,7 +9959,7 @@ impl MobileApp {
                     div()
                         .mb(px(theme::SPACING_SM))
                         .text_size(px(theme::FONT_CAPTION))
-                        .text_color(rgb(theme::ACCENT_RED))
+                        .text_color(theme::accent_red())
                         .child(error.message.clone()),
                 )
             })
@@ -9512,7 +10041,7 @@ impl MobileApp {
                                     .text_color(if !action_enabled {
                                         theme::text_muted()
                                     } else if running {
-                                        rgb(theme::ACCENT_RED).into()
+                                        theme::accent_red().into()
                                     } else {
                                         theme::text_secondary()
                                     }),
@@ -9558,7 +10087,7 @@ impl MobileApp {
                                     .text_color(if runtime_summary.available {
                                         theme::text_primary()
                                     } else {
-                                        rgb(theme::ACCENT_YELLOW).into()
+                                        theme::accent_yellow().into()
                                     })
                                     .child(runtime_summary.primary),
                             )
@@ -9697,7 +10226,7 @@ impl MobileApp {
                     .left(px(theme::SIDEBAR_LIST_PADDING + row.indent))
                     .right(px(theme::SIDEBAR_LIST_PADDING))
                     .h(px(2.0))
-                    .bg(rgb(theme::ACCENT_BLUE));
+                    .bg(theme::accent_blue());
                 match position {
                     SidebarDropPosition::Before => element.child(line.top_0()),
                     SidebarDropPosition::After => element.child(line.bottom_0()),
@@ -9881,7 +10410,7 @@ impl MobileApp {
                         })
                         .size(px(theme::SIDEBAR_AGENT_LOGO_SIZE))
                         .text_color(if auto_archives {
-                            rgb(theme::ACCENT_GREEN).into()
+                            theme::accent_green().into()
                         } else {
                             theme::sidebar_foreground(0.72)
                         }),
@@ -9897,7 +10426,7 @@ impl MobileApp {
                     })
                     .size(px(theme::SIDEBAR_PROJECT_LOGO_SIZE))
                     .text_color(if auto_archives {
-                        rgb(theme::ACCENT_GREEN).into()
+                        theme::accent_green().into()
                     } else {
                         theme::sidebar_foreground(0.72)
                     })
@@ -10364,7 +10893,7 @@ impl MobileApp {
                                 .path("icons/pin.svg")
                                 .size(px(14.0))
                                 .flex_shrink_0()
-                                .text_color(rgb(theme::ACCENT_YELLOW)),
+                                .text_color(theme::accent_yellow()),
                         )
                     })
                     .when(show_status, |right| {
@@ -10379,7 +10908,7 @@ impl MobileApp {
                                 .path("icons/triangle-alert.svg")
                                 .size(px(14.0))
                                 .flex_shrink_0()
-                                .text_color(rgb(theme::ACCENT_YELLOW)),
+                                .text_color(theme::accent_yellow()),
                         )
                     })
                     .when(
@@ -10405,11 +10934,11 @@ impl MobileApp {
                                 .size(px(theme::SIDEBAR_UNREAD_DOT))
                                 .flex_shrink_0()
                                 .rounded_full()
-                                .bg(rgb(theme::ACCENT_BLUE)),
+                                .bg(theme::accent_blue()),
                         )
                     })
                     .when(has_error, |right| {
-                        right.child(sidebar_status_dot(rgb(theme::ACCENT_RED).into()))
+                        right.child(sidebar_status_dot(theme::accent_red().into()))
                     }),
             )
             .into_any_element()
@@ -10993,7 +11522,7 @@ impl MobileApp {
                                             svg()
                                                 .path("icons/trash-2.svg")
                                                 .size(px(16.0))
-                                                .text_color(rgb(theme::ACCENT_RED)),
+                                                .text_color(theme::accent_red()),
                                         ),
                                 ),
                         )
@@ -11088,13 +11617,13 @@ impl MobileApp {
                             .cursor_pointer()
                             .active(|style| style.bg(theme::row_pressed_bg()))
                             .on_mouse_up(MouseButton::Left, cx.listener(Self::open_hosts))
-                            .child(div().size(px(8.0)).flex_shrink_0().rounded_full().bg(rgb(
+                            .child(div().size(px(8.0)).flex_shrink_0().rounded_full().bg(
                                 if host_online {
-                                    theme::ACCENT_GREEN
+                                    theme::accent_green()
                                 } else {
-                                    theme::ACCENT_RED
+                                    theme::accent_red()
                                 },
-                            )))
+                            ))
                             .child(
                                 div()
                                     .flex_1()
@@ -11282,13 +11811,13 @@ impl MobileApp {
                                 }),
                             )
                             .child(div().size(px(8.0)).rounded_full().bg(if selected {
-                                rgb(if active_online {
-                                    theme::ACCENT_GREEN
+                                if active_online {
+                                    theme::accent_green()
                                 } else {
-                                    theme::ACCENT_RED
-                                })
+                                    theme::accent_red()
+                                }
                             } else {
-                                rgb(theme::ACCENT_DIM)
+                                theme::accent_dim()
                             }))
                             .child(
                                 div()
@@ -11413,9 +11942,9 @@ fn timeline_setting_switch(value: bool) -> gpui::Div {
         .rounded_full()
         .p(px(2.0))
         .bg(if value {
-            rgb(theme::ACCENT_GREEN)
+            theme::accent_green()
         } else {
-            rgb(theme::ACCENT_DIM)
+            theme::accent_dim()
         });
     let switch = if value {
         switch.justify_end()
@@ -11426,7 +11955,7 @@ fn timeline_setting_switch(value: bool) -> gpui::Div {
         div()
             .size(px(16.0))
             .rounded_full()
-            .bg(rgb(theme::TEXT_PRIMARY)),
+            .bg(theme::text_primary()),
     )
 }
 
@@ -11965,7 +12494,7 @@ impl MobileApp {
                             div()
                                 .mt(px(theme::SPACING_SM))
                                 .text_size(px(theme::FONT_CAPTION))
-                                .text_color(rgb(theme::ACCENT_RED))
+                                .text_color(theme::accent_red())
                                 .child(error.clone()),
                         )
                     })
@@ -12050,7 +12579,7 @@ impl MobileApp {
                 timeline_reasoning_mode_label(mode),
                 timeline_setting_source_label(overridden),
             ),
-            rgb(theme::ACCENT_PURPLE).into(),
+            theme::accent_purple().into(),
         )
         .cursor_pointer()
         .active(|style| style.bg(theme::row_pressed_bg()))
@@ -12065,6 +12594,178 @@ impl MobileApp {
                 .text_color(theme::text_muted()),
         )
         .into_any_element()
+    }
+
+    /// Cycles through the appearance preference: System → Light → Dark.
+    fn cycle_theme_mode(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.app_settings.theme.unwrap_or_default();
+        let next = match current {
+            theme::AppearanceMode::System => theme::AppearanceMode::Light,
+            theme::AppearanceMode::Light => theme::AppearanceMode::Dark,
+            theme::AppearanceMode::Dark => theme::AppearanceMode::System,
+        };
+        self.update_theme_mode(next, window, cx);
+    }
+
+    /// Cycles through the language preference: System → English → 简体中文 → 繁體中文.
+    fn cycle_language(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.app_settings.language.unwrap_or_default();
+        let next = match current {
+            locale::LanguagePreference::System => locale::LanguagePreference::En,
+            locale::LanguagePreference::En => locale::LanguagePreference::ZhCn,
+            locale::LanguagePreference::ZhCn => locale::LanguagePreference::ZhTw,
+            locale::LanguagePreference::ZhTw => locale::LanguagePreference::System,
+        };
+        self.update_language(next, window, cx);
+    }
+
+    /// Appearance preference row: cycles System / Light / Dark and mirrors the
+    /// desktop's palette source. Shows the resolved mode while on System.
+    fn render_theme_setting_row(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let preference = self.app_settings.theme.unwrap_or_default();
+        let detail = match preference {
+            theme::AppearanceMode::System => locale::common("Match the system appearance"),
+            theme::AppearanceMode::Light => locale::common("Use the light palette everywhere"),
+            theme::AppearanceMode::Dark => {
+                locale::common("Use the desktop dark palette everywhere")
+            }
+        };
+        let (icon, icon_color) = match preference {
+            theme::AppearanceMode::System => ("icons/monitor.svg", theme::text_muted()),
+            theme::AppearanceMode::Light => ("icons/sun.svg", theme::accent_yellow()),
+            theme::AppearanceMode::Dark => ("icons/moon.svg", theme::text_muted()),
+        };
+        let mode_label = |mode: theme::AppearanceMode| -> String {
+            match mode {
+                theme::AppearanceMode::System => locale::common("System").to_string(),
+                theme::AppearanceMode::Light => locale::common("Light").to_string(),
+                theme::AppearanceMode::Dark => locale::common("Dark").to_string(),
+            }
+        };
+        div()
+            .id("mobile-settings-theme")
+            .w_full()
+            .min_h(px(theme::TOUCH_TARGET))
+            .mb(px(theme::SPACING_XS))
+            .rounded(px(theme::RADIUS_CONTROL))
+            .border_1()
+            .border_color(theme::border_subtle())
+            .bg(theme::bg_card_dim())
+            .px(px(theme::SPACING_MD))
+            .flex()
+            .items_center()
+            .gap(px(theme::SPACING_SM))
+            .cursor_pointer()
+            .active(|style| style.bg(theme::row_pressed_bg()))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::cycle_theme_mode))
+            .child(
+                svg()
+                    .path(icon)
+                    .size(px(theme::ICON_SM))
+                    .text_color(icon_color),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.0))
+                    .child(
+                        div()
+                            .text_size(px(theme::FONT_BODY))
+                            .text_color(theme::text_secondary())
+                            .child(locale::common("Theme")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(theme::FONT_MICRO))
+                            .text_color(theme::text_muted())
+                            .child(detail.to_string()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_XS))
+                    .text_size(px(theme::FONT_CAPTION))
+                    .text_color(theme::text_primary())
+                    .child(mode_label(preference)),
+            )
+            .child(
+                svg()
+                    .path("icons/refresh.svg")
+                    .size(px(theme::ICON_SM))
+                    .text_color(theme::text_muted()),
+            )
+            .into_any_element()
+    }
+
+    /// Language preference row: cycles System / English / 简体中文 / 繁體中文.
+    fn render_language_setting_row(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let preference = self.app_settings.language.unwrap_or_default();
+        let detail = match preference {
+            locale::LanguagePreference::System => locale::common("Match the device language"),
+            _ => "",
+        };
+        div()
+            .id("mobile-settings-language")
+            .w_full()
+            .min_h(px(theme::TOUCH_TARGET))
+            .mb(px(theme::SPACING_XS))
+            .rounded(px(theme::RADIUS_CONTROL))
+            .border_1()
+            .border_color(theme::border_subtle())
+            .bg(theme::bg_card_dim())
+            .px(px(theme::SPACING_MD))
+            .flex()
+            .items_center()
+            .gap(px(theme::SPACING_SM))
+            .cursor_pointer()
+            .active(|style| style.bg(theme::row_pressed_bg()))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::cycle_language))
+            .child(
+                svg()
+                    .path("icons/globe.svg")
+                    .size(px(theme::ICON_SM))
+                    .text_color(theme::text_muted()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.0))
+                    .child(
+                        div()
+                            .text_size(px(theme::FONT_BODY))
+                            .text_color(theme::text_secondary())
+                            .child(locale::common("Language")),
+                    )
+                    .when(!detail.is_empty(), |body| {
+                        body.child(
+                            div()
+                                .text_size(px(theme::FONT_MICRO))
+                                .text_color(theme::text_muted())
+                                .child(detail.to_string()),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .text_size(px(theme::FONT_CAPTION))
+                    .text_color(theme::text_primary())
+                    .child(preference.label().to_string()),
+            )
+            .child(
+                svg()
+                    .path("icons/refresh.svg")
+                    .size(px(theme::ICON_SM))
+                    .text_color(theme::text_muted()),
+            )
+            .into_any_element()
     }
 
     fn render_settings(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -12126,9 +12827,9 @@ impl MobileApp {
                             locale::common("Offline").to_string()
                         },
                         if connection_online {
-                            rgb(theme::ACCENT_GREEN).into()
+                            theme::accent_green().into()
                         } else {
-                            rgb(theme::ACCENT_RED).into()
+                            theme::accent_red().into()
                         },
                     ))
                     .child(settings_info_row(
@@ -12175,133 +12876,6 @@ impl MobileApp {
                                     .text_size(px(theme::FONT_BODY))
                                     .text_color(theme::text_secondary())
                                     .child(locale::common("Switch host")),
-                            )
-                            .child(
-                                svg()
-                                    .path("icons/chevron-right.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(theme::text_muted()),
-                            ),
-                    )
-                    .child(settings_section_heading("Agent access"))
-                    .child(
-                        div()
-                            .id("mobile-settings-providers")
-                            .w_full()
-                            .min_h(px(theme::TOUCH_TARGET))
-                            .mb(px(theme::SPACING_XS))
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .border_1()
-                            .border_color(theme::border_subtle())
-                            .bg(theme::bg_card_dim())
-                            .px(px(theme::SPACING_MD))
-                            .flex()
-                            .items_center()
-                            .gap(px(theme::SPACING_SM))
-                            .cursor_pointer()
-                            .active(|style| style.bg(theme::row_pressed_bg()))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|this, _, window, cx| {
-                                    this.open_workbench_surface(
-                                        WorkbenchSurface::Providers,
-                                        window,
-                                        cx,
-                                    )
-                                }),
-                            )
-                            .child(
-                                svg()
-                                    .path("brand/logo.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(rgb(0xc678dd)),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(1.0))
-                                    .child(
-                                        div()
-                                            .text_size(px(theme::FONT_BODY))
-                                            .text_color(theme::text_secondary())
-                                            .child(locale::common("Provider settings")),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(theme::FONT_MICRO))
-                                            .text_color(theme::text_muted())
-                                            .child(locale::text(
-                                                "Read and manage desktop Agent profiles",
-                                                "查看并管理桌面端 Agent 配置",
-                                                "檢視並管理桌面版 Agent 設定檔",
-                                            )),
-                                    ),
-                            )
-                            .child(
-                                svg()
-                                    .path("icons/chevron-right.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(theme::text_muted()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("mobile-settings-runtime")
-                            .w_full()
-                            .min_h(px(theme::TOUCH_TARGET))
-                            .mb(px(theme::SPACING_XS))
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .border_1()
-                            .border_color(theme::border_subtle())
-                            .bg(theme::bg_card_dim())
-                            .px(px(theme::SPACING_MD))
-                            .flex()
-                            .items_center()
-                            .gap(px(theme::SPACING_SM))
-                            .cursor_pointer()
-                            .active(|style| style.bg(theme::row_pressed_bg()))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|this, _, window, cx| {
-                                    this.open_workbench_surface(
-                                        WorkbenchSurface::Runtime,
-                                        window,
-                                        cx,
-                                    )
-                                }),
-                            )
-                            .child(
-                                svg()
-                                    .path("icons/activity.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(rgb(theme::ACCENT_BLUE)),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(1.0))
-                                    .child(
-                                        div()
-                                            .text_size(px(theme::FONT_BODY))
-                                            .text_color(theme::text_secondary())
-                                            .child(locale::common("Runtime options")),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(theme::FONT_MICRO))
-                                            .text_color(theme::text_muted())
-                                            .child(locale::text(
-                                                "Choose the runtime for the active session",
-                                                "选择当前会话的运行时",
-                                                "選擇目前工作階段的執行環境",
-                                            )),
-                                    ),
                             )
                             .child(
                                 svg()
@@ -12388,25 +12962,8 @@ impl MobileApp {
                         ),
                     )
                     .child(settings_section_heading("Appearance"))
-                    .child(settings_info_row(
-                        "mobile-settings-dark",
-                        "icons/activity.svg",
-                        locale::common("Dark appearance").to_string(),
-                        locale::text(
-                            "Vibex mobile uses the desktop dark palette",
-                            "移动端使用桌面端深色配色",
-                            "行動端使用桌面版深色配色",
-                        )
-                        .to_string(),
-                        theme::text_muted(),
-                    ))
-                    .child(settings_info_row(
-                        "mobile-settings-language",
-                        "icons/message-square.svg",
-                        locale::text("Language", "语言", "語言").to_string(),
-                        locale::common("Follows system language").to_string(),
-                        theme::text_muted(),
-                    ))
+                    .child(self.render_theme_setting_row(cx))
+                    .child(self.render_language_setting_row(cx))
                     .child(settings_section_heading("Notifications"))
                     .child(
                         div()
@@ -12478,12 +13035,12 @@ impl MobileApp {
                             .h(px(theme::TOUCH_TARGET))
                             .rounded(px(theme::RADIUS_CONTROL))
                             .border_1()
-                            .border_color(rgb(theme::ACCENT_RED))
+                            .border_color(theme::accent_red())
                             .flex()
                             .items_center()
                             .justify_center()
                             .text_size(px(theme::FONT_BODY))
-                            .text_color(rgb(theme::ACCENT_RED))
+                            .text_color(theme::accent_red())
                             .cursor_pointer()
                             .active(|style| style.bg(theme::row_pressed_bg()))
                             .on_mouse_up(MouseButton::Left, cx.listener(Self::forget_desktop))
@@ -12533,7 +13090,7 @@ impl MobileApp {
                                 svg()
                                     .path("icons/activity.svg")
                                     .size(px(theme::ICON_MD))
-                                    .text_color(rgb(theme::ACCENT_BLUE)),
+                                    .text_color(theme::accent_blue()),
                             ),
                     )
                     .child(
@@ -12905,6 +13462,222 @@ fn runtime_section_heading(label: impl Into<String>) -> gpui::Div {
         .child(label.into())
 }
 
+/// A 40px selectable row in the session-settings cascade, sharing the desktop
+/// row geometry (icon, truncated label, then trailing markers/chevrons).
+fn runtime_sheet_row(
+    id: impl Into<ElementId>,
+    icon: gpui::AnyElement,
+    label: impl Into<String>,
+    selected: bool,
+    highlight_selected: bool,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .min_w_0()
+        .h(px(40.0))
+        .rounded(px(theme::RADIUS_CONTROL))
+        .px_2()
+        .flex()
+        .items_center()
+        .gap_2()
+        .when(selected && highlight_selected, |row| {
+            row.bg(theme::bg_card_dim())
+        })
+        .child(icon)
+        .child(
+            div()
+                .min_w_0()
+                .flex_1()
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .text_size(px(theme::FONT_BODY))
+                .text_color(if selected {
+                    theme::text_primary()
+                } else {
+                    theme::text_secondary()
+                })
+                .child(label.into()),
+        )
+}
+
+/// Compact brand-icon table for the cascade. The desktop carries a full
+/// catalog; the phone mirrors its lookup order for the mainstream marks and
+/// falls back to the same bot/sparkles shapes.
+const MOBILE_AGENT_BRAND_ICONS: &[(&str, &str)] = &[
+    ("opencode", "icons/opencode.svg"),
+    ("gemini", "icons/gemini.svg"),
+    ("qwen", "icons/qwen.svg"),
+    ("tongyi", "icons/qwen.svg"),
+    ("dashscope", "icons/qwen.svg"),
+    ("copilot", "icons/copilot.svg"),
+    ("claude", "icons/claude.svg"),
+    ("anthropic", "icons/claude.svg"),
+    ("codex", "icons/openai.svg"),
+    ("openai", "icons/openai.svg"),
+    ("chatgpt", "icons/openai.svg"),
+    ("antigravity", "icons/agents/antigravity.svg"),
+    ("amp-acp", "icons/agents/amp-acp.svg"),
+    ("auggie", "icons/agents/auggie.svg"),
+    ("cline", "icons/agents/cline.svg"),
+    ("codebuddy-code", "icons/agents/codebuddy-code.svg"),
+    ("codewhale", "icons/agents/codewhale.svg"),
+    ("crow-cli", "icons/agents/crow-cli.svg"),
+    ("cursor", "icons/agents/cursor.svg"),
+    ("deepagents", "icons/agents/deepagents.svg"),
+    ("deepseek", "icons/agents/deepseek-harness.svg"),
+    ("devin", "icons/agents/devin.svg"),
+    ("dimcode", "icons/agents/dimcode.svg"),
+    ("dirac", "icons/agents/dirac.svg"),
+    ("factory-droid", "icons/agents/factory-droid.svg"),
+    ("glm", "icons/agents/glm-acp-agent.svg"),
+    ("zcode", "icons/agents/glm-acp-agent.svg"),
+    ("goose", "icons/agents/goose.svg"),
+    ("grok", "icons/agents/grok.svg"),
+    ("hermes", "icons/agents/hermes.svg"),
+    ("junie", "icons/agents/junie.svg"),
+    ("kilo", "icons/agents/kilo.svg"),
+    ("kiro", "icons/agents/kiro.svg"),
+    ("kimi", "icons/agents/kimi.svg"),
+    ("minion-code", "icons/agents/minion-code.svg"),
+    ("mistral", "icons/agents/mistral-vibe.svg"),
+    ("nova", "icons/agents/nova.svg"),
+    ("qoder", "icons/agents/qoder.svg"),
+    ("poolside", "icons/agents/poolside.svg"),
+    ("stakpak", "icons/agents/stakpak.svg"),
+    ("vtcode", "icons/agents/vtcode.svg"),
+];
+
+const MOBILE_MODEL_BRAND_ICONS: &[(&str, &str)] = &[
+    ("claude", "icons/claude.svg"),
+    ("anthropic", "icons/claude.svg"),
+    ("gpt", "icons/openai.svg"),
+    ("o1", "icons/openai.svg"),
+    ("o3", "icons/openai.svg"),
+    ("o4", "icons/openai.svg"),
+    ("chatgpt", "icons/openai.svg"),
+    ("openai", "icons/openai.svg"),
+    ("codex", "icons/openai.svg"),
+    ("gemini", "icons/gemini.svg"),
+    ("gemma", "icons/gemini.svg"),
+    ("grok", "icons/agents/grok.svg"),
+    ("qwen", "icons/qwen.svg"),
+    ("deepseek", "icons/agents/deepseek-harness.svg"),
+    ("kimi", "icons/agents/kimi.svg"),
+    ("moonshot", "icons/agents/kimi.svg"),
+    ("glm", "icons/agents/glm-acp-agent.svg"),
+    ("zhipu", "icons/agents/glm-acp-agent.svg"),
+    ("opencode", "icons/opencode.svg"),
+    ("copilot", "icons/copilot.svg"),
+];
+
+fn agent_brand_icon_path(agent_id: &str, label: &str) -> Option<&'static str> {
+    let identity = format!("{agent_id} {label}").to_ascii_lowercase();
+    MOBILE_AGENT_BRAND_ICONS
+        .iter()
+        .find(|(needle, _)| identity.contains(needle))
+        .map(|(_, path)| *path)
+}
+
+fn model_brand_icon_path(model_id: &str) -> Option<&'static str> {
+    let normalized = model_id.trim().to_ascii_lowercase();
+    let model_name = normalized.rsplit('/').next().unwrap_or(&normalized);
+    MOBILE_MODEL_BRAND_ICONS
+        .iter()
+        .find(|(needle, _)| {
+            model_name.starts_with(needle)
+                && model_name
+                    .as_bytes()
+                    .get(needle.len())
+                    .is_none_or(|next| matches!(next, b'-' | b'_' | b'.' | b':' | b' ' | b'/'))
+        })
+        .map(|(_, path)| *path)
+}
+
+fn runtime_agent_icon(agent_id: &AgentId, label: &str) -> gpui::AnyElement {
+    let path = agent_brand_icon_path(agent_id.as_str(), label).unwrap_or("icons/bot.svg");
+    let mut icon = svg().path(path).size(px(16.0)).flex_shrink_0();
+    if path == "icons/bot.svg" {
+        icon = icon.text_color(theme::text_secondary());
+    }
+    icon.into_any_element()
+}
+
+fn runtime_model_icon(model_id: Option<&str>, size: gpui::Pixels) -> gpui::AnyElement {
+    match model_id.and_then(model_brand_icon_path) {
+        Some(path) => svg()
+            .path(path)
+            .size(size)
+            .flex_shrink_0()
+            .into_any_element(),
+        None => svg()
+            .path("icons/sparkles.svg")
+            .size(size)
+            .flex_shrink_0()
+            .text_color(theme::accent_green())
+            .into_any_element(),
+    }
+}
+
+fn runtime_model_selection_key(model: &RuntimeModelSelection) -> String {
+    match model {
+        RuntimeModelSelection::Explicit { model_id } => format!("model:{model_id}"),
+        RuntimeModelSelection::AgentDefault => "agent-default".to_string(),
+    }
+}
+
+fn runtime_auth_source_display_label(source: &RuntimeAuthSourceSummary) -> String {
+    match source.kind {
+        RuntimeAuthSourceKind::AgentAccount => {
+            locale::text("Agent account", "Agent 账户", "Agent 帳戶").to_string()
+        }
+        RuntimeAuthSourceKind::ProviderProfile => source.label.clone(),
+    }
+}
+
+fn runtime_auth_source_status_label(
+    availability: RuntimeAuthSourceAvailability,
+    model_count: usize,
+) -> String {
+    match availability {
+        RuntimeAuthSourceAvailability::Available => runtime_model_count_label(model_count),
+        RuntimeAuthSourceAvailability::RequiresAuthentication => {
+            locale::text("Sign in", "需要登录", "需要登入").to_string()
+        }
+        RuntimeAuthSourceAvailability::Verifying => {
+            locale::text("Verifying", "正在验证", "正在驗證").to_string()
+        }
+        RuntimeAuthSourceAvailability::DiscoveringModels => {
+            locale::text("Loading models", "正在读取模型", "正在讀取模型").to_string()
+        }
+        RuntimeAuthSourceAvailability::TemporarilyUnavailable => {
+            locale::text("Unavailable", "暂不可用", "暫不可用").to_string()
+        }
+        RuntimeAuthSourceAvailability::RequiresConfiguration => {
+            locale::text("Configure", "需要配置", "需要設定").to_string()
+        }
+        RuntimeAuthSourceAvailability::Unsupported => {
+            locale::text("Unsupported", "暂不支持", "暫不支援").to_string()
+        }
+    }
+}
+
+fn runtime_profile_count_label(count: usize) -> String {
+    match locale::current() {
+        vibex_ui::locale::Locale::En => format!("{count} profiles"),
+        vibex_ui::locale::Locale::ZhCn => format!("{count} 个配置"),
+        vibex_ui::locale::Locale::ZhTw => format!("{count} 個設定"),
+    }
+}
+
+fn runtime_model_count_label(count: usize) -> String {
+    match locale::current() {
+        vibex_ui::locale::Locale::En => format!("{count} models"),
+        vibex_ui::locale::Locale::ZhCn => format!("{count} 个模型"),
+        vibex_ui::locale::Locale::ZhTw => format!("{count} 個模型"),
+    }
+}
+
 fn runtime_choice_button(
     id: impl Into<ElementId>,
     label: impl Into<String>,
@@ -12919,7 +13692,7 @@ fn runtime_choice_button(
         .rounded(px(theme::RADIUS_CONTROL))
         .border_1()
         .border_color(if selected {
-            rgb(theme::ACCENT_BLUE).into()
+            theme::accent_blue().into()
         } else {
             theme::border_default()
         })
@@ -12959,12 +13732,12 @@ fn runtime_sheet_action_button(
         .rounded(px(theme::RADIUS_CONTROL))
         .border_1()
         .border_color(if primary {
-            rgb(theme::TEXT_PRIMARY).into()
+            theme::text_primary().into()
         } else {
             theme::border_default()
         })
         .bg(if primary {
-            rgb(theme::TEXT_PRIMARY).into()
+            theme::text_primary().into()
         } else {
             theme::bg_card()
         })
@@ -12973,7 +13746,7 @@ fn runtime_sheet_action_button(
         .justify_center()
         .text_size(px(theme::FONT_BODY))
         .text_color(if primary {
-            rgb(theme::BG_PRIMARY).into()
+            theme::bg_primary().into()
         } else {
             theme::text_secondary()
         })
@@ -13021,13 +13794,13 @@ fn workspace_mode_label(mode: WorkspaceMode) -> &'static str {
     }
 }
 
-fn sidebar_workspace_status_color(state: Option<AgentSessionState>) -> u32 {
+fn sidebar_workspace_status_color(state: Option<AgentSessionState>) -> gpui::Hsla {
     match state {
-        Some(AgentSessionState::Running | AgentSessionState::Initializing) => theme::TEXT_PRIMARY,
-        Some(AgentSessionState::NeedsInput) => theme::ACCENT_YELLOW,
-        Some(AgentSessionState::Error) => theme::ACCENT_RED,
-        Some(AgentSessionState::Idle) => theme::ACCENT_GREEN,
-        Some(AgentSessionState::Archived | AgentSessionState::Closed) | None => theme::ACCENT_DIM,
+        Some(AgentSessionState::Running | AgentSessionState::Initializing) => theme::text_primary(),
+        Some(AgentSessionState::NeedsInput) => theme::accent_yellow(),
+        Some(AgentSessionState::Error) => theme::accent_red(),
+        Some(AgentSessionState::Idle) => theme::accent_green(),
+        Some(AgentSessionState::Archived | AgentSessionState::Closed) | None => theme::accent_dim(),
     }
 }
 
@@ -13056,16 +13829,16 @@ fn sidebar_running_indicator(color: gpui::Hsla) -> gpui::AnyElement {
         .into_any_element()
 }
 
-fn sidebar_session_running_color(auto_continue_enabled: bool) -> u32 {
+fn sidebar_session_running_color(auto_continue_enabled: bool) -> gpui::Hsla {
     if auto_continue_enabled {
-        theme::ACCENT_GREEN
+        theme::accent_green()
     } else {
-        theme::TEXT_PRIMARY
+        theme::text_primary()
     }
 }
 
 fn sidebar_workspace_status_indicator(state: Option<AgentSessionState>) -> gpui::AnyElement {
-    let color = rgb(sidebar_workspace_status_color(state));
+    let color = sidebar_workspace_status_color(state);
     match state {
         Some(AgentSessionState::Running | AgentSessionState::Initializing) => {
             sidebar_running_indicator(color.into())
@@ -13083,11 +13856,11 @@ fn sidebar_session_status_indicator(
     auto_continue_enabled: bool,
 ) -> gpui::AnyElement {
     match state {
-        AgentSessionState::Running | AgentSessionState::Initializing => sidebar_running_indicator(
-            rgb(sidebar_session_running_color(auto_continue_enabled)).into(),
-        ),
-        AgentSessionState::NeedsInput => sidebar_status_dot(rgb(theme::ACCENT_YELLOW).into()),
-        AgentSessionState::Error => sidebar_status_dot(rgb(theme::ACCENT_RED).into()),
+        AgentSessionState::Running | AgentSessionState::Initializing => {
+            sidebar_running_indicator(sidebar_session_running_color(auto_continue_enabled))
+        }
+        AgentSessionState::NeedsInput => sidebar_status_dot(theme::accent_yellow().into()),
+        AgentSessionState::Error => sidebar_status_dot(theme::accent_red().into()),
         AgentSessionState::Archived | AgentSessionState::Closed => {
             sidebar_status_dot(theme::sidebar_foreground(0.35))
         }
@@ -13210,12 +13983,12 @@ fn sidebar_project_icon_path(
 fn sidebar_project_icon_color(color: SidebarProjectLogoColor) -> gpui::Hsla {
     match color {
         SidebarProjectLogoColor::Neutral => theme::sidebar_text_muted(),
-        SidebarProjectLogoColor::Blue => rgb(theme::ACCENT_BLUE).into(),
+        SidebarProjectLogoColor::Blue => theme::accent_blue().into(),
         SidebarProjectLogoColor::Cyan => rgb(0x22d3ee).into(),
-        SidebarProjectLogoColor::Green => rgb(theme::ACCENT_GREEN).into(),
-        SidebarProjectLogoColor::Yellow => rgb(theme::ACCENT_YELLOW).into(),
+        SidebarProjectLogoColor::Green => theme::accent_green().into(),
+        SidebarProjectLogoColor::Yellow => theme::accent_yellow().into(),
         SidebarProjectLogoColor::Orange => rgb(0xf97316).into(),
-        SidebarProjectLogoColor::Red => rgb(theme::ACCENT_RED).into(),
+        SidebarProjectLogoColor::Red => theme::accent_red().into(),
         SidebarProjectLogoColor::Magenta => rgb(0xe879f9).into(),
     }
 }
@@ -13823,13 +14596,13 @@ fn timeline_row_status_label(row: &TimelineRow) -> String {
     }
 }
 
-fn timeline_row_color(row: &TimelineRow) -> u32 {
+fn timeline_row_color(row: &TimelineRow) -> gpui::Hsla {
     // Desktop parity: status tone only — danger for failures, neutral
     // otherwise. Type-specific accent colors are a mobile-only divergence.
     if row.failed {
-        theme::ACCENT_RED
+        theme::accent_red()
     } else {
-        theme::TEXT_MUTED
+        theme::text_muted()
     }
 }
 
@@ -13837,7 +14610,7 @@ fn timeline_activity_icon_color(row: &TimelineRow) -> Hsla {
     // Desktop parity: process activity is single-tone; only a failed row
     // leaves the muted foreground (for the danger tint).
     if row.failed {
-        rgb(theme::ACCENT_RED).into()
+        theme::accent_red().into()
     } else {
         theme::text_muted()
     }
@@ -13996,7 +14769,7 @@ fn normalized_timeline_activity_terms(value: &str) -> String {
     terms
 }
 
-fn timeline_status_badge(label: String, color: u32) -> gpui::AnyElement {
+fn timeline_status_badge(label: String, color: gpui::Hsla) -> gpui::AnyElement {
     // Desktop parity (`render_process_status_badge`): uppercase shadcn Badge —
     // h-5 rounded-full px-2 text-xs; plain in-progress rows stay neutral and
     // only failures carry the danger tone.
@@ -14009,10 +14782,10 @@ fn timeline_status_badge(label: String, color: u32) -> gpui::AnyElement {
         .px_2()
         .text_size(px(theme::FONT_MICRO))
         .font_weight(FontWeight::MEDIUM)
-        .when(color == theme::ACCENT_RED, |badge| {
-            badge.bg(rgb(color).opacity(0.20)).text_color(rgb(color))
+        .when(color == theme::accent_red(), |badge| {
+            badge.bg(color.opacity(0.20)).text_color(color)
         })
-        .when(color != theme::ACCENT_RED, |badge| {
+        .when(color != theme::accent_red(), |badge| {
             badge
                 .border_1()
                 .border_color(theme::border_default())
@@ -14244,14 +15017,14 @@ mod tests {
     fn sidebar_running_status_colors_match_desktop_semantics() {
         assert_eq!(
             sidebar_workspace_status_color(Some(AgentSessionState::Running)),
-            theme::TEXT_PRIMARY
+            theme::text_primary()
         );
         assert_eq!(
             sidebar_workspace_status_color(Some(AgentSessionState::Initializing)),
-            theme::TEXT_PRIMARY
+            theme::text_primary()
         );
-        assert_eq!(sidebar_session_running_color(true), theme::ACCENT_GREEN);
-        assert_eq!(sidebar_session_running_color(false), theme::TEXT_PRIMARY);
+        assert_eq!(sidebar_session_running_color(true), theme::accent_green());
+        assert_eq!(sidebar_session_running_color(false), theme::text_primary());
     }
 
     #[test]

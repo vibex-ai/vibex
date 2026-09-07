@@ -1,52 +1,165 @@
 //! Design tokens for the native mobile client.
 //!
-//! Values define the shared mobile palette and spacing scale so the two GPUI
-//! phone clients read as one product. Views must go through these accessors
-//! instead of hardcoding colors.
+//! The palette resolves from the shared desktop token source
+//! (`crates/vibex-ui` generated tokens) at render time through an appearance
+//! mode, so the phone reads as the same product as the desktop shell in both
+//! dark and light. Views must go through these accessors instead of
+//! hardcoding colors.
 
-use gpui::{Hsla, hsla, rgb};
+use std::sync::atomic::{AtomicU8, Ordering};
+
+use gpui::{Hsla, Rgba, hsla, rgb};
+use vibex_ui::{DARK_TOKENS, GpuiColorToken, LIGHT_TOKENS};
 
 // ---------------------------------------------------------------------------
-// Palette
+// Appearance mode
 // ---------------------------------------------------------------------------
 
-// The values below mirror the shared desktop dark tokens
-// (`crates/vibex-ui/theme/tokens.json`) so the phone reads as the same product
-// as the desktop shell: the session page uses `background`, while the sessions
-// and workbench pages share the same compact sidebar base.
-pub const BG_PRIMARY: u32 = 0x09090b;
-pub const BG_CARD: u32 = 0x18181b;
-/// Lower-contrast card fill than [`BG_CARD`]; blends into [`BG_PRIMARY`] on dense lists.
-pub const BG_CARD_DIM: u32 = 0x1c1c1e;
-pub const TEXT_PRIMARY: u32 = 0xfafafa;
-pub const TEXT_SECONDARY: u32 = 0xd4d4d8;
-pub const TEXT_MUTED: u32 = 0x9f9fa9;
-/// Desktop borders are pure white at 10%/6%; these are the flattened values
-/// over [`BG_PRIMARY`] for the places that still need an opaque fill.
-pub const BORDER_DEFAULT: u32 = 0x232326;
-pub const BORDER_SUBTLE: u32 = 0x18181b;
-pub const ACCENT_GREEN: u32 = 0x00c950;
-pub const ACCENT_BLUE: u32 = 0x51a2ff;
-pub const ACCENT_YELLOW: u32 = 0xefb000;
-pub const ACCENT_RED: u32 = 0xff6467;
-pub const ACCENT_DIM: u32 = 0x71717b;
-pub const ACCENT_PURPLE: u32 = 0xc678dd;
+/// The mobile appearance preference. `System` resolves against the platform
+/// at render time so the phone flips with the OS dark-mode toggle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AppearanceMode {
+    Light,
+    Dark,
+    #[default]
+    System,
+}
 
-pub const SIDEBAR_BG: u32 = 0x18181b;
-/// The desktop fills a selected row with `sidebar_accent` lightened by 24%;
-/// this is that value flattened for the phone's fixed dark palette.
-pub const SIDEBAR_SELECTED_BG: u32 = 0x303034;
-/// Border of an expanded worktree card that owns the selection
-/// (`sidebar_accent` lightened by 46% on the desktop).
-pub const SIDEBAR_CARD_FOCUS_BORDER: u32 = 0x39393d;
-pub const SIDEBAR_TEXT_PRIMARY: u32 = 0xfafafa;
-pub const SIDEBAR_TEXT_SECONDARY: u32 = 0xd4d4d8;
-pub const SIDEBAR_TEXT_MUTED: u32 = 0x9f9fa9;
+impl AppearanceMode {
+    pub fn all() -> [AppearanceMode; 3] {
+        [
+            AppearanceMode::System,
+            AppearanceMode::Light,
+            AppearanceMode::Dark,
+        ]
+    }
 
-/// The compact workbench shares the sessions sidebar base for a consistent
-/// page background; panel chrome uses the same token as well.
-pub const WORKBENCH_BG: u32 = SIDEBAR_BG;
-pub const WORKBENCH_PANEL_BG: u32 = 0x18181b;
+    pub fn label(self) -> &'static str {
+        match self {
+            AppearanceMode::System => "System",
+            AppearanceMode::Light => "Light",
+            AppearanceMode::Dark => "Dark",
+        }
+    }
+
+    pub fn from_storage(value: &str) -> Option<AppearanceMode> {
+        match value {
+            "light" => Some(AppearanceMode::Light),
+            "dark" => Some(AppearanceMode::Dark),
+            "system" => Some(AppearanceMode::System),
+            _ => None,
+        }
+    }
+
+    pub fn to_storage(self) -> &'static str {
+        match self {
+            AppearanceMode::Light => "light",
+            AppearanceMode::Dark => "dark",
+            AppearanceMode::System => "system",
+        }
+    }
+}
+
+// Encoding fits the small persistence payload: index into `AppearanceMode::all`.
+const MODE_SYSTEM: u8 = 0;
+const MODE_LIGHT: u8 = 1;
+const MODE_DARK: u8 = 2;
+
+static APPEARANCE_MODE: AtomicU8 = AtomicU8::new(MODE_SYSTEM);
+
+/// Applies the persisted appearance preference for this process. Called once
+/// at startup before the first frame and whenever the user changes the
+/// setting; every color accessor reads from here.
+pub fn set_appearance_mode(mode: AppearanceMode) {
+    let encoded = match mode {
+        AppearanceMode::System => MODE_SYSTEM,
+        AppearanceMode::Light => MODE_LIGHT,
+        AppearanceMode::Dark => MODE_DARK,
+    };
+    APPEARANCE_MODE.store(encoded, Ordering::Relaxed);
+}
+
+pub fn appearance_mode() -> AppearanceMode {
+    match APPEARANCE_MODE.load(Ordering::Relaxed) {
+        MODE_LIGHT => AppearanceMode::Light,
+        MODE_DARK => AppearanceMode::Dark,
+        _ => AppearanceMode::System,
+    }
+}
+
+// The System preference resolves against the platform appearance, which the
+// app refreshes from its window-appearance observer (and once per frame while
+// rendering, so a fresh launch lands on the right side before the first
+// observer tick). Dark is the safe default for a cold read.
+static SYSTEM_DARK: AtomicU8 = AtomicU8::new(1);
+
+/// Records the platform appearance for the System preference. Called by the
+/// app shell whenever the window appearance is known to have changed.
+pub fn set_system_dark(dark: bool) {
+    SYSTEM_DARK.store(dark as u8, Ordering::Relaxed);
+}
+
+/// Whether the window is currently dark. A stored Light/Dark preference wins;
+/// the System preference tracks the platform appearance the same way the
+/// desktop shell resolves `ThemeMode::System`.
+pub fn is_dark() -> bool {
+    match appearance_mode() {
+        AppearanceMode::Light => false,
+        AppearanceMode::Dark => true,
+        AppearanceMode::System => SYSTEM_DARK.load(Ordering::Relaxed) == 1,
+    }
+}
+
+/// Whether the stored preference can still flip at runtime (System mode).
+pub fn follows_system() -> bool {
+    appearance_mode() == AppearanceMode::System
+}
+
+// ---------------------------------------------------------------------------
+// Shared token resolution
+// ---------------------------------------------------------------------------
+
+/// One step above the desktop lookup helper: a missing token is a build-time
+/// contract with `tokens.json`, so a typo surfaces as a panic at first paint
+/// instead of a silent wrong color.
+pub fn semantic_color(name: &str, dark: bool) -> Hsla {
+    let tokens: &[GpuiColorToken] = if dark { DARK_TOKENS } else { LIGHT_TOKENS };
+    let token = tokens
+        .iter()
+        .copied()
+        .find(|token| token.name == name)
+        .unwrap_or_else(|| panic!("missing generated GPUI semantic token: {name}"));
+    Hsla {
+        a: token.alpha,
+        ..rgb(token.rgb).into()
+    }
+}
+
+fn tone(name: &str) -> Hsla {
+    semantic_color(name, is_dark())
+}
+
+// ---------------------------------------------------------------------------
+// Palette (dark values kept as the legacy fallback contract for tests)
+// ---------------------------------------------------------------------------
+
+/// Flattens a translucent token (for example the desktop's 10% white border)
+/// over an opaque surface so callers that need a solid fill keep the same
+/// contrast the alpha produced on the given background.
+fn flatten(token: Rgba, over: Rgba) -> Rgba {
+    token.blend(over)
+}
+
+fn opaque(name: &str, surface: &str) -> Hsla {
+    let dark = is_dark();
+    let token = semantic_color(name, dark);
+    if token.a >= 1.0 {
+        return token;
+    }
+    let over = semantic_color(surface, dark);
+    let flattened = flatten(Rgba::from(token), Rgba::from(over).alpha(1.0));
+    rgb(u32::from(flattened)).into()
+}
 
 // ---------------------------------------------------------------------------
 // Spacing and typography
@@ -176,93 +289,249 @@ pub const DRAWER_CLOSE_ANIMATION_MS: u64 = 100;
 // ---------------------------------------------------------------------------
 
 pub fn bg_primary() -> Hsla {
-    rgb(BG_PRIMARY).into()
+    tone("background")
 }
 
 pub fn bg_card() -> Hsla {
-    rgb(BG_CARD).into()
+    tone("card")
 }
 
 pub fn bg_card_dim() -> Hsla {
-    rgb(BG_CARD_DIM).into()
+    // Dense lists need the dimmed fill flattened over the page background so
+    // nested rows keep one consistent contrast step in both appearances.
+    opaque("secondary", "background")
+}
+
+pub fn bg_popover() -> Hsla {
+    tone("popover")
+}
+
+pub fn bg_composer() -> Hsla {
+    tone("composer-surface")
 }
 
 pub fn text_primary() -> Hsla {
-    rgb(TEXT_PRIMARY).into()
+    tone("foreground")
 }
 
 pub fn text_secondary() -> Hsla {
-    rgb(TEXT_SECONDARY).into()
+    // The desktop sidebar fades one foreground; the phone keeps the ladder
+    // explicit. Secondary text is 78% of the foreground in both appearances.
+    let mut color = tone("foreground");
+    color.a = 0.78;
+    color
 }
 
 pub fn text_muted() -> Hsla {
-    rgb(TEXT_MUTED).into()
+    tone("muted-foreground")
 }
 
 pub fn border_default() -> Hsla {
-    rgb(BORDER_DEFAULT).into()
+    opaque("border", "background")
 }
 
 pub fn border_subtle() -> Hsla {
-    rgb(BORDER_SUBTLE).into()
+    opaque("sidebar-border", "background")
+}
+
+pub fn border_input() -> Hsla {
+    opaque("input", "background")
 }
 
 pub fn row_pressed_bg() -> Hsla {
-    hsla(0.0, 0.0, 1.0, 0.10)
+    // Desktop parity (`theme::hover_wash`): dark paints a soft-white wash,
+    // light the tone-flipped soft-black.
+    let (luminance, alpha) = if is_dark() {
+        (0.92, 0.11)
+    } else {
+        (0.10, 0.11)
+    };
+    hsla(0.0, 0.0, luminance, alpha)
+}
+
+pub fn row_active_bg() -> Hsla {
+    // Desktop parity (`theme::active_wash`).
+    let (luminance, alpha) = if is_dark() {
+        (0.92, 0.16)
+    } else {
+        (0.10, 0.16)
+    };
+    hsla(0.0, 0.0, luminance, alpha)
+}
+
+pub fn accent() -> Hsla {
+    tone("accent")
+}
+
+pub fn accent_foreground() -> Hsla {
+    tone("accent-foreground")
+}
+
+pub fn primary() -> Hsla {
+    tone("primary")
+}
+
+pub fn primary_foreground() -> Hsla {
+    tone("primary-foreground")
+}
+
+/// Status and chart accents stay identical across both appearances, matching
+/// the desktop right-rail tones.
+pub fn accent_green() -> Hsla {
+    tone("chart-2")
+}
+
+pub fn accent_blue() -> Hsla {
+    tone("chart-category-1")
+}
+
+pub fn accent_yellow() -> Hsla {
+    tone("warning")
+}
+
+pub fn accent_red() -> Hsla {
+    tone("destructive")
+}
+
+pub fn accent_dim() -> Hsla {
+    tone("muted-foreground")
+}
+
+pub fn accent_purple() -> Hsla {
+    tone("chart-category-8")
+}
+
+/// Git change statuses share the desktop right-rail tones exactly.
+pub fn status_added() -> Hsla {
+    tone("right-rail-status-added")
+}
+
+pub fn status_modified() -> Hsla {
+    tone("right-rail-status-modified")
+}
+
+pub fn status_untracked() -> Hsla {
+    tone("right-rail-status-untracked")
+}
+
+/// Teal accent used for agent-account markers in the session-settings cascade.
+pub fn accent_chart3() -> Hsla {
+    tone("chart-3")
 }
 
 pub fn sidebar_drop_bg() -> Hsla {
-    hsla(0.58, 0.9, 0.6, 0.18)
+    let mut color = accent_blue();
+    color.a = 0.18;
+    color
 }
 
 pub fn workbench_bg() -> Hsla {
-    rgb(WORKBENCH_BG).into()
+    sidebar_bg()
 }
 
 pub fn workbench_panel_bg() -> Hsla {
-    rgb(WORKBENCH_PANEL_BG).into()
+    tone("card")
 }
 
 pub fn sidebar_bg() -> Hsla {
-    rgb(SIDEBAR_BG).into()
+    tone("sidebar")
 }
 
 pub fn sidebar_selected_bg() -> Hsla {
-    rgb(SIDEBAR_SELECTED_BG).into()
+    opaque("sidebar-accent", "sidebar")
 }
 
 pub fn sidebar_text_primary() -> Hsla {
-    rgb(SIDEBAR_TEXT_PRIMARY).into()
+    tone("sidebar-foreground")
 }
 
 pub fn sidebar_text_secondary() -> Hsla {
-    rgb(SIDEBAR_TEXT_SECONDARY).into()
+    let mut color = tone("sidebar-foreground");
+    color.a = 0.78;
+    color
 }
 
 pub fn sidebar_text_muted() -> Hsla {
-    rgb(SIDEBAR_TEXT_MUTED).into()
+    tone("muted-foreground")
 }
 
 /// The desktop's sidebar builds its contrast ladder by fading one foreground
 /// colour rather than by swapping palette entries. Rows that copy a desktop
 /// opacity go through here so the two trees land on the same shade.
 pub fn sidebar_foreground(alpha: f32) -> Hsla {
-    let mut color: Hsla = rgb(SIDEBAR_TEXT_PRIMARY).into();
+    let mut color = tone("sidebar-foreground");
     color.a = alpha;
     color
 }
 
 pub fn sidebar_card_focus_border() -> Hsla {
-    rgb(SIDEBAR_CARD_FOCUS_BORDER).into()
+    let mut color = tone("sidebar-ring");
+    color.a = if is_dark() { 0.42 } else { 0.45 };
+    color
 }
 
 /// Guide line down a folder's child column.
 pub fn sidebar_tree_guide() -> Hsla {
-    let mut color: Hsla = rgb(BORDER_DEFAULT).into();
+    let mut color = opaque("sidebar-border", "sidebar");
     color.a = 0.70;
     color
 }
 
 pub fn backdrop(opacity: f32) -> Hsla {
     hsla(0.0, 0.0, 0.0, opacity)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // One combined test: the appearance preference lives in a process-global,
+    // so parallel test threads would race each other's mode.
+    #[test]
+    fn appearance_preference_resolves_the_shared_palette() {
+        set_appearance_mode(AppearanceMode::Light);
+        assert!(!is_dark());
+        assert_eq!(
+            bg_primary(),
+            semantic_color("background", false),
+            "light background must resolve from the shared token source"
+        );
+        assert_eq!(bg_primary().a, 1.0);
+
+        set_appearance_mode(AppearanceMode::Dark);
+        assert!(is_dark());
+        assert_eq!(
+            bg_primary(),
+            semantic_color("background", true),
+            "dark background must resolve from the shared token source"
+        );
+
+        // Dark border is white at 10% over #0d0d0d.
+        let over = semantic_color("background", true);
+        let flattened = flatten(
+            Rgba::from(semantic_color("border", true)),
+            Rgba::from(over).alpha(1.0),
+        );
+        assert!(flattened.a >= 1.0);
+        assert!(flattened.r > 0.05, "white wash must lift the dark surface");
+        // The opaque accessors never leak alpha.
+        assert_eq!(border_default().a, 1.0);
+        assert_eq!(border_subtle().a, 1.0);
+        assert_eq!(bg_card_dim().a, 1.0);
+        assert_eq!(sidebar_selected_bg().a, 1.0);
+
+        // Status tones match the desktop right-rail values.
+        assert_eq!(accent_red(), semantic_color("destructive", true));
+        assert_eq!(accent_yellow(), semantic_color("warning", true));
+        assert_eq!(accent_blue(), semantic_color("chart-category-1", true));
+
+        // Storage encoding round-trips every mode.
+        for mode in AppearanceMode::all() {
+            set_appearance_mode(mode);
+            assert_eq!(appearance_mode(), mode);
+            assert_eq!(AppearanceMode::from_storage(mode.to_storage()), Some(mode));
+        }
+        assert_eq!(AppearanceMode::from_storage("nope"), None);
+        set_appearance_mode(AppearanceMode::System);
+    }
 }

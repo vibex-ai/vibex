@@ -1,32 +1,31 @@
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    Context, Entity, IntoElement, MouseButton, MouseUpEvent, ParentElement as _, Render,
-    Styled as _, Task, WeakEntity, Window, div, prelude::*, px, rgb, svg,
+    Context, Entity, FontWeight, IntoElement, MouseButton, MouseUpEvent, ParentElement as _,
+    Render, ScrollDelta, ScrollWheelEvent, Styled as _, Task, WeakEntity, Window, canvas, div,
+    prelude::*, px, rgb, svg,
 };
 use vibex_backend::{
-    AgentBackend as _, BackendError, BackendOperation, BackendResult, MutationRequest,
-    TerminalBackend as _,
+    BackendError, BackendOperation, BackendResult, MutationRequest, TerminalBackend as _,
 };
 use vibex_core::{
-    AgentSessionRuntimeSelectionState, FileEntryKind, FileSearchRequest, GitChange, GitChangeKind,
-    GitCommitSummary, GitDiffResponse, GitHistoryRequest, GitRemoteActionKind,
-    GitRemoteActionRequest, GitStageRequest, ProviderRunHealthProbesRequest, RemoteActionClass,
-    RequestId, RuntimeOptionAvailability, RuntimeSelectionInteraction, SessionRuntimeFeature,
-    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
-    SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest,
-    TerminalId, TerminalSnapshot, VibexSessionId, WorkspaceId,
+    FileEntryKind, FileSearchRequest, GitChange, GitChangeKind, GitCommitDetail,
+    GitCommitDetailRequest, GitCommitFileChange, GitCommitSummary, GitDiffResponse,
+    GitHistoryRequest, GitRemoteActionKind, GitRemoteActionRequest, GitStageRequest,
+    RemoteActionClass, TerminalCreateRequest, TerminalId, TerminalSnapshot, TerminalStatus,
+    VibexSessionId, WorkspaceId,
 };
 use vibex_desktop_model::{
     FileGitSignal, FileIconDescriptor, FileIconKind, GitPathSelectionState, GitQueryKind,
     GitTreeRow, GitTreeRowKind, GitWorkbenchMode, file_icon_descriptor,
 };
 use vibex_remote_client::WebRemoteBackend;
+use vibex_terminal_ui::{
+    TerminalCellColor, TerminalCellSnapshot, TerminalCursorShape, TerminalGridPoint,
+};
 use vibex_ui::{
-    FileEditorStatus, FileWorkflowController, GitWorkflowController,
-    ManagementWorkflowCapabilities, ManagementWorkflowController, ShellKind, TerminalInput,
+    FileEditorStatus, FileWorkflowController, GitWorkflowController, ShellKind, TerminalInput,
     TerminalKey, TerminalKeyModifiers, TerminalWorkflowCapabilities, TerminalWorkflowController,
 };
 
@@ -34,17 +33,26 @@ use crate::input::TextInput;
 use crate::locale;
 use crate::theme;
 
-const TERMINAL_OUTPUT_LIMIT: usize = 64 * 1024;
 const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(600);
-const RUNTIME_FEATURE_VALUE_LIMIT: usize = 256;
+/// Cell metrics copied from the desktop terminal surface so both clients
+/// render the same grid geometry at the base 13px mono font size.
+const TERMINAL_FONT_SIZE: f32 = 13.0;
+const TERMINAL_CELL_WIDTH: f32 = 8.0;
+const TERMINAL_CELL_HEIGHT: f32 = 18.0;
+const TERMINAL_HORIZONTAL_PADDING: f32 = 6.0;
+const TERMINAL_VERTICAL_PADDING: f32 = 4.0;
+/// Auto-fit bounds: the PTY is resized to fill the surface, clamped so extreme
+/// layouts can never request a degenerate grid.
+const TERMINAL_MIN_ROWS: u16 = 4;
+const TERMINAL_MAX_ROWS: u16 = 100;
+const TERMINAL_MIN_COLS: u16 = 20;
+const TERMINAL_MAX_COLS: u16 = 240;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkbenchSurface {
     Files,
     Git,
     Terminal,
-    Providers,
-    Runtime,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,8 +85,6 @@ impl WorkbenchSurface {
             Self::Files => "Files",
             Self::Git => "Git",
             Self::Terminal => "Terminal",
-            Self::Providers => "Providers",
-            Self::Runtime => "Runtime",
         }
     }
 
@@ -94,31 +100,32 @@ pub struct MobileWorkbench {
     files: FileWorkflowController,
     git: GitWorkflowController,
     terminal: TerminalWorkflowController,
-    management: ManagementWorkflowController,
     file_search_input: Entity<TextInput>,
     file_search_mode: MobileFileSearchMode,
     file_editor_input: Entity<TextInput>,
+    /// A chosen file takes over the whole Files surface as its own screen
+    /// with a back button, instead of rendering inline under the tree.
+    file_screen_open: bool,
     git_commit_input: Entity<TextInput>,
     git_history_query_input: Entity<TextInput>,
     terminal_input: Entity<TextInput>,
     file_editor_path: Option<String>,
     git_diff: Option<GitDiffResponse>,
+    /// One commit opened from the Commits list takes over the Git surface as
+    /// its own full-screen view with a back button.
+    git_commit_detail: Option<GitCommitDetail>,
+    git_commit_detail_loading: bool,
     git_commit_confirmation: bool,
     git_history_loading: bool,
     git_history_request_generation: u64,
-    terminal_snapshot: Option<TerminalSnapshot>,
+    /// Next chunk sequence to feed into the render model; 0 forces a rebuild
+    /// from the retained snapshot window.
+    terminal_render_sequence: i64,
     terminal_close_confirmation: Option<TerminalId>,
+    /// Rows/cols this client last requested, so repeated fits are no-ops.
+    terminal_fit_size: Option<(u16, u16)>,
     agent_summaries: Vec<vibex_core::RemoteAgentConfigSummary>,
-    runtime_session_id: Option<VibexSessionId>,
-    runtime_catalog: Option<SessionRuntimeOptionCatalog>,
-    runtime_state: Option<AgentSessionRuntimeSelectionState>,
-    runtime_draft: Option<SessionRuntimeSelection>,
-    runtime_feature_inputs: BTreeMap<String, Entity<TextInput>>,
     terminal_poll_generation: u64,
-    management_request_generation: u64,
-    runtime_request_generation: u64,
-    management_busy_generation: Option<u64>,
-    runtime_busy_generation: Option<u64>,
     busy: bool,
     notice: Option<String>,
     error: Option<BackendError>,
@@ -126,10 +133,14 @@ pub struct MobileWorkbench {
 }
 
 impl MobileWorkbench {
+    /// The session is tracked by the app-level session-settings sheet; the
+    /// workbench keeps the method for workspace lifecycle parity.
+    pub fn set_session(&mut self, _session_id: Option<VibexSessionId>, _: &mut Context<Self>) {}
+
     pub fn new(
         backend: Arc<WebRemoteBackend>,
         workspace_id: WorkspaceId,
-        session_id: Option<VibexSessionId>,
+        _session_id: Option<VibexSessionId>,
         cx: &mut Context<Self>,
     ) -> Self {
         let capabilities = backend.capability_snapshot();
@@ -141,11 +152,6 @@ impl MobileWorkbench {
             backend.clone(),
             TerminalWorkflowCapabilities::from_backend(&capabilities),
         );
-        let management = ManagementWorkflowController::new(
-            backend.clone(),
-            backend.clone(),
-            ManagementWorkflowCapabilities::from_backend(&capabilities),
-        );
         let mut workbench = Self {
             backend,
             workspace_id,
@@ -153,13 +159,13 @@ impl MobileWorkbench {
             files,
             git,
             terminal,
-            management,
             file_search_input: cx
                 .new(|cx| TextInput::new(locale::text("Search files", "搜索文件", "搜尋檔案"), cx)),
             file_search_mode: MobileFileSearchMode::Name,
             file_editor_input: cx.new(|cx| {
                 TextInput::new(locale::text("File content", "文件内容", "檔案內容"), cx).multiline()
             }),
+            file_screen_open: false,
             git_commit_input: cx.new(|cx| {
                 TextInput::new(locale::text("Commit message", "提交消息", "提交訊息"), cx)
             }),
@@ -178,22 +184,16 @@ impl MobileWorkbench {
             }),
             file_editor_path: None,
             git_diff: None,
+            git_commit_detail: None,
+            git_commit_detail_loading: false,
             git_commit_confirmation: false,
             git_history_loading: false,
             git_history_request_generation: 0,
-            terminal_snapshot: None,
+            terminal_render_sequence: 0,
             terminal_close_confirmation: None,
+            terminal_fit_size: None,
             agent_summaries: Vec::new(),
-            runtime_session_id: session_id,
-            runtime_catalog: None,
-            runtime_state: None,
-            runtime_draft: None,
-            runtime_feature_inputs: BTreeMap::new(),
             terminal_poll_generation: 0,
-            management_request_generation: 0,
-            runtime_request_generation: 0,
-            management_busy_generation: None,
-            runtime_busy_generation: None,
             busy: false,
             notice: None,
             error: None,
@@ -213,8 +213,6 @@ impl MobileWorkbench {
             WorkbenchSurface::Files => self.refresh_files(cx),
             WorkbenchSurface::Git => self.refresh_git(cx),
             WorkbenchSurface::Terminal => self.refresh_terminals(cx),
-            WorkbenchSurface::Providers => self.refresh_management(cx),
-            WorkbenchSurface::Runtime => self.refresh_runtime(cx),
         }
         cx.notify();
     }
@@ -227,8 +225,12 @@ impl MobileWorkbench {
         self.files.select_workspace(workspace_id.clone());
         self.git.select_workspace(workspace_id);
         self.file_editor_path = None;
+        self.file_screen_open = false;
         self.git_diff = None;
-        self.terminal_snapshot = None;
+        self.git_commit_detail = None;
+        self.git_commit_detail_loading = false;
+        self.terminal_render_sequence = 0;
+        self.terminal_fit_size = None;
         self.terminal_close_confirmation = None;
         self.git_history_loading = false;
         self.git_history_request_generation = self.git_history_request_generation.wrapping_add(1);
@@ -238,27 +240,8 @@ impl MobileWorkbench {
         self.refresh_all(cx);
     }
 
-    pub fn set_session(&mut self, session_id: Option<VibexSessionId>, cx: &mut Context<Self>) {
-        if self.runtime_session_id == session_id {
-            return;
-        }
-        self.runtime_session_id = session_id;
-        self.runtime_state = None;
-        self.runtime_draft = None;
-        self.runtime_feature_inputs.clear();
-        self.refresh_runtime(cx);
-    }
-
     pub fn suspend(&mut self) {
         self.stop_terminal_poll();
-        self.management_request_generation =
-            self.management_request_generation.saturating_add(1).max(1);
-        self.runtime_request_generation = self.runtime_request_generation.saturating_add(1).max(1);
-        let management_busy = self.management_busy_generation.take().is_some();
-        let runtime_busy = self.runtime_busy_generation.take().is_some();
-        if management_busy || runtime_busy {
-            self.busy = false;
-        }
     }
 
     pub fn resume(&mut self, cx: &mut Context<Self>) {
@@ -270,8 +253,6 @@ impl MobileWorkbench {
         self.refresh_files(cx);
         self.refresh_git(cx);
         self.refresh_terminals(cx);
-        self.refresh_management(cx);
-        self.refresh_runtime(cx);
     }
 
     fn sync_capabilities(&mut self) {
@@ -280,8 +261,6 @@ impl MobileWorkbench {
         self.git.set_capabilities(capabilities.git.clone());
         self.terminal
             .set_capabilities(TerminalWorkflowCapabilities::from_backend(&capabilities));
-        self.management
-            .set_capabilities(ManagementWorkflowCapabilities::from_backend(&capabilities));
     }
 
     fn refresh_active_surface(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -332,6 +311,7 @@ impl MobileWorkbench {
                     this.file_editor_path = Some(ticket.path.clone());
                     this.file_editor_input
                         .update(cx, |input, cx| input.set_text(content, cx));
+                    this.file_screen_open = true;
                 }
                 cx.notify();
             });
@@ -459,6 +439,13 @@ impl MobileWorkbench {
             });
         });
         self.tasks.push(task);
+        cx.notify();
+    }
+
+    /// Returns from the full-screen file view to the file tree. The editor
+    /// keeps its loaded content so re-opening the file is instant.
+    fn close_file_screen(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.file_screen_open = false;
         cx.notify();
     }
 
@@ -769,6 +756,47 @@ impl MobileWorkbench {
         self.tasks.push(task);
     }
 
+    /// Opens the full-screen commit view and loads the commit detail (files
+    /// and patch) from the desktop.
+    fn open_git_commit(&mut self, commit_hash: String, cx: &mut Context<Self>) {
+        self.git.state.model.select_commit(commit_hash.clone());
+        self.git_commit_detail = None;
+        self.git_commit_detail_loading = true;
+        let request = GitCommitDetailRequest {
+            workspace_id: self.workspace_id.clone(),
+            commit_hash,
+            include_patch: true,
+        };
+        let backend = self.backend.clone();
+        let runner =
+            gpui_tokio::Tokio::spawn(cx, async move { backend.git_commit_detail(request).await });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.git_commit_detail_loading = false;
+                match outcome {
+                    Ok(detail) => this.git_commit_detail = Some(detail),
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    /// Returns from the full-screen commit view to the Commits list.
+    fn close_git_commit_screen(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.git_commit_detail = None;
+        self.git_commit_detail_loading = false;
+        cx.notify();
+    }
+
     fn mutate_git_path(&mut self, path: String, stage: bool, cx: &mut Context<Self>) {
         let operation = if stage {
             self.git.begin_stage(vec![path])
@@ -936,6 +964,8 @@ impl MobileWorkbench {
         match self.terminal.attach(terminal_id.clone()) {
             Ok(()) => {
                 self.error = None;
+                self.terminal_render_sequence = 0;
+                self.terminal_fit_size = None;
                 self.start_terminal_poll(terminal_id, cx);
             }
             Err(error) => {
@@ -987,7 +1017,7 @@ impl MobileWorkbench {
                     }
                     match outcome {
                         Ok(snapshot) => {
-                            this.terminal_snapshot = Some(snapshot);
+                            this.apply_terminal_snapshot(snapshot);
                             this.error = None;
                         }
                         Err(error) => this.error = Some(error),
@@ -1017,104 +1047,80 @@ impl MobileWorkbench {
         task.detach();
     }
 
-    fn refresh_terminal_snapshot(
-        &mut self,
-        _: &MouseUpEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(terminal_id) = self
+    /// Feeds a polled snapshot into the shared render model. Chunks already
+    /// applied are skipped by sequence; a sequence reset (snapshot evicted,
+    /// resized, or terminal reattached) rebuilds the emulator from the
+    /// retained window, mirroring the desktop raw-buffer rebuild rules.
+    fn apply_terminal_snapshot(&mut self, snapshot: TerminalSnapshot) {
+        let render = self
             .terminal
             .state
-            .active_session
-            .as_ref()
-            .map(|session| session.id.clone())
-        {
-            self.start_terminal_poll(terminal_id, cx);
-        }
+            .render
+            .get_or_insert_with(|| vibex_ui::TerminalRenderModel::new(1, 1));
+        terminal_feed_snapshot(render, &mut self.terminal_render_sequence, &snapshot);
     }
 
-    fn resize_terminal_by(&mut self, row_delta: i16, col_delta: i16, cx: &mut Context<Self>) {
+    /// Auto-fits the PTY to the available surface. The desktop grid geometry
+    /// (8x18px cells at 13px) determines how many rows/columns fit, and the
+    /// shared render model is resized in lock-step so the frame matches.
+    fn fit_terminal_to(&mut self, width: f32, height: f32, cx: &mut Context<Self>) {
+        let cols = ((((width - TERMINAL_HORIZONTAL_PADDING * 2.0) / TERMINAL_CELL_WIDTH).floor()
+            as i32)
+            .clamp(i32::from(TERMINAL_MIN_COLS), i32::from(TERMINAL_MAX_COLS)))
+            as u16;
+        let rows = ((((height - TERMINAL_VERTICAL_PADDING * 2.0) / TERMINAL_CELL_HEIGHT).floor()
+            as i32)
+            .clamp(i32::from(TERMINAL_MIN_ROWS), i32::from(TERMINAL_MAX_ROWS)))
+            as u16;
         let Some(session) = self.terminal.state.active_session.as_ref() else {
             return;
         };
-        let rows = (i32::from(session.rows) + i32::from(row_delta)).clamp(4, 200) as u16;
-        let cols = (i32::from(session.cols) + i32::from(col_delta)).clamp(20, 400) as u16;
-        if rows == session.rows && cols == session.cols {
+        if session.rows == rows && session.cols == cols {
             return;
         }
+        if self.terminal_fit_size == Some((rows, cols)) || self.busy {
+            return;
+        }
+        self.terminal_fit_size = Some((rows, cols));
+        let terminal_id = session.id.clone();
         let operation = match self.terminal.begin_resize(rows, cols) {
             Ok(operation) => operation,
             Err(error) => {
+                self.terminal_fit_size = None;
                 self.error = Some(error);
                 cx.notify();
                 return;
             }
         };
-        self.busy = true;
         let runner = gpui_tokio::Tokio::spawn(cx, self.terminal.run_resize(operation.clone()));
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
             let _ = entity.update(cx, |this, cx| {
-                this.terminal.apply_resize(&operation, outcome);
-                this.busy = false;
-                this.error = this.terminal.state.last_error.clone();
-                if this.error.is_none() {
-                    this.notice = Some(format!(
-                        "{} {cols} x {rows}",
-                        locale::text("Terminal resized to", "终端已调整为", "終端機已調整為")
-                    ));
-                    if let Some(terminal_id) = this
-                        .terminal
-                        .state
-                        .active_session
-                        .as_ref()
-                        .map(|session| session.id.clone())
-                    {
-                        this.start_terminal_poll(terminal_id, cx);
-                    }
+                let current = this
+                    .terminal
+                    .state
+                    .active_session
+                    .as_ref()
+                    .is_some_and(|session| session.id == terminal_id);
+                if !current {
+                    return;
                 }
+                let resized = this.terminal.apply_resize(&operation, outcome);
+                if resized {
+                    if let Some(session) = this.terminal.state.active_session.as_ref() {
+                        if let Some(render) = this.terminal.state.render.as_mut() {
+                            render.resize(session.rows, session.cols);
+                        }
+                    }
+                    this.terminal_render_sequence = 0;
+                    this.start_terminal_poll(terminal_id, cx);
+                }
+                this.error = this.terminal.state.last_error.clone();
                 cx.notify();
             });
         });
         self.tasks.push(task);
         cx.notify();
-    }
-
-    fn resize_terminal_rows_down(
-        &mut self,
-        _: &MouseUpEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.resize_terminal_by(-4, 0, cx);
-    }
-
-    fn resize_terminal_rows_up(
-        &mut self,
-        _: &MouseUpEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.resize_terminal_by(4, 0, cx);
-    }
-
-    fn resize_terminal_cols_down(
-        &mut self,
-        _: &MouseUpEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.resize_terminal_by(0, -8, cx);
-    }
-
-    fn resize_terminal_cols_up(
-        &mut self,
-        _: &MouseUpEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.resize_terminal_by(0, 8, cx);
     }
 
     fn send_terminal_input(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -1131,6 +1137,49 @@ impl MobileWorkbench {
             false,
             cx,
         );
+    }
+
+    /// Scroll-back for the terminal grid. Wheel deltas move the shared render
+    /// model's viewport; a downward scroll past the history stops at the live
+    /// bottom, mirroring the desktop surface.
+    fn scroll_terminal(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let lines = match event.delta {
+            ScrollDelta::Lines(point) => point.y * 3.0,
+            ScrollDelta::Pixels(point) => f32::from(point.y) / TERMINAL_CELL_HEIGHT,
+        };
+        if lines == 0.0 {
+            return;
+        }
+        let Some(render) = self.terminal.state.render.as_mut() else {
+            return;
+        };
+        let frame = &render.frame;
+        if frame.modes.mouse_reporting {
+            // Applications handling their own mouse events also own scroll;
+            // do not fight them with local viewport movement.
+            cx.stop_propagation();
+            return;
+        }
+        if frame.display_offset == 0 && lines < 0.0 {
+            return;
+        }
+        render.scroll(lines as i32);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn scroll_terminal_to_bottom(&mut self, cx: &mut Context<Self>) {
+        if let Some(render) = self.terminal.state.render.as_mut() {
+            if render.frame.display_offset != 0 {
+                render.scroll_to_bottom();
+                cx.notify();
+            }
+        }
     }
 
     fn send_terminal_value(
@@ -1232,7 +1281,8 @@ impl MobileWorkbench {
             let _ = entity.update(cx, |this, cx| {
                 this.terminal.apply_close(&operation, outcome);
                 this.busy = false;
-                this.terminal_snapshot = None;
+                this.terminal.state.render = None;
+                this.terminal_render_sequence = 0;
                 this.error = this.terminal.state.last_error.clone();
                 if this.error.is_none() {
                     this.stop_terminal_poll();
@@ -1244,286 +1294,17 @@ impl MobileWorkbench {
         cx.notify();
     }
 
-    fn refresh_management(&mut self, cx: &mut Context<Self>) {
-        self.management_request_generation =
-            self.management_request_generation.saturating_add(1).max(1);
-        let generation = self.management_request_generation;
-        if self.management_busy_generation.take().is_some() {
-            self.busy = false;
-        }
-        let mut controller = self.management.clone();
-        let backend = self.backend.clone();
-        let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let result = controller.refresh().await;
-            let agent_summaries = backend.list_agent_config_summaries(true).await;
-            (controller, result, agent_summaries)
-        });
-        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            let outcome = runner.await;
-            let _ = entity.update(cx, |this, cx| {
-                if generation != this.management_request_generation {
-                    return;
-                }
-                match outcome {
-                    Ok((controller, result, agent_summaries)) => {
-                        this.management = controller;
-                        this.error = result.err();
-                        match agent_summaries {
-                            Ok(summaries) => this.agent_summaries = summaries,
-                            Err(error) if this.error.is_none() => this.error = Some(error),
-                            Err(_) => {}
-                        }
-                    }
-                    Err(_) => {
-                        this.error = Some(background_task_error());
-                    }
-                }
-                cx.notify();
-            });
-        });
-        self.tasks.push(task);
-    }
-
-    fn run_health_probes(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.management_request_generation =
-            self.management_request_generation.saturating_add(1).max(1);
-        let generation = self.management_request_generation;
-        self.management_busy_generation = Some(generation);
-        let mut controller = self.management.clone();
-        self.busy = true;
-        let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let result = controller
-                .run_health_probes(MutationRequest::new(ProviderRunHealthProbesRequest {
-                    provider_profile_ids: None,
-                    probe_kinds: None,
-                }))
-                .await;
-            (controller, result)
-        });
-        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            let outcome = runner.await;
-            let _ = entity.update(cx, |this, cx| {
-                if generation != this.management_request_generation {
-                    return;
-                }
-                this.management_busy_generation = None;
-                this.busy = false;
-                match outcome {
-                    Ok((controller, result)) => {
-                        this.management = controller;
-                        this.error = result.err();
-                        if this.error.is_none() {
-                            this.notice = Some(
-                                locale::common("Provider health probes completed").to_string(),
-                            );
-                        }
-                    }
-                    Err(_) => this.error = Some(background_task_error()),
-                }
-                cx.notify();
-            });
-        });
-        self.tasks.push(task);
-        cx.notify();
-    }
-
-    fn refresh_runtime(&mut self, cx: &mut Context<Self>) {
-        self.runtime_request_generation = self.runtime_request_generation.saturating_add(1).max(1);
-        let generation = self.runtime_request_generation;
-        if self.runtime_busy_generation.take().is_some() {
-            self.busy = false;
-        }
-        let Some(session_id) = self.runtime_session_id.clone() else {
-            self.runtime_catalog = None;
-            self.runtime_state = None;
-            self.runtime_draft = None;
-            cx.notify();
-            return;
-        };
-        let requested_session_id = session_id.clone();
-        let backend = self.backend.clone();
-        let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let catalog = backend.list_runtime_options().await?;
-            let state = backend.runtime_selection(session_id).await?;
-            Ok::<_, BackendError>((catalog, state))
-        });
-        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            let outcome = flatten_join(runner.await);
-            let _ = entity.update(cx, |this, cx| {
-                if generation != this.runtime_request_generation
-                    || this.runtime_session_id.as_ref() != Some(&requested_session_id)
-                {
-                    return;
-                }
-                match outcome {
-                    Ok((catalog, state)) => {
-                        this.runtime_draft = Some(state.desired.clone());
-                        this.runtime_catalog = Some(catalog);
-                        this.runtime_state = Some(state);
-                        this.sync_runtime_feature_inputs(cx);
-                        this.error = None;
-                    }
-                    Err(error) => this.error = Some(error),
-                }
-                cx.notify();
-            });
-        });
-        self.tasks.push(task);
-    }
-
-    fn choose_runtime_option(
-        &mut self,
-        selection: SessionRuntimeSelection,
-        cx: &mut Context<Self>,
-    ) {
-        self.runtime_draft = Some(selection);
-        self.sync_runtime_feature_inputs(cx);
-        self.error = None;
-        cx.notify();
-    }
-
-    fn sync_runtime_feature_inputs(&mut self, cx: &mut Context<Self>) {
-        let features = self
-            .runtime_catalog
-            .as_ref()
-            .and_then(|catalog| {
-                self.runtime_draft
-                    .as_ref()
-                    .and_then(|draft| matching_runtime_option(&catalog.options, draft))
-            })
-            .map(|option| option.features.clone())
-            .unwrap_or_default();
-        let config_values = self
-            .runtime_draft
-            .as_ref()
-            .map(|draft| draft.config_values.clone())
-            .unwrap_or_default();
-        self.runtime_feature_inputs = features
-            .into_iter()
-            .filter(|feature| feature.kind == SessionRuntimeFeatureKind::String)
-            .map(|feature| {
-                let value = config_values.get(&feature.id).cloned().unwrap_or_default();
-                let input = cx.new(|cx| {
-                    let mut input = TextInput::new(locale::common("Value"), cx);
-                    input.set_text(value, cx);
-                    input
-                });
-                (feature.id, input)
-            })
-            .collect();
-    }
-
-    fn apply_runtime_feature_inputs(&mut self, cx: &mut Context<Self>) -> BackendResult<()> {
-        let Some(draft) = self.runtime_draft.as_mut() else {
-            return Ok(());
-        };
-        for (feature_id, input) in &self.runtime_feature_inputs {
-            let value = input.read(cx).text().to_string();
-            match runtime_string_override(value)? {
-                Some(value) => {
-                    draft.config_values.insert(feature_id.clone(), value);
-                }
-                None => {
-                    draft.config_values.remove(feature_id);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn choose_runtime_reasoning(&mut self, value: Option<String>, cx: &mut Context<Self>) {
-        if let Some(draft) = self.runtime_draft.as_mut() {
-            draft.reasoning_effort = value;
-        }
-        cx.notify();
-    }
-
-    fn choose_runtime_mode(&mut self, value: Option<String>, cx: &mut Context<Self>) {
-        if let Some(draft) = self.runtime_draft.as_mut() {
-            draft.mode_id = value;
-        }
-        cx.notify();
-    }
-
-    fn choose_runtime_feature(
-        &mut self,
-        id: String,
-        value: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(draft) = self.runtime_draft.as_mut() {
-            if let Some(value) = value {
-                draft.config_values.insert(id, value);
-            } else {
-                draft.config_values.remove(&id);
-            }
-        }
-        cx.notify();
-    }
-
-    fn apply_runtime(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if let Err(error) = self.apply_runtime_feature_inputs(cx) {
-            self.error = Some(error);
-            cx.notify();
-            return;
-        }
-        let (Some(session_id), Some(state), Some(desired)) = (
-            self.runtime_session_id.clone(),
-            self.runtime_state.clone(),
-            self.runtime_draft.clone(),
-        ) else {
-            return;
-        };
-        self.runtime_request_generation = self.runtime_request_generation.saturating_add(1).max(1);
-        let generation = self.runtime_request_generation;
-        self.runtime_busy_generation = Some(generation);
-        let requested_session_id = session_id.clone();
-        let request = MutationRequest::new(SetDesiredAgentSessionRuntimeRequest {
-            session_id,
-            idempotency_key: RequestId::new().into_string(),
-            expected_revision: state.session_revision,
-            expected_selection_revision: state.selection_revision,
-            desired,
-            interaction: RuntimeSelectionInteraction::Seamless,
-        });
-        let backend = self.backend.clone();
-        self.busy = true;
-        let runner =
-            gpui_tokio::Tokio::spawn(
-                cx,
-                async move { backend.set_desired_runtime(request).await },
-            );
-        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            let outcome = flatten_join(runner.await);
-            let _ = entity.update(cx, |this, cx| {
-                if generation != this.runtime_request_generation
-                    || this.runtime_session_id.as_ref() != Some(&requested_session_id)
-                {
-                    return;
-                }
-                this.runtime_busy_generation = None;
-                this.busy = false;
-                match outcome {
-                    Ok(state) => {
-                        this.runtime_draft = Some(state.desired.clone());
-                        this.runtime_state = Some(state);
-                        this.sync_runtime_feature_inputs(cx);
-                        this.notice =
-                            Some(locale::common("Runtime selection sent to desktop").to_string());
-                        this.error = None;
-                    }
-                    Err(error) => this.error = Some(error),
-                }
-                cx.notify();
-            });
-        });
-        self.tasks.push(task);
-        cx.notify();
-    }
-}
-
-impl MobileWorkbench {
     fn render_files(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if self.file_screen_open {
+            return self.render_file_screen(cx);
+        }
+        self.render_file_tree(cx)
+    }
+
+    /// Full-screen file view opened from the file panel: a header with a back
+    /// button and file status, the editor filling the remaining height, and a
+    /// bottom action bar (save / conflict recovery).
+    fn render_file_screen(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let view = self.files.state.view();
         let input_dirty = view
             .editor_content
@@ -1534,7 +1315,167 @@ impl MobileWorkbench {
             file_status_label(view.status)
         };
         let status_color = if input_dirty {
-            rgb(theme::ACCENT_YELLOW).into()
+            theme::accent_yellow().into()
+        } else {
+            file_status_color(view.status)
+        };
+        let has_conflict = view.status == FileEditorStatus::Conflict;
+        let can_write = self
+            .files
+            .capabilities()
+            .supports(BackendOperation::FileWrite);
+        let path = view.selected_path.clone().unwrap_or_default();
+        let file_name = path.rsplit('/').next().unwrap_or(&path).to_string();
+        let icon = file_icon_descriptor(&file_name, FileEntryKind::File);
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(theme::workbench_panel_bg())
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .h(px(48.0))
+                    .px_1()
+                    .border_b_1()
+                    .border_color(theme::border_subtle())
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id("file-screen-back")
+                            .size(px(theme::TOUCH_TARGET))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::close_file_screen))
+                            .child(
+                                svg()
+                                    .path("icons/chevron-left.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_secondary()),
+                            ),
+                    )
+                    .child(mobile_file_tree_icon(icon, false, false))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .justify_center()
+                            .gap(px(1.0))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(px(theme::FONT_BODY))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::text_primary())
+                                    .child(file_name),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(px(theme::FONT_MICRO))
+                                    .text_color(theme::text_muted())
+                                    .child(path),
+                            ),
+                    )
+                    .child(
+                        div().flex_1().min_w_0().flex().justify_end().child(
+                            div()
+                                .flex_shrink_0()
+                                .px_2()
+                                .py(px(2.0))
+                                .rounded(px(theme::RADIUS_CONTROL))
+                                .bg(theme::bg_card_dim())
+                                .text_size(px(theme::FONT_MICRO))
+                                .text_color(status_color)
+                                .child(status),
+                        ),
+                    ),
+            )
+            .child(
+                div()
+                    .id("file-screen-editor")
+                    .flex_1()
+                    .min_h_0()
+                    .m_2()
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .border_1()
+                    .border_color(theme::border_default())
+                    .bg(theme::bg_card())
+                    .overflow_hidden()
+                    .child(self.file_editor_input.clone()),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .border_t_1()
+                    .border_color(theme::border_subtle())
+                    .p_2()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .when(has_conflict, |actions| {
+                                actions.child(
+                                    action_button("reload-desktop-file", "Use desktop version")
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(Self::reload_desktop_file),
+                                        ),
+                                )
+                            }),
+                    )
+                    .child(
+                        action_button(
+                            "save-file",
+                            if !can_write {
+                                "Read only"
+                            } else if self.busy {
+                                "Saving..."
+                            } else {
+                                "Save"
+                            },
+                        )
+                        .when(!self.busy && can_write, |button| {
+                            button.on_mouse_up(MouseButton::Left, cx.listener(Self::save_file))
+                        })
+                        .when(!can_write, |button| button.opacity(0.55)),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The file tree panel (search bar + rows + search results).
+    fn render_file_tree(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let view = self.files.state.view();
+        let input_dirty = view
+            .editor_content
+            .is_some_and(|content| self.file_editor_input.read(cx).text() != content);
+        let status = if input_dirty {
+            "Unsaved"
+        } else {
+            file_status_label(view.status)
+        };
+        let status_color = if input_dirty {
+            theme::accent_yellow().into()
         } else {
             file_status_color(view.status)
         };
@@ -1544,11 +1485,6 @@ impl MobileWorkbench {
         let query_present = !self.file_search_input.read(cx).text().trim().is_empty();
         let search_loading = self.files.state.search.is_loading();
         let search_has_results = !search.is_empty();
-        let has_conflict = view.status == FileEditorStatus::Conflict;
-        let can_write = self
-            .files
-            .capabilities()
-            .supports(BackendOperation::FileWrite);
 
         div()
             .size_full()
@@ -1724,96 +1660,58 @@ impl MobileWorkbench {
                         }))
                     })
                     .when(!query_present, |body| {
+                        // A compact summary of the chosen file; tapping it
+                        // re-opens the full-screen file view.
                         body.when_some(selected_path, |body, path| {
                             body.child(
                                 div()
-                                    .h(px(30.0))
+                                    .id("mobile-file-reopen")
+                                    .min_h(px(36.0))
                                     .px_3()
+                                    .py_1()
                                     .flex()
                                     .items_center()
+                                    .gap_2()
                                     .border_t_1()
                                     .border_color(theme::border_subtle())
-                                    .text_size(px(theme::FONT_MICRO))
-                                    .text_color(theme::text_muted())
-                                    .child(locale::common("Editor")),
-                            )
-                            .child(
-                                div()
-                                    .px_3()
-                                    .pb_3()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.file_screen_open = true;
+                                            cx.notify();
+                                        }),
+                                    )
                                     .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .gap_2()
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .overflow_hidden()
-                                                    .text_ellipsis()
-                                                    .whitespace_nowrap()
-                                                    .text_size(px(theme::FONT_CAPTION))
-                                                    .text_color(theme::text_muted())
-                                                    .child(path),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(px(theme::FONT_MICRO))
-                                                    .text_color(status_color)
-                                                    .child(status),
-                                            ),
+                                        svg()
+                                            .path("icons/pencil.svg")
+                                            .size(px(theme::ICON_SM))
+                                            .text_color(theme::text_muted()),
                                     )
                                     .child(
                                         div()
-                                            .h(px(240.0))
-                                            .rounded(px(theme::RADIUS_CONTROL))
-                                            .border_1()
-                                            .border_color(theme::border_default())
-                                            .bg(theme::bg_card())
+                                            .min_w_0()
+                                            .flex_1()
                                             .overflow_hidden()
-                                            .child(self.file_editor_input.clone()),
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .text_size(px(theme::FONT_CAPTION))
+                                            .text_color(theme::text_secondary())
+                                            .child(path),
                                     )
                                     .child(
                                         div()
-                                            .flex()
-                                            .justify_end()
-                                            .gap_2()
-                                            .when(has_conflict, |actions| {
-                                                actions.child(
-                                                    action_button(
-                                                        "reload-desktop-file",
-                                                        "Use desktop version",
-                                                    )
-                                                    .on_mouse_up(
-                                                        MouseButton::Left,
-                                                        cx.listener(Self::reload_desktop_file),
-                                                    ),
-                                                )
-                                            })
-                                            .child(
-                                                action_button(
-                                                    "save-file",
-                                                    if !can_write {
-                                                        "Read only"
-                                                    } else if self.busy {
-                                                        "Saving..."
-                                                    } else {
-                                                        "Save"
-                                                    },
-                                                )
-                                                .when(!self.busy && can_write, |button| {
-                                                    button.on_mouse_up(
-                                                        MouseButton::Left,
-                                                        cx.listener(Self::save_file),
-                                                    )
-                                                })
-                                                .when(!can_write, |button| button.opacity(0.55)),
-                                            ),
+                                            .flex_shrink_0()
+                                            .text_size(px(theme::FONT_MICRO))
+                                            .text_color(status_color)
+                                            .child(status),
+                                    )
+                                    .child(
+                                        svg()
+                                            .path("icons/chevron-right.svg")
+                                            .size(px(theme::ICON_SM))
+                                            .text_color(theme::text_muted()),
                                     ),
                             )
                         })
@@ -1927,6 +1825,13 @@ impl MobileWorkbench {
     }
 
     fn render_git(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if self.git_commit_detail.is_some() || self.git_commit_detail_loading {
+            return self.render_git_commit_screen(cx);
+        }
+        self.render_git_panel(cx)
+    }
+
+    fn render_git_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let mode = self.git.state.model.mode;
         let changes_active = mode == GitWorkbenchMode::Changes;
         let history_active = mode == GitWorkbenchMode::History;
@@ -2206,7 +2111,7 @@ impl MobileWorkbench {
                                 .font_family("monospace")
                                 .text_size(px(theme::FONT_MICRO))
                                 .text_color(if additions > 0 {
-                                    rgb(theme::ACCENT_GREEN).into()
+                                    theme::accent_green().into()
                                 } else {
                                     theme::text_muted()
                                 })
@@ -2217,7 +2122,7 @@ impl MobileWorkbench {
                                 .font_family("monospace")
                                 .text_size(px(theme::FONT_MICRO))
                                 .text_color(if deletions > 0 {
-                                    rgb(theme::ACCENT_RED).into()
+                                    theme::accent_red().into()
                                 } else {
                                     theme::text_muted()
                                 })
@@ -2426,7 +2331,7 @@ impl MobileWorkbench {
                         .font_family("monospace")
                         .text_size(px(theme::FONT_MICRO))
                         .text_color(if change.additions > 0 {
-                            rgb(theme::ACCENT_GREEN).into()
+                            theme::accent_green().into()
                         } else {
                             theme::text_muted()
                         })
@@ -2439,7 +2344,7 @@ impl MobileWorkbench {
                         .font_family("monospace")
                         .text_size(px(theme::FONT_MICRO))
                         .text_color(if change.deletions > 0 {
-                            rgb(theme::ACCENT_RED).into()
+                            theme::accent_red().into()
                         } else {
                             theme::text_muted()
                         })
@@ -2457,6 +2362,355 @@ impl MobileWorkbench {
                     cx.notify();
                 }),
             )
+            .into_any_element()
+    }
+
+    /// Full-screen commit view: header with a back button, commit metadata,
+    /// the changed-file list, and the full patch body.
+    fn render_git_commit_screen(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let detail = self.git_commit_detail.clone();
+        let loading = self.git_commit_detail_loading;
+        let subject = detail
+            .as_ref()
+            .map(|detail| detail.summary.subject.clone())
+            .unwrap_or_default();
+        let short_hash = detail
+            .as_ref()
+            .map(|detail| detail.summary.short_hash.clone())
+            .unwrap_or_default();
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(theme::workbench_panel_bg())
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .h(px(48.0))
+                    .px_1()
+                    .border_b_1()
+                    .border_color(theme::border_subtle())
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id("git-commit-back")
+                            .size(px(theme::TOUCH_TARGET))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(Self::close_git_commit_screen),
+                            )
+                            .child(
+                                svg()
+                                    .path("icons/chevron-left.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_secondary()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .justify_center()
+                            .gap(px(1.0))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(px(theme::FONT_BODY))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::text_primary())
+                                    .child(subject),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(px(theme::FONT_MICRO))
+                                    .font_family("IBM Plex Mono")
+                                    .text_color(theme::text_muted())
+                                    .child(short_hash),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .id("git-commit-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .when(loading, |body| {
+                        body.child(empty_label(locale::common("Loading")))
+                    })
+                    .when_some(detail.clone(), |body, detail| {
+                        let summary = &detail.summary;
+                        let stats = detail.files.iter().fold(
+                            (0u32, 0u32, 0usize),
+                            |(add, del, count), file| {
+                                (add + file.additions, del + file.deletions, count + 1)
+                            },
+                        );
+                        body.child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .text_size(px(theme::FONT_MICRO))
+                                        .text_color(theme::text_muted())
+                                        .child(history_relative_time(summary.authored_at_ms))
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .flex_1()
+                                                .overflow_hidden()
+                                                .text_ellipsis()
+                                                .whitespace_nowrap()
+                                                .child(summary.author_name.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .font_family("IBM Plex Mono")
+                                                .text_color(theme::accent_green())
+                                                .child(format!("+{}", stats.0)),
+                                        )
+                                        .child(
+                                            div()
+                                                .font_family("IBM Plex Mono")
+                                                .text_color(theme::accent_red())
+                                                .child(format!("-{}", stats.1)),
+                                        ),
+                                )
+                                .when_some(detail.body.clone(), |meta, commit_body| {
+                                    let commit_body = commit_body.trim().to_string();
+                                    meta.when(!commit_body.is_empty(), |meta| {
+                                        meta.child(
+                                            div()
+                                                .pt_1()
+                                                .text_size(px(theme::FONT_CAPTION))
+                                                .whitespace_normal()
+                                                .text_color(theme::text_secondary())
+                                                .child(commit_body),
+                                        )
+                                    })
+                                })
+                                .children(summary.refs.iter().take(4).cloned().map(|reference| {
+                                    div()
+                                        .mr_1()
+                                        .max_w(px(120.0))
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .rounded(px(3.0))
+                                        .bg(theme::accent_blue().opacity(0.18))
+                                        .px_1()
+                                        .text_size(px(theme::FONT_MICRO))
+                                        .text_color(theme::accent_blue())
+                                        .child(reference)
+                                })),
+                        )
+                        .child(
+                            div()
+                                .h(px(30.0))
+                                .px_3()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .border_t_1()
+                                .border_b_1()
+                                .border_color(theme::border_subtle())
+                                .text_size(px(theme::FONT_MICRO))
+                                .text_color(theme::text_muted())
+                                .child(locale::text("Files", "文件", "檔案"))
+                                .child(format!("{}", stats.2)),
+                        )
+                        .children(
+                            detail
+                                .files
+                                .iter()
+                                .map(|file| self.render_git_commit_file_row(file)),
+                        )
+                        .when_some(detail.patch.clone(), |body, patch| {
+                            body.child(
+                                div()
+                                    .h(px(30.0))
+                                    .px_3()
+                                    .flex()
+                                    .items_center()
+                                    .border_t_1()
+                                    .border_color(theme::border_subtle())
+                                    .text_size(px(theme::FONT_MICRO))
+                                    .text_color(theme::text_muted())
+                                    .child(locale::text("Patch", "补丁", "補丁")),
+                            )
+                            .child(self.render_git_patch_body(&patch))
+                            .when(detail.patch_truncated, |body| {
+                                body.child(
+                                    div()
+                                        .px_3()
+                                        .py_2()
+                                        .text_size(px(theme::FONT_MICRO))
+                                        .text_color(theme::accent_yellow())
+                                        .child(locale::text(
+                                            "The patch is truncated.",
+                                            "补丁内容已截断。",
+                                            "補丁內容已截斷。",
+                                        )),
+                                )
+                            })
+                        })
+                        .when(detail.patch.is_none(), |body| {
+                            body.child(
+                                div()
+                                    .px_3()
+                                    .py_2()
+                                    .text_size(px(theme::FONT_MICRO))
+                                    .text_color(theme::text_muted())
+                                    .child(locale::text(
+                                        "This commit has no patch content.",
+                                        "该提交没有补丁内容。",
+                                        "該提交沒有補丁內容。",
+                                    )),
+                            )
+                        })
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// One changed file in a commit, using the desktop right-rail colors and
+    /// A/D/M/R/C/U labels.
+    fn render_git_commit_file_row(&self, file: &GitCommitFileChange) -> gpui::AnyElement {
+        let color = git_change_text_color_mobile(&GitChange {
+            path: file.path.clone(),
+            original_path: file.original_path.clone(),
+            kind: file.kind,
+            staged: false,
+            unstaged: true,
+            additions: file.additions,
+            deletions: file.deletions,
+        });
+        div()
+            .min_h(px(32.0))
+            .px_3()
+            .py_1()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .h(px(18.0))
+                    .min_w(px(22.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(3.0))
+                    .border_1()
+                    .border_color(theme::border_default())
+                    .px_1()
+                    .font_family("IBM Plex Mono")
+                    .text_size(px(theme::FONT_MICRO))
+                    .text_color(color)
+                    .child(git_change_label_mobile(file.kind)),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_size(px(theme::FONT_CAPTION))
+                    .text_color(theme::text_secondary())
+                    .when_some(file.original_path.clone(), |row, original| {
+                        row.child(format!("{original} → {}", file.path))
+                    })
+                    .when(file.original_path.is_none(), |row| {
+                        row.child(file.path.clone())
+                    }),
+            )
+            .child(
+                div()
+                    .w(px(34.0))
+                    .flex_none()
+                    .font_family("IBM Plex Mono")
+                    .text_size(px(theme::FONT_MICRO))
+                    .text_color(if file.additions > 0 {
+                        theme::accent_green().into()
+                    } else {
+                        theme::text_muted()
+                    })
+                    .child(format!("+{}", file.additions)),
+            )
+            .child(
+                div()
+                    .w(px(34.0))
+                    .flex_none()
+                    .font_family("IBM Plex Mono")
+                    .text_size(px(theme::FONT_MICRO))
+                    .text_color(if file.deletions > 0 {
+                        theme::accent_red().into()
+                    } else {
+                        theme::text_muted()
+                    })
+                    .child(format!("-{}", file.deletions)),
+            )
+            .into_any_element()
+    }
+
+    /// The patch body with per-line add/remove coloring, mirroring the desktop
+    /// diff surface.
+    fn render_git_patch_body(&self, patch: &str) -> gpui::AnyElement {
+        div()
+            .mx_2()
+            .my_1()
+            .rounded(px(theme::RADIUS_CONTROL))
+            .border_1()
+            .border_color(theme::border_subtle())
+            .bg(theme::bg_card())
+            .p_2()
+            .flex()
+            .flex_col()
+            .children(patch.lines().take(2000).map(|line| {
+                let line = line.to_string();
+                let color = if line.starts_with('+') && !line.starts_with("+++") {
+                    theme::accent_green().into()
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    theme::accent_red().into()
+                } else {
+                    theme::text_muted()
+                };
+                div()
+                    .font_family("IBM Plex Mono")
+                    .text_size(px(theme::FONT_MICRO))
+                    .text_color(color)
+                    .whitespace_normal()
+                    .child(if line.is_empty() {
+                        " ".to_string()
+                    } else {
+                        line
+                    })
+            }))
             .into_any_element()
     }
 
@@ -2478,9 +2732,9 @@ impl MobileWorkbench {
             .children(diff.diff.lines().take(500).map(|line| {
                 let line = line.to_string();
                 let color = if line.starts_with('+') && !line.starts_with("+++") {
-                    rgb(theme::ACCENT_GREEN).into()
+                    theme::accent_green().into()
                 } else if line.starts_with('-') && !line.starts_with("---") {
-                    rgb(theme::ACCENT_RED).into()
+                    theme::accent_red().into()
                 } else {
                     theme::text_muted()
                 };
@@ -2520,7 +2774,7 @@ impl MobileWorkbench {
                         .p_2()
                         .rounded(px(theme::RADIUS_CONTROL))
                         .border_1()
-                        .border_color(rgb(theme::ACCENT_YELLOW))
+                        .border_color(theme::accent_yellow())
                         .flex()
                         .items_center()
                         .gap_2()
@@ -2660,7 +2914,7 @@ impl MobileWorkbench {
                             .relative()
                             .size(px(if selected { 9.0 } else { 7.0 }))
                             .rounded_full()
-                            .bg(rgb(theme::ACCENT_BLUE)),
+                            .bg(theme::accent_blue()),
                     ),
             )
             .child(
@@ -2693,10 +2947,10 @@ impl MobileWorkbench {
                                     .text_ellipsis()
                                     .whitespace_nowrap()
                                     .rounded(px(3.0))
-                                    .bg(rgb(theme::ACCENT_BLUE).opacity(0.18))
+                                    .bg(theme::accent_blue().opacity(0.18))
                                     .px_1()
                                     .text_size(px(theme::FONT_MICRO))
-                                    .text_color(rgb(theme::ACCENT_BLUE))
+                                    .text_color(theme::accent_blue())
                                     .child(reference)
                             })),
                     )
@@ -2723,17 +2977,19 @@ impl MobileWorkbench {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
-                    this.git.state.model.select_commit(hash.clone());
-                    cx.notify();
+                    this.open_git_commit(hash.clone(), cx);
                 }),
             )
             .into_any_element()
     }
 
+    /// Terminal surface: session chips, an auto-fitted cell grid rendered by
+    /// the shared TerminalRenderModel, a touch key bar, and the input row.
     fn render_terminal(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let view = self.terminal.state.view(ShellKind::Compact);
         let sessions = self.terminal.state.sessions.clone();
         let active = self.terminal.state.active_session.clone();
+        let session = self.terminal.state.active_session.clone();
         let can_create = self
             .terminal
             .capabilities
@@ -2742,19 +2998,11 @@ impl MobileWorkbench {
             .terminal
             .capabilities
             .supports(BackendOperation::TerminalInput);
-        let can_resize = self
-            .terminal
-            .capabilities
-            .supports(BackendOperation::TerminalResize);
         let can_close = self
             .terminal
             .capabilities
             .supports(BackendOperation::TerminalClose);
-        let output = self
-            .terminal_snapshot
-            .as_ref()
-            .map(terminal_output)
-            .unwrap_or_default();
+        let control_latched = self.terminal.state.control_latched;
 
         div()
             .size_full()
@@ -2763,13 +3011,71 @@ impl MobileWorkbench {
             .child(
                 div()
                     .flex_shrink_0()
-                    .p_3()
+                    .h(px(44.0))
+                    .px_2()
                     .border_b_1()
                     .border_color(theme::border_subtle())
                     .flex()
-                    .gap_2()
+                    .items_center()
+                    .gap_1()
                     .child(
-                        action_button("create-terminal", "New")
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .justify_center()
+                            .gap(px(1.0))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(px(theme::FONT_BODY))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::text_primary())
+                                    .child(
+                                        session
+                                            .as_ref()
+                                            .map(|session| session.title.clone())
+                                            .unwrap_or_else(|| {
+                                                locale::common("Terminal").to_string()
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .text_size(px(theme::FONT_MICRO))
+                                    .text_color(theme::text_muted())
+                                    .when_some(session.clone(), |row, session| {
+                                        row.child(
+                                            div()
+                                                .size(px(6.0))
+                                                .rounded_full()
+                                                .bg(terminal_status_color(session.status)),
+                                        )
+                                        .child(format!(
+                                            "{}  {}\u{d7}{}",
+                                            terminal_status_label(session.status),
+                                            session.cols,
+                                            session.rows
+                                        ))
+                                    })
+                                    .when(session.is_none(), |row| {
+                                        row.child(locale::text(
+                                            "No active session",
+                                            "没有活动会话",
+                                            "沒有活動會話",
+                                        ))
+                                    }),
+                            ),
+                    )
+                    .child(
+                        action_button("create-terminal", locale::common("New"))
                             .when(can_create, |button| {
                                 button.on_mouse_up(
                                     MouseButton::Left,
@@ -2778,15 +3084,9 @@ impl MobileWorkbench {
                             })
                             .when(!can_create, |button| button.opacity(0.55)),
                     )
-                    .when(active.is_some(), |bar| {
+                    .when_some(active.clone(), |bar, _| {
                         bar.child(
-                            action_button("refresh-terminal-output", "Refresh").on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(Self::refresh_terminal_snapshot),
-                            ),
-                        )
-                        .child(
-                            action_button("close-terminal", "Close")
+                            action_button("close-terminal", locale::common("Close"))
                                 .when(can_close, |button| {
                                     button.on_mouse_up(
                                         MouseButton::Left,
@@ -2797,6 +3097,73 @@ impl MobileWorkbench {
                         )
                     }),
             )
+            .when(sessions.len() > 1, |terminal| {
+                terminal.child(
+                    div()
+                        .id("mobile-terminal-sessions")
+                        .flex_shrink_0()
+                        .min_h(px(36.0))
+                        .overflow_x_scroll()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .py_1()
+                        .children(sessions.iter().map(|item| {
+                            let terminal_id = item.id.clone();
+                            let selected =
+                                active.as_ref().is_some_and(|active| active.id == item.id);
+                            div()
+                                .id(format!("terminal-chip:{}", item.id))
+                                .flex_shrink_0()
+                                .h(px(26.0))
+                                .rounded(px(theme::RADIUS_CONTROL))
+                                .border_1()
+                                .border_color(if selected {
+                                    theme::accent_blue()
+                                } else {
+                                    theme::border_default()
+                                })
+                                .bg(if selected {
+                                    theme::bg_card_dim()
+                                } else {
+                                    theme::bg_card()
+                                })
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .cursor_pointer()
+                                .active(|style| style.bg(theme::row_pressed_bg()))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.attach_terminal(terminal_id.clone(), cx)
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .size(px(6.0))
+                                        .rounded_full()
+                                        .bg(terminal_status_color(item.status)),
+                                )
+                                .child(
+                                    div()
+                                        .max_w(px(120.0))
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .text_size(px(theme::FONT_CAPTION))
+                                        .text_color(if selected {
+                                            theme::text_primary()
+                                        } else {
+                                            theme::text_secondary()
+                                        })
+                                        .child(item.title.clone()),
+                                )
+                        })),
+                )
+            })
             .when_some(self.terminal_close_confirmation.clone(), |terminal, _| {
                 terminal.child(
                     div()
@@ -2805,7 +3172,7 @@ impl MobileWorkbench {
                         .my_2()
                         .rounded(px(theme::RADIUS_CONTROL))
                         .border_1()
-                        .border_color(rgb(theme::ACCENT_YELLOW))
+                        .border_color(theme::accent_yellow())
                         .p_3()
                         .flex()
                         .flex_col()
@@ -2823,174 +3190,33 @@ impl MobileWorkbench {
                                 .justify_end()
                                 .gap_2()
                                 .child(
-                                    action_button("cancel-terminal-close", "Cancel").on_mouse_up(
+                                    action_button(
+                                        "cancel-terminal-close",
+                                        locale::common("Cancel"),
+                                    )
+                                    .on_mouse_up(
                                         MouseButton::Left,
                                         cx.listener(Self::cancel_close_terminal),
                                     ),
                                 )
                                 .child(
-                                    action_button("confirm-terminal-close", "Close terminal")
-                                        .when(can_close, |button| {
-                                            button.on_mouse_up(
-                                                MouseButton::Left,
-                                                cx.listener(Self::confirm_close_terminal),
-                                            )
-                                        })
-                                        .when(!can_close, |button| button.opacity(0.55)),
+                                    action_button(
+                                        "confirm-terminal-close",
+                                        locale::text("Close terminal", "关闭终端", "關閉終端機"),
+                                    )
+                                    .when(can_close, |button| {
+                                        button.on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(Self::confirm_close_terminal),
+                                        )
+                                    })
+                                    .when(!can_close, |button| button.opacity(0.55)),
                                 ),
                         ),
                 )
             })
-            .child(
-                div()
-                    .id("mobile-terminal-list-scroll")
-                    .flex_shrink_0()
-                    .max_h(px(132.0))
-                    .overflow_y_scroll()
-                    .children(sessions.into_iter().map(|session| {
-                        let terminal_id = session.id.clone();
-                        let selected = active
-                            .as_ref()
-                            .is_some_and(|active| active.id == session.id);
-                        div()
-                            .id(format!("terminal:{}", session.id))
-                            .min_h(px(theme::TOUCH_TARGET))
-                            .px_3()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .when(selected, |row| row.bg(theme::bg_card()))
-                            .cursor_pointer()
-                            .active(|style| style.bg(theme::row_pressed_bg()))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.attach_terminal(terminal_id.clone(), cx)
-                                }),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(theme::FONT_BODY))
-                                    .text_color(theme::text_secondary())
-                                    .child(session.title),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(theme::FONT_MICRO))
-                                    .text_color(theme::text_muted())
-                                    .child(format!(
-                                        "{:?}  {}x{}",
-                                        session.status, session.cols, session.rows
-                                    )),
-                            )
-                    })),
-            )
-            .when_some(active.clone(), |terminal, session| {
-                terminal.child(
-                    div()
-                        .flex_shrink_0()
-                        .min_h(px(theme::TOUCH_TARGET))
-                        .px_3()
-                        .border_t_1()
-                        .border_color(theme::border_subtle())
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_size(px(theme::FONT_CAPTION))
-                                .text_color(theme::text_muted())
-                                .child(format!("{} rows", session.rows)),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .gap_1()
-                                .child(
-                                    compact_action("terminal-rows-down", "-")
-                                        .when(can_resize, |button| {
-                                            button.on_mouse_up(
-                                                MouseButton::Left,
-                                                cx.listener(Self::resize_terminal_rows_down),
-                                            )
-                                        })
-                                        .when(!can_resize, |button| button.opacity(0.55)),
-                                )
-                                .child(
-                                    compact_action("terminal-rows-up", "+")
-                                        .when(can_resize, |button| {
-                                            button.on_mouse_up(
-                                                MouseButton::Left,
-                                                cx.listener(Self::resize_terminal_rows_up),
-                                            )
-                                        })
-                                        .when(!can_resize, |button| button.opacity(0.55)),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(theme::FONT_CAPTION))
-                                .text_color(theme::text_muted())
-                                .child(format!("{} cols", session.cols)),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .gap_1()
-                                .child(
-                                    compact_action("terminal-cols-down", "-")
-                                        .when(can_resize, |button| {
-                                            button.on_mouse_up(
-                                                MouseButton::Left,
-                                                cx.listener(Self::resize_terminal_cols_down),
-                                            )
-                                        })
-                                        .when(!can_resize, |button| button.opacity(0.55)),
-                                )
-                                .child(
-                                    compact_action("terminal-cols-up", "+")
-                                        .when(can_resize, |button| {
-                                            button.on_mouse_up(
-                                                MouseButton::Left,
-                                                cx.listener(Self::resize_terminal_cols_up),
-                                            )
-                                        })
-                                        .when(!can_resize, |button| button.opacity(0.55)),
-                                ),
-                        ),
-                )
-            })
-            .child(
-                div()
-                    .id("mobile-terminal-output-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .bg(rgb(0x080808))
-                    .overflow_y_scroll()
-                    .p_3()
-                    .font_family("IBM Plex Mono")
-                    .children(output.lines().map(|line| {
-                        div()
-                            .min_h(px(16.0))
-                            .text_size(px(theme::FONT_CAPTION))
-                            .text_color(theme::text_secondary())
-                            .whitespace_nowrap()
-                            .child(if line.is_empty() {
-                                " ".to_string()
-                            } else {
-                                line.to_string()
-                            })
-                    }))
-                    .when(output.is_empty(), |terminal| {
-                        terminal.child(empty_label(if active.is_some() {
-                            "No output yet"
-                        } else {
-                            "Select or create a terminal"
-                        }))
-                    }),
-            )
-            .when(active.is_some(), |terminal| {
+            .child(self.render_terminal_grid(cx))
+            .when_some(active.clone(), |terminal, _| {
                 terminal
                     .child(
                         div()
@@ -3002,21 +3228,50 @@ impl MobileWorkbench {
                             .flex()
                             .items_center()
                             .gap_1()
+                            .border_t_1()
+                            .border_color(theme::border_subtle())
                             .children(view.key_bar.into_iter().map(|action| {
                                 let key = action.key;
-                                compact_action(
-                                    format!("terminal-key:{:?}", action.key),
-                                    action.label,
-                                )
-                                .when(can_input, |button| {
-                                    button.on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.send_terminal_key(key, cx)
-                                        }),
-                                    )
-                                })
-                                .when(!can_input, |button| button.opacity(0.55))
+                                let latched = key == TerminalKey::Control && control_latched;
+                                div()
+                                    .id(format!("terminal-key:{:?}", key))
+                                    .flex_shrink_0()
+                                    .h(px(34.0))
+                                    .min_w(px(44.0))
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .border_1()
+                                    .border_color(if latched {
+                                        theme::accent_blue()
+                                    } else {
+                                        theme::border_default()
+                                    })
+                                    .bg(if latched {
+                                        theme::accent_blue().opacity(0.16)
+                                    } else {
+                                        theme::bg_card()
+                                    })
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(theme::FONT_CAPTION))
+                                    .text_color(if latched {
+                                        theme::accent_blue()
+                                    } else {
+                                        theme::text_secondary()
+                                    })
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .when(can_input, |chip| {
+                                        chip.on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.send_terminal_key(key, cx)
+                                            }),
+                                        )
+                                    })
+                                    .when(!can_input, |chip| chip.opacity(0.55))
+                                    .child(action.label)
                             })),
                     )
                     .child(
@@ -3029,7 +3284,7 @@ impl MobileWorkbench {
                             .gap_2()
                             .child(input_shell(self.terminal_input.clone()))
                             .child(
-                                action_button("send-terminal-input", "Send")
+                                action_button("send-terminal-input", locale::common("Send"))
                                     .when(can_input, |button| {
                                         button.on_mouse_up(
                                             MouseButton::Left,
@@ -3043,546 +3298,174 @@ impl MobileWorkbench {
             .into_any_element()
     }
 
-    fn render_providers(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let view = self.management.state.view(ShellKind::Compact);
-        let can_check_health = self
-            .management
-            .capabilities
-            .supports(BackendOperation::ManagementHealth)
-            && self
-                .backend
-                .permits_remote_action(vibex_core::RemoteActionClass::MutateProviderSettings);
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .p_3()
-                    .border_b_1()
-                    .border_color(theme::border_subtle())
-                    .flex()
-                    .justify_between()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_size(px(theme::FONT_CAPTION))
-                            .text_color(theme::text_muted())
-                            .child(format!("{:?}", view.load_state)),
-                    )
-                    .child(
-                        action_button(
-                            "provider-health-probes",
-                            if !can_check_health {
-                                "Read only"
-                            } else if self.busy {
-                                "Checking..."
-                            } else {
-                                "Check health"
-                            },
-                        )
-                        .when(!self.busy && can_check_health, |button| {
-                            button.on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(Self::run_health_probes),
-                            )
-                        })
-                        .when(!can_check_health, |button| button.opacity(0.55)),
-                    ),
-            )
-            .child(
-                div()
-                    .id("mobile-providers-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(section_heading("Agents"))
-                    .when(self.agent_summaries.is_empty(), |body| {
-                        body.child(empty_label("No Agent summaries published"))
-                    })
-                    .children(self.agent_summaries.iter().cloned().map(|agent| {
-                        div()
-                            .px_3()
-                            .py_3()
-                            .border_b_1()
-                            .border_color(theme::border_subtle())
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(
-                                        div()
-                                            .text_size(px(theme::FONT_BODY))
-                                            .text_color(theme::text_primary())
-                                            .child(agent.label),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(theme::FONT_MICRO))
-                                            .text_color(theme::text_muted())
-                                            .child(format!(
-                                                "{} models  {:?}",
-                                                agent.model_count, agent.config_status
-                                            )),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(theme::FONT_CAPTION))
-                                    .text_color(if agent.enabled {
-                                        agent_runtime_status_color(agent.runtime_status)
-                                    } else {
-                                        theme::text_muted()
-                                    })
-                                    .child(if agent.enabled {
-                                        format!("{:?}", agent.runtime_status)
-                                    } else {
-                                        "Disabled".to_string()
-                                    }),
-                            )
-                    }))
-                    .child(section_heading("Provider profiles"))
-                    .when(view.profiles.is_empty(), |body| {
-                        body.child(empty_label("No provider profiles published"))
-                    })
-                    .children(view.profiles.into_iter().map(|profile| {
-                        div()
-                            .px_3()
-                            .py_3()
-                            .border_b_1()
-                            .border_color(theme::border_subtle())
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .flex()
-                                    .justify_between()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_size(px(theme::FONT_BODY))
-                                            .text_color(theme::text_primary())
-                                            .child(profile.display_name),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(theme::FONT_MICRO))
-                                            .text_color(theme::text_muted())
-                                            .child(format!("{:?}", profile.status)),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(theme::FONT_CAPTION))
-                                    .text_color(theme::text_muted())
-                                    .child(format!(
-                                        "{:?}  {} models  secret {:?}",
-                                        profile.kind,
-                                        profile.configured_model_count,
-                                        profile.secret_setup_state
-                                    )),
-                            )
-                    }))
-                    .child(section_heading("Health"))
-                    .when(view.health.is_empty(), |body| {
-                        body.child(empty_label("No health results yet"))
-                    })
-                    .children(view.health.into_iter().map(|health| {
-                        div()
-                            .min_h(px(theme::TOUCH_TARGET))
-                            .px_3()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .border_b_1()
-                            .border_color(theme::border_subtle())
-                            .child(
-                                div()
-                                    .text_size(px(theme::FONT_BODY))
-                                    .text_color(theme::text_secondary())
-                                    .child(health.display_name),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(theme::FONT_CAPTION))
-                                    .text_color(provider_health_color(health.status))
-                                    .child(format!("{:?}", health.status)),
-                            )
-                    }))
-                    .child(section_heading("Runtime probes"))
-                    .when(view.runtime_probes.is_empty(), |body| {
-                        body.child(empty_label("No runtime probes recorded"))
-                    })
-                    .children(view.runtime_probes.into_iter().take(20).map(|probe| {
-                        div()
-                            .px_3()
-                            .py_2()
-                            .border_b_1()
-                            .border_color(theme::border_subtle())
-                            .flex()
-                            .justify_between()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_size(px(theme::FONT_CAPTION))
-                                    .text_color(theme::text_secondary())
-                                    .child(format!("{} / {}", probe.agent_id, probe.adapter_id)),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(theme::FONT_MICRO))
-                                    .text_color(theme::text_muted())
-                                    .child(format!("{:?}", probe.status)),
-                            )
-                    })),
-            )
-            .into_any_element()
-    }
-
-    fn render_runtime(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let catalog = self.runtime_catalog.clone();
-        let draft = self.runtime_draft.clone();
-        let can_switch_runtime = self
-            .backend
-            .capability_snapshot()
-            .agent
-            .supports(BackendOperation::AgentSwitchRuntime);
-        let selected_option = catalog.as_ref().and_then(|catalog| {
-            draft
-                .as_ref()
-                .and_then(|draft| matching_runtime_option(&catalog.options, draft))
-                .cloned()
-        });
-        let selected_reasoning = draft
+    /// The cell grid. The surface reports its bounds on paint so the PTY is
+    /// auto-fitted to fill the screen, and the shared render model frame is
+    /// rendered cell-by-cell with the desktop palette and cursor treatment.
+    fn render_terminal_grid(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let weak_entity = cx.weak_entity();
+        let frame = self
+            .terminal
+            .state
+            .render
             .as_ref()
-            .and_then(|draft| draft.reasoning_effort.clone());
-        let selected_mode = draft.as_ref().and_then(|draft| draft.mode_id.clone());
-        let can_apply = can_switch_runtime
-            && catalog.as_ref().is_some_and(|catalog| {
-                draft
-                    .as_ref()
-                    .is_some_and(|draft| runtime_selection_is_available(&catalog.options, draft))
-            });
+            .map(|render| render.frame.clone());
+        let has_session = self.terminal.state.active_session.is_some();
+        let has_frame = frame.is_some();
         div()
-            .size_full()
-            .flex()
-            .flex_col()
+            .id("mobile-terminal-surface")
+            .flex_1()
+            .min_h_0()
+            .relative()
+            .overflow_hidden()
+            .bg(theme::workbench_bg())
+            .on_scroll_wheel(cx.listener(Self::scroll_terminal))
             .child(
-                div()
-                    .flex_shrink_0()
-                    .px_3()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(theme::border_subtle())
-                    .text_size(px(theme::FONT_CAPTION))
-                    .text_color(theme::text_muted())
-                    .child(
-                        self.runtime_state
-                            .as_ref()
-                            .map(|state| format!("{:?}", state.status))
-                            .unwrap_or_else(|| {
-                                locale::common("Select an Agent session first").to_string()
-                            }),
-                    ),
-            )
-            .child(
-                div()
-                    .id("mobile-runtime-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(section_heading("Agent / provider / model"))
-                    .when(catalog.is_none(), |body| {
-                        body.child(empty_label("Runtime catalog unavailable"))
-                    })
-                    .children(
-                        catalog
-                            .as_ref()
-                            .into_iter()
-                            .flat_map(|catalog| catalog.options.iter().cloned())
-                            .map(|option| {
-                                let selection = option.selection.clone();
-                                let available =
-                                    option.availability == RuntimeOptionAvailability::Available;
-                                let selected = draft
-                                    .as_ref()
-                                    .is_some_and(|draft| runtime_option_matches(&option, draft));
-                                div()
-                                    .id(format!(
-                                        "runtime-option:{}:{}:{}",
-                                        option.selection.agent_id,
-                                        option.auth_source_label,
-                                        option.model_label
-                                    ))
-                                    .mx_3()
-                                    .mb_2()
-                                    .min_h(px(58.0))
-                                    .rounded(px(theme::RADIUS_CONTROL))
-                                    .border_1()
-                                    .border_color(if selected {
-                                        rgb(theme::ACCENT_BLUE).into()
-                                    } else {
-                                        theme::border_default()
-                                    })
-                                    .px_3()
-                                    .py_2()
-                                    .flex()
-                                    .flex_col()
-                                    .justify_center()
-                                    .when(available, |row| {
-                                        row.cursor_pointer()
-                                            .active(|style| style.bg(theme::row_pressed_bg()))
-                                            .on_mouse_up(
-                                                MouseButton::Left,
-                                                cx.listener(move |this, _, _, cx| {
-                                                    this.choose_runtime_option(
-                                                        selection.clone(),
-                                                        cx,
-                                                    )
-                                                }),
-                                            )
-                                    })
-                                    .child(
-                                        div()
-                                            .text_size(px(theme::FONT_BODY))
-                                            .text_color(if selected {
-                                                theme::text_primary()
-                                            } else {
-                                                theme::text_secondary()
-                                            })
-                                            .child(format!(
-                                                "{} / {}",
-                                                option.agent_label, option.model_label
-                                            )),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(theme::FONT_MICRO))
-                                            .text_color(
-                                                if option.availability
-                                                    == RuntimeOptionAvailability::Available
-                                                {
-                                                    theme::text_muted()
-                                                } else {
-                                                    rgb(theme::ACCENT_YELLOW).into()
-                                                },
-                                            )
-                                            .child(format!(
-                                                "{}  {:?}",
-                                                option.auth_source_label, option.availability
-                                            )),
-                                    )
-                                    .into_any_element()
-                            }),
-                    )
-                    .when_some(selected_option, |body, option| {
-                        body.child(section_heading("Reasoning"))
-                            .child(
-                                div()
-                                    .px_3()
-                                    .flex()
-                                    .flex_wrap()
-                                    .gap_2()
-                                    .child(
-                                        choice_button(
-                                            "runtime-reasoning:default",
-                                            "Default",
-                                            selected_reasoning.is_none(),
-                                        )
-                                        .on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| {
-                                                this.choose_runtime_reasoning(None, cx)
-                                            }),
-                                        ),
-                                    )
-                                    .children(option.reasoning_efforts.into_iter().map(|value| {
-                                        let id = value.value.clone();
-                                        let label = value.label.unwrap_or_else(|| id.clone());
-                                        choice_button(
-                                            format!("runtime-reasoning:{id}"),
-                                            label,
-                                            selected_reasoning.as_deref() == Some(id.as_str()),
-                                        )
-                                        .on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.choose_runtime_reasoning(Some(id.clone()), cx)
-                                            }),
-                                        )
-                                    })),
-                            )
-                            .child(section_heading("Mode"))
-                            .child(
-                                div()
-                                    .px_3()
-                                    .flex()
-                                    .flex_wrap()
-                                    .gap_2()
-                                    .child(
-                                        choice_button(
-                                            "runtime-mode:default",
-                                            "Default",
-                                            selected_mode.is_none(),
-                                        )
-                                        .on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| {
-                                                this.choose_runtime_mode(None, cx)
-                                            }),
-                                        ),
-                                    )
-                                    .children(option.modes.into_iter().map(|value| {
-                                        let id = value.value.clone();
-                                        let label = value.label.unwrap_or_else(|| id.clone());
-                                        choice_button(
-                                            format!("runtime-mode:{id}"),
-                                            label,
-                                            selected_mode.as_deref() == Some(id.as_str()),
-                                        )
-                                        .on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.choose_runtime_mode(Some(id.clone()), cx)
-                                            }),
-                                        )
-                                    })),
-                            )
-                            .when(!option.features.is_empty(), |body| {
-                                body.child(section_heading("Session options")).children(
-                                    option
-                                        .features
-                                        .into_iter()
-                                        .map(|feature| self.render_runtime_feature(feature, cx)),
-                                )
-                            })
-                    }),
-            )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .p_3()
-                    .border_t_1()
-                    .border_color(theme::border_subtle())
-                    .flex()
-                    .justify_end()
-                    .child(
-                        action_button(
-                            "apply-runtime-selection",
-                            if !can_switch_runtime {
-                                "Read only"
-                            } else if self.busy {
-                                "Applying..."
-                            } else {
-                                "Apply runtime"
-                            },
-                        )
-                        .when(!self.busy && can_apply, |button| {
-                            button.on_mouse_up(MouseButton::Left, cx.listener(Self::apply_runtime))
-                        })
-                        .when(!can_switch_runtime, |button| button.opacity(0.55)),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn render_runtime_feature(
-        &self,
-        feature: SessionRuntimeFeature,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let feature_id = feature.id.clone();
-        let selected_value = self
-            .runtime_draft
-            .as_ref()
-            .and_then(|draft| draft.config_values.get(&feature_id))
-            .cloned();
-        let values = match feature.kind {
-            SessionRuntimeFeatureKind::Toggle => vec![
-                (locale::common("Default").to_string(), None),
-                (locale::common("On").to_string(), Some("true".to_string())),
-                (locale::common("Off").to_string(), Some("false".to_string())),
-            ],
-            SessionRuntimeFeatureKind::Select => {
-                std::iter::once((locale::common("Default").to_string(), None))
-                    .chain(feature.values.iter().map(|value| {
-                        (
-                            value.label.clone().unwrap_or_else(|| value.value.clone()),
-                            Some(value.value.clone()),
-                        )
-                    }))
-                    .collect()
-            }
-            SessionRuntimeFeatureKind::String => Vec::new(),
-        };
-        let row = div().px_3().pb_3().flex().flex_col().gap_2().child(
-            div()
-                .text_size(px(theme::FONT_CAPTION))
-                .text_color(theme::text_secondary())
-                .child(feature.label.clone()),
-        );
-        if feature.kind == SessionRuntimeFeatureKind::String {
-            return match self.runtime_feature_inputs.get(&feature_id) {
-                Some(input) => row.child(input_shell(input.clone())).into_any_element(),
-                None => row
-                    .child(
-                        div()
-                            .text_size(px(theme::FONT_MICRO))
-                            .text_color(theme::text_muted())
-                            .child(locale::common("Loading value...")),
-                    )
-                    .into_any_element(),
-            };
-        }
-        if values.is_empty() {
-            return row
-                .child(
-                    div()
-                        .text_size(px(theme::FONT_MICRO))
-                        .text_color(theme::text_muted())
-                        .child(
-                            feature
-                                .current_value
-                                .or(feature.default_value)
-                                .map(|value| value.value)
-                                .unwrap_or_else(|| {
-                                    locale::common("Configured by Agent").to_string()
-                                }),
-                        ),
+                canvas(
+                    move |bounds, _, cx| {
+                        let width = f32::from(bounds.size.width);
+                        let height = f32::from(bounds.size.height);
+                        let _ = weak_entity
+                            .update(cx, |this, cx| this.fit_terminal_to(width, height, cx));
+                    },
+                    |_, _, _, _| {},
                 )
+                .absolute()
+                .size_full(),
+            )
+            .when_some(frame, |surface, frame| {
+                let rows = frame.rows;
+                let columns = frame.columns;
+                let cursor = frame.cursor;
+                let mut cells = vec![None; usize::from(rows).saturating_mul(usize::from(columns))];
+                for cell in frame.cells {
+                    let index = usize::from(cell.row)
+                        .saturating_mul(usize::from(columns))
+                        .saturating_add(usize::from(cell.column));
+                    if let Some(slot) = cells.get_mut(index) {
+                        *slot = Some(cell);
+                    }
+                }
+                surface.child(
+                    div()
+                        .id("mobile-terminal-grid")
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .flex_col()
+                        .justify_end()
+                        .pt(px(TERMINAL_VERTICAL_PADDING))
+                        .pb(px(TERMINAL_VERTICAL_PADDING))
+                        .font_family("IBM Plex Mono")
+                        .text_size(px(TERMINAL_FONT_SIZE))
+                        .line_height(px(TERMINAL_CELL_HEIGHT))
+                        .children((0..rows).map(|row| {
+                            div()
+                                .h(px(TERMINAL_CELL_HEIGHT))
+                                .flex_none()
+                                .flex()
+                                .overflow_hidden()
+                                .children((0..columns).map(|column| {
+                                    let index = usize::from(row)
+                                        .saturating_mul(usize::from(columns))
+                                        .saturating_add(usize::from(column));
+                                    self.render_terminal_cell(
+                                        TerminalGridPoint { row, column },
+                                        cells.get(index).cloned().flatten(),
+                                        cursor,
+                                    )
+                                }))
+                        })),
+                )
+            })
+            .when(has_frame == false, |surface| {
+                surface.child(empty_label(if has_session {
+                    "No output yet"
+                } else {
+                    "Select or create a terminal"
+                }))
+            })
+            .into_any_element()
+    }
+
+    /// One terminal cell, using the desktop palette: indexed/RGB colors, wide
+    /// glyph spacing, attribute styling, and the host cursor shape.
+    fn render_terminal_cell(
+        &self,
+        point: TerminalGridPoint,
+        cell: Option<TerminalCellSnapshot>,
+        cursor: Option<vibex_terminal_ui::TerminalCursorSnapshot>,
+    ) -> gpui::AnyElement {
+        let cell = cell.unwrap_or_else(|| empty_terminal_cell(point));
+        if cell.wide_spacer {
+            return div()
+                .w_0()
+                .h(px(TERMINAL_CELL_HEIGHT))
+                .flex_none()
                 .into_any_element();
         }
-
-        row.child(
-            div()
-                .flex()
-                .flex_wrap()
-                .gap_2()
-                .children(values.into_iter().map(|(label, value)| {
-                    let id = feature_id.clone();
-                    let value_id = value.as_deref().unwrap_or("default").to_string();
-                    choice_button(
-                        format!("runtime-feature:{id}:{value_id}"),
-                        label,
-                        selected_value.as_deref() == value.as_deref(),
-                    )
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            this.choose_runtime_feature(id.clone(), value.clone(), cx)
-                        }),
-                    )
-                })),
-        )
-        .into_any_element()
+        let at_cursor = cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.row == point.row && cursor.column == point.column);
+        let default_foreground = theme::text_primary();
+        let default_background = theme::workbench_bg();
+        let mut foreground = terminal_cell_color(
+            cell.foreground,
+            default_foreground,
+            default_background,
+            default_foreground,
+        );
+        let mut background = terminal_cell_color(
+            cell.background,
+            default_foreground,
+            default_background,
+            default_background,
+        );
+        if cell.dim {
+            foreground = foreground.opacity(0.68);
+        }
+        if at_cursor && cursor.is_some_and(|cursor| cursor.shape == TerminalCursorShape::Block) {
+            background = default_foreground;
+            foreground = default_background;
+        }
+        div()
+            .w(px(if cell.wide {
+                TERMINAL_CELL_WIDTH * 2.0
+            } else {
+                TERMINAL_CELL_WIDTH
+            }))
+            .h(px(TERMINAL_CELL_HEIGHT))
+            .flex_none()
+            .overflow_hidden()
+            .bg(background)
+            .text_color(foreground)
+            .when(cell.bold, |cell| cell.font_weight(FontWeight::BOLD))
+            .when(cell.italic, |cell| cell.italic())
+            .when(cell.underline || cell.hyperlink.is_some(), |cell| {
+                cell.underline()
+            })
+            .when(cell.strikeout, |cell| cell.line_through())
+            .when(cell.hidden, |cell| cell.invisible())
+            .when(
+                at_cursor && cursor.is_some_and(|cursor| cursor.shape == TerminalCursorShape::Beam),
+                |cell| cell.border_l_1().border_color(default_foreground),
+            )
+            .when(
+                at_cursor
+                    && cursor.is_some_and(|cursor| cursor.shape == TerminalCursorShape::Underline),
+                |cell| cell.border_b_1().border_color(default_foreground),
+            )
+            .when(
+                at_cursor
+                    && cursor
+                        .is_some_and(|cursor| cursor.shape == TerminalCursorShape::HollowBlock),
+                |cell| cell.border_1().border_color(default_foreground),
+            )
+            .child(if cell.text.is_empty() {
+                " ".to_string()
+            } else {
+                cell.text.clone()
+            })
+            .into_any_element()
     }
 }
 
@@ -3617,7 +3500,7 @@ impl Render for MobileWorkbench {
                             .justify_center()
                             .border_b_1()
                             .border_color(if candidate == surface {
-                                rgb(theme::ACCENT_BLUE).into()
+                                theme::accent_blue().into()
                             } else {
                                 theme::sidebar_bg()
                             })
@@ -3644,7 +3527,7 @@ impl Render for MobileWorkbench {
                         .py_2()
                         .bg(theme::bg_card_dim())
                         .text_size(px(theme::FONT_CAPTION))
-                        .text_color(rgb(theme::ACCENT_GREEN))
+                        .text_color(theme::accent_green())
                         .child(notice),
                 )
             })
@@ -3656,7 +3539,7 @@ impl Render for MobileWorkbench {
                         .py_2()
                         .bg(theme::bg_card_dim())
                         .text_size(px(theme::FONT_CAPTION))
-                        .text_color(rgb(theme::ACCENT_RED))
+                        .text_color(theme::accent_red())
                         .child(error.message),
                 )
             })
@@ -3664,8 +3547,6 @@ impl Render for MobileWorkbench {
                 WorkbenchSurface::Files => self.render_files(cx),
                 WorkbenchSurface::Git => self.render_git(cx),
                 WorkbenchSurface::Terminal => self.render_terminal(cx),
-                WorkbenchSurface::Providers => self.render_providers(cx),
-                WorkbenchSurface::Runtime => self.render_runtime(cx),
             }))
             .child(
                 div()
@@ -3744,7 +3625,7 @@ fn git_mode_tab(
         .justify_center()
         .border_b_2()
         .border_color(if selected {
-            rgb(theme::TEXT_PRIMARY).into()
+            theme::text_primary().into()
         } else {
             theme::workbench_bg()
         })
@@ -3834,17 +3715,17 @@ fn mobile_file_icon_color(kind: FileIconKind, ignored: bool) -> gpui::Hsla {
         | FileIconKind::TypeScript
         | FileIconKind::Markdown
         | FileIconKind::Image
-        | FileIconKind::Svg => rgb(theme::ACCENT_BLUE).into(),
-        FileIconKind::JavaScript | FileIconKind::Script => rgb(theme::ACCENT_YELLOW).into(),
-        FileIconKind::Json => rgb(theme::ACCENT_PURPLE).into(),
+        | FileIconKind::Svg => theme::accent_blue().into(),
+        FileIconKind::JavaScript | FileIconKind::Script => theme::accent_yellow().into(),
+        FileIconKind::Json => theme::accent_purple().into(),
         FileIconKind::Archive | FileIconKind::Config => rgb(0xf0a050).into(),
-        FileIconKind::Database | FileIconKind::Spreadsheet => rgb(theme::ACCENT_GREEN).into(),
+        FileIconKind::Database | FileIconKind::Spreadsheet => theme::accent_green().into(),
         FileIconKind::Style => rgb(0x5ed2d9).into(),
         FileIconKind::Markup => rgb(0xf0a050).into(),
         FileIconKind::Audio => rgb(0xd08ad8).into(),
         FileIconKind::Video => rgb(0xf08fc4).into(),
         FileIconKind::Symlink => rgb(0xb091f2).into(),
-        FileIconKind::Lock | FileIconKind::Secret => rgb(theme::ACCENT_YELLOW).into(),
+        FileIconKind::Lock | FileIconKind::Secret => theme::accent_yellow().into(),
         FileIconKind::Font => rgb(0xd08ad8).into(),
         FileIconKind::Pdf
         | FileIconKind::Office
@@ -3860,29 +3741,34 @@ fn file_tree_row_text_color(row: &vibex_desktop_model::FileExplorerRow) -> gpui:
         return theme::text_muted();
     }
     match row.git.map(|git| git.signal) {
-        Some(FileGitSignal::Added) => rgb(theme::ACCENT_GREEN).into(),
-        Some(FileGitSignal::Untracked) => rgb(theme::ACCENT_YELLOW).into(),
+        Some(FileGitSignal::Added) => theme::accent_green().into(),
+        Some(FileGitSignal::Untracked) => theme::accent_yellow().into(),
         Some(FileGitSignal::Ignored) => theme::text_muted(),
-        Some(_) => rgb(theme::ACCENT_BLUE).into(),
+        Some(_) => theme::accent_blue().into(),
         None => theme::text_primary(),
     }
 }
 
 fn file_git_signal_color(signal: FileGitSignal) -> gpui::Hsla {
     match signal {
-        FileGitSignal::Added => rgb(theme::ACCENT_GREEN).into(),
-        FileGitSignal::Untracked => rgb(theme::ACCENT_YELLOW).into(),
+        FileGitSignal::Added => theme::accent_green().into(),
+        FileGitSignal::Untracked => theme::accent_yellow().into(),
         FileGitSignal::Modified
         | FileGitSignal::Deleted
         | FileGitSignal::Renamed
         | FileGitSignal::Copied
-        | FileGitSignal::Conflicted => rgb(theme::ACCENT_BLUE).into(),
+        | FileGitSignal::Conflicted => theme::accent_blue().into(),
         FileGitSignal::Ignored => theme::text_muted(),
     }
 }
 
+/// Same geometry and tones as the desktop `git_selection_indicator`.
 fn git_selection_indicator_mobile(state: GitPathSelectionState) -> gpui::AnyElement {
     let selected = state != GitPathSelectionState::Unchecked;
+    let mut selected_border = theme::accent_foreground();
+    selected_border.a = 0.18;
+    let mut marker_color = theme::accent_foreground();
+    marker_color.a = 0.72;
     div()
         .size(px(14.0))
         .flex_none()
@@ -3892,26 +3778,35 @@ fn git_selection_indicator_mobile(state: GitPathSelectionState) -> gpui::AnyElem
         .rounded(px(3.0))
         .border_1()
         .border_color(if selected {
-            rgb(theme::ACCENT_BLUE).into()
+            selected_border.into()
         } else {
-            theme::border_default()
+            theme::border_input()
         })
         .bg(if selected {
-            rgb(theme::ACCENT_BLUE).into()
+            theme::accent().into()
         } else {
             theme::workbench_bg()
         })
-        .text_color(theme::text_primary())
+        .text_color(marker_color)
         .when(state == GitPathSelectionState::Checked, |item| {
             item.child(
                 svg()
-                    .path("icons/x.svg")
+                    .path("icons/check.svg")
                     .size(px(10.0))
-                    .text_color(theme::text_primary()),
+                    .relative()
+                    .left(px(0.5))
+                    .top(px(0.5)),
             )
         })
         .when(state == GitPathSelectionState::Indeterminate, |item| {
-            item.child(div().w(px(7.0)).h(px(1.0)).bg(theme::text_primary()))
+            item.child(
+                svg()
+                    .path("icons/minus.svg")
+                    .size(px(10.0))
+                    .relative()
+                    .left(px(0.5))
+                    .top(px(0.5)),
+            )
         })
         .into_any_element()
 }
@@ -3923,15 +3818,15 @@ fn file_icon_kind_for_path(path: &str) -> FileIconKind {
 fn git_change_text_color_mobile(change: &GitChange) -> gpui::Hsla {
     match change.kind {
         GitChangeKind::Deleted => theme::text_muted(),
-        GitChangeKind::Untracked => rgb(theme::ACCENT_YELLOW).into(),
-        GitChangeKind::Added if !change.staged => rgb(theme::ACCENT_YELLOW).into(),
-        GitChangeKind::Added => rgb(theme::ACCENT_GREEN).into(),
+        GitChangeKind::Untracked => theme::status_untracked(),
+        GitChangeKind::Added if !change.staged => theme::status_untracked(),
+        GitChangeKind::Added => theme::status_added(),
         GitChangeKind::Modified
         | GitChangeKind::Renamed
         | GitChangeKind::Copied
         | GitChangeKind::TypeChanged
         | GitChangeKind::Unmerged
-        | GitChangeKind::Unknown => rgb(theme::ACCENT_BLUE).into(),
+        | GitChangeKind::Unknown => theme::status_modified(),
     }
 }
 
@@ -4014,7 +3909,7 @@ fn choice_button(
 ) -> gpui::Stateful<gpui::Div> {
     compact_action(id, label).when(selected, |button| {
         button
-            .border_color(rgb(theme::ACCENT_BLUE))
+            .border_color(theme::accent_blue())
             .bg(theme::bg_card())
             .text_color(theme::text_primary())
     })
@@ -4056,91 +3951,135 @@ fn file_status_label(status: FileEditorStatus) -> &'static str {
 
 fn file_status_color(status: FileEditorStatus) -> gpui::Hsla {
     match status {
-        FileEditorStatus::Conflict | FileEditorStatus::Disconnected => {
-            rgb(theme::ACCENT_RED).into()
-        }
-        FileEditorStatus::Dirty | FileEditorStatus::Saving => rgb(theme::ACCENT_YELLOW).into(),
-        FileEditorStatus::Saved => rgb(theme::ACCENT_GREEN).into(),
+        FileEditorStatus::Conflict | FileEditorStatus::Disconnected => theme::accent_red().into(),
+        FileEditorStatus::Dirty | FileEditorStatus::Saving => theme::accent_yellow().into(),
+        FileEditorStatus::Saved => theme::accent_green().into(),
         _ => theme::text_muted(),
     }
 }
 
-fn provider_health_color(status: vibex_core::ProviderHealthStatus) -> gpui::Hsla {
-    use vibex_core::ProviderHealthStatus;
-    match status {
-        ProviderHealthStatus::Pass => rgb(theme::ACCENT_GREEN).into(),
-        ProviderHealthStatus::Warn
-        | ProviderHealthStatus::Unknown
-        | ProviderHealthStatus::Skipped
-        | ProviderHealthStatus::Unsupported => rgb(theme::ACCENT_YELLOW).into(),
-        ProviderHealthStatus::Fail => rgb(theme::ACCENT_RED).into(),
-    }
-}
-
-fn agent_runtime_status_color(status: vibex_core::AgentRuntimeStatus) -> gpui::Hsla {
-    use vibex_core::AgentRuntimeStatus;
-    match status {
-        AgentRuntimeStatus::Ready => rgb(theme::ACCENT_GREEN).into(),
-        AgentRuntimeStatus::Unknown => rgb(theme::ACCENT_YELLOW).into(),
-        AgentRuntimeStatus::Unavailable
-        | AgentRuntimeStatus::Disabled
-        | AgentRuntimeStatus::ProbeFailed => rgb(theme::ACCENT_RED).into(),
-    }
-}
-
-fn terminal_output(snapshot: &TerminalSnapshot) -> String {
-    let mut output = snapshot
+/// Feeds one polled snapshot into the render model. Chunks already applied
+/// are skipped by sequence; a dims change, a sequence rewind (terminal
+/// reattached), or a gap (retained ring evicted past the next expected chunk)
+/// rebuilds the emulator from the retained window, mirroring the desktop
+/// raw-buffer rebuild rules. Returns true when any bytes were applied.
+fn terminal_feed_snapshot(
+    render: &mut vibex_ui::TerminalRenderModel,
+    applied_next_sequence: &mut i64,
+    snapshot: &TerminalSnapshot,
+) -> bool {
+    let dims_changed =
+        render.frame.rows != snapshot.session.rows || render.frame.columns != snapshot.session.cols;
+    let rewound = snapshot.next_sequence < *applied_next_sequence;
+    let gap = snapshot
         .chunks
-        .iter()
-        .map(|chunk| chunk.data.as_str())
-        .collect::<String>();
-    if output.len() > TERMINAL_OUTPUT_LIMIT {
-        let mut start = output.len() - TERMINAL_OUTPUT_LIMIT;
-        while !output.is_char_boundary(start) {
-            start += 1;
+        .first()
+        .is_some_and(|chunk| chunk.sequence > *applied_next_sequence);
+    let applied_any = *applied_next_sequence > 0;
+    if dims_changed || rewound || gap || !applied_any {
+        render.reset(snapshot.session.rows, snapshot.session.cols);
+        *applied_next_sequence = 0;
+    }
+    let mut applied = false;
+    for chunk in &snapshot.chunks {
+        if chunk.sequence < *applied_next_sequence {
+            continue;
         }
-        output = output[start..].to_string();
+        render.apply(chunk.data.as_bytes());
+        *applied_next_sequence = chunk.sequence + 1;
+        applied = true;
     }
-    output
+    applied
 }
 
-fn runtime_string_override(value: String) -> BackendResult<Option<String>> {
-    if value.trim().is_empty() {
-        return Ok(None);
+/// Status colors follow the desktop right-rail treatment: green for live
+/// sessions, red for ended ones, yellow for a stale host connection.
+fn terminal_status_color(status: TerminalStatus) -> gpui::Hsla {
+    match status {
+        TerminalStatus::Running => theme::accent_green().into(),
+        TerminalStatus::Exited | TerminalStatus::Killed => theme::accent_red().into(),
+        TerminalStatus::Stale => theme::accent_yellow().into(),
     }
-    if value.len() > RUNTIME_FEATURE_VALUE_LIMIT {
-        return Err(BackendError::failed(
-            "mobile_runtime_feature_value_too_long",
-            "runtime option values must be at most 256 bytes",
-        ));
+}
+
+fn terminal_status_label(status: TerminalStatus) -> &'static str {
+    locale::common(match status {
+        TerminalStatus::Running => "running",
+        TerminalStatus::Exited => "exited",
+        TerminalStatus::Killed => "killed",
+        TerminalStatus::Stale => "stale",
+    })
+}
+
+/// The blank cell used wherever the host frame has no explicit cell, matching
+/// the desktop surface defaults (default foreground on default background).
+fn empty_terminal_cell(point: TerminalGridPoint) -> TerminalCellSnapshot {
+    TerminalCellSnapshot {
+        row: point.row,
+        column: point.column,
+        text: " ".into(),
+        foreground: TerminalCellColor::Named { index: 256 },
+        background: TerminalCellColor::Named { index: 257 },
+        bold: false,
+        dim: false,
+        italic: false,
+        underline: false,
+        inverse: false,
+        hidden: false,
+        strikeout: false,
+        wide: false,
+        wide_spacer: false,
+        selected: false,
+        hyperlink: None,
     }
-    Ok(Some(value))
 }
 
-fn runtime_option_matches(
-    option: &SessionRuntimeOption,
-    selection: &SessionRuntimeSelection,
-) -> bool {
-    option.selection.agent_id == selection.agent_id
-        && option.selection.auth_source == selection.auth_source
-        && option.selection.model == selection.model
+/// Resolves a terminal cell color against the current theme, mirroring the
+/// desktop `terminal_color` mapping (RGB passthrough, 256-color palette, and
+/// the emulator's named defaults).
+fn terminal_cell_color(
+    color: TerminalCellColor,
+    default_foreground: gpui::Hsla,
+    default_background: gpui::Hsla,
+    fallback: gpui::Hsla,
+) -> gpui::Hsla {
+    match color {
+        TerminalCellColor::Rgb { red, green, blue } => {
+            rgb((u32::from(red) << 16) | (u32::from(green) << 8) | u32::from(blue)).into()
+        }
+        TerminalCellColor::Indexed { index } => indexed_terminal_color(index),
+        TerminalCellColor::Named { index } if index < 16 => indexed_terminal_color(index as u8),
+        TerminalCellColor::Named { index: 256 } => default_foreground,
+        TerminalCellColor::Named { index: 257 } => default_background,
+        TerminalCellColor::Named { index: 258 } => default_foreground,
+        TerminalCellColor::Named { index } if (259..=266).contains(&index) => {
+            indexed_terminal_color((index - 259) as u8).opacity(0.68)
+        }
+        TerminalCellColor::Named { index: 267 } => default_foreground,
+        TerminalCellColor::Named { index: 268 } => default_foreground.opacity(0.68),
+        TerminalCellColor::Named { .. } => fallback,
+    }
 }
 
-fn matching_runtime_option<'a>(
-    options: &'a [SessionRuntimeOption],
-    selection: &SessionRuntimeSelection,
-) -> Option<&'a SessionRuntimeOption> {
-    options
-        .iter()
-        .find(|option| runtime_option_matches(option, selection))
-}
-
-fn runtime_selection_is_available(
-    options: &[SessionRuntimeOption],
-    selection: &SessionRuntimeSelection,
-) -> bool {
-    matching_runtime_option(options, selection)
-        .is_some_and(|option| option.availability == RuntimeOptionAvailability::Available)
+fn indexed_terminal_color(index: u8) -> gpui::Hsla {
+    const ANSI: [u32; 16] = [
+        0x2e3436, 0xcc0000, 0x4e9a06, 0xc4a000, 0x3465a4, 0x75507b, 0x06989a, 0xd3d7cf, 0x555753,
+        0xef2929, 0x8ae234, 0xfce94f, 0x729fcf, 0xad7fa8, 0x34e2e2, 0xeeeeec,
+    ];
+    let value = if index < 16 {
+        ANSI[usize::from(index)]
+    } else if index < 232 {
+        let offset = index - 16;
+        let levels = [0u32, 95, 135, 175, 215, 255];
+        let red = levels[usize::from(offset / 36)];
+        let green = levels[usize::from((offset % 36) / 6)];
+        let blue = levels[usize::from(offset % 6)];
+        (red << 16) | (green << 8) | blue
+    } else {
+        let gray = 8 + u32::from(index - 232) * 10;
+        (gray << 16) | (gray << 8) | gray
+    };
+    rgb(value).into()
 }
 
 fn flatten_join<T>(outcome: Result<BackendResult<T>, gpui_tokio::JoinError>) -> BackendResult<T> {
@@ -4161,57 +4100,143 @@ fn background_task_error() -> BackendError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vibex_core::{TerminalOutputChunk, TerminalSession};
 
-    fn runtime_option(
-        selection: SessionRuntimeSelection,
-        availability: RuntimeOptionAvailability,
-    ) -> SessionRuntimeOption {
-        SessionRuntimeOption {
-            selection,
-            agent_label: "Codex".to_string(),
-            auth_source_label: "Profile".to_string(),
-            model_label: "Model".to_string(),
-            reasoning_efforts: Vec::new(),
-            modes: Vec::new(),
-            features: Vec::new(),
-            availability,
+    fn fixture_terminal_session(rows: u16, cols: u16) -> TerminalSession {
+        TerminalSession {
+            id: TerminalId::new(),
+            workspace_id: WorkspaceId::new(),
+            title: "Fixture".into(),
+            shell: "/bin/sh".into(),
+            cwd: "/fixture".into(),
+            rows,
+            cols,
+            status: TerminalStatus::Running,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            closed_at_ms: None,
         }
     }
 
-    #[test]
-    fn runtime_defaults_remove_only_empty_overrides_and_preserve_explicit_spacing() {
-        assert_eq!(runtime_string_override("   ".to_string()).unwrap(), None);
-        assert_eq!(
-            runtime_string_override("  explicit value  ".to_string()).unwrap(),
-            Some("  explicit value  ".to_string())
-        );
-        assert_eq!(
-            runtime_string_override("x".repeat(RUNTIME_FEATURE_VALUE_LIMIT + 1))
-                .unwrap_err()
-                .code,
-            "mobile_runtime_feature_value_too_long"
-        );
+    /// Assembles the visible screen text row by row for assertions.
+    fn terminal_visible_text(render: &vibex_ui::TerminalRenderModel) -> String {
+        let frame = &render.frame;
+        let mut rows = vec![String::new(); usize::from(frame.rows)];
+        for cell in &frame.cells {
+            let Some(row) = rows.get_mut(usize::from(cell.row)) else {
+                continue;
+            };
+            while row.chars().count() < usize::from(cell.column) {
+                row.push(' ');
+            }
+            row.push_str(&cell.text);
+        }
+        rows.iter()
+            .map(|row| row.trim_end().to_string())
+            .filter(|row| !row.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
-    fn unavailable_runtime_option_matches_for_display_but_cannot_be_applied() {
-        let selection = SessionRuntimeSelection::provider(
-            vibex_core::AgentId::parse("codex").unwrap(),
-            vibex_core::ProviderProfileId::new(),
-            "gpt-5",
-        );
-        let unavailable = runtime_option(
-            selection.clone(),
-            RuntimeOptionAvailability::RequiresConfiguration,
-        );
-        assert!(runtime_option_matches(&unavailable, &selection));
-        assert!(!runtime_selection_is_available(
-            std::slice::from_ref(&unavailable),
-            &selection
-        ));
+    fn terminal_feed_snapshot_applies_incrementally_and_rebuilds_on_gaps() {
+        let terminal_id = TerminalId::new();
+        let session = fixture_terminal_session(4, 12);
+        let chunk = |sequence: i64, data: &str| TerminalOutputChunk {
+            terminal_id: terminal_id.clone(),
+            sequence,
+            data: data.to_string(),
+            timestamp_ms: 0,
+        };
+        let mut render = vibex_ui::TerminalRenderModel::new(4, 12);
+        let mut applied = 0;
 
-        let available = runtime_option(selection.clone(), RuntimeOptionAvailability::Available);
-        assert!(runtime_selection_is_available(&[available], &selection));
+        // The first snapshot rebuilds from the retained window.
+        let first = TerminalSnapshot {
+            session: session.clone(),
+            chunks: vec![chunk(1, "hello"), chunk(2, " world")],
+            next_sequence: 3,
+        };
+        assert!(terminal_feed_snapshot(&mut render, &mut applied, &first));
+        assert_eq!(applied, 3);
+        assert_eq!(terminal_visible_text(&render), "hello world");
+
+        // No new output applies nothing and keeps the screen intact.
+        let idle = TerminalSnapshot {
+            session: session.clone(),
+            chunks: first.chunks.clone(),
+            next_sequence: 3,
+        };
+        assert!(!terminal_feed_snapshot(&mut render, &mut applied, &idle));
+        assert_eq!(terminal_visible_text(&render), "hello world");
+
+        // An incremental chunk extends the screen instead of duplicating it.
+        let incremental = TerminalSnapshot {
+            session: session.clone(),
+            chunks: vec![chunk(1, "hello"), chunk(2, " world"), chunk(3, "\r\nnext")],
+            next_sequence: 4,
+        };
+        assert!(terminal_feed_snapshot(
+            &mut render,
+            &mut applied,
+            &incremental
+        ));
+        assert_eq!(applied, 4);
+        assert_eq!(terminal_visible_text(&render), "hello world\nnext");
+
+        // A sequence rewind (reattached terminal) rebuilds from scratch.
+        let rewound = TerminalSnapshot {
+            session: session.clone(),
+            chunks: vec![chunk(1, "fresh")],
+            next_sequence: 2,
+        };
+        assert!(terminal_feed_snapshot(&mut render, &mut applied, &rewound));
+        assert_eq!(applied, 2);
+        assert_eq!(terminal_visible_text(&render), "fresh");
+
+        // A gap (ring eviction past the next expected chunk) rebuilds from the
+        // retained window only.
+        let gapped = TerminalSnapshot {
+            session,
+            chunks: vec![chunk(9, "tail")],
+            next_sequence: 10,
+        };
+        assert!(terminal_feed_snapshot(&mut render, &mut applied, &gapped));
+        assert_eq!(applied, 10);
+        assert_eq!(terminal_visible_text(&render), "tail");
+    }
+
+    #[test]
+    fn terminal_cell_colors_follow_desktop_named_defaults() {
+        let foreground = rgb(0xfafafa).into();
+        let background = rgb(0x09090b).into();
+        assert_eq!(
+            terminal_cell_color(
+                TerminalCellColor::Named { index: 256 },
+                foreground,
+                background,
+                foreground,
+            ),
+            foreground
+        );
+        assert_eq!(
+            terminal_cell_color(
+                TerminalCellColor::Named { index: 257 },
+                foreground,
+                background,
+                foreground,
+            ),
+            background
+        );
+        assert_ne!(
+            terminal_cell_color(
+                TerminalCellColor::Indexed { index: 1 },
+                foreground,
+                background,
+                foreground,
+            ),
+            foreground
+        );
     }
 
     #[test]
@@ -4245,6 +4270,6 @@ mod tests {
                 WorkbenchSurface::Terminal,
             ]
         );
-        assert_eq!(theme::WORKBENCH_BG, theme::SIDEBAR_BG);
+        assert_eq!(theme::workbench_bg(), theme::sidebar_bg());
     }
 }

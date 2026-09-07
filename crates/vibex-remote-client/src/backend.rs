@@ -23,7 +23,8 @@ use vibex_core::{
     FetchTimelineRequest, FileMutationRequest, FileReadRequest, FileReadResponse,
     FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest, FileWriteRequest,
     ForkAgentSessionRequest, GetMessageSubmissionRequest, GitCommitRequest, GitCommitResult,
-    GitDiffRequest, GitDiffResponse, GitHistoryRequest, GitHistoryResponse, GitProjectEligibility,
+    GitCommitDetail, GitCommitDetailRequest, GitDiffRequest, GitDiffResponse, GitHistoryRequest,
+    GitHistoryResponse, GitProjectEligibility,
     GitRemoteActionResult, GitStageRequest, GitStatusSummary, GitWorktreeArchiveRequest,
     GitWorktreeAssistanceSessionRequest, GitWorktreeConflictResolveRequest,
     GitWorktreeConflictStageRequest, GitWorktreeCreateRequest, GitWorktreeCreateResult,
@@ -67,7 +68,8 @@ use vibex_core::{
     RemoteFileReadRequest, RemoteFileReadResponse, RemoteFileRenameResponse,
     RemoteFileSearchRequest, RemoteFileSearchResponse, RemoteFileTreeRequest,
     RemoteFileTreeResponse, RemoteFileWriteRequest, RemoteFileWriteResponse,
-    RemoteGitCommitRequest, RemoteGitCommitResponse, RemoteGitDiffRequest, RemoteGitDiffResponse,
+    RemoteGitCommitDetailRequest, RemoteGitCommitDetailResponse, RemoteGitCommitRequest,
+    RemoteGitCommitResponse, RemoteGitDiffRequest, RemoteGitDiffResponse,
     RemoteGitHistoryRequest, RemoteGitHistoryResponse, RemoteGitRemoteActionRequest,
     RemoteGitRemoteActionResponse, RemoteGitStageRequest, RemoteGitStatusMutationResponse,
     RemoteGitStatusRequest, RemoteGitStatusResponse, RemoteGitWorktreeEligibilityRequest,
@@ -369,6 +371,37 @@ impl WebRemoteBackend {
             ));
         }
         Ok(history)
+    }
+
+    /// Reads the full detail of one commit (files and, optionally, the patch)
+    /// through the same desktop Git endpoint. Like `git_history`, this stays an
+    /// adapter method instead of expanding the compact `GitBackend` workflow.
+    pub async fn git_commit_detail(
+        &self,
+        request: GitCommitDetailRequest,
+    ) -> BackendResult<GitCommitDetail> {
+        let workspace_id = request.workspace_id.clone();
+        let payload = RemoteWorkbenchRequest::GitCommitDetail(RemoteGitCommitDetailRequest {
+            auth: self.auth(),
+            request,
+        });
+        let value = self
+            .rpc(
+                RemoteOperationKind::Git,
+                payload,
+                None,
+                None,
+                vibex_core::RemoteTimeoutClass::Standard,
+            )
+            .await?;
+        let detail = decode::<RemoteGitCommitDetailResponse>(value)?.detail;
+        if detail.workspace_id != workspace_id {
+            return Err(BackendError::failed(
+                "remote_git_workspace_mismatch",
+                "remote Git response workspace does not match the request",
+            ));
+        }
+        Ok(detail)
     }
 
     /// Applies a destructive revert from the compact Git toolbar and returns

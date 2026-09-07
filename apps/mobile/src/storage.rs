@@ -21,6 +21,31 @@ const TIMELINE_DISPLAY_SETTINGS_SCHEMA_VERSION: &str =
 const MAX_TIMELINE_DISPLAY_SETTINGS_BYTES: u64 = 128 * 1024;
 const MAX_TIMELINE_DISPLAY_SETTINGS_OVERRIDES: usize = 32;
 const MAX_TIMELINE_DISPLAY_SETTINGS_HOST_ID_BYTES: usize = 256;
+const APP_SETTINGS_FILE: &str = "app-settings.json";
+const APP_SETTINGS_SCHEMA_VERSION: &str = "vibex-native-mobile-app-settings.v1";
+const MAX_APP_SETTINGS_BYTES: u64 = 4 * 1024;
+/// Upper bound on stored preference strings; every value written by the
+/// settings UI is one of a fixed enum, so this only guards corruption.
+const MAX_APP_SETTINGS_VALUE_BYTES: usize = 32;
+
+/// Mobile-owned appearance and language preferences. When a value is `None`
+/// the mobile client follows the platform (system appearance and system
+/// locale), matching the desktop's `System` defaults.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AppSettings {
+    pub theme: Option<crate::theme::AppearanceMode>,
+    pub language: Option<crate::locale::LanguagePreference>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredAppSettings {
+    schema_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    theme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    language: Option<String>,
+}
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -325,6 +350,91 @@ impl CredentialStorage {
         }
     }
 
+    pub fn app_settings_path(&self) -> PathBuf {
+        self.data_dir.join(APP_SETTINGS_FILE)
+    }
+
+    /// Reads the persisted appearance and language preferences. A missing or
+    /// corrupt file falls back to the platform defaults, matching the other
+    /// stored payloads' reject-invalid contract.
+    pub fn load_app_settings(&self) -> BackendResult<AppSettings> {
+        let path = self.app_settings_path();
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(AppSettings::default());
+            }
+            Err(_) => return Err(storage_error("mobile_app_settings_read_failed")),
+        };
+        if metadata.len() == 0 || metadata.len() > MAX_APP_SETTINGS_BYTES {
+            return self.reject_invalid_app_settings(&path);
+        }
+        let bytes =
+            fs::read(&path).map_err(|_| storage_error("mobile_app_settings_read_failed"))?;
+        let stored: StoredAppSettings = match serde_json::from_slice(&bytes) {
+            Ok(stored) => stored,
+            Err(_) => return self.reject_invalid_app_settings(&path),
+        };
+        if stored.schema_version != APP_SETTINGS_SCHEMA_VERSION {
+            return self.reject_invalid_app_settings(&path);
+        }
+        let theme = match stored.theme.as_deref() {
+            None => None,
+            Some(value) => match crate::theme::AppearanceMode::from_storage(value) {
+                Some(mode) if value.len() <= MAX_APP_SETTINGS_VALUE_BYTES => Some(mode),
+                _ => return self.reject_invalid_app_settings(&path),
+            },
+        };
+        let language = match stored.language.as_deref() {
+            None => None,
+            Some(value) => match crate::locale::LanguagePreference::from_storage(value) {
+                Some(language) if value.len() <= MAX_APP_SETTINGS_VALUE_BYTES => Some(language),
+                _ => return self.reject_invalid_app_settings(&path),
+            },
+        };
+        Ok(AppSettings { theme, language })
+    }
+
+    pub fn save_app_settings(&self, settings: &AppSettings) -> BackendResult<()> {
+        fs::create_dir_all(&self.data_dir)
+            .map_err(|_| storage_error("mobile_app_settings_write_failed"))?;
+        let stored = StoredAppSettings {
+            schema_version: APP_SETTINGS_SCHEMA_VERSION.to_string(),
+            theme: settings.theme.map(|mode| mode.to_storage().to_string()),
+            language: settings
+                .language
+                .map(|language| language.to_storage().to_string()),
+        };
+        let encoded = serde_json::to_vec(&stored)
+            .map_err(|_| storage_error("mobile_app_settings_encode_failed"))?;
+        if encoded.is_empty() || encoded.len() as u64 > MAX_APP_SETTINGS_BYTES {
+            return Err(storage_error("mobile_app_settings_invalid"));
+        }
+        write_atomic(
+            &self.app_settings_path(),
+            &encoded,
+            "mobile_app_settings_write_failed",
+        )
+    }
+
+    pub fn clear_app_settings(&self) -> BackendResult<()> {
+        match fs::remove_file(self.app_settings_path()) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(storage_error("mobile_app_settings_clear_failed")),
+        }
+    }
+
+    fn reject_invalid_app_settings(&self, path: &Path) -> BackendResult<AppSettings> {
+        match fs::remove_file(path) {
+            Ok(()) => Err(storage_error("mobile_app_settings_invalid")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(storage_error("mobile_app_settings_invalid"))
+            }
+            Err(_) => Err(storage_error("mobile_app_settings_clear_failed")),
+        }
+    }
+
     pub fn clear(&self) -> BackendResult<()> {
         match fs::remove_file(self.path()) {
             Ok(()) => Ok(()),
@@ -377,6 +487,45 @@ impl CredentialStorage {
 
 fn temporary_path(path: &Path) -> PathBuf {
     path.with_extension("json.tmp")
+}
+
+/// Creates the data dir, writes `encoded` through a temporary file, fsyncs,
+/// and renames it into place with owner-only permissions. The shared body of
+/// every stored payload's save path.
+fn write_atomic(path: &Path, encoded: &[u8], write_failed_code: &'static str) -> BackendResult<()> {
+    let temporary = temporary_path(path);
+    match fs::remove_file(&temporary) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(storage_error(write_failed_code)),
+    }
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let outcome = (|| {
+        let mut file = options
+            .open(&temporary)
+            .map_err(|_| storage_error(write_failed_code))?;
+        file.write_all(encoded)
+            .and_then(|_| file.sync_all())
+            .map_err(|_| storage_error(write_failed_code))?;
+        fs::rename(&temporary, path).map_err(|_| storage_error(write_failed_code))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                .map_err(|_| storage_error(write_failed_code))?;
+        }
+        Ok(())
+    })();
+    if outcome.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    outcome
 }
 
 fn storage_error(code: &'static str) -> BackendError {
@@ -503,6 +652,66 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, "mobile_timeline_settings_invalid");
         assert!(!storage.timeline_display_settings_overrides_path().exists());
+    }
+
+    #[test]
+    fn app_settings_round_trip_and_clear() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        assert_eq!(storage.load_app_settings().unwrap(), AppSettings::default());
+
+        let settings = AppSettings {
+            theme: Some(crate::theme::AppearanceMode::Light),
+            language: Some(crate::locale::LanguagePreference::ZhCn),
+        };
+        storage.save_app_settings(&settings).unwrap();
+        assert_eq!(storage.load_app_settings().unwrap(), settings);
+
+        storage.clear_app_settings().unwrap();
+        assert_eq!(storage.load_app_settings().unwrap(), AppSettings::default());
+    }
+
+    #[test]
+    fn absent_app_settings_fields_follow_the_platform() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        storage
+            .save_app_settings(&AppSettings {
+                theme: Some(crate::theme::AppearanceMode::Dark),
+                language: None,
+            })
+            .unwrap();
+        let loaded = storage.load_app_settings().unwrap();
+        assert_eq!(loaded.theme, Some(crate::theme::AppearanceMode::Dark));
+        assert_eq!(loaded.language, None);
+    }
+
+    #[test]
+    fn malformed_app_settings_are_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        fs::create_dir_all(temp.path()).unwrap();
+        fs::write(storage.app_settings_path(), b"not-json").unwrap();
+
+        let error = storage.load_app_settings().unwrap_err();
+        assert_eq!(error.code, "mobile_app_settings_invalid");
+        assert!(!storage.app_settings_path().exists());
+    }
+
+    #[test]
+    fn unknown_app_settings_values_are_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        fs::create_dir_all(temp.path()).unwrap();
+        fs::write(
+            storage.app_settings_path(),
+            br#"{"schemaVersion":"vibex-native-mobile-app-settings.v1","theme":"sepia"}"#,
+        )
+        .unwrap();
+
+        let error = storage.load_app_settings().unwrap_err();
+        assert_eq!(error.code, "mobile_app_settings_invalid");
+        assert!(!storage.app_settings_path().exists());
     }
 
     #[test]

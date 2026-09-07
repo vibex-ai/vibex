@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use gpui::{
     AnyElement, AppContext as _, Context, IntoElement, ParentElement as _, Render, Styled as _,
-    Task, WeakEntity, Window, div, prelude::FluentBuilder as _, px, rgb,
+    Task, WeakEntity, Window, div, prelude::FluentBuilder as _, px,
 };
 use vibex_markdown::{
     Block, BlockNode, MarkdownDocument, MarkdownInput, MarkdownSurface, parse_markdown, plain_text,
@@ -143,7 +143,7 @@ fn render_block(node: &BlockNode, depth: usize) -> AnyElement {
         }
         Block::Quote(children) => div()
             .border_l_2()
-            .border_color(rgb(theme::BORDER_DEFAULT))
+            .border_color(theme::border_default())
             .pl_3()
             .children(render_blocks(children, depth + 1))
             .into_any_element(),
@@ -152,7 +152,7 @@ fn render_block(node: &BlockNode, depth: usize) -> AnyElement {
         } => div()
             .rounded(px(theme::RADIUS_CARD))
             .border_1()
-            .border_color(rgb(theme::BORDER_DEFAULT))
+            .border_color(theme::border_default())
             .bg(theme::bg_card_dim())
             .p_3()
             .flex()
@@ -161,7 +161,7 @@ fn render_block(node: &BlockNode, depth: usize) -> AnyElement {
             .child(
                 div()
                     .text_size(px(12.0))
-                    .text_color(rgb(theme::ACCENT_YELLOW))
+                    .text_color(theme::accent_yellow())
                     .child(title.clone()),
             )
             .children(render_blocks(children, depth + 1))
@@ -232,14 +232,14 @@ fn render_block(node: &BlockNode, depth: usize) -> AnyElement {
             all_rows.extend(rows.iter().map(|row| (false, row)));
             div()
                 .border_1()
-                .border_color(rgb(theme::BORDER_DEFAULT))
+                .border_color(theme::border_default())
                 .rounded(px(theme::RADIUS_CARD))
                 .overflow_hidden()
                 .children(all_rows.into_iter().map(|(header, row)| {
                     div()
                         .flex()
                         .border_b_1()
-                        .border_color(rgb(theme::BORDER_SUBTLE))
+                        .border_color(theme::border_subtle())
                         .when(header, |row| row.bg(theme::bg_card_dim()))
                         .children(row.cells.iter().map(|cell| {
                             div()
@@ -255,7 +255,7 @@ fn render_block(node: &BlockNode, depth: usize) -> AnyElement {
         Block::ThematicBreak => div()
             .h(px(1.0))
             .my_2()
-            .bg(rgb(theme::BORDER_DEFAULT))
+            .bg(theme::border_default())
             .into_any_element(),
         Block::Details {
             summary, children, ..
@@ -305,7 +305,7 @@ fn code_block(language: Option<&str>, source: &str) -> AnyElement {
     div()
         .rounded(px(theme::RADIUS_CARD))
         .border_1()
-        .border_color(rgb(theme::BORDER_DEFAULT))
+        .border_color(theme::border_default())
         .bg(theme::bg_card_dim())
         .overflow_hidden()
         .when_some(
@@ -314,7 +314,7 @@ fn code_block(language: Option<&str>, source: &str) -> AnyElement {
                 block.child(
                     div()
                         .border_b_1()
-                        .border_color(rgb(theme::BORDER_SUBTLE))
+                        .border_color(theme::border_subtle())
                         .px_3()
                         .py_1()
                         .text_size(px(10.0))

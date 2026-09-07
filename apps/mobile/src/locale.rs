@@ -1,14 +1,105 @@
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use vibex_ui::locale::Locale;
 
 static SYSTEM_LOCALE: OnceLock<Locale> = OnceLock::new();
 
-/// The mobile client follows the device language for every fresh launch.  A
-/// user preference is intentionally not persisted here: the native app has no
-/// independent language setting and should track the platform default.
+/// A user-selected language. `System` follows the device locale; the explicit
+/// values override it from the mobile settings, and take precedence whenever
+/// they exist (matching the desktop's language preference semantics).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LanguagePreference {
+    #[default]
+    System,
+    En,
+    ZhCn,
+    ZhTw,
+}
+
+impl LanguagePreference {
+    pub fn all() -> [LanguagePreference; 4] {
+        [
+            LanguagePreference::System,
+            LanguagePreference::En,
+            LanguagePreference::ZhCn,
+            LanguagePreference::ZhTw,
+        ]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LanguagePreference::System => "System",
+            LanguagePreference::En => "English",
+            LanguagePreference::ZhCn => "简体中文",
+            LanguagePreference::ZhTw => "繁體中文",
+        }
+    }
+
+    pub fn from_storage(value: &str) -> Option<LanguagePreference> {
+        match value {
+            "system" => Some(LanguagePreference::System),
+            "en" => Some(LanguagePreference::En),
+            "zh-cn" => Some(LanguagePreference::ZhCn),
+            "zh-tw" => Some(LanguagePreference::ZhTw),
+            _ => None,
+        }
+    }
+
+    pub fn to_storage(self) -> &'static str {
+        match self {
+            LanguagePreference::System => "system",
+            LanguagePreference::En => "en",
+            LanguagePreference::ZhCn => "zh-cn",
+            LanguagePreference::ZhTw => "zh-tw",
+        }
+    }
+
+    fn resolved(self, system: Locale) -> Locale {
+        match self {
+            LanguagePreference::System => system,
+            LanguagePreference::En => Locale::En,
+            LanguagePreference::ZhCn => Locale::ZhCn,
+            LanguagePreference::ZhTw => Locale::ZhTw,
+        }
+    }
+}
+
+// Encoded indices match `LanguagePreference::all`.
+const PREFERENCE_SYSTEM: u8 = 0;
+const PREFERENCE_EN: u8 = 1;
+const PREFERENCE_ZH_CN: u8 = 2;
+const PREFERENCE_ZH_TW: u8 = 3;
+
+static OVERRIDE: AtomicU8 = AtomicU8::new(PREFERENCE_SYSTEM);
+
+/// Applies the persisted language preference for this process. Called once at
+/// startup and whenever the user changes the setting.
+pub fn set_preference(preference: LanguagePreference) {
+    let encoded = match preference {
+        LanguagePreference::System => PREFERENCE_SYSTEM,
+        LanguagePreference::En => PREFERENCE_EN,
+        LanguagePreference::ZhCn => PREFERENCE_ZH_CN,
+        LanguagePreference::ZhTw => PREFERENCE_ZH_TW,
+    };
+    OVERRIDE.store(encoded, Ordering::Relaxed);
+}
+
+pub fn preference() -> LanguagePreference {
+    match OVERRIDE.load(Ordering::Relaxed) {
+        PREFERENCE_EN => LanguagePreference::En,
+        PREFERENCE_ZH_CN => LanguagePreference::ZhCn,
+        PREFERENCE_ZH_TW => LanguagePreference::ZhTw,
+        _ => LanguagePreference::System,
+    }
+}
+
+/// The locale every string lookup resolves through: the stored mobile
+/// preference when one exists, otherwise the device language.
 pub fn current() -> Locale {
-    *SYSTEM_LOCALE.get_or_init(|| Locale::from_system_tag(sys_locale::get_locale().as_deref()))
+    preference().resolved(
+        *SYSTEM_LOCALE.get_or_init(|| Locale::from_system_tag(sys_locale::get_locale().as_deref())),
+    )
 }
 
 pub const fn text_for(
@@ -81,6 +172,10 @@ pub fn common_for(locale: Locale, en: &'static str) -> &'static str {
         "Files" => ("文件", "檔案"),
         "Git" => ("Git", "Git"),
         "Terminal" => ("终端", "終端機"),
+        "running" => ("运行中", "執行中"),
+        "exited" => ("已退出", "已結束"),
+        "killed" => ("已终止", "已終止"),
+        "stale" => ("已失联", "已失聯"),
         "Providers" => ("供应商", "供應商"),
         "Runtime" => ("运行时", "執行環境"),
         "Loading" => ("加载中", "載入中"),
@@ -133,6 +228,21 @@ pub fn common_for(locale: Locale, en: &'static str) -> &'static str {
         "Appearance" => ("外观", "外觀"),
         "Dark appearance" => ("深色外观", "深色外觀"),
         "Follows system language" => ("跟随系统语言", "跟隨系統語言"),
+        "Theme" => ("主题", "主題"),
+        "Dark" => ("深色", "深色"),
+        "Light" => ("浅色", "淺色"),
+        "English" => ("English", "English"),
+        "Simplified Chinese" => ("简体中文", "簡體中文"),
+        "Traditional Chinese" => ("繁體中文", "繁體中文"),
+        "Mobile settings take precedence over the desktop host" => {
+            ("移动端设置优先于桌面端", "行動端設定優先於桌面版")
+        }
+        "Match the system appearance" => ("跟随系统外观", "跟隨系統外觀"),
+        "Use the light palette everywhere" => ("全局使用浅色配色", "全局使用淺色配色"),
+        "Use the desktop dark palette everywhere" => {
+            ("全局使用桌面端深色配色", "全局使用桌面版深色配色")
+        }
+        "Match the device language" => ("跟随设备语言", "跟隨裝置語言"),
         "Notifications" => ("通知", "通知"),
         "Enable notifications" => ("启用通知", "啟用通知"),
         "Agent access" => ("Agent 访问", "Agent 存取"),

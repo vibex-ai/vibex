@@ -369,6 +369,21 @@ impl TerminalRenderModel {
         self.frame = self.emulator.frame();
     }
 
+    /// Moves the visible viewport by whole lines; negative deltas page back
+    /// into scrollback and positive deltas return toward the live bottom.
+    pub fn scroll(&mut self, lines: i32) {
+        if lines != 0 {
+            self.emulator.scroll(lines);
+            self.frame = self.emulator.frame();
+        }
+    }
+
+    /// Jumps the viewport back to the live bottom of the output.
+    pub fn scroll_to_bottom(&mut self) {
+        self.emulator.scroll_to_bottom();
+        self.frame = self.emulator.frame();
+    }
+
     pub fn modes(&self) -> TerminalModeSnapshot {
         self.emulator.modes()
     }

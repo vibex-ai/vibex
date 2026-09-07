@@ -29,6 +29,7 @@ vibex-core = { path = "../../crates/core" }
 vibex-desktop-model = { path = "../../crates/desktop-model" }
 vibex-markdown = { path = "../../crates/vibex-markdown", default-features = false }
 vibex-remote-client = { path = "../../crates/vibex-remote-client" }
+vibex-terminal-ui = { path = "../../crates/vibex-terminal-ui" }
 vibex-ui = { path = "../../crates/vibex-ui" }
 
 [target.'cfg(target_os = "android")'.dependencies]

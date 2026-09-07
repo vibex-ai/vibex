@@ -10141,6 +10141,7 @@ dependencies = [
  "vibex-desktop-model",
  "vibex-markdown",
  "vibex-remote-client",
+ "vibex-terminal-ui",
  "vibex-ui",
 ]
 
