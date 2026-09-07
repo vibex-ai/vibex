@@ -13795,9 +13795,7 @@ impl VibexWorkbench {
             .flex_1()
             .flex_wrap()
             .items_center()
-            .gap_1()
-            .max_h(px(COMPOSER_QUEUE_PREVIEW_MAX_HEIGHT))
-            .overflow_hidden();
+            .gap_1();
 
         for segment in user_message_inline_segments(text, attachments) {
             match segment {
@@ -13811,7 +13809,6 @@ impl VibexWorkbench {
                             .line_height(gpui::relative(1.5))
                             .whitespace_normal()
                             .overflow_hidden()
-                            .line_clamp(COMPOSER_QUEUE_PREVIEW_MAX_LINES)
                             .child(value),
                     );
                 }
@@ -13839,7 +13836,17 @@ impl VibexWorkbench {
             }
         }
 
-        content.into_any_element()
+        // The three-line preview viewport clips long messages; hovering the
+        // content lets the wheel scroll the remaining lines into view.
+        div()
+            .id(format!("composer-queue-content-{message_id}"))
+            .min_w_0()
+            .flex_1()
+            .max_h(px(COMPOSER_QUEUE_PREVIEW_MAX_HEIGHT))
+            .overflow_hidden()
+            .overflow_y_scroll()
+            .child(content)
+            .into_any_element()
     }
 
     fn delete_composer_queue_message(
@@ -56375,9 +56382,10 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn delete_composer_queue_message("))
             .map(|(body, _)| body)
             .expect("queued message preview renderer should remain inspectable");
-        assert!(preview.contains(".line_clamp(COMPOSER_QUEUE_PREVIEW_MAX_LINES)"));
         assert!(preview.contains(".max_h(px(COMPOSER_QUEUE_PREVIEW_MAX_HEIGHT))"));
         assert!(preview.contains(".overflow_hidden()"));
+        assert!(preview.contains(".overflow_y_scroll()"));
+        assert!(preview.contains("composer-queue-content-"));
         // The clamp only guards the non-editing preview; editing keeps the
         // multi-line input.
         assert!(!preview.contains("COMPOSER_QUEUE_EDIT_ROW_HEIGHT"));
