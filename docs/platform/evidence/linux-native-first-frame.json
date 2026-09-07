@@ -1,14 +1,15 @@
 {
   "schemaVersion": "linux-native-frame-evidence.v2",
-  "capturedAt": "2026-07-18T11:33:40.410Z",
+  "capturedAt": "2026-09-07T05:28:32.028Z",
   "source": {
     "vibexBaselineCommit": "f1c624f115401d6160a771545fa1ec73128394b1",
-    "captureParentCommit": "65efcb3ee74e711bb9d25ca0f55af7b36dc3b0c8",
-    "zedRevision": "819fe337999551ce8177b14c8db1127645617ae4",
-    "gpuiComponentRevision": "3c270ed244d06fb211b47f156761c1d833eac535",
-    "lockfileSha256": "6bafd6ea8d8aa706f6a51a01d7884c6f00209247b716f5cb6ba4e4b8a3aa80a4",
-    "gpuiShellTreeSha256": "86dcd7138fc80a5b421f9b4c35b350f18ff5115498c7987591eea72ec82c8aab",
-    "hostedRunnerPolicySha256": "4dd8867fce81d843cef446b001553a65331b4f6b013a952f575355ac9ccedf29"
+    "captureParentCommit": "17c24ceb6af3d76de05ec6af1929607c947403b1",
+    "dependencySourcePolicy": "fork_submodule_root_cargo_lock",
+    "zedRevision": "7b7bad0fbcea1ec312db104af451b7bb31146e96",
+    "gpuiComponentRevision": "031555662e99a1b5a549990b47f246d475b8288a",
+    "lockfileSha256": "2388c341d5946ce1c113b103285edcc401fa957e54ddd4e5ad865b3b5885fa14",
+    "gpuiShellTreeSha256": "e12fb12c12434d56e5ffc7cad8e22a91cf29af29de67278a7d7f85ed172b147e",
+    "hostedRunnerPolicySha256": "5050c2af587aca45128557125ace976886cfda68f6e33788822d654495d4b313"
   },
   "requiredTargets": [
     "linux_x11",
@@ -27,16 +28,16 @@
         "gpu": {
           "deviceName": "AMD Radeon 780M Graphics (RADV PHOENIX)",
           "driverName": "radv",
-          "driverInfo": "Mesa 26.1.4-arch1.1"
+          "driverInfo": "Mesa 26.2.2-arch1.1"
         },
         "monitor": {
           "width": 2560,
           "height": 1440,
-          "physicalWidthMm": 530,
-          "physicalHeightMm": 300,
+          "physicalWidthMm": 600,
+          "physicalHeightMm": 340,
           "refreshRateHz": 59.951,
           "scaleFactor": 1,
-          "transform": 0
+          "transform": 1
         }
       },
       "window": {
@@ -49,13 +50,13 @@
       },
       "capture": {
         "screenshotPath": "docs/parity/screenshots/current/spikes/linux-x11-native.png",
-        "screenshotSha256": "b8d883f942c876fd67c2cabfd74c1e0d3e624ded9f9454cdbf3a3223878ed30f",
+        "screenshotSha256": "28e1666df5e266a3090ff2b99e1c78699f563a322e2577f37a1026aa233f3d7c",
         "width": 1200,
         "height": 780,
-        "uniqueColors": 684,
-        "entropy": 0.106895,
-        "mean": 0.0484969,
-        "standardDeviation": 0.0427797
+        "uniqueColors": 63860,
+        "entropy": 0.801073,
+        "mean": 0.158811,
+        "standardDeviation": 0.170057
       },
       "nativePixelsVerified": true,
       "blocker": null,
@@ -80,16 +81,16 @@
         "gpu": {
           "deviceName": "AMD Radeon 780M Graphics (RADV PHOENIX)",
           "driverName": "radv",
-          "driverInfo": "Mesa 26.1.4-arch1.1"
+          "driverInfo": "Mesa 26.2.2-arch1.1"
         },
         "monitor": {
           "width": 2560,
           "height": 1440,
-          "physicalWidthMm": 530,
-          "physicalHeightMm": 300,
+          "physicalWidthMm": 600,
+          "physicalHeightMm": 340,
           "refreshRateHz": 59.951,
           "scaleFactor": 1,
-          "transform": 0
+          "transform": 1
         }
       },
       "window": {
@@ -102,13 +103,13 @@
       },
       "capture": {
         "screenshotPath": "docs/parity/screenshots/current/spikes/linux-wayland-native.png",
-        "screenshotSha256": "40939f8f7f0a94c53d2faa98456f72c5e6085f58a577af6b9ccb40b308f4f9df",
+        "screenshotSha256": "28e1666df5e266a3090ff2b99e1c78699f563a322e2577f37a1026aa233f3d7c",
         "width": 1200,
         "height": 780,
-        "uniqueColors": 673,
-        "entropy": 0.105391,
-        "mean": 0.0482516,
-        "standardDeviation": 0.0415409
+        "uniqueColors": 63860,
+        "entropy": 0.801073,
+        "mean": 0.158811,
+        "standardDeviation": 0.170057
       },
       "nativePixelsVerified": true,
       "blocker": null,

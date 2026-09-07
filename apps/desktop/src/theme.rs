@@ -12,6 +12,8 @@ use vibex_ui::{
     LIGHT_HIGHLIGHT_THEME_JSON, LIGHT_TOKENS, RADII, SHADOWS_ENABLED,
 };
 
+use crate::motion::mix;
+
 pub use vibex_ui::{
     GPUI_COMPONENT_REVISION, GPUI_REVISION, TOKEN_PRODUCT_VISUAL_SOURCE, TOKEN_SCHEMA_VERSION,
     TOKEN_SOURCE_PATH, TOKEN_SOURCE_SHA256,
@@ -72,12 +74,40 @@ fn apply_semantic_highlight_colors(theme: &mut Theme, is_dark: bool) {
     theme.tokens.sidebar_accent_foreground = sidebar_accent_foreground.into();
 }
 
+/// State-wash tone shared by hover, active, and selected fills. Quoted in
+/// dark-mode terms: dark paints a soft-white wash, light the tone-flipped
+/// soft-black — the same alpha family the dark tuning established.
+fn state_wash(is_dark: bool, alpha: f32) -> Hsla {
+    if is_dark {
+        gpui::hsla(0.0, 0.0, 0.92, alpha)
+    } else {
+        gpui::hsla(0.0, 0.0, 0.10, alpha)
+    }
+}
+
+/// Hover wash for interactive rows, buttons, and tabs (theme-independent —
+/// callers blending it per-frame through `motion::hover_blend` need a value,
+/// not a borrow of the global theme).
+pub fn hover_wash(is_dark: bool) -> Hsla {
+    state_wash(is_dark, 0.11)
+}
+
+/// Active/pressed and selected wash.
+pub fn active_wash(is_dark: bool) -> Hsla {
+    state_wash(is_dark, 0.16)
+}
+
 pub fn apply_appearance(appearance: &AppearanceUiState, window: Option<&mut Window>, cx: &mut App) {
     match appearance.theme {
         ThemeMode::Light => Theme::change(ComponentThemeMode::Light, window, cx),
         ThemeMode::Dark => Theme::change(ComponentThemeMode::Dark, window, cx),
         ThemeMode::System => Theme::sync_system_appearance(window, cx),
     }
+    // Keep gpui's global animation flag in step with the user preference: the
+    // vendored gpui snaps every `with_animation` element (modal slides, menu
+    // fades, entrance lifts) to its end state and schedules no frames while it
+    // is set — the app-side `Transition` checks stay as a second guard.
+    cx.set_reduce_motion(appearance.reduced_motion);
     let theme = Theme::global_mut(cx);
     theme.font_family = appearance
         .interface_font
@@ -106,12 +136,82 @@ pub fn apply_appearance(appearance: &AppearanceUiState, window: Option<&mut Wind
     theme.highlight_theme = shared_highlight_theme(is_dark);
     apply_semantic_popover_colors(theme, is_dark);
     apply_semantic_highlight_colors(theme, is_dark);
-    theme.sidebar = semantic_color("sidebar", is_dark);
-    theme.sidebar_foreground = semantic_color("sidebar-foreground", is_dark);
+    // Full semantic mapping — every interactive surface resolves from the
+    // shared token source so the two appearances stay in one tuned
+    // relationship (dark is the authored one; light flips tone, not layout).
+    let background = semantic_color("background", is_dark);
+    let foreground = semantic_color("foreground", is_dark);
+    let secondary = semantic_color("secondary", is_dark);
+    let secondary_foreground = semantic_color("secondary-foreground", is_dark);
+    let muted = semantic_color("muted", is_dark);
+    let muted_foreground = semantic_color("muted-foreground", is_dark);
+    let accent = semantic_color("accent", is_dark);
+    let border = semantic_color("border", is_dark);
+    let input = semantic_color("input", is_dark);
+    let ring = semantic_color("ring", is_dark);
+    let sidebar = semantic_color("sidebar", is_dark);
+    let sidebar_foreground = semantic_color("sidebar-foreground", is_dark);
+    let hover = hover_wash(is_dark);
+    let active = active_wash(is_dark);
+
+    theme.background = background;
+    theme.tokens.background = background.into();
+    theme.foreground = foreground;
+    theme.tokens.foreground = foreground.into();
+    theme.secondary = secondary;
+    theme.tokens.secondary = secondary.into();
+    theme.secondary_foreground = secondary_foreground;
+    theme.tokens.secondary_foreground = secondary_foreground.into();
+    theme.muted = muted;
+    theme.tokens.muted = muted.into();
+    theme.muted_foreground = muted_foreground;
+    theme.tokens.muted_foreground = muted_foreground.into();
+    theme.primary = semantic_color("primary", is_dark);
+    theme.tokens.primary = theme.primary.into();
+    theme.primary_foreground = semantic_color("primary-foreground", is_dark);
+    theme.tokens.primary_foreground = theme.primary_foreground.into();
+    theme.border = border;
+    theme.tokens.border = border.into();
+    theme.input = input;
+    theme.tokens.input = input.into();
+    theme.ring = ring;
+    theme.tokens.ring = ring.into();
+    theme.sidebar = sidebar;
+    theme.tokens.sidebar = sidebar.into();
+    theme.sidebar_foreground = sidebar_foreground;
+    theme.tokens.sidebar_foreground = sidebar_foreground.into();
     theme.sidebar_primary = semantic_color("sidebar-primary", is_dark);
+    theme.tokens.sidebar_primary = theme.sidebar_primary.into();
     theme.sidebar_primary_foreground = semantic_color("sidebar-primary-foreground", is_dark);
+    theme.tokens.sidebar_primary_foreground = theme.sidebar_primary_foreground.into();
     theme.sidebar_border = semantic_color("sidebar-border", is_dark);
-    theme.overlay = gpui::black().opacity(0.80);
+    theme.tokens.sidebar_border = theme.sidebar_border.into();
+    // Hover/active washes and their derived component plates. Component hover
+    // plates stay opaque-ready (raised pills never swap to translucent washes),
+    // so they compose the wash over the surface they sit on.
+    theme.accent = accent;
+    theme.accent_foreground = semantic_color("accent-foreground", is_dark);
+    theme.list_hover = hover;
+    theme.tokens.list_hover = hover.into();
+    theme.table_hover = hover;
+    theme.tokens.table_hover = hover.into();
+    theme.secondary_hover = mix(secondary, hover, 0.5);
+    theme.tokens.secondary_hover = theme.secondary_hover.into();
+    theme.button_hover = mix(secondary, hover, 0.5);
+    theme.tokens.button_hover = theme.button_hover.into();
+    theme.button_active = mix(secondary, active, 0.5);
+    theme.tokens.button_active = theme.button_active.into();
+    theme.primary_hover = mix(theme.primary, foreground, 0.08);
+    theme.tokens.primary_hover = theme.primary_hover.into();
+    theme.primary_active = mix(theme.primary, foreground, 0.16);
+    theme.tokens.primary_active = theme.primary_active.into();
+    // Modal scrim: darken what is behind it. A light-mode scrim of the dark
+    // strength reads as a blackout on a bright field, so light runs ~half.
+    theme.overlay = gpui::black().opacity(if is_dark { 0.60 } else { 0.32 });
+    theme.title_bar = sidebar;
+    theme.tokens.title_bar = sidebar.into();
+    theme.title_bar_border = semantic_color("sidebar-border", is_dark);
+    theme.tokens.title_bar_border = theme.title_bar_border.into();
     if appearance.high_contrast {
         let foreground = theme.foreground;
         theme.border = foreground.alpha(if theme.is_dark() { 0.42 } else { 0.30 });
@@ -163,12 +263,24 @@ mod tests {
             "031555662e99a1b5a549990b47f246d475b8288a"
         );
         assert_eq!(semantic_token("background", false).unwrap().hex, "#ffffff");
-        assert_eq!(semantic_token("foreground", true).unwrap().hex, "#fafafa");
+        assert_eq!(semantic_token("foreground", true).unwrap().hex, "#e5e5e5");
         assert_eq!(semantic_token("border", true).unwrap().alpha, 0.1);
         assert!(semantic_token("warning-foreground", false).is_some());
         assert!(semantic_token("warning-foreground", true).is_some());
         assert!(LIGHT_TOKENS.len() >= 40);
         assert_eq!(LIGHT_TOKENS.len(), DARK_TOKENS.len());
+    }
+
+    #[test]
+    fn state_washes_flip_tone_between_appearances() {
+        for (is_dark, wash_channel) in [(true, 0.92_f32), (false, 0.10)] {
+            let hover = hover_wash(is_dark);
+            assert_eq!(hover.l, wash_channel);
+            assert!((hover.a - 0.11).abs() < 1e-6);
+            let active = active_wash(is_dark);
+            assert_eq!(active.l, wash_channel);
+            assert!((active.a - 0.16).abs() < 1e-6);
+        }
     }
 
     #[test]

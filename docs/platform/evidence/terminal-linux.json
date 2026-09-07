@@ -1,12 +1,12 @@
 {
   "schemaVersion": "terminal-linux-evidence.v1",
   "status": "partial",
-  "capturedAt": "2026-07-18T11:23:55.396Z",
+  "capturedAt": "2026-09-07T05:52:08.425Z",
   "source": {
     "vibexBaselineCommit": "f1c624f115401d6160a771545fa1ec73128394b1",
-    "captureParentCommit": "65efcb3ee74e711bb9d25ca0f55af7b36dc3b0c8",
-    "rustToolchain": "rustc 1.97.0 (2d8144b78 2026-07-07) (Arch Linux rust 1:1.97.0-1)",
-    "lockfileSha256": "6bafd6ea8d8aa706f6a51a01d7884c6f00209247b716f5cb6ba4e4b8a3aa80a4",
+    "captureParentCommit": "17c24ceb6af3d76de05ec6af1929607c947403b1",
+    "rustToolchain": "rustc 1.97.0 (2d8144b78 2026-07-07)",
+    "lockfileSha256": "2388c341d5946ce1c113b103285edcc401fa957e54ddd4e5ad865b3b5885fa14",
     "sourceInputRoots": [
       "Cargo.lock",
       "Cargo.toml",
@@ -17,12 +17,12 @@
       "crates/terminal/src",
       "scripts/capture-terminal.mjs"
     ],
-    "sourceInputTreeSha256": "518a7b9885c9d0c3a177762e7cd317489f2e3d97d02f2dbbfb9e2d00d79a9932"
+    "sourceInputTreeSha256": "5cd75a82122c48ee8f520d4c75c2f837d3f704a0cbb0b8abdd6395aa41b1417f"
   },
   "runner": {
     "platform": "linux",
     "architecture": "x64",
-    "kernelRelease": "7.1.3-arch1-3",
+    "kernelRelease": "7.2.3-arch1-3",
     "syntheticPty": false,
     "fixtureProvider": "python-stdlib"
   },
@@ -32,7 +32,7 @@
     "licenseExpression": "MIT",
     "engine": "alacritty_terminal 0.26.0",
     "gpuiRevision": "c8656ac96d2344fc288b551943cc12fcb6ef56ad",
-    "vibexGpuiRevision": "819fe337999551ce817b14c8db1127645617ae4",
+    "vibexGpuiRevision": "7b7bad0fbcea1ec312db104af451b7bb31146e96",
     "directImportSelected": false,
     "sourceCodeCopied": false,
     "coupling": [
@@ -86,8 +86,8 @@
     "throughput": {
       "fixtureBytes": 10485760,
       "fixtureSha256": "e5b844cc57f57094ea4585e235f36c78c1cd222262bb89d53c94dcb4d6b3e55d",
-      "elapsedMs": 551,
-      "mebibytesPerSecond": 18.12954316040422,
+      "elapsedMs": 497,
+      "mebibytesPerSecond": 20.113596888645397,
       "dataLossObserved": false
     },
     "rawTextStored": false

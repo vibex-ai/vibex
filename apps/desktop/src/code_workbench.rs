@@ -73,6 +73,7 @@ use vibex_markdown::{
 use crate::app::VibexWorkbench;
 use crate::assets::{file_tree_asset_icon, open_tool_brand_icon};
 use crate::locale;
+use crate::motion::{hover_blend, hover_listener};
 use crate::office_surface::OfficeSurface;
 use crate::pdf_surface::PdfSurface;
 use crate::platform::{
@@ -9422,6 +9423,18 @@ impl CodeRightRail {
             .when(has_children, |this| this.aria_expanded(expanded))
             .children(file_tree_guides(row.depth, cx))
             .child(div().w(px(row.depth as f32 * FILE_TREE_INDENT)).flex_none())
+            .when(true, |this| {
+                // Animated hover wash (see the file tree rows).
+                let is_dark = cx.theme().is_dark();
+                let hover_key =
+                    crate::motion::hover_key("file-name-search", format!("{index}:{}", row.path));
+                this.on_hover(hover_listener(hover_key.clone()))
+                    .bg(hover_blend(
+                        &hover_key,
+                        cx.theme().transparent,
+                        crate::theme::hover_wash(is_dark),
+                    ))
+            })
             .child(disclosure)
             .child(file_tree_icon(descriptor.kind, false, cx))
             .child(
@@ -9436,7 +9449,6 @@ impl CodeRightRail {
                         cx,
                     )),
             )
-            .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.45)))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.activate_file_name_search_row(
                     click_path.clone(),
@@ -9545,7 +9557,20 @@ impl CodeRightRail {
                     cx,
                 ),
             ))
-            .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.45)))
+            .when(true, |this| {
+                // Animated hover wash (see the file tree rows).
+                let is_dark = cx.theme().is_dark();
+                let hover_key = crate::motion::hover_key(
+                    "file-content-search",
+                    format!("{index}:{path}:{line}"),
+                );
+                this.on_hover(hover_listener(hover_key.clone()))
+                    .bg(hover_blend(
+                        &hover_key,
+                        cx.theme().transparent,
+                        crate::theme::hover_wash(is_dark),
+                    ))
+            })
             .on_click(move |_, window, cx| {
                 let _ = controller.update(cx, |workbench, cx| {
                     workbench.open_file_search_result(
@@ -10213,7 +10238,19 @@ impl CodeRightRail {
             })
             .when(
                 !row_drop_active && !row.selected && !row_drop_scope_active && !typeahead_active,
-                |this| this.hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.35))),
+                |this| {
+                    // Animated hover wash: rest → wash over 150ms instead of a
+                    // snap (theme state washes; frames driven by the window
+                    // root's hover-fade tick).
+                    let is_dark = cx.theme().is_dark();
+                    let hover_key = crate::motion::hover_key("file-tree", &row.id);
+                    this.on_hover(hover_listener(hover_key.clone()))
+                        .bg(hover_blend(
+                            &hover_key,
+                            cx.theme().transparent,
+                            crate::theme::hover_wash(is_dark),
+                        ))
+                },
             )
             .when(row_dragging, |this| this.opacity(0.55))
             .focusable()
@@ -11946,6 +11983,7 @@ impl CodeRightRail {
             let keyboard_chain = path_chain.clone();
             let keyboard_interaction = interaction.clone();
             let directory_label = path.clone();
+            let git_tree_row_id = row.id.clone();
             return h_flex()
                 .id(row.id)
                 .relative()
@@ -11955,7 +11993,17 @@ impl CodeRightRail {
                 .min_w_0()
                 .items_center()
                 .px_1()
-                .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.42)))
+                .when(!selected_path, |this| {
+                    // Animated hover wash (see the file tree rows).
+                    let is_dark = cx.theme().is_dark();
+                    let hover_key = crate::motion::hover_key("git-tree", &git_tree_row_id);
+                    this.on_hover(hover_listener(hover_key.clone()))
+                        .bg(hover_blend(
+                            &hover_key,
+                            cx.theme().transparent,
+                            crate::theme::hover_wash(is_dark),
+                        ))
+                })
                 .children(file_tree_guides(row.depth, cx))
                 .child(div().w(px(row.depth as f32 * FILE_TREE_INDENT)).flex_none())
                 .when_some(selection_button, |this, selection| this.child(selection))
@@ -12041,6 +12089,7 @@ impl CodeRightRail {
         let accessible_name = row.path.clone();
         let status_color = git_change_text_color(&change, cx);
         let deleted = change.kind == GitChangeKind::Deleted;
+        let git_tree_row_id = row.id.clone();
 
         h_flex()
             .id(row.id)
@@ -12063,7 +12112,15 @@ impl CodeRightRail {
                 cx.theme().transparent
             })
             .when(!selected_path, |this| {
-                this.hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.42)))
+                // Animated hover wash (see the file tree rows).
+                let is_dark = cx.theme().is_dark();
+                let hover_key = crate::motion::hover_key("git-tree", &git_tree_row_id);
+                this.on_hover(hover_listener(hover_key.clone()))
+                    .bg(hover_blend(
+                        &hover_key,
+                        cx.theme().transparent,
+                        crate::theme::hover_wash(is_dark),
+                    ))
             })
             .children(file_tree_guides(row.depth, cx))
             .child(div().w(px(row.depth as f32 * FILE_TREE_INDENT)).flex_none())
@@ -12628,7 +12685,21 @@ impl CodeRightRail {
                     .focusable()
                     .tab_index(0)
                     .aria_label(accessible_name)
-                    .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.60)))
+                    .when(true, |this| {
+                        // Animated hover wash (see the file tree rows).
+                        let is_dark = cx.theme().is_dark();
+                        let hover_key = crate::motion::hover_key("git-history-card", &commit.hash);
+                        this.on_hover(hover_listener(hover_key.clone()))
+                            .bg(hover_blend(
+                                &hover_key,
+                                if selected {
+                                    cx.theme().primary.opacity(0.10)
+                                } else {
+                                    cx.theme().background.opacity(0.50)
+                                },
+                                crate::theme::hover_wash(is_dark),
+                            ))
+                    })
                     .child(
                         h_flex()
                             .min_w_0()
@@ -14468,7 +14539,18 @@ fn render_commit_patch_row(
                 .role(Role::Button)
                 .aria_expanded(!collapsed)
                 .aria_label(format!("{}; +{} -{}", path, additions, deletions))
-                .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.65)))
+                .when(true, |this| {
+                    // Animated hover wash (see the file tree rows).
+                    let is_dark = cx.theme().is_dark();
+                    let hover_key =
+                        crate::motion::hover_key("commit-file", format!("{hash}:{file_index}"));
+                    this.on_hover(hover_listener(hover_key.clone()))
+                        .bg(hover_blend(
+                            &hover_key,
+                            cx.theme().muted.opacity(0.30),
+                            crate::theme::hover_wash(is_dark),
+                        ))
+                })
                 .child(
                     h_flex()
                         .min_w_0()

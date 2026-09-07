@@ -9,6 +9,7 @@ pub mod image_editor;
 pub mod local_history_import;
 pub mod locale;
 pub mod management;
+pub mod motion;
 pub mod office_surface;
 pub mod pdf_surface;
 #[allow(dead_code)]

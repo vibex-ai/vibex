@@ -3,9 +3,9 @@
   "status": "passed",
   "claimScope": "manifest_and_contract",
   "realRuntimeVerification": "blocked",
-  "capturedAt": "2026-09-02T12:42:30.776Z",
+  "capturedAt": "2026-09-07T05:53:27.994Z",
   "source": {
-    "captureParentCommit": "8dce4a6686c2b0cf4c0c9a67dd907f89621423d0",
+    "captureParentCommit": "17c24ceb6af3d76de05ec6af1929607c947403b1",
     "rustToolchain": "rustc-1.97.0",
     "sourceInputRoots": [
       "crates/core/src/acp_catalog.rs",
@@ -53,20 +53,20 @@
       "crates/vibex-ui/Cargo.toml",
       "apps/desktop/Cargo.toml"
     ],
-    "sourceInputTreeSha256": "5f14684e59555f9377e302cc5f8c357b069f84c1a926dbc8950810b068136c89",
+    "sourceInputTreeSha256": "f7e399a1519fddf7523a6393df3c6066697edb9346ccc4818c6db608c842fdd6",
     "bindings": {
       "catalog": "38e8d897562ce0c12e6ec47f6e3a55c5db1f01d99b704f5d912b0b2ee0aa4929",
       "manifest": "0c6d1c3326492fa74c842fb3848665eca15d37c4c684b8531f7d83797cfd2380",
-      "probe": "51f91a463b1a8eadacb42e292e0ad60436c5fb873a764b2e1af7d47cd49ce69f",
-      "database": "160e94fca51db879469c37fc54158c61a2fe93a6b729e53c08d0cf009f09e6ee",
-      "remote": "1f0b1dc6bf7a30f06976e3116da319f0b03c40ce2967c5bc35852a248bac6609",
-      "ui": "4a1412ec41593b0940c5eb8673fce4781d89620655a4a32d5fbddd5d64f38061",
-      "switch": "058053ebb6aed983ba1d156b59db41ad91b99e30bbee3c02e3115ddc414579de",
+      "probe": "8ba7214f61e8c38fa75438580c6505e93c78b1c9bea664cc1a0e8c2019cbe2dc",
+      "database": "74cecd2becc54f8914482b1a2bae5e7b62cd7dedd0b1315994594e1665781f8a",
+      "remote": "ab476d4e931460fb81cc53be04c7d61113135d85524dd4730b4f0e530b7b479d",
+      "ui": "b9dcbc428d11cfa27cdc91407dce2da634bf9b9a13ca57f49401728179c461b0",
+      "switch": "ed743a3308e36529dc78f662ff66214b72425b2e39e0b2f661bc6695d5546ab0",
       "scripts": "9d74e8ab705a6c006b0c05a05e3d289278f2f1015499ea391a0ce7a754691b89",
-      "packageMetadata": "bb36ef51be32cb5f0a9d315254b765049260246d9afa49718860f2222e4e0c0e"
+      "packageMetadata": "b98c51248684546d5bfed64891cc11366a3b914bf4da94ee90858c6a3ec04718"
     },
     "cargoLockSha256": "2388c341d5946ce1c113b103285edcc401fa957e54ddd4e5ad865b3b5885fa14",
-    "packageJsonSha256": "3bf13132c815037285846cd90920224559d666d9c18e15db3c1d694e7a783dfa",
+    "packageJsonSha256": "b5f48176d483aeee7c95bb0c6d210ccf3d1ba79715835a64a0867154e9c4e5dd",
     "rolloutManifestSha256": "c430500281070f883a0fe324c67127f7e6868ea46cc3e13b8ff997f8d90af6cc"
   },
   "manifest": {

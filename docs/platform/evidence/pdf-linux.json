@@ -1,12 +1,12 @@
 {
   "schemaVersion": "pdf-linux-evidence.v1",
   "status": "partial",
-  "capturedAt": "2026-07-19T08:24:08.736Z",
+  "capturedAt": "2026-09-07T05:51:55.095Z",
   "source": {
     "vibexBaselineCommit": "f1c624f115401d6160a771545fa1ec73128394b1",
-    "captureParentCommit": "1f51f0dbd31c7bdb990b87b1143fd7630f864031",
-    "rustToolchain": "rustc 1.97.0 (2d8144b78 2026-07-07) (Arch Linux rust 1:1.97.0-1)",
-    "lockfileSha256": "7a5488b1882681707399417335bf61343f78b9afaa9fbe054a41c3c98c5db959",
+    "captureParentCommit": "17c24ceb6af3d76de05ec6af1929607c947403b1",
+    "rustToolchain": "rustc 1.97.0 (2d8144b78 2026-07-07)",
+    "lockfileSha256": "2388c341d5946ce1c113b103285edcc401fa957e54ddd4e5ad865b3b5885fa14",
     "sourceInputRoots": [
       "Cargo.lock",
       "Cargo.toml",
@@ -18,7 +18,7 @@
       "scripts/generate-pdf-fixture.mjs",
       "scripts/capture-pdf.mjs"
     ],
-    "sourceInputTreeSha256": "3d131e5743c3bdc9c689579ca89f8077dca70c6ecaee796f77768f3d513480f1"
+    "sourceInputTreeSha256": "af96f2d4dbd4cbc444f69238bb093cbab8b26014f4119f4ae83db8754b126f0a"
   },
   "runner": {
     "platform": "linux",
@@ -67,17 +67,17 @@
         "width": 960,
         "height": 1358,
         "rgbaBytes": 5214720,
-        "rgbaSha256": "d141d7d28a8c8cc3c8eb107c0f0da10cbdf251239b51a27674b805c5d2a761ad",
-        "sampledUniqueColors": 400,
-        "elapsedMs": 144.129815
+        "rgbaSha256": "cf446d544a9dff5a5b7292bba15050c36aa1c6c88c77b07058742175ac1a1758",
+        "sampledUniqueColors": 394,
+        "elapsedMs": 163.84707500000002
       },
       "zoom150Percent": {
         "width": 1440,
         "height": 2038,
         "rgbaBytes": 11738880,
-        "rgbaSha256": "c5039cb1d068495452f7edf6ef28665fd5215092da53abdab67f7c820d8fb5c7",
-        "sampledUniqueColors": 375,
-        "elapsedMs": 310.204762
+        "rgbaSha256": "7db1c33690ef3f1036b449e9960918069a3ba0aa34e205a6ba3d8c904ce63182",
+        "sampledUniqueColors": 382,
+        "elapsedMs": 337.531073
       },
       "aspectRatioPreserved": true,
       "distinctZoomOutput": true,
@@ -102,9 +102,9 @@
       "loadingErrorIsStructured": true
     },
     "memory": {
-      "currentRssBeforeKib": 23728,
-      "currentRssAfterKib": 79588,
-      "processPeakRssKib": 79588,
+      "currentRssBeforeKib": 50708,
+      "currentRssAfterKib": 109148,
+      "processPeakRssKib": 109148,
       "measurementSource": "proc-self-status"
     },
     "privacy": {
@@ -115,18 +115,18 @@
   },
   "process": {
     "measurement": "proc-self-status-vmhwm",
-    "maximumResidentSetKib": 79588,
+    "maximumResidentSetKib": 109148,
     "processTreeMembers": 1,
     "childProcessesObserved": 0
   },
   "preview": {
     "path": "docs/parity/screenshots/current/spikes/linux-pdfium-page-1.png",
-    "bytes": 95668,
-    "sha256": "82207e83bf96df1bc8bd79b595ecc2aa972ee6d5b77a4b788fcaf6b54f9aa239",
+    "bytes": 96503,
+    "sha256": "3ca957a5e08bacf470a609e266543552fc5702564e34a877bc809cb4d2ca84e6",
     "width": 960,
     "height": 1358,
-    "uniqueColors": 1513,
-    "entropy": 0.12273
+    "uniqueColors": 1506,
+    "entropy": 0.123049
   },
   "licenseReview": {
     "path": "docs/licenses/pdfium-7881-review.json",

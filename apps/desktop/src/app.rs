@@ -33,7 +33,7 @@ use gpui_component::{
     ActiveTheme as _, Colorize as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath,
     InteractiveElementExt as _, Root, Selectable as _, Sizable as _, StyledExt as _, Theme,
     TitleBar, VirtualListScrollHandle, WindowExt as _,
-    animation::{Transition, ease_out_cubic},
+    animation::Transition,
     button::{Button, ButtonVariants as _},
     dialog::{DialogAction, DialogClose, DialogFooter},
     h_flex,
@@ -155,6 +155,7 @@ use crate::image_editor::{
 use crate::local_history_import::LocalHistoryImportDialog;
 use crate::locale::{self, Strings};
 use crate::management::{ManagementCenter, ManagementEvent};
+use crate::motion::{self, hover_blend, hover_listener};
 use crate::platform::{
     StorageUsage, launch_at_login_enabled, open_external_url, reveal_path_in_file_manager,
     send_system_notification, set_launch_at_login, storage_usage, ui_state_path,
@@ -25600,7 +25601,7 @@ impl VibexWorkbench {
             });
         if let (Some(offset), Some(animation_id)) = (reorder_offset, reorder_animation_id) {
             Transition::new(SIDEBAR_REORDER_TRANSITION_DURATION)
-                .ease(ease_out_cubic)
+                .ease(motion::EASE_RESORT.easing())
                 .slide_y(offset, px(0.0))
                 .apply(project, animation_id)
                 .into_any_element()
@@ -25999,7 +26000,7 @@ impl VibexWorkbench {
                 (workspace_reorder_offset, workspace_reorder_animation_id)
             {
                 Transition::new(SIDEBAR_REORDER_TRANSITION_DURATION)
-                    .ease(ease_out_cubic)
+                    .ease(motion::EASE_RESORT.easing())
                     .slide_y(offset, px(0.0))
                     .apply(workspace, animation_id)
                     .into_any_element()
@@ -26047,7 +26048,7 @@ impl VibexWorkbench {
             (workspace_reorder_offset, workspace_reorder_animation_id)
         {
             Transition::new(SIDEBAR_REORDER_TRANSITION_DURATION)
-                .ease(ease_out_cubic)
+                .ease(motion::EASE_RESORT.easing())
                 .slide_y(offset, px(0.0))
                 .apply(workspace, animation_id)
                 .into_any_element()
@@ -26135,10 +26136,12 @@ impl VibexWorkbench {
         } else {
             cx.theme().sidebar_foreground.opacity(0.56)
         };
-        let row_hover_background = if selected || move_selected {
+        let is_dark = cx.theme().is_dark();
+        let session_hover_key = motion::hover_key("sidebar-session", &session_id_string);
+        let row_hover_tone = if selected || move_selected {
             row_background
         } else {
-            sidebar_selected_session_background(cx.theme().sidebar_accent, cx.theme().is_dark())
+            theme::hover_wash(is_dark)
         };
 
         if renaming {
@@ -26295,6 +26298,15 @@ impl VibexWorkbench {
                             .then_some(target.after)
                     })
             });
+        // Animated hover wash: the row background blends from its rest state to
+        // the hover wash over 150ms instead of snapping (theme state washes).
+        let row_rest_background = if active_drop_after.is_some() {
+            cx.theme().tokens.drop_target.into()
+        } else if !selected && !move_selected && context_menu_hovered {
+            theme::hover_wash(is_dark)
+        } else {
+            row_background
+        };
         let drag_payload = SidebarSessionDrag {
             session_id: session.id.clone(),
             session_ids: drag_session_ids,
@@ -26354,18 +26366,12 @@ impl VibexWorkbench {
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
             .anchor_scroll(selected.then(|| self.selected_session_scroll_anchor.clone()))
             .rounded(px(8.0))
-            .bg(if active_drop_after.is_some() {
-                cx.theme().tokens.drop_target.into()
-            } else if selected {
-                row_background
-            } else {
-                if context_menu_hovered {
-                    cx.theme().sidebar_accent.opacity(0.45)
-                } else {
-                    row_background
-                }
+            .bg(row_rest_background)
+            .on_hover(hover_listener(session_hover_key.clone()))
+            .map(|row| {
+                let tone = hover_blend(&session_hover_key, row_rest_background, row_hover_tone);
+                row.hover(move |style| style.bg(tone))
             })
-            .hover(move |style| style.bg(row_hover_background))
             .when_some(active_drop_after, |this, after| {
                 this.child(
                     div()
@@ -26831,7 +26837,7 @@ impl VibexWorkbench {
             });
         if let (Some(offset), Some(animation_id)) = (reorder_offset, reorder_animation_id) {
             Transition::new(SIDEBAR_REORDER_TRANSITION_DURATION)
-                .ease(ease_out_cubic)
+                .ease(motion::EASE_RESORT.easing())
                 .slide_y(offset, px(0.0))
                 .apply(row, animation_id)
                 .into_any_element()
@@ -28765,14 +28771,14 @@ impl VibexWorkbench {
                 .into_any_element()
         } else if project_menu_open {
             Transition::new(NEW_SESSION_PROJECT_MENU_TRANSITION_DURATION)
-                .ease(ease_out_cubic)
+                .ease(motion::MENU_IN.curve.easing())
                 .slide_y(px(-8.0), px(0.0))
                 .fade(0.0, 1.0)
                 .apply(project_menu_panel, "new-session-project-menu-open")
                 .into_any_element()
         } else {
             Transition::new(NEW_SESSION_PROJECT_MENU_TRANSITION_DURATION)
-                .ease(ease_out_cubic)
+                .ease(motion::MENU_IN.curve.easing())
                 .fade(1.0, 0.0)
                 .apply(project_menu_panel, "new-session-project-menu-close")
                 .into_any_element()
@@ -30057,7 +30063,7 @@ impl VibexWorkbench {
                         card.into_any_element()
                     } else {
                         Transition::new(AGENT_TURN_PREVIEW_CARD_TRANSITION_DURATION)
-                            .ease(ease_out_cubic)
+                            .ease(motion::EASE_OUT_EXPO.easing())
                             .slide_x(px(-7.2), px(0.0))
                             .fade(0.0, 1.0)
                             .apply(card, format!("turn-preview-card-open-{preview_index}"))
@@ -30125,7 +30131,7 @@ impl VibexWorkbench {
             list.into_any_element()
         } else {
             Transition::new(AGENT_TURN_PREVIEW_RAIL_TRANSITION_DURATION)
-                .ease(ease_out_cubic)
+                .ease(motion::EASE_OUT_EXPO.easing())
                 .slide_x(px(-5.6), px(0.0))
                 .fade(0.0, 1.0)
                 .apply(list, "agent-turn-preview-rail-open")
@@ -30475,14 +30481,14 @@ impl VibexWorkbench {
                     control.into_any_element()
                 } else if timeline_bottom_control_visible {
                     Transition::new(AGENT_TIMELINE_BOTTOM_CONTROL_TRANSITION_DURATION)
-                        .ease(ease_out_cubic)
+                        .ease(motion::EASE.easing())
                         .height(px(0.0), px(AGENT_TIMELINE_BOTTOM_CONTROL_HEIGHT_PX))
                         .fade(0.0, 1.0)
                         .apply(control, "agent-timeline-bottom-control-open")
                         .into_any_element()
                 } else {
                     Transition::new(AGENT_TIMELINE_BOTTOM_CONTROL_TRANSITION_DURATION)
-                        .ease(ease_out_cubic)
+                        .ease(motion::EASE.easing())
                         .height(px(AGENT_TIMELINE_BOTTOM_CONTROL_HEIGHT_PX), px(0.0))
                         .fade(1.0, 0.0)
                         .apply(control, "agent-timeline-bottom-control-close")
@@ -31249,14 +31255,18 @@ impl VibexWorkbench {
             } else {
                 cx.theme().transparent
             })
-            .hover(|style| {
-                style
-                    .bg(cx
-                        .theme()
-                        .background
-                        .opacity(if active { 1.0 } else { 0.62 }))
-                    .text_color(cx.theme().foreground)
+            .when(!active, |this| {
+                // Animated hover wash: the tab brightens toward the active
+                // plate instead of snapping between two opaque fills.
+                let hover_key = motion::hover_key("composer-terminal-tab", &terminal_id_string);
+                this.on_hover(hover_listener(hover_key.clone()))
+                    .bg(hover_blend(
+                        &hover_key,
+                        cx.theme().transparent,
+                        cx.theme().background.opacity(0.62),
+                    ))
             })
+            .hover(|style| style.text_color(cx.theme().foreground))
             .focus_visible(|style| {
                 style.shadow(vec![
                     gpui::BoxShadow::new(px(0.0), px(0.0), cx.theme().ring).spread_radius(px(1.0)),
@@ -32017,440 +32027,429 @@ impl VibexWorkbench {
             .is_some_and(|session| session.can_redo());
         let text_input = self.image_editor_text_input.clone();
 
-        Some(
-            div()
-                .id("attachment-image-preview")
-                .absolute()
-                .inset_0()
-                .occlude()
-                .overflow_hidden()
-                .bg(gpui::black().opacity(0.80))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        if this
-                            .attachment_image_preview
-                            .as_ref()
-                            .is_some_and(|preview| preview.editing)
-                        {
-                            cx.stop_propagation();
-                        } else {
-                            this.close_attachment_preview(cx);
-                        }
-                    }),
-                )
-                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
-                    if event.dragging()
-                        && this
-                            .attachment_image_preview
-                            .as_ref()
-                            .is_some_and(|preview| preview.editing && preview.edit_drag.is_some())
+        let attachment_preview = div()
+            .id("attachment-image-preview")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .overflow_hidden()
+            .bg(gpui::black().opacity(0.80))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this
+                        .attachment_image_preview
+                        .as_ref()
+                        .is_some_and(|preview| preview.editing)
                     {
-                        this.update_attachment_edit_gesture(
-                            f32::from(event.position.x),
-                            f32::from(event.position.y),
-                            cx,
-                        );
-                        window.prevent_default();
                         cx.stop_propagation();
-                    } else if event.dragging()
-                        && this
-                            .attachment_image_preview
-                            .as_ref()
-                            .is_some_and(|preview| preview.drag.is_some())
-                    {
-                        this.update_attachment_preview_drag(
-                            f32::from(event.position.x),
-                            f32::from(event.position.y),
-                            cx,
-                        );
-                        window.prevent_default();
-                        cx.stop_propagation();
+                    } else {
+                        this.close_attachment_preview(cx);
                     }
-                }))
-                .on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        if this
-                            .attachment_image_preview
-                            .as_ref()
-                            .is_some_and(|preview| preview.edit_drag.is_some())
-                        {
-                            this.finish_attachment_edit_gesture(cx);
-                        } else {
-                            this.finish_attachment_preview_drag(cx);
-                        }
-                    }),
-                )
-                .on_mouse_up_out(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        if this
-                            .attachment_image_preview
-                            .as_ref()
-                            .is_some_and(|preview| preview.edit_drag.is_some())
-                        {
-                            this.finish_attachment_edit_gesture(cx);
-                        } else {
-                            this.finish_attachment_preview_drag(cx);
-                        }
-                    }),
-                )
-                .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
-                    let y = match event.delta {
-                        ScrollDelta::Lines(point) => point.y,
-                        ScrollDelta::Pixels(point) => f32::from(point.y),
-                    };
-                    if y != 0.0 {
-                        this.adjust_attachment_preview_zoom(if y > 0.0 { 0.12 } else { -0.12 }, cx);
-                    }
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                if event.dragging()
+                    && this
+                        .attachment_image_preview
+                        .as_ref()
+                        .is_some_and(|preview| preview.editing && preview.edit_drag.is_some())
+                {
+                    this.update_attachment_edit_gesture(
+                        f32::from(event.position.x),
+                        f32::from(event.position.y),
+                        cx,
+                    );
+                    window.prevent_default();
                     cx.stop_propagation();
-                }))
-                .child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .overflow_hidden()
-                        .px(px(IMAGE_PREVIEW_HORIZONTAL_PADDING))
-                        .pt(px(IMAGE_PREVIEW_VERTICAL_PADDING))
-                        .pb(px(IMAGE_PREVIEW_VERTICAL_PADDING))
-                        .child(
-                            div()
-                                .flex_none()
-                                .w(px(image_width))
-                                .h(px(image_height))
-                                .relative()
-                                .left(px(pan_x))
-                                .top(px(pan_y))
-                                .when(editing, |this| this.cursor_crosshair())
-                                .when(can_pan && !editing && !dragging, |this| this.cursor_grab())
-                                .when(can_pan && !editing && dragging, |this| {
-                                    this.cursor_grabbing()
-                                })
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                        if this
-                                            .attachment_image_preview
-                                            .as_ref()
-                                            .is_some_and(|preview| preview.editing)
-                                        {
-                                            this.begin_attachment_edit_gesture(
-                                                f32::from(event.position.x),
-                                                f32::from(event.position.y),
-                                                cx,
-                                            );
-                                        } else if can_pan {
-                                            this.begin_attachment_preview_drag(
-                                                f32::from(event.position.x),
-                                                f32::from(event.position.y),
-                                                cx,
-                                            );
-                                        }
-                                        window.prevent_default();
-                                        cx.stop_propagation();
-                                    }),
-                                )
-                                .context_menu(move |menu, _, _| {
-                                    let copy_entity = copy_entity.clone();
-                                    let source = copy_source.clone();
-                                    let mime_type = copy_mime_type.clone();
-                                    menu.item(
-                                        PopupMenuItem::new(locale::text(
-                                            "Copy image",
-                                            "复制图片",
-                                            "複製圖片",
-                                        ))
-                                        .icon(IconName::Copy)
-                                        .on_click(
-                                            move |_, _, cx| {
-                                                let _ = copy_entity.update(cx, |this, cx| {
-                                                    this.copy_attachment_preview_image(
-                                                        &source,
-                                                        mime_type.as_deref(),
-                                                        cx,
-                                                    );
-                                                });
-                                            },
-                                        ),
-                                    )
-                                })
-                                .child(image_element),
-                        ),
-                )
-                .child(
-                    h_flex()
-                        .absolute()
-                        .top(px(16.0))
-                        .right(px(16.0))
-                        .items_center()
-                        .gap_2()
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .when(editable && !editing, |this| {
-                            this.child(
-                                Button::new("edit-attachment-preview")
-                                    .ghost()
-                                    .compact()
-                                    .size(px(40.0))
-                                    .rounded(gpui_component::button::ButtonRounded::Size(px(999.0)))
-                                    .bg(cx.theme().foreground.opacity(0.12))
-                                    .text_color(cx.theme().foreground)
-                                    .icon(Icon::default().path("icons/vibex/pencil.svg"))
-                                    .tooltip(locale::text("Edit image", "编辑图片", "編輯圖片"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.toggle_attachment_editor(cx)
-                                    })),
+                } else if event.dragging()
+                    && this
+                        .attachment_image_preview
+                        .as_ref()
+                        .is_some_and(|preview| preview.drag.is_some())
+                {
+                    this.update_attachment_preview_drag(
+                        f32::from(event.position.x),
+                        f32::from(event.position.y),
+                        cx,
+                    );
+                    window.prevent_default();
+                    cx.stop_propagation();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this
+                        .attachment_image_preview
+                        .as_ref()
+                        .is_some_and(|preview| preview.edit_drag.is_some())
+                    {
+                        this.finish_attachment_edit_gesture(cx);
+                    } else {
+                        this.finish_attachment_preview_drag(cx);
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this
+                        .attachment_image_preview
+                        .as_ref()
+                        .is_some_and(|preview| preview.edit_drag.is_some())
+                    {
+                        this.finish_attachment_edit_gesture(cx);
+                    } else {
+                        this.finish_attachment_preview_drag(cx);
+                    }
+                }),
+            )
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                let y = match event.delta {
+                    ScrollDelta::Lines(point) => point.y,
+                    ScrollDelta::Pixels(point) => f32::from(point.y),
+                };
+                if y != 0.0 {
+                    this.adjust_attachment_preview_zoom(if y > 0.0 { 0.12 } else { -0.12 }, cx);
+                }
+                cx.stop_propagation();
+            }))
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .overflow_hidden()
+                    .px(px(IMAGE_PREVIEW_HORIZONTAL_PADDING))
+                    .pt(px(IMAGE_PREVIEW_VERTICAL_PADDING))
+                    .pb(px(IMAGE_PREVIEW_VERTICAL_PADDING))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(image_width))
+                            .h(px(image_height))
+                            .relative()
+                            .left(px(pan_x))
+                            .top(px(pan_y))
+                            .when(editing, |this| this.cursor_crosshair())
+                            .when(can_pan && !editing && !dragging, |this| this.cursor_grab())
+                            .when(can_pan && !editing && dragging, |this| {
+                                this.cursor_grabbing()
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                    if this
+                                        .attachment_image_preview
+                                        .as_ref()
+                                        .is_some_and(|preview| preview.editing)
+                                    {
+                                        this.begin_attachment_edit_gesture(
+                                            f32::from(event.position.x),
+                                            f32::from(event.position.y),
+                                            cx,
+                                        );
+                                    } else if can_pan {
+                                        this.begin_attachment_preview_drag(
+                                            f32::from(event.position.x),
+                                            f32::from(event.position.y),
+                                            cx,
+                                        );
+                                    }
+                                    window.prevent_default();
+                                    cx.stop_propagation();
+                                }),
                             )
-                        })
-                        .when(editing, |this| {
-                            this.child(
-                                h_flex()
-                                    .items_center()
-                                    .gap(px(2.0))
-                                    .rounded(px(10.0))
-                                    .bg(cx.theme().foreground.opacity(0.12))
-                                    .p(px(3.0))
-                                    .children(ImageEditTool::ALL.into_iter().map(|tool| {
-                                        let selected = selected_tool == tool;
-                                        Button::new(format!("attachment-edit-tool-{}", tool.id()))
-                                            .ghost()
-                                            .compact()
-                                            .size(px(32.0))
-                                            .when(selected, |button| button.primary())
-                                            .icon(match tool {
-                                                ImageEditTool::Crop => {
-                                                    Icon::default().path("icons/vibex/scissors.svg")
-                                                }
-                                                ImageEditTool::Brush => {
-                                                    Icon::default().path("icons/vibex/pencil.svg")
-                                                }
-                                                ImageEditTool::Text => {
-                                                    Icon::new(IconName::CaseSensitive)
-                                                }
-                                                ImageEditTool::Rectangle => Icon::default()
-                                                    .path("icons/vibex/rectangle-outline.svg"),
-                                                ImageEditTool::Circle => Icon::default()
-                                                    .path("icons/vibex/circle-outline.svg"),
-                                                ImageEditTool::Arrow => {
-                                                    Icon::new(IconName::ArrowUp)
-                                                }
-                                                ImageEditTool::Mosaic => {
-                                                    Icon::default().path("icons/vibex/mosaic.svg")
-                                                }
-                                            })
-                                            .tooltip(match tool {
-                                                ImageEditTool::Crop => {
-                                                    locale::text("Crop", "裁剪", "裁剪")
-                                                }
-                                                ImageEditTool::Brush => {
-                                                    locale::text("Brush", "笔画", "筆畫")
-                                                }
-                                                ImageEditTool::Text => {
-                                                    locale::text("Text", "文字", "文字")
-                                                }
-                                                ImageEditTool::Rectangle => {
-                                                    locale::text("Rectangle", "矩形框", "矩形框")
-                                                }
-                                                ImageEditTool::Circle => {
-                                                    locale::text("Circle", "圆形框", "圓形框")
-                                                }
-                                                ImageEditTool::Arrow => {
-                                                    locale::text("Arrow", "箭头", "箭頭")
-                                                }
-                                                ImageEditTool::Mosaic => {
-                                                    locale::text("Mosaic", "马赛克", "馬賽克")
-                                                }
-                                            })
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.select_attachment_edit_tool(tool, cx)
-                                            }))
-                                    }))
-                                    .when(selected_tool == ImageEditTool::Text, |this| {
-                                        this.child(
-                                            div()
-                                                .w(px(120.0))
-                                                .h(px(30.0))
-                                                .rounded(px(6.0))
-                                                .bg(cx.theme().background)
-                                                .child(
-                                                    Input::new(&text_input)
-                                                        .appearance(false)
-                                                        .size_full(),
-                                                ),
-                                        )
-                                    })
-                                    .child(
-                                        Button::new("undo-attachment-edit")
-                                            .ghost()
-                                            .compact()
-                                            .size(px(32.0))
-                                            .icon(IconName::Undo2)
-                                            .disabled(!can_undo)
-                                            .tooltip(locale::text(
-                                                "Undo edit",
-                                                "撤销编辑",
-                                                "復原編輯",
-                                            ))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.undo_attachment_edit(cx)
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("redo-attachment-edit")
-                                            .ghost()
-                                            .compact()
-                                            .size(px(32.0))
-                                            .icon(IconName::Redo2)
-                                            .disabled(!can_redo)
-                                            .tooltip(locale::text(
-                                                "Redo edit",
-                                                "重做编辑",
-                                                "重做編輯",
-                                            ))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.redo_attachment_edit(cx)
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("cancel-attachment-edit")
-                                            .ghost()
-                                            .compact()
-                                            .size(px(32.0))
-                                            .icon(IconName::Close)
-                                            .tooltip(locale::text(
-                                                "Cancel editing",
-                                                "取消编辑",
-                                                "取消編輯",
-                                            ))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.cancel_attachment_editor(cx)
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("finish-attachment-edit")
-                                            .primary()
-                                            .compact()
-                                            .size(px(32.0))
-                                            .icon(IconName::Check)
-                                            .tooltip(locale::text(
-                                                "Finish editing",
-                                                "完成编辑",
-                                                "完成編輯",
-                                            ))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.toggle_attachment_editor(cx)
-                                            })),
+                            .context_menu(move |menu, _, _| {
+                                let copy_entity = copy_entity.clone();
+                                let source = copy_source.clone();
+                                let mime_type = copy_mime_type.clone();
+                                menu.item(
+                                    PopupMenuItem::new(locale::text(
+                                        "Copy image",
+                                        "复制图片",
+                                        "複製圖片",
+                                    ))
+                                    .icon(IconName::Copy)
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            let _ = copy_entity.update(cx, |this, cx| {
+                                                this.copy_attachment_preview_image(
+                                                    &source,
+                                                    mime_type.as_deref(),
+                                                    cx,
+                                                );
+                                            });
+                                        },
                                     ),
-                            )
-                        })
-                        .child(
-                            Button::new("save-attachment-preview")
-                                .ghost()
-                                .compact()
-                                .size(px(40.0))
-                                .rounded(gpui_component::button::ButtonRounded::Size(px(999.0)))
-                                .bg(cx.theme().foreground.opacity(0.12))
-                                .text_color(cx.theme().foreground)
-                                .icon(
-                                    Icon::default()
-                                        .path("icons/vibex/download.svg")
-                                        .size(px(18.0)),
                                 )
-                                .tooltip(locale::text("Save image", "保存图片", "儲存圖片"))
-                                .disabled(self.composer_attachment_task.is_some())
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.choose_attachment_save_copy(
-                                        save_source.clone(),
-                                        save_label.clone(),
-                                        cx,
-                                    )
-                                })),
-                        )
-                        .child(
-                            Button::new("close-attachment-preview")
+                            })
+                            .child(image_element),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .absolute()
+                    .top(px(16.0))
+                    .right(px(16.0))
+                    .items_center()
+                    .gap_2()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .when(editable && !editing, |this| {
+                        this.child(
+                            Button::new("edit-attachment-preview")
                                 .ghost()
                                 .compact()
                                 .size(px(40.0))
                                 .rounded(gpui_component::button::ButtonRounded::Size(px(999.0)))
                                 .bg(cx.theme().foreground.opacity(0.12))
                                 .text_color(cx.theme().foreground)
-                                .icon(IconName::Close)
-                                .tooltip(locale::text(
-                                    "Close image preview",
-                                    "关闭图片预览",
-                                    "關閉圖片預覽",
-                                ))
+                                .icon(Icon::default().path("icons/vibex/pencil.svg"))
+                                .tooltip(locale::text("Edit image", "编辑图片", "編輯圖片"))
                                 .on_click(
-                                    cx.listener(|this, _, _, cx| this.close_attachment_preview(cx)),
+                                    cx.listener(|this, _, _, cx| this.toggle_attachment_editor(cx)),
                                 ),
-                        ),
-                )
-                .child(
-                    h_flex()
-                        .absolute()
-                        .left_0()
-                        .right_0()
-                        .bottom(px(24.0))
-                        .justify_center()
-                        .px_6()
-                        .child(
+                        )
+                    })
+                    .when(editing, |this| {
+                        this.child(
                             h_flex()
                                 .items_center()
-                                .gap(px(5.0))
-                                .rounded(px(999.0))
-                                .border_1()
-                                .border_color(cx.theme().border.opacity(0.80))
-                                .bg(cx.theme().popover.opacity(0.72))
-                                .p(px(5.0))
-                                .shadow_lg()
-                                .text_color(cx.theme().popover_foreground)
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .child(
-                                    Button::new("attachment-preview-zoom-out")
+                                .gap(px(2.0))
+                                .rounded(px(10.0))
+                                .bg(cx.theme().foreground.opacity(0.12))
+                                .p(px(3.0))
+                                .children(ImageEditTool::ALL.into_iter().map(|tool| {
+                                    let selected = selected_tool == tool;
+                                    Button::new(format!("attachment-edit-tool-{}", tool.id()))
                                         .ghost()
                                         .compact()
                                         .size(px(32.0))
-                                        .rounded(gpui_component::button::ButtonRounded::Size(px(
-                                            999.0,
-                                        )))
-                                        .icon(IconName::Minus)
-                                        .tooltip(locale::text("Zoom out", "缩小", "縮小"))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.adjust_attachment_preview_zoom(-0.25, cx)
-                                        })),
-                                )
+                                        .when(selected, |button| button.primary())
+                                        .icon(match tool {
+                                            ImageEditTool::Crop => {
+                                                Icon::default().path("icons/vibex/scissors.svg")
+                                            }
+                                            ImageEditTool::Brush => {
+                                                Icon::default().path("icons/vibex/pencil.svg")
+                                            }
+                                            ImageEditTool::Text => {
+                                                Icon::new(IconName::CaseSensitive)
+                                            }
+                                            ImageEditTool::Rectangle => Icon::default()
+                                                .path("icons/vibex/rectangle-outline.svg"),
+                                            ImageEditTool::Circle => Icon::default()
+                                                .path("icons/vibex/circle-outline.svg"),
+                                            ImageEditTool::Arrow => Icon::new(IconName::ArrowUp),
+                                            ImageEditTool::Mosaic => {
+                                                Icon::default().path("icons/vibex/mosaic.svg")
+                                            }
+                                        })
+                                        .tooltip(match tool {
+                                            ImageEditTool::Crop => {
+                                                locale::text("Crop", "裁剪", "裁剪")
+                                            }
+                                            ImageEditTool::Brush => {
+                                                locale::text("Brush", "笔画", "筆畫")
+                                            }
+                                            ImageEditTool::Text => {
+                                                locale::text("Text", "文字", "文字")
+                                            }
+                                            ImageEditTool::Rectangle => {
+                                                locale::text("Rectangle", "矩形框", "矩形框")
+                                            }
+                                            ImageEditTool::Circle => {
+                                                locale::text("Circle", "圆形框", "圓形框")
+                                            }
+                                            ImageEditTool::Arrow => {
+                                                locale::text("Arrow", "箭头", "箭頭")
+                                            }
+                                            ImageEditTool::Mosaic => {
+                                                locale::text("Mosaic", "马赛克", "馬賽克")
+                                            }
+                                        })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.select_attachment_edit_tool(tool, cx)
+                                        }))
+                                }))
+                                .when(selected_tool == ImageEditTool::Text, |this| {
+                                    this.child(
+                                        div()
+                                            .w(px(120.0))
+                                            .h(px(30.0))
+                                            .rounded(px(6.0))
+                                            .bg(cx.theme().background)
+                                            .child(
+                                                Input::new(&text_input)
+                                                    .appearance(false)
+                                                    .size_full(),
+                                            ),
+                                    )
+                                })
                                 .child(
-                                    Button::new("attachment-preview-reset-zoom")
-                                        .ghost()
-                                        .compact()
-                                        .h(px(32.0))
-                                        .min_w(px(68.0))
-                                        .px(px(7.0))
-                                        .label(zoom_label)
-                                        .tooltip(locale::text("Reset zoom", "重置缩放", "重設縮放"))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.set_attachment_preview_zoom(1.0, cx)
-                                        })),
-                                )
-                                .child(
-                                    Button::new("attachment-preview-zoom-in")
+                                    Button::new("undo-attachment-edit")
                                         .ghost()
                                         .compact()
                                         .size(px(32.0))
-                                        .rounded(gpui_component::button::ButtonRounded::Size(px(
-                                            999.0,
-                                        )))
-                                        .icon(IconName::Plus)
-                                        .tooltip(locale::text("Zoom in", "放大", "放大"))
+                                        .icon(IconName::Undo2)
+                                        .disabled(!can_undo)
+                                        .tooltip(locale::text("Undo edit", "撤销编辑", "復原編輯"))
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            this.adjust_attachment_preview_zoom(0.25, cx)
+                                            this.undo_attachment_edit(cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new("redo-attachment-edit")
+                                        .ghost()
+                                        .compact()
+                                        .size(px(32.0))
+                                        .icon(IconName::Redo2)
+                                        .disabled(!can_redo)
+                                        .tooltip(locale::text("Redo edit", "重做编辑", "重做編輯"))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.redo_attachment_edit(cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new("cancel-attachment-edit")
+                                        .ghost()
+                                        .compact()
+                                        .size(px(32.0))
+                                        .icon(IconName::Close)
+                                        .tooltip(locale::text(
+                                            "Cancel editing",
+                                            "取消编辑",
+                                            "取消編輯",
+                                        ))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.cancel_attachment_editor(cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new("finish-attachment-edit")
+                                        .primary()
+                                        .compact()
+                                        .size(px(32.0))
+                                        .icon(IconName::Check)
+                                        .tooltip(locale::text(
+                                            "Finish editing",
+                                            "完成编辑",
+                                            "完成編輯",
+                                        ))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.toggle_attachment_editor(cx)
                                         })),
                                 ),
-                        ),
-                )
+                        )
+                    })
+                    .child(
+                        Button::new("save-attachment-preview")
+                            .ghost()
+                            .compact()
+                            .size(px(40.0))
+                            .rounded(gpui_component::button::ButtonRounded::Size(px(999.0)))
+                            .bg(cx.theme().foreground.opacity(0.12))
+                            .text_color(cx.theme().foreground)
+                            .icon(
+                                Icon::default()
+                                    .path("icons/vibex/download.svg")
+                                    .size(px(18.0)),
+                            )
+                            .tooltip(locale::text("Save image", "保存图片", "儲存圖片"))
+                            .disabled(self.composer_attachment_task.is_some())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.choose_attachment_save_copy(
+                                    save_source.clone(),
+                                    save_label.clone(),
+                                    cx,
+                                )
+                            })),
+                    )
+                    .child(
+                        Button::new("close-attachment-preview")
+                            .ghost()
+                            .compact()
+                            .size(px(40.0))
+                            .rounded(gpui_component::button::ButtonRounded::Size(px(999.0)))
+                            .bg(cx.theme().foreground.opacity(0.12))
+                            .text_color(cx.theme().foreground)
+                            .icon(IconName::Close)
+                            .tooltip(locale::text(
+                                "Close image preview",
+                                "关闭图片预览",
+                                "關閉圖片預覽",
+                            ))
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.close_attachment_preview(cx)),
+                            ),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom(px(24.0))
+                    .justify_center()
+                    .px_6()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap(px(5.0))
+                            .rounded(px(999.0))
+                            .border_1()
+                            .border_color(cx.theme().border.opacity(0.80))
+                            .bg(cx.theme().popover.opacity(0.72))
+                            .p(px(5.0))
+                            .shadow_lg()
+                            .text_color(cx.theme().popover_foreground)
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(
+                                Button::new("attachment-preview-zoom-out")
+                                    .ghost()
+                                    .compact()
+                                    .size(px(32.0))
+                                    .rounded(gpui_component::button::ButtonRounded::Size(px(999.0)))
+                                    .icon(IconName::Minus)
+                                    .tooltip(locale::text("Zoom out", "缩小", "縮小"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.adjust_attachment_preview_zoom(-0.25, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("attachment-preview-reset-zoom")
+                                    .ghost()
+                                    .compact()
+                                    .h(px(32.0))
+                                    .min_w(px(68.0))
+                                    .px(px(7.0))
+                                    .label(zoom_label)
+                                    .tooltip(locale::text("Reset zoom", "重置缩放", "重設縮放"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_attachment_preview_zoom(1.0, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("attachment-preview-zoom-in")
+                                    .ghost()
+                                    .compact()
+                                    .size(px(32.0))
+                                    .rounded(gpui_component::button::ButtonRounded::Size(px(999.0)))
+                                    .icon(IconName::Plus)
+                                    .tooltip(locale::text("Zoom in", "放大", "放大"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.adjust_attachment_preview_zoom(0.25, cx)
+                                    })),
+                            ),
+                    ),
+            );
+        // Entrance fade + lift: the overlay mounts once when opened, so the
+        // one-shot animation replays only on a fresh open.
+        Some(
+            motion::overlay_in("attachment-image-preview-enter", attachment_preview)
                 .into_any_element(),
         )
     }
@@ -37150,25 +37149,30 @@ impl VibexWorkbench {
             })
             .overflow_y_scrollbar();
 
-        v_flex()
-            .id(format!("composer-command-menu:{}", target.id()))
-            .role(Role::ListBox)
-            .aria_label("Composer commands")
-            .absolute()
-            .left(px(menu_left))
-            .w(px(menu_width))
-            .max_h(px(menu_placement.max_height))
-            .occlude()
-            .overflow_hidden()
-            .rounded(px(12.0))
-            .border_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().popover.opacity(0.985))
-            .shadow_xl()
-            .child(menu_header)
-            .child(scroll_content)
-            .bottom(px(menu_placement.window_edge_offset))
-            .into_any_element()
+        // Quick opacity pop on mount; stays mounted while typing so the fade
+        // does not replay per keystroke.
+        motion::fade_quick(
+            "composer-command-menu-enter",
+            v_flex()
+                .id(format!("composer-command-menu:{}", target.id()))
+                .role(Role::ListBox)
+                .aria_label("Composer commands")
+                .absolute()
+                .left(px(menu_left))
+                .w(px(menu_width))
+                .max_h(px(menu_placement.max_height))
+                .occlude()
+                .overflow_hidden()
+                .rounded(px(12.0))
+                .border_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().popover.opacity(0.985))
+                .shadow_xl()
+                .child(menu_header)
+                .child(scroll_content)
+                .bottom(px(menu_placement.window_edge_offset)),
+        )
+        .into_any_element()
     }
 
     fn render_composer_collaboration(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -39060,7 +39064,7 @@ impl VibexWorkbench {
                 .into_any_element()
         } else {
             Transition::new(SIDEBAR_INLINE_TRANSITION_DURATION)
-                .ease(ease_out_cubic)
+                .ease(motion::EASE_OUT_EXPO.easing())
                 .width(
                     px(animation_state.from_value),
                     px(animation_state.target_value),
@@ -39163,7 +39167,7 @@ impl VibexWorkbench {
                 .into_any_element()
         } else {
             Transition::new(SIDEBAR_FLOATING_TRANSITION_DURATION)
-                .ease(ease_out_cubic)
+                .ease(motion::EASE_OUT_EXPO.easing())
                 .slide_x(
                     px(animation_state.animation.from_value),
                     px(animation_state.animation.target_value),
@@ -39190,7 +39194,7 @@ impl VibexWorkbench {
                 .right_0()
                 .bottom_0()
                 .left_0()
-                .bg(gpui::black().opacity(0.80))
+                .bg(cx.theme().overlay)
                 .occlude()
                 .on_mouse_down(
                     MouseButton::Left,
@@ -39211,7 +39215,7 @@ impl VibexWorkbench {
                         .into_any_element()
                 } else {
                     Transition::new(SIDEBAR_FLOATING_TRANSITION_DURATION)
-                        .ease(ease_out_cubic)
+                        .ease(motion::EASE_OUT_EXPO.easing())
                         .fade(
                             animation_state.animation.from_opacity,
                             animation_state.animation.target_opacity,
@@ -39413,114 +39417,114 @@ impl VibexWorkbench {
         };
         let backdrop_opacity = if cx.theme().is_dark() { 0.72 } else { 0.46 };
 
-        Some(
-            div()
-                .id("session-search-overlay")
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .p_4()
-                .bg(gpui::black().opacity(backdrop_opacity))
-                .occlude()
-                .capture_key_down(cx.listener(Self::on_session_search_key_down))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, window, cx| this.close_session_search(window, cx)),
-                )
-                .child(
-                    v_flex()
-                        .id("session-search-dialog")
-                        .w(px(dialog_width))
-                        .h(px(dialog_height))
-                        .max_w_full()
-                        .max_h_full()
-                        .overflow_hidden()
-                        .rounded(px(8.0))
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .bg(cx.theme().popover)
-                        .text_color(cx.theme().popover_foreground)
-                        .shadow_lg()
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(
-                            h_flex()
-                                .h(px(56.0))
-                                .w_full()
-                                .flex_none()
-                                .items_center()
-                                .gap_2()
-                                .border_b_1()
-                                .border_color(cx.theme().border)
-                                .px_3()
-                                .child(
-                                    div()
-                                        .h(px(40.0))
-                                        .min_w_0()
-                                        .flex_1()
-                                        .rounded(px(6.0))
-                                        .bg(cx.theme().muted.opacity(0.42))
-                                        .child(
-                                            Input::new(&self.session_search)
-                                                .h_full()
-                                                .w_full()
-                                                .appearance(false)
-                                                .prefix(
-                                                    Icon::new(IconName::Search)
-                                                        .small()
-                                                        .text_color(cx.theme().muted_foreground),
-                                                ),
-                                        ),
+        let search_overlay = div()
+            .id("session-search-overlay")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .bg(gpui::black().opacity(backdrop_opacity))
+            .occlude()
+            .capture_key_down(cx.listener(Self::on_session_search_key_down))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.close_session_search(window, cx)),
+            )
+            .child(
+                v_flex()
+                    .id("session-search-dialog")
+                    .w(px(dialog_width))
+                    .h(px(dialog_height))
+                    .max_w_full()
+                    .max_h_full()
+                    .overflow_hidden()
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().popover)
+                    .text_color(cx.theme().popover_foreground)
+                    .shadow_lg()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        h_flex()
+                            .h(px(56.0))
+                            .w_full()
+                            .flex_none()
+                            .items_center()
+                            .gap_2()
+                            .border_b_1()
+                            .border_color(cx.theme().border)
+                            .px_3()
+                            .child(
+                                div()
+                                    .h(px(40.0))
+                                    .min_w_0()
+                                    .flex_1()
+                                    .rounded(px(6.0))
+                                    .bg(cx.theme().muted.opacity(0.42))
+                                    .child(
+                                        Input::new(&self.session_search)
+                                            .h_full()
+                                            .w_full()
+                                            .appearance(false)
+                                            .prefix(
+                                                Icon::new(IconName::Search)
+                                                    .small()
+                                                    .text_color(cx.theme().muted_foreground),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                Button::new("session-search-close")
+                                    .small()
+                                    .ghost()
+                                    .compact()
+                                    .size(px(32.0))
+                                    .icon(IconName::Close)
+                                    .tooltip(strings.session_search_close)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.close_session_search(window, cx)
+                                    })),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .h(px(34.0))
+                            .w_full()
+                            .flex_none()
+                            .items_center()
+                            .justify_between()
+                            .border_b_1()
+                            .border_color(cx.theme().border.opacity(0.70))
+                            .px_4()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(section_label)
+                            .when(self.session_search_index_loading, |this| {
+                                this.child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(Spinner::new().xsmall())
+                                        .child(strings.session_search_loading),
                                 )
-                                .child(
-                                    Button::new("session-search-close")
-                                        .small()
-                                        .ghost()
-                                        .compact()
-                                        .size(px(32.0))
-                                        .icon(IconName::Close)
-                                        .tooltip(strings.session_search_close)
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.close_session_search(window, cx)
-                                        })),
-                                ),
-                        )
-                        .child(
-                            h_flex()
-                                .h(px(34.0))
-                                .w_full()
-                                .flex_none()
-                                .items_center()
-                                .justify_between()
-                                .border_b_1()
-                                .border_color(cx.theme().border.opacity(0.70))
-                                .px_4()
-                                .text_xs()
-                                .font_medium()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(section_label)
-                                .when(self.session_search_index_loading, |this| {
-                                    this.child(
-                                        h_flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .child(Spinner::new().xsmall())
-                                            .child(strings.session_search_loading),
-                                    )
-                                }),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_h_0()
-                                .w_full()
-                                .overflow_hidden()
-                                .child(result_list),
-                        ),
-                )
-                .into_any_element(),
-        )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .w_full()
+                            .overflow_hidden()
+                            .child(result_list),
+                    ),
+            );
+        // The overlay mounts once when opened — the one-shot entrance replays
+        // only on a fresh open.
+        Some(motion::overlay_in("session-search-overlay-enter", search_overlay).into_any_element())
     }
 
     fn render_shell(
@@ -48713,6 +48717,12 @@ fn startup_loading_overlay(show_loading_indicator: bool, cx: &App) -> AnyElement
 
 impl Render for VibexWorkbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Manual hover fades tick exactly once per frame here, and while any
+        // blend is mid-flight the root keeps scheduling frames (the same
+        // scheduling `with_animation` would have requested).
+        if motion::hover_fades_active() {
+            window.request_animation_frame();
+        }
         self.present_persistence_note(window, cx);
         if self.initial_new_session_setup_pending {
             self.initial_new_session_setup_pending = false;
@@ -56237,11 +56247,11 @@ mod tests {
         assert!(theme::semantic_token("composer-backdrop", true).is_none());
         assert_eq!(
             theme::semantic_token("composer-queue", true).unwrap().hex,
-            "#18181b"
+            "#181818"
         );
         assert_eq!(
             theme::semantic_token("composer-surface", true).unwrap().hex,
-            "#1c1c1e"
+            "#141414"
         );
         assert_eq!(
             AGENT_CONTENT_NARROW_MAX_WIDTH - COMPOSER_QUEUE_HORIZONTAL_INSET * 2.0,
