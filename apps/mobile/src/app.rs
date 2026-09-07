@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
 use futures_util::StreamExt as _;
@@ -38,6 +38,9 @@ use vibex_desktop_model::{
     SidebarProjectLogoColor, SidebarState, TimelineConversationTurn, TimelineModel,
     TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
 };
+use vibex_markdown::{
+    MarkdownInput, MarkdownLimits, MarkdownSurface, parse_markdown_with_limits, utf8_prefix,
+};
 use vibex_remote_client::{
     RemoteConnectionState, RemoteLifecycleSignal, WebRemoteBackend, ZeroConfigLanPairingSession,
 };
@@ -72,6 +75,30 @@ const TIMELINE_MARKDOWN_VIEW_CACHE_LIMIT: usize = 64;
 const TIMELINE_RUNTIME_LABEL_MAX_CHARS: usize = 48;
 const TIMELINE_SHIMMER_DURATION: Duration = Duration::from_secs(12);
 const TIMELINE_SHIMMER_SCAN_PASSES: f32 = 10.0;
+/// Desktop parity: `AGENT_THINKING_LABEL_MAX_CHARS`.
+const AGENT_THINKING_LABEL_MAX_CHARS: usize = 48;
+/// Reasoning preview cache bounds — one entry per visible reasoning row.
+const REASONING_SUMMARY_CACHE_LIMIT: usize = 64;
+
+#[derive(Clone)]
+struct ReasoningRowSummary {
+    source_len: usize,
+    has_more: bool,
+    preview: String,
+}
+
+struct ReasoningSummaryCache(Mutex<BTreeMap<String, (i64, ReasoningRowSummary)>>);
+
+impl ReasoningSummaryCache {
+    fn lock_or_insert(&self) -> MutexGuard<'_, BTreeMap<String, (i64, ReasoningRowSummary)>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+static REASONING_SUMMARY_CACHE: LazyLock<ReasoningSummaryCache> =
+    LazyLock::new(|| ReasoningSummaryCache(Mutex::new(BTreeMap::new())));
 const MAX_INLINE_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024;
 const RESUME_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const RESUME_RECOVERY_POLL_ATTEMPTS: usize = 600;
@@ -6969,12 +6996,26 @@ impl MobileApp {
                     if !display_settings.show_agent_generation_status {
                         return container;
                     }
-                    container.child(render_mobile_thinking_indicator(
-                        &turn.id,
+                    // Desktop parity: pending permission replaces the progress
+                    // label with the waiting-for-confirmation string, then the
+                    // label is projected through the bounded markdown summary
+                    // (`agent_progress_label`).
+                    let pending_label = if turn.pending_permission {
+                        locale::text(
+                            "Waiting for confirmation...",
+                            "等待确认中...",
+                            "等待確認中...",
+                        )
+                        .to_string()
+                    } else {
                         turn.live_status
                             .as_deref()
-                            .unwrap_or(locale::common("Working...")),
-                        turn.pending_permission,
+                            .unwrap_or(locale::text("Thinking...", "思考中...", "思考中..."))
+                            .to_string()
+                    };
+                    container.child(render_mobile_thinking_indicator(
+                        &turn.id,
+                        &agent_progress_label(&pending_label),
                     ))
                 },
             )
@@ -7728,113 +7769,163 @@ impl MobileApp {
         row: &TimelineRow,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        if row.kind == TimelineRowKind::Reasoning {
+            return self.render_reasoning_row(row, cx);
+        }
+        // Plans retain the compact muted markdown presentation used by the
+        // existing process timeline.
         if row.body.trim().is_empty() {
             return div().id(row.id.clone()).into_any_element();
         }
-        let expanded = if row.streaming {
-            true
-        } else if self.collapsed_timeline_rows.contains(&row.id) {
-            false
-        } else if self.expanded_timeline_rows.contains(&row.id) {
-            true
-        } else {
-            row.kind == TimelineRowKind::Reasoning
-                && self
-                    .effective_timeline_display_settings()
-                    .reasoning_expanded_by_default
-        };
-        let can_expand = row.collapsible && !row.streaming;
-        let row_id = row.id.clone();
-        let tone = if row.failed {
-            rgb(theme::ACCENT_RED).into()
-        } else if row.streaming {
-            rgb(theme::ACCENT_PURPLE).into()
-        } else {
-            theme::text_muted()
-        };
         div()
             .id(format!("thought:{}", row.id))
             .w_full()
             .min_w_0()
-            .border_l_1()
-            .border_color(tone.opacity(0.42))
-            .pl_3()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .id(format!("thought-header:{}", row.id))
-                    .w_full()
-                    .min_w_0()
-                    .min_h(px(32.0))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .when(can_expand, |header| {
-                        header
-                            .cursor_pointer()
-                            .active(|style| style.bg(theme::row_pressed_bg()))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.toggle_timeline_row(row_id.clone(), cx)
-                                }),
-                            )
-                    })
-                    .child(
-                        svg()
-                            .path(self.timeline_row_icon_path_for_row(row))
-                            .size(px(14.0))
-                            .flex_shrink_0()
-                            .text_color(tone),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .text_size(px(theme::FONT_CAPTION))
-                            .text_color(theme::text_secondary())
-                            .child(if expanded {
-                                process_title(row)
-                            } else {
-                                timeline_row_preview(&row.body)
-                            }),
-                    )
-                    .when(row.streaming, |header| {
-                        header.child(timeline_status_badge(
-                            timeline_row_status_label(row),
-                            timeline_row_color(row),
-                        ))
-                    })
-                    .when(can_expand, |header| {
-                        header.child(
-                            svg()
-                                .path(if expanded {
-                                    "icons/chevron-down.svg"
-                                } else {
-                                    "icons/chevron-right.svg"
-                                })
-                                .size(px(theme::ICON_SM))
-                                .flex_shrink_0()
-                                .text_color(theme::text_muted()),
-                        )
-                    }),
-            )
-            .when(expanded, |thought| {
-                thought.child(
+            .text_color(theme::text_secondary())
+            .child(self.render_markdown_view(format!("thought:{}", row.id), row, cx))
+            .into_any_element()
+    }
+
+    fn render_reasoning_row(&self, row: &TimelineRow, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if row.body.trim().is_empty() {
+            return div().id(row.id.clone()).into_any_element();
+        }
+        let row_id = row.id.clone();
+        let expanded = self.reasoning_row_expanded(&row_id, row);
+        if expanded {
+            let (first_line_source, remaining_source) = reasoning_source_parts(&row.body);
+            let first_line_row = self.render_markdown_view(
+                format!("thought:{}:first-line", row.id),
+                &reasoning_first_line_row(row, first_line_source),
+                cx,
+            );
+            let remaining = remaining_source.map(|source| {
+                self.render_markdown_view(
+                    format!("thought:{}:remaining", row.id),
+                    &reasoning_remaining_row(row, source),
+                    cx,
+                )
+            });
+            let mut layout = div()
+                .id(row_id.clone())
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
                     div()
                         .w_full()
                         .min_w_0()
-                        .text_size(px(theme::FONT_CAPTION))
-                        .text_color(theme::text_secondary())
-                        .child(self.render_markdown_view(format!("thought:{}", row.id), row, cx)),
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            svg()
+                                .path("icons/brain.svg")
+                                .size(px(14.0))
+                                .flex_shrink_0()
+                                .text_color(theme::text_muted()),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .max_w_full()
+                                .text_color(theme::text_muted())
+                                .child(first_line_row),
+                        )
+                        .child(
+                            svg()
+                                .path("icons/chevron-down.svg")
+                                .size(px(14.0))
+                                .flex_shrink_0()
+                                .text_color(theme::text_muted()),
+                        ),
+                );
+            if let Some(remaining) = remaining {
+                layout = layout.child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .pl(px(22.0))
+                        .border_l_1()
+                        .border_color(theme::text_muted().opacity(0.46))
+                        .ml(px(7.0))
+                        .text_color(theme::text_muted())
+                        .child(remaining),
+                );
+            }
+            return layout
+                .cursor_pointer()
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.collapsed_timeline_rows.insert(row_id.clone());
+                        this.expanded_timeline_rows.remove(&row_id);
+                        this.timeline_list.remeasure();
+                        cx.notify();
+                    }),
                 )
-            })
-            .into_any_element()
+                .into_any_element();
+        }
+        let summary = reasoning_summary_cached(&row_id, row.last_sequence.max(0), &row.body);
+        let content: gpui::AnyElement = if row.streaming {
+            render_mobile_thinking_indicator(&row.id, &summary.preview)
+        } else {
+            div()
+                .min_w_0()
+                .flex_1()
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .text_size(px(theme::FONT_CAPTION))
+                .text_color(theme::text_muted())
+                .child(summary.preview.clone())
+                .into_any_element()
+        };
+        let mut container = div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap_1()
+            .text_color(theme::text_muted())
+            .child(content);
+        if summary.has_more {
+            container = container
+                .child(
+                    svg()
+                        .path("icons/chevron-right.svg")
+                        .size(px(14.0))
+                        .flex_shrink_0()
+                        .text_color(theme::text_muted()),
+                )
+                .cursor_pointer()
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.expanded_timeline_rows.insert(row_id.clone());
+                        this.collapsed_timeline_rows.remove(&row_id);
+                        this.timeline_list.remeasure();
+                        cx.notify();
+                    }),
+                );
+        }
+        container.into_any_element()
+    }
+
+    fn reasoning_row_expanded(&self, row_id: &str, _row: &TimelineRow) -> bool {
+        if self.collapsed_timeline_rows.contains(row_id) {
+            return false;
+        }
+        if self.expanded_timeline_rows.contains(row_id) {
+            return true;
+        }
+        // Desktop parity: expansion defaults from the "expand reasoning by
+        // default" setting; streaming state does not force the row open.
+        self.effective_timeline_display_settings()
+            .reasoning_expanded_by_default
     }
 
     fn render_process_activity_group(
@@ -7896,16 +7987,9 @@ impl MobileApp {
                             .text_color(if latest_row.failed {
                                 rgb(theme::ACCENT_RED).into()
                             } else {
-                                theme::text_secondary()
+                                theme::text_muted()
                             })
                             .child(summary),
-                    )
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .text_size(px(theme::FONT_MICRO))
-                            .text_color(theme::text_muted())
-                            .child(format!("{}", rows.len())),
                     )
                     .when(can_expand, |header| {
                         header.child(
@@ -7949,7 +8033,6 @@ impl MobileApp {
         let can_expand = has_details && !row.streaming;
         let expanded = has_details && (row.streaming || self.timeline_row_expanded(&row.id));
         let row_id = row.id.clone();
-        let color = timeline_row_color(row);
         div()
             .id(format!("activity:{}", row.id))
             .w_full()
@@ -7994,15 +8077,9 @@ impl MobileApp {
                             .text_color(if row.failed {
                                 rgb(theme::ACCENT_RED).into()
                             } else {
-                                theme::text_secondary()
+                                theme::text_muted()
                             })
                             .child(timeline_activity_summary(row)),
-                    )
-                    .when(
-                        row.failed || row.streaming || row.pending_permission,
-                        |line| {
-                            line.child(timeline_status_badge(timeline_row_status_label(row), color))
-                        },
                     )
                     .when(can_expand, |line| {
                         line.child(
@@ -8101,13 +8178,13 @@ impl MobileApp {
                     })
                     .child(
                         svg()
-                            .path("icons/file-terminal.svg")
+                            .path("icons/square-terminal.svg")
                             .size(px(14.0))
                             .flex_shrink_0()
                             .text_color(if failed {
-                                rgb(theme::ACCENT_RED)
+                                rgb(theme::ACCENT_RED).into()
                             } else {
-                                rgb(theme::ACCENT_BLUE)
+                                theme::text_muted()
                             }),
                     )
                     .child(
@@ -8117,6 +8194,7 @@ impl MobileApp {
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
+                            .font_family("IBM Plex Sans")
                             .text_size(px(theme::FONT_CAPTION))
                             .text_color(theme::text_primary())
                             .child(title),
@@ -8238,7 +8316,7 @@ impl MobileApp {
                             .path("icons/file-text.svg")
                             .size(px(14.0))
                             .flex_shrink_0()
-                            .text_color(rgb(theme::ACCENT_BLUE)),
+                            .text_color(theme::text_muted()),
                     )
                     .child(
                         div()
@@ -8350,9 +8428,9 @@ impl MobileApp {
                             .size(px(14.0))
                             .flex_shrink_0()
                             .text_color(if failed {
-                                rgb(theme::ACCENT_RED)
+                                rgb(theme::ACCENT_RED).into()
                             } else {
-                                rgb(theme::ACCENT_PURPLE)
+                                theme::text_muted()
                             }),
                     )
                     .child(
@@ -13376,6 +13454,108 @@ fn shimmer_scan_position(delta: f32) -> f32 {
     -0.35 + (delta * TIMELINE_SHIMMER_SCAN_PASSES).fract() * 1.7
 }
 
+/// Desktop parity: `truncate_agent_thinking_label`.
+fn truncate_agent_thinking_label(label: &str) -> String {
+    let characters = label.chars().collect::<Vec<_>>();
+    if characters.len() <= AGENT_THINKING_LABEL_MAX_CHARS {
+        return label.to_string();
+    }
+    characters[..AGENT_THINKING_LABEL_MAX_CHARS - 3]
+        .iter()
+        .collect::<String>()
+        + "..."
+}
+
+/// Desktop parity: `reasoning_preview_text`.
+fn reasoning_preview_text(label: &str) -> String {
+    let normalized = label.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_agent_thinking_label(normalized.trim())
+}
+
+/// Desktop parity: `reasoning_source_parts` — split a reasoning body into the
+/// first line (shown beside the brain icon) and the remaining lines (shown
+/// under a thin connector while expanded).
+fn reasoning_source_parts(source: &str) -> (&str, Option<&str>) {
+    let source = source.trim_start_matches(['\r', '\n']);
+    let Some((first_line, remaining)) = source.split_once('\n') else {
+        return (source.trim_end_matches('\r'), None);
+    };
+    let first_line = first_line.trim_end_matches('\r');
+    let remaining = remaining.trim_start_matches(['\r', '\n']);
+    (
+        first_line,
+        (!remaining.trim().is_empty()).then_some(remaining),
+    )
+}
+
+/// Synthetic single-line rows so the shared markdown view cache can render the
+/// first line and the remaining lines of an expanded reasoning row separately.
+fn reasoning_first_line_row(row: &TimelineRow, source: &str) -> TimelineRow {
+    TimelineRow {
+        id: format!("{}:first-line", row.id),
+        body: source.to_string(),
+        ..row.clone()
+    }
+}
+
+fn reasoning_remaining_row(row: &TimelineRow, source: &str) -> TimelineRow {
+    TimelineRow {
+        id: format!("{}:remaining", row.id),
+        body: source.to_string(),
+        ..row.clone()
+    }
+}
+
+/// Desktop parity: `timeline_reasoning_summary_cached_at` — collapsed
+/// reasoning rows repaint on every shimmer frame, so derive the preview from
+/// the parsed plain text once per (row, sequence, body) instead of re-running
+/// the projection in the render closure.
+fn reasoning_summary_cached(row_id: &str, sequence: i64, body: &str) -> ReasoningRowSummary {
+    let mut cache = REASONING_SUMMARY_CACHE.lock_or_insert();
+    if let Some((cached_sequence, summary)) = cache.get(row_id)
+        && *cached_sequence == sequence
+        && summary.source_len == body.len()
+    {
+        return summary.clone();
+    }
+    let plain = reasoning_plain_text(body);
+    let preview = reasoning_preview_text(&plain);
+    let summary = ReasoningRowSummary {
+        source_len: body.len(),
+        has_more: plain.chars().count() > AGENT_THINKING_LABEL_MAX_CHARS,
+        preview,
+    };
+    if cache.len() >= REASONING_SUMMARY_CACHE_LIMIT && !cache.contains_key(row_id) {
+        cache
+            .keys()
+            .next()
+            .cloned()
+            .map(|evicted| cache.remove(&evicted));
+    }
+    cache.insert(row_id.to_string(), (sequence, summary.clone()));
+    summary
+}
+
+/// Desktop parity: `agent_markdown_summary` — bounded markdown parse reduced
+/// to plain reading-order text.
+fn reasoning_plain_text(source: &str) -> String {
+    const MAX_SOURCE_BYTES: usize = 8 * 1024;
+    const MAX_NODES: usize = 4_096;
+    const MAX_RESOURCES: usize = 32;
+    let source = utf8_prefix(source, MAX_SOURCE_BYTES);
+    let limits = MarkdownLimits {
+        max_source_bytes: MAX_SOURCE_BYTES,
+        max_nodes: MAX_NODES,
+        max_resources: MAX_RESOURCES,
+        ..MarkdownLimits::default()
+    };
+    let document = parse_markdown_with_limits(
+        MarkdownInput::new(source, "", 0).surface(MarkdownSurface::Agent),
+        limits,
+    );
+    document.plain_text()
+}
+
 fn shimmer_color(base: Hsla, glow: Hsla, position: f32, scan_position: f32) -> Hsla {
     let intensity = (1.0 - (position - scan_position).abs() / 0.42).clamp(0.0, 1.0);
     let intensity = intensity * intensity * (3.0 - 2.0 * intensity);
@@ -13387,23 +13567,55 @@ fn shimmer_color(base: Hsla, glow: Hsla, position: f32, scan_position: f32) -> H
     }
 }
 
-fn render_mobile_thinking_indicator(
-    turn_id: &str,
-    label: &str,
-    pending_permission: bool,
-) -> gpui::AnyElement {
-    let base: Hsla = if pending_permission {
-        rgb(theme::ACCENT_YELLOW).opacity(0.78).into()
+/// Desktop parity: `agent_progress_label` — project the live progress label
+/// through the bounded markdown summary, trim dangling sentence dots, and
+/// always close with an ellipsis so the shimmer reads as in-progress text.
+fn agent_progress_label(label: &str) -> String {
+    // Desktop parity: project through the bounded markdown summary, trim
+    // dangling sentence dots, and close with exactly one ellipsis so the
+    // shimmer always reads as in-progress text.
+    let plain_text = reasoning_plain_text(label);
+    let compact = compact_preview_message(&plain_text);
+    let stem = compact.trim_end().trim_end_matches(['.', '…']).trim_end();
+    let has_visible_content = stem.chars().any(|character| {
+        character.is_alphanumeric()
+            || (!character.is_whitespace() && !character.is_ascii_punctuation())
+    });
+    let stem = if has_visible_content {
+        stem
     } else {
-        theme::text_muted().opacity(0.78)
+        locale::text("Thinking...", "思考中...", "思考中...")
+            .trim_end()
+            .trim_end_matches(['.', '…'])
+            .trim_end()
     };
-    let glow: Hsla = if pending_permission {
-        rgb(theme::ACCENT_YELLOW).into()
-    } else {
-        theme::text_primary()
-    };
-    let label = truncate_single_line(label, 48);
-    let character_count = label.chars().count();
+    format!("{stem}...")
+}
+
+/// Desktop parity: `compact_agent_turn_preview_message` — whitespace-
+/// normalized preview capped at 180 characters with a trailing ellipsis.
+fn compact_preview_message(value: &str) -> String {
+    const MAX_CHARS: usize = 180;
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= MAX_CHARS {
+        return normalized;
+    }
+    let mut truncated = normalized.chars().take(MAX_CHARS - 3).collect::<String>();
+    while truncated.ends_with(char::is_whitespace) {
+        truncated.pop();
+    }
+    truncated.push_str("...");
+    truncated
+}
+
+fn render_mobile_thinking_indicator(turn_id: &str, label: &str) -> gpui::AnyElement {
+    // Desktop parity (`render_agent_thinking_indicator`): the shimmer rides a
+    // single text node — building a GPUI child per glyph per frame made long
+    // streaming labels disproportionately expensive to repaint — and the
+    // pending-permission state is carried by the label text, not a color swap.
+    let base: Hsla = theme::text_muted().opacity(0.75);
+    let glow: Hsla = theme::text_primary();
+    let label: Arc<str> = truncate_agent_thinking_label(label).into();
     div()
         .flex()
         .w_full()
@@ -13415,25 +13627,15 @@ fn render_mobile_thinking_indicator(
                 .min_w_0()
                 .flex_1()
                 .overflow_hidden()
+                .whitespace_nowrap()
                 .text_size(px(theme::FONT_CAPTION))
                 .with_animation(
                     format!("timeline-progress-animation:{turn_id}"),
                     Animation::new(TIMELINE_SHIMMER_DURATION).repeat(),
                     move |this, delta| {
                         let scan_position = shimmer_scan_position(delta);
-                        this.child(div().flex().flex_none().whitespace_nowrap().children(
-                            label.chars().enumerate().map(|(index, character)| {
-                                let position = if character_count > 1 {
-                                    index as f32 / (character_count - 1) as f32
-                                } else {
-                                    0.5
-                                };
-                                div()
-                                    .flex_none()
-                                    .text_color(shimmer_color(base, glow, position, scan_position))
-                                    .child(character.to_string())
-                            }),
-                        ))
+                        this.text_color(shimmer_color(base, glow, 0.5, scan_position))
+                            .child(label.to_string())
                     },
                 ),
         )
@@ -13609,6 +13811,7 @@ fn message_attachment_workspace_path(uri: &str, workspace_root: Option<&str>) ->
 }
 
 fn timeline_row_status_label(row: &TimelineRow) -> String {
+    // Desktop parity: `command_status_label` + `tool_status_label`.
     if row.failed {
         locale::text("Failed", "失败", "失敗").to_string()
     } else if row.pending_permission {
@@ -13616,37 +13819,25 @@ fn timeline_row_status_label(row: &TimelineRow) -> String {
     } else if row.streaming {
         locale::text("Running", "运行中", "執行中").to_string()
     } else {
-        locale::text("Done", "完成", "完成").to_string()
+        locale::text("Completed", "已完成", "已完成").to_string()
     }
 }
 
 fn timeline_row_color(row: &TimelineRow) -> u32 {
+    // Desktop parity: status tone only — danger for failures, neutral
+    // otherwise. Type-specific accent colors are a mobile-only divergence.
     if row.failed {
         theme::ACCENT_RED
-    } else if row.pending_permission {
-        theme::ACCENT_YELLOW
-    } else if row.streaming {
-        theme::ACCENT_GREEN
     } else {
-        match row.kind {
-            TimelineRowKind::Reasoning | TimelineRowKind::Plan => theme::ACCENT_PURPLE,
-            TimelineRowKind::Command | TimelineRowKind::FileOperation => theme::ACCENT_BLUE,
-            TimelineRowKind::WebSearch => theme::ACCENT_BLUE,
-            TimelineRowKind::ImageGeneration => theme::ACCENT_PURPLE,
-            TimelineRowKind::GitNotice => theme::ACCENT_YELLOW,
-            TimelineRowKind::Error => theme::ACCENT_RED,
-            _ => theme::TEXT_MUTED,
-        }
+        theme::TEXT_MUTED
     }
 }
 
 fn timeline_activity_icon_color(row: &TimelineRow) -> Hsla {
+    // Desktop parity: process activity is single-tone; only a failed row
+    // leaves the muted foreground (for the danger tint).
     if row.failed {
         rgb(theme::ACCENT_RED).into()
-    } else if row.pending_permission {
-        rgb(theme::ACCENT_YELLOW).into()
-    } else if row.streaming {
-        rgb(theme::ACCENT_GREEN).into()
     } else {
         theme::text_muted()
     }
@@ -13657,7 +13848,7 @@ fn timeline_row_icon_path(kind: TimelineRowKind) -> &'static str {
         TimelineRowKind::Reasoning => "icons/brain.svg",
         TimelineRowKind::Plan | TimelineRowKind::TodoUpdate => "icons/list-checks.svg",
         TimelineRowKind::ToolCall => "icons/zap.svg",
-        TimelineRowKind::Command => "icons/file-terminal.svg",
+        TimelineRowKind::Command => "icons/square-terminal.svg",
         TimelineRowKind::FileOperation => "icons/file-code.svg",
         TimelineRowKind::WebSearch => "icons/search.svg",
         TimelineRowKind::Collaboration => "icons/message-square.svg",
@@ -13682,9 +13873,9 @@ fn timeline_payload_icon_path(payload: &TimelinePayload) -> &'static str {
         TimelinePayload::Reasoning(_) => "icons/brain.svg",
         TimelinePayload::Plan(_) => "icons/list-checks.svg",
         TimelinePayload::ToolCall(tool) => timeline_tool_icon_path(&tool.tool_name, &tool.summary),
-        TimelinePayload::Command(_) => "icons/file-terminal.svg",
+        TimelinePayload::Command(_) => "icons/square-terminal.svg",
         TimelinePayload::FileOperation(operation) => match operation.operation {
-            vibex_core::FileOperationKind::Read => "icons/book-open-text.svg",
+            vibex_core::FileOperationKind::Read => "icons/book-open.svg",
             vibex_core::FileOperationKind::Write => "icons/file-plus.svg",
             vibex_core::FileOperationKind::Edit | vibex_core::FileOperationKind::Move => {
                 "icons/pencil.svg"
@@ -13732,7 +13923,7 @@ fn semantic_timeline_tool_icon_path(value: &str) -> Option<&'static str> {
         "run",
         "ran",
     ]) {
-        Some("icons/file-terminal.svg")
+        Some("icons/square-terminal.svg")
     } else if has_any(&["search", "searched", "grep", "find", "query", "rg"]) {
         Some("icons/search.svg")
     } else if has_any(&[
@@ -13765,7 +13956,7 @@ fn semantic_timeline_tool_icon_path(value: &str) -> Option<&'static str> {
         "load",
         "loaded",
     ]) {
-        Some("icons/book-open-text.svg")
+        Some("icons/book-open.svg")
     } else if has_any(&["todo", "plan", "checklist"]) {
         Some("icons/list-checks.svg")
     } else if has_any(&["agent", "collaboration", "delegate", "task"]) {
@@ -13806,19 +13997,29 @@ fn normalized_timeline_activity_terms(value: &str) -> String {
 }
 
 fn timeline_status_badge(label: String, color: u32) -> gpui::AnyElement {
+    // Desktop parity (`render_process_status_badge`): uppercase shadcn Badge —
+    // h-5 rounded-full px-2 text-xs; plain in-progress rows stay neutral and
+    // only failures carry the danger tone.
     div()
         .flex_shrink_0()
         .h(px(20.0))
         .flex()
         .items_center()
         .rounded_full()
-        .border_1()
-        .border_color(rgb(color).opacity(0.42))
-        .bg(rgb(color).opacity(0.14))
         .px_2()
         .text_size(px(theme::FONT_MICRO))
-        .text_color(rgb(color))
-        .child(label)
+        .font_weight(FontWeight::MEDIUM)
+        .when(color == theme::ACCENT_RED, |badge| {
+            badge.bg(rgb(color).opacity(0.20)).text_color(rgb(color))
+        })
+        .when(color != theme::ACCENT_RED, |badge| {
+            badge
+                .border_1()
+                .border_color(theme::border_default())
+                .bg(theme::bg_card_dim())
+                .text_color(theme::text_primary())
+        })
+        .child(label.to_uppercase())
         .into_any_element()
 }
 
@@ -14164,7 +14365,7 @@ mod tests {
     fn timeline_tool_icon_prefers_tool_name_over_summary() {
         assert_eq!(
             timeline_tool_icon_path("read_file", "run command"),
-            "icons/book-open-text.svg"
+            "icons/book-open.svg"
         );
         assert_eq!(
             timeline_tool_icon_path("custom_tool", "search files"),

@@ -96,6 +96,8 @@ const ICONS: &[&str] = &[
     "icons/trash-2.svg",
     "icons/plug-zap.svg",
     "icons/user.svg",
+    "icons/square-terminal.svg",
+    "icons/book-open.svg",
     "icons/openai.svg",
     "icons/claude.svg",
     "icons/opencode.svg",
@@ -280,6 +282,12 @@ impl AssetSource for MobileAssets {
             )),
             "icons/pencil.svg" => Some(include_bytes!("../../desktop/assets/icons/pencil.svg")),
             "icons/brain.svg" => Some(include_bytes!("../../desktop/assets/icons/brain.svg")),
+            "icons/square-terminal.svg" => Some(include_bytes!(
+                "../../desktop/assets/icons/square-terminal.svg"
+            )),
+            "icons/book-open.svg" => {
+                Some(include_bytes!("../../desktop/assets/icons/book-open.svg"))
+            }
             "icons/file-plus.svg" => {
                 Some(include_bytes!("../../desktop/assets/icons/file-plus.svg"))
             }
