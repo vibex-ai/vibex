@@ -14,7 +14,19 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const PLATFORMS = new Set(["linux", "macos", "windows"]);
+// Cross-packaged architectures are released as deb (Linux), dmg (macOS), and
+// NSIS (Windows); cargo-packager 0.11.8 supports the deb, dmg, and nsis
+// bundlers for cross targets, while AppImage (linuxdeploy) is host-arch only.
+const ARCHITECTURES = new Set(["x86_64", "aarch64"]);
 const CHANNELS = new Set(["preview", "rc", "stable"]);
+const TARGET_TRIPLES = {
+  "linux-x86_64": "x86_64-unknown-linux-gnu",
+  "linux-aarch64": "aarch64-unknown-linux-gnu",
+  "macos-x86_64": "x86_64-apple-darwin",
+  "macos-aarch64": "aarch64-apple-darwin",
+  "windows-x86_64": "x86_64-pc-windows-msvc",
+  "windows-aarch64": "aarch64-pc-windows-msvc"
+};
 // Keep macOS input dimensions within cargo-packager's supported ICNS types.
 const MACOS_ICON_INPUTS = [
   "assets/app-icons/icon-16.png",
@@ -46,6 +58,9 @@ function parseArguments() {
   }
   if (!CHANNELS.has(argumentsByName.channel)) {
     fail(`unsupported release channel: ${argumentsByName.channel}`);
+  }
+  if (argumentsByName.arch && !ARCHITECTURES.has(argumentsByName.arch)) {
+    fail(`unsupported desktop architecture: ${argumentsByName.arch}`);
   }
   return argumentsByName;
 }
@@ -95,21 +110,37 @@ function withIcons(source, icons) {
   return source.replace(pattern, replacement);
 }
 
-function writePlatformConfig(platform, channel) {
-  const channelConfig = read(`apps/desktop/Packager.${channel}.toml`);
-  let config = read("apps/desktop/Packager.toml");
-  for (const field of ["name", "productName", "version", "identifier", "description"]) {
-    config = withField(config, field, fieldValue(channelConfig, field));
+function withoutResources(source) {
+  const pattern = /^resources\s*=\s*\[[\s\S]*?^\]\n/m;
+  if (!pattern.test(source)) fail("channel Packager configuration is missing resources");
+  return source.replace(pattern, "");
+}
+
+function writePlatformConfig(platform, arch, channel, triple, cross) {
+  let config;
+  if (platform === "linux") {
+    // The Linux ARM64 deb omits the PDFium resource payload: its distribution
+    // approval covers linux-x86_64 only, mirroring the macOS/Windows packages.
+    config = withoutResources(read(`apps/desktop/Packager.${channel}.toml`));
+  } else {
+    const channelConfig = read(`apps/desktop/Packager.${channel}.toml`);
+    config = read("apps/desktop/Packager.toml");
+    for (const field of ["name", "productName", "version", "identifier", "description"]) {
+      config = withField(config, field, fieldValue(channelConfig, field));
+    }
+    if (platform === "macos") {
+      config = withIcons(config, MACOS_ICON_INPUTS);
+      config = config.replace(/\n\[nsis\][\s\S]*$/, "\n");
+    }
   }
-  if (platform === "macos") {
-    config = withIcons(config, MACOS_ICON_INPUTS);
-    config = config.replace(/\n\[nsis\][\s\S]*$/, "\n");
+  if (cross) {
+    config = withField(config, "binariesDir", `../../target/${triple}/release`);
   }
   const output = join(
     ROOT,
     "apps",
     "desktop",
-    `.Packager.release-${process.pid}-${channel}-${platform}.toml`
+    `.Packager.release-${process.pid}-${channel}-${platform}-${arch}.toml`
   );
   writeFileSync(output, config);
   return output;
@@ -133,36 +164,45 @@ function exactlyOne(values, label) {
   return values[0];
 }
 
-function architecture(platform) {
-  if (platform === "macos") return process.arch === "arm64" ? "aarch64" : "x86_64";
-  return "x86_64";
+function hostArchitecture() {
+  if (process.arch === "x64") return "x86_64";
+  if (process.arch === "arm64") return "aarch64";
+  return fail(`unsupported host architecture: ${process.arch}`);
 }
 
-function normalizedArtifacts(platform, version, packageDirectory) {
+function normalizedArtifacts(platform, arch, version, packageDirectory) {
   const files = filesUnder(packageDirectory);
   if (platform === "linux") {
     const deb = exactlyOne(files.filter((path) => path.endsWith(".deb")), "Linux deb package");
-    const appImage = exactlyOne(
-      files.filter((path) => path.endsWith(".AppImage")),
-      "Linux AppImage package"
-    );
-    return [
-      { source: deb, name: `vibex-${version}-linux-x86_64-deb.deb`, package: "deb", os: "linux", arch: "x86_64" },
+    const artifacts = [
       {
+        source: deb,
+        name: `vibex-${version}-linux-${arch}-deb.deb`,
+        package: "deb",
+        os: "linux",
+        arch
+      }
+    ];
+    if (arch === "x86_64") {
+      const appImage = exactlyOne(
+        files.filter((path) => path.endsWith(".AppImage")),
+        "Linux AppImage package"
+      );
+      artifacts.push({
         source: appImage,
         name: `vibex-${version}-linux-x86_64-appimage.AppImage`,
         package: "appimage",
         os: "linux",
         arch: "x86_64"
-      }
-    ];
+      });
+    }
+    return artifacts;
   }
   const extension = platform === "macos" ? ".dmg" : ".exe";
   const source = exactlyOne(
     files.filter((path) => path.toLowerCase().endsWith(extension)),
     `${platform} package`
   );
-  const arch = architecture(platform);
   const packageName = platform === "macos" ? "app" : "nsis";
   return [
     {
@@ -181,18 +221,24 @@ function digest(path) {
 
 function main() {
   const { platform, channel, version } = parseArguments();
+  const arch = process.argv.includes("--arch")
+    ? process.argv[process.argv.indexOf("--arch") + 1]
+    : hostArchitecture();
+  const triple = TARGET_TRIPLES[`${platform}-${arch}`];
+  if (!triple) fail(`unsupported platform/architecture combination: ${platform}-${arch}`);
+  const cross = arch !== hostArchitecture();
   const configuredVersion = fieldValue(read(`apps/desktop/Packager.${channel}.toml`), "version");
   if (configuredVersion !== version) {
     fail(`--version ${version} does not match Packager.${channel}.toml ${configuredVersion}`);
   }
-  const packageDirectory = join(ROOT, "target", "release-packages", `${channel}-${platform}`);
+  const packageDirectory = join(ROOT, "target", "release-packages", `${channel}-${platform}-${arch}`);
   const artifactDirectory = join(ROOT, "target", "release-artifacts");
   rmSync(packageDirectory, { recursive: true, force: true });
   rmSync(artifactDirectory, { recursive: true, force: true });
   mkdirSync(packageDirectory, { recursive: true });
   mkdirSync(artifactDirectory, { recursive: true });
 
-  if (platform === "linux") {
+  if (platform === "linux" && arch === "x86_64") {
     run(process.execPath, ["scripts/prepare-pdfium-runtime.mjs"]);
   }
 
@@ -203,22 +249,43 @@ function main() {
   if (process.env.VIBEX_UPDATE_SIGNING_ENABLED !== "true") {
     delete buildEnvironment.VIBEX_UPDATE_PUBLIC_KEY;
   }
-  run(process.execPath, ["scripts/build-channel.mjs", channel], { env: buildEnvironment });
+  run(
+    process.execPath,
+    cross
+      ? ["scripts/build-channel.mjs", channel, "--target", triple]
+      : ["scripts/build-channel.mjs", channel],
+    { env: buildEnvironment }
+  );
 
-  const generatedConfig = platform === "linux" ? null : writePlatformConfig(platform, channel);
+  const generatedConfig =
+    platform === "linux" && arch === "x86_64"
+      ? null
+      : writePlatformConfig(platform, arch, channel, triple, cross);
   try {
     const config = generatedConfig ?? join(ROOT, "apps", "desktop", `Packager.${channel}.toml`);
-    const formats = { linux: "deb,appimage", macos: "dmg", windows: "nsis" }[platform];
+    const formats =
+      platform === "linux" && arch === "aarch64"
+        ? "deb"
+        : { linux: "deb,appimage", macos: "dmg", windows: "nsis" }[platform];
     run(
       "cargo",
-      ["packager", "--config", config, "--formats", formats, "--out-dir", packageDirectory],
+      [
+        "packager",
+        "--config",
+        config,
+        "--formats",
+        formats,
+        "--out-dir",
+        packageDirectory,
+        ...(cross ? ["--target", triple] : [])
+      ],
       { env: buildEnvironment }
     );
   } finally {
     if (generatedConfig) rmSync(generatedConfig, { force: true });
   }
 
-  const artifacts = normalizedArtifacts(platform, version, packageDirectory).map((artifact) => {
+  const artifacts = normalizedArtifacts(platform, arch, version, packageDirectory).map((artifact) => {
     const destination = join(artifactDirectory, artifact.name);
     const bytes = readFileSync(artifact.source);
     writeFileSync(destination, bytes);
@@ -233,9 +300,9 @@ function main() {
   });
   writeFileSync(
     join(artifactDirectory, "release-assets.json"),
-    `${JSON.stringify({ schemaVersion: "vibex-release-assets.v1", platform, channel, version, artifacts }, null, 2)}\n`
+    `${JSON.stringify({ schemaVersion: "vibex-release-assets.v1", platform, arch, channel, version, artifacts }, null, 2)}\n`
   );
-  console.log(`Desktop ${platform} artifacts written to ${repositoryPath(artifactDirectory)}`);
+  console.log(`Desktop ${platform}-${arch} artifacts written to ${repositoryPath(artifactDirectory)}`);
 }
 
 try {

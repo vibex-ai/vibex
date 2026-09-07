@@ -7,9 +7,10 @@ embeds the other product's assets.
 | Product | Artifact | Build command | Determinism | Required validation |
 | --- | --- | --- | --- | --- |
 | Desktop Preview | Linux `.deb`/AppImage | `pnpm package:preview` | Source, Cargo lock, PDFium lock | `pnpm check:release`, package smoke, native content gates |
-| Desktop RC/Stable Linux | `.deb`/AppImage | `pnpm package:rc` / `pnpm package:stable` | Source, Cargo lock, release channel, reviewed Linux PDFium | Release runbook, signing, install and rollback evidence |
-| Desktop RC/Stable macOS | `.dmg` | `node scripts/package-desktop-release.mjs --platform macos` | Source, Cargo lock, native macOS runner | Package existence and checksum; signing/notarization when credentials exist |
-| Desktop RC/Stable Windows | NSIS `.exe` | `node scripts/package-desktop-release.mjs --platform windows` | Source, Cargo lock, native Windows runner | Package existence and checksum; Authenticode when credentials exist |
+| Desktop RC/Stable Linux x86_64 | `.deb`/AppImage | `pnpm package:rc` / `pnpm package:stable` | Source, Cargo lock, release channel, reviewed Linux PDFium | Release runbook, signing, install and rollback evidence |
+| Desktop RC/Stable Linux aarch64 | `.deb` (cross-built, no PDFium payload) | `node scripts/package-desktop-release.mjs --platform linux --arch aarch64` | Source, Cargo lock, release channel, cross toolchain | Package existence and checksum; native validation deferred with the PDFium review |
+| Desktop RC/Stable macOS aarch64/x86_64 | `.dmg` | `node scripts/package-desktop-release.mjs --platform macos --arch aarch64\|x86_64` | Source, Cargo lock, native macOS runner | Package existence and checksum; signing/notarization when credentials exist |
+| Desktop RC/Stable Windows x86_64/aarch64 | NSIS `.exe` | `node scripts/package-desktop-release.mjs --platform windows --arch x86_64\|aarch64` | Source, Cargo lock, native Windows runner (aarch64 via cross-compile) | Package existence and checksum; Authenticode when credentials exist |
 | Android mobile | Signed native GPUI APK + AAB | `pnpm package:mobile:android` locally; tagged workflow signs before upload | Rust source, Cargo lock, vendor/zed revision, Gradle wrapper, Android API 35/NDK, release key | `pnpm check:mobile-native`, `apksigner`/`jarsigner` verification, APK/AAB checksum, device validation |
 | iOS mobile | Unsigned simulator app + XCFramework | `pnpm build:mobile:ios` on macOS | Rust source, Cargo lock, vendor/zed revision, XcodeGen project | `pnpm check:mobile-native`, simulator/device validation and signing pipeline |
 | Relay | Transport container | `pnpm smoke:relay:local` plus deployment scripts | Rust source and Cargo lock | Health/API smoke, TLS/NAT/operator validation |
@@ -21,6 +22,22 @@ embeds the other product's assets.
   Mesa or proprietary driver stack.
 - `pnpm check:release` enforces the exclusion across the Linux, Preview, RC,
   and Stable AppImage configurations.
+- AppImage packaging stays x86_64-only. The linuxdeploy toolchain cannot
+  process cross-architecture binaries, so aarch64 releases ship the `.deb`
+  package instead of an AppImage.
+
+## Cross-Architecture Packaging Rules
+
+- Non-native targets are built with `cargo build --target <triple>` through
+  `scripts/build-channel.mjs --target` and packaged with
+  `cargo packager --target <triple>`.
+- Linux aarch64 cross-builds on the x86_64 runner require the Ubuntu ports
+  apt sources, the `aarch64-linux-gnu` GNU toolchain, the `:arm64` GTK/WebKit
+  development packages, and the pkg-config/cargo cross environment. Multi-Arch
+  `:same` libraries (graphite2, harfbuzz, freetype, libssl3) must be version
+  aligned before the `:arm64` packages install.
+- The Linux aarch64 deb, macOS, and Windows packages carry no embedded PDFium
+  runtime: distribution approval is scoped to linux-x86_64.
 
 ## Mobile Packaging Rules
 

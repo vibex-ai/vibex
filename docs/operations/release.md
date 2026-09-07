@@ -24,11 +24,21 @@ or unverified source identity.
 ## Desktop
 
 The tag-triggered GitHub Actions release uses standard GitHub-hosted runners and
-keeps one native job per desktop platform. Linux produces the reviewed PDFium
-backed `.deb` and AppImage; macOS produces a `.dmg`; Windows produces an NSIS
-installer. Each job normalizes its filenames, writes SHA-256 sidecars, and
-uploads an immutable artifact. A final Ubuntu job collects the matrix before
-creating the GitHub Release, so a partial platform build can never be published.
+keeps one native job per desktop platform and architecture. Linux x86_64
+produces the reviewed PDFium backed `.deb` and AppImage; Linux aarch64 produces
+a `.deb` cross-built on the x86_64 runner; macOS produces `.dmg` images for
+aarch64 and x86_64; Windows produces NSIS installers for x86_64 and aarch64.
+Each job normalizes its filenames, writes SHA-256 sidecars, and uploads an
+immutable artifact. A final Ubuntu job collects the matrix before creating the
+GitHub Release, so a partial platform build can never be published.
+
+AppImage packaging stays x86_64-only: the AppImage tooling (linuxdeploy) cannot
+process cross-architecture binaries, so an aarch64 AppImage would require a
+qemu binfmt compatibility layer that is not acceptable for release artifacts.
+
+The PDFium distribution approval covers linux-x86_64 only. The Linux aarch64
+deb and the macOS and Windows packages are built and packaged without the
+embedded PDFium runtime until their native runtime review completes.
 
 The local equivalent for a single desktop target is:
 
@@ -81,8 +91,11 @@ Updater manifest signing is optional. Set the repository variable
 `VIBEX_UPDATE_SIGNING_ENABLED=true`, `VIBEX_UPDATE_PUBLIC_KEY`, and the
 `VIBEX_UPDATE_SIGNING_KEY` secret to add the signed desktop updater manifest;
 when these values are absent, the immutable release assets are still published.
-The Linux package carries the currently approved PDFium runtime; macOS and
-Windows remain build/package evidence until their target runtime review passes.
+The manifest enumerates one artifact per platform, package format, and
+architecture found in the release, and the updater client resolves its own
+architecture (`arm64` or `x86_64`) against it. The Linux x86_64 package carries
+the currently approved PDFium runtime; every other packaging target remains
+build/package evidence until its target runtime review passes.
 
 Before a release claim, validate the exact generated artifact on the intended
 device class. Exercise pairing, Direct/Tailnet/Relay route selection, reconnect,

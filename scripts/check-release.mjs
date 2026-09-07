@@ -7,7 +7,10 @@ import { fileURLToPath } from "node:url";
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const WRITE = process.argv.includes("--write");
 const SELF_TEST = process.argv.includes("--self-test");
-const EXPECTED_DEFERRED_PLATFORMS = ["macos", "windows"];
+// PDFium distribution is approved for linux-x86_64 only; every other desktop
+// packaging target ships without the embedded PDFium runtime until its native
+// runtime review completes.
+const EXPECTED_PDFIUM_APPROVED_ARCHITECTURES = { linux: ["x86_64"] };
 const REQUIRED_APPIMAGE_EXCLUDED_LIBS = 'excludedLibs = ["libpdfium.so", "libwayland*"]';
 
 function path(relativePath) {
@@ -145,11 +148,49 @@ function validatePackaging() {
   ]) {
     assert(releaseWorkflow.includes(dependency), `publish workflow is missing ${dependency}`);
   }
+  const releaseMatrix = [
+    ["linux", "x86_64", "ubuntu-24.04", "x86_64-unknown-linux-gnu"],
+    ["linux", "aarch64", "ubuntu-24.04", "aarch64-unknown-linux-gnu"],
+    ["macos", "x86_64", "macos-14", "x86_64-apple-darwin"],
+    ["macos", "aarch64", "macos-14", "aarch64-apple-darwin"],
+    ["windows", "x86_64", "windows-2022", "x86_64-pc-windows-msvc"],
+    ["windows", "aarch64", "windows-2022", "aarch64-pc-windows-msvc"]
+  ];
+  for (const [platform, arch, runner, target] of releaseMatrix) {
+    const matrixEntry = `platform: ${platform}\n            runner: ${runner}\n            arch: ${arch}\n            target: ${target}`;
+    assert(
+      releaseWorkflow.includes(matrixEntry),
+      `publish workflow is missing the ${platform}-${arch} release matrix entry`
+    );
+  }
+  assert(
+    releaseWorkflow.includes("--arch ${{ matrix.arch }}"),
+    "publish workflow does not pass the release architecture to the packaging script"
+  );
+  for (const required of [
+    "gcc-aarch64-linux-gnu",
+    "g++-aarch64-linux-gnu",
+    "libwebkit2gtk-4.1-dev:arm64",
+    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER"
+  ]) {
+    assert(
+      releaseWorkflow.includes(required),
+      `publish workflow is missing the Linux arm64 cross-build contract ${required}`
+    );
+  }
+  assert(
+    releaseWorkflow.includes("name: desktop-${{ matrix.platform }}-${{ matrix.arch }}-${{ github.sha }}"),
+    "publish workflow artifact names lost their architecture segment"
+  );
+  assert(
+    releaseWorkflow.includes("manifest_arch"),
+    "publish workflow updater manifest does not normalize artifact architectures"
+  );
   for (const required of [
     "platform: linux",
     "platform: macos",
     "platform: windows",
-    "name: Desktop ${{ matrix.platform }}",
+    "name: Desktop ${{ matrix.platform }} ${{ matrix.arch }}",
     "mobile-android",
     "mobile-ios",
     "download-artifact",
@@ -205,6 +246,49 @@ function validatePackaging() {
   assert(
     desktopReleaseScript.includes("--formats"),
     "desktop release packager must select an explicit platform format"
+  );
+  assert(
+    desktopReleaseScript.includes("const ARCHITECTURES = new Set([\"x86_64\", \"aarch64\"])"),
+    "desktop release packager lost its cross-architecture set"
+  );
+  assert(
+    desktopReleaseScript.includes("TARGET_TRIPLES"),
+    "desktop release packager lost its target triple map"
+  );
+  assert(
+    desktopReleaseScript.includes('"--target", triple'),
+    "cross-architecture packaging must pass --target to cargo packager"
+  );
+  assert(
+    desktopReleaseScript.includes('withField(config, "binariesDir"') &&
+      desktopReleaseScript.includes("binariesDir"),
+    "cross-architecture packaging must repoint binariesDir at the target triple build directory"
+  );
+  assert(
+    desktopReleaseScript.includes("withoutResources"),
+    "deferred-architecture packaging must drop the Linux-only PDFium resources"
+  );
+  assert(
+    desktopReleaseScript.includes('platform === "linux" && arch === "x86_64"'),
+    "desktop release packager must gate the approved PDFium runtime to linux-x86_64"
+  );
+  for (const triple of [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc"
+  ]) {
+    assert(
+      desktopReleaseScript.includes(triple),
+      `desktop release packager is missing the ${triple} release target`
+    );
+  }
+  const buildChannelScript = source("scripts/build-channel.mjs");
+  assert(
+    buildChannelScript.includes('"--target", target'),
+    "channel build script must forward --target to cargo build"
   );
 }
 
@@ -308,7 +392,7 @@ const report = {
   overallStatus: checks.every((check) => check.status === "pass") ? "pass" : "fail",
   releaseOwner: "apps/desktop",
   rollbackMechanism: "published_release_artifacts",
-  acceptedDeferredPlatforms: EXPECTED_DEFERRED_PLATFORMS,
+  acceptedPdfiumApprovedArchitectures: EXPECTED_PDFIUM_APPROVED_ARCHITECTURES,
   checks
 };
 
