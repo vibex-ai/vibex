@@ -178,6 +178,9 @@ Vibex 使用 [Agent Client Protocol](https://agentclientprotocol.com/) (ACP) 作
           <sub><b>任意 ACP Agent</b></sub>
         </a>
       </td>
+      <td align="center" valign="middle" width="135" height="84">
+        <sub><b>更多 Agent 待添加</b></sub>
+      </td>
     </tr>
   </table>
 </div>

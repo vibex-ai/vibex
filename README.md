@@ -189,6 +189,9 @@ Works with **any ACP-compatible agent** — if it speaks ACP, it runs in Vibex.
           <sub><b>Any ACP Agent</b></sub>
         </a>
       </td>
+      <td align="center" valign="middle" width="135" height="84">
+        <sub><b>More agents coming soon</b></sub>
+      </td>
     </tr>
   </table>
 </div>
