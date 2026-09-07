@@ -1391,28 +1391,14 @@ impl AgentInstallService {
             .env("npm_config_update_notifier", "false")
             .env_remove("NPM_TOKEN")
             .env_remove("NODE_AUTH_TOKEN");
-        let status = timeout(INSTALL_TIMEOUT, command.status())
-            .await
-            .map_err(|_| {
-                VibexError::process(
-                    "agent_npm_install_timeout",
-                    "managed npm installation timed out",
-                )
-            })?
-            .map_err(|error| {
-                process_error(
-                    "agent_npm_install_spawn_failed",
-                    "managed npm installation could not start",
-                    error,
-                )
-            })?;
-        if !status.success() {
-            return Err(VibexError::process(
-                "agent_npm_install_failed",
-                "managed npm installation failed",
-            )
-            .with_diagnostic("status", status.to_string()));
-        }
+        run_install_command(
+            command,
+            "agent_npm_install_timeout",
+            "agent_npm_install_spawn_failed",
+            "agent_npm_install_failed",
+            "managed npm installation failed",
+        )
+        .await?;
 
         run_trusted_npm_setup(agent_id, staging, node, &npm_config).await?;
         for package in packages {
