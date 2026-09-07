@@ -1044,9 +1044,26 @@ fn spawn_open_command(
     code: &'static str,
     message: &'static str,
 ) -> VibexResult<()> {
+    suppress_child_console_window(command);
     command.spawn().map(|_| ()).map_err(|error| {
         VibexError::process(code, message).with_diagnostic("error", error.to_string())
     })
+}
+
+/// Keep spawned helpers such as `powershell.exe` or `cmd.exe` from allocating a
+/// visible console window while the desktop app runs as a GUI-subsystem binary.
+/// The native terminal launcher opts out: `start` there opens the terminal
+/// window the user asked for.
+fn suppress_child_console_window(command: &mut Command) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt as _;
+
+        command.creation_flags(0x0800_0000);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    let _ = command;
 }
 
 fn normalize_font_families(fonts: impl IntoIterator<Item = String>) -> Vec<String> {

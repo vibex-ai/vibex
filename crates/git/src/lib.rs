@@ -2733,7 +2733,7 @@ fn run_git(root: &Path, args: &[&str]) -> VibexResult<String> {
 }
 
 fn run_git_optional(root: &Path, args: &[&str]) -> VibexResult<Option<String>> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(root)
         .args(args)

@@ -180,16 +180,24 @@ impl Installation {
             .arg(target)
             .spawn();
         #[cfg(target_os = "windows")]
-        let result = Command::new("powershell.exe")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "Wait-Process -Id $args[0]; Start-Process -FilePath $args[1]",
-            ])
-            .arg(std::process::id().to_string())
-            .arg(target)
-            .spawn();
+        let result = {
+            use std::os::windows::process::CommandExt as _;
+
+            // The helper must wait invisibly: a console window would stay on
+            // screen for the whole `Wait-Process` duration of the restart.
+            let mut command = Command::new("powershell.exe");
+            command
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Wait-Process -Id $args[0]; Start-Process -FilePath $args[1]",
+                ])
+                .arg(std::process::id().to_string())
+                .arg(target)
+                .creation_flags(0x0800_0000);
+            command.spawn()
+        };
         #[cfg(not(any(unix, target_os = "windows")))]
         let result = Command::new(target).spawn();
         result.map(|_| ()).map_err(|_| {
@@ -424,10 +432,18 @@ fn launch_system_installer(path: &Path) -> AppUpdateResult<()> {
     #[cfg(target_os = "macos")]
     let result = Command::new("open").arg(path).spawn();
     #[cfg(target_os = "windows")]
-    let result = Command::new("cmd")
-        .args(["/C", "start", ""])
-        .arg(path)
-        .spawn();
+    let result = {
+        use std::os::windows::process::CommandExt as _;
+
+        // `start` launches the installer in its own window; the intermediate
+        // cmd.exe only needs to run invisibly.
+        let mut command = Command::new("cmd");
+        command
+            .args(["/C", "start", ""])
+            .arg(path)
+            .creation_flags(0x0800_0000);
+        command.spawn()
+    };
     #[cfg(all(unix, not(target_os = "macos")))]
     let result = Command::new("xdg-open").arg(path).spawn();
     #[cfg(not(any(unix, target_os = "windows")))]

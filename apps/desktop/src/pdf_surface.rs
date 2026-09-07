@@ -1306,10 +1306,15 @@ fn spawn_system_open(path: &Path) -> std::io::Result<Child> {
 
 #[cfg(target_os = "windows")]
 fn spawn_system_open(path: &Path) -> std::io::Result<Child> {
-    Command::new("rundll32.exe")
+    use std::os::windows::process::CommandExt as _;
+
+    // The GUI app must not make rundll32 flash a console window.
+    let mut command = Command::new("rundll32.exe");
+    command
         .arg("url.dll,FileProtocolHandler")
         .arg(path)
-        .spawn()
+        .creation_flags(0x0800_0000);
+    command.spawn()
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]

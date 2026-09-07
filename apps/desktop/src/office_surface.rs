@@ -40,6 +40,20 @@ pub struct OfficePhysicalObservation {
     pub system_open_available: bool,
 }
 
+/// `cmd.exe` is console-subsystem; without this flag it would briefly flash a
+/// console window when the GUI app opens a document through it.
+fn suppress_child_console_window(command: &mut Command) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt as _;
+
+        command.creation_flags(0x0800_0000);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    let _ = command;
+}
+
 impl OfficeSurface {
     pub fn physical_observation(&self) -> OfficePhysicalObservation {
         let (ready, closed, kind, visible_items, system_open_available) = match &self.phase {
@@ -148,10 +162,10 @@ impl OfficeSurface {
         let result = if cfg!(target_os = "macos") {
             Command::new("open").arg(path).spawn()
         } else if cfg!(target_os = "windows") {
-            Command::new("cmd")
-                .args(["/C", "start", ""])
-                .arg(path)
-                .spawn()
+            let mut command = Command::new("cmd");
+            command.args(["/C", "start", ""]).arg(path);
+            suppress_child_console_window(&mut command);
+            command.spawn()
         } else {
             Command::new("xdg-open").arg(path).spawn()
         };
