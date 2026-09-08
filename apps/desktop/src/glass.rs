@@ -72,7 +72,9 @@ impl GlassSettings {
 /// Read the active glass settings. Defaults to solid (glass off) until the
 /// appearance layer applies the user preference.
 pub fn glass_settings(cx: &App) -> GlassSettings {
-    cx.try_global::<GlassSettings>().copied().unwrap_or_default()
+    cx.try_global::<GlassSettings>()
+        .copied()
+        .unwrap_or_default()
 }
 
 /// Store the active glass settings (called by the desktop appearance layer).

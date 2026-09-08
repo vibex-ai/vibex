@@ -22620,12 +22620,7 @@ impl VibexWorkbench {
         cx.notify();
     }
 
-    fn set_glass_surfaces(
-        &mut self,
-        enabled: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn set_glass_surfaces(&mut self, enabled: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.ui_state.appearance.glass_surfaces = enabled;
         theme::apply_appearance(&self.ui_state.appearance, Some(window), cx);
         self.queue_ui_state();
@@ -28905,9 +28900,7 @@ impl VibexWorkbench {
             if project_menu_open {
                 glass::frosted(8.0, project_menu_panel).into_any_element()
             } else {
-                project_menu_panel
-                    .opacity(0.0)
-                    .into_any_element()
+                project_menu_panel.opacity(0.0).into_any_element()
             }
         } else if project_menu_open {
             // The close path fades out WITHOUT frost: a blur region cannot
@@ -29161,32 +29154,32 @@ impl VibexWorkbench {
             .text_color(popover_foreground)
             .shadow_lg()
             .child(
-                    div()
-                        .mb_1()
-                        .h(px(34.0))
-                        .rounded(px(7.0))
-                        .border_1()
-                        .border_color(input_color)
-                        .when(base_ref_search_focused, |this| {
-                            this.border_color(ring_color).shadow(vec![
-                                gpui::BoxShadow::new(px(0.0), px(0.0), ring_color.opacity(0.30))
-                                    .spread_radius(px(2.0)),
-                            ])
-                        })
-                        .child(
-                            Input::new(&self.new_session_base_ref_search)
-                                .small()
-                                .h_full()
-                                .appearance(false)
-                                .text_xs()
-                                .prefix(
-                                    Icon::new(IconName::Search)
-                                        .small()
-                                        .text_color(muted_foreground),
-                                ),
-                        ),
-                )
-                .child(base_ref_results);
+                div()
+                    .mb_1()
+                    .h(px(34.0))
+                    .rounded(px(7.0))
+                    .border_1()
+                    .border_color(input_color)
+                    .when(base_ref_search_focused, |this| {
+                        this.border_color(ring_color).shadow(vec![
+                            gpui::BoxShadow::new(px(0.0), px(0.0), ring_color.opacity(0.30))
+                                .spread_radius(px(2.0)),
+                        ])
+                    })
+                    .child(
+                        Input::new(&self.new_session_base_ref_search)
+                            .small()
+                            .h_full()
+                            .appearance(false)
+                            .text_xs()
+                            .prefix(
+                                Icon::new(IconName::Search)
+                                    .small()
+                                    .text_color(muted_foreground),
+                            ),
+                    ),
+            )
+            .child(base_ref_results);
         let base_ref_trigger = Button::new("new-session-base-ref")
             .xsmall()
             .ghost()
@@ -46890,12 +46883,7 @@ impl FoundationSettings {
         cx.notify();
     }
 
-    fn set_glass_surfaces(
-        &mut self,
-        enabled: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn set_glass_surfaces(&mut self, enabled: bool, window: &mut Window, cx: &mut Context<Self>) {
         let _ = self
             .workbench
             .update(cx, |this, cx| this.set_glass_surfaces(enabled, window, cx));
@@ -46903,9 +46891,9 @@ impl FoundationSettings {
     }
 
     fn set_glass_blur_radius(&mut self, radius: u16, window: &mut Window, cx: &mut Context<Self>) {
-        let _ = self
-            .workbench
-            .update(cx, |this, cx| this.set_glass_blur_radius(radius, window, cx));
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.set_glass_blur_radius(radius, window, cx)
+        });
         cx.notify();
     }
 
@@ -47986,7 +47974,11 @@ impl FoundationSettings {
                         }),
                         cx.listener(|this, _, window, cx| {
                             let current = this.appearance(cx).glass_blur_radius;
-                            this.set_glass_blur_radius(current.saturating_add(4).min(64), window, cx)
+                            this.set_glass_blur_radius(
+                                current.saturating_add(4).min(64),
+                                window,
+                                cx,
+                            )
                         }),
                         locale::text("Decrease blur", "减小模糊", "減小模糊"),
                         locale::text("Increase blur", "增大模糊", "增大模糊"),

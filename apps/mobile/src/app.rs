@@ -6284,7 +6284,7 @@ impl MobileApp {
                     .active(|style| style.bg(theme::row_pressed_bg()))
                     .text_size(px(theme::FONT_BODY))
                     .text_color(if destructive {
-                        theme::accent_red().into()
+                        theme::accent_red()
                     } else {
                         theme::text_primary()
                     })
@@ -8942,7 +8942,7 @@ impl MobileApp {
                             .whitespace_nowrap()
                             .text_size(px(theme::FONT_CAPTION))
                             .text_color(if latest_row.failed {
-                                theme::accent_red().into()
+                                theme::accent_red()
                             } else {
                                 theme::text_muted()
                             })
@@ -9032,7 +9032,7 @@ impl MobileApp {
                             .whitespace_nowrap()
                             .text_size(px(theme::FONT_CAPTION))
                             .text_color(if row.failed {
-                                theme::accent_red().into()
+                                theme::accent_red()
                             } else {
                                 theme::text_muted()
                             })
@@ -9107,7 +9107,7 @@ impl MobileApp {
             .rounded(px(theme::RADIUS_CARD))
             .border_1()
             .border_color(if failed {
-                theme::accent_red().opacity(0.46).into()
+                theme::accent_red().opacity(0.46)
             } else {
                 theme::border_default()
             })
@@ -9139,7 +9139,7 @@ impl MobileApp {
                             .size(px(14.0))
                             .flex_shrink_0()
                             .text_color(if failed {
-                                theme::accent_red().into()
+                                theme::accent_red()
                             } else {
                                 theme::text_muted()
                             }),
@@ -9353,7 +9353,7 @@ impl MobileApp {
             .rounded(px(theme::RADIUS_CARD))
             .border_1()
             .border_color(if failed {
-                theme::accent_red().opacity(0.46).into()
+                theme::accent_red().opacity(0.46)
             } else {
                 theme::border_default()
             })
@@ -9385,7 +9385,7 @@ impl MobileApp {
                             .size(px(14.0))
                             .flex_shrink_0()
                             .text_color(if failed {
-                                theme::accent_red().into()
+                                theme::accent_red()
                             } else {
                                 theme::text_muted()
                             }),
@@ -10063,7 +10063,7 @@ impl MobileApp {
                             .rounded(px(theme::RADIUS_CONTROL))
                             .border_1()
                             .border_color(if selected {
-                                theme::text_primary().into()
+                                theme::text_primary()
                             } else {
                                 theme::border_default()
                             })
@@ -10124,7 +10124,7 @@ impl MobileApp {
                                     .rounded(px(theme::RADIUS_CONTROL))
                                     .border_1()
                                     .border_color(if selected {
-                                        theme::text_primary().into()
+                                        theme::text_primary()
                                     } else {
                                         theme::border_default()
                                     })
@@ -10168,7 +10168,7 @@ impl MobileApp {
                             .rounded(px(theme::RADIUS_CONTROL))
                             .border_1()
                             .border_color(if selected {
-                                theme::text_primary().into()
+                                theme::text_primary()
                             } else {
                                 theme::border_default()
                             })
@@ -10469,7 +10469,7 @@ impl MobileApp {
                                     .text_color(if !action_enabled {
                                         theme::text_muted()
                                     } else if running {
-                                        theme::accent_red().into()
+                                        theme::accent_red()
                                     } else {
                                         theme::text_secondary()
                                     }),
@@ -10515,7 +10515,7 @@ impl MobileApp {
                                     .text_color(if runtime_summary.available {
                                         theme::text_primary()
                                     } else {
-                                        theme::accent_yellow().into()
+                                        theme::accent_yellow()
                                     })
                                     .child(runtime_summary.primary),
                             )
@@ -10838,7 +10838,7 @@ impl MobileApp {
                         })
                         .size(px(theme::SIDEBAR_AGENT_LOGO_SIZE))
                         .text_color(if auto_archives {
-                            theme::accent_green().into()
+                            theme::accent_green()
                         } else {
                             theme::sidebar_foreground(0.72)
                         }),
@@ -10854,7 +10854,7 @@ impl MobileApp {
                     })
                     .size(px(theme::SIDEBAR_PROJECT_LOGO_SIZE))
                     .text_color(if auto_archives {
-                        theme::accent_green().into()
+                        theme::accent_green()
                     } else {
                         theme::sidebar_foreground(0.72)
                     })
@@ -11366,7 +11366,7 @@ impl MobileApp {
                         )
                     })
                     .when(has_error, |right| {
-                        right.child(sidebar_status_dot(theme::accent_red().into()))
+                        right.child(sidebar_status_dot(theme::accent_red()))
                     }),
             )
             .into_any_element()
@@ -13014,7 +13014,7 @@ impl MobileApp {
                 timeline_reasoning_mode_label(mode),
                 timeline_setting_source_label(overridden),
             ),
-            theme::accent_purple().into(),
+            theme::accent_purple(),
         )
         .cursor_pointer()
         .active(|style| style.bg(theme::row_pressed_bg()))
@@ -13262,9 +13262,9 @@ impl MobileApp {
                             locale::common("Offline").to_string()
                         },
                         if connection_online {
-                            theme::accent_green().into()
+                            theme::accent_green()
                         } else {
-                            theme::accent_red().into()
+                            theme::accent_red()
                         },
                     ))
                     .child(settings_info_row(
@@ -14815,7 +14815,7 @@ fn runtime_choice_button(
         .rounded(px(theme::RADIUS_CONTROL))
         .border_1()
         .border_color(if selected {
-            theme::accent_blue().into()
+            theme::accent_blue()
         } else {
             theme::border_default()
         })
@@ -14855,12 +14855,12 @@ fn runtime_sheet_action_button(
         .rounded(px(theme::RADIUS_CONTROL))
         .border_1()
         .border_color(if primary {
-            theme::text_primary().into()
+            theme::text_primary()
         } else {
             theme::border_default()
         })
         .bg(if primary {
-            theme::text_primary().into()
+            theme::text_primary()
         } else {
             theme::bg_card()
         })
@@ -14869,7 +14869,7 @@ fn runtime_sheet_action_button(
         .justify_center()
         .text_size(px(theme::FONT_BODY))
         .text_color(if primary {
-            theme::bg_primary().into()
+            theme::bg_primary()
         } else {
             theme::text_secondary()
         })
@@ -14964,13 +14964,13 @@ fn sidebar_workspace_status_indicator(state: Option<AgentSessionState>) -> gpui:
     let color = sidebar_workspace_status_color(state);
     match state {
         Some(AgentSessionState::Running | AgentSessionState::Initializing) => {
-            sidebar_running_indicator(color.into())
+            sidebar_running_indicator(color)
         }
         Some(
             AgentSessionState::NeedsInput | AgentSessionState::Error | AgentSessionState::Idle,
         )
         | Some(AgentSessionState::Archived | AgentSessionState::Closed)
-        | None => sidebar_status_dot(color.into()),
+        | None => sidebar_status_dot(color),
     }
 }
 
@@ -14982,8 +14982,8 @@ fn sidebar_session_status_indicator(
         AgentSessionState::Running | AgentSessionState::Initializing => {
             sidebar_running_indicator(sidebar_session_running_color(auto_continue_enabled))
         }
-        AgentSessionState::NeedsInput => sidebar_status_dot(theme::accent_yellow().into()),
-        AgentSessionState::Error => sidebar_status_dot(theme::accent_red().into()),
+        AgentSessionState::NeedsInput => sidebar_status_dot(theme::accent_yellow()),
+        AgentSessionState::Error => sidebar_status_dot(theme::accent_red()),
         AgentSessionState::Archived | AgentSessionState::Closed => {
             sidebar_status_dot(theme::sidebar_foreground(0.35))
         }
@@ -15106,12 +15106,12 @@ fn sidebar_project_icon_path(
 fn sidebar_project_icon_color(color: SidebarProjectLogoColor) -> gpui::Hsla {
     match color {
         SidebarProjectLogoColor::Neutral => theme::sidebar_text_muted(),
-        SidebarProjectLogoColor::Blue => theme::accent_blue().into(),
+        SidebarProjectLogoColor::Blue => theme::accent_blue(),
         SidebarProjectLogoColor::Cyan => rgb(0x22d3ee).into(),
-        SidebarProjectLogoColor::Green => theme::accent_green().into(),
-        SidebarProjectLogoColor::Yellow => theme::accent_yellow().into(),
+        SidebarProjectLogoColor::Green => theme::accent_green(),
+        SidebarProjectLogoColor::Yellow => theme::accent_yellow(),
         SidebarProjectLogoColor::Orange => rgb(0xf97316).into(),
-        SidebarProjectLogoColor::Red => theme::accent_red().into(),
+        SidebarProjectLogoColor::Red => theme::accent_red(),
         SidebarProjectLogoColor::Magenta => rgb(0xe879f9).into(),
     }
 }
@@ -15733,7 +15733,7 @@ fn timeline_activity_icon_color(row: &TimelineRow) -> Hsla {
     // Desktop parity: process activity is single-tone; only a failed row
     // leaves the muted foreground (for the danger tint).
     if row.failed {
-        theme::accent_red().into()
+        theme::accent_red()
     } else {
         theme::text_muted()
     }

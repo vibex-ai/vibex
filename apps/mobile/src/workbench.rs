@@ -1107,10 +1107,10 @@ impl MobileWorkbench {
                 }
                 let resized = this.terminal.apply_resize(&operation, outcome);
                 if resized {
-                    if let Some(session) = this.terminal.state.active_session.as_ref() {
-                        if let Some(render) = this.terminal.state.render.as_mut() {
-                            render.resize(session.rows, session.cols);
-                        }
+                    if let Some(session) = this.terminal.state.active_session.as_ref()
+                        && let Some(render) = this.terminal.state.render.as_mut()
+                    {
+                        render.resize(session.rows, session.cols);
                     }
                     this.terminal_render_sequence = 0;
                     this.start_terminal_poll(terminal_id, cx);
@@ -1174,11 +1174,11 @@ impl MobileWorkbench {
     }
 
     fn scroll_terminal_to_bottom(&mut self, cx: &mut Context<Self>) {
-        if let Some(render) = self.terminal.state.render.as_mut() {
-            if render.frame.display_offset != 0 {
-                render.scroll_to_bottom();
-                cx.notify();
-            }
+        if let Some(render) = self.terminal.state.render.as_mut()
+            && render.frame.display_offset != 0
+        {
+            render.scroll_to_bottom();
+            cx.notify();
         }
     }
 
@@ -1315,7 +1315,7 @@ impl MobileWorkbench {
             file_status_label(view.status)
         };
         let status_color = if input_dirty {
-            theme::accent_yellow().into()
+            theme::accent_yellow()
         } else {
             file_status_color(view.status)
         };
@@ -1475,7 +1475,7 @@ impl MobileWorkbench {
             file_status_label(view.status)
         };
         let status_color = if input_dirty {
-            theme::accent_yellow().into()
+            theme::accent_yellow()
         } else {
             file_status_color(view.status)
         };
@@ -2111,7 +2111,7 @@ impl MobileWorkbench {
                                 .font_family("monospace")
                                 .text_size(px(theme::FONT_MICRO))
                                 .text_color(if additions > 0 {
-                                    theme::accent_green().into()
+                                    theme::accent_green()
                                 } else {
                                     theme::text_muted()
                                 })
@@ -2122,7 +2122,7 @@ impl MobileWorkbench {
                                 .font_family("monospace")
                                 .text_size(px(theme::FONT_MICRO))
                                 .text_color(if deletions > 0 {
-                                    theme::accent_red().into()
+                                    theme::accent_red()
                                 } else {
                                     theme::text_muted()
                                 })
@@ -2331,7 +2331,7 @@ impl MobileWorkbench {
                         .font_family("monospace")
                         .text_size(px(theme::FONT_MICRO))
                         .text_color(if change.additions > 0 {
-                            theme::accent_green().into()
+                            theme::accent_green()
                         } else {
                             theme::text_muted()
                         })
@@ -2344,7 +2344,7 @@ impl MobileWorkbench {
                         .font_family("monospace")
                         .text_size(px(theme::FONT_MICRO))
                         .text_color(if change.deletions > 0 {
-                            theme::accent_red().into()
+                            theme::accent_red()
                         } else {
                             theme::text_muted()
                         })
@@ -2656,7 +2656,7 @@ impl MobileWorkbench {
                     .font_family("IBM Plex Mono")
                     .text_size(px(theme::FONT_MICRO))
                     .text_color(if file.additions > 0 {
-                        theme::accent_green().into()
+                        theme::accent_green()
                     } else {
                         theme::text_muted()
                     })
@@ -2669,7 +2669,7 @@ impl MobileWorkbench {
                     .font_family("IBM Plex Mono")
                     .text_size(px(theme::FONT_MICRO))
                     .text_color(if file.deletions > 0 {
-                        theme::accent_red().into()
+                        theme::accent_red()
                     } else {
                         theme::text_muted()
                     })
@@ -2694,9 +2694,9 @@ impl MobileWorkbench {
             .children(patch.lines().take(2000).map(|line| {
                 let line = line.to_string();
                 let color = if line.starts_with('+') && !line.starts_with("+++") {
-                    theme::accent_green().into()
+                    theme::accent_green()
                 } else if line.starts_with('-') && !line.starts_with("---") {
-                    theme::accent_red().into()
+                    theme::accent_red()
                 } else {
                     theme::text_muted()
                 };
@@ -2732,9 +2732,9 @@ impl MobileWorkbench {
             .children(diff.diff.lines().take(500).map(|line| {
                 let line = line.to_string();
                 let color = if line.starts_with('+') && !line.starts_with("+++") {
-                    theme::accent_green().into()
+                    theme::accent_green()
                 } else if line.starts_with('-') && !line.starts_with("---") {
-                    theme::accent_red().into()
+                    theme::accent_red()
                 } else {
                     theme::text_muted()
                 };
@@ -3377,7 +3377,7 @@ impl MobileWorkbench {
                         })),
                 )
             })
-            .when(has_frame == false, |surface| {
+            .when(!has_frame, |surface| {
                 surface.child(empty_label(if has_session {
                     "No output yet"
                 } else {
@@ -3500,7 +3500,7 @@ impl Render for MobileWorkbench {
                             .justify_center()
                             .border_b_1()
                             .border_color(if candidate == surface {
-                                theme::accent_blue().into()
+                                theme::accent_blue()
                             } else {
                                 theme::sidebar_bg()
                             })
@@ -3625,7 +3625,7 @@ fn git_mode_tab(
         .justify_center()
         .border_b_2()
         .border_color(if selected {
-            theme::text_primary().into()
+            theme::text_primary()
         } else {
             theme::workbench_bg()
         })
@@ -3715,17 +3715,17 @@ fn mobile_file_icon_color(kind: FileIconKind, ignored: bool) -> gpui::Hsla {
         | FileIconKind::TypeScript
         | FileIconKind::Markdown
         | FileIconKind::Image
-        | FileIconKind::Svg => theme::accent_blue().into(),
-        FileIconKind::JavaScript | FileIconKind::Script => theme::accent_yellow().into(),
-        FileIconKind::Json => theme::accent_purple().into(),
+        | FileIconKind::Svg => theme::accent_blue(),
+        FileIconKind::JavaScript | FileIconKind::Script => theme::accent_yellow(),
+        FileIconKind::Json => theme::accent_purple(),
         FileIconKind::Archive | FileIconKind::Config => rgb(0xf0a050).into(),
-        FileIconKind::Database | FileIconKind::Spreadsheet => theme::accent_green().into(),
+        FileIconKind::Database | FileIconKind::Spreadsheet => theme::accent_green(),
         FileIconKind::Style => rgb(0x5ed2d9).into(),
         FileIconKind::Markup => rgb(0xf0a050).into(),
         FileIconKind::Audio => rgb(0xd08ad8).into(),
         FileIconKind::Video => rgb(0xf08fc4).into(),
         FileIconKind::Symlink => rgb(0xb091f2).into(),
-        FileIconKind::Lock | FileIconKind::Secret => theme::accent_yellow().into(),
+        FileIconKind::Lock | FileIconKind::Secret => theme::accent_yellow(),
         FileIconKind::Font => rgb(0xd08ad8).into(),
         FileIconKind::Pdf
         | FileIconKind::Office
@@ -3741,23 +3741,23 @@ fn file_tree_row_text_color(row: &vibex_desktop_model::FileExplorerRow) -> gpui:
         return theme::text_muted();
     }
     match row.git.map(|git| git.signal) {
-        Some(FileGitSignal::Added) => theme::accent_green().into(),
-        Some(FileGitSignal::Untracked) => theme::accent_yellow().into(),
+        Some(FileGitSignal::Added) => theme::accent_green(),
+        Some(FileGitSignal::Untracked) => theme::accent_yellow(),
         Some(FileGitSignal::Ignored) => theme::text_muted(),
-        Some(_) => theme::accent_blue().into(),
+        Some(_) => theme::accent_blue(),
         None => theme::text_primary(),
     }
 }
 
 fn file_git_signal_color(signal: FileGitSignal) -> gpui::Hsla {
     match signal {
-        FileGitSignal::Added => theme::accent_green().into(),
-        FileGitSignal::Untracked => theme::accent_yellow().into(),
+        FileGitSignal::Added => theme::accent_green(),
+        FileGitSignal::Untracked => theme::accent_yellow(),
         FileGitSignal::Modified
         | FileGitSignal::Deleted
         | FileGitSignal::Renamed
         | FileGitSignal::Copied
-        | FileGitSignal::Conflicted => theme::accent_blue().into(),
+        | FileGitSignal::Conflicted => theme::accent_blue(),
         FileGitSignal::Ignored => theme::text_muted(),
     }
 }
@@ -3778,12 +3778,12 @@ fn git_selection_indicator_mobile(state: GitPathSelectionState) -> gpui::AnyElem
         .rounded(px(3.0))
         .border_1()
         .border_color(if selected {
-            selected_border.into()
+            selected_border
         } else {
             theme::border_input()
         })
         .bg(if selected {
-            theme::accent().into()
+            theme::accent()
         } else {
             theme::workbench_bg()
         })
@@ -3951,9 +3951,9 @@ fn file_status_label(status: FileEditorStatus) -> &'static str {
 
 fn file_status_color(status: FileEditorStatus) -> gpui::Hsla {
     match status {
-        FileEditorStatus::Conflict | FileEditorStatus::Disconnected => theme::accent_red().into(),
-        FileEditorStatus::Dirty | FileEditorStatus::Saving => theme::accent_yellow().into(),
-        FileEditorStatus::Saved => theme::accent_green().into(),
+        FileEditorStatus::Conflict | FileEditorStatus::Disconnected => theme::accent_red(),
+        FileEditorStatus::Dirty | FileEditorStatus::Saving => theme::accent_yellow(),
+        FileEditorStatus::Saved => theme::accent_green(),
         _ => theme::text_muted(),
     }
 }
@@ -3996,9 +3996,9 @@ fn terminal_feed_snapshot(
 /// sessions, red for ended ones, yellow for a stale host connection.
 fn terminal_status_color(status: TerminalStatus) -> gpui::Hsla {
     match status {
-        TerminalStatus::Running => theme::accent_green().into(),
-        TerminalStatus::Exited | TerminalStatus::Killed => theme::accent_red().into(),
-        TerminalStatus::Stale => theme::accent_yellow().into(),
+        TerminalStatus::Running => theme::accent_green(),
+        TerminalStatus::Exited | TerminalStatus::Killed => theme::accent_red(),
+        TerminalStatus::Stale => theme::accent_yellow(),
     }
 }
 
