@@ -11860,7 +11860,11 @@ impl VibexWorkbench {
     }
 
     fn refresh_last_timeline_size(&mut self) -> bool {
-        self.timeline_pending_turn_heights.clear();
+        // Apply queued measurement corrections instead of dropping them: the
+        // streaming branch below intentionally keeps the current virtual
+        // extent, so a cleared batch would never be re-recorded and a
+        // switched-to session could keep a blank band under its last row.
+        self.apply_pending_timeline_row_heights();
         let turns = self.conversation_turns_cached();
         let Some(turn) = turns.last().cloned() else {
             self.streaming_row_state = None;
@@ -12300,7 +12304,18 @@ impl VibexWorkbench {
             self.timeline_measured_turn_layout_signatures
                 .remove(&turn_id);
         }
-        if previous_height.is_some_and(|current| (current - measured_height).abs() < 1.0) {
+        // The cached measurement alone does not prove the virtual row
+        // converged: a streaming refresh can drop a pending height batch
+        // before it is applied, leaving the slot at a stale estimate. Requeue
+        // the correction whenever the slot disagrees, otherwise a switched-to
+        // session would keep an empty band under its last row until an
+        // unrelated event invalidated the turn again.
+        if previous_height.is_some_and(|current| (current - measured_height).abs() < 1.0)
+            && self
+                .timeline_row_sizes
+                .get(turn_index)
+                .is_some_and(|row_size| (f32::from(row_size.height) - measured_height).abs() < 1.0)
+        {
             return;
         }
         self.timeline_measured_turn_heights
