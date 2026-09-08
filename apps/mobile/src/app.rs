@@ -3017,10 +3017,12 @@ impl MobileApp {
                     Ok(snapshot) => {
                         this.sidebar_view = SidebarOrganizationView::from_remote(&snapshot);
                     }
-                    Err(error) => {
+                    Err(_) => {
                         // The optimistic local edit is now wrong either way, so
                         // re-read rather than leaving the two shells disagreeing.
-                        this.error = Some(error);
+                        // The tree belongs to the Desktop and the refresh rolls
+                        // the edit back on its own; a rejection is nothing the
+                        // user can act on, so it never surfaces as an error.
                         this.refresh_sidebar_organization(cx);
                     }
                 }
