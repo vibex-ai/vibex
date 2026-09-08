@@ -20,8 +20,10 @@
 //! ones to their start state, and no frames are scheduled. The hover fades read
 //! the same flag in [`hover_listener`] and snap instead of tweening.
 //!
-//! translateY is implemented as a relative-position `top` inset: taffy applies
-//! relative insets after layout, so — like a CSS transform — siblings never move.
+//! translateY is implemented as a `top` inset: taffy applies relative insets
+//! after layout, so — like a CSS transform — siblings never move. Entrances
+//! never set `position` themselves; an element's own positioning (relative is
+//! the gpui default) must survive the animation untouched.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -229,12 +231,18 @@ where
 }
 
 /// Overlay entrance: opacity 0→1 + translateY 6→0 over [`OVERLAY_FADE`].
+///
+/// Unlike the in-flow entrances above, this must not force `relative` onto the
+/// element: callers pass `absolute inset_0` overlays, and overriding their
+/// position would drop the overlay back into normal flow, stacking it below
+/// the shell instead of covering it. `top` still animates the rise because
+/// absolute elements honor the top inset directly.
 pub fn overlay_in<E>(id: impl Into<ElementId>, element: E) -> AnimationElement<E>
 where
     E: Styled + IntoElement + 'static,
 {
     element.with_animation(id, OVERLAY_FADE.animation(), |el, t| {
-        el.relative().opacity(t).top(px(6.0 * (1.0 - t)))
+        el.opacity(t).top(px(6.0 * (1.0 - t)))
     })
 }
 
