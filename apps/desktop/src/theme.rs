@@ -12,6 +12,7 @@ use vibex_ui::{
     LIGHT_HIGHLIGHT_THEME_JSON, LIGHT_TOKENS, RADII, SHADOWS_ENABLED,
 };
 
+use crate::glass;
 use crate::motion::mix;
 
 pub use vibex_ui::{
@@ -47,6 +48,19 @@ fn shared_highlight_theme(is_dark: bool) -> Arc<HighlightTheme> {
         appearance,
         style,
     })
+}
+
+/// Propagate the frosted-glass preference to the shared glass layer. Card
+/// surfaces read this through `glass::glass_settings` when they paint.
+fn apply_glass_surfaces(appearance: &AppearanceUiState, cx: &mut App) {
+    glass::apply_glass_settings(
+        glass::GlassSettings {
+            enabled: appearance.glass_surfaces,
+            blur_radius: f32::from(appearance.glass_blur_radius.clamp(4, 64)),
+            tint_opacity: glass::DEFAULT_GLASS_TINT_OPACITY,
+        },
+        cx,
+    );
 }
 
 fn apply_semantic_popover_colors(theme: &mut Theme, is_dark: bool) {
@@ -103,6 +117,7 @@ pub fn apply_appearance(appearance: &AppearanceUiState, window: Option<&mut Wind
         ThemeMode::Dark => Theme::change(ComponentThemeMode::Dark, window, cx),
         ThemeMode::System => Theme::sync_system_appearance(window, cx),
     }
+    apply_glass_surfaces(appearance, cx);
     // Keep gpui's global animation flag in step with the user preference: the
     // vendored gpui snaps every `with_animation` element (modal slides, menu
     // fades, entrance lifts) to its end state and schedules no frames while it

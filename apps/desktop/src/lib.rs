@@ -5,6 +5,7 @@ pub mod app;
 pub mod assets;
 pub mod code_workbench;
 pub mod directory_picker;
+pub mod glass;
 pub mod gpui_ext;
 pub mod image_editor;
 pub mod local_history_import;
