@@ -80,6 +80,7 @@ use crate::platform::{
     available_external_tools, open_external_url, open_native_terminal_for_path,
     open_path_with_default_app, open_path_with_external_tool, reveal_path_in_file_manager,
 };
+use crate::resize_seam;
 use crate::terminal_surface::TerminalSurface;
 
 const FILE_ROW_HEIGHT: f32 = 28.0;
@@ -12375,6 +12376,7 @@ impl CodeRightRail {
         let active = self.history_drawer_resize.is_some();
         let increment_target = cx.weak_entity();
         let decrement_target = cx.weak_entity();
+        let seam_key = resize_seam::seam_hover_key("git-history-drawer");
         h_flex()
             .id("git-history-drawer-resize")
             .role(Role::Splitter)
@@ -12392,18 +12394,12 @@ impl CodeRightRail {
             )
             .focusable()
             .tab_index(0)
+            .relative()
             .h(px(12.0))
             .w_full()
             .flex_none()
             .cursor_ns_resize()
-            .items_center()
-            .justify_center()
-            .bg(if active {
-                cx.theme().accent.opacity(0.24)
-            } else {
-                cx.theme().sidebar
-            })
-            .hover(|style| style.bg(cx.theme().accent.opacity(0.20)))
+            .on_hover(hover_listener(seam_key.clone()))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 let next = match event.keystroke.key.as_str() {
                     "up" => this.history_drawer_height + GIT_HISTORY_DRAWER_KEYBOARD_STEP,
@@ -12461,11 +12457,12 @@ impl CodeRightRail {
                 cx.listener(|this, _, _, cx| this.finish_history_drawer_resize(cx)),
             )
             .child(
-                div()
-                    .h(px(4.0))
-                    .w(px(42.0))
-                    .rounded_full()
-                    .bg(cx.theme().border),
+                resize_seam::seam_line(&seam_key, cx.theme().border, true, active, true)
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .h(px(1.0)),
             )
             .into_any_element()
     }
@@ -12765,8 +12762,8 @@ impl CodeRightRail {
         v_flex()
             .size_full()
             .min_h_0()
-            .border_t_1()
-            .border_color(cx.theme().border)
+            // The resize seam above owns the divider hairline at its bottom
+            // edge, so the drawer paints no second border of its own.
             .bg(cx.theme().sidebar)
             .child(
                 v_flex()

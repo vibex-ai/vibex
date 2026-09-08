@@ -18,6 +18,7 @@ mod pdf_worker;
 pub mod platform;
 pub mod primitives;
 pub mod remote_access_pairing;
+pub mod resize_seam;
 pub mod responsive;
 pub mod system_tray;
 pub mod terminal_surface;

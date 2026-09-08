@@ -165,7 +165,7 @@ use crate::remote_access_pairing::open_remote_access_pairing;
 use crate::responsive::WorkbenchVisibility;
 use crate::terminal_surface::{TerminalSurface, available_shells, bind_terminal_keys};
 use crate::usage::UsageView;
-use crate::{DEFAULT_HEIGHT, DEFAULT_WIDTH, MIN_HEIGHT, MIN_WIDTH, theme};
+use crate::{DEFAULT_HEIGHT, DEFAULT_WIDTH, MIN_HEIGHT, MIN_WIDTH, resize_seam, theme};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RuntimeStatus {
@@ -31847,6 +31847,7 @@ impl VibexWorkbench {
         let resize_active = self.composer_terminal_resize_drag.is_some();
         let (min_height, max_height) = self.composer_terminal_height_limits();
         let drag_target = cx.weak_entity();
+        let seam_key = resize_seam::seam_hover_key("composer-terminal");
         div()
             .id("composer-terminal-resize-handle")
             .role(Role::Splitter)
@@ -31862,15 +31863,8 @@ impl VibexWorkbench {
             .right_0()
             .h(px(COMPOSER_TERMINAL_RESIZE_HANDLE_HEIGHT_PX))
             .cursor_row_resize()
-            .group("composer-terminal-resize-handle")
             .occlude()
-            .when(resize_active, |this| {
-                this.bg(cx.theme().drag_border.opacity(0.14))
-            })
-            .hover(|style| style.bg(cx.theme().drag_border.opacity(0.10)))
-            .flex()
-            .items_center()
-            .justify_center()
+            .on_hover(hover_listener(seam_key.clone()))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|_, _: &MouseDownEvent, window, cx| {
@@ -31900,14 +31894,14 @@ impl VibexWorkbench {
                 cx.listener(|this, _, _, cx| this.finish_composer_terminal_resize(cx)),
             )
             .child(
-                div()
-                    .w(px(48.0))
-                    .h(px(3.0))
-                    .rounded_full()
-                    .bg(cx.theme().border)
-                    .group_hover("composer-terminal-resize-handle", |style| {
-                        style.bg(cx.theme().drag_border.opacity(0.78))
-                    }),
+                // The seam line rides the terminal card's top hairline (the
+                // card begins one pixel below the strip's bottom edge).
+                resize_seam::seam_line(&seam_key, cx.theme().border, false, resize_active, true)
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom(px(1.0))
+                    .h(px(1.0)),
             )
             .into_any_element()
     }
@@ -39249,11 +39243,7 @@ impl VibexWorkbench {
             return Empty.into_any_element();
         };
         let resize_active = self.sidebar_resize_drag.is_some();
-        let line_color = if resize_active {
-            cx.theme().drag_border
-        } else {
-            cx.theme().border
-        };
+        let seam_key = resize_seam::seam_hover_key("sidebar");
         let increment_target = cx.weak_entity();
         let decrement_target = cx.weak_entity();
         let drag_target = cx.weak_entity();
@@ -39275,13 +39265,9 @@ impl VibexWorkbench {
             .bottom_0()
             .w(px(SIDEBAR_RESIZE_HANDLE_WIDTH))
             .cursor_col_resize()
-            .group("sidebar-resize-handle")
             .occlude()
-            .when(resize_active, |this| {
-                this.bg(cx.theme().drag_border.opacity(0.14))
-            })
-            .hover(|style| style.bg(cx.theme().drag_border.opacity(0.10)))
-            .focus_visible(|style| style.bg(cx.theme().drag_border.opacity(0.16)))
+            .on_hover(hover_listener(seam_key.clone()))
+            .focus_visible(|style| style.bg(cx.theme().border.opacity(0.16)))
             .on_key_down(cx.listener(Self::on_sidebar_resize_key_down))
             .on_a11y_action(AccessibleAction::Increment, move |_, _, cx| {
                 let _ = increment_target.update(cx, |this, cx| {
@@ -39322,16 +39308,12 @@ impl VibexWorkbench {
                 cx.listener(|this, _, _, cx| this.finish_sidebar_resize(cx)),
             )
             .child(
-                div()
+                resize_seam::seam_line(&seam_key, cx.theme().border, false, resize_active, false)
                     .absolute()
                     .top_0()
                     .right_0()
                     .bottom_0()
-                    .w(px(1.0))
-                    .bg(line_color)
-                    .group_hover("sidebar-resize-handle", |style| {
-                        style.bg(cx.theme().drag_border.opacity(0.78))
-                    }),
+                    .w(px(1.0)),
             )
             .into_any_element()
     }
@@ -39354,11 +39336,10 @@ impl VibexWorkbench {
         let resize_active = self
             .right_panel_resize_drag
             .is_some_and(|drag| drag.panel == panel);
-        let line_color = if resize_active {
-            cx.theme().drag_border
-        } else {
-            cx.theme().border
-        };
+        let seam_key = resize_seam::seam_hover_key(match panel {
+            RightPanelKind::Preview => "preview",
+            RightPanelKind::RightRail => "right-rail",
+        });
         let increment_target = cx.weak_entity();
         let decrement_target = cx.weak_entity();
 
@@ -39379,13 +39360,9 @@ impl VibexWorkbench {
             .bottom_0()
             .w(px(RIGHT_PANEL_RESIZE_HANDLE_WIDTH))
             .cursor_col_resize()
-            .group(id)
             .occlude()
-            .when(resize_active, |this| {
-                this.bg(cx.theme().drag_border.opacity(0.14))
-            })
-            .hover(|style| style.bg(cx.theme().drag_border.opacity(0.10)))
-            .focus_visible(|style| style.bg(cx.theme().drag_border.opacity(0.16)))
+            .on_hover(hover_listener(seam_key.clone()))
+            .focus_visible(|style| style.bg(cx.theme().border.opacity(0.16)))
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
                 let delta = match event.keystroke.key.as_str() {
                     "left" => RIGHT_PANEL_RESIZE_KEYBOARD_STEP,
@@ -39438,14 +39415,12 @@ impl VibexWorkbench {
                 cx.listener(|this, _, _, cx| this.finish_right_panel_resize(cx)),
             )
             .child(
-                div()
+                resize_seam::seam_line(&seam_key, cx.theme().border, false, resize_active, false)
                     .absolute()
                     .top_0()
                     .left_0()
                     .bottom_0()
-                    .w(px(1.0))
-                    .bg(line_color)
-                    .group_hover(id, |style| style.bg(cx.theme().drag_border.opacity(0.78))),
+                    .w(px(1.0)),
             )
             .into_any_element()
     }

@@ -10,10 +10,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    AccessibleAction, Anchor, Animation, AnimationExt as _, AnyElement, AnyWindowHandle, App,
-    Context, DragMoveEvent, Empty, Entity, EventEmitter, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, Orientation, Render, Role, SharedString, StatefulInteractiveElement as _,
-    Subscription, Task, Window, div, prelude::*, px,
+    AccessibleAction, Anchor, AnyElement, AnyWindowHandle, App, Context, DragMoveEvent, Empty,
+    Entity, EventEmitter, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Orientation,
+    Render, Role, SharedString, StatefulInteractiveElement as _, Subscription, Task, Window, div,
+    prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Size,
@@ -60,7 +60,9 @@ use vibex_ui::{AgentProviderBindingEditorState, ProjectionCredentialSurface};
 use crate::assets::agent_brand_icon;
 use crate::gpui_ext::button_with_aria_label;
 use crate::locale::{self, ResolvedLocale};
+use crate::motion::hover_listener;
 use crate::remote_access_pairing::open_remote_access_pairing;
+use crate::resize_seam;
 use crate::terminal_surface::TerminalSurface;
 use crate::theme;
 
@@ -71,11 +73,6 @@ const MANAGEMENT_COMPACT_SIDEBAR_MIN_HEIGHT: f32 = 192.0;
 const MANAGEMENT_COMPACT_SIDEBAR_MAX_HEIGHT: f32 = 560.0;
 const MANAGEMENT_COMPACT_MAIN_MIN_HEIGHT: f32 = 192.0;
 const MANAGEMENT_COMPACT_RESIZE_HANDLE_HEIGHT: f32 = 12.0;
-const MANAGEMENT_COMPACT_RESIZE_HANDLE_IDLE_WIDTH: f32 = 48.0;
-const MANAGEMENT_COMPACT_RESIZE_HANDLE_HOVER_WIDTH: f32 = 80.0;
-const MANAGEMENT_COMPACT_RESIZE_HANDLE_IDLE_THICKNESS: f32 = 3.0;
-const MANAGEMENT_COMPACT_RESIZE_HANDLE_HOVER_THICKNESS: f32 = 5.0;
-const MANAGEMENT_COMPACT_RESIZE_HANDLE_ANIMATION_MS: u64 = 140;
 const AGENT_AUTH_TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MANAGEMENT_HOST_TITLE_BAR_HEIGHT: f32 = 50.0;
 const MANAGEMENT_COMPACT_RESIZE_STEP: f32 = 16.0;
@@ -659,7 +656,6 @@ pub struct ManagementCenter {
     selected_skill_id: Option<String>,
     selected_scheduled_task_id: Option<String>,
     compact_sidebar_height: f32,
-    compact_sidebar_resize_hovered: bool,
     compact_sidebar_resize_drag: Option<ManagementSidebarResizeDragState>,
     profile_editor_open: bool,
     editing_profile_id: Option<String>,
@@ -1172,7 +1168,6 @@ impl ManagementCenter {
             selected_skill_id: None,
             selected_scheduled_task_id: None,
             compact_sidebar_height: MANAGEMENT_COMPACT_SIDEBAR_DEFAULT_HEIGHT,
-            compact_sidebar_resize_hovered: false,
             compact_sidebar_resize_drag: None,
             profile_editor_open: false,
             editing_profile_id: None,
@@ -7328,45 +7323,9 @@ impl ManagementCenter {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let resize_active = self.compact_sidebar_resize_drag.is_some();
-        let resize_highlighted = resize_active || self.compact_sidebar_resize_hovered;
         let increment_target = cx.weak_entity();
         let decrement_target = cx.weak_entity();
-        let handle = div()
-            .h(px(MANAGEMENT_COMPACT_RESIZE_HANDLE_IDLE_THICKNESS))
-            .w(px(MANAGEMENT_COMPACT_RESIZE_HANDLE_IDLE_WIDTH))
-            .rounded_full()
-            .bg(cx.theme().border);
-        let handle = if resize_highlighted {
-            let idle_color = cx.theme().border;
-            let highlighted_color = cx.theme().drag_border.opacity(0.92);
-            handle
-                .with_animation(
-                    "management-compact-sidebar-resize-highlight",
-                    Animation::new(Duration::from_millis(
-                        MANAGEMENT_COMPACT_RESIZE_HANDLE_ANIMATION_MS,
-                    ))
-                    .with_easing(ease_out_cubic),
-                    move |handle, delta| {
-                        let width = MANAGEMENT_COMPACT_RESIZE_HANDLE_IDLE_WIDTH
-                            + (MANAGEMENT_COMPACT_RESIZE_HANDLE_HOVER_WIDTH
-                                - MANAGEMENT_COMPACT_RESIZE_HANDLE_IDLE_WIDTH)
-                                * delta;
-                        let thickness = MANAGEMENT_COMPACT_RESIZE_HANDLE_IDLE_THICKNESS
-                            + (MANAGEMENT_COMPACT_RESIZE_HANDLE_HOVER_THICKNESS
-                                - MANAGEMENT_COMPACT_RESIZE_HANDLE_IDLE_THICKNESS)
-                                * delta;
-                        handle.w(px(width)).h(px(thickness)).bg(gpui::Hsla {
-                            h: idle_color.h + (highlighted_color.h - idle_color.h) * delta,
-                            s: idle_color.s + (highlighted_color.s - idle_color.s) * delta,
-                            l: idle_color.l + (highlighted_color.l - idle_color.l) * delta,
-                            a: idle_color.a + (highlighted_color.a - idle_color.a) * delta,
-                        })
-                    },
-                )
-                .into_any_element()
-        } else {
-            handle.into_any_element()
-        };
+        let seam_key = resize_seam::seam_hover_key("management-compact-sidebar");
         h_flex()
             .id("management-compact-sidebar-resize")
             .role(Role::Splitter)
@@ -7382,27 +7341,14 @@ impl ManagementCenter {
             .aria_max_numeric_value(max_height as f64)
             .focusable()
             .tab_index(0)
+            .relative()
             .h(px(MANAGEMENT_COMPACT_RESIZE_HANDLE_HEIGHT))
             .w_full()
             .flex_none()
             .cursor_ns_resize()
-            .items_center()
-            .justify_center()
-            .border_t_1()
             .border_b_1()
             .border_color(cx.theme().border)
-            .bg(if resize_active {
-                cx.theme().accent.opacity(0.30)
-            } else {
-                cx.theme().background
-            })
-            .hover(|style| style.bg(cx.theme().accent.opacity(0.24)))
-            .on_hover(cx.listener(|this, hovered, _, cx| {
-                if this.compact_sidebar_resize_hovered != *hovered {
-                    this.compact_sidebar_resize_hovered = *hovered;
-                    cx.notify();
-                }
-            }))
+            .on_hover(hover_listener(seam_key.clone()))
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
                 let next = match event.keystroke.key.as_str() {
                     "up" => this.compact_sidebar_height - MANAGEMENT_COMPACT_RESIZE_STEP,
@@ -7465,7 +7411,14 @@ impl ManagementCenter {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| this.finish_compact_sidebar_resize(cx)),
             )
-            .child(handle)
+            .child(
+                resize_seam::seam_line(&seam_key, cx.theme().border, false, resize_active, true)
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .h(px(1.0)),
+            )
             .into_any_element()
     }
 
