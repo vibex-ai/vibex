@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, AppContext as _, ClickEvent, Context, Entity, Focusable as _, FontWeight,
-    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, ScrollHandle,
-    SharedString, StatefulInteractiveElement as _, Styled, Task, Window, div,
+    AnyElement, App, AppContext as _, BoxShadow, ClickEvent, Context, Entity, Focusable as _,
+    FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _,
+    ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled, Task, Window, div,
     prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
@@ -352,6 +352,8 @@ impl DirectoryPickerDialog {
         let strings = text(self.locale());
         let is_dark = cx.theme().is_dark();
         let foreground = crate::theme::semantic_color("popover-foreground", is_dark);
+        let muted = crate::theme::semantic_color("muted-foreground", is_dark);
+        let primary = cx.theme().primary;
         let selected_label = self
             .selected
             .as_ref()
@@ -360,16 +362,35 @@ impl DirectoryPickerDialog {
         h_flex()
             .w_full()
             .items_center()
-            .justify_between()
             .gap_3()
             .child(
-                div()
+                h_flex()
                     .min_w_0()
                     .flex_1()
-                    .truncate()
+                    .items_center()
+                    .gap_1p5()
+                    .child(
+                        Icon::new(IconName::FolderOpen)
+                            .size(px(13.0))
+                            .flex_none()
+                            .text_color(primary),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_xs()
+                            .text_color(foreground.opacity(0.75))
+                            .child(selected_label),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
                     .text_xs()
-                    .text_color(foreground.opacity(0.65))
-                    .child(selected_label),
+                    .text_color(muted.opacity(0.7))
+                    .child(strings.hint),
             )
             .child(
                 h_flex()
@@ -522,6 +543,21 @@ impl gpui::Render for DirectoryPickerDialog {
                 .gap_2()
                 .child(
                     div()
+                        .size(px(44.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(12.0))
+                        .bg(muted_bg.opacity(0.4))
+                        .child(
+                            Icon::new(IconName::FolderOpen)
+                                .size(px(20.0))
+                                .text_color(muted),
+                        ),
+                )
+                .child(
+                    div()
                         .text_sm()
                         .text_color(muted)
                         .child(if query.is_empty() {
@@ -552,15 +588,15 @@ impl gpui::Render for DirectoryPickerDialog {
                 .overflow_y_scroll()
                 .vertical_scrollbar(&self.list_scroll)
                 .gap(px(2.0))
-                .py(px(4.0))
+                .pt(px(2.0))
+                .pb(px(4.0))
                 .children(entries.into_iter().enumerate().map(|(ix, entry)| {
                     let is_active = ix == self.active;
                     let name: SharedString = entry.name.clone().into();
-                    let path_label: SharedString = entry.path.to_string_lossy().into_owned().into();
                     let path = entry.path.clone();
                     h_flex()
                         .id(("directory-picker-row", ix))
-                        .min_h(px(30.0))
+                        .min_h(px(32.0))
                         .px_2()
                         .rounded(px(6.0))
                         .gap_2()
@@ -585,35 +621,26 @@ impl gpui::Render for DirectoryPickerDialog {
                                 .text_color(if is_active { primary } else { muted }),
                         )
                         .child(div().min_w_0().truncate().child(name))
-                        .child(
-                            div()
-                                .ml_auto()
-                                .flex_none()
-                                .max_w(px(160.0))
-                                .truncate()
-                                .text_xs()
-                                .text_color(muted.opacity(0.7))
-                                .child(path_label),
-                        )
                 }))
                 .into_any_element()
         };
 
         let rail = v_flex()
-            .w(px(168.0))
+            .w(px(172.0))
             .flex_none()
             .border_l_1()
             .border_color(border.opacity(0.6))
             .px(px(8.0))
-            .py(px(8.0))
+            .pt(px(10.0))
+            .pb(px(8.0))
             .gap(px(2.0))
             .child(
                 div()
                     .px(px(8.0))
-                    .pb(px(4.0))
+                    .pb(px(6.0))
                     .text_xs()
                     .font_weight(FontWeight::MEDIUM)
-                    .text_color(muted.opacity(0.8))
+                    .text_color(muted.opacity(0.7))
                     .child(strings.places),
             )
             .children(quick_rows.into_iter().map(|(location, label)| {
@@ -628,7 +655,7 @@ impl gpui::Render for DirectoryPickerDialog {
                 };
                 h_flex()
                     .id(("directory-picker-location", row_key))
-                    .min_h(px(28.0))
+                    .min_h(px(30.0))
                     .px(px(8.0))
                     .rounded(px(6.0))
                     .gap_2()
@@ -672,8 +699,10 @@ impl gpui::Render for DirectoryPickerDialog {
                     )
                     .child(if is_last {
                         div()
-                            .px(px(4.0))
-                            .rounded(px(4.0))
+                            .px(px(5.0))
+                            .py(px(2.0))
+                            .rounded(px(5.0))
+                            .bg(primary.opacity(0.10))
                             .text_color(foreground)
                             .font_weight(FontWeight::MEDIUM)
                             .child(crumb.label)
@@ -682,11 +711,12 @@ impl gpui::Render for DirectoryPickerDialog {
                         let path = crumb.path;
                         div()
                             .id(("directory-picker-crumb", ix))
-                            .px(px(4.0))
-                            .rounded(px(4.0))
+                            .px(px(5.0))
+                            .py(px(2.0))
+                            .rounded(px(5.0))
                             .cursor_pointer()
                             .text_color(muted)
-                            .hover(|style| style.text_color(foreground))
+                            .hover(|style| style.text_color(foreground).bg(muted_bg.opacity(0.6)))
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                 this.browse(Some(path.clone()), cx);
                             }))
@@ -722,6 +752,7 @@ impl gpui::Render for DirectoryPickerDialog {
                     .flex_none()
                     .items_center()
                     .gap_2()
+                    .pb_2()
                     .child(
                         div()
                             .flex_1()
@@ -731,6 +762,12 @@ impl gpui::Render for DirectoryPickerDialog {
                             .border_1()
                             .border_color(if search_focused { ring } else { input_color })
                             .bg(muted_bg.opacity(0.5))
+                            .when(search_focused, |field| {
+                                field.shadow(vec![
+                                    BoxShadow::new(px(0.0), px(0.0), ring.opacity(0.30))
+                                        .spread_radius(px(2.0)),
+                                ])
+                            })
                             .child(
                                 Input::new(&self.search_input)
                                     .small()
@@ -753,29 +790,28 @@ impl gpui::Render for DirectoryPickerDialog {
                     ),
             )
             .child(
-                // Breadcrumb path strip above the folder list.
-                h_flex()
-                    .flex_none()
-                    .items_center()
-                    .min_h(px(28.0))
-                    .px_1()
-                    .child(crumbs),
-            )
-            .child(
+                // Folder column (breadcrumbs above the list) beside the
+                // full-height places rail.
                 h_flex()
                     .flex_1()
                     .min_h_0()
                     .items_stretch()
-                    .child(v_flex().flex_1().min_w_0().min_h_0().child(list))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .child(
+                                h_flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .min_h(px(28.0))
+                                    .px_1()
+                                    .child(crumbs),
+                            )
+                            .child(list),
+                    )
                     .child(rail),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .pt_2()
-                    .text_xs()
-                    .text_color(muted.opacity(0.7))
-                    .child(strings.hint),
             )
     }
 }
@@ -796,20 +832,22 @@ fn breadcrumb_segments(path: &Path, home: Option<&Path>, home_label: &str) -> Ve
         ),
         _ => (None, path),
     };
-    if let Some(fold) = folded {
+    if let Some(ref fold) = folded {
         segments.push(Crumb {
             label: SharedString::from(home_label),
-            path: fold,
+            path: fold.clone(),
         });
     }
-    let mut accumulated = PathBuf::new();
+    // Accumulate from the folded base (or the path root) so every crumb
+    // target stays absolute; segments below the home fold would otherwise
+    // browse a relative path and fail to list.
+    let mut accumulated = folded.unwrap_or_default();
     for component in visible.components() {
-        let label = component.as_os_str().to_string_lossy().into_owned();
-        if accumulated.as_os_str().is_empty() {
-            accumulated = PathBuf::from(&label);
-        } else {
-            accumulated.push(&label);
-        }
+        accumulated.push(component.as_os_str());
+        let label = accumulated
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| accumulated.to_string_lossy().into_owned());
         segments.push(Crumb {
             label: SharedString::from(label),
             path: accumulated.clone(),
@@ -1006,4 +1044,65 @@ fn user_home_directory() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .filter(|home| !home.as_os_str().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn breadcrumb_segments_under_home_stay_absolute() {
+        let home = Path::new("/home/ada");
+        let crumbs = breadcrumb_segments(Path::new("/home/ada/projects/vibex"), Some(home), "Home");
+        let targets: Vec<&Path> = crumbs.iter().map(|crumb| crumb.path.as_path()).collect();
+        assert_eq!(
+            targets,
+            vec![
+                Path::new("/home/ada"),
+                Path::new("/home/ada/projects"),
+                Path::new("/home/ada/projects/vibex"),
+            ]
+        );
+        let labels: Vec<&str> = crumbs.iter().map(|crumb| crumb.label.as_ref()).collect();
+        assert_eq!(labels, vec!["Home", "projects", "vibex"]);
+    }
+
+    #[test]
+    fn breadcrumb_segments_outside_home_show_full_path() {
+        let crumbs = breadcrumb_segments(
+            Path::new("/media/backup"),
+            Some(Path::new("/home/ada")),
+            "Home",
+        );
+        assert!(crumbs.iter().all(|crumb| crumb.path.is_absolute()));
+        // The leading filesystem-root crumb ("label /", path /) is present
+        // and clickable on paths outside the home fold.
+        assert_eq!(crumbs[0].label.as_ref(), "/");
+        assert_eq!(crumbs[0].path, Path::new("/"));
+        assert_eq!(
+            crumbs
+                .iter()
+                .map(|crumb| crumb.label.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["/", "media", "backup"]
+        );
+    }
+
+    #[test]
+    fn breadcrumb_segments_at_home_root_show_single_crumb() {
+        let crumbs =
+            breadcrumb_segments(Path::new("/home/ada"), Some(Path::new("/home/ada")), "Home");
+        assert_eq!(crumbs.len(), 1);
+        assert_eq!(crumbs[0].label.as_ref(), "Home");
+        assert_eq!(crumbs[0].path, Path::new("/home/ada"));
+    }
+
+    #[test]
+    fn expand_query_resolves_tilde_forms() {
+        let home = Path::new("/home/ada");
+        assert_eq!(expand_query("~", Some(home)), "/home/ada");
+        assert_eq!(expand_query("~/docs", Some(home)), "/home/ada/docs");
+        assert_eq!(expand_query("/opt", Some(home)), "/opt");
+        assert_eq!(expand_query("~", None), "");
+    }
 }
