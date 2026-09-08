@@ -147,6 +147,7 @@ use crate::assets::{agent_brand_icon, model_brand_icon, window_icon};
 use crate::code_workbench::{
     CodeRightRail, CodeWorkbench, CodeWorkbenchEvent, CodeWorkbenchPersistedState, RightRailMode,
 };
+use crate::directory_picker::{DirectoryPickHandler, DirectoryPickerDialog};
 use crate::gpui_ext::button_with_aria_label;
 use crate::image_editor::{
     ImageEditSession, ImageEditTool, apply_arrow, apply_brush, apply_circle, apply_crop,
@@ -16257,6 +16258,90 @@ impl VibexWorkbench {
         if self.sidebar_picker_task.is_some() || self.agent_action_pending {
             return;
         }
+        if !self.new_session_open {
+            self.open_new_session(None, window, cx);
+        }
+        self.set_new_session_project_menu_open(false, window, cx);
+        self.open_project_directory_picker(window, cx);
+    }
+
+    /// Opens the in-app folder browser used to pick a project directory for
+    /// a new session. The picker only resolves a path; the workspace is
+    /// opened by [`Self::open_picked_project_workspace`] once the user
+    /// confirms.
+    fn open_project_directory_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let locale_mode = self.ui_state.appearance.locale;
+        let workbench = cx.weak_entity();
+        // Start at the selected project's root when there is one, so the
+        // common "sibling of the current project" case is one step away.
+        let initial_dir = {
+            let project_root = self.new_session_workspace.project_root.trim();
+            (!project_root.is_empty() && Path::new(project_root).is_dir())
+                .then(|| PathBuf::from(project_root))
+        };
+        let on_pick: DirectoryPickHandler = Arc::new(move |root_path, window, cx| {
+            workbench
+                .update(cx, |workbench, cx| {
+                    workbench.open_picked_project_workspace(root_path, window, cx);
+                })
+                .is_ok()
+        });
+        let dialog_view: Entity<DirectoryPickerDialog> =
+            cx.new(|cx| DirectoryPickerDialog::new(locale_mode, initial_dir, on_pick, window, cx));
+        let title = locale::text("Choose project directory", "选择项目目录", "選擇專案目錄");
+        let viewport = window.viewport_size();
+        let dialog_width = (f32::from(viewport.width) - 48.0).clamp(420.0, 640.0);
+        let dialog_height = (f32::from(viewport.height) - 48.0).clamp(1.0, 520.0);
+        let dialog_entity = dialog_view.downgrade();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let is_dark = cx.theme().is_dark();
+            let popover = theme::semantic_color("popover", is_dark);
+            let popover_foreground = theme::semantic_color("popover-foreground", is_dark);
+            // Rebuilt on every dialog render so the footer always reflects
+            // the picker's live browse position.
+            let footer = dialog_entity
+                .update(cx, |picker, cx| picker.render_footer(cx).into_any_element())
+                .unwrap_or_else(|_| div().into_any_element());
+            let content_view = dialog_view.clone();
+            dialog
+                .title(title)
+                .w(px(dialog_width))
+                .max_w(px(dialog_width))
+                .h(px(dialog_height))
+                .rounded(px(14.0))
+                .bg(popover)
+                .text_color(popover_foreground)
+                .border_color(popover_foreground.opacity(0.10))
+                // The picker owns Enter/Escape through its own key handler;
+                // the dialog defaults would confirm on every propagated
+                // keystroke before the browser sees it.
+                .keyboard(false)
+                .overlay(true)
+                .overlay_closable(true)
+                .content(move |content, _, _| {
+                    // `min_h_0` + `overflow_hidden` keep the dialog content
+                    // column from growing to its min-content height, the
+                    // same load-bearing combo the session importer uses.
+                    content
+                        .min_h_0()
+                        .overflow_hidden()
+                        .pt(px(4.0))
+                        .child(content_view.clone())
+                })
+                .footer(footer)
+        });
+        cx.notify();
+    }
+
+    fn open_picked_project_workspace(
+        &mut self,
+        root_path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(backend) = self.backend.clone() else {
             self.new_session_error = Some("Local backend is not ready".into());
             cx.notify();
@@ -16265,17 +16350,8 @@ impl VibexWorkbench {
         if !self.new_session_open {
             self.open_new_session(None, window, cx);
         }
-        self.set_new_session_project_menu_open(false, window, cx);
         let entity = cx.weak_entity();
         let picker = gpui_tokio::Tokio::spawn(cx, async move {
-            let Some(folder) = rfd::AsyncFileDialog::new()
-                .set_title("Choose project directory")
-                .pick_folder()
-                .await
-            else {
-                return Ok::<_, vibex_backend::BackendError>(None);
-            };
-            let root_path = folder.path().to_string_lossy().into_owned();
             backend
                 .workspace()
                 .open_workspace(
