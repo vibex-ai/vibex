@@ -419,6 +419,8 @@ mod tests {
     const ANDROID_CONNECTION_SERVICE: &str =
         include_str!("../android/app/src/main/java/ai/vibex/mobile/RemoteConnectionService.java");
     const BACKGROUND_CONNECTION_SOURCE: &str = include_str!("background_connection.rs");
+    const GPUI_ANDROID_EVENTS: &str =
+        include_str!("../../../vendor/zed/crates/gpui_android/src/events.rs");
 
     fn notification() -> BackendEvent {
         BackendEvent::Notification(vibex_core::AgentNotificationIntent {
@@ -483,5 +485,25 @@ mod tests {
                 "Rust is missing the {method} JNI call"
             );
         }
+    }
+
+    #[test]
+    fn android_back_key_is_mapped_for_in_app_navigation() {
+        // The vendor platform maps KEYCODE_BACK to the "back" keystroke, and
+        // the app binds it to NavigateBack so the system back gesture pops the
+        // page stack instead of backgrounding the activity.
+        assert!(
+            GPUI_ANDROID_EVENTS.contains("Back => \"back\""),
+            "gpui_android must map KEYCODE_BACK to the \"back\" keystroke"
+        );
+        let app_source = include_str!("app.rs");
+        assert!(
+            app_source.contains("KeyBinding::new(\"back\", NavigateBack, None)"),
+            "the mobile app must bind the back keystroke to NavigateBack"
+        );
+        assert!(
+            app_source.contains("fn handle_navigate_back"),
+            "the mobile app must implement the back-navigation handler"
+        );
     }
 }

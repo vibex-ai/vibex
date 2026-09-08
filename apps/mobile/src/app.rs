@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt as _;
 use gpui::{
@@ -53,8 +53,8 @@ use vibex_ui::{
 
 use crate::discovery::{LanDiscoveryCandidate, LanDiscoveryEvent, LanDiscoveryMode};
 use crate::input::{
-    Backspace, Copy, Cut, Delete, Down, Enter, Left, Paste, Right, SelectAll, SelectDown,
-    SelectLeft, SelectRight, SelectUp, TextInput, Up,
+    Backspace, Copy, Cut, Delete, Down, Enter, Left, NavigateBack, Paste, Right, SelectAll,
+    SelectDown, SelectLeft, SelectRight, SelectUp, TextInput, Up,
 };
 use crate::lifecycle::MobileLifecycleEvent;
 use crate::pairing::{MobileCredentialBundle, claim_pairing_link, claim_zero_config_lan_pairing};
@@ -139,6 +139,26 @@ enum RootMode {
     Pairing,
     Connecting,
     Workspace,
+}
+
+/// One closable screen on the back-navigation stack. The back key/gesture pops
+/// entries front-to-back; an empty stack means the host back behavior applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackScreen {
+    /// A full-screen overlay (Hosts, Settings, Usage, NewProject, NewSession).
+    Overlay(MobileOverlay),
+    /// A renamed/detached session with its title still open in the prompt.
+    SessionAction,
+    /// The runtime selection sheet.
+    RuntimeOptions,
+    /// The Sessions drawer.
+    SessionsDrawer,
+    /// The Workbench drawer.
+    WorkbenchDrawer,
+    /// The Sessions drawer with its search field expanded.
+    SidebarSearch,
+    /// The batch (multi-select) sidebar mode.
+    SidebarBatchMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -414,17 +434,60 @@ enum DrawerDragOrigin {
 
 /// Touch pans arrive as scroll events (see `gpui_android`/`gpui_ios`), so the drawer
 /// tracks its own accumulated translation rather than absolute pointer positions.
+/// Recent movement samples feed the release-velocity estimate that decides
+/// whether a pan commits as a swipe.
 #[derive(Debug, Clone, Copy)]
 enum DrawerGesture {
     Pending {
         origin: DrawerDragOrigin,
         dx: f32,
         dy: f32,
+        velocity: DrawerVelocity,
     },
     Dragging {
         page: DrawerPage,
         last_dx: f32,
+        velocity: DrawerVelocity,
     },
+}
+
+/// Exponential moving average of pan velocity over recent Moved events, in
+/// logical pixels per second.
+#[derive(Debug, Clone, Copy, Default)]
+struct DrawerVelocity {
+    vx: f32,
+    vy: f32,
+    samples: u32,
+}
+
+impl DrawerVelocity {
+    /// Blends one more per-event delta. Each Moved event carries the average
+    /// velocity since the previous event (touch coalescing varies), so the
+    /// instantaneous velocity `delta / dt` is folded in with a fixed blend
+    /// factor rather than accumulating raw distances.
+    fn record(mut self, delta_x: f32, delta_y: f32, dt: Duration) -> Self {
+        let seconds = dt.as_secs_f32();
+        if seconds <= f32::EPSILON {
+            return self;
+        }
+        let ix = delta_x / seconds;
+        let iy = delta_y / seconds;
+        // The first sample initializes; later samples are an EMA so a brief
+        // fast flick right before release still dominates the estimate.
+        let blend = if self.samples == 0 { 1.0 } else { 0.55 };
+        self.vx += (ix - self.vx) * blend;
+        self.vy += (iy - self.vy) * blend;
+        self.samples = self.samples.saturating_add(1);
+        self
+    }
+
+    /// A deliberate horizontal flick: fast along x and clearly faster along x
+    /// than along y.
+    fn is_horizontal_flick(&self) -> bool {
+        self.samples > 0
+            && self.vx.abs() >= theme::DRAWER_SWIPE_VELOCITY
+            && self.vx.abs() > self.vy.abs() * theme::DRAWER_SWIPE_STRAIGHTNESS
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -454,6 +517,10 @@ fn apply_app_settings(settings: &AppSettings, cx: &App) {
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
+        // Android's back key/gesture arrives as the "back" keystroke (mapped by
+        // gpui_android). It pops the topmost screen; at the root the host
+        // Activity already falls back to its own back behavior.
+        KeyBinding::new("back", NavigateBack, None),
         KeyBinding::new("backspace", Backspace, Some("MobileTextInput")),
         KeyBinding::new("delete", Delete, Some("MobileTextInput")),
         KeyBinding::new("enter", Enter, Some("MobileTextInput")),
@@ -516,6 +583,9 @@ pub struct MobileApp {
     drawer_snap: Option<DrawerSnap>,
     drawer_animation_id: u64,
     drawer_snap_task: Option<Task<()>>,
+    /// Timestamp of the last drawer pan event, feeding the release-velocity
+    /// estimate that separates deliberate swipes from slow drags.
+    drawer_pan_last_at: Option<Instant>,
     expanded_process: BTreeMap<String, bool>,
     expanded_timeline_rows: BTreeSet<String>,
     collapsed_timeline_rows: BTreeSet<String>,
@@ -591,6 +661,8 @@ pub struct MobileApp {
     resume_recovery_task: Option<Task<()>>,
     pending_notification_action: Option<notifications::NotificationAction>,
     tasks: Vec<Task<()>>,
+    /// Ordered by recency: the front is the screen the back key closes first.
+    back_stack: Vec<BackScreen>,
 }
 
 fn timeline_action_button(
@@ -730,6 +802,7 @@ impl MobileApp {
             drawer_snap: None,
             drawer_animation_id: 0,
             drawer_snap_task: None,
+            drawer_pan_last_at: None,
             expanded_process: BTreeMap::new(),
             expanded_timeline_rows: BTreeSet::new(),
             collapsed_timeline_rows: BTreeSet::new(),
@@ -820,6 +893,7 @@ impl MobileApp {
             event_consumer_task: None,
             resume_recovery_task: None,
             pending_notification_action: None,
+            back_stack: Vec::new(),
             tasks: Vec::new(),
         };
         if let Ok(Some(bundle)) = stored {
@@ -918,7 +992,30 @@ impl MobileApp {
                 }
                 background.timer(RESUME_RECOVERY_POLL_INTERVAL).await;
             }
+            // The transport gave up before the UI saw a stable connection.
+            // Surface it as a retryable notice instead of leaving the user on
+            // a frozen screen, and clear the stale event-consumer task.
+            let _ = entity.update(cx, |this, cx| {
+                this.stop_event_stream();
+                this.notice = Some(
+                    locale::text(
+                        "Reconnection failed. Tap to retry.",
+                        "重新连接失败，点击重试。",
+                        "重新連線失敗，點擊重試。",
+                    )
+                    .to_string(),
+                );
+                cx.notify();
+            });
         }));
+    }
+
+    /// Stops forwarding backend events to the UI and cancels the recovery
+    /// poll. The transport itself is untouched, so an in-flight reconnect can
+    /// still complete and be picked up by the next lifecycle signal.
+    fn stop_event_stream(&mut self) {
+        crate::background_connection::suspend_ui_events();
+        self.event_consumer_task = None;
     }
 
     fn start_scanner_result_stream(&mut self, cx: &mut Context<Self>) {
@@ -1034,6 +1131,7 @@ impl MobileApp {
                 }
                 self.reset_drawers();
                 self.reset_sidebar_ui(cx);
+                self.back_stack.clear();
                 self.workspaces.clear();
                 self.workspace_summaries.clear();
                 self.timeline_markdown_views.borrow_mut().clear();
@@ -1729,6 +1827,7 @@ impl MobileApp {
         self.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
         self.runtime_draft = Some(desired);
         self.runtime_options_open = true;
+        self.push_back_screen(BackScreen::RuntimeOptions);
         self.runtime_switch_error = None;
         self.sync_runtime_feature_inputs(cx);
         if !has_catalog {
@@ -1801,6 +1900,7 @@ impl MobileApp {
         self.runtime_options_target = RuntimeOptionsTarget::NewSession;
         self.runtime_draft = Some(desired);
         self.runtime_options_open = true;
+        self.push_back_screen(BackScreen::RuntimeOptions);
         self.runtime_switch_error = None;
         self.sync_runtime_feature_inputs(cx);
         if !has_catalog {
@@ -2526,6 +2626,7 @@ impl MobileApp {
             session_id,
             current_title,
         });
+        self.push_back_screen(BackScreen::SessionAction);
         self.error = None;
         cx.notify();
     }
@@ -3346,6 +3447,12 @@ impl MobileApp {
         self.new_session_runtime = None;
         self.sidebar_projects_initialized = false;
         self.sidebar_search_open = false;
+        Self::remove_back_screens(&mut self.back_stack, |screen| {
+            matches!(
+                screen,
+                BackScreen::SidebarSearch | BackScreen::SidebarBatchMode
+            )
+        });
         self.sidebar_search_input
             .update(cx, |input, cx| input.set_text("", cx));
     }
@@ -3403,7 +3510,9 @@ impl MobileApp {
         cx: &mut Context<Self>,
     ) {
         self.sidebar_batch_mode = !self.sidebar_batch_mode;
-        if !self.sidebar_batch_mode {
+        if self.sidebar_batch_mode {
+            self.push_back_screen(BackScreen::SidebarBatchMode);
+        } else {
             self.sidebar_state.selected_ids.clear();
         }
         cx.notify();
@@ -3612,6 +3721,7 @@ impl MobileApp {
     ) {
         self.sidebar_search_open = !self.sidebar_search_open;
         if self.sidebar_search_open {
+            self.push_back_screen(BackScreen::SidebarSearch);
             self.sidebar_search_input
                 .read(cx)
                 .focus_handle(cx)
@@ -3638,6 +3748,7 @@ impl MobileApp {
             self.overlay_parent = previous;
         }
         self.overlay = Some(overlay);
+        self.push_back_screen(BackScreen::Overlay(overlay));
         self.start_drawer_snap(0.0, Some(window), cx);
         cx.notify();
     }
@@ -3646,6 +3757,85 @@ impl MobileApp {
         self.overlay = None;
         self.overlay_parent = None;
         self.overlay_returns_to_drawer = false;
+        Self::remove_back_screens(&mut self.back_stack, |screen| {
+            matches!(screen, BackScreen::Overlay(_))
+        });
+    }
+
+    /// Records `screen` as the top of the back stack, collapsing consecutive
+    /// duplicates so repeated entries never pile up.
+    fn push_back_screen(&mut self, screen: BackScreen) {
+        if self.back_stack.last() != Some(&screen) {
+            self.back_stack.push(screen);
+        }
+    }
+
+    /// Drops every occurrence of `screen` (and anything opened on top of it)
+    /// from the back stack, keeping the remaining order intact.
+    fn remove_back_screens<P>(back_stack: &mut Vec<BackScreen>, mut predicate: P)
+    where
+        P: FnMut(&BackScreen) -> bool,
+    {
+        while let Some(index) = back_stack.iter().rposition(&mut predicate) {
+            back_stack.truncate(index);
+        }
+    }
+
+    fn sync_back_stack_with_ui(&mut self) {
+        let session_action_open = self.session_action.is_some();
+        let runtime_options_open = self.runtime_options_open;
+        let settled_target = self.settled_drawer_target();
+        let sidebar_search_open = self.sidebar_search_open;
+        let sidebar_batch_mode = self.sidebar_batch_mode;
+        self.back_stack.retain(|screen| match *screen {
+            BackScreen::Overlay(_) => false,
+            BackScreen::SessionAction => session_action_open,
+            BackScreen::RuntimeOptions => runtime_options_open,
+            BackScreen::SessionsDrawer => settled_target == DrawerPage::Sessions.open_offset(),
+            BackScreen::WorkbenchDrawer => settled_target == DrawerPage::Workbench.open_offset(),
+            BackScreen::SidebarSearch => sidebar_search_open,
+            BackScreen::SidebarBatchMode => sidebar_batch_mode,
+        });
+        if let Some(overlay) = self.overlay {
+            self.push_back_screen(BackScreen::Overlay(overlay));
+        }
+    }
+
+    /// The Android back key/gesture: close the topmost screen and keep the app
+    /// in the foreground. The host Activity backgrounding remains the fallback
+    /// for an empty stack because gpui_android reports unhandled keystrokes to
+    /// the framework by never mapping unknown keys.
+    fn handle_navigate_back(
+        &mut self,
+        _: &NavigateBack,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(self.mode, RootMode::Pairing | RootMode::Connecting) {
+            return;
+        }
+        self.sync_back_stack_with_ui();
+        let Some(screen) = self.back_stack.pop() else {
+            return;
+        };
+        window.hide_soft_keyboard();
+        match screen {
+            BackScreen::SessionAction => {
+                if !self.session_action_busy {
+                    self.session_action = None;
+                }
+            }
+            BackScreen::RuntimeOptions => self.close_runtime_options(&noop_mouse_up(), window, cx),
+            BackScreen::Overlay(_) => self.dismiss_overlay(Some(window), cx),
+            BackScreen::SessionsDrawer | BackScreen::WorkbenchDrawer => {
+                self.start_drawer_snap(0.0, Some(window), cx)
+            }
+            BackScreen::SidebarSearch => self.toggle_sidebar_search(&noop_mouse_up(), window, cx),
+            BackScreen::SidebarBatchMode => {
+                self.toggle_sidebar_batch_mode(&noop_mouse_up(), window, cx)
+            }
+        }
+        cx.notify();
     }
 
     fn close_overlay(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -4341,6 +4531,11 @@ impl MobileApp {
         self.drawer_open = target > 0.0;
         let workbench_was_open = self.workbench_open;
         self.workbench_open = target < 0.0;
+        if target > 0.0 {
+            self.push_back_screen(BackScreen::SessionsDrawer);
+        } else if target < 0.0 {
+            self.push_back_screen(BackScreen::WorkbenchDrawer);
+        }
         if self.workbench_open && !workbench_was_open {
             if let Some(workbench) = self.workbench.as_ref() {
                 workbench.update(cx, |workbench, cx| workbench.resume(cx));
@@ -4398,6 +4593,12 @@ impl MobileApp {
         self.drawer_gesture = None;
         self.drawer_snap = None;
         self.drawer_snap_task = None;
+        Self::remove_back_screens(&mut self.back_stack, |screen| {
+            matches!(
+                screen,
+                BackScreen::SessionsDrawer | BackScreen::WorkbenchDrawer
+            )
+        });
     }
 
     fn settled_drawer_target(&self) -> f32 {
@@ -4768,6 +4969,7 @@ impl MobileApp {
         self.reset_runtime_options();
         self.notice = None;
         self.error = None;
+        self.back_stack.clear();
         cx.notify();
     }
 
@@ -4780,9 +4982,11 @@ impl MobileApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let now = Instant::now();
         match drawer_pan_input(event) {
             DrawerPanInput::Started { delta_x, delta_y } => {
                 self.drawer_gesture = None;
+                self.drawer_pan_last_at = Some(now);
                 if self.drawer_snap.is_some()
                     || self.session_action.is_some()
                     || self.runtime_options_open
@@ -4795,13 +4999,14 @@ impl MobileApp {
                     origin,
                     dx: 0.0,
                     dy: 0.0,
+                    velocity: DrawerVelocity::default(),
                 });
                 // Android reports the translation that broke its touch slop on this
                 // very event, so fold it in rather than waiting for the next one.
-                self.advance_drawer_pan(delta_x, delta_y, window, cx);
+                self.advance_drawer_pan(delta_x, delta_y, now, window, cx);
             }
             DrawerPanInput::Moved { delta_x, delta_y } => {
-                self.advance_drawer_pan(delta_x, delta_y, window, cx)
+                self.advance_drawer_pan(delta_x, delta_y, now, window, cx)
             }
             DrawerPanInput::Ended => self.finish_drawer_pan(false, window, cx),
             DrawerPanInput::Cancelled => self.finish_drawer_pan(true, window, cx),
@@ -4811,6 +5016,7 @@ impl MobileApp {
 
     fn finish_drawer_pan(&mut self, cancelled: bool, window: &mut Window, cx: &mut Context<Self>) {
         let gesture = self.drawer_gesture.take();
+        self.drawer_pan_last_at = None;
         if self.drawer_snap.is_some() {
             return;
         }
@@ -4879,15 +5085,32 @@ impl MobileApp {
         &mut self,
         delta_x: f32,
         delta_y: f32,
+        now: Instant,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let elapsed = self
+            .drawer_pan_last_at
+            .replace(now)
+            .and_then(|last| now.checked_duration_since(last))
+            .unwrap_or_default();
         match self.drawer_gesture {
-            Some(DrawerGesture::Pending { origin, dx, dy }) => {
+            Some(DrawerGesture::Pending {
+                origin,
+                dx,
+                dy,
+                velocity,
+            }) => {
                 let (dx, dy) = (dx + delta_x, dy + delta_y);
+                let velocity = velocity.record(delta_x, delta_y, elapsed);
                 match drawer_pan_decision(origin, dx, dy) {
                     DrawerPanDecision::Wait => {
-                        self.drawer_gesture = Some(DrawerGesture::Pending { origin, dx, dy });
+                        self.drawer_gesture = Some(DrawerGesture::Pending {
+                            origin,
+                            dx,
+                            dy,
+                            velocity,
+                        });
                     }
                     DrawerPanDecision::Cancel => {
                         self.drawer_gesture = None;
@@ -4901,14 +5124,25 @@ impl MobileApp {
                         if page == DrawerPage::Workbench && self.workbench.is_none() {
                             self.refresh_workspaces(cx);
                         }
-                        self.drawer_gesture = Some(DrawerGesture::Dragging { page, last_dx: 0.0 });
-                        self.apply_drawer_drag(page, dx, workspace_page_width(window), cx);
+                        self.drawer_gesture = Some(DrawerGesture::Dragging {
+                            page,
+                            last_dx: 0.0,
+                            velocity,
+                        });
+                        self.apply_drawer_drag(
+                            page,
+                            dx,
+                            velocity,
+                            workspace_page_width(window),
+                            cx,
+                        );
                         cx.stop_propagation();
                     }
                 }
             }
-            Some(DrawerGesture::Dragging { page, .. }) => {
-                self.apply_drawer_drag(page, delta_x, workspace_page_width(window), cx);
+            Some(DrawerGesture::Dragging { page, velocity, .. }) => {
+                let velocity = velocity.record(delta_x, delta_y, elapsed);
+                self.apply_drawer_drag(page, delta_x, velocity, workspace_page_width(window), cx);
                 cx.stop_propagation();
             }
             None => {}
@@ -4919,6 +5153,7 @@ impl MobileApp {
         &mut self,
         page: DrawerPage,
         delta_x: f32,
+        velocity: DrawerVelocity,
         page_width: f32,
         cx: &mut Context<Self>,
     ) {
@@ -4930,6 +5165,7 @@ impl MobileApp {
         self.drawer_gesture = Some(DrawerGesture::Dragging {
             page,
             last_dx: delta_x,
+            velocity,
         });
         cx.notify();
     }
@@ -4950,6 +5186,7 @@ impl MobileApp {
             .items_center()
             .justify_center()
             .px(px(theme::SPACING_XL))
+            .on_action(cx.listener(Self::handle_navigate_back))
             .child(
                 div()
                     .flex()
@@ -5332,6 +5569,7 @@ impl MobileApp {
             .items_center()
             .justify_center()
             .px(px(theme::SPACING_XL))
+            .on_action(cx.listener(Self::handle_navigate_back))
             .child(
                 svg()
                     .path("brand/logo.svg")
@@ -5488,6 +5726,7 @@ impl MobileApp {
             .size_full()
             .relative()
             .capture_scroll_wheel(cx.listener(Self::drawer_pan))
+            .on_action(cx.listener(Self::handle_navigate_back))
             .child(
                 div()
                     .size_full()
@@ -5582,6 +5821,7 @@ impl MobileApp {
                     .when_some(self.notice.as_ref(), |workspace, notice| {
                         workspace.child(
                             div()
+                                .id("workspace-notice")
                                 .border_t_1()
                                 .border_color(theme::border_subtle())
                                 .bg(theme::bg_card_dim())
@@ -5589,6 +5829,8 @@ impl MobileApp {
                                 .py_2()
                                 .text_size(px(theme::FONT_CAPTION))
                                 .text_color(theme::accent_yellow())
+                                .cursor_pointer()
+                                .on_mouse_up(MouseButton::Left, cx.listener(Self::refresh))
                                 .child(notice.clone()),
                         )
                     })
@@ -13180,6 +13422,17 @@ impl MobileApp {
     }
 }
 
+/// A placeholder mouse event for reusing mouse-up listeners from the back-key
+/// action handler, where no real pointer event exists.
+fn noop_mouse_up() -> MouseUpEvent {
+    MouseUpEvent {
+        button: MouseButton::Left,
+        position: Default::default(),
+        modifiers: Default::default(),
+        click_count: 0,
+    }
+}
+
 fn drawer_snap_duration_ms(from: f32, target: f32) -> u64 {
     if target.abs() > from.abs() {
         theme::DRAWER_OPEN_ANIMATION_MS
@@ -13273,11 +13526,16 @@ fn drawer_terminal_target(
     settled_target: f32,
     cancelled: bool,
 ) -> Option<f32> {
-    if let Some(DrawerGesture::Dragging { page, last_dx }) = gesture {
+    if let Some(DrawerGesture::Dragging {
+        page,
+        last_dx,
+        velocity,
+    }) = gesture
+    {
         return Some(if cancelled {
             settled_target
         } else {
-            drawer_snap_target(page, offset, last_dx, settled_target)
+            drawer_snap_target(page, offset, last_dx, velocity, settled_target)
         });
     }
     drawer_offset_is_intermediate(offset).then(|| {
@@ -13343,21 +13601,33 @@ fn visible_drawer_page(offset: f32, snap: Option<DrawerSnap>) -> Option<DrawerPa
     }
 }
 
-fn drawer_snap_target(page: DrawerPage, offset: f32, last_dx: f32, settled_target: f32) -> f32 {
+fn drawer_snap_target(
+    page: DrawerPage,
+    offset: f32,
+    last_dx: f32,
+    velocity: DrawerVelocity,
+    settled_target: f32,
+) -> f32 {
     let direction = page.open_offset();
     let directional_delta = last_dx * direction;
     let reveal = (offset * direction).clamp(0.0, 1.0);
     let started_on_side_page = (settled_target - direction).abs() < 0.001;
-    if started_on_side_page && directional_delta < -theme::DRAWER_SNAP_COMMIT_DIRECTION_THRESHOLD {
+    // A deliberate flick toward the page commits even from a short drag;
+    // slow drags must travel the full hysteresis before settling elsewhere.
+    let flick_toward = velocity.is_horizontal_flick() && velocity.vx * direction > 0.0;
+    let flick_away = velocity.is_horizontal_flick() && velocity.vx * direction < 0.0;
+    if started_on_side_page
+        && (flick_away || directional_delta < -theme::DRAWER_SNAP_COMMIT_DIRECTION_THRESHOLD)
+    {
         0.0
     } else if (!started_on_side_page
-        && directional_delta > theme::DRAWER_SNAP_COMMIT_DIRECTION_THRESHOLD)
+        && (flick_toward || directional_delta > theme::DRAWER_SNAP_COMMIT_DIRECTION_THRESHOLD))
         || (started_on_side_page
             && directional_delta > theme::DRAWER_SNAP_REVERSE_DIRECTION_THRESHOLD)
     {
         direction
     } else if !started_on_side_page
-        && directional_delta < -theme::DRAWER_SNAP_REVERSE_DIRECTION_THRESHOLD
+        && (flick_away || directional_delta < -theme::DRAWER_SNAP_REVERSE_DIRECTION_THRESHOLD)
     {
         0.0
     } else if started_on_side_page {
@@ -15222,7 +15492,7 @@ mod tests {
     #[test]
     fn drawer_pan_waits_until_the_gesture_clears_the_threshold() {
         assert_eq!(
-            drawer_pan_decision(DrawerDragOrigin::Main, 4.0, 3.0),
+            drawer_pan_decision(DrawerDragOrigin::Main, 8.0, 6.0),
             DrawerPanDecision::Wait
         );
     }
@@ -15266,6 +15536,12 @@ mod tests {
 
     #[test]
     fn drawer_pan_yields_to_vertical_scrolling_and_wrong_direction_swipes() {
+        // A pan with any meaningful vertical bias belongs to list scrolling.
+        assert_eq!(
+            drawer_pan_decision(DrawerDragOrigin::Main, 24.0, 36.0),
+            DrawerPanDecision::Cancel
+        );
+        // Sub-threshold horizontal travel with vertical drift is a scroll, too.
         assert_eq!(
             drawer_pan_decision(DrawerDragOrigin::Main, 8.0, 40.0),
             DrawerPanDecision::Cancel
@@ -15319,6 +15595,7 @@ mod tests {
         let gesture = Some(DrawerGesture::Dragging {
             page: DrawerPage::Sessions,
             last_dx: -24.0,
+            velocity: DrawerVelocity::default(),
         });
         assert_eq!(drawer_terminal_target(gesture, 0.3, 1.0, true), Some(1.0));
         assert_eq!(drawer_terminal_target(gesture, 0.3, 0.0, true), Some(0.0));
@@ -15398,35 +15675,83 @@ mod tests {
     #[test]
     fn drawer_snap_uses_forgiving_travel_hysteresis() {
         assert_eq!(
-            drawer_snap_target(DrawerPage::Sessions, 0.13, 0.0, 0.0),
+            drawer_snap_target(
+                DrawerPage::Sessions,
+                0.19,
+                0.0,
+                DrawerVelocity::default(),
+                0.0
+            ),
             1.0
         );
         assert_eq!(
-            drawer_snap_target(DrawerPage::Sessions, 0.11, 0.0, 0.0),
+            drawer_snap_target(
+                DrawerPage::Sessions,
+                0.17,
+                0.0,
+                DrawerVelocity::default(),
+                0.0
+            ),
             0.0
         );
         assert_eq!(
-            drawer_snap_target(DrawerPage::Sessions, 0.87, 0.0, 1.0),
+            drawer_snap_target(
+                DrawerPage::Sessions,
+                0.81,
+                0.0,
+                DrawerVelocity::default(),
+                1.0
+            ),
             0.0
         );
         assert_eq!(
-            drawer_snap_target(DrawerPage::Sessions, 0.89, 0.0, 1.0),
+            drawer_snap_target(
+                DrawerPage::Sessions,
+                0.83,
+                0.0,
+                DrawerVelocity::default(),
+                1.0
+            ),
             1.0
         );
         assert_eq!(
-            drawer_snap_target(DrawerPage::Workbench, -0.13, 0.0, 0.0),
+            drawer_snap_target(
+                DrawerPage::Workbench,
+                -0.19,
+                0.0,
+                DrawerVelocity::default(),
+                0.0
+            ),
             -1.0
         );
         assert_eq!(
-            drawer_snap_target(DrawerPage::Workbench, -0.11, 0.0, 0.0),
+            drawer_snap_target(
+                DrawerPage::Workbench,
+                -0.17,
+                0.0,
+                DrawerVelocity::default(),
+                0.0
+            ),
             0.0
         );
         assert_eq!(
-            drawer_snap_target(DrawerPage::Workbench, -0.87, 0.0, -1.0),
+            drawer_snap_target(
+                DrawerPage::Workbench,
+                -0.81,
+                0.0,
+                DrawerVelocity::default(),
+                -1.0
+            ),
             0.0
         );
         assert_eq!(
-            drawer_snap_target(DrawerPage::Workbench, -0.89, 0.0, -1.0),
+            drawer_snap_target(
+                DrawerPage::Workbench,
+                -0.83,
+                0.0,
+                DrawerVelocity::default(),
+                -1.0
+            ),
             -1.0
         );
     }
@@ -15434,45 +15759,123 @@ mod tests {
     #[test]
     fn drawer_snap_ignores_release_jitter_but_honors_decisive_direction() {
         assert_eq!(
-            drawer_snap_target(DrawerPage::Sessions, 0.6, -9.0, 0.0),
-            1.0
-        );
-        assert_eq!(drawer_snap_target(DrawerPage::Sessions, 0.1, 5.0, 0.0), 1.0);
-        assert_eq!(
-            drawer_snap_target(DrawerPage::Sessions, 0.8, -29.0, 0.0),
-            0.0
-        );
-        assert_eq!(
-            drawer_snap_target(DrawerPage::Workbench, -0.6, 9.0, 0.0),
-            -1.0
-        );
-        assert_eq!(
-            drawer_snap_target(DrawerPage::Workbench, -0.1, -5.0, 0.0),
-            -1.0
-        );
-        assert_eq!(
-            drawer_snap_target(DrawerPage::Workbench, -0.8, 29.0, 0.0),
-            0.0
-        );
-        assert_eq!(
-            drawer_snap_target(DrawerPage::Sessions, 0.9, -5.0, 1.0),
-            0.0
-        );
-        assert_eq!(drawer_snap_target(DrawerPage::Sessions, 0.4, 9.0, 1.0), 0.0);
-        assert_eq!(
-            drawer_snap_target(DrawerPage::Sessions, 0.2, 29.0, 1.0),
+            drawer_snap_target(
+                DrawerPage::Sessions,
+                0.6,
+                -9.0,
+                DrawerVelocity::default(),
+                0.0
+            ),
             1.0
         );
         assert_eq!(
-            drawer_snap_target(DrawerPage::Workbench, -0.9, 5.0, -1.0),
+            drawer_snap_target(
+                DrawerPage::Sessions,
+                0.1,
+                5.0,
+                DrawerVelocity::default(),
+                0.0
+            ),
+            1.0
+        );
+        assert_eq!(
+            drawer_snap_target(
+                DrawerPage::Sessions,
+                0.8,
+                -29.0,
+                DrawerVelocity::default(),
+                0.0
+            ),
             0.0
         );
         assert_eq!(
-            drawer_snap_target(DrawerPage::Workbench, -0.4, -9.0, -1.0),
+            drawer_snap_target(
+                DrawerPage::Workbench,
+                -0.6,
+                9.0,
+                DrawerVelocity::default(),
+                0.0
+            ),
+            -1.0
+        );
+        assert_eq!(
+            drawer_snap_target(
+                DrawerPage::Workbench,
+                -0.1,
+                -5.0,
+                DrawerVelocity::default(),
+                0.0
+            ),
+            -1.0
+        );
+        assert_eq!(
+            drawer_snap_target(
+                DrawerPage::Workbench,
+                -0.8,
+                29.0,
+                DrawerVelocity::default(),
+                0.0
+            ),
             0.0
         );
         assert_eq!(
-            drawer_snap_target(DrawerPage::Workbench, -0.2, -29.0, -1.0),
+            drawer_snap_target(
+                DrawerPage::Sessions,
+                0.9,
+                -5.0,
+                DrawerVelocity::default(),
+                1.0
+            ),
+            0.0
+        );
+        assert_eq!(
+            drawer_snap_target(
+                DrawerPage::Sessions,
+                0.4,
+                9.0,
+                DrawerVelocity::default(),
+                1.0
+            ),
+            0.0
+        );
+        assert_eq!(
+            drawer_snap_target(
+                DrawerPage::Sessions,
+                0.2,
+                29.0,
+                DrawerVelocity::default(),
+                1.0
+            ),
+            1.0
+        );
+        assert_eq!(
+            drawer_snap_target(
+                DrawerPage::Workbench,
+                -0.9,
+                5.0,
+                DrawerVelocity::default(),
+                -1.0
+            ),
+            0.0
+        );
+        assert_eq!(
+            drawer_snap_target(
+                DrawerPage::Workbench,
+                -0.4,
+                -9.0,
+                DrawerVelocity::default(),
+                -1.0
+            ),
+            0.0
+        );
+        assert_eq!(
+            drawer_snap_target(
+                DrawerPage::Workbench,
+                -0.2,
+                -29.0,
+                DrawerVelocity::default(),
+                -1.0
+            ),
             -1.0
         );
     }
@@ -15494,6 +15897,154 @@ mod tests {
         assert_eq!(
             drawer_snap_duration_ms(-1.0, 0.0),
             theme::DRAWER_CLOSE_ANIMATION_MS
+        );
+    }
+
+    #[test]
+    fn a_deliberate_flick_opens_a_drawer_from_a_short_drag() {
+        let toward_sessions = DrawerVelocity::default().record(
+            theme::DRAWER_SWIPE_VELOCITY,
+            0.0,
+            Duration::from_secs(1),
+        );
+        let toward_workbench = DrawerVelocity::default().record(
+            -theme::DRAWER_SWIPE_VELOCITY,
+            0.0,
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            drawer_snap_target(DrawerPage::Sessions, 0.05, 0.0, toward_sessions, 0.0),
+            1.0
+        );
+        assert_eq!(
+            drawer_snap_target(DrawerPage::Workbench, -0.05, 0.0, toward_workbench, 0.0),
+            -1.0
+        );
+    }
+
+    #[test]
+    fn slow_drags_still_need_the_travel_hysteresis() {
+        let slow = DrawerVelocity::default()
+            .record(90.0, 0.0, Duration::from_secs(1))
+            .record(90.0, 0.0, Duration::from_secs(1));
+        assert!(slow.vx < theme::DRAWER_SWIPE_VELOCITY);
+        assert_eq!(
+            drawer_snap_target(DrawerPage::Sessions, 0.05, 0.0, slow, 0.0),
+            0.0
+        );
+        assert_eq!(
+            drawer_snap_target(DrawerPage::Sessions, 0.25, 0.0, slow, 0.0),
+            1.0
+        );
+    }
+
+    #[test]
+    fn diagonal_flicks_do_not_commit_drawer_swipes() {
+        let diagonal = DrawerVelocity::default().record(
+            theme::DRAWER_SWIPE_VELOCITY,
+            theme::DRAWER_SWIPE_VELOCITY,
+            Duration::from_secs(1),
+        );
+        assert!(!diagonal.is_horizontal_flick());
+        assert_eq!(
+            drawer_snap_target(DrawerPage::Sessions, 0.05, 0.0, diagonal, 0.0),
+            0.0
+        );
+    }
+
+    #[test]
+    fn an_away_flick_closes_an_open_drawer_from_any_travel() {
+        let away = DrawerVelocity::default().record(
+            -theme::DRAWER_SWIPE_VELOCITY,
+            0.0,
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            drawer_snap_target(DrawerPage::Sessions, 0.95, 0.0, away, 1.0),
+            0.0
+        );
+    }
+
+    #[test]
+    fn velocity_blends_recent_movement_with_a_finite_memory() {
+        let fast = DrawerVelocity::default().record(2_000.0, 0.0, Duration::from_secs(1));
+        // One short event at the end cannot fully erase a fast flick.
+        let recovered = fast.record(50.0, 0.0, Duration::from_secs(1));
+        assert!(recovered.vx.abs() > 800.0);
+        assert!(fast.is_horizontal_flick());
+        // A vertical component weakens the horizontal flick verdict.
+        let tilted = fast.record(0.0, 2_000.0, Duration::from_secs(1));
+        assert!(!tilted.is_horizontal_flick());
+    }
+
+    #[test]
+    fn push_back_screen_collapses_consecutive_duplicates() {
+        let mut stack: Vec<BackScreen> = Vec::new();
+        let push = |stack: &mut Vec<BackScreen>, screen| {
+            if stack.last() != Some(&screen) {
+                stack.push(screen);
+            }
+        };
+        push(&mut stack, BackScreen::SessionsDrawer);
+        push(&mut stack, BackScreen::SessionsDrawer);
+        assert_eq!(stack, vec![BackScreen::SessionsDrawer]);
+        push(&mut stack, BackScreen::Overlay(MobileOverlay::Settings));
+        assert_eq!(
+            stack,
+            vec![
+                BackScreen::SessionsDrawer,
+                BackScreen::Overlay(MobileOverlay::Settings)
+            ]
+        );
+    }
+
+    #[test]
+    fn removing_a_back_screen_also_drops_entries_opened_on_top_of_it() {
+        let mut stack = vec![
+            BackScreen::SessionsDrawer,
+            BackScreen::Overlay(MobileOverlay::Hosts),
+            BackScreen::Overlay(MobileOverlay::Settings),
+        ];
+        while let Some(index) = stack
+            .iter()
+            .rposition(|screen| matches!(screen, BackScreen::Overlay(_)))
+        {
+            stack.truncate(index);
+        }
+        assert_eq!(stack, vec![BackScreen::SessionsDrawer]);
+    }
+
+    #[test]
+    fn sync_back_stack_drops_stale_entries_and_keeps_the_live_overlay() {
+        // Mirrors `MobileApp::sync_back_stack_with_ui`'s bookkeeping on a plain
+        // stack: stale screens fall away, then the open overlay is re-armed.
+        let mut stack = vec![
+            BackScreen::SessionsDrawer,
+            BackScreen::SessionAction,
+            BackScreen::Overlay(MobileOverlay::Usage),
+        ];
+        let session_action_open = false;
+        stack.retain(|screen| match *screen {
+            BackScreen::Overlay(_) => false,
+            BackScreen::SessionAction => session_action_open,
+            BackScreen::RuntimeOptions => false,
+            BackScreen::SessionsDrawer => true,
+            BackScreen::WorkbenchDrawer => true,
+            BackScreen::SidebarSearch => false,
+            BackScreen::SidebarBatchMode => false,
+        });
+        let overlay = Some(MobileOverlay::Usage);
+        if let Some(overlay) = overlay
+            && stack.last() != Some(&BackScreen::Overlay(overlay))
+        {
+            stack.push(BackScreen::Overlay(overlay));
+        }
+        assert_eq!(
+            stack,
+            vec![
+                BackScreen::SessionsDrawer,
+                BackScreen::Overlay(MobileOverlay::Usage)
+            ]
         );
     }
 

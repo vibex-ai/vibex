@@ -32,6 +32,11 @@ actions!(
     ]
 );
 
+// Pops the topmost screen from the app's back-navigation stack. Bound to the
+// Android "back" keystroke so the system back key/gesture walks up the page
+// stack instead of backgrounding the app.
+actions!(mobile_app, [NavigateBack]);
+
 pub struct TextInput {
     focus_handle: FocusHandle,
     content: SharedString,
