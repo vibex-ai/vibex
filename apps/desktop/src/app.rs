@@ -1462,10 +1462,12 @@ fn render_composer_plan_details(
     max_height: f32,
     cx: &App,
 ) -> AnyElement {
-    let mut steps = v_flex()
-        .w_full()
-        .max_h(px(max_height - 74.0))
-        .overflow_y_scrollbar();
+    // The scroll viewport has to be clamped by an ancestor: a `max_h` on the
+    // scrollable element itself leaves its wrapper auto-height, so the inner
+    // area grows to full content height and clips instead of scrolling. The
+    // card caps at `max_height` and the flex chain hands the step list the
+    // room left over after the header and divider.
+    let mut step_list = v_flex().w_full().overflow_y_scrollbar();
     for (index, step) in plan.steps.iter().enumerate() {
         let icon = match step.status {
             PlanStepStatus::Pending => div()
@@ -1491,7 +1493,7 @@ fn render_composer_plan_details(
                 .text_color(cx.theme().danger)
                 .into_any_element(),
         };
-        steps = steps.child(
+        step_list = step_list.child(
             h_flex()
                 .w_full()
                 .min_w_0()
@@ -1574,7 +1576,7 @@ fn render_composer_plan_details(
                 ),
         )
         .child(div().w_full().h(px(1.0)).bg(cx.theme().border))
-        .child(steps)
+        .child(div().flex_1().min_h_0().overflow_hidden().child(step_list))
         .into_any_element()
 }
 
