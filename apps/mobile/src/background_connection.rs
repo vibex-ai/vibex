@@ -506,4 +506,38 @@ mod tests {
             "the mobile app must implement the back-navigation handler"
         );
     }
+
+    #[test]
+    fn android_battery_allowlist_guidance_contract_is_complete() {
+        let power_source = include_str!("power.rs");
+        for (java_method, rust_call) in [
+            (
+                "public boolean isIgnoringBatteryOptimizations()",
+                "isIgnoringBatteryOptimizations",
+            ),
+            (
+                "public void requestIgnoreBatteryOptimizations()",
+                "requestIgnoreBatteryOptimizations",
+            ),
+        ] {
+            assert!(
+                ANDROID_ACTIVITY.contains(java_method),
+                "Android Activity is missing the {java_method} JNI bridge"
+            );
+            assert!(
+                power_source.contains(&format!(r#"jni::jni_str!("{rust_call}")"#)),
+                "Rust is missing the {rust_call} JNI call"
+            );
+        }
+        assert!(
+            ANDROID_MANIFEST.contains(
+                r#"<uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />"#
+            ),
+            "the battery-optimization request dialog requires its manifest permission"
+        );
+        assert!(
+            ANDROID_ACTIVITY.contains("powerManager.isIgnoringBatteryOptimizations"),
+            "the allowlist query must be backed by PowerManager"
+        );
+    }
 }

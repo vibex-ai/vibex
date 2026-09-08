@@ -65,7 +65,7 @@ use crate::sidebar::{
 };
 use crate::storage::{AppSettings, CredentialStorage, MobileTimelineDisplaySettingsOverride};
 use crate::workbench::{MobileWorkbench, WorkbenchSurface};
-use crate::{locale, markdown, notifications, scanner, theme};
+use crate::{locale, markdown, notifications, power, scanner, theme};
 
 const TIMELINE_NEAR_BOTTOM_PX: f32 = 96.0;
 const TIMELINE_LIST_OVERDRAW_PX: f32 = 800.0;
@@ -663,6 +663,9 @@ pub struct MobileApp {
     tasks: Vec<Task<()>>,
     /// Ordered by recency: the front is the screen the back key closes first.
     back_stack: Vec<BackScreen>,
+    /// Cached battery-optimization allowlist state, refreshed when Settings
+    /// opens so returning from the system dialog updates the row.
+    battery_allowlist_ok: bool,
 }
 
 fn timeline_action_button(
@@ -893,6 +896,7 @@ impl MobileApp {
             event_consumer_task: None,
             resume_recovery_task: None,
             pending_notification_action: None,
+            battery_allowlist_ok: power::is_ignoring_battery_optimizations(),
             back_stack: Vec::new(),
             tasks: Vec::new(),
         };
@@ -944,6 +948,13 @@ impl MobileApp {
             }
             MobileLifecycleEvent::Resumed => {
                 self.app_backgrounded = false;
+                // The battery-optimization dialog only pauses this activity,
+                // so re-read the allowlist state when it closes as well.
+                let battery_allowlist_ok = power::is_ignoring_battery_optimizations();
+                if battery_allowlist_ok != self.battery_allowlist_ok {
+                    self.battery_allowlist_ok = battery_allowlist_ok;
+                    cx.notify();
+                }
                 let Some(backend) = self.backend.clone() else {
                     return;
                 };
@@ -3864,6 +3875,7 @@ impl MobileApp {
     }
 
     fn open_settings(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.battery_allowlist_ok = power::is_ignoring_battery_optimizations();
         self.show_overlay(MobileOverlay::Settings, window, cx);
     }
 
@@ -13290,6 +13302,66 @@ impl MobileApp {
                                     ),
                             ),
                     )
+                    .when(!self.battery_allowlist_ok, |section| {
+                        section.child(
+                            div()
+                                .id("mobile-settings-battery-allowlist")
+                                .w_full()
+                                .min_h(px(theme::TOUCH_TARGET))
+                                .mb(px(theme::SPACING_XS))
+                                .rounded(px(theme::RADIUS_CONTROL))
+                                .border_1()
+                                .border_color(theme::border_subtle())
+                                .bg(theme::bg_card_dim())
+                                .px(px(theme::SPACING_MD))
+                                .flex()
+                                .items_center()
+                                .gap(px(theme::SPACING_SM))
+                                .cursor_pointer()
+                                .active(|style| style.bg(theme::row_pressed_bg()))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|_, _, _, cx| {
+                                        power::request_ignore_battery_optimizations();
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(
+                                    svg()
+                                        .path("icons/triangle-alert.svg")
+                                        .size(px(theme::ICON_SM))
+                                        .text_color(theme::text_secondary()),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(1.0))
+                                        .child(
+                                            div()
+                                                .text_size(px(theme::FONT_BODY))
+                                                .text_color(theme::text_secondary())
+                                                .child(locale::text(
+                                                    "Allow background battery use",
+                                                    "允许后台使用电池",
+                                                    "允許背景使用電池",
+                                                )),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(theme::FONT_MICRO))
+                                                .text_color(theme::text_muted())
+                                                .child(locale::text(
+                                                    "Exempt Vibex from battery optimization so background alerts keep arriving",
+                                                    "将 Vibex 加入电池优化白名单，保证后台通知不中断",
+                                                    "將 Vibex 加入電池最佳化白名單，確保背景通知不中斷",
+                                                )),
+                                        ),
+                                ),
+                        )
+                    })
                     .child(settings_section_heading("About"))
                     .child(settings_info_row(
                         "mobile-settings-version",

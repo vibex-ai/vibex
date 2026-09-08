@@ -6,14 +6,18 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
+import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.net.Uri;
 import android.net.nsd.NsdManager;
 import android.net.nsd.NsdServiceInfo;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.PowerManager;
+import android.provider.Settings;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextWatcher;
@@ -109,6 +113,37 @@ public final class GpuiNativeActivity extends NativeActivity {
 
     public void stopRemoteConnectionService() {
         RemoteConnectionService.stop(getApplicationContext());
+    }
+
+    /** Whether the system exempts this app from Doze/App Standby battery optimizations. */
+    public boolean isIgnoringBatteryOptimizations() {
+        PowerManager powerManager = getSystemService(PowerManager.class);
+        return powerManager != null
+                && powerManager.isIgnoringBatteryOptimizations(getPackageName());
+    }
+
+    /**
+     * Opens the system dialog that asks the user to exempt the app from battery
+     * optimizations, falling back to the app details page when unavailable.
+     */
+    public void requestIgnoreBatteryOptimizations() {
+        runOnUiThread(() -> {
+            Intent intent = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                    .setData(Uri.parse("package:" + getPackageName()))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            try {
+                startActivity(intent);
+            } catch (ActivityNotFoundException error) {
+                Intent appDetails = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                        .setData(Uri.parse("package:" + getPackageName()))
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                try {
+                    startActivity(appDetails);
+                } catch (ActivityNotFoundException ignored) {
+                    // Nothing else to open; the user can find the page manually.
+                }
+            }
+        });
     }
 
     public void showAgentNotification(
