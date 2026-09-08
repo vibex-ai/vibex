@@ -106,6 +106,13 @@ const RESUME_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const RESUME_RECOVERY_POLL_ATTEMPTS: usize = 600;
 const RUNTIME_FEATURE_VALUE_LIMIT: usize = 256;
 
+/// The runtime sheet pins its view bands (Agent strip, search row, model
+/// list) at fixed heights so each band scrolls inside itself instead of
+/// growing the card; the session-options band fills whatever remains.
+const RUNTIME_SHEET_AGENT_STRIP_HEIGHT: f32 = 52.0;
+const RUNTIME_SHEET_SEARCH_HEIGHT: f32 = 44.0;
+const RUNTIME_SHEET_MODEL_LIST_HEIGHT: f32 = 216.0;
+
 fn timeline_list_state(turn_count: usize) -> ListState {
     ListState::new(
         turn_count,
@@ -204,14 +211,6 @@ enum WorkspaceActionKind {
 enum RuntimeOptionsTarget {
     ActiveSession,
     NewSession,
-}
-
-/// The session-settings sheet drills into one Agent at a time, mirroring the
-/// desktop composer cascade (Agent list → provider-grouped model list).
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RuntimeSheetMenu {
-    agent_id: AgentId,
-    agent_label: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -648,7 +647,6 @@ pub struct MobileApp {
     runtime_options_open: bool,
     runtime_options_target: RuntimeOptionsTarget,
     runtime_draft: Option<SessionRuntimeSelection>,
-    runtime_sheet_menu: Option<RuntimeSheetMenu>,
     runtime_sheet_search: Option<Entity<TextInput>>,
     runtime_feature_inputs: BTreeMap<String, Entity<TextInput>>,
     runtime_switch_generation: u64,
@@ -898,7 +896,6 @@ impl MobileApp {
             runtime_options_open: false,
             runtime_options_target: RuntimeOptionsTarget::ActiveSession,
             runtime_draft: None,
-            runtime_sheet_menu: None,
             runtime_sheet_search: None,
             runtime_feature_inputs: BTreeMap::new(),
             runtime_switch_generation: 0,
@@ -1859,6 +1856,8 @@ impl MobileApp {
         self.runtime_options_open = true;
         self.push_back_screen(BackScreen::RuntimeOptions);
         self.runtime_switch_error = None;
+        self.runtime_sheet_search =
+            Some(cx.new(|cx| TextInput::new(locale::text("Search models", "搜索模型", "搜尋模型"), cx)));
         self.sync_runtime_feature_inputs(cx);
         if !has_catalog {
             self.refresh_runtime_options(cx);
@@ -1932,6 +1931,8 @@ impl MobileApp {
         self.runtime_options_open = true;
         self.push_back_screen(BackScreen::RuntimeOptions);
         self.runtime_switch_error = None;
+        self.runtime_sheet_search =
+            Some(cx.new(|cx| TextInput::new(locale::text("Search models", "搜索模型", "搜尋模型"), cx)));
         self.sync_runtime_feature_inputs(cx);
         if !has_catalog {
             self.refresh_runtime_options(cx);
@@ -1944,7 +1945,7 @@ impl MobileApp {
             self.runtime_options_open = false;
             self.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
             self.runtime_draft = None;
-            self.close_runtime_sheet_menu();
+            self.reset_runtime_search();
             self.runtime_feature_inputs.clear();
             self.runtime_switch_error = None;
             cx.notify();
@@ -1957,44 +1958,46 @@ impl MobileApp {
         self.runtime_options_open = false;
         self.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
         self.runtime_draft = None;
-        self.close_runtime_sheet_menu();
+        self.reset_runtime_search();
         self.runtime_feature_inputs.clear();
         self.runtime_switch_error = None;
     }
 
-    /// Drills from the Agent list into the provider-grouped model list for one
-    /// Agent. The draft is untouched until a model row is actually chosen.
-    fn open_runtime_sheet_menu(
-        &mut self,
-        agent_id: AgentId,
-        agent_label: String,
-        cx: &mut Context<Self>,
-    ) {
-        if self.runtime_switch_busy_generation.is_some() {
-            return;
-        }
-        self.runtime_sheet_menu = Some(RuntimeSheetMenu {
-            agent_id,
-            agent_label,
-        });
-        self.runtime_sheet_search =
-            Some(cx.new(|cx| {
-                TextInput::new(locale::text("Search models", "搜索模型", "搜尋模型"), cx)
-            }));
-        cx.notify();
-    }
-
-    fn close_runtime_sheet_menu(&mut self) {
-        self.runtime_sheet_menu = None;
+    /// Resets the model search field (and drops it, so a reopened sheet starts
+    /// with a fresh input instead of the previous query).
+    fn reset_runtime_search(&mut self) {
         self.runtime_sheet_search = None;
     }
 
-    fn choose_runtime_sheet_model(
-        &mut self,
-        selection: SessionRuntimeSelection,
-        cx: &mut Context<Self>,
-    ) {
-        self.close_runtime_sheet_menu();
+    /// Switching the session Agent also re-scopes the model list: the draft
+    /// moves to that Agent's first available option, resetting provider and
+    /// model so the list below never shows a foreign Agent's models.
+    fn choose_runtime_agent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
+        if self.runtime_switch_busy_generation.is_some()
+            || self
+                .runtime_draft
+                .as_ref()
+                .is_some_and(|draft| draft.agent_id == agent_id)
+        {
+            return;
+        }
+        let fallback = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.runtime_options.value.as_ref())
+            .and_then(|catalog| {
+                catalog
+                    .options
+                    .iter()
+                    .find(|option| {
+                        option.availability == RuntimeOptionAvailability::Available
+                            && option.selection.agent_id == agent_id
+                    })
+                    .map(|option| option.selection.clone())
+            });
+        let Some(selection) = fallback else {
+            return;
+        };
         self.choose_runtime_selection(selection, cx);
     }
 
@@ -2129,7 +2132,7 @@ impl MobileApp {
             self.runtime_options_open = false;
             self.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
             self.runtime_draft = None;
-            self.close_runtime_sheet_menu();
+            self.reset_runtime_search();
             self.runtime_feature_inputs.clear();
             self.runtime_switch_error = None;
             self.notice = Some(
@@ -2195,7 +2198,7 @@ impl MobileApp {
                         this.runtime_options_open = false;
                         this.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
                         this.runtime_draft = None;
-                        this.close_runtime_sheet_menu();
+                        this.reset_runtime_search();
                         this.runtime_feature_inputs.clear();
                         this.runtime_switch_error = None;
                         this.notice =
@@ -6710,6 +6713,11 @@ impl MobileApp {
             )
     }
 
+    /// The runtime sheet is pinned into four fixed-height view bands, top to
+    /// bottom: the Agent logo strip, the model search row, the provider-grouped
+    /// model list, and the remaining session options. Every band keeps a fixed
+    /// viewport and scrolls its own overflow, so a long catalog never pushes
+    /// the other bands around.
     fn render_runtime_options_sheet(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let catalog = self
             .controller
@@ -6766,14 +6774,45 @@ impl MobileApp {
                     .flex_col()
                     .overflow_hidden()
                     .child(self.render_runtime_sheet_header(busy, cx))
-                    .child(self.render_runtime_sheet_body(
+                    .child(self.render_runtime_agent_strip(
+                        catalog.as_ref(),
+                        draft.as_ref(),
+                        busy,
+                        cx,
+                    ))
+                    .child(self.render_runtime_search_row())
+                    .child(self.render_runtime_model_list(
+                        catalog.as_ref(),
+                        draft.as_ref(),
+                        busy,
+                        cx,
+                    ))
+                    .child(self.render_runtime_options_list(
                         catalog.as_ref(),
                         draft.as_ref(),
                         reasoning_efforts,
                         modes,
                         features,
+                        selection_available,
+                        busy,
                         cx,
                     ))
+                    .when_some(self.runtime_switch_error.as_ref(), |sheet, error| {
+                        sheet.child(
+                            div()
+                                .flex_shrink_0()
+                                .mx_3()
+                                .mb_2()
+                                .rounded(px(theme::RADIUS_CONTROL))
+                                .border_1()
+                                .border_color(theme::accent_red())
+                                .bg(theme::bg_card_dim())
+                                .p_3()
+                                .text_size(px(theme::FONT_CAPTION))
+                                .text_color(theme::accent_red())
+                                .child(error.message.clone()),
+                        )
+                    })
                     .child(
                         div()
                             .flex_shrink_0()
@@ -6828,85 +6867,24 @@ impl MobileApp {
             )
     }
 
-    /// Sheet header. Inside the model picker it becomes a breadcrumb bar
-    /// (back chevron + Agent name) like the desktop cascade navigation.
+    /// Sheet header: title plus the close button. The bands below carry the
+    /// whole selection flow, so there is no cascade breadcrumb anymore.
     fn render_runtime_sheet_header(&self, busy: bool, cx: &mut Context<Self>) -> gpui::Div {
-        let menu = self.runtime_sheet_menu.clone();
         div()
             .h(px(52.0))
             .flex_shrink_0()
             .border_b_1()
             .border_color(theme::border_subtle())
-            .px_2()
+            .pl(px(theme::SPACING_MD))
             .flex()
             .items_center()
-            .gap_1()
-            .when_some(menu.clone(), |header, menu| {
-                header
-                    .child(
-                        div()
-                            .id("runtime-sheet-back")
-                            .size(px(theme::TOUCH_TARGET))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .when(!busy, |button| {
-                                button
-                                    .cursor_pointer()
-                                    .active(|style| style.bg(theme::row_pressed_bg()))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.close_runtime_sheet_menu();
-                                            cx.notify();
-                                        }),
-                                    )
-                            })
-                            .child(
-                                svg()
-                                    .path("icons/chevron-left.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(theme::text_secondary()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex()
-                            .items_baseline()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .text_size(px(theme::FONT_HEADING))
-                                    .text_color(theme::text_primary())
-                                    .child(menu.agent_label),
-                            )
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_size(px(theme::FONT_CAPTION))
-                                    .text_color(theme::text_muted())
-                                    .child(locale::text("Model", "模型", "模型")),
-                            ),
-                    )
-            })
-            .when(menu.is_none(), |header| {
-                header.child(
-                    div()
-                        .px_2()
-                        .text_size(px(theme::FONT_HEADING))
-                        .text_color(theme::text_primary())
-                        .child(locale::text("Session settings", "会话设置", "工作階段設定")),
-                )
-            })
             .child(
                 div()
                     .flex_1()
-                    .when(menu.is_some(), |spacer| spacer.min_w_0()),
+                    .min_w_0()
+                    .text_size(px(theme::FONT_HEADING))
+                    .text_color(theme::text_primary())
+                    .child(locale::text("Session settings", "会话设置", "工作階段設定")),
             )
             .child(
                 div()
@@ -6919,10 +6897,7 @@ impl MobileApp {
                         button
                             .cursor_pointer()
                             .active(|style| style.opacity(0.6))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(Self::close_runtime_options),
-                            )
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::close_runtime_options))
                     })
                     .child(
                         svg()
@@ -6933,382 +6908,135 @@ impl MobileApp {
             )
     }
 
-    /// Scrollable sheet body: either the Agent cascade or the model picker.
-    fn render_runtime_sheet_body(
+    /// Band 1 — every enabled Agent as a horizontally scrolling logo strip.
+    /// Tapping a logo moves the draft to that Agent's first available option,
+    /// which re-scopes the model list below; the active logo wears an accent
+    /// bar on the strip's bottom hairline.
+    fn render_runtime_agent_strip(
         &self,
         catalog: Option<&SessionRuntimeOptionCatalog>,
         draft: Option<&SessionRuntimeSelection>,
-        reasoning_efforts: Vec<RuntimeCascadeChoice>,
-        modes: Vec<RuntimeCascadeChoice>,
-        features: Vec<SessionRuntimeFeature>,
+        busy: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let busy = self.runtime_switch_busy_generation.is_some();
-        let selection_available = catalog.is_some_and(|catalog| {
-            draft.is_some_and(|draft| runtime_selection_is_available(&catalog.options, draft))
-        });
-        let mut body = div()
-            .id("runtime-options-scroll")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .pb_2();
-        if self.runtime_sheet_menu.is_some() {
-            body = body.child(self.render_runtime_model_picker(catalog, cx));
-        } else if let Some(draft) = draft {
-            body = body.child(self.render_runtime_agent_cascade(catalog, draft, cx));
-        }
-        body = body
-            .when(catalog.is_none(), |body| {
-                body.child(
-                    div()
-                        .p_4()
-                        .text_size(px(theme::FONT_CAPTION))
-                        .text_color(theme::text_muted())
-                        .child(locale::text(
-                            "Loading session settings...",
-                            "正在加载会话设置…",
-                            "正在載入工作階段設定…",
-                        )),
-                )
-            })
-            .when(
-                catalog.is_some() && draft.is_some() && !selection_available,
-                |body| {
-                    body.child(
-                        div()
-                            .mx_3()
-                            .mt_3()
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .border_1()
-                            .border_color(theme::accent_yellow())
-                            .bg(theme::bg_card_dim())
-                            .p_3()
-                            .text_size(px(theme::FONT_CAPTION))
-                            .text_color(theme::accent_yellow())
-                            .child(locale::text(
-                                "The current session settings are unavailable. Select an available option.",
-                                "当前会话设置不可用，请选择一个可用选项。",
-                                "目前工作階段設定無法使用，請選擇可用選項。",
-                            )),
-                    )
-                },
-            );
-        if self.runtime_sheet_menu.is_none() {
-            if let Some(draft) = draft {
-                body = body
-                    .when(!reasoning_efforts.is_empty(), |body| {
-                        body.child(runtime_section_heading(locale::common("Reasoning")))
-                            .child(
-                                div()
-                                    .px_3()
-                                    .flex()
-                                    .flex_wrap()
-                                    .gap_2()
-                                    .child(
-                                        runtime_choice_button(
-                                            "runtime-reasoning:default",
-                                            locale::common("Default"),
-                                            draft.reasoning_effort.is_none(),
-                                        )
-                                        .when(
-                                            !busy,
-                                            |button| {
-                                                button
-                                                    .cursor_pointer()
-                                                    .active(|style| {
-                                                        style.bg(theme::row_pressed_bg())
-                                                    })
-                                                    .on_mouse_up(
-                                                        MouseButton::Left,
-                                                        cx.listener(|this, _, _, cx| {
-                                                            this.choose_default_runtime_reasoning(
-                                                                cx,
-                                                            )
-                                                        }),
-                                                    )
-                                            },
-                                        ),
-                                    )
-                                    .children(reasoning_efforts.into_iter().map(|choice| {
-                                        let selected = draft.reasoning_effort.as_deref()
-                                            == Some(choice.value.as_str());
-                                        self.render_runtime_choice(
-                                            "reasoning",
-                                            choice,
-                                            selected,
-                                            cx,
-                                        )
-                                    })),
-                            )
-                    })
-                    .when(!modes.is_empty(), |body| {
-                        body.child(runtime_section_heading(locale::common("Mode")))
-                            .child(
-                                div()
-                                    .px_3()
-                                    .flex()
-                                    .flex_wrap()
-                                    .gap_2()
-                                    .child(
-                                        runtime_choice_button(
-                                            "runtime-mode:default",
-                                            locale::common("Default"),
-                                            draft.mode_id.is_none(),
-                                        )
-                                        .when(
-                                            !busy,
-                                            |button| {
-                                                button
-                                                    .cursor_pointer()
-                                                    .active(|style| {
-                                                        style.bg(theme::row_pressed_bg())
-                                                    })
-                                                    .on_mouse_up(
-                                                        MouseButton::Left,
-                                                        cx.listener(|this, _, _, cx| {
-                                                            this.choose_default_runtime_mode(cx)
-                                                        }),
-                                                    )
-                                            },
-                                        ),
-                                    )
-                                    .children(modes.into_iter().map(|choice| {
-                                        let selected =
-                                            draft.mode_id.as_deref() == Some(choice.value.as_str());
-                                        self.render_runtime_choice("mode", choice, selected, cx)
-                                    })),
-                            )
-                    });
+        let mut agents = BTreeMap::new();
+        if let Some(catalog) = catalog {
+            for option in &catalog.options {
+                if option.availability == RuntimeOptionAvailability::Available {
+                    agents
+                        .entry(option.selection.agent_id.clone())
+                        .or_insert_with(|| option.agent_label.clone());
+                }
             }
-            body = body
-                .when(!features.is_empty(), |body| {
-                    body.child(runtime_section_heading(locale::common("Session options")))
-                        .children(
-                            features
-                                .into_iter()
-                                .map(|feature| self.render_runtime_feature(feature, cx)),
-                        )
-                })
-                .when_some(self.runtime_switch_error.as_ref(), |body, error| {
-                    body.child(
-                        div()
-                            .mx_3()
-                            .my_3()
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .border_1()
-                            .border_color(theme::accent_red())
-                            .bg(theme::bg_card_dim())
-                            .p_3()
-                            .text_size(px(theme::FONT_CAPTION))
-                            .text_color(theme::accent_red())
-                            .child(error.message.clone()),
-                    )
-                });
         }
-        body.into_any_element()
-    }
-
-    /// Cascade root: an Agent list plus a summary row for the active
-    /// authentication source / model, in the desktop two-in-one style.
-    fn render_runtime_agent_cascade(
-        &self,
-        catalog: Option<&SessionRuntimeOptionCatalog>,
-        draft: &SessionRuntimeSelection,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let Some(catalog) = catalog else {
-            return div().into_any_element();
-        };
-        let busy = self.runtime_switch_busy_generation.is_some();
-        let selected_option = matching_runtime_option(&catalog.options, draft);
-        let agent_label = selected_option
-            .map(|option| option.agent_label.clone())
-            .unwrap_or_else(|| draft.agent_id.to_string());
-        let model_label = selected_option
-            .map(|option| option.model_label.clone())
-            .unwrap_or_else(|| match &draft.model {
-                RuntimeModelSelection::Explicit { model_id } => model_id.clone(),
-                RuntimeModelSelection::AgentDefault => locale::common("Default").to_string(),
-            });
-        let auth_source_label = selected_option
-            .map(|option| option.auth_source_label.clone())
-            .unwrap_or_else(|| draft.auth_source.id().to_string());
-        let model_icon = runtime_model_icon(draft.model_id(), px(theme::ICON_SM + 2.0));
-        let agents = catalog
-            .options
-            .iter()
-            .filter(|option| option.availability == RuntimeOptionAvailability::Available)
-            .map(|option| {
-                (
-                    option.selection.agent_id.clone(),
-                    option.agent_label.clone(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-
+        let draft_agent = draft.map(|draft| draft.agent_id.clone());
         div()
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(theme::border_subtle())
             .child(
-                // Two-in-one summary row: current auth source / model with the
-                // model brand icon, tapping it opens the model picker directly.
                 div()
-                    .id("runtime-sheet-model")
-                    .mx_3()
-                    .mt_3()
-                    .h(px(theme::TOUCH_TARGET))
-                    .rounded(px(theme::RADIUS_CONTROL))
-                    .border_1()
-                    .border_color(theme::border_default())
-                    .bg(theme::bg_card())
-                    .px_3()
+                    .id("runtime-agent-strip")
+                    .h(px(RUNTIME_SHEET_AGENT_STRIP_HEIGHT))
+                    .overflow_x_scroll()
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .when(!busy, |row| {
-                        row.cursor_pointer()
-                            .active(|style| style.bg(theme::row_active_bg()))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener({
-                                    let agent_id = draft.agent_id.clone();
-                                    let agent_label = agent_label.clone();
-                                    move |this, _, _, cx| {
-                                        this.open_runtime_sheet_menu(
-                                            agent_id.clone(),
-                                            agent_label.clone(),
-                                            cx,
-                                        )
-                                    }
-                                }),
-                            )
-                    })
-                    .child(model_icon)
-                    .child(
+                    .gap_1()
+                    .px_2()
+                    .children(agents.into_iter().map(|(agent_id, label)| {
+                        let selected = draft_agent.as_ref() == Some(&agent_id);
+                        let tab_agent_id = agent_id.clone();
                         div()
-                            .min_w_0()
-                            .flex_1()
+                            .id(format!("runtime-agent-tab:{}", agent_id.as_str()))
+                            .relative()
+                            .flex_shrink_0()
+                            .w(px(40.0))
+                            .h(px(40.0))
+                            .rounded(px(theme::RADIUS_CONTROL))
                             .flex()
-                            .flex_col()
+                            .items_center()
                             .justify_center()
-                            .gap(px(1.0))
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .text_size(px(theme::FONT_BODY))
-                                    .text_color(theme::text_primary())
-                                    .child(model_label),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .text_size(px(theme::FONT_MICRO))
-                                    .text_color(theme::text_muted())
-                                    .child(auth_source_label),
-                            ),
-                    )
-                    .child(
-                        svg()
-                            .path("icons/chevron-right.svg")
-                            .size(px(theme::ICON_SM))
-                            .text_color(theme::text_muted()),
-                    ),
-            )
-            .when(!agents.is_empty(), |body| {
-                body.child(runtime_section_heading(locale::text(
-                    "Agent", "Agent", "Agent",
-                )))
-                .child(
-                    div()
-                        .px_2()
-                        .pb_1()
-                        .flex()
-                        .flex_col()
-                        .children(agents.into_iter().map(|(agent_id, label)| {
-                            let auth_source_count = catalog
-                                .auth_sources
-                                .iter()
-                                .filter(|source| source.agent_id == agent_id)
-                                .count();
-                            let selected = agent_id == draft.agent_id;
-                            let row_agent_id = agent_id.clone();
-                            let row_label = label.clone();
-                            runtime_sheet_row(
-                                format!("runtime-sheet-agent:{}", agent_id.as_str()),
-                                runtime_agent_icon(&agent_id, &label),
-                                label,
-                                selected,
-                                true,
-                            )
-                            .when(!busy, |row| {
-                                row.cursor_pointer()
-                                    .active(|style| style.bg(theme::row_active_bg()))
+                            .when(selected, |tab| tab.bg(theme::bg_card_dim()))
+                            .when(!busy, |tab| {
+                                tab.cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
                                     .on_mouse_up(
                                         MouseButton::Left,
                                         cx.listener(move |this, _, _, cx| {
-                                            this.open_runtime_sheet_menu(
-                                                row_agent_id.clone(),
-                                                row_label.clone(),
-                                                cx,
-                                            )
+                                            this.choose_runtime_agent(tab_agent_id.clone(), cx)
                                         }),
                                     )
                             })
-                            .when(selected, |row| {
-                                row.child(
-                                    svg()
-                                        .path("icons/crosshair.svg")
-                                        .size(px(theme::ICON_SM))
-                                        .text_color(theme::primary()),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_size(px(theme::FONT_MICRO))
-                                    .text_color(theme::text_muted())
-                                    .child(runtime_profile_count_label(auth_source_count)),
-                            )
-                            .child(
-                                svg()
-                                    .path("icons/chevron-right.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(theme::text_muted()),
-                            )
-                        })),
-                )
+                            .child(runtime_agent_icon(&agent_id, &label))
+                            .when(selected, |tab| tab.child(runtime_tab_indicator()))
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// Band 2 — the full-bleed search row. The query filters provider labels
+    /// and model labels inside the band below; it never leaves the selected
+    /// Agent when the strip switches.
+    fn render_runtime_search_row(&self) -> gpui::AnyElement {
+        div()
+            .flex_shrink_0()
+            .h(px(RUNTIME_SHEET_SEARCH_HEIGHT))
+            .border_b_1()
+            .border_color(theme::border_subtle())
+            .px_3()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                svg()
+                    .path("icons/search.svg")
+                    .size(px(theme::ICON_SM))
+                    .flex_shrink_0()
+                    .text_color(theme::text_muted()),
+            )
+            .when_some(self.runtime_sheet_search.clone(), |row, input| {
+                row.child(div().flex_1().min_w_0().child(input))
             })
             .into_any_element()
     }
 
-    /// Provider-grouped model picker for one Agent, mirroring the desktop
-    /// cascade: provider headings with brand/account markers and model rows
-    /// with a check icon on the active selection.
-    fn render_runtime_model_picker(
+    /// Band 3 — provider-grouped model list for the selected Agent, at a
+    /// fixed height so the bands above and below stay put; a long catalog
+    /// scrolls inside this band. Rows keep the desktop model brand icons.
+    fn render_runtime_model_list(
         &self,
         catalog: Option<&SessionRuntimeOptionCatalog>,
+        draft: Option<&SessionRuntimeSelection>,
+        busy: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let Some((menu, catalog)) = self.runtime_sheet_menu.as_ref().zip(catalog) else {
-            return div().into_any_element();
-        };
-        let busy = self.runtime_switch_busy_generation.is_some();
-        let draft = self.runtime_draft.clone();
         let query = self
             .runtime_sheet_search
             .as_ref()
             .map(|input| input.read(cx).text().trim().to_lowercase())
             .unwrap_or_default();
+        let Some((catalog, draft)) = catalog.zip(draft) else {
+            return div()
+                .flex_shrink_0()
+                .h(px(RUNTIME_SHEET_MODEL_LIST_HEIGHT))
+                .border_b_1()
+                .border_color(theme::border_subtle())
+                .p_4()
+                .text_size(px(theme::FONT_CAPTION))
+                .text_color(theme::text_muted())
+                .child(locale::text(
+                    "Loading session settings...",
+                    "正在加载会话设置…",
+                    "正在載入工作階段設定…",
+                ))
+                .into_any_element();
+        };
+        let agent_id = draft.agent_id.clone();
 
         let mut sources = catalog
             .auth_sources
             .iter()
-            .filter(|source| source.agent_id == menu.agent_id)
+            .filter(|source| source.agent_id == agent_id)
             .cloned()
             .collect::<Vec<_>>();
         sources.sort_by(|left, right| {
@@ -7325,7 +7053,7 @@ impl MobileApp {
                 .iter()
                 .filter(|option| {
                     option.availability == RuntimeOptionAvailability::Available
-                        && option.selection.agent_id == menu.agent_id
+                        && option.selection.agent_id == agent_id
                         && option.selection.auth_source == source.source
                 })
                 .cloned()
@@ -7393,12 +7121,10 @@ impl MobileApp {
                 )
                 .children(models.into_iter().map(|option| {
                     let selection = option.selection.clone();
-                    let is_selected = draft
-                        .as_ref()
-                        .is_some_and(|draft| runtime_option_matches(&option, draft));
+                    let is_selected = runtime_option_matches(&option, draft);
                     let model_id = selection.model_id().map(str::to_string);
                     let row_id = format!(
-                        "runtime-sheet-model:{}:{}",
+                        "runtime-model:{}:{}",
                         source_id,
                         runtime_model_selection_key(&selection.model)
                     );
@@ -7419,7 +7145,7 @@ impl MobileApp {
                                 cx.listener({
                                     let selection = selection.clone();
                                     move |this, _, _, cx| {
-                                        this.choose_runtime_sheet_model(selection.clone(), cx)
+                                        this.choose_runtime_selection(selection.clone(), cx)
                                     }
                                 }),
                             )
@@ -7437,44 +7163,151 @@ impl MobileApp {
         }
 
         div()
-            .pb_2()
-            .when_some(self.runtime_sheet_search.clone(), |picker, input| {
-                picker.child(
-                    div()
-                        .mx_3()
-                        .my_2()
-                        .h(px(theme::TOUCH_TARGET))
-                        .rounded(px(theme::RADIUS_CONTROL))
-                        .border_1()
-                        .border_color(theme::border_input())
-                        .bg(theme::bg_card())
-                        .px_2()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            svg()
-                                .path("icons/search.svg")
-                                .size(px(theme::ICON_SM))
-                                .text_color(theme::text_muted()),
-                        )
-                        .child(input),
-                )
-            })
-            .when(groups.is_empty(), |picker| {
-                picker.child(
+            .id("runtime-model-list")
+            .flex_shrink_0()
+            .h(px(RUNTIME_SHEET_MODEL_LIST_HEIGHT))
+            .overflow_y_scroll()
+            .border_b_1()
+            .border_color(theme::border_subtle())
+            .pb_1()
+            .when(groups.is_empty(), |list| {
+                list.child(
                     div()
                         .px_4()
                         .py(px(28.0))
                         .text_size(px(theme::FONT_CAPTION))
                         .text_color(theme::text_muted())
-                        .child(locale::text("No configuration", "暂无配置", "暫無配置")),
+                        .child(if query.is_empty() {
+                            locale::text("No configuration", "暂无配置", "暫無配置")
+                        } else {
+                            locale::text("No models found", "未找到模型", "找不到模型")
+                        }),
                 )
             })
             .children(groups)
             .into_any_element()
     }
 
+    /// Band 4 — everything beyond Agent and model: reasoning effort, mode and
+    /// per-model session options. The band fills the card's remaining height
+    /// and scrolls on its own.
+    #[allow(clippy::too_many_arguments)]
+    fn render_runtime_options_list(
+        &self,
+        catalog: Option<&SessionRuntimeOptionCatalog>,
+        draft: Option<&SessionRuntimeSelection>,
+        reasoning_efforts: Vec<RuntimeCascadeChoice>,
+        modes: Vec<RuntimeCascadeChoice>,
+        features: Vec<SessionRuntimeFeature>,
+        selection_available: bool,
+        busy: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let mut list = div()
+            .id("runtime-options-list")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .pb_2();
+        let Some(draft) = draft else {
+            return list.into_any_element();
+        };
+        list = list
+            .when(catalog.is_some() && !selection_available, |list| {
+                list.child(
+                    div()
+                        .mx_3()
+                        .mt_3()
+                        .rounded(px(theme::RADIUS_CONTROL))
+                        .border_1()
+                        .border_color(theme::accent_yellow())
+                        .bg(theme::bg_card_dim())
+                        .p_3()
+                        .text_size(px(theme::FONT_CAPTION))
+                        .text_color(theme::accent_yellow())
+                        .child(locale::text(
+                            "The current session settings are unavailable. Select an available option.",
+                            "当前会话设置不可用，请选择一个可用选项。",
+                            "目前工作階段設定無法使用，請選擇可用選項。",
+                        )),
+                )
+            })
+            .when(!reasoning_efforts.is_empty(), |list| {
+                list.child(runtime_section_heading(locale::common("Reasoning")))
+                    .child(
+                        div()
+                            .px_3()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(
+                                runtime_choice_button(
+                                    "runtime-reasoning:default",
+                                    locale::common("Default"),
+                                    draft.reasoning_effort.is_none(),
+                                )
+                                .when(!busy, |button| {
+                                    button
+                                        .cursor_pointer()
+                                        .active(|style| style.bg(theme::row_pressed_bg()))
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.choose_default_runtime_reasoning(cx)
+                                            }),
+                                        )
+                                }),
+                            )
+                            .children(reasoning_efforts.into_iter().map(|choice| {
+                                let selected = draft.reasoning_effort.as_deref()
+                                    == Some(choice.value.as_str());
+                                self.render_runtime_choice("reasoning", choice, selected, cx)
+                            })),
+                    )
+            })
+            .when(!modes.is_empty(), |list| {
+                list.child(runtime_section_heading(locale::common("Mode")))
+                    .child(
+                        div()
+                            .px_3()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(
+                                runtime_choice_button(
+                                    "runtime-mode:default",
+                                    locale::common("Default"),
+                                    draft.mode_id.is_none(),
+                                )
+                                .when(!busy, |button| {
+                                    button
+                                        .cursor_pointer()
+                                        .active(|style| style.bg(theme::row_pressed_bg()))
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.choose_default_runtime_mode(cx)
+                                            }),
+                                        )
+                                }),
+                            )
+                            .children(modes.into_iter().map(|choice| {
+                                let selected =
+                                    draft.mode_id.as_deref() == Some(choice.value.as_str());
+                                self.render_runtime_choice("mode", choice, selected, cx)
+                            })),
+                    )
+            })
+            .when(!features.is_empty(), |list| {
+                list.child(runtime_section_heading(locale::common("Session options")))
+                    .children(
+                        features
+                            .into_iter()
+                            .map(|feature| self.render_runtime_feature(feature, cx)),
+                    )
+            });
+        list.into_any_element()
+    }
     fn render_runtime_choice(
         &self,
         group: &'static str,
@@ -13870,8 +13703,22 @@ fn runtime_section_heading(label: impl Into<String>) -> gpui::Div {
         .child(label.into())
 }
 
-/// A 40px selectable row in the session-settings cascade, sharing the desktop
-/// row geometry (icon, truncated label, then trailing markers/chevrons).
+/// The 2px accent bar marking the active Agent logo: it sits on the strip's
+/// bottom hairline (the tab is 40px inside the 52px strip, so -6px lands
+/// exactly on the border), rounded like a capsule.
+fn runtime_tab_indicator() -> gpui::Div {
+    div()
+        .absolute()
+        .bottom(px(-6.0))
+        .left(px(6.0))
+        .right(px(6.0))
+        .h(px(2.0))
+        .rounded(px(1.0))
+        .bg(theme::primary())
+}
+
+/// A 40px selectable row in the session-settings sheet, sharing the desktop
+/// row geometry (icon, truncated label, then trailing markers).
 fn runtime_sheet_row(
     id: impl Into<ElementId>,
     icon: gpui::AnyElement,
@@ -14067,14 +13914,6 @@ fn runtime_auth_source_status_label(
         RuntimeAuthSourceAvailability::Unsupported => {
             locale::text("Unsupported", "暂不支持", "暫不支援").to_string()
         }
-    }
-}
-
-fn runtime_profile_count_label(count: usize) -> String {
-    match locale::current() {
-        vibex_ui::locale::Locale::En => format!("{count} profiles"),
-        vibex_ui::locale::Locale::ZhCn => format!("{count} 个配置"),
-        vibex_ui::locale::Locale::ZhTw => format!("{count} 個設定"),
     }
 }
 
