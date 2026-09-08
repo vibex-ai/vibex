@@ -654,19 +654,18 @@ impl MobileApp {
     }
 
     fn persist_app_settings(&self, cx: &mut Context<Self>) {
-        if let Err(error) = self.storage.save_app_settings(&self.app_settings) {
-            eprintln!("mobile app settings could not be saved: {error}");
-        }
+        // Storage failures surface through the persisted-preference contract
+        // instead of stderr, which native mobile hosts never show.
+        self.storage.save_app_settings(&self.app_settings).ok();
         cx.notify();
     }
 
     pub fn new(data_dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let storage = CredentialStorage::new(data_dir);
         let stored = storage.load();
-        let app_settings = storage.load_app_settings().unwrap_or_else(|error| {
-            eprintln!("mobile app settings unavailable: {error}");
-            AppSettings::default()
-        });
+        let app_settings = storage
+            .load_app_settings()
+            .unwrap_or_else(|_| AppSettings::default());
         apply_app_settings(&app_settings, cx);
         let appearance_subscription = if theme::follows_system() {
             Some(cx.observe_window_appearance(window, |_this, _window, cx| {

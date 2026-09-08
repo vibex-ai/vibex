@@ -145,9 +145,13 @@ fn tone(name: &str) -> Hsla {
 
 /// Flattens a translucent token (for example the desktop's 10% white border)
 /// over an opaque surface so callers that need a solid fill keep the same
-/// contrast the alpha produced on the given background.
+/// contrast the alpha produced on the given background. `Rgba::blend`
+/// composites its argument on top of the receiver, so the surface receives
+/// the token. The blend must stay in `Rgba`: a `u32` round-trip through
+/// `gpui::rgb` would reinterpret the `0xRRGGBBAA` layout as `0x00RRGGBB` and
+/// turn the alpha byte into a full-blue channel.
 fn flatten(token: Rgba, over: Rgba) -> Rgba {
-    token.blend(over)
+    over.blend(token)
 }
 
 fn opaque(name: &str, surface: &str) -> Hsla {
@@ -158,7 +162,7 @@ fn opaque(name: &str, surface: &str) -> Hsla {
     }
     let over = semantic_color(surface, dark);
     let flattened = flatten(Rgba::from(token), Rgba::from(over).alpha(1.0));
-    rgb(u32::from(flattened)).into()
+    flattened.into()
 }
 
 // ---------------------------------------------------------------------------
@@ -506,14 +510,24 @@ mod tests {
             "dark background must resolve from the shared token source"
         );
 
-        // Dark border is white at 10% over #0d0d0d.
+        // Dark border is white at 10% over #0d0d0d: flattening lifts the
+        // surface to ~#252525 and must stay achromatic. A stray blue channel
+        // here means the blend order or a hex round-trip corrupted the
+        // channels (the bug that painted every dark-mode divider blue).
         let over = semantic_color("background", true);
         let flattened = flatten(
             Rgba::from(semantic_color("border", true)),
             Rgba::from(over).alpha(1.0),
         );
-        assert!(flattened.a >= 1.0);
-        assert!(flattened.r > 0.05, "white wash must lift the dark surface");
+        assert_eq!(flattened.a, 1.0);
+        let lifted = 0.1 + 0.9 * (0x0d as f32 / 255.0);
+        for channel in [flattened.r, flattened.g, flattened.b] {
+            assert!(
+                (channel - lifted).abs() < 1e-3,
+                "flattened dark border must stay an achromatic wash"
+            );
+        }
+        assert_eq!(Rgba::from(border_default()), flattened);
         // The opaque accessors never leak alpha.
         assert_eq!(border_default().a, 1.0);
         assert_eq!(border_subtle().a, 1.0);
