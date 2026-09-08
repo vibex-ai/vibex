@@ -2784,14 +2784,42 @@ impl MobileApp {
         };
         let future = controller.load_session(ticket.clone());
         let runner = gpui_tokio::Tokio::spawn(cx, future);
+        // A cache-backed switch restores the authoritative prefix
+        // synchronously; keep that conversation on screen instead of flashing
+        // an empty list while only the newer tail refreshes.
+        let restored_from_cache = controller
+            .state
+            .active_session
+            .value
+            .as_ref()
+            .is_some_and(|session| session.id == ticket.session_id)
+            && controller.state.timeline.session_id.as_ref() == Some(&ticket.session_id);
+        let restored_workspace_id = if restored_from_cache {
+            controller
+                .state
+                .active_session
+                .value
+                .as_ref()
+                .map(|session| session.workspace_id.clone())
+        } else {
+            None
+        };
         self.reset_drawers();
         self.expanded_process.clear();
         self.expanded_timeline_rows.clear();
         self.collapsed_timeline_rows.clear();
         self.expanded_approval.clear();
         self.timeline_markdown_views.borrow_mut().clear();
-        self.timeline_turns = Arc::new(Vec::new());
-        self.timeline_list.reset(0);
+        if restored_from_cache {
+            self.rebuild_timeline_turns();
+            self.timeline_list.scroll_to_end();
+        } else {
+            self.timeline_turns = Arc::new(Vec::new());
+            self.timeline_list.reset(0);
+        }
+        if let Some(workspace_id) = restored_workspace_id {
+            self.ensure_workbench(workspace_id, cx);
+        }
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
             let _ = entity.update(cx, |this, cx| {

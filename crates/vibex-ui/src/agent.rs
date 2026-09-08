@@ -28,6 +28,13 @@ use crate::{
 
 pub const AGENT_TIMELINE_PAGE_LIMIT: u32 = 500;
 pub const AGENT_TIMELINE_MAX_ITEMS: usize = 20_000;
+/// Bounded LRU over previously loaded sessions. Switching back to a cached
+/// session renders its stored authoritative prefix immediately and refreshes
+/// only the newer tail instead of re-paginating the whole timeline.
+pub const AGENT_SESSION_CACHE_SESSION_LIMIT: usize = 6;
+/// Total cached timeline items across all sessions; timeline item payloads
+/// dominate the memory cost on phones.
+pub const AGENT_SESSION_CACHE_ITEM_BUDGET: usize = 8_192;
 
 fn session_update_is_current(existing: &AgentSession, incoming: &AgentSession) -> bool {
     incoming.updated_at_ms >= existing.updated_at_ms
@@ -421,6 +428,54 @@ impl AgentWorkflowState {
 pub struct AgentSessionLoadTicket {
     pub generation: WorkflowViewGeneration,
     pub session_id: VibexSessionId,
+    /// Sequence the timeline fetch resumes after. `0` rebuilds the complete
+    /// authoritative timeline; a cached complete-prefix end only fetches the
+    /// newer tail.
+    pub after_sequence: i64,
+}
+
+/// Authoritative projection of a previously loaded session. The stored
+/// timeline is a complete persisted prefix (paginated from sequence 0 with no
+/// gaps), so persisted items are immutable and a later refresh only needs the
+/// tail after the stored end sequence.
+#[derive(Clone)]
+struct CachedAgentSession {
+    session: AgentSession,
+    timeline: Vec<TimelineItem>,
+    runtime_selection: Option<AgentSessionRuntimeSelectionState>,
+}
+
+/// Most-recently-used-first LRU keyed by session id, bounded by session count
+/// and by the total number of cached timeline items.
+#[derive(Clone, Default)]
+struct AgentSessionCache {
+    entries: Vec<(VibexSessionId, CachedAgentSession)>,
+}
+
+impl AgentSessionCache {
+    fn take(&mut self, session_id: &VibexSessionId) -> Option<CachedAgentSession> {
+        let index = self.entries.iter().position(|(id, _)| id == session_id)?;
+        Some(self.entries.remove(index).1)
+    }
+
+    fn put(&mut self, entry: CachedAgentSession) {
+        if entry.timeline.len() > AGENT_SESSION_CACHE_ITEM_BUDGET {
+            return;
+        }
+        self.entries.retain(|(id, _)| id != &entry.session.id);
+        self.entries.insert(0, (entry.session.id.clone(), entry));
+        while self.entries.len() > AGENT_SESSION_CACHE_SESSION_LIMIT
+            || self.entries.len() > 1
+                && self
+                    .entries
+                    .iter()
+                    .map(|(_, entry)| entry.timeline.len())
+                    .sum::<usize>()
+                    > AGENT_SESSION_CACHE_ITEM_BUDGET
+        {
+            self.entries.pop();
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -475,6 +530,7 @@ pub struct AgentWorkflowController {
     backend: Arc<dyn AgentBackend>,
     capabilities: DomainCapabilities,
     pub state: AgentWorkflowState,
+    session_cache: AgentSessionCache,
 }
 
 impl AgentWorkflowController {
@@ -483,6 +539,7 @@ impl AgentWorkflowController {
             backend,
             capabilities,
             state: AgentWorkflowState::default(),
+            session_cache: AgentSessionCache::default(),
         }
     }
 
@@ -556,13 +613,32 @@ impl AgentWorkflowController {
         self.require(BackendOperation::AgentOpenSession)?;
         self.require(BackendOperation::AgentFetchTimeline)?;
         let switching_session = self.state.selected_session_id.as_ref() != Some(&session_id);
+        if switching_session {
+            self.cache_live_session_snapshot();
+        }
         let generation = self.state.generation.advance();
         self.state.selected_session_id = Some(session_id.clone());
+        let cached = if switching_session {
+            self.session_cache.take(&session_id)
+        } else {
+            None
+        };
         if switching_session {
             self.state.active_session.clear();
             self.state.timeline = TimelineModel::default();
             self.state.timeline_status.clear();
             self.state.runtime_selection.clear();
+        }
+        if let Some(cached) = cached {
+            // Restoring a cached complete prefix keeps the conversation
+            // visible while only the newer tail refreshes.
+            self.state.active_session.resolve(cached.session);
+            self.state
+                .timeline
+                .replace_authoritative(session_id.clone(), cached.timeline);
+            if let Some(runtime_selection) = cached.runtime_selection {
+                self.state.runtime_selection.resolve(runtime_selection);
+            }
         }
         self.state.active_session.begin();
         self.state.timeline_status.begin();
@@ -580,10 +656,52 @@ impl AgentWorkflowController {
             self.state.pending_elicitation_resolutions.clear();
         }
         self.state.last_runtime_event = None;
+        // Only a restored cache prefix may resume past sequence 0; a
+        // same-session recovery reload must always rebuild the whole
+        // authoritative timeline so dropped-event gaps are repaired.
+        let after_sequence = if switching_session {
+            self.state
+                .timeline
+                .items
+                .last()
+                .map(|item| item.sequence)
+                .unwrap_or(0)
+        } else {
+            0
+        };
         Ok(AgentSessionLoadTicket {
             generation,
             session_id,
+            after_sequence,
         })
+    }
+
+    /// Preserves the outgoing session's authoritative projection so switching
+    /// back to it can render instantly and refresh only the newer tail. A
+    /// timeline with a pending authoritative refetch may contain sequence gaps
+    /// and must not be treated as a complete prefix.
+    fn cache_live_session_snapshot(&mut self) {
+        let Some(session_id) = self.state.selected_session_id.clone() else {
+            return;
+        };
+        if self.state.timeline.needs_authoritative_refetch
+            || self.state.timeline.session_id.as_ref() != Some(&session_id)
+        {
+            return;
+        }
+        let Some(session) = self.state.active_session.value.clone() else {
+            return;
+        };
+        if session.id != session_id
+            || self.state.timeline.items.len() > AGENT_SESSION_CACHE_ITEM_BUDGET
+        {
+            return;
+        }
+        self.session_cache.put(CachedAgentSession {
+            session,
+            timeline: self.state.timeline.items.clone(),
+            runtime_selection: self.state.runtime_selection.value.clone(),
+        });
     }
 
     pub fn load_session(
@@ -600,7 +718,12 @@ impl AgentWorkflowController {
                     "the backend returned a different Agent session",
                 ));
             }
-            let timeline = load_complete_timeline(backend.as_ref(), &ticket.session_id).await?;
+            // An empty cached prefix still resumes from 0 and refetches the
+            // complete timeline, so the same paginated loader serves both the
+            // cold and the incremental path.
+            let timeline =
+                load_timeline_after(backend.as_ref(), &ticket.session_id, ticket.after_sequence)
+                    .await?;
             // Runtime metadata is a best-effort sibling query. The
             // authoritative timeline must still render when a provider or
             // remote device cannot expose runtime-selection details.
@@ -642,9 +765,26 @@ impl AgentWorkflowController {
                     return true;
                 }
                 self.state.active_session.resolve(snapshot.session);
-                self.state
-                    .timeline
-                    .replace_authoritative(ticket.session_id.clone(), snapshot.timeline);
+                if ticket.after_sequence > 0 {
+                    // Merge the refreshed tail into the restored complete
+                    // prefix; sequence normalization deduplicates items that
+                    // live events already applied while the refresh ran.
+                    let merged = self
+                        .state
+                        .timeline
+                        .items
+                        .iter()
+                        .cloned()
+                        .chain(snapshot.timeline)
+                        .collect::<Vec<_>>();
+                    self.state
+                        .timeline
+                        .replace_authoritative(ticket.session_id.clone(), merged);
+                } else {
+                    self.state
+                        .timeline
+                        .replace_authoritative(ticket.session_id.clone(), snapshot.timeline);
+                }
                 self.state.timeline_status.resolve(());
                 if let Some(runtime_selection) = snapshot.runtime_selection {
                     self.state.runtime_selection.resolve(runtime_selection);
@@ -652,6 +792,15 @@ impl AgentWorkflowController {
                     self.state.runtime_selection.clear();
                 }
                 self.state.connection = AgentConnectionState::Online;
+                // Remember the refreshed projection so switching back to this
+                // session is instant and only refreshes the newer tail.
+                if let Some(session) = self.state.active_session.value.clone() {
+                    self.session_cache.put(CachedAgentSession {
+                        session,
+                        timeline: self.state.timeline.items.clone(),
+                        runtime_selection: self.state.runtime_selection.value.clone(),
+                    });
+                }
             }
             Err(error) => {
                 self.state.active_session.reject(error.clone());
@@ -1196,11 +1345,12 @@ impl AgentWorkflowController {
     }
 }
 
-async fn load_complete_timeline(
+async fn load_timeline_after(
     backend: &dyn AgentBackend,
     session_id: &VibexSessionId,
+    after_sequence: i64,
 ) -> BackendResult<Vec<TimelineItem>> {
-    let mut after_sequence = 0_i64;
+    let mut after_sequence = after_sequence.max(0);
     let mut by_sequence = BTreeMap::new();
     loop {
         let page = backend
@@ -1772,6 +1922,241 @@ mod tests {
         assert!(controller.state.active_session.value.is_none());
         assert!(controller.state.timeline_status.value.is_none());
         assert!(controller.state.timeline.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn switching_back_to_cached_session_renders_prefix_and_refreshes_tail_incrementally() {
+        let session = session();
+        let items = vec![
+            timeline_item(
+                &session.id,
+                1,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "go".into(),
+                    attachments: Vec::new(),
+                }),
+            ),
+            timeline_item(
+                &session.id,
+                2,
+                TimelinePayload::AgentMessage(AgentMessagePayload {
+                    text: "done".into(),
+                    is_final: true,
+                }),
+            ),
+        ];
+        let backend = Arc::new(MockAgentBackend::new(session.clone(), items));
+        let mut controller = AgentWorkflowController::new(backend.clone(), capabilities());
+        let first = controller.begin_session_load(session.id.clone()).unwrap();
+        assert_eq!(first.after_sequence, 0);
+        let snapshot = controller.load_session(first.clone()).await.unwrap();
+        assert!(controller.apply_session_snapshot(&first, Ok(snapshot)));
+
+        // The Agent keeps working while another session is selected.
+        for sequence in 3..=4 {
+            backend.timeline.lock().unwrap().push(timeline_item(
+                &session.id,
+                sequence,
+                TimelinePayload::AgentMessage(AgentMessagePayload {
+                    text: format!("update {sequence}"),
+                    is_final: true,
+                }),
+            ));
+        }
+        controller
+            .begin_session_load(VibexSessionId::new())
+            .expect("switching away should start");
+
+        let back = controller.begin_session_load(session.id.clone()).unwrap();
+        assert_eq!(back.after_sequence, 2);
+        assert_eq!(controller.state.active_session.phase, AsyncPhase::Loading);
+        assert_eq!(
+            controller.state.active_session.value.as_ref().unwrap().id,
+            session.id
+        );
+        assert_eq!(
+            controller
+                .state
+                .timeline
+                .items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        // Only the tail after the cached prefix is fetched.
+        let tail = controller.load_session(back.clone()).await.unwrap();
+        assert_eq!(
+            tail.timeline
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+
+        // A failed refresh keeps the cached prefix visible.
+        assert!(controller.apply_session_snapshot(
+            &back,
+            Err(BackendError::failed(
+                "backend_unavailable",
+                "refresh failed"
+            ))
+        ));
+        assert_eq!(controller.state.timeline.items.len(), 2);
+
+        assert!(controller.apply_session_snapshot(&back, Ok(tail)));
+        assert_eq!(
+            controller
+                .state
+                .timeline
+                .items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(controller.state.active_session.phase, AsyncPhase::Ready);
+        assert_eq!(controller.state.timeline_status.phase, AsyncPhase::Ready);
+    }
+
+    #[tokio::test]
+    async fn lagged_live_timeline_does_not_overwrite_the_cached_complete_prefix() {
+        let session = session();
+        let items = vec![timeline_item(
+            &session.id,
+            1,
+            TimelinePayload::AgentMessage(AgentMessagePayload {
+                text: "one".into(),
+                is_final: true,
+            }),
+        )];
+        let backend = Arc::new(MockAgentBackend::new(session.clone(), items));
+        let mut controller = AgentWorkflowController::new(backend.clone(), capabilities());
+        let first = controller.begin_session_load(session.id.clone()).unwrap();
+        let snapshot = controller.load_session(first.clone()).await.unwrap();
+        assert!(controller.apply_session_snapshot(&first, Ok(snapshot)));
+
+        // A dropped event leaves a sequence gap in the live model: sequence 3
+        // arrives without 2. The gapped model must not replace the cached
+        // complete prefix, or the missing item could never be recovered.
+        let gap_item = timeline_item(
+            &session.id,
+            3,
+            TimelinePayload::AgentMessage(AgentMessagePayload {
+                text: "three".into(),
+                is_final: true,
+            }),
+        );
+        assert!(controller.state.timeline.apply_live(TimelineLiveEvent {
+            session_id: session.id.clone(),
+            sequence: 3,
+            item: gap_item,
+        }));
+        assert!(controller.state.timeline.needs_authoritative_refetch);
+        for (sequence, text) in [(2, "two"), (3, "three")] {
+            backend.timeline.lock().unwrap().push(timeline_item(
+                &session.id,
+                sequence,
+                TimelinePayload::AgentMessage(AgentMessagePayload {
+                    text: text.into(),
+                    is_final: true,
+                }),
+            ));
+        }
+        controller
+            .begin_session_load(VibexSessionId::new())
+            .expect("switching away should start");
+
+        let back = controller.begin_session_load(session.id.clone()).unwrap();
+        assert_eq!(back.after_sequence, 1);
+        assert_eq!(
+            controller
+                .state
+                .timeline
+                .items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+
+        // The tail fetch after the cached prefix repairs the gap.
+        let tail = controller.load_session(back.clone()).await.unwrap();
+        assert_eq!(
+            tail.timeline
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert!(controller.apply_session_snapshot(&back, Ok(tail)));
+        assert_eq!(
+            controller
+                .state
+                .timeline
+                .items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(!controller.state.timeline.needs_authoritative_refetch);
+    }
+
+    #[test]
+    fn session_cache_evicts_least_recently_used_and_respects_item_budget() {
+        fn put_entry(cache: &mut AgentSessionCache, timeline_len: usize) -> VibexSessionId {
+            let session = session();
+            cache.put(CachedAgentSession {
+                session: session.clone(),
+                timeline: vec![
+                    timeline_item(
+                        &session.id,
+                        1,
+                        TimelinePayload::AgentMessage(AgentMessagePayload {
+                            text: "done".into(),
+                            is_final: true,
+                        })
+                    );
+                    timeline_len
+                ],
+                runtime_selection: None,
+            });
+            session.id
+        }
+
+        let mut cache = AgentSessionCache::default();
+        let mut ids = Vec::new();
+        for _ in 0..AGENT_SESSION_CACHE_SESSION_LIMIT {
+            ids.push(put_entry(&mut cache, 0));
+        }
+        assert_eq!(cache.entries.len(), AGENT_SESSION_CACHE_SESSION_LIMIT);
+
+        // Refreshing the oldest entry makes it most-recently used, so the
+        // next eviction drops the new least-recently-used tail instead.
+        let oldest = ids[0].clone();
+        let refreshed = cache.take(&oldest).expect("oldest entry is cached");
+        cache.put(refreshed);
+        assert_eq!(cache.entries[0].0, oldest);
+        let lru_tail = ids[1].clone();
+        let fresh = put_entry(&mut cache, 0);
+        assert!(cache.entries.len() <= AGENT_SESSION_CACHE_SESSION_LIMIT);
+        assert!(!cache.entries.iter().any(|(id, _)| *id == lru_tail));
+        assert!(cache.entries.iter().any(|(id, _)| *id == oldest));
+        assert!(cache.entries.iter().any(|(id, _)| *id == fresh));
+
+        // A single oversized snapshot is never cached.
+        let oversized = put_entry(&mut cache, AGENT_SESSION_CACHE_ITEM_BUDGET + 1);
+        assert!(!cache.entries.iter().any(|(id, _)| *id == oversized));
+        assert!(
+            cache
+                .entries
+                .iter()
+                .map(|(_, entry)| entry.timeline.len())
+                .sum::<usize>()
+                <= AGENT_SESSION_CACHE_ITEM_BUDGET
+        );
     }
 
     #[test]
