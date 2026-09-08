@@ -58,7 +58,10 @@ use crate::input::{
     SelectDown, SelectLeft, SelectRight, SelectUp, TextInput, Up,
 };
 use crate::lifecycle::MobileLifecycleEvent;
-use crate::pairing::{MobileCredentialBundle, claim_pairing_link, claim_zero_config_lan_pairing};
+use crate::pairing::{
+    MobileCredentialBundle, claim_pairing_link, claim_server_pairing_code,
+    claim_zero_config_lan_pairing,
+};
 use crate::sidebar::{
     SidebarCard, SidebarCardEdge, SidebarDropPosition, SidebarDropTarget, SidebarProject,
     SidebarRow, SidebarRowInput, SidebarRowKind, SidebarWorkspace, ancestors_of, drop_target,
@@ -851,17 +854,10 @@ impl MobileApp {
             elicitation_draft: None,
             pairing_busy: false,
             pairing_server_url_input: cx.new(|cx| {
-                TextInput::new(
-                    locale::text("Server URL", "服务器地址", "伺服器位址"),
-                    cx,
-                )
+                TextInput::new(locale::text("Server URL", "服务器地址", "伺服器位址"), cx)
             }),
-            pairing_code_input: cx.new(|cx| {
-                TextInput::new(
-                    locale::text("Pairing code", "配对码", "配對碼"),
-                    cx,
-                )
-            }),
+            pairing_code_input: cx
+                .new(|cx| TextInput::new(locale::text("Pairing code", "配对码", "配對碼"), cx)),
             nearby_pairing_state: NearbyPairingState::Idle,
             nearby_candidates: BTreeMap::new(),
             nearby_discovery_generation: 0,
@@ -1734,6 +1730,75 @@ impl MobileApp {
         cx.notify();
     }
 
+    /// Pairs with a headless `vibex-server` deployment from the address and
+    /// the one-time numeric code its operator printed at startup.  The code
+    /// travels only inside the bounded HTTPS claim body and the resulting
+    /// credential is validated and pinned before it is stored.
+    fn claim_entered_server_pairing_code(&mut self, cx: &mut Context<Self>) {
+        if self.pairing_busy || self.mode != RootMode::Pairing {
+            return;
+        }
+        let server_url = self
+            .pairing_server_url_input
+            .read(cx)
+            .text()
+            .trim()
+            .to_string();
+        let pairing_code = self.pairing_code_input.read(cx).text().trim().to_string();
+        if server_url.is_empty() || pairing_code.is_empty() {
+            self.error = Some(BackendError::failed(
+                "remote_pairing_code_request_invalid",
+                locale::text(
+                    "Enter the server address and the pairing code.",
+                    "请输入服务器地址和配对码。",
+                    "請輸入伺服器位址和配對碼。",
+                )
+                .to_string(),
+            ));
+            cx.notify();
+            return;
+        }
+        self.pairing_busy = true;
+        self.error = None;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            claim_server_pairing_code(server_url, pairing_code).await
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                this.pairing_busy = false;
+                match outcome {
+                    Ok(Ok(bundle)) => {
+                        this.pairing_server_url_input.update(cx, |input, cx| {
+                            input.set_text("", cx);
+                        });
+                        this.pairing_code_input.update(cx, |input, cx| {
+                            input.set_text("", cx);
+                        });
+                        match this.storage.save(&bundle) {
+                            Ok(()) => this.install_bundle(bundle, cx),
+                            Err(error) => this.error = Some(error),
+                        }
+                    }
+                    Ok(Err(error)) => this.error = Some(error),
+                    Err(_) => {
+                        this.error = Some(BackendError::failed(
+                            "remote_pairing_task_failed",
+                            locale::text(
+                                "Pairing stopped unexpectedly.",
+                                "配对意外停止。",
+                                "配對意外停止。",
+                            ),
+                        ))
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
     fn refresh_sessions(&mut self, cx: &mut Context<Self>) {
         if self.session_sync_busy {
             self.session_sync_queued = true;
@@ -1924,7 +1989,9 @@ impl MobileApp {
         self.push_back_screen(BackScreen::RuntimeOptions);
         self.runtime_switch_error = None;
         self.runtime_sheet_search =
-            Some(cx.new(|cx| TextInput::new(locale::text("Search models", "搜索模型", "搜尋模型"), cx)));
+            Some(cx.new(|cx| {
+                TextInput::new(locale::text("Search models", "搜索模型", "搜尋模型"), cx)
+            }));
         self.refresh_runtime_agents(cx);
         self.sync_runtime_feature_inputs(cx);
         self.anchor_runtime_agent_strip();
@@ -2001,7 +2068,9 @@ impl MobileApp {
         self.push_back_screen(BackScreen::RuntimeOptions);
         self.runtime_switch_error = None;
         self.runtime_sheet_search =
-            Some(cx.new(|cx| TextInput::new(locale::text("Search models", "搜索模型", "搜尋模型"), cx)));
+            Some(cx.new(|cx| {
+                TextInput::new(locale::text("Search models", "搜索模型", "搜尋模型"), cx)
+            }));
         self.refresh_runtime_agents(cx);
         self.sync_runtime_feature_inputs(cx);
         self.anchor_runtime_agent_strip();
@@ -5399,6 +5468,7 @@ impl MobileApp {
                                 locale::common("Use QR Code")
                             }),
                     )
+                    .child(self.render_server_pairing_code_entry(cx))
                     .when(self.pairing_from_hosts, |panel| {
                         panel.child(
                             div()
@@ -5419,6 +5489,73 @@ impl MobileApp {
                         )
                     }),
             )
+    }
+
+    /// Manual headless-server pairing: the operator reads the server address
+    /// and one-time numeric code off the `vibex-server` console and enters
+    /// them here. The code never goes into a URL, so it stays out of proxy
+    /// logs and history.
+    fn render_server_pairing_code_entry(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let ready = !self.pairing_busy;
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(theme::SPACING_SM))
+            .child(
+                div()
+                    .text_size(px(theme::FONT_DETAIL))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::text_primary())
+                    .child(locale::text(
+                        "Pair with a Cloud Server",
+                        "连接云端服务器",
+                        "連線雲端伺服器",
+                    )),
+            )
+            .child(
+                div()
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .border_1()
+                    .border_color(theme::border_default())
+                    .child(self.pairing_server_url_input.clone()),
+            )
+            .child(
+                div()
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .border_1()
+                    .border_color(theme::border_default())
+                    .child(self.pairing_code_input.clone()),
+            )
+            .child(
+                div()
+                    .id("claim-server-pairing-code")
+                    .h(px(theme::TOUCH_TARGET))
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .bg(theme::text_primary())
+                    .text_color(theme::bg_primary())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(theme::FONT_HEADING))
+                    .when(ready, |button| {
+                        button
+                            .cursor_pointer()
+                            .active(|style| style.opacity(0.7))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                    this.claim_entered_server_pairing_code(cx);
+                                }),
+                            )
+                    })
+                    .child(if self.pairing_busy {
+                        locale::common("Pairing...")
+                    } else {
+                        locale::text("Pair with Code", "使用配对码连接", "使用配對碼連線")
+                    }),
+            )
+            .into_any_element()
     }
 
     fn render_nearby_pairing(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -6969,7 +7106,10 @@ impl MobileApp {
                         button
                             .cursor_pointer()
                             .active(|style| style.opacity(0.6))
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::close_runtime_options))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(Self::close_runtime_options),
+                            )
                     })
                     .child(
                         svg()
@@ -13925,7 +14065,11 @@ const MOBILE_AGENT_BRAND_ASSETS: &[(&str, &str, bool)] = &[
     ("crow-cli", "icons/agents/crow-cli.svg", false),
     ("cursor", "icons/agents/cursor.svg", true),
     ("deepagents", "icons/agents/deepagents.svg", true),
-    ("deepseek-harness", "icons/agents/deepseek-harness.svg", false),
+    (
+        "deepseek-harness",
+        "icons/agents/deepseek-harness.svg",
+        false,
+    ),
     ("devin", "icons/agents/devin.svg", true),
     ("dimcode", "icons/agents/dimcode.svg", false),
     ("dirac", "icons/agents/dirac.svg", true),
@@ -13953,49 +14097,609 @@ const MOBILE_AGENT_BRAND_ASSETS: &[(&str, &str, bool)] = &[
     ("mistral", "icons/agents/mistral-vibe.svg", false),
 ];
 
-const MOBILE_MODEL_BRAND_ASSETS: &[(&str, &str, bool)] = &[
-    ("claude", "icons/claude.svg", false),
-    ("anthropic", "icons/claude.svg", false),
-    ("gpt", "icons/openai.svg", true),
-    ("o1", "icons/openai.svg", true),
-    ("o3", "icons/openai.svg", true),
-    ("o4", "icons/openai.svg", true),
-    ("chatgpt", "icons/openai.svg", true),
-    ("openai", "icons/openai.svg", true),
-    ("codex", "icons/openai.svg", true),
-    ("gemini", "icons/gemini.svg", false),
-    ("gemma", "icons/gemini.svg", false),
-    ("grok", "icons/agents/grok.svg", true),
-    ("qwen", "icons/qwen.svg", false),
-    ("deepseek", "icons/agents/deepseek-harness.svg", false),
-    ("kimi", "icons/agents/kimi.svg", false),
-    ("moonshot", "icons/agents/kimi.svg", false),
-    ("glm", "icons/agents/glm-acp-agent.svg", true),
-    ("zhipu", "icons/agents/glm-acp-agent.svg", true),
-    ("opencode", "icons/opencode.svg", false),
-    ("copilot", "icons/copilot.svg", true),
+/// Desktop-parity model brand assets: `(path, uses_current_color)`. Marks
+/// that use the current color are monochrome glyphs tinted with the row's
+/// text color; the rest carry their own brand colors and render via `img`.
+type ModelBrandAsset = (&'static str, bool);
+
+const fn model_colored(path: &'static str) -> ModelBrandAsset {
+    (path, false)
+}
+
+const fn model_themed(path: &'static str) -> ModelBrandAsset {
+    (path, true)
+}
+
+/// Provider slug → mark, matched exactly against the part before `/`.
+const MOBILE_MODEL_PROVIDER_BRANDS: &[(&str, ModelBrandAsset)] = &[
+    (
+        "aion-labs",
+        model_colored("icons/model-providers/aion-labs.svg"),
+    ),
+    (
+        "alibaba",
+        model_colored("icons/model-providers/alibaba.svg"),
+    ),
+    ("amazon", model_colored("icons/model-providers/amazon.svg")),
+    (
+        "anthracite-org",
+        model_colored("icons/model-providers/anthracite-org.svg"),
+    ),
+    ("anthropic", model_colored("icons/claude.svg")),
+    (
+        "arcee-ai",
+        model_colored("icons/model-providers/arcee-ai.svg"),
+    ),
+    ("baai", model_colored("icons/model-providers/baai.svg")),
+    ("baidu", model_colored("icons/model-providers/baidu.svg")),
+    (
+        "black-forest-labs",
+        model_colored("icons/model-providers/black-forest-labs.svg"),
+    ),
+    (
+        "bytedance",
+        model_colored("icons/model-providers/bytedance.svg"),
+    ),
+    (
+        "bytedance-seed",
+        model_colored("icons/model-providers/bytedance-seed.svg"),
+    ),
+    (
+        "canopylabs",
+        model_colored("icons/model-providers/canopylabs.svg"),
+    ),
+    (
+        "cognitivecomputations",
+        model_colored("icons/model-providers/cognitivecomputations.svg"),
+    ),
+    ("cohere", model_colored("icons/model-providers/cohere.svg")),
+    (
+        "deepgram",
+        model_themed("icons/model-providers/deepgram.svg"),
+    ),
+    (
+        "deepseek",
+        model_colored("icons/agents/deepseek-harness.svg"),
+    ),
+    (
+        "deepseek-ai",
+        model_colored("icons/agents/deepseek-harness.svg"),
+    ),
+    (
+        "dots-studio",
+        model_colored("icons/model-providers/dots-studio.svg"),
+    ),
+    (
+        "fish-audio",
+        model_colored("icons/model-providers/fish-audio.svg"),
+    ),
+    ("google", model_colored("icons/gemini.svg")),
+    ("gryphe", model_colored("icons/model-providers/gryphe.svg")),
+    (
+        "hexgrad",
+        model_colored("icons/model-providers/hexgrad.svg"),
+    ),
+    ("heygen", model_colored("icons/model-providers/heygen.svg")),
+    (
+        "ibm-granite",
+        model_themed("icons/model-providers/ibm-granite.svg"),
+    ),
+    (
+        "inception",
+        model_themed("icons/model-providers/inception.svg"),
+    ),
+    (
+        "inclusionai",
+        model_colored("icons/model-providers/inclusionai.svg"),
+    ),
+    (
+        "intfloat",
+        model_colored("icons/model-providers/intfloat.svg"),
+    ),
+    ("krea", model_colored("icons/model-providers/krea.svg")),
+    (
+        "kwaipilot",
+        model_colored("icons/model-providers/kwaipilot.svg"),
+    ),
+    (
+        "kwaivgi",
+        model_colored("icons/model-providers/kwaivgi.svg"),
+    ),
+    ("liquid", model_colored("icons/model-providers/liquid.svg")),
+    ("mancer", model_colored("icons/model-providers/mancer.svg")),
+    (
+        "meituan",
+        model_colored("icons/model-providers/meituan.svg"),
+    ),
+    ("meta", model_colored("icons/model-providers/meta.svg")),
+    (
+        "meta-llama",
+        model_colored("icons/model-providers/meta-llama.svg"),
+    ),
+    (
+        "microsoft",
+        model_colored("icons/model-providers/microsoft.svg"),
+    ),
+    (
+        "minimax",
+        model_colored("icons/model-providers/minimax.svg"),
+    ),
+    ("mistralai", model_colored("icons/agents/mistral-vibe.svg")),
+    ("moonshotai", model_colored("icons/agents/kimi.svg")),
+    ("morph", model_colored("icons/model-providers/morph.svg")),
+    ("nex-agi", model_themed("icons/model-providers/nex-agi.svg")),
+    ("nousresearch", model_themed("icons/agents/hermes.svg")),
+    ("nvidia", model_colored("icons/model-providers/nvidia.svg")),
+    ("openai", model_themed("icons/openai.svg")),
+    (
+        "openrouter",
+        model_colored("icons/model-providers/openrouter.svg"),
+    ),
+    (
+        "perceptron",
+        model_colored("icons/model-providers/perceptron.svg"),
+    ),
+    (
+        "perplexity",
+        model_colored("icons/model-providers/perplexity.svg"),
+    ),
+    ("poolside", model_themed("icons/agents/poolside.svg")),
+    ("qwen", model_colored("icons/qwen.svg")),
+    ("recraft", model_themed("icons/model-providers/recraft.svg")),
+    ("rekaai", model_colored("icons/model-providers/rekaai.svg")),
+    ("relace", model_colored("icons/model-providers/relace.svg")),
+    ("runway", model_colored("icons/model-providers/runway.svg")),
+    ("sakana", model_colored("icons/model-providers/sakana.svg")),
+    ("sao10k", model_colored("icons/model-providers/sao10k.svg")),
+    (
+        "sentence-transformers",
+        model_colored("icons/model-providers/sentence-transformers.svg"),
+    ),
+    ("sesame", model_colored("icons/model-providers/sesame.svg")),
+    (
+        "sourceful",
+        model_colored("icons/model-providers/sourceful.svg"),
+    ),
+    (
+        "stepfun",
+        model_colored("icons/model-providers/stepfun.svg"),
+    ),
+    (
+        "tencent",
+        model_colored("icons/model-providers/tencent.svg"),
+    ),
+    (
+        "thedrummer",
+        model_colored("icons/model-providers/thedrummer.svg"),
+    ),
+    (
+        "thenlper",
+        model_colored("icons/model-providers/thenlper.svg"),
+    ),
+    (
+        "thinkingmachines",
+        model_colored("icons/model-providers/thinkingmachines.svg"),
+    ),
+    ("undi95", model_colored("icons/model-providers/undi95.svg")),
+    (
+        "upstage",
+        model_colored("icons/model-providers/upstage.svg"),
+    ),
+    (
+        "voyageai",
+        model_colored("icons/model-providers/voyageai.svg"),
+    ),
+    ("writer", model_colored("icons/model-providers/writer.svg")),
+    ("x-ai", model_themed("icons/agents/grok.svg")),
+    ("xiaomi", model_colored("icons/model-providers/xiaomi.svg")),
+    ("z-ai", model_themed("icons/agents/glm-acp-agent.svg")),
 ];
 
+/// Longer model-name prefix exceptions whose first keyword is shared by
+/// providers; the longest matching prefix wins.
+const MOBILE_MODEL_BRAND_PREFIXES: &[(&str, ModelBrandAsset)] = &[
+    (
+        "microsoft/mai",
+        model_colored("icons/model-providers/mai.svg"),
+    ),
+    (
+        "deepgram/flux",
+        model_themed("icons/model-providers/deepgram.svg"),
+    ),
+    (
+        "deepgram/nova",
+        model_themed("icons/model-providers/deepgram.svg"),
+    ),
+    (
+        "cohere/rerank",
+        model_colored("icons/model-providers/cohere.svg"),
+    ),
+    (
+        "voyageai/rerank",
+        model_colored("icons/model-providers/voyageai.svg"),
+    ),
+    (
+        "nvidia/llama",
+        model_colored("icons/model-providers/nvidia.svg"),
+    ),
+    (
+        "meta-llama/llama",
+        model_colored("icons/model-providers/meta-llama.svg"),
+    ),
+    (
+        "flux-tts",
+        model_themed("icons/model-providers/deepgram.svg"),
+    ),
+    ("nova-3", model_themed("icons/model-providers/deepgram.svg")),
+    (
+        "rerank-4",
+        model_colored("icons/model-providers/cohere.svg"),
+    ),
+    (
+        "rerank-v3.5",
+        model_colored("icons/model-providers/cohere.svg"),
+    ),
+    (
+        "llama-nemotron",
+        model_colored("icons/model-providers/nvidia.svg"),
+    ),
+];
+
+/// Model keyword rules for the part after `/`; the longest matching
+/// keyword wins.
+const MOBILE_MODEL_BRAND_RULES: &[(&str, ModelBrandAsset)] = &[
+    ("mai", model_colored("icons/model-providers/mai.svg")),
+    (
+        "multilingual",
+        model_colored("icons/model-providers/intfloat.svg"),
+    ),
+    (
+        "bodybuilder",
+        model_colored("icons/model-providers/openrouter.svg"),
+    ),
+    (
+        "happyhorse",
+        model_colored("icons/model-providers/alibaba.svg"),
+    ),
+    (
+        "paraphrase",
+        model_colored("icons/model-providers/sentence-transformers.svg"),
+    ),
+    (
+        "perceptron",
+        model_colored("icons/model-providers/perceptron.svg"),
+    ),
+    (
+        "transcribe",
+        model_colored("icons/model-providers/fish-audio.svg"),
+    ),
+    (
+        "unslopnemo",
+        model_colored("icons/model-providers/thedrummer.svg"),
+    ),
+    ("codestral", model_colored("icons/agents/mistral-vibe.svg")),
+    ("ministral", model_colored("icons/agents/mistral-vibe.svg")),
+    (
+        "riverflow",
+        model_colored("icons/model-providers/sourceful.svg"),
+    ),
+    (
+        "deepseek",
+        model_colored("icons/agents/deepseek-harness.svg"),
+    ),
+    ("devstral", model_colored("icons/agents/mistral-vibe.svg")),
+    (
+        "mythomax",
+        model_colored("icons/model-providers/gryphe.svg"),
+    ),
+    (
+        "nemotron",
+        model_colored("icons/model-providers/nvidia.svg"),
+    ),
+    (
+        "parakeet",
+        model_colored("icons/model-providers/nvidia.svg"),
+    ),
+    (
+        "seedance",
+        model_colored("icons/model-providers/bytedance.svg"),
+    ),
+    (
+        "seedream",
+        model_colored("icons/model-providers/bytedance-seed.svg"),
+    ),
+    (
+        "wizardlm",
+        model_colored("icons/model-providers/microsoft.svg"),
+    ),
+    ("command", model_colored("icons/model-providers/cohere.svg")),
+    (
+        "cydonia",
+        model_colored("icons/model-providers/thedrummer.svg"),
+    ),
+    (
+        "dolphin",
+        model_colored("icons/model-providers/cognitivecomputations.svg"),
+    ),
+    (
+        "granite",
+        model_themed("icons/model-providers/ibm-granite.svg"),
+    ),
+    (
+        "hunyuan",
+        model_colored("icons/model-providers/tencent.svg"),
+    ),
+    (
+        "inkling",
+        model_colored("icons/model-providers/thinkingmachines.svg"),
+    ),
+    (
+        "longcat",
+        model_colored("icons/model-providers/meituan.svg"),
+    ),
+    (
+        "mercury",
+        model_themed("icons/model-providers/inception.svg"),
+    ),
+    (
+        "minimax",
+        model_colored("icons/model-providers/minimax.svg"),
+    ),
+    ("mistral", model_colored("icons/agents/mistral-vibe.svg")),
+    ("mixtral", model_colored("icons/agents/mistral-vibe.svg")),
+    (
+        "orpheus",
+        model_colored("icons/model-providers/canopylabs.svg"),
+    ),
+    ("palmyra", model_colored("icons/model-providers/writer.svg")),
+    ("qwen2.5", model_colored("icons/qwen.svg")),
+    ("qwen3.5", model_colored("icons/qwen.svg")),
+    ("qwen3.6", model_colored("icons/qwen.svg")),
+    ("qwen3.7", model_colored("icons/qwen.svg")),
+    ("qwen3.8", model_colored("icons/qwen.svg")),
+    ("recraft", model_themed("icons/model-providers/recraft.svg")),
+    (
+        "skyfall",
+        model_colored("icons/model-providers/thedrummer.svg"),
+    ),
+    (
+        "trinity",
+        model_colored("icons/model-providers/arcee-ai.svg"),
+    ),
+    ("voxtral", model_colored("icons/agents/mistral-vibe.svg")),
+    ("whisper", model_themed("icons/openai.svg")),
+    ("avatar", model_colored("icons/model-providers/heygen.svg")),
+    ("claude", model_colored("icons/claude.svg")),
+    (
+        "flux.2",
+        model_colored("icons/model-providers/black-forest-labs.svg"),
+    ),
+    (
+        "fusion",
+        model_colored("icons/model-providers/openrouter.svg"),
+    ),
+    ("gemini", model_colored("icons/gemini.svg")),
+    ("hailuo", model_colored("icons/model-providers/minimax.svg")),
+    ("hermes", model_themed("icons/agents/hermes.svg")),
+    ("kokoro", model_colored("icons/model-providers/hexgrad.svg")),
+    ("laguna", model_themed("icons/agents/poolside.svg")),
+    (
+        "magnum",
+        model_colored("icons/model-providers/anthracite-org.svg"),
+    ),
+    (
+        "pareto",
+        model_colored("icons/model-providers/openrouter.svg"),
+    ),
+    ("relace", model_colored("icons/model-providers/relace.svg")),
+    (
+        "rerank",
+        model_colored("icons/model-providers/voyageai.svg"),
+    ),
+    ("sakana", model_colored("icons/model-providers/sakana.svg")),
+    ("speech", model_colored("icons/model-providers/minimax.svg")),
+    (
+        "voyage",
+        model_colored("icons/model-providers/voyageai.svg"),
+    ),
+    ("weaver", model_colored("icons/model-providers/mancer.svg")),
+    ("aleph", model_colored("icons/model-providers/runway.svg")),
+    ("chirp", model_colored("icons/gemini.svg")),
+    ("ernie", model_colored("icons/model-providers/baidu.svg")),
+    ("gemma", model_colored("icons/gemini.svg")),
+    ("kling", model_colored("icons/model-providers/kwaivgi.svg")),
+    (
+        "llama",
+        model_colored("icons/model-providers/meta-llama.svg"),
+    ),
+    ("lyria", model_colored("icons/gemini.svg")),
+    ("morph", model_colored("icons/model-providers/morph.svg")),
+    (
+        "multi",
+        model_colored("icons/model-providers/sentence-transformers.svg"),
+    ),
+    ("north", model_colored("icons/model-providers/cohere.svg")),
+    ("qwen3", model_colored("icons/qwen.svg")),
+    ("solar", model_colored("icons/model-providers/upstage.svg")),
+    (
+        "sonar",
+        model_colored("icons/model-providers/perplexity.svg"),
+    ),
+    ("aion", model_colored("icons/model-providers/aion-labs.svg")),
+    ("aura", model_themed("icons/model-providers/deepgram.svg")),
+    (
+        "auto",
+        model_colored("icons/model-providers/openrouter.svg"),
+    ),
+    (
+        "dots",
+        model_colored("icons/model-providers/dots-studio.svg"),
+    ),
+    (
+        "flux",
+        model_colored("icons/model-providers/black-forest-labs.svg"),
+    ),
+    (
+        "free",
+        model_colored("icons/model-providers/openrouter.svg"),
+    ),
+    ("fugu", model_colored("icons/model-providers/sakana.svg")),
+    ("grok", model_themed("icons/agents/grok.svg")),
+    ("kimi", model_colored("icons/agents/kimi.svg")),
+    ("krea", model_colored("icons/model-providers/krea.svg")),
+    ("l3.1", model_colored("icons/model-providers/sao10k.svg")),
+    ("l3.3", model_colored("icons/model-providers/sao10k.svg")),
+    (
+        "ling",
+        model_colored("icons/model-providers/inclusionai.svg"),
+    ),
+    ("mimo", model_colored("icons/model-providers/xiaomi.svg")),
+    ("muse", model_colored("icons/model-providers/meta.svg")),
+    ("nova", model_colored("icons/model-providers/amazon.svg")),
+    (
+        "pplx",
+        model_colored("icons/model-providers/perplexity.svg"),
+    ),
+    ("qwen", model_colored("icons/qwen.svg")),
+    ("reka", model_colored("icons/model-providers/rekaai.svg")),
+    ("remm", model_colored("icons/model-providers/undi95.svg")),
+    (
+        "s2.1",
+        model_colored("icons/model-providers/fish-audio.svg"),
+    ),
+    (
+        "seed",
+        model_colored("icons/model-providers/bytedance-seed.svg"),
+    ),
+    ("sora", model_themed("icons/openai.svg")),
+    ("step", model_colored("icons/model-providers/stepfun.svg")),
+    ("text", model_themed("icons/openai.svg")),
+    (
+        "all",
+        model_colored("icons/model-providers/sentence-transformers.svg"),
+    ),
+    ("bge", model_colored("icons/model-providers/baai.svg")),
+    ("csm", model_colored("icons/model-providers/sesame.svg")),
+    ("gen", model_colored("icons/model-providers/runway.svg")),
+    ("glm", model_themed("icons/agents/glm-acp-agent.svg")),
+    ("gpt", model_themed("icons/openai.svg")),
+    ("gte", model_colored("icons/model-providers/thenlper.svg")),
+    ("hy3", model_colored("icons/model-providers/tencent.svg")),
+    ("hy4", model_colored("icons/model-providers/tencent.svg")),
+    ("kat", model_colored("icons/model-providers/kwaipilot.svg")),
+    ("lfm", model_colored("icons/model-providers/liquid.svg")),
+    ("nex", model_themed("icons/model-providers/nex-agi.svg")),
+    ("phi", model_colored("icons/model-providers/microsoft.svg")),
+    ("veo", model_colored("icons/gemini.svg")),
+    ("wan", model_colored("icons/model-providers/alibaba.svg")),
+    ("e5", model_colored("icons/model-providers/intfloat.svg")),
+    ("hy", model_colored("icons/model-providers/tencent.svg")),
+    ("l3", model_colored("icons/model-providers/sao10k.svg")),
+    ("o1", model_themed("icons/openai.svg")),
+    ("o3", model_themed("icons/openai.svg")),
+    ("o4", model_themed("icons/openai.svg")),
+    ("s1", model_colored("icons/model-providers/fish-audio.svg")),
+    ("s2", model_colored("icons/model-providers/fish-audio.svg")),
+    ("ui", model_colored("icons/model-providers/bytedance.svg")),
+];
+
+/// Model ids emitted by the built-in Agent integrations keep their marks.
+const MOBILE_MODEL_COMPATIBILITY_BRANDS: &[(&str, ModelBrandAsset)] = &[
+    ("opencode", model_colored("icons/opencode.svg")),
+    ("codex", model_themed("icons/openai.svg")),
+    ("chatgpt", model_themed("icons/openai.svg")),
+    ("copilot", model_themed("icons/copilot.svg")),
+    ("tongyi", model_colored("icons/qwen.svg")),
+    ("dashscope", model_colored("icons/qwen.svg")),
+];
+
+fn model_keyword_matches(model: &str, keyword: &str) -> bool {
+    model.starts_with(keyword)
+        && model.as_bytes().get(keyword.len()).is_none_or(|character| {
+            matches!(
+                character,
+                b'-' | b'_' | b'.' | b'/' | b':' | b' ' | b'\t' | b'\n' | b'\r'
+            )
+        })
+}
+
+fn model_brand_prefix(model: &str) -> Option<ModelBrandAsset> {
+    MOBILE_MODEL_BRAND_PREFIXES
+        .iter()
+        .filter(|(prefix, _)| model_keyword_matches(model, prefix))
+        .max_by_key(|(prefix, _)| prefix.len())
+        .map(|(_, asset)| *asset)
+}
+
+/// Desktop-parity model brand lookup: prefix exceptions, provider slugs,
+/// longest keyword rules, built-in Agent compatibility aliases, then the
+/// legacy gpt/o* and opus/sonnet/haiku fallbacks.
+fn model_brand_asset(model_id: &str) -> Option<ModelBrandAsset> {
+    let normalized = model_id.trim().to_ascii_lowercase();
+    let normalized = normalized.strip_prefix('~').unwrap_or(&normalized);
+    if normalized.is_empty() {
+        return None;
+    }
+
+    if let Some(asset) = model_brand_prefix(normalized) {
+        return Some(asset);
+    }
+
+    let (provider, model_name) = normalized
+        .split_once('/')
+        .map_or((normalized, normalized), |(provider, model_name)| {
+            (provider, model_name)
+        });
+    if let Some((_, asset)) = MOBILE_MODEL_PROVIDER_BRANDS
+        .iter()
+        .find(|(candidate, _)| *candidate == provider)
+    {
+        return Some(*asset);
+    }
+
+    if let Some(asset) = model_brand_prefix(model_name) {
+        return Some(asset);
+    }
+
+    if let Some((_, asset)) = MOBILE_MODEL_BRAND_RULES
+        .iter()
+        .filter(|(keyword, _)| model_keyword_matches(model_name, keyword))
+        .max_by_key(|(keyword, _)| keyword.len())
+    {
+        return Some(*asset);
+    }
+
+    if let Some((_, asset)) = MOBILE_MODEL_COMPATIBILITY_BRANDS
+        .iter()
+        .find(|(keyword, _)| model_keyword_matches(model_name, keyword))
+    {
+        return Some(*asset);
+    }
+
+    if ["gpt", "o1", "o3", "o4", "o5"]
+        .iter()
+        .any(|keyword| model_keyword_matches(model_name, keyword))
+    {
+        agent_brand_identity_asset("openai")
+    } else if ["opus", "sonnet", "haiku"]
+        .iter()
+        .any(|keyword| model_keyword_matches(model_name, keyword))
+    {
+        agent_brand_identity_asset("claude")
+    } else {
+        None
+    }
+}
+
 fn agent_brand_asset(agent_id: &str, label: &str) -> Option<(&'static str, bool)> {
-    let identity = format!("{agent_id} {label}").to_ascii_lowercase();
+    agent_brand_identity_asset(&format!("{agent_id} {label}"))
+}
+
+fn agent_brand_identity_asset(identity: &str) -> Option<(&'static str, bool)> {
+    let identity = identity.to_ascii_lowercase();
     MOBILE_AGENT_BRAND_ASSETS
         .iter()
         .find(|(needle, _, _)| identity.contains(needle))
-        .map(|(_, path, uses_current_color)| (*path, *uses_current_color))
-}
-
-fn model_brand_asset(model_id: &str) -> Option<(&'static str, bool)> {
-    let normalized = model_id.trim().to_ascii_lowercase();
-    let model_name = normalized.rsplit('/').next().unwrap_or(&normalized);
-    MOBILE_MODEL_BRAND_ASSETS
-        .iter()
-        .find(|(needle, _, _)| {
-            model_name.starts_with(needle)
-                && model_name
-                    .as_bytes()
-                    .get(needle.len())
-                    .is_none_or(|next| matches!(next, b'-' | b'_' | b'.' | b':' | b' ' | b'/'))
-        })
         .map(|(_, path, uses_current_color)| (*path, *uses_current_color))
 }
 
@@ -15452,11 +16156,11 @@ mod tests {
             agent_brand_asset("deepseek-harness", "DeepSeek"),
             Some(("icons/agents/deepseek-harness.svg", false))
         );
-        assert_eq!(
-            agent_brand_asset("totally-unknown", "Mystery"),
-            None
-        );
+        assert_eq!(agent_brand_asset("totally-unknown", "Mystery"), None);
 
+        // Model lookup mirrors the desktop cascade: provider slug exact match,
+        // prefix exceptions, longest keyword rules, compatibility aliases,
+        // then the legacy opus/sonnet/haiku fallback.
         assert_eq!(
             model_brand_asset("anthropic/claude-opus-4"),
             Some(("icons/claude.svg", false))
@@ -15465,7 +16169,51 @@ mod tests {
             model_brand_asset("openai/gpt-5"),
             Some(("icons/openai.svg", true))
         );
+        assert_eq!(
+            model_brand_asset("meta-llama/llama-4"),
+            Some(("icons/model-providers/meta-llama.svg", false))
+        );
+        assert_eq!(
+            model_brand_asset("qwen/qwen3.5-coder"),
+            Some(("icons/qwen.svg", false))
+        );
+        assert_eq!(
+            model_brand_asset("mistralai/codestral"),
+            Some(("icons/agents/mistral-vibe.svg", false))
+        );
+        assert_eq!(
+            model_brand_asset("deepseek/deepseek-chat"),
+            Some(("icons/agents/deepseek-harness.svg", false))
+        );
+        assert_eq!(
+            model_brand_asset("sonnet"),
+            Some(("icons/claude.svg", false))
+        );
         assert_eq!(model_brand_asset("mystery/model-x"), None);
+    }
+
+    /// Every brand path referenced by the model/Agent lookup tables must be
+    /// bundled by the asset source, or a matching row renders nothing.
+    #[test]
+    fn runtime_brand_tables_only_reference_bundled_assets() {
+        let bundled: BTreeSet<&str> = crate::assets::mobile_bundled_brand_paths().collect();
+        let mut referenced = BTreeSet::new();
+        for (_, (path, _)) in MOBILE_MODEL_PROVIDER_BRANDS
+            .iter()
+            .chain(MOBILE_MODEL_BRAND_PREFIXES.iter())
+            .chain(MOBILE_MODEL_BRAND_RULES.iter())
+            .chain(MOBILE_MODEL_COMPATIBILITY_BRANDS.iter())
+        {
+            referenced.insert(*path);
+        }
+        for (_, path, _) in MOBILE_AGENT_BRAND_ASSETS.iter() {
+            referenced.insert(*path);
+        }
+        let missing: Vec<_> = referenced.difference(&bundled).collect();
+        assert!(
+            missing.is_empty(),
+            "brand assets referenced by lookup tables but not bundled: {missing:?}"
+        );
     }
 
     #[test]

@@ -154,6 +154,314 @@ pub fn load_fonts(cx: &mut App) -> Result<()> {
     ])
 }
 
+// Brand marks bundled from the desktop asset pack under the same `icons/vibex/`
+// paths the desktop asset source serves, so model and Agent brand lookups
+// resolve identically on the phone.
+const VIBEX_BRAND_ASSETS: &[(&str, &[u8])] = &[
+    (
+        "icons/claude.svg",
+        include_bytes!("../../desktop/assets/icons/claude.svg"),
+    ),
+    (
+        "icons/copilot.svg",
+        include_bytes!("../../desktop/assets/icons/copilot.svg"),
+    ),
+    (
+        "icons/gemini.svg",
+        include_bytes!("../../desktop/assets/icons/gemini.svg"),
+    ),
+    (
+        "icons/openai.svg",
+        include_bytes!("../../desktop/assets/icons/openai.svg"),
+    ),
+    (
+        "icons/opencode.svg",
+        include_bytes!("../../desktop/assets/icons/opencode.svg"),
+    ),
+    (
+        "icons/qwen.svg",
+        include_bytes!("../../desktop/assets/icons/qwen.svg"),
+    ),
+    (
+        "icons/agents/deepseek-harness.svg",
+        include_bytes!("../../desktop/assets/icons/agents/deepseek-harness.svg"),
+    ),
+    (
+        "icons/agents/glm-acp-agent.svg",
+        include_bytes!("../../desktop/assets/icons/agents/glm-acp-agent.svg"),
+    ),
+    (
+        "icons/agents/grok.svg",
+        include_bytes!("../../desktop/assets/icons/agents/grok.svg"),
+    ),
+    (
+        "icons/agents/hermes.svg",
+        include_bytes!("../../desktop/assets/icons/agents/hermes.svg"),
+    ),
+    (
+        "icons/agents/kimi.svg",
+        include_bytes!("../../desktop/assets/icons/agents/kimi.svg"),
+    ),
+    (
+        "icons/agents/mistral-vibe.svg",
+        include_bytes!("../../desktop/assets/icons/agents/mistral-vibe.svg"),
+    ),
+    (
+        "icons/agents/poolside.svg",
+        include_bytes!("../../desktop/assets/icons/agents/poolside.svg"),
+    ),
+];
+
+const VIBEX_MODEL_PROVIDER_ASSETS: &[(&str, &[u8])] = &[
+    (
+        "icons/model-providers/aion-labs.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/aion-labs.svg"),
+    ),
+    (
+        "icons/model-providers/alibaba.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/alibaba.svg"),
+    ),
+    (
+        "icons/model-providers/amazon.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/amazon.svg"),
+    ),
+    (
+        "icons/model-providers/anthracite-org.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/anthracite-org.svg"),
+    ),
+    (
+        "icons/model-providers/arcee-ai.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/arcee-ai.svg"),
+    ),
+    (
+        "icons/model-providers/baai.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/baai.svg"),
+    ),
+    (
+        "icons/model-providers/baidu.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/baidu.svg"),
+    ),
+    (
+        "icons/model-providers/black-forest-labs.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/black-forest-labs.svg"),
+    ),
+    (
+        "icons/model-providers/bytedance-seed.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/bytedance-seed.svg"),
+    ),
+    (
+        "icons/model-providers/bytedance.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/bytedance.svg"),
+    ),
+    (
+        "icons/model-providers/canopylabs.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/canopylabs.svg"),
+    ),
+    (
+        "icons/model-providers/cognitivecomputations.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/cognitivecomputations.svg"),
+    ),
+    (
+        "icons/model-providers/cohere.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/cohere.svg"),
+    ),
+    (
+        "icons/model-providers/deepgram.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/deepgram.svg"),
+    ),
+    (
+        "icons/model-providers/dots-studio.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/dots-studio.svg"),
+    ),
+    (
+        "icons/model-providers/fish-audio.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/fish-audio.svg"),
+    ),
+    (
+        "icons/model-providers/gryphe.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/gryphe.svg"),
+    ),
+    (
+        "icons/model-providers/hexgrad.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/hexgrad.svg"),
+    ),
+    (
+        "icons/model-providers/heygen.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/heygen.svg"),
+    ),
+    (
+        "icons/model-providers/ibm-granite.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/ibm-granite.svg"),
+    ),
+    (
+        "icons/model-providers/inception.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/inception.svg"),
+    ),
+    (
+        "icons/model-providers/inclusionai.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/inclusionai.svg"),
+    ),
+    (
+        "icons/model-providers/intfloat.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/intfloat.svg"),
+    ),
+    (
+        "icons/model-providers/krea.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/krea.svg"),
+    ),
+    (
+        "icons/model-providers/kwaipilot.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/kwaipilot.svg"),
+    ),
+    (
+        "icons/model-providers/kwaivgi.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/kwaivgi.svg"),
+    ),
+    (
+        "icons/model-providers/liquid.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/liquid.svg"),
+    ),
+    (
+        "icons/model-providers/mai.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/mai.svg"),
+    ),
+    (
+        "icons/model-providers/mancer.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/mancer.svg"),
+    ),
+    (
+        "icons/model-providers/meituan.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/meituan.svg"),
+    ),
+    (
+        "icons/model-providers/meta-llama.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/meta-llama.svg"),
+    ),
+    (
+        "icons/model-providers/meta.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/meta.svg"),
+    ),
+    (
+        "icons/model-providers/microsoft.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/microsoft.svg"),
+    ),
+    (
+        "icons/model-providers/minimax.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/minimax.svg"),
+    ),
+    (
+        "icons/model-providers/morph.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/morph.svg"),
+    ),
+    (
+        "icons/model-providers/nex-agi.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/nex-agi.svg"),
+    ),
+    (
+        "icons/model-providers/nvidia.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/nvidia.svg"),
+    ),
+    (
+        "icons/model-providers/openrouter.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/openrouter.svg"),
+    ),
+    (
+        "icons/model-providers/perceptron.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/perceptron.svg"),
+    ),
+    (
+        "icons/model-providers/perplexity.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/perplexity.svg"),
+    ),
+    (
+        "icons/model-providers/recraft.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/recraft.svg"),
+    ),
+    (
+        "icons/model-providers/rekaai.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/rekaai.svg"),
+    ),
+    (
+        "icons/model-providers/relace.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/relace.svg"),
+    ),
+    (
+        "icons/model-providers/runway.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/runway.svg"),
+    ),
+    (
+        "icons/model-providers/sakana.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/sakana.svg"),
+    ),
+    (
+        "icons/model-providers/sao10k.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/sao10k.svg"),
+    ),
+    (
+        "icons/model-providers/sentence-transformers.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/sentence-transformers.svg"),
+    ),
+    (
+        "icons/model-providers/sesame.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/sesame.svg"),
+    ),
+    (
+        "icons/model-providers/sourceful.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/sourceful.svg"),
+    ),
+    (
+        "icons/model-providers/stepfun.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/stepfun.svg"),
+    ),
+    (
+        "icons/model-providers/tencent.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/tencent.svg"),
+    ),
+    (
+        "icons/model-providers/thedrummer.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/thedrummer.svg"),
+    ),
+    (
+        "icons/model-providers/thenlper.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/thenlper.svg"),
+    ),
+    (
+        "icons/model-providers/thinkingmachines.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/thinkingmachines.svg"),
+    ),
+    (
+        "icons/model-providers/undi95.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/undi95.svg"),
+    ),
+    (
+        "icons/model-providers/upstage.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/upstage.svg"),
+    ),
+    (
+        "icons/model-providers/voyageai.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/voyageai.svg"),
+    ),
+    (
+        "icons/model-providers/writer.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/writer.svg"),
+    ),
+    (
+        "icons/model-providers/xiaomi.svg",
+        include_bytes!("../../desktop/assets/icons/model-providers/xiaomi.svg"),
+    ),
+];
+
+/// Every asset path the source serves, so the app can assert its brand
+/// lookup tables never reference an unloaded path.
+pub fn mobile_bundled_brand_paths() -> impl Iterator<Item = &'static str> {
+    ICONS.iter().copied().chain(
+        VIBEX_BRAND_ASSETS
+            .iter()
+            .chain(VIBEX_MODEL_PROVIDER_ASSETS.iter())
+            .map(|(asset, _)| *asset),
+    )
+}
+
 impl AssetSource for MobileAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         let bytes: Option<&'static [u8]> = match path {
@@ -410,14 +718,28 @@ impl AssetSource for MobileAssets {
             )),
             _ => None,
         };
+        let bytes = bytes.or_else(|| {
+            VIBEX_BRAND_ASSETS
+                .iter()
+                .chain(VIBEX_MODEL_PROVIDER_ASSETS.iter())
+                .find(|(asset, _)| *asset == path)
+                .map(|(_, bytes)| *bytes)
+        });
         Ok(bytes.map(Cow::Borrowed))
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         Ok(ICONS
             .iter()
+            .copied()
+            .chain(
+                VIBEX_BRAND_ASSETS
+                    .iter()
+                    .chain(VIBEX_MODEL_PROVIDER_ASSETS.iter())
+                    .map(|(asset, _)| *asset),
+            )
             .filter(|item| item.starts_with(path))
-            .map(|item| SharedString::from(*item))
+            .map(SharedString::from)
             .collect())
     }
 }
