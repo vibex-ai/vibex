@@ -14,6 +14,16 @@ use crate::motion::hover_blend;
 /// Hover/drag step above the resting `border` hairline (dark: white 10% → 17%).
 const HIGHLIGHT_STEP: f32 = 1.7;
 
+/// The seam-line color for `border` at hover/drag strength. Computed directly
+/// on the alpha channel — `Hsla::opacity` clamps the factor below 1, so a
+/// 1.7× step through it would silently return the resting color.
+fn highlight(border: Hsla) -> Hsla {
+    Hsla {
+        a: (border.a * HIGHLIGHT_STEP).min(1.0),
+        ..border
+    }
+}
+
 /// Stable hover-fade key for one seam's highlight line. Pair the key with
 /// [`crate::motion::hover_listener`] on the seam's hitbox so the fade runs.
 pub fn seam_hover_key(id: &'static str) -> String {
@@ -34,7 +44,7 @@ pub fn seam_line(
     pinned: bool,
     horizontal: bool,
 ) -> Div {
-    let highlight = border.opacity(HIGHLIGHT_STEP);
+    let highlight = highlight(border);
     let overlay = if pinned {
         highlight
     } else {
@@ -71,10 +81,10 @@ mod tests {
     #[test]
     fn highlight_steps_alpha_without_shifting_hue() {
         let border = hsla(0.6, 0.2, 0.5, 0.1);
-        let highlight = highlight(border);
-        assert!((highlight.a - border.a * HIGHLIGHT_STEP).abs() < 1e-6);
+        let stepped = super::highlight(border);
+        assert!((stepped.a - border.a * HIGHLIGHT_STEP).abs() < 1e-6);
         assert_eq!(
-            (highlight.h, highlight.s, highlight.l),
+            (stepped.h, stepped.s, stepped.l),
             (border.h, border.s, border.l)
         );
     }

@@ -39494,7 +39494,6 @@ impl VibexWorkbench {
             .flex()
             .h_full()
             .flex_none()
-            .justify_end()
             .overflow_hidden()
             .when_some(panel, |this, panel| this.child(panel));
 
@@ -39507,13 +39506,14 @@ impl VibexWorkbench {
                 .opacity(animation_state.target_opacity)
                 .into_any_element()
         } else {
+            // Collapse/expand is a pure width clip: the panel keeps its target
+            // width (pinned to the window edge) and the seam sweeps across it.
             Transition::new(SIDEBAR_INLINE_TRANSITION_DURATION)
-                .ease(motion::EASE_OUT_EXPO.easing())
+                .ease(motion::EASE_OUT.easing())
                 .width(
                     px(animation_state.from_value),
                     px(animation_state.target_value),
                 )
-                .fade(animation_state.from_opacity, animation_state.target_opacity)
                 .apply(
                     wrapper,
                     sidebar_animation_id("sidebar-inline-animation", animation_state),
@@ -39971,6 +39971,98 @@ impl VibexWorkbench {
         Some(motion::overlay_in("session-search-overlay-enter", search_overlay).into_any_element())
     }
 
+    /// Toggle animation state for a docked right panel: the same width-clip
+    /// tween the sidebar uses. Width changes that are not open/close flips —
+    /// seam drags, viewport resizes — apply directly instead of tweening.
+    fn update_docked_panel_animation(
+        &mut self,
+        scope: &'static str,
+        open: bool,
+        width: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> SidebarAnimationState {
+        let animation_state = window.use_keyed_state(
+            ElementId::Name(format!("{scope}-dock-animation").into()),
+            cx,
+            |_, _| SidebarAnimationState::new(width, 0.0, open),
+        );
+        let toggling = animation_state.read(cx).render_child != open;
+        let animate = !self.ui_state.appearance.reduced_motion && toggling;
+        let hide_request = if animation_state
+            .read(cx)
+            .needs_update(width, 0.0, open, animate)
+        {
+            animation_state.update(cx, |state, _| {
+                state.update_target(width, 0.0, open, animate)
+            })
+        } else {
+            None
+        };
+        if let Some(hide_request) = hide_request {
+            cx.spawn({
+                let animation_state = animation_state.clone();
+                async move |_, cx| {
+                    cx.background_executor()
+                        .timer(SIDEBAR_INLINE_TRANSITION_DURATION)
+                        .await;
+                    animation_state.update(cx, |state, cx| {
+                        if state.finish_hide(hide_request) {
+                            cx.notify();
+                        }
+                    });
+                }
+            })
+            .detach();
+        }
+        *animation_state.read(cx)
+    }
+
+    /// Animated container for a docked right panel: the outer width tweens and
+    /// clips while the inner content keeps the larger endpoint's width,
+    /// right-anchored, so it never reflows mid-transition (the sidebar's clip
+    /// idiom mirrored for the right edge).
+    fn render_docked_side_panel(
+        scope: &'static str,
+        animation_state: SidebarAnimationState,
+        panel: Option<AnyElement>,
+    ) -> AnyElement {
+        let content_width = animation_state.from_value.max(animation_state.target_value);
+        let container = div()
+            .id(SharedString::from(format!("{scope}-panel-dock")))
+            .relative()
+            .h_full()
+            .flex_none()
+            .overflow_hidden()
+            .when_some(panel, |this, panel| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .h_full()
+                        .w(px(content_width))
+                        .child(panel),
+                )
+            });
+        if animation_state.from_value == animation_state.target_value
+            && animation_state.from_opacity == animation_state.target_opacity
+        {
+            container
+                .w(px(animation_state.target_value))
+                .into_any_element()
+        } else {
+            Transition::new(SIDEBAR_INLINE_TRANSITION_DURATION)
+                .ease(motion::EASE_OUT.easing())
+                .width(
+                    px(animation_state.from_value),
+                    px(animation_state.target_value),
+                )
+                .apply(container, sidebar_animation_id(scope, animation_state))
+                .into_any_element()
+        }
+    }
+
     fn render_shell(
         &mut self,
         visibility: WorkbenchVisibility,
@@ -40052,30 +40144,47 @@ impl VibexWorkbench {
                     self.render_agent_workbench(window, cx)
                 }),
         );
-        if preview_docked {
+        let preview_animation = self.update_docked_panel_animation(
+            "preview",
+            preview_docked,
+            preview_width,
+            window,
+            cx,
+        );
+        let preview_panel = preview_animation.render_child.then(|| {
             let resize_handle = self.render_right_panel_resize_handle(
                 RightPanelKind::Preview,
                 visibility,
                 preview_width,
                 cx,
             );
-            shell = shell.child(
-                div()
-                    .relative()
-                    .w(px(preview_width))
-                    .h_full()
-                    .flex_none()
-                    .border_l_1()
-                    .border_color(cx.theme().border)
-                    .child(
-                        self.code_workbench
-                            .clone()
-                            .cached(StyleRefinement::default().size_full()),
-                    )
-                    .child(resize_handle),
-            );
-        }
-        if right_rail_docked {
+            div()
+                .relative()
+                .w_full()
+                .h_full()
+                .border_l_1()
+                .border_color(cx.theme().border)
+                .child(
+                    self.code_workbench
+                        .clone()
+                        .cached(StyleRefinement::default().size_full()),
+                )
+                .child(resize_handle)
+                .into_any_element()
+        });
+        shell = shell.child(Self::render_docked_side_panel(
+            "preview",
+            preview_animation,
+            preview_panel,
+        ));
+        let right_rail_animation = self.update_docked_panel_animation(
+            "right-rail",
+            right_rail_docked,
+            right_rail_content_width,
+            window,
+            cx,
+        );
+        let right_rail_panel = right_rail_animation.render_child.then(|| {
             let resize_handle = self.render_right_panel_resize_handle(
                 RightPanelKind::RightRail,
                 visibility,
@@ -40083,18 +40192,21 @@ impl VibexWorkbench {
                 cx,
             );
             let panel = self.render_right_rail_panel(window, cx);
-            shell = shell.child(
-                div()
-                    .relative()
-                    .w(px(right_rail_content_width))
-                    .h_full()
-                    .flex_none()
-                    .border_l_1()
-                    .border_color(cx.theme().border)
-                    .child(panel)
-                    .child(resize_handle),
-            );
-        }
+            div()
+                .relative()
+                .w_full()
+                .h_full()
+                .border_l_1()
+                .border_color(cx.theme().border)
+                .child(panel)
+                .child(resize_handle)
+                .into_any_element()
+        });
+        shell = shell.child(Self::render_docked_side_panel(
+            "right-rail",
+            right_rail_animation,
+            right_rail_panel,
+        ));
         if agent_open && !new_session_open && !preview_fullscreen {
             shell = shell.child(self.render_right_rail_activity_bar(cx));
         }
