@@ -278,20 +278,21 @@ pub const DRAWER_ACTION_HEIGHT: f32 = 40.0;
 pub const DRAWER_SECTION_HEIGHT: f32 = 40.0;
 /// Horizontal travel before a page pan may be recognized as a drawer swipe.
 /// Deliberately above the platform touch slop so ordinary taps and slow
-/// vertical scrolls on the session screen never open a side page.
-pub const DRAWER_DRAG_THRESHOLD: f32 = 18.0;
+/// vertical scrolls on the session screen never open a side page, while a
+/// normal swipe still arms after roughly a centimeter of travel.
+pub const DRAWER_DRAG_THRESHOLD: f32 = 12.0;
 /// A pan whose vertical travel reaches this fraction of its horizontal travel
 /// belongs to list scrolling, not to a drawer swipe.
-pub const DRAWER_VERTICAL_CANCEL_RATIO: f32 = 1.35;
+pub const DRAWER_VERTICAL_CANCEL_RATIO: f32 = 1.6;
 /// Fraction of the viewport a page must travel before settling on the next page.
-pub const DRAWER_SNAP_TRAVEL_RATIO: f32 = 0.18;
+pub const DRAWER_SNAP_TRAVEL_RATIO: f32 = 0.15;
 /// Release-adjacent movement in the intended direction commits the transition.
 pub const DRAWER_SNAP_COMMIT_DIRECTION_THRESHOLD: f32 = 2.0;
 /// Reversing a transition requires a much clearer release-adjacent movement.
 pub const DRAWER_SNAP_REVERSE_DIRECTION_THRESHOLD: f32 = 28.0;
 /// A swipe only commits when its release velocity points at the target with at
 /// least this magnitude (logical px/s), so slow drags rely on travel instead.
-pub const DRAWER_SWIPE_VELOCITY: f32 = 700.0;
+pub const DRAWER_SWIPE_VELOCITY: f32 = 600.0;
 /// Ratio between horizontal and vertical release velocity for a fling to count
 /// as a horizontal swipe.
 pub const DRAWER_SWIPE_STRAIGHTNESS: f32 = 1.5;

@@ -919,6 +919,13 @@ impl MobileApp {
         app.start_notification_action_stream(cx);
         app.start_lan_discovery_event_stream(cx);
         app.start_lifecycle_stream(cx);
+        // The battery-optimization dialog only pauses the activity, which does
+        // not emit a Background phase on Android; track window activation so
+        // returning from it re-reads the allowlist state.
+        cx.observe_window_activation(window, move |this, _, cx| {
+            this.refresh_battery_allowlist(cx);
+        })
+        .attach(Self::WEAK_RELEASE???);
         // Keep the window root on the dispatch path from the very first frame
         // so system back events reach `handle_navigate_back` before any text
         // input has taken focus.
@@ -15636,10 +15643,16 @@ mod tests {
 
     #[test]
     fn drawer_pan_yields_to_vertical_scrolling_and_wrong_direction_swipes() {
-        // A pan with any meaningful vertical bias belongs to list scrolling.
+        // A pan whose vertical travel clearly outgrows its horizontal travel
+        // belongs to list scrolling.
+        assert_eq!(
+            drawer_pan_decision(DrawerDragOrigin::Main, 24.0, 40.0),
+            DrawerPanDecision::Cancel
+        );
+        // Moderate diagonal drift is tolerated as a drawer swipe.
         assert_eq!(
             drawer_pan_decision(DrawerDragOrigin::Main, 24.0, 36.0),
-            DrawerPanDecision::Cancel
+            DrawerPanDecision::Drag(DrawerPage::Sessions)
         );
         // Sub-threshold horizontal travel with vertical drift is a scroll, too.
         assert_eq!(
@@ -15831,7 +15844,7 @@ mod tests {
         assert_eq!(
             drawer_snap_target(
                 DrawerPage::Sessions,
-                0.19,
+                0.16,
                 0.0,
                 DrawerVelocity::default(),
                 0.0
@@ -15841,7 +15854,7 @@ mod tests {
         assert_eq!(
             drawer_snap_target(
                 DrawerPage::Sessions,
-                0.17,
+                0.14,
                 0.0,
                 DrawerVelocity::default(),
                 0.0
@@ -15851,7 +15864,7 @@ mod tests {
         assert_eq!(
             drawer_snap_target(
                 DrawerPage::Sessions,
-                0.81,
+                0.84,
                 0.0,
                 DrawerVelocity::default(),
                 1.0
@@ -15861,7 +15874,7 @@ mod tests {
         assert_eq!(
             drawer_snap_target(
                 DrawerPage::Sessions,
-                0.83,
+                0.86,
                 0.0,
                 DrawerVelocity::default(),
                 1.0
@@ -15871,7 +15884,7 @@ mod tests {
         assert_eq!(
             drawer_snap_target(
                 DrawerPage::Workbench,
-                -0.19,
+                -0.16,
                 0.0,
                 DrawerVelocity::default(),
                 0.0
@@ -15881,7 +15894,7 @@ mod tests {
         assert_eq!(
             drawer_snap_target(
                 DrawerPage::Workbench,
-                -0.17,
+                -0.14,
                 0.0,
                 DrawerVelocity::default(),
                 0.0
@@ -15891,7 +15904,7 @@ mod tests {
         assert_eq!(
             drawer_snap_target(
                 DrawerPage::Workbench,
-                -0.81,
+                -0.84,
                 0.0,
                 DrawerVelocity::default(),
                 -1.0
@@ -15901,7 +15914,7 @@ mod tests {
         assert_eq!(
             drawer_snap_target(
                 DrawerPage::Workbench,
-                -0.83,
+                -0.86,
                 0.0,
                 DrawerVelocity::default(),
                 -1.0
