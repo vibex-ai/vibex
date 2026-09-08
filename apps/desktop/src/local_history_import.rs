@@ -342,61 +342,13 @@ impl LocalHistoryImportDialog {
         &self,
         cx: &App,
     ) -> Vec<(LocalHistoryScanFolder, Vec<LocalHistoryScanSession>)> {
-        let query = self.search_input.read(cx).value().trim().to_lowercase();
-        let mut folders = Vec::new();
-        let Some(scan) = self.scan.as_ref() else {
-            return folders;
-        };
-        for folder in &scan.folders {
-            if !folder_matches_focus(folder, self.focus_workspace.as_deref()) {
-                continue;
-            }
-            let mut sessions = folder
-                .sessions
-                .iter()
-                .filter(|session| session.status == LocalHistoryImportStatus::New)
-                .filter(|session| {
-                    self.source_filter
-                        .as_ref()
-                        .is_none_or(|filter| filter.contains(&session.summary.key.source))
-                })
-                .filter(|session| {
-                    query.is_empty()
-                        || folder.workspace_root.to_lowercase().contains(&query)
-                        || session.summary.title.to_lowercase().contains(&query)
-                        || session
-                            .summary
-                            .key
-                            .external_id
-                            .to_lowercase()
-                            .contains(&query)
-                        || session
-                            .summary
-                            .key
-                            .source
-                            .label()
-                            .to_lowercase()
-                            .contains(&query)
-                        || session
-                            .summary
-                            .model
-                            .as_deref()
-                            .is_some_and(|model| model.to_lowercase().contains(&query))
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            sessions.sort_by(|left, right| {
-                right
-                    .summary
-                    .updated_at_ms
-                    .or(right.summary.started_at_ms)
-                    .cmp(&left.summary.updated_at_ms.or(left.summary.started_at_ms))
-            });
-            if !sessions.is_empty() {
-                folders.push((folder.clone(), sessions));
-            }
-        }
-        folders
+        let query = self.search_input.read(cx).value().trim().to_string();
+        visible_import_folders(
+            self.scan.as_ref(),
+            self.focus_workspace.as_deref(),
+            &query,
+            self.source_filter.as_ref(),
+        )
     }
 
     fn folder_selection(&self, sessions: &[LocalHistoryScanSession]) -> FolderSelection {
@@ -1514,6 +1466,80 @@ fn folder_matches_focus(folder: &LocalHistoryScanFolder, focus_workspace: Option
     focus_workspace.is_none_or(|target| paths_equal(&folder.workspace_root, target))
 }
 
+/// Filtered folder list for the picker body. `query` must be trimmed; it is
+/// lowercased here so matching is case-insensitive. Folders are ordered by
+/// their visible session count, most sessions first, so the busiest projects
+/// lead the list; equal-sized projects fall back to workspace-path order.
+fn visible_import_folders(
+    scan: Option<&LocalHistoryScanResult>,
+    focus_workspace: Option<&str>,
+    query: &str,
+    source_filter: Option<&HashSet<LocalHistorySource>>,
+) -> Vec<(LocalHistoryScanFolder, Vec<LocalHistoryScanSession>)> {
+    let query = query.to_lowercase();
+    let mut folders = Vec::new();
+    let Some(scan) = scan else {
+        return folders;
+    };
+    for folder in &scan.folders {
+        if !folder_matches_focus(folder, focus_workspace) {
+            continue;
+        }
+        let mut sessions = folder
+            .sessions
+            .iter()
+            .filter(|session| session.status == LocalHistoryImportStatus::New)
+            .filter(|session| {
+                source_filter.is_none_or(|filter| filter.contains(&session.summary.key.source))
+            })
+            .filter(|session| {
+                query.is_empty()
+                    || folder.workspace_root.to_lowercase().contains(&query)
+                    || session.summary.title.to_lowercase().contains(&query)
+                    || session
+                        .summary
+                        .key
+                        .external_id
+                        .to_lowercase()
+                        .contains(&query)
+                    || session
+                        .summary
+                        .key
+                        .source
+                        .label()
+                        .to_lowercase()
+                        .contains(&query)
+                    || session
+                        .summary
+                        .model
+                        .as_deref()
+                        .is_some_and(|model| model.to_lowercase().contains(&query))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        sessions.sort_by(|left, right| {
+            right
+                .summary
+                .updated_at_ms
+                .or(right.summary.started_at_ms)
+                .cmp(&left.summary.updated_at_ms.or(left.summary.started_at_ms))
+        });
+        if !sessions.is_empty() {
+            folders.push((folder.clone(), sessions));
+        }
+    }
+    // Busiest projects first; equal-sized projects fall back to the
+    // workspace path so the list order never depends on scan internals.
+    folders.sort_by(|left, right| {
+        right
+            .1
+            .len()
+            .cmp(&left.1.len())
+            .then_with(|| left.0.workspace_root.cmp(&right.0.workspace_root))
+    });
+    folders
+}
+
 /// Centered state icon inside a soft rounded tile, used by the error, done,
 /// and empty states.
 fn scan_state_icon(icon: IconName, color: gpui::Hsla, cx: &App) -> AnyElement {
@@ -1677,6 +1703,88 @@ fn relative_time(timestamp_ms: Option<i64>, locale: ResolvedLocale) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vibex_core::{LocalHistoryKey, LocalHistorySessionSummary};
+
+    fn scan_session(source: LocalHistorySource, external_id: &str) -> LocalHistoryScanSession {
+        LocalHistoryScanSession {
+            summary: LocalHistorySessionSummary {
+                key: LocalHistoryKey {
+                    source,
+                    external_id: external_id.to_string(),
+                },
+                agent_id: source.agent_id(),
+                title: external_id.to_string(),
+                workspace_root: None,
+                source_path: String::new(),
+                started_at_ms: None,
+                updated_at_ms: None,
+                message_count: 1,
+                model: None,
+            },
+            status: LocalHistoryImportStatus::New,
+        }
+    }
+
+    fn scan_folder(root: &str, session_count: usize) -> LocalHistoryScanFolder {
+        LocalHistoryScanFolder {
+            workspace_root: root.to_string(),
+            sources: vec![LocalHistorySource::Codex],
+            sessions: (0..session_count)
+                .map(|index| scan_session(LocalHistorySource::Codex, &format!("{root}-{index}")))
+                .collect(),
+        }
+    }
+
+    fn folder_roots(
+        folders: &[(LocalHistoryScanFolder, Vec<LocalHistoryScanSession>)],
+    ) -> Vec<&str> {
+        folders
+            .iter()
+            .map(|(folder, _)| folder.workspace_root.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn visible_folders_orders_projects_by_session_count_descending() {
+        let scan = LocalHistoryScanResult {
+            folders: vec![
+                scan_folder("/workspace/alpha", 1),
+                scan_folder("/workspace/beta", 3),
+                scan_folder("/workspace/gamma", 2),
+            ],
+            total_sessions: 6,
+            importable_count: 6,
+            unassigned_count: 0,
+            diagnostics: Vec::new(),
+        };
+
+        let folders = visible_import_folders(Some(&scan), None, "", None);
+        assert_eq!(
+            folder_roots(&folders),
+            ["/workspace/beta", "/workspace/gamma", "/workspace/alpha"]
+        );
+    }
+
+    #[test]
+    fn visible_folders_breaks_session_count_ties_in_workspace_path_order() {
+        let scan = LocalHistoryScanResult {
+            folders: vec![
+                scan_folder("/workspace/later", 2),
+                scan_folder("/workspace/earlier", 2),
+                scan_folder("/workspace/most", 4),
+            ],
+            total_sessions: 8,
+            importable_count: 8,
+            unassigned_count: 0,
+            diagnostics: Vec::new(),
+        };
+
+        let folders = visible_import_folders(Some(&scan), None, "", None);
+        assert_eq!(
+            folder_roots(&folders),
+            ["/workspace/most", "/workspace/earlier", "/workspace/later"]
+        );
+    }
 
     #[test]
     fn present_sources_follows_the_stable_registry_order() {
