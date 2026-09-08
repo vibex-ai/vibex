@@ -10,7 +10,7 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::header::{
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN, HOST,
-    ORIGIN, SEC_WEBSOCKET_PROTOCOL, VARY,
+    ORIGIN, RETRY_AFTER, SEC_WEBSOCKET_PROTOCOL, VARY,
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
@@ -84,11 +84,44 @@ const FILE_TRANSFER_CHUNK_BYTES: usize = 64 * 1024;
 const LAN_PAIRING_MAX_CONCURRENT_REQUESTS: usize = 16;
 const LAN_PAIRING_MAX_BODY_BYTES: usize = 8 * 1024;
 const ZERO_CONFIG_PAIRING_MAX_SESSIONS: usize = 16;
+const DEFAULT_PEER_UNAUTHENTICATED_REQUESTS_PER_WINDOW: u32 = 120;
+const DEFAULT_PEER_AUTH_FAILURES_PER_WINDOW: u32 = 10;
+const DEFAULT_PEER_LIMIT_WINDOW_MS: u64 = 60_000;
+const DEFAULT_PEER_LIMIT_TRACKED_PEERS: usize = 4_096;
+const MAX_PEER_LIMIT_WINDOW_MS: u64 = 60 * 60 * 1000;
+const PEER_LIMITED_PATHS: [&str; 6] = [
+    "/api/v2/info",
+    "/api/v2/pairing/claim",
+    "/api/v2/ws-ticket",
+    "/api/v2/pairing/lan",
+    "/api/v2/pairing/lan/request",
+    "/api/v2/pairing/lan/status",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteGatewayDeploymentMode {
+    /// Loopback-only listener. This is the desktop default and the base for
+    /// Tailscale Serve or a user-managed reverse proxy on the same host.
     Loopback,
+    /// LAN listener behind a trusted HTTPS proxy or the pinned-certificate
+    /// local network Gateway.
     Lan,
+    /// Publicly reachable listener owned by a headless runtime such as
+    /// `vibex-server`. The listener may bind an unspecified address, must sit
+    /// behind trusted TLS (proxy or its own certificate), only accepts the
+    /// explicit deployment hosts, and enforces per-peer rate limits on every
+    /// unauthenticated endpoint.
+    Public,
+}
+
+impl RemoteGatewayDeploymentMode {
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Loopback => "loopback",
+            Self::Lan => "lan",
+            Self::Public => "public",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +129,143 @@ pub enum RemoteGatewayTlsPolicy {
     LoopbackHttp,
     TrustedHttpsProxy,
     PinnedCertificate,
+    /// The Gateway terminates TLS itself with an operator-provided
+    /// certificate chain and private key (`RemoteGatewayTlsIdentity`).
+    ServerCertificate,
+}
+
+impl RemoteGatewayTlsPolicy {
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::LoopbackHttp => "loopback_http",
+            Self::TrustedHttpsProxy => "trusted_https_proxy",
+            Self::PinnedCertificate => "pinned_certificate",
+            Self::ServerCertificate => "server_certificate",
+        }
+    }
+
+    /// Whether clients must reach this listener over HTTPS/WSS. Only the
+    /// explicit loopback development policy accepts plain HTTP origins.
+    pub const fn requires_https(self) -> bool {
+        !matches!(self, Self::LoopbackHttp)
+    }
+}
+
+/// Operator-provided PEM material for the `ServerCertificate` TLS policy.
+/// `Debug` never prints the key or certificate bytes.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RemoteGatewayTlsIdentity {
+    pub certificate_chain_pem: Vec<u8>,
+    pub private_key_pem: Vec<u8>,
+}
+
+impl std::fmt::Debug for RemoteGatewayTlsIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteGatewayTlsIdentity")
+            .field("certificate_chain_bytes", &self.certificate_chain_pem.len())
+            .field("has_private_key", &!self.private_key_pem.is_empty())
+            .finish()
+    }
+}
+
+impl RemoteGatewayTlsIdentity {
+    pub const MAX_PEM_BYTES: usize = 256 * 1024;
+
+    pub fn from_pem(
+        certificate_chain_pem: impl Into<Vec<u8>>,
+        private_key_pem: impl Into<Vec<u8>>,
+    ) -> VibexResult<Self> {
+        let identity = Self {
+            certificate_chain_pem: certificate_chain_pem.into(),
+            private_key_pem: private_key_pem.into(),
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    pub fn from_pem_files(
+        certificate_chain_path: impl AsRef<std::path::Path>,
+        private_key_path: impl AsRef<std::path::Path>,
+    ) -> VibexResult<Self> {
+        let read = |path: &std::path::Path, what: &str| {
+            std::fs::read(path).map_err(|error| {
+                VibexError::validation(
+                    "remote_gateway_tls_identity_unreadable",
+                    format!("RemoteGateway TLS {what} file could not be read"),
+                )
+                .with_diagnostic("errorKind", format!("{:?}", error.kind()))
+            })
+        };
+        Self::from_pem(
+            read(certificate_chain_path.as_ref(), "certificate")?,
+            read(private_key_path.as_ref(), "private key")?,
+        )
+    }
+
+    /// Structural validation only. The full parse happens when the listener
+    /// starts, because rustls parsing is asynchronous in `axum-server`.
+    pub fn validate(&self) -> VibexResult<()> {
+        let looks_like_pem = |bytes: &[u8], marker: &str| {
+            !bytes.is_empty()
+                && bytes.len() <= Self::MAX_PEM_BYTES
+                && std::str::from_utf8(bytes).is_ok_and(|text| text.contains(marker))
+        };
+        if !looks_like_pem(&self.certificate_chain_pem, "-----BEGIN CERTIFICATE-----")
+            || !looks_like_pem(&self.private_key_pem, "-----BEGIN ")
+            || !std::str::from_utf8(&self.private_key_pem)
+                .is_ok_and(|text| text.contains("PRIVATE KEY-----"))
+        {
+            return Err(VibexError::validation(
+                "remote_gateway_tls_identity_invalid",
+                "RemoteGateway TLS identity requires a PEM certificate chain and PEM private key",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Per-peer limits for the unauthenticated surface of a listener. The peer is
+/// the connecting socket address, or the first `X-Forwarded-For` hop when the
+/// configuration trusts its reverse proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteGatewayPeerLimits {
+    /// Requests per window to `/api/v2/info`, pairing, and ticket endpoints.
+    pub unauthenticated_requests_per_window: u32,
+    /// Failed authentication or pairing attempts per window before the peer is
+    /// rejected with `remote_rate_limited` for the rest of the window.
+    pub auth_failures_per_window: u32,
+    pub window_ms: u64,
+    /// Upper bound on tracked peers; the oldest window is evicted first.
+    pub max_tracked_peers: usize,
+}
+
+impl Default for RemoteGatewayPeerLimits {
+    fn default() -> Self {
+        Self {
+            unauthenticated_requests_per_window: DEFAULT_PEER_UNAUTHENTICATED_REQUESTS_PER_WINDOW,
+            auth_failures_per_window: DEFAULT_PEER_AUTH_FAILURES_PER_WINDOW,
+            window_ms: DEFAULT_PEER_LIMIT_WINDOW_MS,
+            max_tracked_peers: DEFAULT_PEER_LIMIT_TRACKED_PEERS,
+        }
+    }
+}
+
+impl RemoteGatewayPeerLimits {
+    pub fn validate(&self) -> VibexResult<()> {
+        if self.unauthenticated_requests_per_window == 0
+            || self.auth_failures_per_window == 0
+            || self.window_ms == 0
+            || self.window_ms > MAX_PEER_LIMIT_WINDOW_MS
+            || self.max_tracked_peers == 0
+        {
+            return Err(VibexError::validation(
+                "remote_gateway_peer_limits_invalid",
+                "RemoteGateway peer limits must be positive and bounded",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -194,6 +364,13 @@ pub struct RemoteGatewayConfig {
     pub max_in_flight_rpcs_per_connection: usize,
     pub outbound_queue_capacity: usize,
     pub ws_ticket_ttl_ms: u32,
+    /// Required when `tls_policy` is `ServerCertificate`; ignored otherwise.
+    pub tls_identity: Option<RemoteGatewayTlsIdentity>,
+    /// Trust `X-Forwarded-For` from the immediate hop. Only enable behind a
+    /// reverse proxy that overwrites the header; otherwise peers could evade
+    /// rate limits by spoofing it.
+    pub trust_forwarded_headers: bool,
+    pub peer_limits: RemoteGatewayPeerLimits,
 }
 
 impl Default for RemoteGatewayConfig {
@@ -202,6 +379,9 @@ impl Default for RemoteGatewayConfig {
             service: RemoteServiceConfig::loopback_disabled(),
             deployment_mode: RemoteGatewayDeploymentMode::Loopback,
             tls_policy: RemoteGatewayTlsPolicy::LoopbackHttp,
+            tls_identity: None,
+            trust_forwarded_headers: false,
+            peer_limits: RemoteGatewayPeerLimits::default(),
             allowed_hosts: vec![
                 "localhost".to_string(),
                 "127.0.0.1".to_string(),
@@ -286,6 +466,7 @@ impl RemoteGatewayConfig {
                 self.tls_policy,
                 RemoteGatewayTlsPolicy::TrustedHttpsProxy
                     | RemoteGatewayTlsPolicy::PinnedCertificate
+                    | RemoteGatewayTlsPolicy::ServerCertificate
             )
         {
             return Err(VibexError::validation(
@@ -293,8 +474,41 @@ impl RemoteGatewayConfig {
                 "LAN RemoteGateway requires a trusted HTTPS/WSS proxy or a pinned local certificate",
             ));
         }
-        if self.deployment_mode == RemoteGatewayDeploymentMode::Lan
-            && self.tls_policy != RemoteGatewayTlsPolicy::PinnedCertificate
+        if self.deployment_mode == RemoteGatewayDeploymentMode::Public
+            && !matches!(
+                self.tls_policy,
+                RemoteGatewayTlsPolicy::TrustedHttpsProxy
+                    | RemoteGatewayTlsPolicy::ServerCertificate
+            )
+        {
+            return Err(VibexError::validation(
+                "remote_gateway_public_tls_required",
+                "public RemoteGateway requires a trusted HTTPS/WSS proxy or its own server certificate",
+            ));
+        }
+        if self.tls_policy == RemoteGatewayTlsPolicy::ServerCertificate {
+            match &self.tls_identity {
+                Some(identity) => identity.validate()?,
+                None => {
+                    return Err(VibexError::validation(
+                        "remote_gateway_tls_identity_missing",
+                        "the server certificate TLS policy requires a certificate chain and private key",
+                    ));
+                }
+            }
+        }
+        if self.trust_forwarded_headers
+            && self.tls_policy != RemoteGatewayTlsPolicy::TrustedHttpsProxy
+        {
+            return Err(VibexError::validation(
+                "remote_gateway_forwarded_headers_require_proxy",
+                "forwarded client headers are only trusted behind a trusted HTTPS proxy",
+            ));
+        }
+        if matches!(
+            self.deployment_mode,
+            RemoteGatewayDeploymentMode::Lan | RemoteGatewayDeploymentMode::Public
+        ) && self.tls_policy != RemoteGatewayTlsPolicy::PinnedCertificate
             && self
                 .allowed_hosts
                 .iter()
@@ -306,6 +520,7 @@ impl RemoteGatewayConfig {
                 "LAN RemoteGateway Host allowlist must contain only explicit deployment hosts",
             ));
         }
+        self.peer_limits.validate()?;
         for origin in &self.allowed_origins {
             validate_origin_value(origin)?;
         }
@@ -370,6 +585,7 @@ struct RemoteGatewayInner {
     zero_config_lan_pairing: Arc<LanPairingCoordinator>,
     zero_config_lan_sessions: Arc<Mutex<HashMap<RelaySessionId, ZeroConfigLanSession>>>,
     lan_pairing_requests: Arc<Semaphore>,
+    peer_limiter: Arc<PeerRateLimiter>,
     session_epoch: AtomicU64,
 }
 
@@ -425,6 +641,7 @@ impl GatewayDomainEvents {
 struct GatewayLifecycle {
     bound_addr: Option<SocketAddr>,
     shutdown: Option<oneshot::Sender<()>>,
+    tls_handle: Option<AxumServerHandle<SocketAddr>>,
     task: Option<JoinHandle<()>>,
     zero_config_bound_addr: Option<SocketAddr>,
     zero_config_shutdown: Option<oneshot::Sender<()>>,
@@ -462,6 +679,7 @@ impl RemoteGateway {
                 zero_config_lan_pairing: Arc::new(LanPairingCoordinator::default()),
                 zero_config_lan_sessions: Arc::new(Mutex::new(HashMap::new())),
                 lan_pairing_requests: Arc::new(Semaphore::new(LAN_PAIRING_MAX_CONCURRENT_REQUESTS)),
+                peer_limiter: Arc::new(PeerRateLimiter::default()),
                 session_epoch: AtomicU64::new(0),
             }),
         }
@@ -1220,6 +1438,7 @@ impl RemoteGateway {
             zero_config_lan_pairing: self.inner.zero_config_lan_pairing.clone(),
             zero_config_lan_sessions: self.inner.zero_config_lan_sessions.clone(),
             lan_pairing_requests: self.inner.lan_pairing_requests.clone(),
+            peer_limiter: self.inner.peer_limiter.clone(),
             local_lan_info: self.local_lan_gateway_info(),
             session_epoch: context.session_epoch,
         };
@@ -1622,6 +1841,7 @@ impl RemoteGateway {
                 zero_config_lan_pairing: self.inner.zero_config_lan_pairing.clone(),
                 zero_config_lan_sessions: self.inner.zero_config_lan_sessions.clone(),
                 lan_pairing_requests: self.inner.lan_pairing_requests.clone(),
+                peer_limiter: self.inner.peer_limiter.clone(),
                 local_lan_info: self.local_lan_gateway_info(),
                 session_epoch: context.session_epoch,
             },
@@ -1675,6 +1895,7 @@ impl RemoteGateway {
             zero_config_lan_pairing: self.inner.zero_config_lan_pairing.clone(),
             zero_config_lan_sessions: self.inner.zero_config_lan_sessions.clone(),
             lan_pairing_requests: self.inner.lan_pairing_requests.clone(),
+            peer_limiter: self.inner.peer_limiter.clone(),
             local_lan_info: self.local_lan_gateway_info(),
             session_epoch: epoch,
         }))
@@ -1697,6 +1918,7 @@ impl RemoteGateway {
             zero_config_lan_pairing: self.inner.zero_config_lan_pairing.clone(),
             zero_config_lan_sessions: self.inner.zero_config_lan_sessions.clone(),
             lan_pairing_requests: self.inner.lan_pairing_requests.clone(),
+            peer_limiter: self.inner.peer_limiter.clone(),
             local_lan_info: self.local_lan_gateway_info(),
             session_epoch: epoch,
         }))
@@ -1713,6 +1935,8 @@ impl RemoteGateway {
         }
         let bind_addr = config.validate()?;
         self.bump_session_epoch();
+        let tls_policy = config.tls_policy;
+        let tls_identity = config.tls_identity.clone();
         let router = self.router_with_config(config)?;
         let listener = tokio::net::TcpListener::bind(bind_addr)
             .await
@@ -1730,21 +1954,70 @@ impl RemoteGateway {
             )
             .with_diagnostic("errorKind", format!("{:?}", error.kind()))
         })?;
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let task = tokio::spawn(async move {
-            let _ = axum::serve(listener, router)
-                .with_graceful_shutdown(async move {
-                    let _ = shutdown_rx.await;
-                })
-                .await;
-        });
+        let service = router.into_make_service_with_connect_info::<SocketAddr>();
+        let (shutdown, tls_handle, task) = if tls_policy == RemoteGatewayTlsPolicy::ServerCertificate
+        {
+            let identity = tls_identity.ok_or_else(|| {
+                VibexError::validation(
+                    "remote_gateway_tls_identity_missing",
+                    "the server certificate TLS policy requires a certificate chain and private key",
+                )
+            })?;
+            let tls_config = RustlsConfig::from_pem(
+                identity.certificate_chain_pem,
+                identity.private_key_pem,
+            )
+            .await
+            .map_err(|_| {
+                VibexError::validation(
+                    "remote_gateway_tls_identity_invalid",
+                    "RemoteGateway TLS certificate chain or private key could not be parsed",
+                )
+            })?;
+            let std_listener = listener.into_std().map_err(|error| {
+                VibexError::process(
+                    "remote_gateway_listener_config_failed",
+                    "RemoteGateway TLS listener could not be configured",
+                )
+                .with_diagnostic("errorKind", format!("{:?}", error.kind()))
+            })?;
+            let server = axum_server::from_tcp_rustls(std_listener, tls_config).map_err(|error| {
+                VibexError::process(
+                    "remote_gateway_listener_config_failed",
+                    "RemoteGateway TLS server could not be initialized",
+                )
+                .with_diagnostic("errorKind", format!("{:?}", error.kind()))
+            })?;
+            let handle = AxumServerHandle::new();
+            let task_handle = handle.clone();
+            let task = tokio::spawn(async move {
+                if let Err(error) = server.handle(task_handle).serve(service).await {
+                    eprintln!(
+                        "vibex-remote: TLS listener stopped error_kind={:?}",
+                        error.kind()
+                    );
+                }
+            });
+            (None, Some(handle), task)
+        } else {
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                let _ = axum::serve(listener, service)
+                    .with_graceful_shutdown(async move {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await;
+            });
+            (Some(shutdown_tx), None, task)
+        };
         let mut lifecycle = self
             .inner
             .lifecycle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         lifecycle.bound_addr = Some(bound_addr);
-        lifecycle.shutdown = Some(shutdown_tx);
+        lifecycle.shutdown = shutdown;
+        lifecycle.tls_handle = tls_handle;
         lifecycle.task = Some(task);
         Ok(Some(bound_addr))
     }
@@ -1759,20 +2032,27 @@ impl RemoteGateway {
             message: "RemoteGateway is shutting down".to_string(),
             retry: RemoteRetryClass::Reconnect,
         });
-        let (shutdown, task) = {
+        let (shutdown, tls_handle, task) = {
             let mut lifecycle = self
                 .inner
                 .lifecycle
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             lifecycle.bound_addr = None;
-            (lifecycle.shutdown.take(), lifecycle.task.take())
+            (
+                lifecycle.shutdown.take(),
+                lifecycle.tls_handle.take(),
+                lifecycle.task.take(),
+            )
         };
         if let Some(shutdown) = shutdown {
             let _ = shutdown.send(());
         }
+        if let Some(handle) = tls_handle {
+            handle.graceful_shutdown(Some(Duration::from_secs(3)));
+        }
         if let Some(mut task) = task
-            && tokio::time::timeout(Duration::from_secs(3), &mut task)
+            && tokio::time::timeout(Duration::from_secs(4), &mut task)
                 .await
                 .is_err()
         {
@@ -1934,8 +2214,173 @@ struct GatewayState {
     zero_config_lan_pairing: Arc<LanPairingCoordinator>,
     zero_config_lan_sessions: Arc<Mutex<HashMap<RelaySessionId, ZeroConfigLanSession>>>,
     lan_pairing_requests: Arc<Semaphore>,
+    peer_limiter: Arc<PeerRateLimiter>,
     local_lan_info: Option<LocalLanGatewayInfo>,
     session_epoch: u64,
+}
+
+/// Rate-limit identity of the current request, inserted by the security
+/// perimeter so authentication handlers can record failures for the peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PeerKey(String);
+
+#[derive(Debug, Default)]
+struct PeerWindow {
+    window_started_at_ms: i64,
+    requests: u32,
+    auth_failures: u32,
+    last_seen_at_ms: i64,
+}
+
+/// Fixed-window per-peer limiter shared by every listener epoch of a Gateway.
+/// It is intentionally simple: one window per peer, bounded map, no
+/// allocation on the authenticated RPC path.
+#[derive(Debug, Default)]
+struct PeerRateLimiter {
+    windows: Mutex<HashMap<String, PeerWindow>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerLimitDecision {
+    Allowed,
+    Limited { retry_after_ms: u64 },
+}
+
+impl PeerRateLimiter {
+    fn with_window<T>(
+        &self,
+        peer: &str,
+        limits: &RemoteGatewayPeerLimits,
+        now_ms: i64,
+        apply: impl FnOnce(&mut PeerWindow) -> T,
+    ) -> T {
+        let mut windows = self
+            .windows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let window_ms = i64::try_from(limits.window_ms).unwrap_or(i64::MAX);
+        if !windows.contains_key(peer) && windows.len() >= limits.max_tracked_peers {
+            // Evict expired windows first, then the least recently seen peer.
+            windows.retain(|_, window| now_ms.saturating_sub(window.window_started_at_ms) < window_ms);
+            if windows.len() >= limits.max_tracked_peers
+                && let Some(oldest) = windows
+                    .iter()
+                    .min_by_key(|(_, window)| window.last_seen_at_ms)
+                    .map(|(key, _)| key.clone())
+            {
+                windows.remove(&oldest);
+            }
+        }
+        let window = windows.entry(peer.to_string()).or_default();
+        if now_ms.saturating_sub(window.window_started_at_ms) >= window_ms {
+            *window = PeerWindow {
+                window_started_at_ms: now_ms,
+                ..PeerWindow::default()
+            };
+        }
+        window.last_seen_at_ms = now_ms;
+        apply(window)
+    }
+
+    fn retry_after(window: &PeerWindow, limits: &RemoteGatewayPeerLimits, now_ms: i64) -> u64 {
+        let elapsed = u64::try_from(now_ms.saturating_sub(window.window_started_at_ms))
+            .unwrap_or_default();
+        limits.window_ms.saturating_sub(elapsed).max(1)
+    }
+
+    /// Counts one unauthenticated request and rejects the peer once it exceeds
+    /// its request budget or has already exhausted its authentication budget.
+    fn check_unauthenticated_request(
+        &self,
+        peer: &str,
+        limits: &RemoteGatewayPeerLimits,
+        now_ms: i64,
+    ) -> PeerLimitDecision {
+        self.with_window(peer, limits, now_ms, |window| {
+            if window.auth_failures >= limits.auth_failures_per_window {
+                return PeerLimitDecision::Limited {
+                    retry_after_ms: Self::retry_after(window, limits, now_ms),
+                };
+            }
+            window.requests = window.requests.saturating_add(1);
+            if window.requests > limits.unauthenticated_requests_per_window {
+                PeerLimitDecision::Limited {
+                    retry_after_ms: Self::retry_after(window, limits, now_ms),
+                }
+            } else {
+                PeerLimitDecision::Allowed
+            }
+        })
+    }
+
+    /// Whether the peer may still attempt authentication in this window.
+    fn check_auth_attempt(
+        &self,
+        peer: &str,
+        limits: &RemoteGatewayPeerLimits,
+        now_ms: i64,
+    ) -> PeerLimitDecision {
+        self.with_window(peer, limits, now_ms, |window| {
+            if window.auth_failures >= limits.auth_failures_per_window {
+                PeerLimitDecision::Limited {
+                    retry_after_ms: Self::retry_after(window, limits, now_ms),
+                }
+            } else {
+                PeerLimitDecision::Allowed
+            }
+        })
+    }
+
+    fn record_auth_failure(&self, peer: &str, limits: &RemoteGatewayPeerLimits, now_ms: i64) {
+        self.with_window(peer, limits, now_ms, |window| {
+            window.auth_failures = window.auth_failures.saturating_add(1);
+        });
+    }
+
+    #[cfg(test)]
+    fn tracked_peers(&self) -> usize {
+        self.windows
+            .lock()
+            .map(|windows| windows.len())
+            .unwrap_or_default()
+    }
+}
+
+fn peer_key_for_request(config: &RemoteGatewayConfig, request: &Request<Body>) -> PeerKey {
+    if config.trust_forwarded_headers
+        && let Some(forwarded) = request
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(',').next())
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && value.len() <= 64)
+            .and_then(|value| value.parse::<IpAddr>().ok())
+    {
+        return PeerKey(forwarded.to_string());
+    }
+    request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|info| PeerKey(info.0.ip().to_string()))
+        .unwrap_or_else(|| PeerKey("unknown".to_string()))
+}
+
+fn rate_limited_response(retry_after_ms: u64) -> Response {
+    let error = RemoteProtocolError {
+        error: VibexError::new(
+            ErrorCategory::Remote,
+            "remote_rate_limited",
+            "RemoteGateway rejected the request because the peer exceeded its rate limit",
+        ),
+        retryable: true,
+        retry_after_ms: Some(u32::try_from(retry_after_ms).unwrap_or(u32::MAX)),
+    };
+    let mut response = (StatusCode::TOO_MANY_REQUESTS, Json(error)).into_response();
+    if let Ok(value) = HeaderValue::from_str(&retry_after_ms.div_ceil(1000).max(1).to_string()) {
+        response.headers_mut().insert(RETRY_AFTER, value);
+    }
+    response
 }
 
 #[derive(Clone)]
@@ -2275,15 +2720,8 @@ async fn gateway_info(State(state): State<GatewayState>) -> Response {
         "lanPairingRequestPath": "/api/v2/pairing/lan/request",
         "lanPairingStatusPath": "/api/v2/pairing/lan/status",
         "wsTicketPath": "/api/v2/ws-ticket",
-        "deploymentMode": match state.config.deployment_mode {
-            RemoteGatewayDeploymentMode::Loopback => "loopback",
-            RemoteGatewayDeploymentMode::Lan => "lan",
-        },
-        "tlsPolicy": match state.config.tls_policy {
-            RemoteGatewayTlsPolicy::LoopbackHttp => "loopback_http",
-            RemoteGatewayTlsPolicy::TrustedHttpsProxy => "trusted_https_proxy",
-            RemoteGatewayTlsPolicy::PinnedCertificate => "pinned_certificate",
-        },
+        "deploymentMode": state.config.deployment_mode.wire_name(),
+        "tlsPolicy": state.config.tls_policy.wire_name(),
         "sessionEpoch": state.session_epoch,
         "enabledFeatures": gateway_features(&state),
     }))
@@ -2339,10 +2777,26 @@ fn lan_pairing_busy_response() -> Response {
     )
 }
 
+fn peer_from_extensions(request_peer: Option<axum::Extension<PeerKey>>) -> String {
+    request_peer
+        .map(|axum::Extension(peer)| peer.0)
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 async fn claim_pairing_offer(
     State(state): State<GatewayState>,
+    peer: Option<axum::Extension<PeerKey>>,
     Json(request): Json<RemoteClaimPairingOfferRequest>,
 ) -> Response {
+    let peer = peer_from_extensions(peer);
+    let now_ms = unix_timestamp_ms();
+    if let PeerLimitDecision::Limited { retry_after_ms } =
+        state
+            .peer_limiter
+            .check_auth_attempt(&peer, &state.config.peer_limits, now_ms)
+    {
+        return rate_limited_response(retry_after_ms);
+    }
     let connection = match open_migrated_database(&state.db_path) {
         Ok(connection) => connection,
         Err(error) => return protocol_error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
@@ -2353,21 +2807,41 @@ async fn claim_pairing_offer(
             let _ = state.lan_pairing.clear_offer(&offer_id);
             Json(response).into_response()
         }
-        Err(error) => protocol_error_response(status_for_error(&error), error),
+        Err(error) => {
+            state
+                .peer_limiter
+                .record_auth_failure(&peer, &state.config.peer_limits, now_ms);
+            protocol_error_response(status_for_error(&error), error)
+        }
     }
 }
 
 async fn issue_ws_ticket(
     State(state): State<GatewayState>,
+    peer: Option<axum::Extension<PeerKey>>,
     Json(request): Json<RemoteWsTicketRequest>,
 ) -> Response {
+    let peer = peer_from_extensions(peer);
+    let now_ms = unix_timestamp_ms();
+    if let PeerLimitDecision::Limited { retry_after_ms } =
+        state
+            .peer_limiter
+            .check_auth_attempt(&peer, &state.config.peer_limits, now_ms)
+    {
+        return rate_limited_response(retry_after_ms);
+    }
     let connection = match open_migrated_database(&state.db_path) {
         Ok(connection) => connection,
         Err(error) => return protocol_error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
     };
     let auth = match RemoteTrustService::authenticate(&connection, request.auth.clone()) {
         Ok(auth) => auth,
-        Err(error) => return protocol_error_response(StatusCode::UNAUTHORIZED, error),
+        Err(error) => {
+            state
+                .peer_limiter
+                .record_auth_failure(&peer, &state.config.peer_limits, now_ms);
+            return protocol_error_response(StatusCode::UNAUTHORIZED, error);
+        }
     };
     let ticket = secure_secret("ws");
     let proof_challenge = secure_secret("proof");
@@ -4254,6 +4728,16 @@ fn mutation_requires_idempotency(kind: &str) -> bool {
             | "terminal_resize"
             | "terminal_kill"
             | "run_health_probes"
+            | "create_custom_agent"
+            | "delete_custom_agent"
+            | "create_model_provider_profile"
+            | "update_model_provider_profile"
+            | "create_agent_runtime_profile"
+            | "update_agent_runtime_profile"
+            | "create_agent_model_provider_binding"
+            | "update_agent_model_provider_binding"
+            | "mutate_provider_credential_secret"
+            | "set_agent_model_provider_default"
             | "create_pairing_offer"
             | "cancel_pairing_offer"
             | "revoke_device"
@@ -4541,7 +5025,7 @@ fn websocket_close_code(code: RemoteCloseCode) -> u16 {
 
 async fn security_perimeter(
     State(state): State<GatewayState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let origin = request
@@ -4552,6 +5036,16 @@ async fn security_perimeter(
     if let Err((status, error)) = validate_perimeter_request(&state, &request, origin.as_deref()) {
         return protocol_error_response(status, error);
     }
+    let peer = peer_key_for_request(&state.config, &request);
+    if request.method() != Method::OPTIONS
+        && PEER_LIMITED_PATHS.contains(&request.uri().path())
+        && let PeerLimitDecision::Limited { retry_after_ms } = state
+            .peer_limiter
+            .check_unauthenticated_request(&peer.0, &state.config.peer_limits, unix_timestamp_ms())
+    {
+        return rate_limited_response(retry_after_ms);
+    }
+    request.extensions_mut().insert(peer);
     if request.method() == Method::OPTIONS {
         let mut response = StatusCode::NO_CONTENT.into_response();
         apply_cors_headers(&mut response, &request, origin.as_deref());
@@ -4671,11 +5165,10 @@ fn origin_allowed(config: &RemoteGatewayConfig, origin: &str, request_host: &str
             .filter_map(|allowed| normalize_origin(allowed))
             .any(|allowed| allowed == origin)
     });
-    let scheme_allowed = match config.tls_policy {
-        RemoteGatewayTlsPolicy::LoopbackHttp => matches!(url.scheme(), "http" | "https"),
-        RemoteGatewayTlsPolicy::TrustedHttpsProxy | RemoteGatewayTlsPolicy::PinnedCertificate => {
-            url.scheme() == "https"
-        }
+    let scheme_allowed = if config.tls_policy.requires_https() {
+        url.scheme() == "https"
+    } else {
+        matches!(url.scheme(), "http" | "https")
     };
     if !scheme_allowed {
         return false;
@@ -4909,6 +5402,14 @@ fn gateway_features(state: &GatewayState) -> Vec<String> {
     }
     if state.dispatcher.supports_timeline_display_settings() {
         features.push("agent_timeline_display_settings".to_string());
+    }
+    if state
+        .dispatcher
+        .info()
+        .capabilities
+        .supports_provider_management
+    {
+        features.push("provider_management".to_string());
     }
     if state
         .pairing_routes
@@ -6245,6 +6746,7 @@ mod tests {
             zero_config_lan_pairing: gateway.inner.zero_config_lan_pairing.clone(),
             zero_config_lan_sessions: gateway.inner.zero_config_lan_sessions.clone(),
             lan_pairing_requests: gateway.inner.lan_pairing_requests.clone(),
+            peer_limiter: gateway.inner.peer_limiter.clone(),
             local_lan_info: gateway.local_lan_gateway_info(),
             session_epoch: epoch,
         }
@@ -6307,4 +6809,244 @@ mod tests {
             }
         }
     }
+
+    fn test_pem_block(label: &str, der: &[u8]) -> Vec<u8> {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(der);
+        let mut pem = format!("-----BEGIN {label}-----\n");
+        for chunk in encoded.as_bytes().chunks(64) {
+            pem.push_str(std::str::from_utf8(chunk).unwrap());
+            pem.push('\n');
+        }
+        pem.push_str(&format!("-----END {label}-----\n"));
+        pem.into_bytes()
+    }
+
+    #[test]
+    fn public_gateway_config_requires_tls_and_explicit_hosts() {
+        let mut config = RemoteGatewayConfig::loopback_enabled("0.0.0.0:0");
+        config.deployment_mode = RemoteGatewayDeploymentMode::Public;
+        assert_eq!(
+            config.validate().unwrap_err().code,
+            "remote_gateway_public_tls_required"
+        );
+        config.tls_policy = RemoteGatewayTlsPolicy::TrustedHttpsProxy;
+        assert_eq!(
+            config.validate().unwrap_err().code,
+            "remote_gateway_lan_host_allowlist_invalid"
+        );
+        config.allowed_hosts = vec!["vibex.example.test".to_string()];
+        config.allowed_origins = vec!["https://vibex.example.test".to_string()];
+        assert!(config.validate().is_ok());
+        config.trust_forwarded_headers = true;
+        assert!(config.validate().is_ok());
+
+        config.trust_forwarded_headers = false;
+        config.tls_policy = RemoteGatewayTlsPolicy::ServerCertificate;
+        assert_eq!(
+            config.validate().unwrap_err().code,
+            "remote_gateway_tls_identity_missing"
+        );
+        config.tls_identity = Some(RemoteGatewayTlsIdentity {
+            certificate_chain_pem: b"not a certificate".to_vec(),
+            private_key_pem: b"not a key".to_vec(),
+        });
+        assert_eq!(
+            config.validate().unwrap_err().code,
+            "remote_gateway_tls_identity_invalid"
+        );
+        let certified = rcgen::generate_simple_self_signed(vec!["vibex.example.test".to_string()])
+            .unwrap();
+        config.tls_identity = Some(
+            RemoteGatewayTlsIdentity::from_pem(
+                test_pem_block("CERTIFICATE", certified.cert.der()),
+                test_pem_block("PRIVATE KEY", &certified.signing_key.serialize_der()),
+            )
+            .unwrap(),
+        );
+        assert!(config.validate().is_ok());
+        config.trust_forwarded_headers = true;
+        assert_eq!(
+            config.validate().unwrap_err().code,
+            "remote_gateway_forwarded_headers_require_proxy"
+        );
+        config.trust_forwarded_headers = false;
+        let debug = format!("{:?}", config.tls_identity.as_ref().unwrap());
+        assert!(debug.contains("has_private_key: true"));
+        assert!(!debug.contains("PRIVATE KEY"));
+
+        config.peer_limits.auth_failures_per_window = 0;
+        assert_eq!(
+            config.validate().unwrap_err().code,
+            "remote_gateway_peer_limits_invalid"
+        );
+        assert_eq!(RemoteGatewayDeploymentMode::Public.wire_name(), "public");
+        assert_eq!(
+            RemoteGatewayTlsPolicy::ServerCertificate.wire_name(),
+            "server_certificate"
+        );
+        assert!(RemoteGatewayTlsPolicy::ServerCertificate.requires_https());
+        assert!(!RemoteGatewayTlsPolicy::LoopbackHttp.requires_https());
+    }
+
+    #[test]
+    fn peer_rate_limiter_bounds_unauthenticated_requests_and_auth_failures() {
+        let limiter = PeerRateLimiter::default();
+        let limits = RemoteGatewayPeerLimits {
+            unauthenticated_requests_per_window: 3,
+            auth_failures_per_window: 2,
+            window_ms: 1_000,
+            max_tracked_peers: 2,
+        };
+        for _ in 0..3 {
+            assert_eq!(
+                limiter.check_unauthenticated_request("198.51.100.1", &limits, 10_000),
+                PeerLimitDecision::Allowed
+            );
+        }
+        assert!(matches!(
+            limiter.check_unauthenticated_request("198.51.100.1", &limits, 10_500),
+            PeerLimitDecision::Limited { retry_after_ms } if retry_after_ms == 500
+        ));
+        assert_eq!(
+            limiter.check_unauthenticated_request("198.51.100.1", &limits, 11_000),
+            PeerLimitDecision::Allowed,
+            "a new window resets the request budget"
+        );
+
+        assert_eq!(
+            limiter.check_auth_attempt("198.51.100.2", &limits, 20_000),
+            PeerLimitDecision::Allowed
+        );
+        limiter.record_auth_failure("198.51.100.2", &limits, 20_000);
+        limiter.record_auth_failure("198.51.100.2", &limits, 20_100);
+        assert!(matches!(
+            limiter.check_auth_attempt("198.51.100.2", &limits, 20_200),
+            PeerLimitDecision::Limited { .. }
+        ));
+        assert!(
+            matches!(
+                limiter.check_unauthenticated_request("198.51.100.2", &limits, 20_300),
+                PeerLimitDecision::Limited { .. }
+            ),
+            "an exhausted authentication budget also blocks unauthenticated requests"
+        );
+        assert_eq!(
+            limiter.check_auth_attempt("198.51.100.2", &limits, 21_100),
+            PeerLimitDecision::Allowed
+        );
+
+        assert_eq!(limiter.tracked_peers(), 2);
+        assert_eq!(
+            limiter.check_unauthenticated_request("198.51.100.3", &limits, 21_200),
+            PeerLimitDecision::Allowed
+        );
+        assert_eq!(limiter.tracked_peers(), 2, "the tracked peer map stays bounded");
+    }
+
+    #[test]
+    fn forwarded_client_addresses_are_only_trusted_behind_a_proxy() {
+        let mut config = RemoteGatewayConfig::default();
+        let request = HttpRequest::get("/api/v2/info")
+            .header("x-forwarded-for", "203.0.113.9, 10.0.0.2")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            peer_key_for_request(&config, &request),
+            PeerKey("unknown".to_string())
+        );
+        config.trust_forwarded_headers = true;
+        assert_eq!(
+            peer_key_for_request(&config, &request),
+            PeerKey("203.0.113.9".to_string())
+        );
+        let mut request = HttpRequest::get("/api/v2/info")
+            .header("x-forwarded-for", "not-an-address")
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo::<SocketAddr>(
+                "192.0.2.7:51000".parse().unwrap(),
+            ));
+        assert_eq!(
+            peer_key_for_request(&config, &request),
+            PeerKey("192.0.2.7".to_string()),
+            "an unparseable forwarded value falls back to the socket peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_gateway_terminates_tls_with_its_own_certificate_and_rate_limits_peers() {
+        let directory = tempfile::tempdir().unwrap();
+        let certified = rcgen::generate_simple_self_signed(vec!["vibex.example.test".to_string()])
+            .unwrap();
+        let mut config = RemoteGatewayConfig::loopback_enabled("127.0.0.1:0");
+        config.deployment_mode = RemoteGatewayDeploymentMode::Public;
+        config.tls_policy = RemoteGatewayTlsPolicy::ServerCertificate;
+        config.tls_identity = Some(
+            RemoteGatewayTlsIdentity::from_pem(
+                test_pem_block("CERTIFICATE", certified.cert.der()),
+                test_pem_block("PRIVATE KEY", &certified.signing_key.serialize_der()),
+            )
+            .unwrap(),
+        );
+        config.allowed_hosts = vec!["vibex.example.test".to_string()];
+        config.allowed_origins = vec!["https://vibex.example.test".to_string()];
+        config.peer_limits.unauthenticated_requests_per_window = 3;
+        let gateway = test_gateway(&directory, config);
+        let address = gateway.start().await.unwrap().unwrap();
+
+        // The probe must never leave the host, so ignore any proxy environment.
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .danger_accept_invalid_certs(true)
+            .resolve("vibex.example.test", address)
+            .build()
+            .unwrap();
+        let url = format!("https://vibex.example.test:{}/api/v2/info", address.port());
+        let response = client.get(&url).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let info: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(info["deploymentMode"], "public");
+        assert_eq!(info["tlsPolicy"], "server_certificate");
+
+        let mut statuses = Vec::new();
+        for _ in 0..3 {
+            statuses.push(client.get(&url).send().await.unwrap().status());
+        }
+        assert_eq!(
+            statuses,
+            vec![
+                reqwest::StatusCode::OK,
+                reqwest::StatusCode::OK,
+                reqwest::StatusCode::TOO_MANY_REQUESTS
+            ]
+        );
+        let limited = client.get(&url).send().await.unwrap();
+        assert_eq!(limited.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+        assert!(limited.headers().get(reqwest::header::RETRY_AFTER).is_some());
+        let body: serde_json::Value = limited.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "remote_rate_limited");
+        assert_eq!(body["retryable"], true);
+        assert!(body["retryAfterMs"].as_u64().is_some_and(|ms| ms > 0));
+
+        let plain = reqwest::Client::builder()
+            .no_proxy()
+            .resolve("vibex.example.test", address)
+            .build()
+            .unwrap()
+            .get(format!(
+                "http://vibex.example.test:{}/api/v2/info",
+                address.port()
+            ))
+            .send()
+            .await;
+        assert!(plain.is_err(), "the TLS listener must not answer plaintext");
+
+        gateway.stop().await.unwrap();
+        assert!(!gateway.status().running);
+        let rebind = tokio::net::TcpListener::bind(address).await;
+        assert!(rebind.is_ok(), "stopping the TLS listener releases its socket");
+    }
+
 }

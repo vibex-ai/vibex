@@ -100,6 +100,10 @@ pub struct RemoteCapabilitySummary {
     pub supports_worktree_read: bool,
     pub supports_terminal: bool,
     pub supports_provider_settings: bool,
+    /// Provider, Agent runtime, binding, and Secret management mutations are
+    /// exposed to full-control devices. Older runtimes omit the field.
+    #[serde(default)]
+    pub supports_provider_management: bool,
     pub live_event_channels: Vec<RemoteLiveEventChannel>,
 }
 
@@ -119,6 +123,7 @@ impl RemoteCapabilitySummary {
             supports_worktree_read: false,
             supports_terminal: false,
             supports_provider_settings: false,
+            supports_provider_management: false,
             live_event_channels: vec![RemoteLiveEventChannel::System],
         }
     }
@@ -144,6 +149,7 @@ impl RemoteCapabilitySummary {
     pub fn with_agent_workbench_and_provider() -> Self {
         let mut capabilities = Self::with_agent_and_workbench();
         capabilities.supports_provider_settings = true;
+        capabilities.supports_provider_management = true;
         capabilities
             .live_event_channels
             .push(RemoteLiveEventChannel::Provider);
@@ -1444,6 +1450,20 @@ pub enum RemoteProviderOperationKind {
     RunHealthProbes,
     ListUsageSummaries,
     ListFailoverRecommendations,
+    ListAgents,
+    CreateCustomAgent,
+    DeleteCustomAgent,
+    ListModelProviderProfiles,
+    CreateModelProviderProfile,
+    UpdateModelProviderProfile,
+    ListAgentRuntimeProfiles,
+    CreateAgentRuntimeProfile,
+    UpdateAgentRuntimeProfile,
+    ListAgentModelProviderBindings,
+    CreateAgentModelProviderBinding,
+    UpdateAgentModelProviderBinding,
+    MutateProviderCredentialSecret,
+    SetAgentModelProviderDefault,
 }
 
 /// Redacted Agent configuration state for remote management surfaces. Command
@@ -1646,6 +1666,235 @@ pub struct RemoteProviderFailoverRecommendationListResponse {
     pub recommendations: Vec<ProviderFailoverRecommendation>,
 }
 
+/// Full Agent snapshot list for remote management surfaces. Environment
+/// values are blanked, and native configuration paths and diagnostics are
+/// dropped before the entries leave the runtime; see
+/// [`redact_agent_snapshot_for_remote`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentListRequest {
+    pub auth: RemoteAuthProof,
+    pub include_disabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentListResponse {
+    pub agents: Vec<crate::AgentSnapshotEntry>,
+}
+
+/// Strips host-private Agent configuration before an entry is sent to a paired
+/// device: environment values are replaced by empty strings (keys remain so a
+/// client can show which variables exist), native config paths and diagnostics
+/// are removed. Command lines stay because custom Agent editing needs them.
+pub fn redact_agent_snapshot_for_remote(
+    mut entry: crate::AgentSnapshotEntry,
+) -> crate::AgentSnapshotEntry {
+    for value in entry.env.values_mut() {
+        value.clear();
+    }
+    entry.native_config_paths.clear();
+    entry.diagnostics.clear();
+    entry
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteCustomAgentCreateRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::CustomAgentCreateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteCustomAgentCreateResponse {
+    pub agent: crate::AgentSnapshotEntry,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteCustomAgentDeleteRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::CustomAgentDeleteRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteCustomAgentDeleteResponse {
+    pub agent_id: AgentId,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteModelProviderProfileListRequest {
+    pub auth: RemoteAuthProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteModelProviderProfileListResponse {
+    pub profiles: Vec<crate::ModelProviderProfile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteModelProviderProfileCreateRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::ModelProviderProfileCreateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteModelProviderProfileUpdateRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::ModelProviderProfileUpdateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteModelProviderProfileResponse {
+    pub profile: crate::ModelProviderProfile,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentRuntimeProfileListRequest {
+    pub auth: RemoteAuthProof,
+    pub agent_id: AgentId,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentRuntimeProfileListResponse {
+    pub profiles: Vec<crate::AgentRuntimeProfile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentRuntimeProfileCreateRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::AgentRuntimeProfileCreateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentRuntimeProfileUpdateRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::AgentRuntimeProfileUpdateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentRuntimeProfileResponse {
+    pub profile: crate::AgentRuntimeProfile,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentModelProviderBindingListRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::AgentModelProviderBindingListRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentModelProviderBindingListResponse {
+    pub bindings: Vec<crate::AgentModelProviderBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentModelProviderBindingCreateRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::AgentModelProviderBindingCreateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentModelProviderBindingUpdateRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::AgentModelProviderBindingUpdateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentModelProviderBindingResponse {
+    pub binding: crate::AgentModelProviderBinding,
+}
+
+/// Carries a Secret value to the authoritative runtime. The transport is
+/// always E2EE or TLS, `Debug` never prints the value, and the runtime stores
+/// it in its own secret store before answering with the redacted profile.
+/// This is the only wire type that may contain a Secret value; it is never
+/// persisted, logged, or echoed back.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderCredentialSecretMutationRequest {
+    pub auth: RemoteAuthProof,
+    pub model_provider_profile_id: crate::ModelProviderProfileId,
+    pub credential_id: RequestId,
+    pub touched: bool,
+    pub clear: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+impl RemoteProviderCredentialSecretMutationRequest {
+    pub fn from_request(
+        auth: RemoteAuthProof,
+        request: crate::ProviderCredentialSecretMutationRequest,
+    ) -> Self {
+        Self {
+            auth,
+            model_provider_profile_id: request.model_provider_profile_id,
+            credential_id: request.credential_id,
+            touched: request.touched,
+            clear: request.clear,
+            value: request.value,
+        }
+    }
+
+    pub fn into_request(self) -> (RemoteAuthProof, crate::ProviderCredentialSecretMutationRequest) {
+        (
+            self.auth,
+            crate::ProviderCredentialSecretMutationRequest {
+                model_provider_profile_id: self.model_provider_profile_id,
+                credential_id: self.credential_id,
+                touched: self.touched,
+                clear: self.clear,
+                value: self.value,
+            },
+        )
+    }
+}
+
+impl fmt::Debug for RemoteProviderCredentialSecretMutationRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteProviderCredentialSecretMutationRequest")
+            .field("auth", &self.auth)
+            .field("model_provider_profile_id", &self.model_provider_profile_id)
+            .field("credential_id", &self.credential_id)
+            .field("touched", &self.touched)
+            .field("clear", &self.clear)
+            .field("value", &self.value.as_ref().map(|_| "[redacted]"))
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentModelProviderDefaultRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::AgentModelProviderSetDefaultRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentModelProviderDefaultResponse {
+    pub selection: crate::AgentModelProviderDefaultSelection,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum RemoteProviderRequest {
@@ -1662,9 +1911,44 @@ pub enum RemoteProviderRequest {
     RunHealthProbes(RemoteProviderRunHealthProbesRequest),
     ListUsageSummaries(RemoteProviderUsageSummaryListRequest),
     ListFailoverRecommendations(RemoteProviderFailoverRecommendationListRequest),
+    ListAgents(RemoteAgentListRequest),
+    CreateCustomAgent(RemoteCustomAgentCreateRequest),
+    DeleteCustomAgent(RemoteCustomAgentDeleteRequest),
+    ListModelProviderProfiles(RemoteModelProviderProfileListRequest),
+    CreateModelProviderProfile(RemoteModelProviderProfileCreateRequest),
+    UpdateModelProviderProfile(RemoteModelProviderProfileUpdateRequest),
+    ListAgentRuntimeProfiles(RemoteAgentRuntimeProfileListRequest),
+    CreateAgentRuntimeProfile(RemoteAgentRuntimeProfileCreateRequest),
+    UpdateAgentRuntimeProfile(RemoteAgentRuntimeProfileUpdateRequest),
+    ListAgentModelProviderBindings(RemoteAgentModelProviderBindingListRequest),
+    CreateAgentModelProviderBinding(RemoteAgentModelProviderBindingCreateRequest),
+    UpdateAgentModelProviderBinding(RemoteAgentModelProviderBindingUpdateRequest),
+    MutateProviderCredentialSecret(RemoteProviderCredentialSecretMutationRequest),
+    SetAgentModelProviderDefault(RemoteAgentModelProviderDefaultRequest),
 }
 
 impl RemoteProviderRequest {
+    /// Whether the request changes Provider state. Mutations require
+    /// `MutateProviderSettings`, an idempotency key, and an audit record.
+    pub const fn is_mutation(&self) -> bool {
+        matches!(
+            self,
+            Self::StartRuntimeProbe(_)
+                | Self::CancelRuntimeProbe(_)
+                | Self::RunHealthProbes(_)
+                | Self::CreateCustomAgent(_)
+                | Self::DeleteCustomAgent(_)
+                | Self::CreateModelProviderProfile(_)
+                | Self::UpdateModelProviderProfile(_)
+                | Self::CreateAgentRuntimeProfile(_)
+                | Self::UpdateAgentRuntimeProfile(_)
+                | Self::CreateAgentModelProviderBinding(_)
+                | Self::UpdateAgentModelProviderBinding(_)
+                | Self::MutateProviderCredentialSecret(_)
+                | Self::SetAgentModelProviderDefault(_)
+        )
+    }
+
     pub const fn operation_kind(&self) -> RemoteProviderOperationKind {
         match self {
             Self::ListAgentSummaries(_) => RemoteProviderOperationKind::ListAgentSummaries,
@@ -1681,6 +1965,42 @@ impl RemoteProviderRequest {
             Self::ListUsageSummaries(_) => RemoteProviderOperationKind::ListUsageSummaries,
             Self::ListFailoverRecommendations(_) => {
                 RemoteProviderOperationKind::ListFailoverRecommendations
+            }
+            Self::ListAgents(_) => RemoteProviderOperationKind::ListAgents,
+            Self::CreateCustomAgent(_) => RemoteProviderOperationKind::CreateCustomAgent,
+            Self::DeleteCustomAgent(_) => RemoteProviderOperationKind::DeleteCustomAgent,
+            Self::ListModelProviderProfiles(_) => {
+                RemoteProviderOperationKind::ListModelProviderProfiles
+            }
+            Self::CreateModelProviderProfile(_) => {
+                RemoteProviderOperationKind::CreateModelProviderProfile
+            }
+            Self::UpdateModelProviderProfile(_) => {
+                RemoteProviderOperationKind::UpdateModelProviderProfile
+            }
+            Self::ListAgentRuntimeProfiles(_) => {
+                RemoteProviderOperationKind::ListAgentRuntimeProfiles
+            }
+            Self::CreateAgentRuntimeProfile(_) => {
+                RemoteProviderOperationKind::CreateAgentRuntimeProfile
+            }
+            Self::UpdateAgentRuntimeProfile(_) => {
+                RemoteProviderOperationKind::UpdateAgentRuntimeProfile
+            }
+            Self::ListAgentModelProviderBindings(_) => {
+                RemoteProviderOperationKind::ListAgentModelProviderBindings
+            }
+            Self::CreateAgentModelProviderBinding(_) => {
+                RemoteProviderOperationKind::CreateAgentModelProviderBinding
+            }
+            Self::UpdateAgentModelProviderBinding(_) => {
+                RemoteProviderOperationKind::UpdateAgentModelProviderBinding
+            }
+            Self::MutateProviderCredentialSecret(_) => {
+                RemoteProviderOperationKind::MutateProviderCredentialSecret
+            }
+            Self::SetAgentModelProviderDefault(_) => {
+                RemoteProviderOperationKind::SetAgentModelProviderDefault
             }
         }
     }

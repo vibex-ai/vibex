@@ -271,13 +271,29 @@ impl RemoteWorkbenchRuntime {
 #[derive(Clone)]
 pub struct RemoteProviderRuntime {
     db_path: PathBuf,
+    /// The runtime-owned service carries profile-change listeners. When it is
+    /// absent (legacy router builders and tests) a plain service is opened on
+    /// the same database.
+    service: Option<ProviderConfigService>,
 }
 
 impl RemoteProviderRuntime {
     pub fn new(db_path: impl Into<PathBuf>) -> Self {
         Self {
             db_path: db_path.into(),
+            service: None,
         }
+    }
+
+    pub fn with_config_service(mut self, service: ProviderConfigService) -> Self {
+        self.service = Some(service);
+        self
+    }
+
+    fn service(&self) -> ProviderConfigService {
+        self.service
+            .clone()
+            .unwrap_or_else(|| ProviderConfigService::new(self.db_path.clone()))
     }
 }
 
@@ -474,6 +490,16 @@ impl RemoteDispatcher {
                 workbench,
             ),
         }
+    }
+
+    /// Routes remote Provider management through the runtime's configured
+    /// `ProviderConfigService`, so profile-change listeners observe remote
+    /// mutations exactly like local ones.
+    pub fn with_provider_config_service(mut self, service: ProviderConfigService) -> Self {
+        if let Some(provider) = self.state.provider.as_mut() {
+            provider.service = Some(service);
+        }
+        self
     }
 
     pub fn with_runtime_option_catalog_source(
@@ -1340,7 +1366,7 @@ async fn dispatch_provider_request(
             "remote Provider settings APIs are not available on this service",
         )
     })?;
-    let service = ProviderConfigService::new(runtime.db_path.clone());
+    let service = runtime.service();
 
     match request {
         RemoteProviderRequest::ListAgentSummaries(request) => {
@@ -1559,6 +1585,301 @@ async fn dispatch_provider_request(
                 recommendations,
             })
             .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::ListAgents(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let agents = service
+                .list_agents(vibex_core::AgentListRequest {
+                    include_disabled: request.include_disabled,
+                })?
+                .agents
+                .into_iter()
+                .map(vibex_core::redact_agent_snapshot_for_remote)
+                .collect();
+            serde_json::to_value(vibex_core::RemoteAgentListResponse { agents })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::CreateCustomAgent(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let agent_id = request.request.agent_id.clone();
+            let result = service.create_custom_agent(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                format!("custom_agent:{agent_id}"),
+                "Custom Agent created from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let agent = vibex_core::redact_agent_snapshot_for_remote(result?);
+            serde_json::to_value(vibex_core::RemoteCustomAgentCreateResponse { agent })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::DeleteCustomAgent(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let agent_id = request.request.agent_id.clone();
+            let result = service.delete_custom_agent(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                format!("custom_agent:{agent_id}"),
+                "Custom Agent deleted from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            result?;
+            serde_json::to_value(vibex_core::RemoteCustomAgentDeleteResponse { agent_id })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::ListModelProviderProfiles(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let profiles = service.list_model_provider_profiles()?;
+            serde_json::to_value(vibex_core::RemoteModelProviderProfileListResponse { profiles })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::CreateModelProviderProfile(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = service.create_model_provider_profile(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                result
+                    .as_ref()
+                    .map(|profile| format!("model_provider:{}", profile.id))
+                    .unwrap_or_else(|_| "model_provider:create".to_string()),
+                "Model provider profile created from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let profile = result?;
+            serde_json::to_value(vibex_core::RemoteModelProviderProfileResponse { profile })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::UpdateModelProviderProfile(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let profile_id = request.request.profile.id.clone();
+            let result = service.update_model_provider_profile(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                format!("model_provider:{profile_id}"),
+                "Model provider profile updated from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let profile = result?;
+            serde_json::to_value(vibex_core::RemoteModelProviderProfileResponse { profile })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::ListAgentRuntimeProfiles(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let profiles = service.list_agent_runtime_profiles(&request.agent_id)?;
+            serde_json::to_value(vibex_core::RemoteAgentRuntimeProfileListResponse { profiles })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::CreateAgentRuntimeProfile(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let agent_id = request.request.version_identity.route.agent_id.clone();
+            let result = service.create_agent_runtime_profile(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                format!("agent_runtime_profile:{agent_id}"),
+                "Agent runtime profile created from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let profile = result?;
+            serde_json::to_value(vibex_core::RemoteAgentRuntimeProfileResponse { profile })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::UpdateAgentRuntimeProfile(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let profile_id = request.request.profile.id.clone();
+            let result = service.update_agent_runtime_profile(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                format!("agent_runtime_profile:{profile_id}"),
+                "Agent runtime profile updated from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let profile = result?;
+            serde_json::to_value(vibex_core::RemoteAgentRuntimeProfileResponse { profile })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::ListAgentModelProviderBindings(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let bindings = service.list_agent_model_provider_bindings(request.request)?;
+            serde_json::to_value(vibex_core::RemoteAgentModelProviderBindingListResponse {
+                bindings,
+            })
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::CreateAgentModelProviderBinding(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let agent_id = request.request.agent_id.clone();
+            let result = service.create_agent_model_provider_binding(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                format!("agent_model_provider_binding:{agent_id}"),
+                "Agent model provider binding created from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let binding = result?;
+            serde_json::to_value(vibex_core::RemoteAgentModelProviderBindingResponse { binding })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::UpdateAgentModelProviderBinding(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let binding_id = request.request.binding.id.clone();
+            let result = service.update_agent_model_provider_binding(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                format!("agent_model_provider_binding:{binding_id}"),
+                "Agent model provider binding updated from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let binding = result?;
+            serde_json::to_value(vibex_core::RemoteAgentModelProviderBindingResponse { binding })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::MutateProviderCredentialSecret(request) => {
+            let (proof, request) = request.into_request();
+            let auth = authorize_provider_action(
+                runtime,
+                proof,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let profile_id = request.model_provider_profile_id.clone();
+            let cleared = request.clear;
+            let result = service.mutate_provider_credential_secret(request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                format!("model_provider_secret:{profile_id}"),
+                if cleared {
+                    "Provider credential Secret cleared from a paired device"
+                } else {
+                    "Provider credential Secret replaced from a paired device"
+                },
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let profile = result?;
+            serde_json::to_value(vibex_core::RemoteModelProviderProfileResponse { profile })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::SetAgentModelProviderDefault(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let agent_id = request.request.agent_id.clone();
+            let result = service.set_agent_model_provider_default(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                format!("agent_model_provider_default:{agent_id}"),
+                "Agent default model provider selected from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let selection = result?;
+            serde_json::to_value(vibex_core::RemoteAgentModelProviderDefaultResponse { selection })
+                .map_err(remote_payload_encode_error)
         }
     }
 }
@@ -5741,6 +6062,159 @@ mod tests {
 
         cleanup_db(db_path);
         cleanup_workspace(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn remote_provider_management_mutations_are_full_control_only_and_round_trip() {
+        let (db_path, manager) = test_agent_manager("provider-management");
+        let reader = pair_device(&db_path, RemoteDevicePermissionLevel::ReadOnly, "Reader");
+        let admin = pair_device(&db_path, RemoteDevicePermissionLevel::FullControl, "Admin");
+        let router = build_router_with_agent_and_workbench(
+            RemoteServiceConfig::loopback_disabled(),
+            manager,
+            RemoteWorkbenchRuntime::new(db_path.clone(), TerminalManager::new()),
+        );
+
+        let info_response = router
+            .clone()
+            .oneshot(Request::get("/api/info").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let info_body = to_bytes(info_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let info: RemoteServiceInfo = serde_json::from_slice(&info_body).unwrap();
+        assert!(info.capabilities.supports_provider_management);
+
+        let create_request = |auth: RemoteAuthProof| {
+            RemoteProviderRequest::CreateModelProviderProfile(
+                vibex_core::RemoteModelProviderProfileCreateRequest {
+                    auth,
+                    request: vibex_core::ModelProviderProfileCreateRequest {
+                        display_name: "Remote Vendor".to_string(),
+                        vendor_hint: None,
+                        endpoints: vec![vibex_core::ModelProviderEndpoint {
+                            id: "api".to_string(),
+                            kind: vibex_core::ModelProviderEndpointKind::Api,
+                            url: "https://api.example.test/v1".to_string(),
+                            wire_protocol_id: None,
+                        }],
+                        proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                        credentials: Vec::new(),
+                        configured_models: Vec::new(),
+                        default_model_id: None,
+                        headers: Vec::new(),
+                        status: vibex_core::ModelProviderProfileStatus::Enabled,
+                    },
+                },
+            )
+        };
+        assert!(RemoteProviderRequest::is_mutation(&create_request(reader.clone())));
+        let denied = post_provider(router.clone(), create_request(reader.clone())).await;
+        assert_eq!(denied.error.unwrap().code, "remote_permission_denied");
+
+        let created = post_provider(router.clone(), create_request(admin.clone())).await;
+        let created: vibex_core::RemoteModelProviderProfileResponse =
+            serde_json::from_value(created.payload.unwrap()).unwrap();
+        assert_eq!(created.profile.display_name, "Remote Vendor");
+
+        let listed = post_provider(
+            router.clone(),
+            RemoteProviderRequest::ListModelProviderProfiles(
+                vibex_core::RemoteModelProviderProfileListRequest {
+                    auth: reader.clone(),
+                },
+            ),
+        )
+        .await;
+        let listed: vibex_core::RemoteModelProviderProfileListResponse =
+            serde_json::from_value(listed.payload.unwrap()).unwrap();
+        assert!(
+            listed
+                .profiles
+                .iter()
+                .any(|profile| profile.id == created.profile.id),
+            "read-only devices may list provider storage records"
+        );
+
+        let mut renamed = created.profile.clone();
+        renamed.display_name = "Renamed Vendor".to_string();
+        let updated = post_provider(
+            router.clone(),
+            RemoteProviderRequest::UpdateModelProviderProfile(
+                vibex_core::RemoteModelProviderProfileUpdateRequest {
+                    auth: admin.clone(),
+                    request: vibex_core::ModelProviderProfileUpdateRequest {
+                        profile: renamed,
+                        expected_revision: created.profile.revision,
+                    },
+                },
+            ),
+        )
+        .await;
+        let updated: vibex_core::RemoteModelProviderProfileResponse =
+            serde_json::from_value(updated.payload.unwrap()).unwrap();
+        assert_eq!(updated.profile.display_name, "Renamed Vendor");
+        assert_eq!(updated.profile.revision, created.profile.revision + 1);
+
+        let agents = post_provider(
+            router.clone(),
+            RemoteProviderRequest::ListAgents(vibex_core::RemoteAgentListRequest {
+                auth: reader.clone(),
+                include_disabled: true,
+            }),
+        )
+        .await;
+        let agents: vibex_core::RemoteAgentListResponse =
+            serde_json::from_value(agents.payload.unwrap()).unwrap();
+        assert!(!agents.agents.is_empty());
+        assert!(agents.agents.iter().all(|agent| {
+            agent.env.values().all(String::is_empty)
+                && agent.native_config_paths.is_empty()
+                && agent.diagnostics.is_empty()
+        }));
+
+        let secret_request = |auth: RemoteAuthProof| {
+            RemoteProviderRequest::MutateProviderCredentialSecret(
+                vibex_core::RemoteProviderCredentialSecretMutationRequest::from_request(
+                    auth,
+                    vibex_core::ProviderCredentialSecretMutationRequest {
+                        model_provider_profile_id: created.profile.id.clone(),
+                        credential_id: vibex_core::RequestId::new(),
+                        touched: false,
+                        clear: false,
+                        value: Some("never-logged".to_string()),
+                    },
+                ),
+            )
+        };
+        let debug = format!("{:?}", secret_request(admin.clone()));
+        assert!(!debug.contains("never-logged"));
+        let denied_secret = post_provider(router.clone(), secret_request(reader.clone())).await;
+        assert_eq!(
+            denied_secret.error.unwrap().code,
+            "remote_permission_denied"
+        );
+        let untouched = post_provider(router.clone(), secret_request(admin.clone())).await;
+        assert!(untouched.error.is_none());
+
+        let audit = RemoteAuditRepository::list(
+            &open_database(&db_path).unwrap(),
+            &vibex_core::RemoteAuditListRequest {
+                device_id: None,
+                limit: Some(50),
+            },
+        )
+        .unwrap();
+        assert!(audit.iter().any(|record| {
+            record.target_kind == RemoteAuditTargetKind::ProviderSettings
+                && record
+                    .target_id
+                    .as_deref()
+                    .is_some_and(|target| target.starts_with("model_provider:"))
+        }));
+
+        cleanup_db(db_path);
     }
 
     #[tokio::test]

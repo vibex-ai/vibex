@@ -245,6 +245,18 @@ pub use relay::{
     RelayPushRegistration, RelayRemoteHandshakeContext, RelayTransportMode,
 };
 pub use remote::{
+    RemoteAgentListRequest, RemoteAgentListResponse, RemoteAgentModelProviderBindingCreateRequest,
+    RemoteAgentModelProviderBindingListRequest, RemoteAgentModelProviderBindingListResponse,
+    RemoteAgentModelProviderBindingResponse, RemoteAgentModelProviderBindingUpdateRequest,
+    RemoteAgentModelProviderDefaultRequest, RemoteAgentModelProviderDefaultResponse,
+    RemoteAgentRuntimeProfileCreateRequest, RemoteAgentRuntimeProfileListRequest,
+    RemoteAgentRuntimeProfileListResponse, RemoteAgentRuntimeProfileResponse,
+    RemoteAgentRuntimeProfileUpdateRequest, RemoteCustomAgentCreateRequest,
+    RemoteCustomAgentCreateResponse, RemoteCustomAgentDeleteRequest,
+    RemoteCustomAgentDeleteResponse, RemoteModelProviderProfileCreateRequest,
+    RemoteModelProviderProfileListRequest, RemoteModelProviderProfileListResponse,
+    RemoteModelProviderProfileResponse, RemoteModelProviderProfileUpdateRequest,
+    RemoteProviderCredentialSecretMutationRequest, redact_agent_snapshot_for_remote,
     RemoteActionClass, RemoteAgentAttachRuntimeRequest, RemoteAgentAttachRuntimeResponse,
     RemoteAgentAuthContextListRequest, RemoteAgentAuthContextListResponse,
     RemoteAgentAuthContextMutationResponse, RemoteAgentAuthLogoutPreviewRequest,

@@ -2312,31 +2312,81 @@ impl TerminalBackend for WebRemoteBackend {
 }
 
 impl ManagementBackend for WebRemoteBackend {
-    fn list_agents(&self, _request: AgentListRequest) -> BackendFuture<'_, AgentListResponse> {
-        self.unsupported(
-            "remote_management_agents_unavailable",
-            "remote Agent management summaries are not exposed by this Gateway",
-        )
+    fn list_agents(&self, request: AgentListRequest) -> BackendFuture<'_, AgentListResponse> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::ListAgents(vibex_core::RemoteAgentListRequest {
+                auth: this.auth(),
+                include_disabled: request.include_disabled,
+            });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(AgentListResponse {
+                agents: decode::<vibex_core::RemoteAgentListResponse>(value)?.agents,
+            })
+        })
     }
 
     fn create_custom_agent(
         &self,
-        _request: MutationRequest<vibex_core::CustomAgentCreateRequest>,
+        request: MutationRequest<vibex_core::CustomAgentCreateRequest>,
     ) -> BackendFuture<'_, vibex_core::AgentSnapshotEntry> {
-        self.unsupported(
-            "remote_custom_agent_management_unavailable",
-            "custom Agent management is only available on the authoritative desktop",
-        )
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::CreateCustomAgent(
+                vibex_core::RemoteCustomAgentCreateRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteCustomAgentCreateResponse>(value)?.agent)
+        })
     }
 
     fn delete_custom_agent(
         &self,
-        _request: MutationRequest<vibex_core::CustomAgentDeleteRequest>,
+        request: MutationRequest<vibex_core::CustomAgentDeleteRequest>,
     ) -> BackendFuture<'_, ()> {
-        self.unsupported(
-            "remote_custom_agent_management_unavailable",
-            "custom Agent management is only available on the authoritative desktop",
-        )
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::DeleteCustomAgent(
+                vibex_core::RemoteCustomAgentDeleteRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            decode::<vibex_core::RemoteCustomAgentDeleteResponse>(value)?;
+            Ok(())
+        })
     }
 
     fn list_profiles(&self) -> BackendFuture<'_, Vec<ProviderProfileSummary>> {
@@ -2361,101 +2411,288 @@ impl ManagementBackend for WebRemoteBackend {
 
     fn select_profile(
         &self,
-        _request: MutationRequest<ManagementProfileSelectionRequest>,
+        request: MutationRequest<ManagementProfileSelectionRequest>,
     ) -> BackendFuture<'_, ProviderProfileSummary> {
-        self.unsupported(
-            "remote_provider_profile_select_unavailable",
-            "remote profile selection is not exposed by this Gateway",
-        )
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let selection_request = vibex_core::AgentModelProviderSetDefaultRequest {
+                scope: vibex_core::ProviderProfileDefaultScope {
+                    kind: vibex_core::ProviderDefaultScopeKind::Global,
+                    project_id: None,
+                    workspace_id: None,
+                },
+                agent_id: request.payload.agent_id,
+                provider_profile_id: request.payload.provider_profile_id,
+            };
+            let payload = RemoteProviderRequest::SetAgentModelProviderDefault(
+                vibex_core::RemoteAgentModelProviderDefaultRequest {
+                    auth: this.auth(),
+                    request: selection_request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            let selection =
+                decode::<vibex_core::RemoteAgentModelProviderDefaultResponse>(value)?.selection;
+            let profile_id = selection.provider_profile_id.ok_or_else(|| {
+                BackendError::failed(
+                    "management_profile_selection_empty",
+                    "provider selection returned no active profile",
+                )
+            })?;
+            let profiles = this.list_profiles().await?;
+            profiles
+                .into_iter()
+                .find(|profile| profile.id == profile_id)
+                .ok_or_else(|| {
+                    BackendError::failed(
+                        "management_profile_selection_missing",
+                        "the selected provider profile is no longer listed by the runtime",
+                    )
+                })
+        })
     }
 
     fn list_model_provider_profiles(
         &self,
     ) -> BackendFuture<'_, Vec<vibex_core::ModelProviderProfile>> {
-        self.unsupported(
-            "remote_model_provider_profiles_private",
-            "remote clients receive projection capabilities instead of provider storage records",
-        )
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::ListModelProviderProfiles(
+                vibex_core::RemoteModelProviderProfileListRequest { auth: this.auth() },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteModelProviderProfileListResponse>(value)?.profiles)
+        })
     }
 
     fn create_model_provider_profile(
         &self,
-        _request: MutationRequest<vibex_core::ModelProviderProfileCreateRequest>,
+        request: MutationRequest<vibex_core::ModelProviderProfileCreateRequest>,
     ) -> BackendFuture<'_, vibex_core::ModelProviderProfile> {
-        self.unsupported(
-            "remote_model_provider_mutation_unavailable",
-            "model provider mutations must be performed by the authoritative desktop",
-        )
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::CreateModelProviderProfile(
+                vibex_core::RemoteModelProviderProfileCreateRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteModelProviderProfileResponse>(value)?.profile)
+        })
     }
 
     fn update_model_provider_profile(
         &self,
-        _request: MutationRequest<vibex_core::ModelProviderProfileUpdateRequest>,
+        request: MutationRequest<vibex_core::ModelProviderProfileUpdateRequest>,
     ) -> BackendFuture<'_, vibex_core::ModelProviderProfile> {
-        self.unsupported(
-            "remote_model_provider_mutation_unavailable",
-            "model provider mutations must be performed by the authoritative desktop",
-        )
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::UpdateModelProviderProfile(
+                vibex_core::RemoteModelProviderProfileUpdateRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteModelProviderProfileResponse>(value)?.profile)
+        })
     }
 
     fn list_agent_runtime_profiles(
         &self,
-        _agent_id: vibex_core::AgentId,
+        agent_id: vibex_core::AgentId,
     ) -> BackendFuture<'_, Vec<vibex_core::AgentRuntimeProfile>> {
-        self.unsupported(
-            "remote_agent_runtime_profiles_private",
-            "remote clients do not receive native Agent command or runtime-home records",
-        )
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::ListAgentRuntimeProfiles(
+                vibex_core::RemoteAgentRuntimeProfileListRequest {
+                    auth: this.auth(),
+                    agent_id,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentRuntimeProfileListResponse>(value)?.profiles)
+        })
     }
 
     fn create_agent_runtime_profile(
         &self,
-        _request: MutationRequest<vibex_core::AgentRuntimeProfileCreateRequest>,
+        request: MutationRequest<vibex_core::AgentRuntimeProfileCreateRequest>,
     ) -> BackendFuture<'_, vibex_core::AgentRuntimeProfile> {
-        self.unsupported(
-            "remote_agent_runtime_mutation_unavailable",
-            "Agent runtime mutations must be performed by the authoritative desktop",
-        )
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::CreateAgentRuntimeProfile(
+                vibex_core::RemoteAgentRuntimeProfileCreateRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentRuntimeProfileResponse>(value)?.profile)
+        })
     }
 
     fn update_agent_runtime_profile(
         &self,
-        _request: MutationRequest<vibex_core::AgentRuntimeProfileUpdateRequest>,
+        request: MutationRequest<vibex_core::AgentRuntimeProfileUpdateRequest>,
     ) -> BackendFuture<'_, vibex_core::AgentRuntimeProfile> {
-        self.unsupported(
-            "remote_agent_runtime_mutation_unavailable",
-            "Agent runtime mutations must be performed by the authoritative desktop",
-        )
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::UpdateAgentRuntimeProfile(
+                vibex_core::RemoteAgentRuntimeProfileUpdateRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentRuntimeProfileResponse>(value)?.profile)
+        })
     }
 
     fn list_agent_model_provider_bindings(
         &self,
-        _request: vibex_core::AgentModelProviderBindingListRequest,
+        request: vibex_core::AgentModelProviderBindingListRequest,
     ) -> BackendFuture<'_, Vec<vibex_core::AgentModelProviderBinding>> {
-        self.unsupported(
-            "remote_agent_provider_bindings_private",
-            "remote clients receive projection capabilities instead of binding storage records",
-        )
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::ListAgentModelProviderBindings(
+                vibex_core::RemoteAgentModelProviderBindingListRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentModelProviderBindingListResponse>(value)?.bindings)
+        })
     }
 
     fn create_agent_model_provider_binding(
         &self,
-        _request: MutationRequest<vibex_core::AgentModelProviderBindingCreateRequest>,
+        request: MutationRequest<vibex_core::AgentModelProviderBindingCreateRequest>,
     ) -> BackendFuture<'_, vibex_core::AgentModelProviderBinding> {
-        self.unsupported(
-            "remote_agent_provider_binding_mutation_unavailable",
-            "Agent provider binding mutations must be performed by the authoritative desktop",
-        )
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::CreateAgentModelProviderBinding(
+                vibex_core::RemoteAgentModelProviderBindingCreateRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentModelProviderBindingResponse>(value)?.binding)
+        })
     }
 
     fn update_agent_model_provider_binding(
         &self,
-        _request: MutationRequest<vibex_core::AgentModelProviderBindingUpdateRequest>,
+        request: MutationRequest<vibex_core::AgentModelProviderBindingUpdateRequest>,
     ) -> BackendFuture<'_, vibex_core::AgentModelProviderBinding> {
-        self.unsupported(
-            "remote_agent_provider_binding_mutation_unavailable",
-            "Agent provider binding mutations must be performed by the authoritative desktop",
-        )
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::UpdateAgentModelProviderBinding(
+                vibex_core::RemoteAgentModelProviderBindingUpdateRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentModelProviderBindingResponse>(value)?.binding)
+        })
     }
 
     fn agent_provider_projection_capability(
@@ -2614,12 +2851,29 @@ impl ManagementBackend for WebRemoteBackend {
 
     fn mutate_provider_credential_secret(
         &self,
-        _request: MutationRequest<vibex_core::ProviderCredentialSecretMutationRequest>,
+        request: MutationRequest<vibex_core::ProviderCredentialSecretMutationRequest>,
     ) -> BackendFuture<'_, vibex_core::ModelProviderProfile> {
-        self.unsupported(
-            "remote_provider_secret_mutation_unavailable",
-            "Secret values never cross the Remote provider protocol",
-        )
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::MutateProviderCredentialSecret(
+                vibex_core::RemoteProviderCredentialSecretMutationRequest::from_request(
+                    this.auth(),
+                    request.payload,
+                ),
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteModelProviderProfileResponse>(value)?.profile)
+        })
     }
 
     fn health_summaries(&self) -> BackendFuture<'_, Vec<ProviderHealthSummary>> {
@@ -2834,6 +3088,7 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
     let has_worktree_read = features.contains("git_worktree_read");
     let has_terminal = features.is_empty() || features.contains("terminal");
     let has_provider = features.is_empty() || features.contains("provider_settings");
+    let has_provider_management = has_provider && features.contains("provider_management");
     let has_device = features.contains("device_management");
     let has_device_pairing = features.contains("device_pairing");
     let permits = |action: RemoteActionClass| {
@@ -3026,12 +3281,28 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
         management: if has_provider {
             available_filtered([
                 (
+                    BackendOperation::ManagementAgents,
+                    has_provider_management && permits(RemoteActionClass::ReadProviderSettings),
+                ),
+                (
                     BackendOperation::ManagementProfiles,
                     permits(RemoteActionClass::ReadProviderSettings),
                 ),
                 (
+                    BackendOperation::ManagementProfileSelect,
+                    has_provider_management && permits(RemoteActionClass::MutateProviderSettings),
+                ),
+                (
                     BackendOperation::ManagementProviderProjectionRead,
                     permits(RemoteActionClass::ReadProviderSettings),
+                ),
+                (
+                    BackendOperation::ManagementProviderProjectionMutate,
+                    has_provider_management && permits(RemoteActionClass::MutateProviderSettings),
+                ),
+                (
+                    BackendOperation::ManagementProviderSecretMutate,
+                    has_provider_management && permits(RemoteActionClass::MutateProviderSettings),
                 ),
                 (
                     BackendOperation::ManagementRuntimeProbeRead,
