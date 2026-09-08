@@ -1462,12 +1462,17 @@ fn render_composer_plan_details(
     max_height: f32,
     cx: &App,
 ) -> AnyElement {
-    // The scroll viewport has to be clamped by an ancestor: a `max_h` on the
-    // scrollable element itself leaves its wrapper auto-height, so the inner
-    // area grows to full content height and clips instead of scrolling. The
-    // card caps at `max_height` and the flex chain hands the step list the
-    // room left over after the header and divider.
-    let mut step_list = v_flex().w_full().overflow_y_scrollbar();
+    // Clamp the scrolling element itself instead of a flex/percentage
+    // viewport: inside this auto-height card those resolve to zero height or
+    // full content height, while a max_h on the scroll container gives it a
+    // real box to scroll within. Same idiom as the queued-message preview.
+    let mut step_list = v_flex()
+        .id(SharedString::from(format!(
+            "composer-plan-steps-{surface_id}"
+        )))
+        .w_full()
+        .max_h(px(max_height - 74.0))
+        .overflow_y_scroll();
     for (index, step) in plan.steps.iter().enumerate() {
         let icon = match step.status {
             PlanStepStatus::Pending => div()
@@ -1576,7 +1581,7 @@ fn render_composer_plan_details(
                 ),
         )
         .child(div().w_full().h(px(1.0)).bg(cx.theme().border))
-        .child(div().flex_1().min_h_0().overflow_hidden().child(step_list))
+        .child(step_list)
         .into_any_element()
 }
 
