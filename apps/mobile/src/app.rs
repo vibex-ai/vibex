@@ -8,11 +8,11 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt as _;
 use gpui::{
     Animation, AnimationExt as _, App, AppContext as _, ClipboardItem, Context, ElementId, Entity,
-    Focusable, FontWeight, Hsla, Image, ImageFormat, IntoElement, KeyBinding, ListAlignment,
-    ListOffset, ListState, MouseButton, MouseUpEvent, ObjectFit, ParentElement as _, Render,
-    ScrollDelta, ScrollHandle, ScrollWheelEvent, Styled as _, Task, TouchPhase, Transformation,
-    UniformListScrollHandle, WeakEntity, Window, div, ease_in_out, ease_out_quint, img, list,
-    percentage, prelude::*, px, rgb, svg, uniform_list,
+    FocusHandle, Focusable, FontWeight, Hsla, Image, ImageFormat, IntoElement, KeyBinding,
+    ListAlignment, ListOffset, ListState, MouseButton, MouseUpEvent, ObjectFit, ParentElement as _,
+    Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, Styled as _, Task, TouchPhase,
+    Transformation, UniformListScrollHandle, WeakEntity, Window, div, ease_in_out, ease_out_quint,
+    img, list, percentage, prelude::*, px, rgb, svg, uniform_list,
 };
 use vibex_backend::{
     AgentBackend as _, BackendError, BackendEvent, BackendFuture, BackendOperation,
@@ -663,9 +663,20 @@ pub struct MobileApp {
     tasks: Vec<Task<()>>,
     /// Ordered by recency: the front is the screen the back key closes first.
     back_stack: Vec<BackScreen>,
+    /// The window's fallback focus. GPUI routes keystroke bindings and
+    /// dispatched actions along the focused element's dispatch path, so with
+    /// no focus anywhere the root `on_action` handlers would never fire. This
+    /// handle keeps the root reachable whenever no text input holds focus.
+    root_focus: FocusHandle,
     /// Cached battery-optimization allowlist state, refreshed when Settings
     /// opens so returning from the system dialog updates the row.
     battery_allowlist_ok: bool,
+}
+
+impl Focusable for MobileApp {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.root_focus.clone()
+    }
 }
 
 fn timeline_action_button(
@@ -898,6 +909,7 @@ impl MobileApp {
             pending_notification_action: None,
             battery_allowlist_ok: power::is_ignoring_battery_optimizations(),
             back_stack: Vec::new(),
+            root_focus: cx.focus_handle(),
             tasks: Vec::new(),
         };
         if let Ok(Some(bundle)) = stored {
@@ -907,6 +919,10 @@ impl MobileApp {
         app.start_notification_action_stream(cx);
         app.start_lan_discovery_event_stream(cx);
         app.start_lifecycle_stream(cx);
+        // Keep the window root on the dispatch path from the very first frame
+        // so system back events reach `handle_navigate_back` before any text
+        // input has taken focus.
+        app.root_focus.focus(window, cx);
         app
     }
 
@@ -5200,6 +5216,7 @@ impl MobileApp {
             .items_center()
             .justify_center()
             .px(px(theme::SPACING_XL))
+            .track_focus(&self.root_focus)
             .on_action(cx.listener(Self::handle_navigate_back))
             .child(
                 div()
@@ -5583,6 +5600,7 @@ impl MobileApp {
             .items_center()
             .justify_center()
             .px(px(theme::SPACING_XL))
+            .track_focus(&self.root_focus)
             .on_action(cx.listener(Self::handle_navigate_back))
             .child(
                 svg()
@@ -5740,6 +5758,7 @@ impl MobileApp {
             .size_full()
             .relative()
             .capture_scroll_wheel(cx.listener(Self::drawer_pan))
+            .track_focus(&self.root_focus)
             .on_action(cx.listener(Self::handle_navigate_back))
             .child(
                 div()
@@ -12166,6 +12185,13 @@ impl MobileApp {
 impl Render for MobileApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_elicitation_form(cx);
+        // When the focused text input unmounts (search closing, overlay
+        // dismissing), GPUI drops focus entirely and keystroke bindings stop
+        // dispatching. Reclaim the window root so back navigation keeps
+        // working; a live input focus is left untouched.
+        if window.focused(cx).is_none() {
+            self.root_focus.focus(window, cx);
+        }
         let insets = window.insets().effective();
         let page_width = workspace_page_width(window);
         let root_background = match visible_drawer_page(self.drawer_offset, self.drawer_snap) {
@@ -15679,6 +15705,60 @@ mod tests {
     fn header_button_targets_the_full_sessions_page() {
         assert_eq!(sessions_button_target(false), 1.0);
         assert_eq!(sessions_button_target(true), 0.0);
+    }
+
+    #[gpui::test]
+    fn back_keystroke_pops_the_top_of_the_page_stack(cx: &mut TestAppContext) {
+        cx.update(bind_keys);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = MobileApp::new(data_dir.path().to_path_buf(), window, cx);
+            app.mode = RootMode::Workspace;
+            app
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        app.update(cx, |app, cx| {
+            app.start_drawer_snap(DrawerPage::Sessions.open_offset(), None, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.back_stack.clone()),
+            vec![BackScreen::SessionsDrawer]
+        );
+
+        // The constructor leaves the window root focused, so the keystroke has
+        // a dispatch path even before any text input has taken focus; this
+        // assertion fails if back navigation silently dead-ends again.
+        cx.simulate_keystrokes("back");
+
+        let (stack, drawer_open) =
+            app.read_with(cx, |app, _| (app.back_stack.clone(), app.drawer_open));
+        assert!(stack.is_empty(), "back stack after back key: {stack:?}");
+        assert!(!drawer_open, "sessions drawer must close on back");
+    }
+
+    #[gpui::test]
+    fn back_keystroke_is_ignored_while_pairing(cx: &mut TestAppContext) {
+        cx.update(bind_keys);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            MobileApp::new(data_dir.path().to_path_buf(), window, cx)
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(app.read_with(cx, |app, _| matches!(app.mode, RootMode::Pairing)));
+
+        // Pressing back on the pairing screen must not panic or mutate state.
+        cx.simulate_keystrokes("back");
+        assert_eq!(
+            app.read_with(cx, |app, _| app.back_stack.clone()),
+            Vec::<BackScreen>::new()
+        );
     }
 
     #[gpui::test]
