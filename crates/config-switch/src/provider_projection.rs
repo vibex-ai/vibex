@@ -638,6 +638,12 @@ impl ProviderConfigService {
         request: ModelProviderProfileUpdateRequest,
     ) -> VibexResult<ModelProviderProfile> {
         let mut profile = request.profile;
+        // The request carries the revision observed by the client. The
+        // repository owns the write contract and requires the replacement
+        // record to advance exactly once from that expected revision. Keep
+        // that calculation here so remote clients do not need to manufacture
+        // a second, derived revision before submitting a full profile.
+        profile.revision = request.expected_revision.saturating_add(1);
         profile.updated_at_ms = unix_timestamp_ms().max(profile.updated_at_ms.saturating_add(1));
         let conn = self.open_connection()?;
         let updated =
@@ -6091,5 +6097,39 @@ mod tests {
                 .status,
             AgentModelProviderBindingStatus::Ready
         );
+    }
+
+    #[test]
+    fn model_provider_update_derives_next_revision_from_expected_revision() {
+        let dir = tempdir().unwrap();
+        let service = ProviderConfigService::new(dir.path().join("vibex.db"));
+        let created = service
+            .create_model_provider_profile(ModelProviderProfileCreateRequest {
+                display_name: "Revision test".to_string(),
+                vendor_hint: None,
+                endpoints: Vec::new(),
+                proxy_policy: ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: Vec::new(),
+                default_model_id: None,
+                headers: Vec::new(),
+                status: ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap();
+
+        // Clients submit the version they read in the profile and the
+        // compare-and-swap token separately; the service derives the stored
+        // replacement revision.
+        let mut update = created.clone();
+        update.display_name = "Revision test updated".to_string();
+        let updated = service
+            .update_model_provider_profile(ModelProviderProfileUpdateRequest {
+                profile: update,
+                expected_revision: created.revision,
+            })
+            .unwrap();
+
+        assert_eq!(updated.display_name, "Revision test updated");
+        assert_eq!(updated.revision, created.revision + 1);
     }
 }

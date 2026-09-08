@@ -35,7 +35,8 @@ use vibex_core::{
     REMOTE_V2_MAX_BINARY_PAYLOAD_BYTES, RelayEncryptedFrame, RelayRemoteHandshakeContext,
     RelaySessionId, RemoteActionClass, RemoteAttachmentAcceptedV2, RemoteAttachmentKind,
     RemoteAuthContext, RemoteAuthProof, RemoteBinaryFrame, RemoteBinaryFrameHeader,
-    RemoteBinaryFrameKind, RemoteCancelPairingOfferRequest, RemoteClaimPairingOfferRequest,
+    RemoteBinaryFrameKind, RemoteCancelPairingOfferRequest, RemoteClaimPairingCodeRequest,
+    RemoteClaimPairingCodeResponse, RemoteClaimPairingOfferRequest,
     RemoteClaimPairingOfferResponse, RemoteCloseCode, RemoteCloseReason, RemoteControlMessageV2,
     RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeviceListResponse,
     RemoteDevicePermissionLevel, RemoteDeviceRequest, RemoteEventV2, RemoteHello,
@@ -89,9 +90,10 @@ const DEFAULT_PEER_AUTH_FAILURES_PER_WINDOW: u32 = 10;
 const DEFAULT_PEER_LIMIT_WINDOW_MS: u64 = 60_000;
 const DEFAULT_PEER_LIMIT_TRACKED_PEERS: usize = 4_096;
 const MAX_PEER_LIMIT_WINDOW_MS: u64 = 60 * 60 * 1000;
-const PEER_LIMITED_PATHS: [&str; 6] = [
+const PEER_LIMITED_PATHS: [&str; 7] = [
     "/api/v2/info",
     "/api/v2/pairing/claim",
+    "/api/v2/pairing/code/claim",
     "/api/v2/ws-ticket",
     "/api/v2/pairing/lan",
     "/api/v2/pairing/lan/request",
@@ -1955,7 +1957,8 @@ impl RemoteGateway {
             .with_diagnostic("errorKind", format!("{:?}", error.kind()))
         })?;
         let service = router.into_make_service_with_connect_info::<SocketAddr>();
-        let (shutdown, tls_handle, task) = if tls_policy == RemoteGatewayTlsPolicy::ServerCertificate
+        let (shutdown, tls_handle, task) = if tls_policy
+            == RemoteGatewayTlsPolicy::ServerCertificate
         {
             let identity = tls_identity.ok_or_else(|| {
                 VibexError::validation(
@@ -1981,13 +1984,14 @@ impl RemoteGateway {
                 )
                 .with_diagnostic("errorKind", format!("{:?}", error.kind()))
             })?;
-            let server = axum_server::from_tcp_rustls(std_listener, tls_config).map_err(|error| {
-                VibexError::process(
-                    "remote_gateway_listener_config_failed",
-                    "RemoteGateway TLS server could not be initialized",
-                )
-                .with_diagnostic("errorKind", format!("{:?}", error.kind()))
-            })?;
+            let server =
+                axum_server::from_tcp_rustls(std_listener, tls_config).map_err(|error| {
+                    VibexError::process(
+                        "remote_gateway_listener_config_failed",
+                        "RemoteGateway TLS server could not be initialized",
+                    )
+                    .with_diagnostic("errorKind", format!("{:?}", error.kind()))
+                })?;
             let handle = AxumServerHandle::new();
             let task_handle = handle.clone();
             let task = tokio::spawn(async move {
@@ -2261,7 +2265,8 @@ impl PeerRateLimiter {
         let window_ms = i64::try_from(limits.window_ms).unwrap_or(i64::MAX);
         if !windows.contains_key(peer) && windows.len() >= limits.max_tracked_peers {
             // Evict expired windows first, then the least recently seen peer.
-            windows.retain(|_, window| now_ms.saturating_sub(window.window_started_at_ms) < window_ms);
+            windows
+                .retain(|_, window| now_ms.saturating_sub(window.window_started_at_ms) < window_ms);
             if windows.len() >= limits.max_tracked_peers
                 && let Some(oldest) = windows
                     .iter()
@@ -2283,8 +2288,8 @@ impl PeerRateLimiter {
     }
 
     fn retry_after(window: &PeerWindow, limits: &RemoteGatewayPeerLimits, now_ms: i64) -> u64 {
-        let elapsed = u64::try_from(now_ms.saturating_sub(window.window_started_at_ms))
-            .unwrap_or_default();
+        let elapsed =
+            u64::try_from(now_ms.saturating_sub(window.window_started_at_ms)).unwrap_or_default();
         limits.window_ms.saturating_sub(elapsed).max(1)
     }
 
@@ -2484,6 +2489,7 @@ fn build_gateway_router(state: GatewayState) -> Router {
     let v2 = Router::new()
         .route("/api/v2/info", get(gateway_info))
         .route("/api/v2/pairing/claim", post(claim_pairing_offer))
+        .route("/api/v2/pairing/code/claim", post(claim_pairing_code))
         .route("/api/v2/ws-ticket", post(issue_ws_ticket))
         .route("/ws/v2", get(ws_v2))
         .with_state(state.clone())
@@ -2716,6 +2722,7 @@ async fn gateway_info(State(state): State<GatewayState>) -> Response {
         "protocolRange": RemoteProtocolVersionRange::v2(),
         "wsPath": "/ws/v2",
         "pairingClaimPath": "/api/v2/pairing/claim",
+        "pairingCodeClaimPath": "/api/v2/pairing/code/claim",
         "lanPairingDiscoveryPath": "/api/v2/pairing/lan",
         "lanPairingRequestPath": "/api/v2/pairing/lan/request",
         "lanPairingStatusPath": "/api/v2/pairing/lan/status",
@@ -2807,6 +2814,40 @@ async fn claim_pairing_offer(
             let _ = state.lan_pairing.clear_offer(&offer_id);
             Json(response).into_response()
         }
+        Err(error) => {
+            state
+                .peer_limiter
+                .record_auth_failure(&peer, &state.config.peer_limits, now_ms);
+            protocol_error_response(status_for_error(&error), error)
+        }
+    }
+}
+
+/// Claim the operator-displayed numeric pairing code.  The code is accepted
+/// only in the JSON body so it cannot leak through access logs, browser
+/// history, proxies, or URL referrers.  This endpoint deliberately creates a
+/// normal device grant; the client must immediately persist the returned
+/// credential and never send the one-time code again.
+async fn claim_pairing_code(
+    State(state): State<GatewayState>,
+    peer: Option<axum::Extension<PeerKey>>,
+    Json(request): Json<RemoteClaimPairingCodeRequest>,
+) -> Response {
+    let peer = peer_from_extensions(peer);
+    let now_ms = unix_timestamp_ms();
+    if let PeerLimitDecision::Limited { retry_after_ms } =
+        state
+            .peer_limiter
+            .check_auth_attempt(&peer, &state.config.peer_limits, now_ms)
+    {
+        return rate_limited_response(retry_after_ms);
+    }
+    let connection = match open_migrated_database(&state.db_path) {
+        Ok(connection) => connection,
+        Err(error) => return protocol_error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
+    };
+    match RemoteTrustService::claim_pairing_code(&connection, request) {
+        Ok(response) => Json::<RemoteClaimPairingCodeResponse>(response).into_response(),
         Err(error) => {
             state
                 .peer_limiter
@@ -6701,6 +6742,76 @@ mod tests {
         gateway.stop().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn gateway_pairing_code_claim_issues_one_device_and_rejects_reuse() {
+        let directory = tempfile::tempdir().unwrap();
+        let gateway = test_gateway(
+            &directory,
+            RemoteGatewayConfig::loopback_enabled("127.0.0.1:1428"),
+        );
+        let router = gateway.router().unwrap();
+        let connection = open_migrated_database(&gateway.inner.db_path).unwrap();
+        let pairing = RemoteTrustService::create_pairing_code(
+            &connection,
+            RemoteCreatePairingCodeRequest {
+                permission_level: RemoteDevicePermissionLevel::ApproveOnly,
+                ttl_ms: Some(60_000),
+            },
+        )
+        .unwrap();
+        let request_body = |pairing_code: &str| {
+            HttpRequest::post("/api/v2/pairing/code/claim")
+                .header(HOST, "127.0.0.1")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&RemoteClaimPairingCodeRequest {
+                        pairing_code: pairing_code.to_string(),
+                        display_name: "Headless Client".to_string(),
+                        public_key: Some("client-public-key".to_string()),
+                    })
+                    .unwrap(),
+                ))
+                .unwrap()
+        };
+
+        let claimed = router
+            .clone()
+            .oneshot(request_body(&pairing.pairing_code))
+            .await
+            .unwrap();
+        assert_eq!(claimed.status(), StatusCode::OK);
+        let body = to_bytes(claimed.into_body(), usize::MAX).await.unwrap();
+        let claimed: vibex_core::RemoteClaimPairingCodeResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            claimed.device.status,
+            vibex_core::RemoteDeviceStatus::Active
+        );
+        assert_eq!(
+            claimed.device.permission_level,
+            RemoteDevicePermissionLevel::ApproveOnly
+        );
+        assert_eq!(
+            claimed.device.public_key.as_deref(),
+            Some("client-public-key")
+        );
+        assert!(!claimed.auth_token.is_empty());
+
+        let reused = router
+            .oneshot(request_body(&pairing.pairing_code))
+            .await
+            .unwrap();
+        assert_eq!(reused.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(reused.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("remote_pairing_code_invalid"));
+
+        let debugged = format!("{:?}", claimed);
+        assert!(
+            !debugged.contains(&claimed.auth_token),
+            "the issued auth token must not appear in derived debug output"
+        );
+    }
+
     fn pair_test_device(
         database_path: &FsPath,
         permission_level: RemoteDevicePermissionLevel,
@@ -6854,8 +6965,8 @@ mod tests {
             config.validate().unwrap_err().code,
             "remote_gateway_tls_identity_invalid"
         );
-        let certified = rcgen::generate_simple_self_signed(vec!["vibex.example.test".to_string()])
-            .unwrap();
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["vibex.example.test".to_string()]).unwrap();
         config.tls_identity = Some(
             RemoteGatewayTlsIdentity::from_pem(
                 test_pem_block("CERTIFICATE", certified.cert.der()),
@@ -6940,7 +7051,11 @@ mod tests {
             limiter.check_unauthenticated_request("198.51.100.3", &limits, 21_200),
             PeerLimitDecision::Allowed
         );
-        assert_eq!(limiter.tracked_peers(), 2, "the tracked peer map stays bounded");
+        assert_eq!(
+            limiter.tracked_peers(),
+            2,
+            "the tracked peer map stays bounded"
+        );
     }
 
     #[test]
@@ -6978,8 +7093,8 @@ mod tests {
     #[tokio::test]
     async fn public_gateway_terminates_tls_with_its_own_certificate_and_rate_limits_peers() {
         let directory = tempfile::tempdir().unwrap();
-        let certified = rcgen::generate_simple_self_signed(vec!["vibex.example.test".to_string()])
-            .unwrap();
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["vibex.example.test".to_string()]).unwrap();
         let mut config = RemoteGatewayConfig::loopback_enabled("127.0.0.1:0");
         config.deployment_mode = RemoteGatewayDeploymentMode::Public;
         config.tls_policy = RemoteGatewayTlsPolicy::ServerCertificate;
@@ -7024,7 +7139,12 @@ mod tests {
         );
         let limited = client.get(&url).send().await.unwrap();
         assert_eq!(limited.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
-        assert!(limited.headers().get(reqwest::header::RETRY_AFTER).is_some());
+        assert!(
+            limited
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .is_some()
+        );
         let body: serde_json::Value = limited.json().await.unwrap();
         assert_eq!(body["error"]["code"], "remote_rate_limited");
         assert_eq!(body["retryable"], true);
@@ -7046,7 +7166,9 @@ mod tests {
         gateway.stop().await.unwrap();
         assert!(!gateway.status().running);
         let rebind = tokio::net::TcpListener::bind(address).await;
-        assert!(rebind.is_ok(), "stopping the TLS listener releases its socket");
+        assert!(
+            rebind.is_ok(),
+            "stopping the TLS listener releases its socket"
+        );
     }
-
 }

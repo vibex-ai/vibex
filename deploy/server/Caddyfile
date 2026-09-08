@@ -1,0 +1,19 @@
+# Vibex headless runtime reverse proxy.
+# Set VIBEX_SERVER_SITE_ADDRESS to your public host, for example:
+#   VIBEX_SERVER_SITE_ADDRESS=vibex.example.com
+#
+# Remote v2 keeps control, RPC, events, and binary frames on one full-duplex
+# WebSocket at /ws/v2, so the proxy must forward upgrade requests unchanged.
+# The HTTP surface (/api/v2/*) carries the pairing-code claim and WS tickets;
+# pairing codes are sent in JSON bodies and never appear in URLs or logs.
+# The server enforces its own Host/Origin allowlists and per-peer rate
+# limits; this proxy only terminates TLS.
+
+{$VIBEX_SERVER_SITE_ADDRESS:vibex.example.com} {
+	encode zstd gzip
+
+	@websocket path /ws/v2
+	reverse_proxy @websocket vibex-server:8765
+
+	reverse_proxy vibex-server:8765
+}

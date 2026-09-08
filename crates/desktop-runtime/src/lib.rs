@@ -62,8 +62,9 @@ use vibex_desktop_model::DesktopPollingPolicy;
 use vibex_diagnostics::{DiagnosticBundleService, DiagnosticBundleServiceConfig};
 use vibex_remote::{
     RemoteAgentRuntimeProbeSource, RemoteDispatcher, RemoteGateway, RemoteGatewayConfig,
-    RemoteRouter, RemoteServiceConfig, RemoteWorkbenchRuntime, RemoteWorktreeSnapshotSource,
-    build_router_with_dispatcher,
+    RemoteGatewayDeploymentMode, RemoteGatewayPeerLimits, RemoteGatewayTlsIdentity,
+    RemoteGatewayTlsPolicy, RemoteRouter, RemoteServiceConfig, RemoteWorkbenchRuntime,
+    RemoteWorktreeSnapshotSource, build_router_with_dispatcher,
 };
 use vibex_terminal::TerminalManager;
 
@@ -119,6 +120,7 @@ pub const PREVIEW_HOME_DIRECTORY: &str = "desktop-preview";
 pub const RC_APP_ID: &str = "dev.vibex.desktop.rc";
 pub const RC_HOME_DIRECTORY: &str = "desktop-rc";
 pub const RELEASE_STABLE_HOME_DIRECTORY: &str = "desktop-stable";
+pub const HEADLESS_APP_ID: &str = "dev.vibex.server";
 pub const NATIVE_TERMINAL_RING_CAPACITY: usize = 2_000;
 pub const NATIVE_TERMINAL_RAW_CAPACITY_BYTES: usize = 10 * 1024 * 1024;
 pub const DESKTOP_UI_STATE_FILE: &str = "desktop-ui-state.json";
@@ -192,6 +194,7 @@ pub enum DesktopRuntimeMode {
     Preview,
     ReleaseCandidate,
     ReleaseStable,
+    Headless,
 }
 
 #[derive(Debug, Clone)]
@@ -212,6 +215,148 @@ pub struct DesktopRuntimeConfig {
 }
 
 impl DesktopRuntimeConfig {
+    /// Construct the production headless runtime from the documented
+    /// `VIBEX_*` environment contract.  The default is a loopback listener;
+    /// binding a cloud/public address requires an explicit deployment mode and
+    /// TLS policy, so an accidental container environment never creates an
+    /// unauthenticated Internet service.
+    pub fn headless_from_environment() -> VibexResult<Self> {
+        let home_dir = std::env::var_os("VIBEX_HOME")
+            .map(PathBuf::from)
+            .filter(|path| !path.as_os_str().is_empty())
+            .or_else(|| {
+                std::env::var_os("VIBEX_DB_PATH")
+                    .and_then(|path| PathBuf::from(path).parent().map(Path::to_path_buf))
+            })
+            .or_else(|| {
+                default_database_path()
+                    .ok()
+                    .and_then(|path| path.parent().map(Path::to_path_buf))
+            })
+            .unwrap_or_else(|| PathBuf::from("/data"));
+        let database_path = std::env::var_os("VIBEX_DB_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_dir.join("vibex.db"));
+        let bind_addr =
+            environment_string("VIBEX_BIND_ADDR").unwrap_or_else(|| "127.0.0.1:8765".to_string());
+        let deployment_mode = parse_deployment_mode(
+            &environment_string("VIBEX_DEPLOYMENT_MODE").unwrap_or_else(|| "loopback".to_string()),
+        )?;
+        let tls_policy =
+            parse_tls_policy(&environment_string("VIBEX_TLS_MODE").unwrap_or_else(|| {
+                if deployment_mode == RemoteGatewayDeploymentMode::Loopback {
+                    "loopback_http".to_string()
+                } else {
+                    "trusted_https_proxy".to_string()
+                }
+            }))?;
+        let public_host = environment_string("VIBEX_PUBLIC_HOST");
+        let allowed_hosts = environment_list("VIBEX_ALLOWED_HOSTS")
+            .or_else(|| public_host.clone().map(|host| vec![host]))
+            .unwrap_or_else(|| {
+                vec![
+                    "localhost".to_string(),
+                    "127.0.0.1".to_string(),
+                    "::1".to_string(),
+                ]
+            });
+        let allowed_origins = environment_list("VIBEX_ALLOWED_ORIGINS")
+            .or_else(|| {
+                public_host
+                    .as_deref()
+                    .map(|host| vec![format!("https://{host}")])
+            })
+            .unwrap_or_else(|| {
+                vec![
+                    "http://localhost".to_string(),
+                    "http://127.0.0.1".to_string(),
+                    "http://[::1]".to_string(),
+                ]
+            });
+        let mut remote_gateway = RemoteGatewayConfig::default();
+        remote_gateway.service = RemoteServiceConfig {
+            enabled: environment_bool("VIBEX_GATEWAY_ENABLED").unwrap_or(true),
+            bind_addr,
+            service_name: environment_string("VIBEX_SERVICE_NAME")
+                .unwrap_or_else(|| "Vibex Headless Runtime".to_string()),
+            server_version: env!("CARGO_PKG_VERSION").to_string(),
+        };
+        remote_gateway.deployment_mode = deployment_mode;
+        remote_gateway.tls_policy = tls_policy;
+        remote_gateway.allowed_hosts = allowed_hosts;
+        remote_gateway.allowed_origins = allowed_origins;
+        remote_gateway.trust_forwarded_headers = environment_bool("VIBEX_TRUST_FORWARDED_HEADERS")
+            .unwrap_or(matches!(
+                tls_policy,
+                RemoteGatewayTlsPolicy::TrustedHttpsProxy
+            ));
+        remote_gateway.max_connections =
+            environment_usize("VIBEX_MAX_CONNECTIONS").unwrap_or(remote_gateway.max_connections);
+        remote_gateway.max_in_flight_rpcs_per_connection =
+            environment_usize("VIBEX_MAX_IN_FLIGHT_RPCS")
+                .unwrap_or(remote_gateway.max_in_flight_rpcs_per_connection);
+        remote_gateway.outbound_queue_capacity = environment_usize("VIBEX_OUTBOUND_QUEUE_CAPACITY")
+            .unwrap_or(remote_gateway.outbound_queue_capacity);
+        remote_gateway.peer_limits = RemoteGatewayPeerLimits {
+            unauthenticated_requests_per_window: environment_u32(
+                "VIBEX_UNAUTHENTICATED_REQUESTS_PER_WINDOW",
+            )
+            .unwrap_or(
+                remote_gateway
+                    .peer_limits
+                    .unauthenticated_requests_per_window,
+            ),
+            auth_failures_per_window: environment_u32("VIBEX_AUTH_FAILURES_PER_WINDOW")
+                .unwrap_or(remote_gateway.peer_limits.auth_failures_per_window),
+            window_ms: environment_u64("VIBEX_RATE_LIMIT_WINDOW_MS")
+                .unwrap_or(remote_gateway.peer_limits.window_ms),
+            max_tracked_peers: environment_usize("VIBEX_MAX_TRACKED_PEERS")
+                .unwrap_or(remote_gateway.peer_limits.max_tracked_peers),
+        };
+        if tls_policy == RemoteGatewayTlsPolicy::ServerCertificate {
+            let cert = required_environment_path("VIBEX_TLS_CERT_FILE")?;
+            let key = required_environment_path("VIBEX_TLS_KEY_FILE")?;
+            remote_gateway.tls_identity =
+                Some(RemoteGatewayTlsIdentity::from_pem_files(cert, key)?);
+        }
+        if let Some(host) = public_host
+            && deployment_mode != RemoteGatewayDeploymentMode::Loopback
+        {
+            remote_gateway.pairing_routes.direct_candidates.push(
+                vibex_core::RemotePairingCandidate {
+                    transport: vibex_core::RemotePairingTransport::Direct,
+                    url: format!(
+                        "{}://{host}",
+                        if tls_policy.requires_https() {
+                            "https"
+                        } else {
+                            "http"
+                        }
+                    ),
+                    relay_room_id: None,
+                    relay_pc_peer_id: None,
+                    relay_pc_public_key: None,
+                },
+            );
+        }
+        Ok(Self {
+            mode: DesktopRuntimeMode::Headless,
+            application_id: environment_string("VIBEX_APPLICATION_ID")
+                .unwrap_or_else(|| HEADLESS_APP_ID.to_string()),
+            home_dir,
+            database_path,
+            event_capacity: environment_usize("VIBEX_EVENT_CAPACITY").unwrap_or(512),
+            install_managed_adapters: environment_bool("VIBEX_INSTALL_MANAGED_ADAPTERS")
+                .unwrap_or(true),
+            agent_node_runtime: AgentNodeRuntimeOptions::from_environment(),
+            agent_uv_runtime: AgentUvRuntimeOptions::from_environment(),
+            acquire_home_lock: environment_bool("VIBEX_ACQUIRE_HOME_LOCK").unwrap_or(true),
+            remote_gateway,
+            delegation_sidecar_command: std::env::var_os("VIBEX_DELEGATION_SIDECAR_COMMAND")
+                .map(PathBuf::from),
+        })
+    }
+
     pub fn stable_default() -> VibexResult<Self> {
         let database_path = default_database_path()?;
         let home_dir = database_path
@@ -326,7 +471,7 @@ impl DesktopRuntimeConfig {
         }
     }
 
-    fn validate(&self) -> VibexResult<()> {
+    pub fn validate(&self) -> VibexResult<()> {
         if self.application_id.trim().is_empty() || self.event_capacity == 0 {
             return Err(VibexError::validation(
                 "desktop_runtime_config_invalid",
@@ -383,6 +528,79 @@ impl DesktopRuntimeConfig {
         }
         self.remote_gateway.validate()?;
         Ok(())
+    }
+}
+
+fn environment_string(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn environment_list(name: &str) -> Option<Vec<String>> {
+    let values = environment_string(name)?
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    (!values.is_empty()).then_some(values)
+}
+
+fn environment_bool(name: &str) -> Option<bool> {
+    match environment_string(name)?.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn environment_u32(name: &str) -> Option<u32> {
+    environment_string(name)?.parse().ok()
+}
+
+fn environment_u64(name: &str) -> Option<u64> {
+    environment_string(name)?.parse().ok()
+}
+
+fn environment_usize(name: &str) -> Option<usize> {
+    environment_string(name)?.parse().ok()
+}
+
+fn required_environment_path(name: &str) -> VibexResult<PathBuf> {
+    environment_string(name).map(PathBuf::from).ok_or_else(|| {
+        VibexError::validation(
+            "headless_tls_file_missing",
+            format!("{name} must be set when server TLS is enabled"),
+        )
+    })
+}
+
+fn parse_deployment_mode(value: &str) -> VibexResult<RemoteGatewayDeploymentMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "loopback" => Ok(RemoteGatewayDeploymentMode::Loopback),
+        "lan" => Ok(RemoteGatewayDeploymentMode::Lan),
+        "public" | "cloud" => Ok(RemoteGatewayDeploymentMode::Public),
+        _ => Err(VibexError::validation(
+            "headless_deployment_mode_invalid",
+            "VIBEX_DEPLOYMENT_MODE must be loopback, lan, or public",
+        )),
+    }
+}
+
+fn parse_tls_policy(value: &str) -> VibexResult<RemoteGatewayTlsPolicy> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "loopback" | "loopback_http" | "http" => Ok(RemoteGatewayTlsPolicy::LoopbackHttp),
+        "proxy" | "trusted_https_proxy" | "https_proxy" => {
+            Ok(RemoteGatewayTlsPolicy::TrustedHttpsProxy)
+        }
+        "pinned" | "pinned_certificate" => Ok(RemoteGatewayTlsPolicy::PinnedCertificate),
+        "server" | "server_certificate" | "https" => Ok(RemoteGatewayTlsPolicy::ServerCertificate),
+        _ => Err(VibexError::validation(
+            "headless_tls_mode_invalid",
+            "VIBEX_TLS_MODE must be loopback_http, trusted_https_proxy, pinned_certificate, or server_certificate",
+        )),
     }
 }
 
@@ -2178,7 +2396,7 @@ fn update_channel_for_mode(mode: DesktopRuntimeMode) -> UpdateChannel {
     match mode {
         DesktopRuntimeMode::Stable | DesktopRuntimeMode::ReleaseStable => UpdateChannel::Stable,
         DesktopRuntimeMode::ReleaseCandidate => UpdateChannel::Rc,
-        DesktopRuntimeMode::Preview => UpdateChannel::Preview,
+        DesktopRuntimeMode::Preview | DesktopRuntimeMode::Headless => UpdateChannel::Preview,
     }
 }
 

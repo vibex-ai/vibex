@@ -76,8 +76,8 @@ mod pairing_v2;
 mod zero_config_pairing;
 pub use gateway::{
     RelayAttachmentTasks, RelayRemoteOutbound, RemoteGateway, RemoteGatewayConfig,
-    RemoteGatewayDeploymentMode, RemoteGatewayPairingRoutes, RemoteGatewayStatus,
-    RemoteGatewayTlsPolicy,
+    RemoteGatewayDeploymentMode, RemoteGatewayPairingRoutes, RemoteGatewayPeerLimits,
+    RemoteGatewayStatus, RemoteGatewayTlsIdentity, RemoteGatewayTlsPolicy,
 };
 
 pub type RemoteRouter = Router;
@@ -634,7 +634,10 @@ impl RemoteTrustService {
             .ttl_ms
             .unwrap_or(Self::DEFAULT_PAIRING_TTL_MS)
             .clamp(1, Self::MAX_PAIRING_TTL_MS);
-        let pairing_code = generate_secret("pair");
+        // Pairing codes are entered manually on a second device.  Use a
+        // bounded, grouped numeric code while retaining the full entropy of a
+        // UUID-derived value; only its hash is persisted.
+        let pairing_code = generate_pairing_code();
         let pairing = RemotePairingCode {
             pairing_id: RequestId::new(),
             permission_level: request.permission_level,
@@ -683,7 +686,10 @@ impl RemoteTrustService {
             ));
         }
 
-        let code_hash = hash_secret(&request.pairing_code);
+        let pairing_code = canonical_pairing_code(&request.pairing_code).ok_or_else(|| {
+            remote_error("remote_pairing_code_invalid", "pairing code is invalid")
+        })?;
+        let code_hash = hash_secret(&pairing_code);
         let Some(pairing_record) = RemotePairingCodeRepository::get_by_hash(conn, &code_hash)?
         else {
             Self::insert_audit(
@@ -969,6 +975,35 @@ impl RemoteTrustService {
 
 fn generate_secret(prefix: &str) -> String {
     format!("{prefix}-{}", RequestId::new().into_string())
+}
+
+fn generate_pairing_code() -> String {
+    let digest = Sha256::digest(RequestId::new().as_str().as_bytes());
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    let value = u64::from_be_bytes(bytes) % 1_000_000_000;
+    let digits = format!("{value:09}");
+    format!("{}-{}-{}", &digits[..3], &digits[3..6], &digits[6..])
+}
+
+fn canonical_pairing_code(value: &str) -> Option<String> {
+    let digits = value
+        .chars()
+        .filter(|character| character.is_ascii_digit())
+        .collect::<String>();
+    if digits.len() != 9
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_digit() || matches!(character, '-' | ' ' | '\t'))
+    {
+        return None;
+    }
+    Some(format!(
+        "{}-{}-{}",
+        &digits[..3],
+        &digits[3..6],
+        &digits[6..]
+    ))
 }
 
 fn hash_secret(secret: &str) -> String {
@@ -6109,7 +6144,9 @@ mod tests {
                 },
             )
         };
-        assert!(RemoteProviderRequest::is_mutation(&create_request(reader.clone())));
+        assert!(RemoteProviderRequest::is_mutation(&create_request(
+            reader.clone()
+        )));
         let denied = post_provider(router.clone(), create_request(reader.clone())).await;
         assert_eq!(denied.error.unwrap().code, "remote_permission_denied");
 

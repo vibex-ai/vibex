@@ -281,6 +281,40 @@ impl MobileCredentialBundle {
     }
 }
 
+/// Pair with a headless `vibex-server` deployment using the server address
+/// and the one-time numeric code the operator printed at startup.  The code
+/// travels only inside the bounded HTTPS claim body and is single-use; the
+/// returned credential pins the server identity before it is persisted.
+pub async fn claim_server_pairing_code(
+    server_url: String,
+    pairing_code: String,
+) -> BackendResult<MobileCredentialBundle> {
+    let server_url = server_url.trim().trim_end_matches('/').to_string();
+    let bundle = vibex_remote_client::claim_pairing_code_with_identity(
+        server_url.clone(),
+        pairing_code,
+        "Vibex Mobile".to_string(),
+        cfg!(debug_assertions),
+    )
+    .await?;
+    let bundle = MobileCredentialBundle {
+        schema_version: MOBILE_CREDENTIAL_SCHEMA_VERSION.to_string(),
+        record: bundle.credential,
+        identity_private_key: bundle.identity.private_key_base64(),
+        expected_server_id: bundle.server_id,
+        client_type: RemoteClientType::Mobile,
+        allow_insecure_local_dev: cfg!(debug_assertions),
+        display_name: None,
+        route: Some(MobileRemoteRouteBundle {
+            local_network: None,
+            direct_candidates: vec![server_url],
+            relay: None,
+        }),
+    };
+    bundle.validate()?;
+    Ok(bundle)
+}
+
 pub async fn claim_pairing_link(link: String) -> BackendResult<MobileCredentialBundle> {
     let now_ms = vibex_core::unix_timestamp_ms();
     let offer = parse_pairing_offer_fragment(&link, now_ms)?;

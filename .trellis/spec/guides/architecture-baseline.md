@@ -6,23 +6,41 @@ historical client.
 
 ## Product Surfaces
 
-Vibex has two clients and one optional transport service:
+Vibex has three clients and two transport services around one authoritative
+runtime core:
 
 | Surface | Source | Responsibility |
 | --- | --- | --- |
-| Native desktop | `apps/desktop` | Full GPUI workbench and the authoritative `DesktopRuntime` |
+| Native desktop | `apps/desktop` | Full GPUI workbench over the authoritative `DesktopRuntime` |
+| Headless server | `apps/server` | The same `DesktopRuntime` as a daemon (`vibex-server`) for cloud deployment |
 | Native mobile | `apps/mobile` | iOS/Android GPUI remote client and compact GUI composition |
 | Self-hosted Relay | `apps/relay-server` | Encrypted frame transport only |
 
-The desktop runtime is the only state authority. Mobile never starts an Agent,
-opens a local workspace, owns a PTY, mutates local Git, or stores provider
-configuration. It requests typed operations and renders authoritative responses.
+## Authority Invariant
+
+The **runtime** is the only state authority. The runtime is the
+`DesktopRuntime` core process regardless of its frontend: a desktop app on
+the user's PC, or a headless `vibex-server` on a cloud host. Clients —
+desktop UI, mobile, any future web surface — never start an Agent, open a
+local workspace, own a PTY, mutate local Git, or store provider
+configuration. They request typed operations over Remote v2 and render
+authoritative responses.
+
+This is a deliberate extension of the original "desktop is the only state
+authority" rule: the cloud server occupies the same authority seat the
+desktop occupies on a PC, and a connected desktop becomes a client exactly
+like the phone. One runtime owns one Vibex home and one database; the
+deployment is single-user by design. Relay stays transport-only and never
+becomes a second authority or database.
 
 ## Ownership Invariants
 
-1. `DesktopRuntime` owns Agent lifecycle, session timelines, files, Git, PTY,
-   provider configuration, device permissions, audit records, and durable local
-   state.
+1. The runtime process (`DesktopRuntime`, desktop or headless) owns Agent
+   lifecycle, session timelines, files, Git, PTY, provider configuration,
+   device permissions, audit records, and durable local state. `apps/server`
+   is the headless entry point of that same core: it consumes
+   `DesktopRuntimeConfig::headless_from_environment` and adds a daemon
+   lifecycle (signals, CLI) but no second state model.
 2. `crates/core` owns serialized domain ids, DTOs, errors, capabilities, and
    protocol contracts. It has no GPUI, database, filesystem, or provider
    implementation dependency.
@@ -117,6 +135,37 @@ The server timeline and sequence cursors are authoritative. On reconnect, gap,
 queue overflow, or session-epoch change, the client refetches before applying
 new live events. Unknown mutations are resolved by an idempotency query and are
 never replayed blindly.
+
+## Cloud Deployment Flow
+
+`vibex-server` reuses the identical gateway, so the remote flow is the same
+with the cloud runtime in the authority seat:
+
+```text
+vibex-server (DesktopRuntime, Headless mode)
+  -> RemoteGateway (identical /ws/v2 + /api/v2 API)
+  -> HTTPS/WSS (public mode: trusted proxy TLS or server certificate)
+  -> AutoRemoteTransport
+  -> WebRemoteBackend
+  -> desktop UI / mobile GPUI clients
+```
+
+Headless pairing replaces the desktop SAS approval surface: the server prints
+a single-use numeric pairing code (only its SHA-256 hash is stored), the
+client submits it in the bounded JSON body of
+`POST /api/v2/pairing/code/claim`, and the claim issues exactly one device
+grant bound to a client-generated identity key. The code never travels in a
+URL, the route is rate-limited, and reuse/expiry returns structured errors
+with an audit record. Security posture for Public mode is enforced at
+configuration validation, not at request time: the gateway refuses to boot
+without trusted TLS, an explicit non-loopback host allowlist, and forwarded
+headers only behind a trusted proxy. Deployment artifacts live in
+`deploy/server/` (Docker, compose, Caddy, systemd) and the protocol contract
+in `docs/remote/protocol-v2.md`.
+
+Provider credentials belong to the runtime database. In cloud mode the
+operator's own host stores them, which is the accepted single-user threat
+model; multi-tenant hosting remains out of scope.
 
 ## Layout And Design
 

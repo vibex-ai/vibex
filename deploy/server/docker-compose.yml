@@ -1,0 +1,88 @@
+name: vibex-server
+
+services:
+  vibex-server:
+    build:
+      context: ../..
+      dockerfile: deploy/server/Dockerfile
+    image: vibex-server:local
+    container_name: vibex-server
+    restart: unless-stopped
+    environment:
+      # Identity and storage.
+      VIBEX_HOME: /data
+      VIBEX_DB_PATH: /data/vibex.db
+      VIBEX_APPLICATION_ID: dev.vibex.server
+
+      # Listener. The container default is loopback HTTP; a cloud deployment
+      # MUST override VIBEX_DEPLOYMENT_MODE=public and choose one of:
+      #   VIBEX_TLS_MODE=trusted_https_proxy (Caddy profile below terminates
+      #   TLS and forwards), or
+      #   VIBEX_TLS_MODE=server_certificate with VIBEX_TLS_CERT_FILE /
+      #   VIBEX_TLS_KEY_FILE mounted into the container.
+      VIBEX_BIND_ADDR: 0.0.0.0:8765
+      VIBEX_DEPLOYMENT_MODE: ${VIBEX_DEPLOYMENT_MODE:-loopback}
+      VIBEX_TLS_MODE: ${VIBEX_TLS_MODE:-loopback_http}
+      VIBEX_PUBLIC_HOST: ${VIBEX_PUBLIC_HOST:-}
+      VIBEX_ALLOWED_HOSTS: ${VIBEX_ALLOWED_HOSTS:-}
+      VIBEX_ALLOWED_ORIGINS: ${VIBEX_ALLOWED_ORIGINS:-}
+      VIBEX_TLS_CERT_FILE: ${VIBEX_TLS_CERT_FILE:-}
+      VIBEX_TLS_KEY_FILE: ${VIBEX_TLS_KEY_FILE:-}
+      VIBEX_TRUST_FORWARDED_HEADERS: ${VIBEX_TRUST_FORWARDED_HEADERS:-false}
+
+      # Headless runtime knobs. VIBEX_ACQUIRE_HOME_LOCK stays true so a second
+      # container sharing the volume fails fast instead of corrupting state.
+      VIBEX_ACQUIRE_HOME_LOCK: "true"
+      VIBEX_INSTALL_MANAGED_ADAPTERS: ${VIBEX_INSTALL_MANAGED_ADAPTERS:-true}
+      VIBEX_MAX_CONNECTIONS: ${VIBEX_MAX_CONNECTIONS:-}
+      VIBEX_MAX_IN_FLIGHT_RPCS: ${VIBEX_MAX_IN_FLIGHT_RPCS:-}
+      VIBEX_UNAUTHENTICATED_REQUESTS_PER_WINDOW: ${VIBEX_UNAUTHENTICATED_REQUESTS_PER_WINDOW:-}
+      VIBEX_AUTH_FAILURES_PER_WINDOW: ${VIBEX_AUTH_FAILURES_PER_WINDOW:-}
+      VIBEX_RATE_LIMIT_WINDOW_MS: ${VIBEX_RATE_LIMIT_WINDOW_MS:-}
+
+      # Delegation sidecar (optional; must exist inside the image to start).
+      VIBEX_DELEGATION_SIDECAR_COMMAND: ${VIBEX_DELEGATION_SIDECAR_COMMAND:-}
+    ports:
+      # Publish on loopback by default. Direct public exposure requires an
+      # explicit override plus a Public deployment mode and TLS policy.
+      - "${VIBEX_SERVER_HOST_BIND:-127.0.0.1}:8765:8765"
+    volumes:
+      - vibex-server-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8765/api/v2/info"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Optional public HTTPS entrypoint. Enable with:
+  #   VIBEX_PUBLIC_HOST=vibex.example.com \
+  #   VIBEX_DEPLOYMENT_MODE=public \
+  #   VIBEX_TLS_MODE=trusted_https_proxy \
+  #   VIBEX_TRUST_FORWARDED_HEADERS=true \
+  #   VIBEX_ALLOWED_HOSTS=vibex.example.com \
+  #   VIBEX_ALLOWED_ORIGINS=https://vibex.example.com \
+  #   docker compose -f deploy/server/docker-compose.yml --profile caddy up -d
+  caddy:
+    image: caddy:2-alpine
+    container_name: vibex-server-caddy
+    restart: unless-stopped
+    profiles:
+      - caddy
+    environment:
+      VIBEX_SERVER_SITE_ADDRESS: ${VIBEX_PUBLIC_HOST:-vibex.example.com}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      vibex-server:
+        condition: service_healthy
+
+volumes:
+  vibex-server-data:
+  caddy-data:
+  caddy-config:

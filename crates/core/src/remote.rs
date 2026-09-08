@@ -236,14 +236,24 @@ pub struct RemoteCreatePairingCodeRequest {
     pub ttl_ms: Option<u32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteCreatePairingCodeResponse {
     pub pairing: RemotePairingCode,
     pub pairing_code: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl fmt::Debug for RemoteCreatePairingCodeResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteCreatePairingCodeResponse")
+            .field("pairing", &self.pairing)
+            .field("has_pairing_code", &!self.pairing_code.is_empty())
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteClaimPairingCodeRequest {
     pub pairing_code: String,
@@ -251,11 +261,32 @@ pub struct RemoteClaimPairingCodeRequest {
     pub public_key: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl fmt::Debug for RemoteClaimPairingCodeRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteClaimPairingCodeRequest")
+            .field("has_pairing_code", &!self.pairing_code.is_empty())
+            .field("display_name", &self.display_name)
+            .field("has_public_key", &self.public_key.is_some())
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteClaimPairingCodeResponse {
     pub device: RemoteDeviceDetail,
     pub auth_token: String,
+}
+
+impl fmt::Debug for RemoteClaimPairingCodeResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteClaimPairingCodeResponse")
+            .field("device", &self.device)
+            .field("has_auth_token", &!self.auth_token.is_empty())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1854,7 +1885,12 @@ impl RemoteProviderCredentialSecretMutationRequest {
         }
     }
 
-    pub fn into_request(self) -> (RemoteAuthProof, crate::ProviderCredentialSecretMutationRequest) {
+    pub fn into_request(
+        self,
+    ) -> (
+        RemoteAuthProof,
+        crate::ProviderCredentialSecretMutationRequest,
+    ) {
         (
             self.auth,
             crate::ProviderCredentialSecretMutationRequest {

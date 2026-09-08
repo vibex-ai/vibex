@@ -22,19 +22,18 @@ use vibex_core::{
     CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
     FetchTimelineRequest, FileMutationRequest, FileReadRequest, FileReadResponse,
     FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest, FileWriteRequest,
-    ForkAgentSessionRequest, GetMessageSubmissionRequest, GitCommitRequest, GitCommitResult,
-    GitCommitDetail, GitCommitDetailRequest, GitDiffRequest, GitDiffResponse, GitHistoryRequest,
-    GitHistoryResponse, GitProjectEligibility,
-    GitRemoteActionResult, GitStageRequest, GitStatusSummary, GitWorktreeArchiveRequest,
-    GitWorktreeAssistanceSessionRequest, GitWorktreeConflictResolveRequest,
-    GitWorktreeConflictStageRequest, GitWorktreeCreateRequest, GitWorktreeCreateResult,
-    GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
-    GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeOperationRecord,
-    GitWorktreeOperationRequest, GitWorktreeReadinessRecord, GitWorktreeReadinessRequest,
-    GitWorktreeRestoreRequest, MessageSubmissionState, OpenWorkspaceRequest, ProjectId,
-    ProjectWorkspaceSummary, ProviderHealthSummary, ProviderProfileSummary,
-    ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, RemoteActionClass,
-    RemoteAgentAuthContextListRequest, RemoteAgentAuthContextListResponse,
+    ForkAgentSessionRequest, GetMessageSubmissionRequest, GitCommitDetail, GitCommitDetailRequest,
+    GitCommitRequest, GitCommitResult, GitDiffRequest, GitDiffResponse, GitHistoryRequest,
+    GitHistoryResponse, GitProjectEligibility, GitRemoteActionResult, GitStageRequest,
+    GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
+    GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeCreateRequest,
+    GitWorktreeCreateResult, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
+    GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
+    GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeReadinessRecord,
+    GitWorktreeReadinessRequest, GitWorktreeRestoreRequest, MessageSubmissionState,
+    OpenWorkspaceRequest, ProjectId, ProjectWorkspaceSummary, ProviderHealthSummary,
+    ProviderProfileSummary, ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult,
+    RemoteActionClass, RemoteAgentAuthContextListRequest, RemoteAgentAuthContextListResponse,
     RemoteAgentAuthContextMutationResponse, RemoteAgentAuthLogoutPreviewRequest,
     RemoteAgentAuthLogoutPreviewResponse, RemoteAgentAuthMethodListRequest,
     RemoteAgentAuthMethodListResponse, RemoteAgentAuthenticateContextRequest,
@@ -69,10 +68,10 @@ use vibex_core::{
     RemoteFileSearchRequest, RemoteFileSearchResponse, RemoteFileTreeRequest,
     RemoteFileTreeResponse, RemoteFileWriteRequest, RemoteFileWriteResponse,
     RemoteGitCommitDetailRequest, RemoteGitCommitDetailResponse, RemoteGitCommitRequest,
-    RemoteGitCommitResponse, RemoteGitDiffRequest, RemoteGitDiffResponse,
-    RemoteGitHistoryRequest, RemoteGitHistoryResponse, RemoteGitRemoteActionRequest,
-    RemoteGitRemoteActionResponse, RemoteGitStageRequest, RemoteGitStatusMutationResponse,
-    RemoteGitStatusRequest, RemoteGitStatusResponse, RemoteGitWorktreeEligibilityRequest,
+    RemoteGitCommitResponse, RemoteGitDiffRequest, RemoteGitDiffResponse, RemoteGitHistoryRequest,
+    RemoteGitHistoryResponse, RemoteGitRemoteActionRequest, RemoteGitRemoteActionResponse,
+    RemoteGitStageRequest, RemoteGitStatusMutationResponse, RemoteGitStatusRequest,
+    RemoteGitStatusResponse, RemoteGitWorktreeEligibilityRequest,
     RemoteGitWorktreeEligibilityResponse, RemoteGitWorktreeSnapshotRequest,
     RemoteGitWorktreeSnapshotResponse, RemoteOperationKind, RemotePairingOfferSummary,
     RemoteProviderHealthSummaryListRequest, RemoteProviderHealthSummaryListResponse,
@@ -3806,45 +3805,43 @@ mod tests {
 
     #[tokio::test]
     async fn remote_provider_projection_keeps_entities_and_secret_mutation_private() {
+        let transport = Arc::new(MockTransport::new([]));
         let backend = WebRemoteBackend::new(
-            Arc::new(MockTransport::new([])),
+            transport,
             RemoteAuthProof {
                 device_id: vibex_core::DeviceId::new(),
                 auth_token: "test-token".to_string(),
             },
         );
 
-        assert_eq!(
-            backend
-                .list_model_provider_profiles()
-                .await
-                .unwrap_err()
-                .code,
-            "remote_model_provider_profiles_private"
-        );
-        assert_eq!(
-            backend
-                .list_agent_runtime_profiles(vibex_core::AgentId::parse("codex").unwrap())
-                .await
-                .unwrap_err()
-                .code,
-            "remote_agent_runtime_profiles_private"
-        );
-        assert_eq!(
-            backend
-                .list_agent_model_provider_bindings(
-                    vibex_core::AgentModelProviderBindingListRequest {
-                        agent_id: Some(vibex_core::AgentId::parse("codex").unwrap()),
-                        model_provider_profile_id: None,
-                    },
-                )
-                .await
-                .unwrap_err()
-                .code,
-            "remote_agent_provider_bindings_private"
-        );
-
+        // Entity reads and writes are real RPCs against the authoritative
+        // runtime; the wire contract is covered end-to-end by the vibex-remote
+        // router tests. What this client must guarantee locally is that the
+        // secret mutation is still an explicit, audited mutation and that the
+        // credential value is never mirrored into derived debug output.
         let secret = "remote-secret-must-stay-local";
+        let secret_mutation =
+            vibex_core::RemoteProviderCredentialSecretMutationRequest::from_request(
+                RemoteAuthProof {
+                    device_id: vibex_core::DeviceId::new(),
+                    auth_token: "test-token".to_string(),
+                },
+                vibex_core::ProviderCredentialSecretMutationRequest {
+                    model_provider_profile_id: vibex_core::ModelProviderProfileId::new(),
+                    credential_id: vibex_core::RequestId::new(),
+                    touched: true,
+                    clear: false,
+                    value: Some(secret.to_string()),
+                },
+            );
+        assert!(
+            vibex_core::RemoteProviderRequest::MutateProviderCredentialSecret(
+                secret_mutation.clone(),
+            )
+            .is_mutation()
+        );
+        assert!(!format!("{secret_mutation:?}").contains(secret));
+
         let error = backend
             .mutate_provider_credential_secret(MutationRequest::new(
                 vibex_core::ProviderCredentialSecretMutationRequest {
@@ -3857,7 +3854,7 @@ mod tests {
             ))
             .await
             .unwrap_err();
-        assert_eq!(error.code, "remote_provider_secret_mutation_unavailable");
+        assert_eq!(error.code, "mock_unavailable");
         assert!(!format!("{error:?}").contains(secret));
     }
 

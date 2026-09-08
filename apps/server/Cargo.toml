@@ -1,0 +1,18 @@
+[package]
+name = "vibex-server"
+version = "0.1.0-rc.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio.workspace = true
+vibex-core = { path = "../../crates/core" }
+vibex-db = { path = "../../crates/db" }
+vibex-desktop-runtime = { path = "../../crates/desktop-runtime" }
+vibex-remote = { path = "../../crates/remote" }
+
+[[bin]]
+name = "vibex-server"
+path = "src/main.rs"

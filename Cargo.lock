@@ -10252,6 +10252,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibex-server"
+version = "0.1.0-rc.1"
+dependencies = [
+ "tokio",
+ "vibex-core",
+ "vibex-db",
+ "vibex-desktop-runtime",
+ "vibex-remote",
+]
+
+[[package]]
 name = "vibex-terminal"
 version = "0.1.0-rc.1"
 dependencies = [

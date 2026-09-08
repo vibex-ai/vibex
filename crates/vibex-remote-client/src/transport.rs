@@ -26,12 +26,12 @@ use vibex_core::{
     CorrelationId, RelayControlMessage, RelayError, RelayErrorCode, RelayFrameKind,
     RelayHandshakeHello, RelayPeerId, RelayPeerMessage, RelayPeerRole, RelayRoomId,
     RelayTransportMode, RemoteAttachRequestV2, RemoteAttachmentAcceptedV2, RemoteAuthProof,
-    RemoteBinaryFrame, RemoteClaimPairingOfferRequest, RemoteClaimPairingOfferResponse,
-    RemoteCloseCode, RemoteControlMessageV2, RemoteEventV2, RemoteHello, RemoteJsonMessageV2,
-    RemotePing, RemoteProtocolVersionRange, RemoteRpcRequestV2, RemoteRpcResponseV2,
-    RemoteServerInfoV2, RemoteStreamCursor, RemoteSubscribeRequestV2, RemoteSubscriptionAcceptedV2,
-    RemoteTimeoutClass, RemoteWsTicketRequest, RemoteWsTicketResponse, RequestId, VibexError,
-    unix_timestamp_ms,
+    RemoteBinaryFrame, RemoteClaimPairingCodeRequest, RemoteClaimPairingCodeResponse,
+    RemoteClaimPairingOfferRequest, RemoteClaimPairingOfferResponse, RemoteCloseCode,
+    RemoteControlMessageV2, RemoteEventV2, RemoteHello, RemoteJsonMessageV2, RemotePing,
+    RemoteProtocolVersionRange, RemoteRpcRequestV2, RemoteRpcResponseV2, RemoteServerInfoV2,
+    RemoteStreamCursor, RemoteSubscribeRequestV2, RemoteSubscriptionAcceptedV2, RemoteTimeoutClass,
+    RemoteWsTicketRequest, RemoteWsTicketResponse, RequestId, VibexError, unix_timestamp_ms,
 };
 use vibex_relay::{
     RELAY_CRYPTO_SUITE_V2, RelayCryptoSuite, RelayKeypair, RelaySession, RelaySessionConfig,
@@ -658,6 +658,149 @@ pub fn claim_pairing_offer(
                 .json(&request),
         )
         .await
+    })
+}
+
+/// Claim the one-time numeric code printed by a headless Vibex server.  The
+/// code is sent only in a bounded JSON body; it is never appended to the URL.
+pub fn claim_pairing_code(
+    base_url: impl Into<String>,
+    request: RemoteClaimPairingCodeRequest,
+    allow_insecure_local_dev: bool,
+) -> BackendFuture<'static, RemoteClaimPairingCodeResponse> {
+    let base_url = base_url.into();
+    Box::pin(async move {
+        if request.pairing_code.trim().is_empty() || request.display_name.trim().is_empty() {
+            return Err(BackendError::failed(
+                "remote_pairing_code_request_invalid",
+                "pairing code and display name are required",
+            ));
+        }
+        if request.pairing_code.len() > 64 || request.display_name.len() > 128 {
+            return Err(BackendError::failed(
+                "remote_pairing_code_request_invalid",
+                "pairing code or display name exceeds the bounded size",
+            ));
+        }
+        let mut url = Url::parse(&base_url).map_err(|_| {
+            BackendError::failed("remote_url_invalid", "remote server URL is invalid")
+        })?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(BackendError::failed(
+                "remote_secure_context_required",
+                "pairing code claim requires an HTTP(S) URL without embedded credentials",
+            ));
+        }
+        let loopback = url
+            .host_str()
+            .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1"));
+        if url.scheme() == "http" && !(allow_insecure_local_dev && loopback) {
+            return Err(BackendError::failed(
+                "remote_secure_context_required",
+                "pairing code claim requires HTTPS outside the explicit loopback development exception",
+            ));
+        }
+        url.set_query(None);
+        url.set_fragment(None);
+        let endpoint = endpoint_url(&url, "/api/v2/pairing/code/claim")?;
+        http_json(
+            remote_http_client_for_url(&url)?
+                .post(endpoint)
+                .json(&request),
+        )
+        .await
+    })
+}
+
+/// Complete a headless pairing-code claim with a fresh client identity and a
+/// durable credential record.  The identity is generated before the request,
+/// then rebound to the server-issued device id without changing its private
+/// key.  A server identity probe is required before returning so future
+/// connections can pin the authenticated server key.
+pub struct PairingCodeClientBundle {
+    pub response: RemoteClaimPairingCodeResponse,
+    pub identity: ClientDeviceIdentity,
+    pub credential: RemoteCredentialRecord,
+    /// Stable server identifier from `/api/v2/info`; clients pin it so a
+    /// credential saved for one headless runtime is never replayed against a
+    /// different one.
+    pub server_id: String,
+}
+
+impl fmt::Debug for PairingCodeClientBundle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PairingCodeClientBundle")
+            .field("response", &self.response)
+            .field("identity", &self.identity)
+            .field("credential", &self.credential)
+            .finish()
+    }
+}
+
+pub fn claim_pairing_code_with_identity(
+    base_url: impl Into<String>,
+    pairing_code: impl Into<String>,
+    display_name: impl Into<String>,
+    allow_insecure_local_dev: bool,
+) -> BackendFuture<'static, PairingCodeClientBundle> {
+    let base_url = base_url.into();
+    let pairing_code = pairing_code.into();
+    let display_name = display_name.into();
+    Box::pin(async move {
+        let provisional = ClientDeviceIdentity::generate(vibex_core::DeviceId::new())?;
+        let request = RemoteClaimPairingCodeRequest {
+            pairing_code,
+            display_name,
+            public_key: Some(provisional.public_key_base64()),
+        };
+        let response =
+            claim_pairing_code(base_url.clone(), request, allow_insecure_local_dev).await?;
+        if response.device.status != vibex_core::RemoteDeviceStatus::Active
+            || response.auth_token.trim().is_empty()
+        {
+            return Err(BackendError::failed(
+                "remote_pairing_claim_response_invalid",
+                "pairing code claim did not return an active device grant",
+            ));
+        }
+        if response.device.public_key.as_deref() != Some(provisional.public_key_base64().as_str()) {
+            return Err(BackendError::permission(
+                "remote_client_identity_mismatch",
+                "server returned a different client identity key",
+            ));
+        }
+        let identity = ClientDeviceIdentity::from_private_key_base64(
+            response.device.device_id.clone(),
+            &provisional.private_key_base64(),
+        )?;
+        let base = Url::parse(&base_url).map_err(|_| {
+            BackendError::failed("remote_url_invalid", "remote server URL is invalid")
+        })?;
+        let info: RemoteGatewayInfo =
+            http_json(remote_http_client_for_url(&base)?.get(endpoint_url(&base, "/api/v2/info")?))
+                .await?;
+        let credential = RemoteCredentialRecord {
+            server_url: base_url,
+            auth: vibex_core::RemoteAuthProof {
+                device_id: response.device.device_id.clone(),
+                auth_token: response.auth_token.clone(),
+            },
+            device_identity_public_key: identity.public_key_base64(),
+            server_identity_public_key: Some(info.server_identity_public_key.clone()),
+        };
+        Ok(PairingCodeClientBundle {
+            response,
+            identity,
+            credential,
+            server_id: info.server_id,
+        })
     })
 }
 
