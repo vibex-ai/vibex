@@ -16,13 +16,14 @@ use gpui::{
 };
 use vibex_backend::{
     AgentBackend as _, BackendError, BackendEvent, BackendFuture, BackendOperation,
-    BackendProjection, BackendResult, MutationRequest, WorkspaceBackend as _, WorkspaceSummary,
+    BackendProjection, BackendResult, ManagementBackend as _, MutationRequest,
+    WorkspaceBackend as _, WorkspaceSummary,
 };
 use vibex_core::{
-    AgentId, AgentSessionState, AgentTimelineDisplaySettings, AgentTimelineReasoningDisplayMode,
-    ContinueAgentTurnRequest, CreateAgentSessionRequest, ElicitationFieldKind,
-    ElicitationResolutionAction, ForkAgentSessionRequest, MessageAttachment, OpenWorkspaceRequest,
-    PermissionResolution, PermissionResponseKind, PermissionRiskCategory,
+    AgentId, AgentListRequest, AgentSessionState, AgentTimelineDisplaySettings,
+    AgentTimelineReasoningDisplayMode, ContinueAgentTurnRequest, CreateAgentSessionRequest,
+    ElicitationFieldKind, ElicitationResolutionAction, ForkAgentSessionRequest, MessageAttachment,
+    OpenWorkspaceRequest, PermissionResolution, PermissionResponseKind, PermissionRiskCategory,
     RemoteDeepLinkResolutionStatus, RemoteLanPairingRequestState, RemoteSidebarDropPosition,
     RemoteSidebarItemKind, RemoteSidebarItemRef, RemoteSidebarOrganizationMutation,
     RenameAgentSessionRequest, RequestId, ResolvePermissionRequest, RuntimeAuthSourceAvailability,
@@ -602,6 +603,8 @@ pub struct MobileApp {
     elicitation_inputs: BTreeMap<String, Entity<TextInput>>,
     elicitation_draft: Option<ElicitationFormDraft>,
     pairing_busy: bool,
+    pairing_server_url_input: Entity<TextInput>,
+    pairing_code_input: Entity<TextInput>,
     nearby_pairing_state: NearbyPairingState,
     nearby_candidates: BTreeMap<String, LanDiscoveryCandidate>,
     nearby_discovery_generation: u64,
@@ -648,6 +651,13 @@ pub struct MobileApp {
     runtime_options_target: RuntimeOptionsTarget,
     runtime_draft: Option<SessionRuntimeSelection>,
     runtime_sheet_search: Option<Entity<TextInput>>,
+    /// Desktop agent snapshots keyed by id, providing the labels the desktop
+    /// uses for brand lookup and the `order_index` ordering its menus show.
+    runtime_agent_labels: BTreeMap<AgentId, String>,
+    runtime_agent_order: Vec<AgentId>,
+    /// Keeps the selected Agent logo inside the strip's viewport whenever the
+    /// selection or the strip contents change.
+    runtime_agent_strip_scroll: ScrollHandle,
     runtime_feature_inputs: BTreeMap<String, Entity<TextInput>>,
     runtime_switch_generation: u64,
     runtime_switch_busy_generation: Option<u64>,
@@ -840,6 +850,18 @@ impl MobileApp {
             elicitation_inputs: BTreeMap::new(),
             elicitation_draft: None,
             pairing_busy: false,
+            pairing_server_url_input: cx.new(|cx| {
+                TextInput::new(
+                    locale::text("Server URL", "服务器地址", "伺服器位址"),
+                    cx,
+                )
+            }),
+            pairing_code_input: cx.new(|cx| {
+                TextInput::new(
+                    locale::text("Pairing code", "配对码", "配對碼"),
+                    cx,
+                )
+            }),
             nearby_pairing_state: NearbyPairingState::Idle,
             nearby_candidates: BTreeMap::new(),
             nearby_discovery_generation: 0,
@@ -897,6 +919,9 @@ impl MobileApp {
             runtime_options_target: RuntimeOptionsTarget::ActiveSession,
             runtime_draft: None,
             runtime_sheet_search: None,
+            runtime_agent_labels: BTreeMap::new(),
+            runtime_agent_order: Vec::new(),
+            runtime_agent_strip_scroll: ScrollHandle::new(),
             runtime_feature_inputs: BTreeMap::new(),
             runtime_switch_generation: 0,
             runtime_switch_busy_generation: None,
@@ -1229,6 +1254,7 @@ impl MobileApp {
                         this.refresh_sessions(cx);
                         this.refresh_timeline_display_settings(cx);
                         this.refresh_runtime_options(cx);
+                        this.refresh_runtime_agents(cx);
                         this.refresh_workspaces(cx);
                         notifications::request_authorization();
                         this.resolve_pending_notification_action(cx);
@@ -1763,6 +1789,46 @@ impl MobileApp {
         cx.notify();
     }
 
+    /// Pulls the desktop's agent snapshots so the runtime sheet's Agent strip
+    /// orders its logos exactly like the desktop menus (`order_index`, then
+    /// label, then id) and can borrow the same display labels for brand
+    /// lookup. Unknown Agents fall back to catalog order with the id as label.
+    fn refresh_runtime_agents(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let runner = gpui_tokio::Tokio::spawn(cx, {
+            let backend = backend.clone();
+            async move {
+                backend
+                    .list_agents(AgentListRequest {
+                        include_disabled: false,
+                    })
+                    .await
+            }
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, _cx| {
+                if let Ok(response) = outcome {
+                    let mut entries = response.agents;
+                    entries.sort_by(|left, right| {
+                        left.order_index
+                            .cmp(&right.order_index)
+                            .then_with(|| left.label.cmp(&right.label))
+                            .then_with(|| left.id.cmp(&right.id))
+                    });
+                    this.runtime_agent_labels = entries
+                        .iter()
+                        .map(|agent| (agent.id.clone(), agent.label.clone()))
+                        .collect();
+                    this.runtime_agent_order = entries.into_iter().map(|agent| agent.id).collect();
+                }
+            });
+        });
+        self.tasks.push(task);
+    }
+
     fn refresh_runtime_options(&mut self, cx: &mut Context<Self>) {
         let Some(controller) = self.controller.as_mut() else {
             return;
@@ -1804,6 +1870,7 @@ impl MobileApp {
                 }
                 if applied && this.runtime_options_open {
                     this.sync_runtime_feature_inputs(cx);
+                    this.anchor_runtime_agent_strip();
                 }
                 cx.notify();
             });
@@ -1858,7 +1925,9 @@ impl MobileApp {
         self.runtime_switch_error = None;
         self.runtime_sheet_search =
             Some(cx.new(|cx| TextInput::new(locale::text("Search models", "搜索模型", "搜尋模型"), cx)));
+        self.refresh_runtime_agents(cx);
         self.sync_runtime_feature_inputs(cx);
+        self.anchor_runtime_agent_strip();
         if !has_catalog {
             self.refresh_runtime_options(cx);
         }
@@ -1933,7 +2002,9 @@ impl MobileApp {
         self.runtime_switch_error = None;
         self.runtime_sheet_search =
             Some(cx.new(|cx| TextInput::new(locale::text("Search models", "搜索模型", "搜尋模型"), cx)));
+        self.refresh_runtime_agents(cx);
         self.sync_runtime_feature_inputs(cx);
+        self.anchor_runtime_agent_strip();
         if !has_catalog {
             self.refresh_runtime_options(cx);
         }
@@ -1999,6 +2070,7 @@ impl MobileApp {
             return;
         };
         self.choose_runtime_selection(selection, cx);
+        self.anchor_runtime_agent_strip();
     }
 
     fn choose_runtime_selection(
@@ -6911,7 +6983,7 @@ impl MobileApp {
     /// Band 1 — every enabled Agent as a horizontally scrolling logo strip.
     /// Tapping a logo moves the draft to that Agent's first available option,
     /// which re-scopes the model list below; the active logo wears an accent
-    /// bar on the strip's bottom hairline.
+    /// bar on the strip's bottom hairline and stays scrolled into view.
     fn render_runtime_agent_strip(
         &self,
         catalog: Option<&SessionRuntimeOptionCatalog>,
@@ -6919,16 +6991,7 @@ impl MobileApp {
         busy: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let mut agents = BTreeMap::new();
-        if let Some(catalog) = catalog {
-            for option in &catalog.options {
-                if option.availability == RuntimeOptionAvailability::Available {
-                    agents
-                        .entry(option.selection.agent_id.clone())
-                        .or_insert_with(|| option.agent_label.clone());
-                }
-            }
-        }
+        let agents = self.runtime_agent_strip_agents(catalog);
         let draft_agent = draft.map(|draft| draft.agent_id.clone());
         div()
             .flex_shrink_0()
@@ -6939,6 +7002,7 @@ impl MobileApp {
                     .id("runtime-agent-strip")
                     .h(px(RUNTIME_SHEET_AGENT_STRIP_HEIGHT))
                     .overflow_x_scroll()
+                    .track_scroll(&self.runtime_agent_strip_scroll)
                     .flex()
                     .items_center()
                     .gap_1()
@@ -6967,11 +7031,85 @@ impl MobileApp {
                                         }),
                                     )
                             })
-                            .child(runtime_agent_icon(&agent_id, &label))
+                            .child(runtime_agent_icon(
+                                &agent_id,
+                                &label,
+                                px(18.0),
+                                if selected {
+                                    theme::text_primary()
+                                } else {
+                                    theme::text_secondary()
+                                },
+                            ))
                             .when(selected, |tab| tab.child(runtime_tab_indicator()))
                     })),
             )
             .into_any_element()
+    }
+
+    /// The strip's tabs in display order: catalog-available Agents labelled
+    /// with the desktop's snapshots, ordered like the desktop runtime menus
+    /// (`order_index`, then label, then id). A snapshot that has not landed
+    /// yet falls back to the label ordering.
+    fn runtime_agent_strip_agents(
+        &self,
+        catalog: Option<&SessionRuntimeOptionCatalog>,
+    ) -> Vec<(AgentId, String)> {
+        let Some(catalog) = catalog else {
+            return Vec::new();
+        };
+        let mut agents: Vec<(AgentId, String)> = Vec::new();
+        for option in &catalog.options {
+            if option.availability != RuntimeOptionAvailability::Available {
+                continue;
+            }
+            let agent_id = &option.selection.agent_id;
+            if agents.iter().any(|(existing, _)| existing == agent_id) {
+                continue;
+            }
+            let label = self
+                .runtime_agent_labels
+                .get(agent_id)
+                .cloned()
+                .unwrap_or_else(|| option.agent_label.clone());
+            agents.push((agent_id.clone(), label));
+        }
+        agents.sort_by(|(left_id, left_label), (right_id, right_label)| {
+            let left_rank = self
+                .runtime_agent_order
+                .iter()
+                .position(|id| id == left_id)
+                .unwrap_or(usize::MAX);
+            let right_rank = self
+                .runtime_agent_order
+                .iter()
+                .position(|id| id == right_id)
+                .unwrap_or(usize::MAX);
+            left_rank
+                .cmp(&right_rank)
+                .then_with(|| left_label.cmp(right_label))
+                .then_with(|| left_id.cmp(right_id))
+        });
+        agents
+    }
+
+    /// Scrolls the Agent strip so the draft Agent's logo is visible. Safe to
+    /// call before the strip's first paint: the scroll handle defers the
+    /// anchor until the tab's bounds exist and then applies it once.
+    fn anchor_runtime_agent_strip(&mut self) {
+        let catalog = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.runtime_options.value.as_ref());
+        let agents = self.runtime_agent_strip_agents(catalog);
+        let Some(index) = self.runtime_draft.as_ref().and_then(|draft| {
+            agents
+                .iter()
+                .position(|(agent_id, _)| agent_id == &draft.agent_id)
+        }) else {
+            return;
+        };
+        self.runtime_agent_strip_scroll.scroll_to_item(index);
     }
 
     /// Band 2 — the full-bleed search row. The query filters provider labels
@@ -7130,7 +7268,11 @@ impl MobileApp {
                     );
                     runtime_sheet_row(
                         row_id,
-                        runtime_model_icon(model_id.as_deref(), px(theme::ICON_SM + 2.0)),
+                        runtime_model_icon(
+                            model_id.as_deref(),
+                            px(theme::ICON_SM + 2.0),
+                            theme::text_primary(),
+                        ),
                         option.model_label.clone(),
                         is_selected,
                         false,
@@ -13756,114 +13898,144 @@ fn runtime_sheet_row(
         )
 }
 
-/// Compact brand-icon table for the cascade. The desktop carries a full
-/// catalog; the phone mirrors its lookup order for the mainstream marks and
-/// falls back to the same bot/sparkles shapes.
-const MOBILE_AGENT_BRAND_ICONS: &[(&str, &str)] = &[
-    ("opencode", "icons/opencode.svg"),
-    ("gemini", "icons/gemini.svg"),
-    ("qwen", "icons/qwen.svg"),
-    ("tongyi", "icons/qwen.svg"),
-    ("dashscope", "icons/qwen.svg"),
-    ("copilot", "icons/copilot.svg"),
-    ("claude", "icons/claude.svg"),
-    ("anthropic", "icons/claude.svg"),
-    ("codex", "icons/openai.svg"),
-    ("openai", "icons/openai.svg"),
-    ("chatgpt", "icons/openai.svg"),
-    ("antigravity", "icons/agents/antigravity.svg"),
-    ("amp-acp", "icons/agents/amp-acp.svg"),
-    ("auggie", "icons/agents/auggie.svg"),
-    ("cline", "icons/agents/cline.svg"),
-    ("codebuddy-code", "icons/agents/codebuddy-code.svg"),
-    ("codewhale", "icons/agents/codewhale.svg"),
-    ("crow-cli", "icons/agents/crow-cli.svg"),
-    ("cursor", "icons/agents/cursor.svg"),
-    ("deepagents", "icons/agents/deepagents.svg"),
-    ("deepseek", "icons/agents/deepseek-harness.svg"),
-    ("devin", "icons/agents/devin.svg"),
-    ("dimcode", "icons/agents/dimcode.svg"),
-    ("dirac", "icons/agents/dirac.svg"),
-    ("factory-droid", "icons/agents/factory-droid.svg"),
-    ("glm", "icons/agents/glm-acp-agent.svg"),
-    ("zcode", "icons/agents/glm-acp-agent.svg"),
-    ("goose", "icons/agents/goose.svg"),
-    ("grok", "icons/agents/grok.svg"),
-    ("hermes", "icons/agents/hermes.svg"),
-    ("junie", "icons/agents/junie.svg"),
-    ("kilo", "icons/agents/kilo.svg"),
-    ("kiro", "icons/agents/kiro.svg"),
-    ("kimi", "icons/agents/kimi.svg"),
-    ("minion-code", "icons/agents/minion-code.svg"),
-    ("mistral", "icons/agents/mistral-vibe.svg"),
-    ("nova", "icons/agents/nova.svg"),
-    ("qoder", "icons/agents/qoder.svg"),
-    ("poolside", "icons/agents/poolside.svg"),
-    ("stakpak", "icons/agents/stakpak.svg"),
-    ("vtcode", "icons/agents/vtcode.svg"),
+/// Desktop-parity Agent brand marks: `(needle, path, uses_current_color)`.
+/// Marks that use the current color are monochrome glyphs tinted through
+/// `svg`; the rest carry their own brand colors and must render through
+/// `img` (an alpha-masked `svg` would flatten them into a one-color
+/// silhouette). Needle order mirrors the desktop lookup: mainstream
+/// identities first, then the catalog table, then loose legacy needles.
+const MOBILE_AGENT_BRAND_ASSETS: &[(&str, &str, bool)] = &[
+    ("opencode", "icons/opencode.svg", false),
+    ("gemini", "icons/gemini.svg", false),
+    ("qwen", "icons/qwen.svg", false),
+    ("tongyi", "icons/qwen.svg", false),
+    ("dashscope", "icons/qwen.svg", false),
+    ("copilot", "icons/copilot.svg", true),
+    ("claude", "icons/claude.svg", false),
+    ("anthropic", "icons/claude.svg", false),
+    ("codex", "icons/openai.svg", true),
+    ("openai", "icons/openai.svg", true),
+    ("chatgpt", "icons/openai.svg", true),
+    ("antigravity", "icons/agents/antigravity.svg", false),
+    ("amp-acp", "icons/agents/amp-acp.svg", false),
+    ("auggie", "icons/agents/auggie.svg", true),
+    ("cline", "icons/agents/cline.svg", true),
+    ("codebuddy-code", "icons/agents/codebuddy-code.svg", false),
+    ("codewhale", "icons/agents/codewhale.svg", false),
+    ("crow-cli", "icons/agents/crow-cli.svg", false),
+    ("cursor", "icons/agents/cursor.svg", true),
+    ("deepagents", "icons/agents/deepagents.svg", true),
+    ("deepseek-harness", "icons/agents/deepseek-harness.svg", false),
+    ("devin", "icons/agents/devin.svg", true),
+    ("dimcode", "icons/agents/dimcode.svg", false),
+    ("dirac", "icons/agents/dirac.svg", true),
+    ("factory-droid", "icons/agents/factory-droid.svg", true),
+    ("glm-acp-agent", "icons/agents/glm-acp-agent.svg", true),
+    ("zcode", "icons/agents/glm-acp-agent.svg", true),
+    ("goose", "icons/agents/goose.svg", true),
+    ("grok", "icons/agents/grok.svg", true),
+    ("hermes", "icons/agents/hermes.svg", true),
+    ("junie", "icons/agents/junie.svg", false),
+    ("kilo", "icons/agents/kilo.svg", true),
+    ("kiro", "icons/agents/kiro.svg", false),
+    ("kimi", "icons/agents/kimi.svg", false),
+    ("minion-code", "icons/agents/minion-code.svg", true),
+    ("mistral-vibe", "icons/agents/mistral-vibe.svg", false),
+    ("nova", "icons/agents/nova.svg", true),
+    ("pi", "icons/agents/pi.svg", true),
+    ("poolside", "icons/agents/poolside.svg", true),
+    ("qoder", "icons/agents/qoder.svg", false),
+    ("stakpak", "icons/agents/stakpak.svg", true),
+    ("vtcode", "icons/agents/vtcode.svg", true),
+    // Loose fallbacks for short Agent ids the catalog needles above miss.
+    ("deepseek", "icons/agents/deepseek-harness.svg", false),
+    ("glm", "icons/agents/glm-acp-agent.svg", true),
+    ("mistral", "icons/agents/mistral-vibe.svg", false),
 ];
 
-const MOBILE_MODEL_BRAND_ICONS: &[(&str, &str)] = &[
-    ("claude", "icons/claude.svg"),
-    ("anthropic", "icons/claude.svg"),
-    ("gpt", "icons/openai.svg"),
-    ("o1", "icons/openai.svg"),
-    ("o3", "icons/openai.svg"),
-    ("o4", "icons/openai.svg"),
-    ("chatgpt", "icons/openai.svg"),
-    ("openai", "icons/openai.svg"),
-    ("codex", "icons/openai.svg"),
-    ("gemini", "icons/gemini.svg"),
-    ("gemma", "icons/gemini.svg"),
-    ("grok", "icons/agents/grok.svg"),
-    ("qwen", "icons/qwen.svg"),
-    ("deepseek", "icons/agents/deepseek-harness.svg"),
-    ("kimi", "icons/agents/kimi.svg"),
-    ("moonshot", "icons/agents/kimi.svg"),
-    ("glm", "icons/agents/glm-acp-agent.svg"),
-    ("zhipu", "icons/agents/glm-acp-agent.svg"),
-    ("opencode", "icons/opencode.svg"),
-    ("copilot", "icons/copilot.svg"),
+const MOBILE_MODEL_BRAND_ASSETS: &[(&str, &str, bool)] = &[
+    ("claude", "icons/claude.svg", false),
+    ("anthropic", "icons/claude.svg", false),
+    ("gpt", "icons/openai.svg", true),
+    ("o1", "icons/openai.svg", true),
+    ("o3", "icons/openai.svg", true),
+    ("o4", "icons/openai.svg", true),
+    ("chatgpt", "icons/openai.svg", true),
+    ("openai", "icons/openai.svg", true),
+    ("codex", "icons/openai.svg", true),
+    ("gemini", "icons/gemini.svg", false),
+    ("gemma", "icons/gemini.svg", false),
+    ("grok", "icons/agents/grok.svg", true),
+    ("qwen", "icons/qwen.svg", false),
+    ("deepseek", "icons/agents/deepseek-harness.svg", false),
+    ("kimi", "icons/agents/kimi.svg", false),
+    ("moonshot", "icons/agents/kimi.svg", false),
+    ("glm", "icons/agents/glm-acp-agent.svg", true),
+    ("zhipu", "icons/agents/glm-acp-agent.svg", true),
+    ("opencode", "icons/opencode.svg", false),
+    ("copilot", "icons/copilot.svg", true),
 ];
 
-fn agent_brand_icon_path(agent_id: &str, label: &str) -> Option<&'static str> {
+fn agent_brand_asset(agent_id: &str, label: &str) -> Option<(&'static str, bool)> {
     let identity = format!("{agent_id} {label}").to_ascii_lowercase();
-    MOBILE_AGENT_BRAND_ICONS
+    MOBILE_AGENT_BRAND_ASSETS
         .iter()
-        .find(|(needle, _)| identity.contains(needle))
-        .map(|(_, path)| *path)
+        .find(|(needle, _, _)| identity.contains(needle))
+        .map(|(_, path, uses_current_color)| (*path, *uses_current_color))
 }
 
-fn model_brand_icon_path(model_id: &str) -> Option<&'static str> {
+fn model_brand_asset(model_id: &str) -> Option<(&'static str, bool)> {
     let normalized = model_id.trim().to_ascii_lowercase();
     let model_name = normalized.rsplit('/').next().unwrap_or(&normalized);
-    MOBILE_MODEL_BRAND_ICONS
+    MOBILE_MODEL_BRAND_ASSETS
         .iter()
-        .find(|(needle, _)| {
+        .find(|(needle, _, _)| {
             model_name.starts_with(needle)
                 && model_name
                     .as_bytes()
                     .get(needle.len())
                     .is_none_or(|next| matches!(next, b'-' | b'_' | b'.' | b':' | b' ' | b'/'))
         })
-        .map(|(_, path)| *path)
+        .map(|(_, path, uses_current_color)| (*path, *uses_current_color))
 }
 
-fn runtime_agent_icon(agent_id: &AgentId, label: &str) -> gpui::AnyElement {
-    let path = agent_brand_icon_path(agent_id.as_str(), label).unwrap_or("icons/bot.svg");
-    let mut icon = svg().path(path).size(px(16.0)).flex_shrink_0();
-    if path == "icons/bot.svg" {
-        icon = icon.text_color(theme::text_secondary());
-    }
-    icon.into_any_element()
-}
-
-fn runtime_model_icon(model_id: Option<&str>, size: gpui::Pixels) -> gpui::AnyElement {
-    match model_id.and_then(model_brand_icon_path) {
-        Some(path) => svg()
+/// Brand icon for an Agent, desktop-style: colored marks render through
+/// `img` to keep their embedded palette; themed marks and the bot fallback
+/// are tinted with `tint`.
+fn runtime_agent_icon(
+    agent_id: &AgentId,
+    label: &str,
+    size: gpui::Pixels,
+    tint: Hsla,
+) -> gpui::AnyElement {
+    match agent_brand_asset(agent_id.as_str(), label) {
+        Some((path, false)) => img(path).size(size).flex_shrink_0().into_any_element(),
+        Some((path, true)) => svg()
             .path(path)
             .size(size)
             .flex_shrink_0()
+            .text_color(tint)
+            .into_any_element(),
+        None => svg()
+            .path("icons/bot.svg")
+            .size(size)
+            .flex_shrink_0()
+            .text_color(tint)
+            .into_any_element(),
+    }
+}
+
+/// Brand icon for a model id, desktop-style: colored marks render through
+/// `img`; themed marks are tinted with `tint` and unknown ids fall back to
+/// the sparkles glyph.
+fn runtime_model_icon(model_id: Option<&str>, size: gpui::Pixels, tint: Hsla) -> gpui::AnyElement {
+    match model_id.and_then(model_brand_asset) {
+        Some((path, false)) => img(path).size(size).flex_shrink_0().into_any_element(),
+        Some((path, true)) => svg()
+            .path(path)
+            .size(size)
+            .flex_shrink_0()
+            .text_color(tint)
             .into_any_element(),
         None => svg()
             .path("icons/sparkles.svg")
@@ -15258,6 +15430,42 @@ mod tests {
         assert_eq!(agent_icon_path("chatgpt-acp"), "icons/openai.svg");
         assert_eq!(agent_icon_path("tongyi"), "icons/qwen.svg");
         assert_eq!(agent_icon_path("unknown-provider"), "brand/logo.svg");
+    }
+
+    #[test]
+    fn runtime_brand_assets_match_desktop_lookup_and_coloring() {
+        // Desktop-parity marks: monochrome glyphs tint through the current
+        // color, brand-colored marks must render through `img`.
+        assert_eq!(
+            agent_brand_asset("claude-code", "Claude Code"),
+            Some(("icons/claude.svg", false))
+        );
+        assert_eq!(
+            agent_brand_asset("codex", "Codex"),
+            Some(("icons/openai.svg", true))
+        );
+        assert_eq!(
+            agent_brand_asset("zcode", "ZCode"),
+            Some(("icons/agents/glm-acp-agent.svg", true))
+        );
+        assert_eq!(
+            agent_brand_asset("deepseek-harness", "DeepSeek"),
+            Some(("icons/agents/deepseek-harness.svg", false))
+        );
+        assert_eq!(
+            agent_brand_asset("totally-unknown", "Mystery"),
+            None
+        );
+
+        assert_eq!(
+            model_brand_asset("anthropic/claude-opus-4"),
+            Some(("icons/claude.svg", false))
+        );
+        assert_eq!(
+            model_brand_asset("openai/gpt-5"),
+            Some(("icons/openai.svg", true))
+        );
+        assert_eq!(model_brand_asset("mystery/model-x"), None);
     }
 
     #[test]
