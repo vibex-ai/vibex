@@ -12,7 +12,7 @@ const MILLIS_PER_DAY: i64 = 24 * 60 * 60 * 1_000;
 
 pub const SIDEBAR_AUTO_ARCHIVE_MAX_DAYS: u8 = 14;
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "id", rename_all = "snake_case")]
 pub enum SidebarOrganizationItem {
     Folder(String),
@@ -28,7 +28,7 @@ impl SidebarOrganizationItem {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SidebarFolderUiState {
     pub name: String,
@@ -42,7 +42,7 @@ pub struct SidebarFolderUiState {
     pub auto_archive_after_days: Option<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SidebarOrganizationPlacement {
     pub item: SidebarOrganizationItem,
@@ -56,7 +56,7 @@ pub enum SidebarOrganizationScope {
     Project(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SidebarOrganizationState {
     #[serde(default)]

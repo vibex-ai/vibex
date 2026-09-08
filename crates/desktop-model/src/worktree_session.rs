@@ -19,7 +19,7 @@ pub enum NewSessionLocation {
     CurrentCheckout,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SidebarHierarchyMode {
     Detailed,

@@ -73,6 +73,20 @@ impl SidebarMutationRejection {
     }
 }
 
+/// The result of a client-originated change. A change that is legal but
+/// already reflected in the tree — collapsing a project that is collapsed,
+/// dropping a row back where it came from — succeeds as a no-op instead of
+/// reporting a rejection the user cannot act on; the compact client and the
+/// Desktop already agree about what the sidebar shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarMutationOutcome {
+    /// The tree changed; the Desktop persists and republishes the snapshot.
+    Applied(SidebarMutationEffect),
+    /// The requested state already held; answering with the current snapshot
+    /// is enough for the client to resynchronize.
+    AlreadyApplied,
+}
+
 fn item_to_remote(item: &SidebarOrganizationItem) -> RemoteSidebarItemRef {
     let (kind, id) = match item {
         SidebarOrganizationItem::Folder(id) => (RemoteSidebarItemKind::Folder, id),
@@ -276,8 +290,8 @@ impl SidebarOrganizationView {
         mutation: &RemoteSidebarOrganizationMutation,
         session_projects: &BTreeMap<String, String>,
         new_folder_id: &str,
-    ) -> Result<SidebarMutationEffect, SidebarMutationRejection> {
-        let changed = match mutation {
+    ) -> Result<SidebarMutationOutcome, SidebarMutationRejection> {
+        let outcome = match mutation {
             RemoteSidebarOrganizationMutation::MoveItems {
                 items,
                 anchor,
@@ -288,25 +302,53 @@ impl SidebarOrganizationView {
                 if moving.is_empty() {
                     return Err(SidebarMutationRejection::Rejected);
                 }
+                // A legal move that changes nothing — the dropped row already
+                // sits in the requested position, which is how a drag that
+                // raced a desktop-side edit or dropped in place lands — is an
+                // idempotent success, not an error the client cannot act on.
                 let moved = match (anchor, position) {
                     (Some(anchor), RemoteSidebarDropPosition::Into) => {
                         let RemoteSidebarItemKind::Folder = anchor.kind else {
                             return Err(SidebarMutationRejection::Rejected);
                         };
+                        if !self.organization.can_move_many_into(
+                            &moving,
+                            &anchor.id,
+                            session_projects,
+                        ) {
+                            return Err(SidebarMutationRejection::Rejected);
+                        }
                         self.organization
                             .move_many_into(&moving, &anchor.id, session_projects)
                     }
-                    (Some(anchor), position) => self.organization.move_many_relative(
-                        &moving,
-                        &item_from_remote(anchor),
-                        matches!(position, RemoteSidebarDropPosition::After),
-                        session_projects,
-                    ),
+                    (Some(anchor), position) => {
+                        let anchor = item_from_remote(anchor);
+                        if !self.organization.can_move_many_relative(
+                            &moving,
+                            &anchor,
+                            session_projects,
+                        ) {
+                            return Err(SidebarMutationRejection::Rejected);
+                        }
+                        self.organization.move_many_relative(
+                            &moving,
+                            &anchor,
+                            matches!(position, RemoteSidebarDropPosition::After),
+                            session_projects,
+                        )
+                    }
                     (None, _) => {
                         let scope = project_id.clone().map_or(
                             SidebarOrganizationScope::Root,
                             SidebarOrganizationScope::Project,
                         );
+                        if !self.organization.can_move_many_to_scope_root(
+                            &moving,
+                            &scope,
+                            session_projects,
+                        ) {
+                            return Err(SidebarMutationRejection::Rejected);
+                        }
                         self.organization.move_many_to_scope_root_end(
                             &moving,
                             &scope,
@@ -314,10 +356,11 @@ impl SidebarOrganizationView {
                         )
                     }
                 };
-                if !moved {
-                    return Err(SidebarMutationRejection::Rejected);
+                if moved {
+                    SidebarMutationEffect::ORGANIZATION.into()
+                } else {
+                    SidebarMutationOutcome::AlreadyApplied
                 }
-                SidebarMutationEffect::ORGANIZATION
             }
             RemoteSidebarOrganizationMutation::MoveWorkspaces {
                 project_id,
@@ -335,15 +378,18 @@ impl SidebarOrganizationView {
                 let Some(order) = self.workspace_order.get_mut(project_id) else {
                     return Err(SidebarMutationRejection::Rejected);
                 };
-                if !move_workspace_ids_relative(
+                match move_workspace_ids_relative(
                     order,
                     workspace_ids,
                     anchor_workspace_id.as_deref(),
                     after,
                 ) {
-                    return Err(SidebarMutationRejection::Rejected);
+                    WorkspaceMoveOutcome::Illegal => {
+                        return Err(SidebarMutationRejection::Rejected);
+                    }
+                    WorkspaceMoveOutcome::Moved => SidebarMutationEffect::NAVIGATION.into(),
+                    WorkspaceMoveOutcome::Unchanged => SidebarMutationOutcome::AlreadyApplied,
                 }
-                SidebarMutationEffect::NAVIGATION
             }
             RemoteSidebarOrganizationMutation::CreateFolder {
                 name,
@@ -365,19 +411,26 @@ impl SidebarOrganizationView {
                         .collapsed_folder_ids
                         .remove(parent_folder_id);
                 }
-                SidebarMutationEffect::ORGANIZATION
+                SidebarMutationEffect::ORGANIZATION.into()
             }
             RemoteSidebarOrganizationMutation::RenameFolder { folder_id, name } => {
-                if !self.organization.rename_folder(folder_id, name.trim()) {
+                let name = name.trim();
+                let Some(folder) = self.organization.folders.get(folder_id) else {
+                    return Err(SidebarMutationRejection::Rejected);
+                };
+                if folder.name == name {
+                    return Ok(SidebarMutationOutcome::AlreadyApplied);
+                }
+                if !self.organization.rename_folder(folder_id, name) {
                     return Err(SidebarMutationRejection::Rejected);
                 }
-                SidebarMutationEffect::ORGANIZATION
+                SidebarMutationEffect::ORGANIZATION.into()
             }
             RemoteSidebarOrganizationMutation::DeleteFolder { folder_id } => {
                 if !self.organization.delete_folder(folder_id) {
                     return Err(SidebarMutationRejection::Rejected);
                 }
-                SidebarMutationEffect::ORGANIZATION
+                SidebarMutationEffect::ORGANIZATION.into()
             }
             RemoteSidebarOrganizationMutation::SetFolderCollapsed {
                 folder_id,
@@ -393,10 +446,11 @@ impl SidebarOrganizationView {
                 } else {
                     self.organization.collapsed_folder_ids.remove(folder_id)
                 };
-                if !changed {
-                    return Err(SidebarMutationRejection::Rejected);
+                if changed {
+                    SidebarMutationEffect::ORGANIZATION.into()
+                } else {
+                    SidebarMutationOutcome::AlreadyApplied
                 }
-                SidebarMutationEffect::ORGANIZATION
             }
             RemoteSidebarOrganizationMutation::SetProjectCollapsed {
                 project_id,
@@ -407,10 +461,11 @@ impl SidebarOrganizationView {
                 } else {
                     self.collapsed_project_ids.remove(project_id)
                 };
-                if !changed {
-                    return Err(SidebarMutationRejection::Rejected);
+                if changed {
+                    SidebarMutationEffect::NAVIGATION.into()
+                } else {
+                    SidebarMutationOutcome::AlreadyApplied
                 }
-                SidebarMutationEffect::NAVIGATION
             }
             RemoteSidebarOrganizationMutation::SetWorkspaceCollapsed {
                 workspace_id,
@@ -421,10 +476,11 @@ impl SidebarOrganizationView {
                 } else {
                     self.collapsed_workspace_ids.remove(workspace_id)
                 };
-                if !changed {
-                    return Err(SidebarMutationRejection::Rejected);
+                if changed {
+                    SidebarMutationEffect::NAVIGATION.into()
+                } else {
+                    SidebarMutationOutcome::AlreadyApplied
                 }
-                SidebarMutationEffect::NAVIGATION
             }
             RemoteSidebarOrganizationMutation::SetSessionPinned { session_id, pinned } => {
                 if !session_projects.contains_key(session_id) {
@@ -435,10 +491,11 @@ impl SidebarOrganizationView {
                 } else {
                     self.pinned_session_ids.remove(session_id)
                 };
-                if !changed {
-                    return Err(SidebarMutationRejection::Rejected);
+                if changed {
+                    SidebarMutationEffect::NAVIGATION.into()
+                } else {
+                    SidebarMutationOutcome::AlreadyApplied
                 }
-                SidebarMutationEffect::NAVIGATION
             }
             RemoteSidebarOrganizationMutation::SetSessionAutoContinue {
                 session_id,
@@ -457,7 +514,7 @@ impl SidebarOrganizationView {
                 // An explicit enable/disable always clears a pause; the
                 // suspension is only set by pausing or stopping a session.
                 self.auto_continue_paused_session_ids.remove(session_id);
-                SidebarMutationEffect::NAVIGATION
+                SidebarMutationEffect::NAVIGATION.into()
             }
             RemoteSidebarOrganizationMutation::SetWorktreeTitle {
                 workspace_id,
@@ -472,7 +529,7 @@ impl SidebarOrganizationView {
                 }
                 self.worktree_titles
                     .insert(workspace_id.clone(), title.to_string());
-                SidebarMutationEffect::NAVIGATION
+                SidebarMutationEffect::NAVIGATION.into()
             }
             RemoteSidebarOrganizationMutation::SetHierarchyMode { mode } => {
                 let next = match mode {
@@ -480,14 +537,20 @@ impl SidebarOrganizationView {
                     RemoteSidebarHierarchyMode::Compact => SidebarHierarchyMode::Compact,
                 };
                 if self.hierarchy_mode == next {
-                    return Err(SidebarMutationRejection::Rejected);
+                    return Ok(SidebarMutationOutcome::AlreadyApplied);
                 }
                 self.hierarchy_mode = next;
-                SidebarMutationEffect::NAVIGATION
+                SidebarMutationEffect::NAVIGATION.into()
             }
         };
         self.revision = self.revision.wrapping_add(1);
-        Ok(changed)
+        Ok(outcome)
+    }
+}
+
+impl From<SidebarMutationEffect> for SidebarMutationOutcome {
+    fn from(effect: SidebarMutationEffect) -> Self {
+        Self::Applied(effect)
     }
 }
 
@@ -508,9 +571,9 @@ fn move_workspace_ids_relative(
     moving_ids: &[String],
     anchor_id: Option<&str>,
     after: bool,
-) -> bool {
+) -> WorkspaceMoveOutcome {
     if moving_ids.is_empty() {
-        return false;
+        return WorkspaceMoveOutcome::Illegal;
     }
     let moving_set = moving_ids.iter().collect::<BTreeSet<_>>();
     if moving_set.len() != moving_ids.len()
@@ -519,12 +582,12 @@ fn move_workspace_ids_relative(
             .iter()
             .any(|id| !order.iter().any(|candidate| candidate == id))
     {
-        return false;
+        return WorkspaceMoveOutcome::Illegal;
     }
     if let Some(anchor) = anchor_id
         && !order.iter().any(|candidate| candidate == anchor)
     {
-        return false;
+        return WorkspaceMoveOutcome::Illegal;
     }
 
     let original = order.clone();
@@ -542,7 +605,20 @@ fn move_workspace_ids_relative(
             .unwrap_or(order.len())
     });
     order.splice(insert_at..insert_at, moving_order);
-    *order != original
+    if *order == original {
+        WorkspaceMoveOutcome::Unchanged
+    } else {
+        WorkspaceMoveOutcome::Moved
+    }
+}
+
+/// Distinguishes a workspace reorder that is not legal for the current order
+/// from one that is legal but already in the requested arrangement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceMoveOutcome {
+    Illegal,
+    Moved,
+    Unchanged,
 }
 
 /// Root-level children under `parent_folder_id`: root folders and projects, in
@@ -784,6 +860,9 @@ mod tests {
                 "unused",
             )
             .expect("moving a session into a project folder is legal");
+        let SidebarMutationOutcome::Applied(effect) = effect else {
+            panic!("moving into a folder should report an applied effect");
+        };
         assert!(effect.organization);
         assert_eq!(view.revision, before + 1);
         assert_eq!(
@@ -819,6 +898,61 @@ mod tests {
     }
 
     #[test]
+    fn a_noop_move_succeeds_without_reordering_the_tree() {
+        let mut view = view_with_folder();
+        let before = view.organization.placements.clone();
+        // session-a already sits directly before session-b, so dropping it
+        // "before session-b" again is a legal move that changes nothing.
+        let outcome = view.apply_remote(
+            &RemoteSidebarOrganizationMutation::MoveItems {
+                items: vec![RemoteSidebarItemRef {
+                    kind: RemoteSidebarItemKind::Session,
+                    id: "session-a".to_string(),
+                }],
+                anchor: Some(RemoteSidebarItemRef {
+                    kind: RemoteSidebarItemKind::Session,
+                    id: "session-b".to_string(),
+                }),
+                position: RemoteSidebarDropPosition::Before,
+                project_id: Some("project-1".to_string()),
+            },
+            &session_projects(),
+            "unused",
+        );
+        assert_eq!(outcome, Ok(SidebarMutationOutcome::AlreadyApplied));
+        assert_eq!(view.organization.placements, before);
+    }
+
+    #[test]
+    fn collapsing_an_already_collapsed_project_is_a_noop_not_a_rejection() {
+        let mut view = view_with_folder();
+        view.collapsed_project_ids.insert("project-1".to_string());
+        let outcome = view.apply_remote(
+            &RemoteSidebarOrganizationMutation::SetProjectCollapsed {
+                project_id: "project-1".to_string(),
+                collapsed: true,
+            },
+            &session_projects(),
+            "unused",
+        );
+        assert_eq!(outcome, Ok(SidebarMutationOutcome::AlreadyApplied));
+    }
+
+    #[test]
+    fn setting_the_current_hierarchy_mode_is_a_noop_not_a_rejection() {
+        let mut view = view_with_folder();
+        view.hierarchy_mode = SidebarHierarchyMode::Compact;
+        let outcome = view.apply_remote(
+            &RemoteSidebarOrganizationMutation::SetHierarchyMode {
+                mode: RemoteSidebarHierarchyMode::Compact,
+            },
+            &session_projects(),
+            "unused",
+        );
+        assert_eq!(outcome, Ok(SidebarMutationOutcome::AlreadyApplied));
+    }
+
+    #[test]
     fn pinning_an_unknown_session_is_refused() {
         let mut view = view_with_folder();
         assert_eq!(
@@ -847,6 +981,9 @@ mod tests {
                 "unused",
             )
             .expect("collapsing a project is always legal");
+        let SidebarMutationOutcome::Applied(effect) = effect else {
+            panic!("collapsing a fresh project should report an applied effect");
+        };
         assert!(effect.navigation && !effect.organization);
         assert!(view.collapsed_project_ids.contains("project-1"));
     }
@@ -874,6 +1011,9 @@ mod tests {
                 "unused",
             )
             .expect("workspace reorder should be legal");
+        let SidebarMutationOutcome::Applied(effect) = effect else {
+            panic!("a real workspace reorder should report an applied effect");
+        };
         assert!(effect.navigation && !effect.organization);
         assert_eq!(
             view.workspace_order.get("project-1"),

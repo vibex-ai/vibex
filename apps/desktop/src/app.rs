@@ -105,15 +105,15 @@ use vibex_desktop_model::{
     NewSessionProjectTicket, NewSessionSubmissionStage, NewSessionWorkspaceState,
     RUNTIME_SELECTION_PREFERENCE_LIMIT, ReasoningDisplayMode, RuntimeCascadeChoice,
     RuntimeCascadeProjection, SIDEBAR_AUTO_ARCHIVE_MAX_DAYS, SessionContentWidthMode,
-    SessionUiState, SidebarHierarchyMode, SidebarMutationRejection, SidebarOrganizationItem,
-    SidebarOrganizationScope, SidebarOrganizationView, SidebarProjectAppearance,
-    SidebarProjectLogo, SidebarProjectLogoColor, SidebarProjectProjection, SidebarState,
-    SidebarWorkspaceProjection, StartupDestination, TerminalWorkingDirectory,
-    ThemeMode as ModelThemeMode, ThrottledUiStateWriter, TimelineConversationTurn,
-    TimelineDelegationProjection, TimelineFollowState, TimelineModel, TimelineProcessActivityGroup,
-    TimelineRow, TimelineRowKind, UiStateStore, UnifiedDiffLineKind, WorkbenchRoute,
-    WorkspaceContextProjection, WorktreeLifecycleDisplayState, active_collaborations,
-    complete_string_order, composer_trigger_at, current_agent_plan,
+    SessionUiState, SidebarHierarchyMode, SidebarMutationOutcome, SidebarMutationRejection,
+    SidebarOrganizationItem, SidebarOrganizationScope, SidebarOrganizationView,
+    SidebarProjectAppearance, SidebarProjectLogo, SidebarProjectLogoColor,
+    SidebarProjectProjection, SidebarState, SidebarWorkspaceProjection, StartupDestination,
+    TerminalWorkingDirectory, ThemeMode as ModelThemeMode, ThrottledUiStateWriter,
+    TimelineConversationTurn, TimelineDelegationProjection, TimelineFollowState, TimelineModel,
+    TimelineProcessActivityGroup, TimelineRow, TimelineRowKind, UiStateStore, UnifiedDiffLineKind,
+    WorkbenchRoute, WorkspaceContextProjection, WorktreeLifecycleDisplayState,
+    active_collaborations, complete_string_order, composer_trigger_at, current_agent_plan,
     custom_worktree_path_is_absolute, has_managed_child_agent_delegations, move_string_relative,
     move_strings_relative, ordered_agent_ids, parse_unified_diff,
     sidebar_project_custom_logo_file_is_valid, sidebar_project_items,
@@ -1941,15 +1941,22 @@ impl SidebarAnimationState {
 /// Content fingerprint of the sidebar tree. Compact clients echo it back with
 /// a drag so a layout that changed on the Desktop in the meantime rejects the
 /// stale move instead of silently reordering something else.
+///
+/// Only layout-bearing state participates. A move is revalidated against the
+/// full tree on the Desktop anyway, so folding pure display state — unread
+/// badges, auto-continue markers, per-session activity timestamps that move a
+/// row without the user arranging anything — into the revision would reject
+/// moves that are still valid, surfacing errors during ordinary streaming.
 fn sidebar_organization_revision(view: &SidebarOrganizationView) -> u64 {
     use std::hash::{Hash, Hasher};
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    let mut fingerprint = view.clone();
-    fingerprint.revision = 0;
-    serde_json::to_string(&fingerprint.to_remote())
-        .unwrap_or_default()
-        .hash(&mut hasher);
+    view.organization.hash(&mut hasher);
+    view.session_order.hash(&mut hasher);
+    view.session_order_anchored_at_ms.hash(&mut hasher);
+    view.project_order.hash(&mut hasher);
+    view.workspace_order.hash(&mut hasher);
+    view.hierarchy_mode.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -5952,7 +5959,7 @@ impl VibexWorkbench {
                 let session_projects = self.sidebar_session_projects();
                 let folder_id = RequestId::new().to_string();
                 match view.apply_remote(&mutation, &session_projects, &folder_id) {
-                    Ok(effect) => {
+                    Ok(SidebarMutationOutcome::Applied(effect)) => {
                         if effect.organization {
                             self.ui_state.sidebar.organization = view.organization.clone();
                             self.queue_ui_state();
@@ -5978,6 +5985,15 @@ impl VibexWorkbench {
                         self.invalidate_sidebar_projection_cache();
                         self.publish_sidebar_invalidation();
                         cx.notify();
+                        let snapshot = self.sidebar_organization_view().to_remote();
+                        request.respond(Ok(snapshot));
+                    }
+                    // The request was already reflected in the tree — a toggle
+                    // that raced the authoritative refresh, a drop that landed
+                    // in place. Nothing changed, so skip the persist and the
+                    // invalidation round trip and just hand back the current
+                    // snapshot for the client to resynchronize with.
+                    Ok(SidebarMutationOutcome::AlreadyApplied) => {
                         let snapshot = self.sidebar_organization_view().to_remote();
                         request.respond(Ok(snapshot));
                     }
