@@ -671,6 +671,7 @@ pub struct MobileApp {
     /// Cached battery-optimization allowlist state, refreshed when Settings
     /// opens so returning from the system dialog updates the row.
     battery_allowlist_ok: bool,
+    _battery_allowlist_subscription: gpui::Subscription,
 }
 
 impl Focusable for MobileApp {
@@ -778,6 +779,13 @@ impl MobileApp {
             .unwrap_or_default();
         let sidebar_search_input = cx.new(|cx| TextInput::new(locale::common("Search"), cx));
         let sidebar_search_subscription = cx.observe(&sidebar_search_input, |_, _, cx| cx.notify());
+        // The battery-optimization dialog only pauses the activity, which does
+        // not emit a Background phase on Android; track window activation so
+        // returning from it re-reads the allowlist state.
+        let battery_allowlist_subscription =
+            cx.observe_window_activation(window, move |this, _, cx| {
+                this.refresh_battery_allowlist(cx);
+            });
         let mut app = Self {
             storage,
             app_settings,
@@ -908,6 +916,7 @@ impl MobileApp {
             resume_recovery_task: None,
             pending_notification_action: None,
             battery_allowlist_ok: power::is_ignoring_battery_optimizations(),
+            _battery_allowlist_subscription: battery_allowlist_subscription,
             back_stack: Vec::new(),
             root_focus: cx.focus_handle(),
             tasks: Vec::new(),
@@ -919,13 +928,6 @@ impl MobileApp {
         app.start_notification_action_stream(cx);
         app.start_lan_discovery_event_stream(cx);
         app.start_lifecycle_stream(cx);
-        // The battery-optimization dialog only pauses the activity, which does
-        // not emit a Background phase on Android; track window activation so
-        // returning from it re-reads the allowlist state.
-        cx.observe_window_activation(window, move |this, _, cx| {
-            this.refresh_battery_allowlist(cx);
-        })
-        .attach(Self::WEAK_RELEASE???);
         // Keep the window root on the dispatch path from the very first frame
         // so system back events reach `handle_navigate_back` before any text
         // input has taken focus.
@@ -971,13 +973,7 @@ impl MobileApp {
             }
             MobileLifecycleEvent::Resumed => {
                 self.app_backgrounded = false;
-                // The battery-optimization dialog only pauses this activity,
-                // so re-read the allowlist state when it closes as well.
-                let battery_allowlist_ok = power::is_ignoring_battery_optimizations();
-                if battery_allowlist_ok != self.battery_allowlist_ok {
-                    self.battery_allowlist_ok = battery_allowlist_ok;
-                    cx.notify();
-                }
+                self.refresh_battery_allowlist(cx);
                 let Some(backend) = self.backend.clone() else {
                     return;
                 };
@@ -3897,8 +3893,16 @@ impl MobileApp {
         self.show_overlay(MobileOverlay::Hosts, window, cx);
     }
 
+    fn refresh_battery_allowlist(&mut self, cx: &mut Context<Self>) {
+        let battery_allowlist_ok = power::is_ignoring_battery_optimizations();
+        if battery_allowlist_ok != self.battery_allowlist_ok {
+            self.battery_allowlist_ok = battery_allowlist_ok;
+            cx.notify();
+        }
+    }
+
     fn open_settings(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.battery_allowlist_ok = power::is_ignoring_battery_optimizations();
+        self.refresh_battery_allowlist(cx);
         self.show_overlay(MobileOverlay::Settings, window, cx);
     }
 
