@@ -33,9 +33,7 @@ pub const TOKEN_SCHEMA_VERSION: &str = "vibex-design-tokens.v1";
 pub const TOKEN_PRODUCT_VISUAL_SOURCE: &str = "apps/desktop";
 pub const TOKEN_SOURCE_PATH: &str = "crates/vibex-ui/theme/tokens.json";
 pub const TOKEN_SOURCE_SHA256: &str =
-    "df02e27063f652eeaeab570bb7560112e13fc5604820ef77225d4064e7079ddd";
-pub const GPUI_REVISION: &str = "81d3457d0f637fce3c737712f7add44c5dfb49e1";
-pub const GPUI_COMPONENT_REVISION: &str = "89ffa4c07d649933c01e70df41adfc7e05bd87c9";
+    "41df8c45acb8d87d2a4634f4aa4ae39f9bda7cf76a9876f44505bdbdd996139e";
 
 pub const INTERFACE_TYPOGRAPHY: GpuiTypographyToken = GpuiTypographyToken {
     family: "Inter Variable",

@@ -38,8 +38,6 @@ mod tests {
         assert_eq!(TOKEN_PRODUCT_VISUAL_SOURCE, "apps/desktop");
         assert_eq!(TOKEN_SOURCE_PATH, "crates/vibex-ui/theme/tokens.json");
         assert_eq!(TOKEN_SOURCE_SHA256.len(), 64);
-        assert_eq!(GPUI_REVISION.len(), 40);
-        assert_eq!(GPUI_COMPONENT_REVISION.len(), 40);
         assert_eq!(LIGHT_TOKENS.len(), DARK_TOKENS.len());
         assert!(LIGHT_TOKENS.len() >= 40);
         assert!(!LIGHT_HIGHLIGHT_THEME_JSON.is_empty());

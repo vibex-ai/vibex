@@ -9,7 +9,6 @@ const SOURCE = "crates/vibex-ui/theme/tokens.json";
 const OUTPUT = "crates/vibex-ui/src/generated_tokens.rs";
 const SCHEMA_VERSION = "vibex-design-tokens.v1";
 const PRODUCT_VISUAL_SOURCE = "apps/desktop";
-const DEPENDENCY_SOURCE_POLICY = "fork_submodule_root_cargo_lock";
 const FORBIDDEN_SOURCE_REFERENCES = [
   "apps/web",
   "apps/mobile-wasm",
@@ -48,13 +47,6 @@ function finiteNumber(value, label, { minimum = 0 } = {}) {
 
 function positiveInteger(value, label) {
   if (!Number.isInteger(value) || value <= 0) fail(`${label} must be a positive integer`);
-  return value;
-}
-
-function revision(value, label) {
-  if (typeof value !== "string" || !/^[a-f0-9]{40}$/.test(value)) {
-    fail(`${label} must be a full Git revision`);
-  }
   return value;
 }
 
@@ -174,7 +166,6 @@ function parseSource(raw) {
       "schemaVersion",
       "productVisualSource",
       "frozenAt",
-      "dependencySource",
       "typography",
       "radiiPx",
       "spacingPx",
@@ -195,20 +186,6 @@ function parseSource(raw) {
     if (raw.toLowerCase().includes(reference.toLowerCase())) {
       fail(`${SOURCE} references frozen UI input ${reference}`);
     }
-  }
-
-  exactKeys(
-    source.dependencySource,
-    ["policy", "gpuiRevision", "gpuiComponentRevision", "gpuiComponentTheme"],
-    "dependencySource"
-  );
-  if (source.dependencySource.policy !== DEPENDENCY_SOURCE_POLICY) {
-    fail(`dependency source policy must be ${DEPENDENCY_SOURCE_POLICY}`);
-  }
-  revision(source.dependencySource.gpuiRevision, "dependencySource.gpuiRevision");
-  revision(source.dependencySource.gpuiComponentRevision, "dependencySource.gpuiComponentRevision");
-  if (source.dependencySource.gpuiComponentTheme !== "Default") {
-    fail("dependencySource.gpuiComponentTheme must preserve the Default theme");
   }
 
   exactKeys(source.typography, ["interface", "code"], "typography");
@@ -337,8 +314,6 @@ function generate(raw) {
     `pub const TOKEN_PRODUCT_VISUAL_SOURCE: &str = ${rustString(source.productVisualSource)};`,
     `pub const TOKEN_SOURCE_PATH: &str = ${rustString(SOURCE)};`,
     `pub const TOKEN_SOURCE_SHA256: &str = ${rustString(hash)};`,
-    `pub const GPUI_REVISION: &str = ${rustString(source.dependencySource.gpuiRevision)};`,
-    `pub const GPUI_COMPONENT_REVISION: &str = ${rustString(source.dependencySource.gpuiComponentRevision)};`,
     "",
     "pub const INTERFACE_TYPOGRAPHY: GpuiTypographyToken = GpuiTypographyToken {",
     `    family: ${rustString(source.typography.interface.family)},`,

@@ -16,8 +16,7 @@ use crate::glass;
 use crate::motion::mix;
 
 pub use vibex_ui::{
-    GPUI_COMPONENT_REVISION, GPUI_REVISION, TOKEN_PRODUCT_VISUAL_SOURCE, TOKEN_SCHEMA_VERSION,
-    TOKEN_SOURCE_PATH, TOKEN_SOURCE_SHA256,
+    TOKEN_PRODUCT_VISUAL_SOURCE, TOKEN_SCHEMA_VERSION, TOKEN_SOURCE_PATH, TOKEN_SOURCE_SHA256,
 };
 
 fn shared_code_font_family() -> &'static str {
@@ -272,11 +271,6 @@ mod tests {
         assert_eq!(TOKEN_SCHEMA_VERSION, "vibex-design-tokens.v1");
         assert_eq!(TOKEN_PRODUCT_VISUAL_SOURCE, "apps/desktop");
         assert_eq!(TOKEN_SOURCE_PATH, "crates/vibex-ui/theme/tokens.json");
-        assert_eq!(GPUI_REVISION, "81d3457d0f637fce3c737712f7add44c5dfb49e1");
-        assert_eq!(
-            GPUI_COMPONENT_REVISION,
-            "89ffa4c07d649933c01e70df41adfc7e05bd87c9"
-        );
         assert_eq!(semantic_token("background", false).unwrap().hex, "#ffffff");
         assert_eq!(semantic_token("foreground", true).unwrap().hex, "#e5e5e5");
         assert_eq!(semantic_token("border", true).unwrap().alpha, 0.1);
