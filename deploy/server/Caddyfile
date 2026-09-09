@@ -2,6 +2,9 @@
 # Set VIBEX_SERVER_SITE_ADDRESS to your public host, for example:
 #   VIBEX_SERVER_SITE_ADDRESS=vibex.example.com
 #
+# The Caddy sidecar runs on the host network (see docker-compose.yml), so the
+# gateway is reachable on the host's own loopback at 127.0.0.1:8765.
+#
 # Remote v2 keeps control, RPC, events, and binary frames on one full-duplex
 # WebSocket at /ws/v2, so the proxy must forward upgrade requests unchanged.
 # The HTTP surface (/api/v2/*) carries the pairing-code claim and WS tickets;
@@ -13,7 +16,7 @@
 	encode zstd gzip
 
 	@websocket path /ws/v2
-	reverse_proxy @websocket vibex-server:8765
+	reverse_proxy @websocket 127.0.0.1:8765
 
-	reverse_proxy vibex-server:8765
+	reverse_proxy 127.0.0.1:8765
 }

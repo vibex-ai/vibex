@@ -8,6 +8,13 @@ services:
     image: vibex-server:local
     container_name: vibex-server
     restart: unless-stopped
+    # Host networking: the container shares the host network namespace, so
+    # the loopback bind below is the host's own loopback — reachable by
+    # paired desktop/mobile clients and by the Caddy sidecar, invisible to
+    # anything beyond this machine. A bridge-network port publish would need
+    # a non-loopback bind, which loopback mode refuses by design
+    # (RemoteGatewayConfig::validate).
+    network_mode: host
     environment:
       # Identity and storage.
       VIBEX_HOME: /data
@@ -20,7 +27,7 @@ services:
       #   TLS and forwards), or
       #   VIBEX_TLS_MODE=server_certificate with VIBEX_TLS_CERT_FILE /
       #   VIBEX_TLS_KEY_FILE mounted into the container.
-      VIBEX_BIND_ADDR: 0.0.0.0:8765
+      VIBEX_BIND_ADDR: 127.0.0.1:8765
       VIBEX_DEPLOYMENT_MODE: ${VIBEX_DEPLOYMENT_MODE:-loopback}
       VIBEX_TLS_MODE: ${VIBEX_TLS_MODE:-loopback_http}
       VIBEX_PUBLIC_HOST: ${VIBEX_PUBLIC_HOST:-}
@@ -42,10 +49,6 @@ services:
 
       # Delegation sidecar (optional; must exist inside the image to start).
       VIBEX_DELEGATION_SIDECAR_COMMAND: ${VIBEX_DELEGATION_SIDECAR_COMMAND:-}
-    ports:
-      # Publish on loopback by default. Direct public exposure requires an
-      # explicit override plus a Public deployment mode and TLS policy.
-      - "${VIBEX_SERVER_HOST_BIND:-127.0.0.1}:8765:8765"
     volumes:
       - vibex-server-data:/data
     healthcheck:
@@ -55,7 +58,9 @@ services:
       retries: 5
       start_period: 10s
 
-  # Optional public HTTPS entrypoint. Enable with:
+  # Optional public HTTPS entrypoint. It shares the host network namespace,
+  # so it reaches the gateway on the host's own loopback (127.0.0.1:8765).
+  # Enable with:
   #   VIBEX_PUBLIC_HOST=vibex.example.com \
   #   VIBEX_DEPLOYMENT_MODE=public \
   #   VIBEX_TLS_MODE=trusted_https_proxy \
@@ -69,11 +74,9 @@ services:
     restart: unless-stopped
     profiles:
       - caddy
+    network_mode: host
     environment:
       VIBEX_SERVER_SITE_ADDRESS: ${VIBEX_PUBLIC_HOST:-vibex.example.com}
-    ports:
-      - "80:80"
-      - "443:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data

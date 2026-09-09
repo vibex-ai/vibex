@@ -33,14 +33,17 @@ RUN apt-get update \
 WORKDIR /data
 COPY --from=builder /workspace/target/release/vibex-server /usr/local/bin/vibex-server
 
-# Defaults describe the safest posture: loopback HTTP inside the container.
-# Anything reachable from outside the container must set VIBEX_DEPLOYMENT_MODE
-# and a TLS policy explicitly; RemoteGatewayConfig::validate enforces that
-# combination at startup, so a misconfigured container refuses to boot instead
-# of silently exposing an unauthenticated runtime.
+# Defaults describe the safest posture: loopback HTTP bound to the container's
+# loopback interface. Bridge-network users publish that port explicitly (e.g.
+# `-p 127.0.0.1:8765:8765`); host-network users share the host's loopback
+# directly. Anything reachable from outside the machine must set
+# VIBEX_DEPLOYMENT_MODE and a TLS policy explicitly; RemoteGatewayConfig::validate
+# enforces the mode/bind/TLS combination at startup (loopback mode refuses
+# non-loopback binds), so a misconfigured container refuses to boot instead of
+# silently exposing an unauthenticated runtime.
 ENV VIBEX_HOME=/data \
     VIBEX_DB_PATH=/data/vibex.db \
-    VIBEX_BIND_ADDR=0.0.0.0:8765 \
+    VIBEX_BIND_ADDR=127.0.0.1:8765 \
     VIBEX_DEPLOYMENT_MODE=loopback \
     VIBEX_TLS_MODE=loopback_http \
     VIBEX_APPLICATION_ID=dev.vibex.server

@@ -33,6 +33,17 @@ docker logs vibex-server | grep pairing_code=
 curl -fsS http://127.0.0.1:8765/api/v2/info
 ```
 
+The stack runs on the host network (`network_mode: host`), and the gateway
+binds the host loopback `127.0.0.1:8765`. `RemoteGatewayConfig::validate`
+refuses a loopback deployment on a non-loopback bind, and a loopback bind
+inside a bridge-network container would be unreachable through published
+ports — host networking keeps the bind, the validation, and the reachability
+consistent. No ports are published: nothing listens beyond the loopback.
+
+To pair a desktop workbench against this container, enter
+`http://127.0.0.1:8765` and the pairing code under **Settings → Remote
+Runtime** (see "Desktop as a remote client" below).
+
 Stop it with:
 
 ```bash
@@ -40,9 +51,10 @@ docker compose -f deploy/server/docker-compose.yml down
 ```
 
 The startup log prints `server_id`, `endpoint`, and a one-time numeric
-`pairing_code` (grouped `NNN-NNN-NNN`, expires after 15 minutes by default).
-Only its SHA-256 hash is persisted, it is single-use, and claiming it is
-rate-limited like every other unauthenticated route.
+`pairing_code` (grouped `NNN-NNN-NNN`, expires after 5 minutes by default,
+capped at 30 via `pairing-code --ttl-ms`). Only its SHA-256 hash is
+persisted, it is single-use, and claiming it is rate-limited like every
+other unauthenticated route.
 
 ## Pairing a device
 
@@ -72,13 +84,17 @@ device management, session lifecycle, and Terminal/file writes.
 
 ## Public HTTPS
 
-Direct public exposure requires `VIBEX_DEPLOYMENT_MODE=public` plus one of:
+Direct public exposure requires `VIBEX_DEPLOYMENT_MODE=public` plus one of
+the TLS policies below. The stack keeps host networking in both profiles;
+the two modes differ only in what the gateway binds and who terminates TLS.
 
 - `VIBEX_TLS_MODE=trusted_https_proxy` — a reverse proxy terminates TLS. Set
   `VIBEX_TRUST_FORWARDED_HEADERS=true` **only** in this mode; the gateway
   derives per-peer rate-limit keys from the forwarded client address and
   refuses forwarded headers everywhere else. The bundled Caddy profile does
-  exactly this:
+  exactly this: it runs on the host network and forwards to the gateway on
+  the host's loopback, so keep the gateway bound to `127.0.0.1:8765` in this
+  mode:
 
   ```bash
   VIBEX_PUBLIC_HOST=vibex.example.com \
@@ -92,7 +108,9 @@ Direct public exposure requires `VIBEX_DEPLOYMENT_MODE=public` plus one of:
 
 - `VIBEX_TLS_MODE=server_certificate` — the gateway terminates TLS itself.
   Mount `VIBEX_TLS_CERT_FILE` / `VIBEX_TLS_KEY_FILE` (PEM) into the
-  container and publish the port directly.
+  container, bind it on `0.0.0.0:8765` (host networking puts that on the
+  host's interfaces), and publish nothing — TLS is end to end to the
+  gateway.
 
 The gateway validates the combination at startup: a Public listener without
 trusted TLS, with loopback hosts in `VIBEX_ALLOWED_HOSTS`, or with forwarded
