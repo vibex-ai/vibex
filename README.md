@@ -386,7 +386,7 @@ Read the [UI architecture boundary](docs/architecture/ui-boundary.md),
 | **Content** | `pulldown-cmark`, HTML5ever, MathJax SVG, Mermaid rendering, PDFium, ZIP/XML parsers |
 | **Remote transport** | Axum, HTTP/WebSocket v2, Rustls, `tokio-tungstenite`, X25519, HKDF, HMAC, ChaCha20-Poly1305 |
 | **Platforms** | Linux, macOS, and Windows desktop; native Android and iOS through `gpui_android` and `gpui_ios` |
-| **Tooling** | Node.js 22, pnpm 11.3.0, deterministic smoke tests and evidence-based release gates |
+| **Tooling** | Node.js 22, pnpm 11.3.0, deterministic smoke tests and release quality gates |
 
 ## Privacy and Control
 
@@ -401,7 +401,7 @@ Read the [UI architecture boundary](docs/architecture/ui-boundary.md),
   configuration by default. Export is an explicit user action with preview and
   rollback boundaries.
 - **Redacted diagnostics:** tokens, private keys, prompts, file contents, and
-  terminal bytes are excluded from logs and evidence artifacts.
+  terminal bytes are excluded from logs and diagnostic artifacts.
 
 ## Contributing
 
@@ -411,7 +411,6 @@ Issues and pull requests are welcome. Before opening a change:
   typed backend and remote contracts.
 - Run the smallest relevant gate while iterating, then run `pnpm check` for
   cross-layer changes.
-- Include updated evidence when changing behavior covered by a release gate.
 
 ## License
 

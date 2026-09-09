@@ -1,8 +1,8 @@
-# Code Workbench Gate
+# Code Workbench Contract
 
-The code workbench gate covers the current GPUI Files, editor, Preview, Git,
-diff, and Markdown surfaces. It defines the current regression contract for
-those features.
+This page records the behavioral contract for the GPUI Files, editor, Preview,
+Git, diff, and Markdown surfaces. It is the reference for what those features
+must keep doing across refactors.
 
 ## Covered Behavior
 
@@ -19,34 +19,6 @@ those features.
 - Bounded rendering for large file trees and diffs, cache eviction, and repeated
   workspace/revision switching.
 
-## Evidence
-
-`docs/parity/evidence/code-workbench.json` stores the source-bound model,
-performance, source-contract, and visual status. A model-only capture records
-visual evidence as `pending`; it does not reuse screenshots from another source.
-Full-capture screenshots live in `docs/parity/screenshots/current/code-workbench/`.
-
-The checker rejects stale current-source identities, unbounded render contracts,
-missing screenshots, invalid visual metrics, and sensitive workspace content.
-Physical captures prove only the platform and viewport recorded by the evidence.
-
-Run the gate with:
-
-```bash
-pnpm check:code-workbench
-```
-
-Create new evidence only on a suitable capture host:
-
-```bash
-pnpm capture:code-workbench
-```
-
-Refresh only the model, performance, and source contracts when no unlocked
-physical Wayland session is available:
-
-```bash
-pnpm capture:code-workbench:model
-```
-
-This mode leaves the physical visual result pending.
+Regressions in these areas are caught by the workspace test suites
+(`cargo test`) and the `smoke:*` targets; there is no separate capture-based
+gate for this surface anymore.

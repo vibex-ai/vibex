@@ -48,15 +48,15 @@ The native mobile surface follows Zedra's restrained dark palette, compact spaci
 small radii, clear hierarchy, and edge-drawer navigation. Product-specific
 content remains Vibex GUI session content rather than Zedra's terminal workflow.
 
-## Required Evidence
+## Required Checks
 
 ```text
-pnpm check:tokens
-pnpm check:graph
+node scripts/generate-tokens.mjs
 pnpm check:mobile-native
 cargo test -p vibex-ui --locked
 cargo test -p vibex-mobile --locked
 ```
 
-Platform SDK builds are separate evidence: Android requires the Android SDK/NDK
-and `cargo-ndk`; iOS requires Xcode, XcodeGen, and the Apple Rust targets.
+Platform SDK builds are separate validation: Android requires the Android
+SDK/NDK and `cargo-ndk`; iOS requires Xcode, XcodeGen, and the Apple Rust
+targets.

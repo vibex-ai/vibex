@@ -3031,10 +3031,9 @@ GitWorktreeLifecycleMutate  -> readiness, merge, conflict, archive/restore/disca
 - Backend fixture tests keep Native, disconnected, and Remote Git trait surfaces
   exhaustive; remote tests assert read capability never implies lifecycle
   mutation.
-- Run Desktop/model/UI tests, `pnpm check:rust`, and
-  `pnpm check:code-workbench`. When physical visual capture is deferred, evidence
-  must explicitly remain `model_passed_visual_pending` rather than claiming a
-  passed screenshot review.
+- Run Desktop/model/UI tests and `pnpm check:rust`. When visual review is
+  deferred, the spec statement must explicitly say `model_passed_visual_pending`
+  rather than claiming a passed screenshot review.
 
 ### 7. Wrong vs Correct
 

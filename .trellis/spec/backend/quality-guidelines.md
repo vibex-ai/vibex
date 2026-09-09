@@ -228,8 +228,8 @@ TerminalFrameBatch {
 - `cargo test -p vibex-backend --locked` asserts safe frame `Debug` output.
 - `cargo test -p vibex-backend --features native --locked` covers eviction,
   dropped-frame growth, normal continuity, and server sequence rewind.
-- `cargo check -p vibex-ui --target wasm32-unknown-unknown --locked` and
-  `pnpm check:graph` prove the shared default graph remains WASM-isolated.
+- `cargo check -p vibex-ui --target wasm32-unknown-unknown --locked` proves the
+  shared default graph remains WASM-isolated.
 - `pnpm check:rust` remains the full workspace fmt/check/Clippy/test gate.
 
 ### 7. Wrong vs Correct
@@ -1522,8 +1522,6 @@ vibex-desktop --native-content-pdf-controller \
   <pdfium-library> <fixture.pdf> <encrypted-fixture.pdf> \
   <too-many-pages.pdf> <extreme-page.pdf> <oversized-source.pdf> <output.json>
 VIBEX_PDF_ENCRYPTED_FIXTURE_PASSWORD=<reviewed-test-password>
-pnpm check:pdf-fixtures
-pnpm check:pdf-controller
 ```
 
 ### 3. Contracts
@@ -1881,7 +1879,6 @@ ReleaseController::{promote_preview_to_rc, approve_stable_transfer, rollback_to_
 VIBEX_CHANNEL=preview|rc|stable
 VIBEX_IMPORT_REQUEST=/absolute/path/to/request.json
 node scripts/build-channel.mjs <preview|rc|stable>
-pnpm capture:release:linux
 pnpm check:release
 
 linux-release-evidence.v1 -> {

@@ -1,8 +1,9 @@
 # Platform Support Matrix
 
-This page describes the native Vibex product surfaces and the evidence required
-for a support claim. A successful compile is build evidence; native pixels,
-input, packaging, and physical-device behavior require platform-specific checks.
+This page describes the native Vibex product surfaces and the validation
+required for a support claim. A successful compile is build evidence; native
+pixels, input, packaging, and physical-device behavior require
+platform-specific checks.
 
 ## Client Surfaces
 
@@ -29,20 +30,15 @@ Git, PTY, or workspace filesystem services.
 | Credentials | OS/native desktop storage | App-sandbox credential bundle with restrictive file permissions |
 | Pairing and routes | Publishes Direct/Tailnet/Relay offers | Claims one-time offers and selects validated Direct/Tailnet/Relay routes |
 
-## Evidence Rules
-
-Machine-readable evidence under `docs/platform/evidence/` is checked by its
-matching command and is valid only for the source and lockfile identities it
-records. Do not hand-edit generated evidence.
+## Validation Commands
 
 ```bash
-pnpm check:graph
 pnpm check:licenses
 pnpm check:mobile-native
 pnpm release:build-smoke
 pnpm smoke:relay:local
 ```
 
-Physical and release-host captures are deliberately separate from the default
-developer loop. Run them only when the requested SDK, device, signing team, and
-exact source identity are available.
+Physical and release-host validation is deliberately separate from the default
+developer loop. Run it only when the requested SDK, device, and signing team
+are available.

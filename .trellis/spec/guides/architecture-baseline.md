@@ -238,7 +238,6 @@ directly or introduce a second authority.
 ## Required Gates
 
 ```bash
-pnpm check:graph
 pnpm check:licenses
 pnpm check:mobile-native
 cargo test -p vibex-ui --locked

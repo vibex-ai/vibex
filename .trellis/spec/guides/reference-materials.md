@@ -55,10 +55,11 @@ guide wins on signatures and error handling.
   confirm against current code and tests before writing a rule.
 - Prefer the shared Rust contract in `crates/core` over any per-surface shape.
   If two layers disagree about a payload, the `crates/core` DTO is right.
-- Prefer recorded evidence (`docs/parity`, `docs/platform/evidence`,
-  `docs/release`) over prose when asserting that something is verified.
-- When a spec statement can no longer be traced to code, tests, or evidence,
-  fix or delete the statement. Do not leave an unbacked rule in place.
+- Prefer executable checks (`pnpm check:*`, `smoke:*`, `cargo test`) and recorded
+  contracts (`docs/parity`, `docs/release`) over prose when asserting that
+  something is verified.
+- When a spec statement can no longer be traced to code, tests, or an executable
+  check, fix or delete the statement. Do not leave an unbacked rule in place.
 - Raw research notes and superseded planning reports are private and live under
   `.trellis/research/`, which is untracked here and synchronized with the task
   repository. They may explain how a decision was reached, but they are never an

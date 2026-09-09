@@ -205,8 +205,8 @@ AGPL-3.0-or-later. Two product clients share one GPUI design system:
 
 Layout: `apps/` (desktop, mobile, relay-server) · `crates/` (~25 Rust
 crates: agent/ACP adapters, db, fs, git, terminal, relay, remote, content,
-diagnostics, vibex-ui, vibex-terminal-ui, ...) · `scripts/` (Node evidence and
-gate scripts) · `.trellis/` (workflow, spec, tasks).
+diagnostics, vibex-ui, vibex-terminal-ui, ...) · `scripts/` (Node build,
+release, and license tooling) · `.trellis/` (workflow, spec, tasks).
 
 The pnpm workspace covers `apps/*` only; there is no top-level `packages/`.
 
@@ -245,19 +245,11 @@ pnpm lint
 
 `apps/` holds no TypeScript since the Capacitor host was removed, so `pnpm lint`
 usually matches nothing; it stays wired up to catch any web code added back
-under `apps/`. The `scripts/` tooling is deliberately outside eslint: those
-files are hashed into the `docs/platform/evidence/*.json` release gates, so a
-cosmetic edit there invalidates captured evidence and forces a re-capture.
+under `apps/`.
 
-`pnpm check` chains roughly thirty gates and takes a long time — treat it as a
-pre-release gate, not an edit-loop command. During iteration run only the gates
-covering what you touched.
-
-This project uses an **evidence-based gate convention**: `capture:*` scripts run
-a scenario and write an evidence artifact (`--write`), while the matching
-`check:*` script re-runs it and fails when reality and the recorded evidence
-diverge. Many also accept `--self-test`. When a `check:*` gate fails, fix the
-code or re-capture deliberately — do not hand-edit evidence files.
+`pnpm check` chains the fast quality gates (Rust fmt/clippy/tests, typecheck,
+licenses) and takes a while — during iteration run only the gates covering
+what you touched.
 
 `smoke:*` targets exercise real subsystems (`smoke:db`, `smoke:git`,
 `smoke:pty`, `smoke:codex`, `smoke:claude`, `smoke:relay:local`); `e2e:*` and

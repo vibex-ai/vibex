@@ -4,14 +4,15 @@ Frontend quality means native desktop and the installed mobile runtime operate
 against the same Vibex domain contract while presenting the right amount of
 control for each form factor.
 
-Current evidence: [Architecture Baseline](../guides/architecture-baseline.md), GPUI Desktop source-bound
-evidence, and current runtime/protocol tests.
+Validation today: [Architecture Baseline](../guides/architecture-baseline.md),
+the `pnpm check` quality gates, `check:mobile-native`, and `cargo test` suites in
+the owning crates. The capture-based evidence gate system was removed; scenario
+sections below record behavioral contracts only, not gate workflows.
 
-The long React/Tauri scenarios retained below are historical validation evidence
-for deleted migration surfaces. Their paths, commands, and writers are not
-current gates and must not be restored. New UI quality evidence must cover
-shared GPUI components, platform dependency isolation, Wide on native desktop,
-the compact native mobile client, native input, and the
+Historical React/Tauri migration scenarios were removed together with their
+commands and artifacts and must not be restored. New UI work must cover shared
+GPUI components, platform dependency isolation, Wide on native desktop, the
+compact native mobile client, native input, and the
 NativeBackend/WebRemoteBackend boundary.
 
 ## Review Checklist
@@ -355,191 +356,18 @@ Correct: Activity System.loadLibrary -> one-shot GPUI queue -> claim_pairing_lin
 ```
 
 
-## Scenario: Deterministic Desktop Browser Fixtures
-
-### 1. Scope / Trigger
-
-- Trigger: desktop workflow screenshots or scripted UI actions must run without
-  Tauri, a Provider process, real credentials, or developer browser persistence.
-- The fixture layer is browser evidence only. Native window, IME, WebView,
-  Terminal, PDF, DPI, and package behavior still require native evidence.
-
-### 2. Signatures
-
-```text
-apps/desktop/src/fixtures/desktop-behavioral-v1.json
-  fixtures[workflowId] -> {
-    states, initialView, actions, expectedCalls, expectedEvents, expectedState
-  }
-
-?fixture=<workflow-id>&state=<state>&theme=<light|dark>&locale=<en|zh-CN>
-
-window.__VIBEX_DESKTOP_FIXTURE__.getSnapshot() -> {
-  fixtureId, state, theme, locale, deterministic, providerFree, ready, calls[]
-}
-
-desktop-react-fixture-evidence.v2 -> {
-  scope: { coreMatrix, browserInteractions, notClaimed },
-  captures[]: {
-    group, catalogActionId, interaction, browserState,
-    actions, assertions, interactionCallContracts, screenshot
-  }
-}
-```
-
-### 3. Contracts
-
-- The catalog is the single workflow contract. Manifest generation, browser
-  runtime selection, actions, screenshots, and evidence checks reference the
-  same stable workflow id.
-- Fixture activation is explicit through `fixture`. A missing selector keeps
-  ordinary browser mock behavior, and Tauri always invokes the native command.
-- Initialize the fixture before dynamically importing `App`. Zustand persist
-  hydrates during module evaluation, so clearing or seeding storage after a
-  static `App` import is too late and produces machine-dependent screenshots.
-- Clear only Vibex-owned local/session storage keys. Seed theme, locale, and
-  lightweight workbench navigation; authoritative workflow data still enters
-  through typed `api` mock responses and TanStack Query.
-- Use a fixed monotonic fixture clock and sanitize the public call trace.
-  Secret/token/password fields and real home paths must not enter evidence.
-- Project Agent states with generated `AgentSession`, `TimelinePage`,
-  `PermissionRequest`, and runtime DTOs. UI code must not read fixture-specific
-  provider payloads or branch on fixture ids.
-- Distinguish transport errors from authoritative timeline errors. An invoke
-  failure rejects the Promise; a persisted `TimelinePayload.type === "error"`
-  resolves normally and renders recovery from authoritative data.
-- Screenshot evidence records input hashes, browser/environment identity,
-  viewport, actions/assertions, call outcomes, PNG size, and PNG SHA-256. A
-  representative matrix must explicitly say it is not full Cartesian coverage.
-- A complete browser matrix must name the stable fixture/state and exact Cartesian
-  dimensions it covers. Do not shorten "one fixture x theme x locale x viewport" to
-  an unqualified "full matrix" or imply every workflow/state combination ran.
-- Interaction captures reference an action id declared by the same workflow fixture.
-  Store exact sanitized command projections for behavior under test, but explicitly
-  omit nondeterministic fields such as generated idempotency keys instead of dropping
-  the entire request contract.
-- Controlled Radix Dialogs whose keyboard trigger is outside the `Dialog` root must
-  capture `document.activeElement` in `onOpenAutoFocus`. In `onCloseAutoFocus`, prevent
-  the default and focus that element only while it is still connected. This preserves
-  Escape/Cancel return without focusing a trigger that a successful action removed.
-
-### 4. Validation & Error Matrix
-
-- Unknown fixture id or undeclared state -> fail before rendering.
-- Missing workflow, command, event, action, or expected-state record -> fail
-  the baseline generator.
-- `loading` -> the fixture entry command remains pending and evidence asserts
-  the pending outcome.
-- Transport `error` -> the configured command rejects and the error surface is
-  visible.
-- Timeline `error` -> `agent_fetch_timeline` resolves with a typed error item;
-  evidence asserts the error copy and recovery action.
-- `empty` -> list/page DTOs retain their protocol shape with empty collections;
-  do not return an arbitrary `null`.
-- Changed runtime/catalog/app/lockfile input -> offline evidence check fails and
-  requires explicit recapture.
-- Missing theme x locale x required-viewport core cell, unknown catalog action id,
-  changed scripted assertion, or changed deterministic command projection -> offline
-  evidence check fails.
-- Dialog Escape/Cancel does not return to its still-mounted trigger, or forward/reverse
-  Tab leaves an open modal -> browser interaction capture fails.
-- Browser evidence claims native CJK/IME or platform-window behavior -> evidence scope
-  is invalid even if synthetic DOM composition or Chromium input passed.
-- Browser console/page error or blank/incomplete DOM -> capture fails.
-
-### 5. Good/Base/Bad Cases
-
-- Good: a permission fixture renders the normal permission card from a typed
-  `TimelinePage`, and its call trace contains only sanitized local mock calls.
-- Base: a representative pass covers each state/theme/locale/viewport value once and
-  labels itself representative rather than implying every combination ran.
-- Good: a complete browser pass records all 24 cells for one stable fixture across two
-  themes, two locales, and six required viewports, while listing native CJK/IME and
-  platform evidence under `notClaimed`.
-- Bad: override component props or query cache directly to manufacture a
-  screenshot that bypasses the command and protocol boundaries.
-- Bad: reject `agent_fetch_timeline` to represent a persisted recoverable error;
-  this tests transport failure and never exercises the error timeline renderer.
-- Bad: import `App` statically, then clear localStorage in `main.tsx`; Zustand may
-  already have hydrated stale navigation state.
-
-### 6. Tests Required
-
-- `pnpm check:desktop-baseline` asserts catalog/manifest/source consistency.
-- `pnpm capture:desktop:fixtures` is the explicit Playwright recapture command.
-- `pnpm check:desktop-fixtures` validates committed inputs, assertions, call
-  outcomes, PNG presence/size, and hashes without launching a browser.
-- Keyboard/focus interaction captures assert both forward and reverse focus trapping,
-  Escape/Cancel trigger return, Enter versus Shift+Enter, and Composer focus after
-  send. Drag/drop asserts the exact typed `file_rename` path/newPath request.
-- `pnpm check:frontend` and the desktop Vite build cover fixture DTO imports,
-  dynamic bootstrap order, and production bundle separation.
-- Visually inspect every changed screenshot, including the absolute 360 x 620
-  minimum; record baseline defects instead of silently accepting them as parity.
-
-### 7. Wrong vs Correct
-
-#### Wrong
-
-```tsx
-import { App } from "./App";
-
-localStorage.clear();
-render(<App fixtureTimeline={rawProviderEvent as TimelinePage} />);
-```
-
-#### Correct
-
-```tsx
-const fixture = initializeDesktopFixtureRuntime();
-const { App } = await import("./App");
-
-render(<App />); // typed api mocks remain the data boundary
-```
-
-#### Wrong: controlled Dialog without a trigger
-
-```tsx
-<Dialog open={open} onOpenChange={setOpen}>
-  <DialogContent />
-</Dialog>
-```
-
-When the actual trigger lives elsewhere in the workbench, Radix has no
-`Dialog.Trigger` to receive focus after Escape.
-
-#### Correct: connected opening-element return
-
-```tsx
-const returnFocusRef = useRef<HTMLElement | null>(null);
-
-<DialogContent
-  onOpenAutoFocus={() => {
-    returnFocusRef.current = document.activeElement instanceof HTMLElement
-      ? document.activeElement
-      : null;
-  }}
-  onCloseAutoFocus={(event) => {
-    if (returnFocusRef.current?.isConnected) {
-      event.preventDefault();
-      returnFocusRef.current.focus({ preventScroll: true });
-    }
-  }}
-/>
-```
-
 ## Scenario: Native File Dialog Backend Isolation
 
 ### 1. Scope / Trigger
 
-- Trigger: GPUI adds or changes a native file/directory chooser while the Tauri
-  workspace still uses `tauri-plugin-dialog`.
+- Trigger: GPUI adds or changes a native file/directory chooser or the Linux
+  tray stack.
 
 ### 2. Signatures
 
 ```toml
 # GPUI uses a distinct rfd release so Cargo cannot merge its Portal features
-# with Tauri's GTK3 features.
+# with GTK3 features pulled in by any other workspace consumer.
 rfd = { version = "0.17.2", default-features = false,
         features = ["wayland", "xdg-portal"] }
 ```
@@ -549,9 +377,8 @@ rfd = { version = "0.17.2", default-features = false,
 - The default GPUI Linux binary uses XDG Desktop Portal and must not link GTK or
   WebKit solely for file dialogs. GTK is permitted only for the Linux AppIndicator
   system-tray integration; WebKit remains excluded from the default build.
-- Tauri may retain its independently versioned GTK3 dialog backend.
-- The two surfaces must not resolve to the same `rfd` package version when they
-  require mutually exclusive backend features.
+- Any second consumer needing mutually exclusive `rfd` backend features must pin
+  a different `rfd` release; Cargo cannot merge conflicting feature sets.
 - GPUI awaits `AsyncFileDialog` through its existing async task boundary; the
   dialog backend must not require a Tokio reactor on arbitrary GPUI worker
   threads.
@@ -568,17 +395,16 @@ rfd = { version = "0.17.2", default-features = false,
 
 ### 5. Good/Base/Bad Cases
 
-- Good: GPUI uses `rfd 0.17.x` Portal while Tauri uses `rfd 0.16.x` GTK3.
+- Good: GPUI uses `rfd 0.17.x` Portal while any other consumer pins its own
+  GTK3 release.
 - Base: each app builds independently and `cargo check --workspace --all-targets
   --locked` also succeeds.
-- Bad: both apps use `rfd 0.16` with conflicting features and only package-local
-  checks are run.
+- Bad: two consumers share one `rfd` version with conflicting features.
 
 ### 6. Tests Required
 
 - `cargo check --workspace --all-targets --locked`.
-- `node scripts/capture-linux-package.mjs --write`, then its read-only check.
-- Verify the release `NEEDED` set and license/SBOM graph after dependency changes.
+- `pnpm check:licenses` and the release packaging smoke after dependency changes.
 
 ### 7. Wrong vs Correct
 
@@ -586,7 +412,7 @@ rfd = { version = "0.17.2", default-features = false,
 
 ```toml
 rfd = { version = "0.16", features = ["xdg-portal"] }
-# Tauri transitively enables rfd 0.16/gtk3 in the same workspace graph.
+# Another workspace consumer transitively enables rfd 0.16/gtk3 in the same graph.
 ```
 
 #### Correct
@@ -596,273 +422,14 @@ rfd = { version = "0.17.2", default-features = false,
         features = ["wayland", "xdg-portal"] }
 ```
 
-## Scenario: Native Tauri Evidence Claims
-
-### 1. Scope / Trigger
-
-- Trigger: desktop behavior depends on a native window, display scale, input method,
-  system dialog, Terminal, embedded WebView, platform lifecycle, or package rather
-  than browser DOM behavior.
-- Browser fixtures and synthetic displays may contribute evidence, but they cannot
-  satisfy a claim that remains assigned to a physical native protocol. An approved
-  hosted policy may exclude named macOS/Windows GUI claims from the decision
-  denominator; exclusion still does not satisfy those claims.
-
-### 2. Signatures
-
-```text
-pnpm capture:tauri:native-baseline -> explicit local evidence writer
-pnpm check:tauri-native-baseline   -> offline identity/schema/artifact check
-
-tauri-native-baseline-evidence.v1 -> {
-  protocol, source, requiredNativeScenarios, requiredTargets,
-  nativeGateSatisfied, targets[]
-}
-
-target -> {
-  id: linux_x11 | linux_wayland | macos | windows,
-  status: captured_synthetic | captured_native |
-          blocked_runner_unavailable | blocked_backend_unavailable,
-  requiredNativeGateSatisfied, ui, runner, window, capture,
-  scenarios[], blockers[], limitations[]
-}
-```
-
-### 3. Contracts
-
-- Every target and required scenario in the historical capture artifact has a stable
-  id, status, owner, and either an observation or an actionable capture blocker. A
-  current decision consumer must overlay the reviewed hosted-runner policy: failed
-  hosted build/package checks remain blockers, while its exact five GUI exclusions
-  are non-decision skips rather than passes or inferred deviations.
-- `requiredNativeGateSatisfied` is true only when the target and every required
-  scenario in this physical protocol have `captured_native` evidence.
-  `captured_synthetic` always leaves that physical gate false. This legacy aggregate
-  is not the denominator for policy-approved hosted exclusions.
-- Runner identity must match the target: Linux X11/Wayland cannot satisfy macOS or
-  Windows, and XWayland cannot satisfy native Wayland surface identity.
-- Capture with disposable `HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and
-  `XDG_CACHE_HOME`. Fix and record theme/locale. Never load user databases, browser
-  profiles, prompts, terminal history, credentials, clipboard content, or user files.
-- Build the Tauri evidence binary with embedded frontend assets and
-  `tauri/custom-protocol`. A release-mode binary built without that feature may load
-  the development URL and produce a connection-refused or blank client; that is a
-  failed capture input, not native rendering evidence.
-- Bind evidence to lockfiles, Tauri config, desktop/shared source, capture script, and
-  protocol hashes. Normal checks never regenerate evidence.
-- For physical Linux capture, screenshot only the application window/client or a
-  dedicated isolated synthetic output. For nested Wayland, create a dedicated
-  headless output, disable the nested visible output before app launch, assert native
-  `xdg_toplevel`, and crop/poll the discovered application client. Hosted macOS/
-  Windows jobs do not capture screenshots.
-- Pixel readiness must be measured on the application client. A non-uniform
-  compositor wallpaper or notification around a uniform white/gray client is not
-  rendered-application evidence.
-- A first non-uniform client frame can still be a loading state. Require a bounded
-  settling interval and repeated stable pixel signatures before committing the frame.
-
-### 4. Validation & Error Matrix
-
-- Input/protocol/lock/config hash changed -> offline check fails; run the explicit
-  writer and review all generated artifacts.
-- Target OS or display backend mismatches the row -> fail; cross-platform evidence is
-  not substitutable.
-- Screenshot missing, hash/byte/dimension mismatch, or client remains uniform -> fail
-  capture.
-- Full synthetic output is non-uniform but the cropped client is uniform -> keep
-  polling or fail; never accept background pixels.
-- Synthetic target or scenario claims a completed native gate -> fail schema check.
-- Incomplete target lacks an owner-assigned blocker -> fail schema check.
-- Native target still has a required scenario blocked -> keep its gate false.
-- macOS/Windows hosted runner unavailable for a decision-bearing build/package check
-  -> block that check; do not use a Linux compile or cross-build as evidence.
-- macOS/Windows physical GUI claim is one of the five approved exclusions -> retain
-  `skipped_by_product_decision` in the hosted policy layer with
-  `decisionImpact: false`; do not promote the legacy capture row to a pass.
-
-### 5. Good/Base/Bad Cases
-
-- Good: isolated Xvfb captures a non-uniform Tauri client, records window identity and
-  minimum hints, and explicitly blocks physical DPI/IME/dialog/package claims.
-- Good: nested Wayland disables every visible nested output, verifies
-  `xwayland: false`, crops the Tauri client, and records an undersized request plus
-  observed minimum enforcement.
-- Base: a hosted build/package runner is absent and its decision-bearing checks remain
-  blocked with exact replay steps, while approved GUI exclusions remain non-decision
-  skips.
-- Bad: count a successful Tauri compile, window handle, compositor wallpaper, or
-  browser composition event as native pixels/IME/platform parity.
-- Bad: mark macOS or Windows passed from Linux cross-compilation or screenshots.
-
-### 6. Tests Required
-
-- Run `pnpm capture:tauri:native-baseline` only as an explicit reviewed write.
-- Visually inspect each changed PNG at original resolution for application pixels,
-  overlap, host-desktop leakage, private data, and the recorded theme/locale.
-- Run `pnpm check:tauri-native-baseline`; assert target/scenario completeness, source
-  identities, status/gate consistency, platform/backend identity, and PNG hashes.
-- Keep `pnpm check:tauri-native-baseline` in root `pnpm check` so source drift fails
-  offline.
-- Run the complete physical protocol on Linux X11 and Linux Wayland, plus the reviewed
-  hosted build/test/package/lifecycle protocol on macOS and Windows. Do not require
-  the five hosted GUI exclusions to complete the decision-bearing checklist.
-
-### 7. Wrong vs Correct
-
-#### Wrong
-
-```json
-{
-  "id": "windows",
-  "status": "captured_native",
-  "runner": { "os": "linux", "displayBackend": "x11" },
-  "requiredNativeGateSatisfied": true
-}
-```
-
-#### Correct
-
-```json
-{
-  "id": "windows",
-  "claim": "ime_composition",
-  "status": "skipped_by_product_decision",
-  "decisionImpact": false,
-  "notEvidenceOfParity": true
-}
-```
-
-## Scenario: Tauri Process-Tree Performance Evidence
-
-### 1. Scope / Trigger
-
-- Trigger: a desktop migration baseline or performance claim covers Tauri startup,
-  memory, CPU, large workbench data, Terminal, Web content, resize, or idle behavior.
-- Service-only scale smoke and browser fixture timing are different evidence layers;
-  neither may be renamed as a desktop process-tree baseline.
-
-### 2. Signatures
-
-```text
-pnpm capture:tauri:performance-baseline -> explicit release evidence writer
-pnpm check:tauri-performance-baseline   -> offline source/raw/summary checker
-
-desktop-tauri-process-tree-baseline.v1 -> {
-  protocol, source, policy, requiredTargets, requiredScenarios,
-  measurementGateSatisfied, targets[]
-}
-
-target -> {
-  id, status, runner, runCount, summaries, runs[], scenarios[],
-  requiredMeasurementGateSatisfied, blockers[], limitations[]
-}
-```
-
-### 3. Contracts
-
-- Build the release application with embedded frontend assets and
-  `tauri/custom-protocol`. A release binary loading the development URL produces a
-  blank client and is a failed build, not a startup measurement.
-- Use at least five fresh process/profile runs per measured scenario. Record raw run
-  values plus median, nearest-rank p95, and min/max range; summaries must be derived
-  and offline-recomputed rather than hand-maintained.
-- Measure from the `vibex-desktop` root through every descendant. Include WebKit Web,
-  Network, GPU, and sandbox helpers; exclude the display server/compositor, launch
-  wrapper, and private D-Bus daemon.
-- Retain aggregate RSS and PSS. Summed RSS intentionally counts each process mapping;
-  PSS remains available when shared-page attribution matters.
-- CPU is one-core-normalized process-tree CPU and may exceed 100 percent. Record the
-  kernel clock-tick rate and sampling interval that define the conversion.
-- Give every run disposable HOME/XDG config/data/cache/temp state and remove common
-  credential/Provider/Agent environment variables. Do not retain full paths, process
-  command lines, environments, prompts, terminal output, or user workspace data.
-- A native surface plus stable non-uniform pixels proves a stable rendered frame, not
-  time to interactive. Keep TTI null until a sanitized native input/readiness
-  round-trip completes.
-- Start/end pixel equality does not prove that hidden repaint cadence is zero. Keep
-  repaint status partial until frame/damage instrumentation exists.
-- Every required scaled workflow retains a row. Missing native timeline/file/diff/
-  Terminal/Web/resize drivers are owner-assigned blockers, never zero-valued results.
-- Synthetic Linux rows cannot satisfy physical Linux gates or any hosted macOS/
-  Windows decision-bearing check. Approved hosted GUI exclusions are outside the
-  denominator rather than gates satisfied by Linux data.
-- Keep observed Tauri values separate from GPUI planning targets and frozen budgets.
-  Budget disposition is a separately reviewed, versioned artifact.
-
-### 4. Validation & Error Matrix
-
-- Fewer than five runs, shortened idle series, or non-monotonic samples -> reject the
-  measured target.
-- Ready/sample tree lacks the Tauri root or WebKit Web child -> reject the full-tree
-  claim.
-- Aggregate RSS/CPU disagrees with raw process rows -> reject the artifact.
-- Interaction probe is absent but TTI is non-null -> reject fabricated readiness.
-- Repaint instrumentation is absent but repaint gate is complete -> reject the claim.
-- Blocked scenario carries measured values -> reject the scenario.
-- Source/protocol/lock/capture input changed -> fail offline and require explicit
-  reviewed recapture.
-- Missing physical Linux measurement -> retain blocked rows; do not copy synthetic or
-  hosted values.
-- Missing hosted macOS/Windows GUI performance measurement -> retain the approved
-  `skipped_by_product_decision` disposition with `decisionImpact: false`; do not copy
-  Linux values or invent an absolute budget.
-
-### 5. Good/Base/Bad Cases
-
-- Good: five X11 release runs include the Rust parent and WebKit descendants, retain
-  25 samples over two-minute idle, and label stable pixels separately from TTI.
-- Good: a 100,000-entry native file-tree route is absent, so its row names the fixture
-  owner and required action with no fabricated memory value.
-- Base: synthetic X11/Wayland startup and idle values inform later budgets while the
-  overall measurement gate stays false.
-- Bad: report `vibex-desktop` parent RSS as total desktop RSS.
-- Bad: reuse `pnpm baseline:performance` and label its service fixture a Tauri
-  timeline/file/diff measurement.
-- Bad: treat a browser mock or a blank app as a measured native scenario.
-
-### 6. Tests Required
-
-- Run `pnpm capture:tauri:performance-baseline` only for explicit reviewed recapture.
-- Run `pnpm check:tauri-performance-baseline` offline and keep it in root `pnpm check`.
-- Inspect target summaries against raw runs and confirm no capture processes remain.
-- Search committed evidence for home paths, credentials, command lines, environment
-  values, prompts, terminal output, and real workspace identifiers.
-- Repeat every decision-bearing scenario on physical Linux X11 and Wayland before
-  completing the performance checklist or freezing final budgets. Hosted macOS/
-  Windows GUI performance exclusions remain explicit and do not enter that gate.
-
-### 7. Wrong vs Correct
-
-#### Wrong
-
-```json
-{
-  "scenario": "cold_start_to_interactive",
-  "timeToInteractiveMs": 15000,
-  "measurement": "stable screenshot"
-}
-```
-
-#### Correct
-
-```json
-{
-  "scenario": "cold_start_to_interactive",
-  "stableRenderedFrameMs": 15000,
-  "timeToInteractiveMs": null,
-  "blocker": "native input round-trip required"
-}
-```
-
-## Scenario: GPUI Foundation Lifecycle And Linux Evidence
+## Scenario: GPUI Foundation Lifecycle
 
 ### 1. Scope / Trigger
 
 - Trigger: the production GPUI workbench starts the shared desktop runtime, persists
-  desktop UI state, renders component overlays, or claims native Foundation behavior.
-- Linux is the physical execution target for the current release. macOS and Windows
-  remain deferred without source, build, runtime, pixel, input, DPI, or package claims
-  until a future task runs their native checks.
+  desktop UI state, or handles window close and application quit.
+- Linux is the current release target; macOS and Windows remain deferred without
+  platform claims until a future task runs their native checks.
 
 ### 2. Signatures
 
@@ -870,20 +437,7 @@ target -> {
 DesktopRuntime::start(DesktopRuntimeConfig::preview_default())
 App::on_app_quit -> flush DesktopUiStateV1 -> await DesktopRuntime::shutdown
 
-pnpm check:foundation:linux
-node scripts/capture-foundation-linux.mjs --write
-
-foundation-linux.v1 -> {
-  runner, requiredViewports, scenarios[], lifecycle: {
-    processExitCode, uiStateExitFlush, runtimeShutdownAwaited,
-    homeLockedWhileRunning, homeLockReleasedAfterExit
-  }
-}
-```
-
 Lifecycle markers are bounded diagnostics only:
-
-```text
 vibex-foundation: ui-state-flushed
 vibex-foundation: runtime-stopped
 ```
@@ -903,22 +457,11 @@ vibex-foundation: runtime-stopped
 - `DesktopRuntime` owns the process/home lock. A second shell must fail while the
   workbench is live, and the same external lock probe must succeed only after awaited
   shutdown and process exit. Cleanup that is merely spawned and abandoned is invalid.
-- GPUI Foundation uses the isolated preview app id/home; it must not acquire the stable
-  Tauri home or read a user's ordinary desktop state during evidence capture.
-- Foundation capture is provider-free: it sets
-  `VIBEX_FOUNDATION_SKIP_ADAPTER_INSTALL=1` so managed ACP adapter installation
-  cannot block the lifecycle/window evidence. Real adapter installation remains
-  covered by the separate ACP bridge and daily-driver smoke gates.
-- Physical Linux evidence requires a native Wayland `xdg_toplevel` (`xwayland=false`),
-  a scale-1 monitor, stable non-uniform client pixels, the six required workbench
-  viewports, and a separate dark Traditional Chinese Settings Sheet capture. The
-  current matrix therefore contains seven client captures.
-- The offline verifier binds `Cargo.lock`, the Foundation source tree, every PNG hash,
-  viewport/window identity, lifecycle fields, and Settings Sheet observation. Normal
-  `pnpm check` verifies the artifact and never recaptures it.
-- Tauri native and process-tree reference writers build with embedded frontend assets
-  and `tauri/custom-protocol`; GPUI evidence and Tauri evidence remain separate
-  protocols and cannot satisfy one another.
+- The preview shell uses the isolated preview app id/home; it must not acquire a
+  user's ordinary desktop state or an existing production home.
+- The preview shell stays provider-free: managed ACP adapter installation must not
+  block lifecycle tests (`VIBEX_FOUNDATION_SKIP_ADAPTER_INSTALL=1`); real adapter
+  installation is covered by the ACP bridge smoke gates.
 
 ### 4. Validation & Error Matrix
 
@@ -929,21 +472,14 @@ vibex-foundation: runtime-stopped
   final persistence flush.
 - A second process acquires the home while GPUI runs -> fail runtime exclusivity.
 - The lock remains unavailable after exit -> fail shutdown ownership/release.
-- Process exits non-zero, before runtime-ready, or before the Settings Sheet marker ->
-  fail the affected scenario.
-- XWayland, synthetic display, wrong scale/viewport, uniform pixels, missing PNG, or
-  source/hash drift -> reject the Linux evidence.
-- macOS/Windows source checks run from Linux -> retain deferred native status; do not
-  promote them to platform smoke passes.
+- Process exits non-zero or before runtime-ready -> fail the affected scenario.
 
 ### 5. Good/Base/Bad Cases
 
 - Good: a real Wayland close dispatch exits zero, rewrites UI state, awaits runtime
   shutdown, and changes the lock probe from `locked by another process` to acquirable.
-- Base: Windows and macOS remain deferred and unclaimed; Linux evidence names the
-  accepted deviation without inferring build or native parity.
-- Bad: kill the process after taking screenshots, infer cleanup from `Drop`, or mark a
-  Tauri/Web fixture as GPUI lifecycle evidence.
+- Base: Windows and macOS remain deferred and unclaimed.
+- Bad: kill the process to exit, or infer cleanup from `Drop` alone.
 
 ### 6. Tests Required
 
@@ -952,10 +488,6 @@ vibex-foundation: runtime-stopped
 - `cargo test -p vibex-desktop --locked` covers the shell contract, responsive
   viewports, settings, primitives, fonts, locales, and source-compatible platform
   branches.
-- Run `capture-foundation-linux.mjs --write` only on the reviewed physical Linux
-  Wayland runner; visually inspect all seven PNGs at original resolution.
-- Run `pnpm check:foundation:linux`, `pnpm check:tauri-native-baseline`, and
-  `pnpm check:tauri-performance-baseline` before committing changed evidence.
 
 ### 7. Wrong vs Correct
 
@@ -992,23 +524,18 @@ cx.on_app_quit(|app, cx| {
 
 One app-level owner completes persistence and runtime cleanup before exit.
 
-## Scenario: GPUI Native Content And Physical Linux Capture
+## Scenario: GPUI Native Content Surfaces
 
 ### 1. Scope / Trigger
 
-- Trigger: GPUI adds or changes Terminal, PDF, Office, or the
-  Native Content evidence workbench.
-- Linux is the first physical target. A source check, headless compositor, or old
-  screenshot cannot replace a current physical input/window run.
+- Trigger: GPUI adds or changes the Terminal, PDF, or Office content surfaces, or
+  the shared `ContentSurfaceLifecycle` they compose through.
 
 ### 2. Signatures
 
 ```text
 vibex-desktop --native-content-contract <output.json>
 vibex-desktop --native-content-workbench [output.json]
-pnpm capture:native-content:linux
-pnpm check:native-content
-pnpm check:native-content:linux
 
 native-content-run.v1 -> {
   status,
@@ -1024,104 +551,60 @@ native-content-run.v1 -> {
 
 - `vibex-terminal::TerminalManager` remains the PTY owner. GPUI consumes bounded raw
   snapshots and must not create a second terminal/session persistence domain.
-- The physical capture runner requires an active native Wayland monitor and a
-  non-XWayland window. Monitor `-1`, an empty monitor list, or a created headless
-  output is a blocker, not a physical pass.
-- The run report stores booleans and bounded counts only. It must not contain the PTY
-  command/output marker, URL, PDF text, Office text, private paths, clipboard data, or
-  user content.
-- A screenshot proves only the rendered Native Content slice it shows. X11,
-  terminal stress/soak, PDF page interaction, and Office rendering retain explicit
-  blocked rows until their own protocols run.
-- Aggregate evidence imports source-bound Terminal stress and X11 evidence by exact
-  path, SHA-256, and status. It must rerun both owning validators before promoting a
-  claim; editing only the aggregate JSON cannot turn a blocked row into a pass.
-- Aggregate Native Content evidence must bind every embedded implementation source, not
-  only the workbench shell. If `NativeContentWorkbench` embeds `PdfSurface`, its source
-  input tree includes `pdf_surface.rs`; otherwise PDF behavior could drift while the
-  aggregate evidence remains falsely current.
-- Shared `ContentSurfaceLifecycle` owns focus state in addition to visibility: opening an
-  overlay clears focus and records `focusReturnPending`; only a current-generation
-  `focus_entered` clears that pending state. Close, crash, failure, deactivation, and a
-  newer activation clear focus. Same-generation callbacks after `Closed` are ignored.
+- Run and contract reports store booleans and bounded counts only. They must not
+  contain the PTY command/output marker, URL, PDF text, Office text, private paths,
+  clipboard data, or user content.
+- A report proves only the slice it covers; behavior not covered by an owned protocol
+  stays an explicit limitation, never an inferred pass.
+- Shared `ContentSurfaceLifecycle` owns focus state in addition to visibility: opening
+  an overlay clears focus and records `focusReturnPending`; only a current-generation
+  `focus_entered` clears that pending state. Close, crash, failure, deactivation, and
+  a newer activation clear focus. Same-generation callbacks after `Closed` are ignored.
 
 ### 4. Validation & Error Matrix
 
 | Condition | Required result |
 | --- | --- |
-| No active physical monitor / active window | Capture fails before input injection. |
-| Window is XWayland or screenshot pixels are uniform | Reject physical Wayland evidence. |
-| PTY marker is not observed through raw snapshots | Run report is not written as passed. |
-| Web surface/profile/cache/network allocation is non-zero | Contract and physical checks fail. |
-| Report contains marker text, URL, or content fields | Redaction gate fails. |
-| Window close leaves the process alive or reports a panic | Clean-close claim fails. |
-| Overlay closes without focus returning to the current surface | Focus integration gate fails; `focusReturnPending` must remain observable until a current-generation focus event. |
+| Report contains marker text, URL, or content fields | Redaction validation fails. |
+| Window close leaves the process alive or reports a panic | Clean-close contract fails. |
+| Overlay closes without focus returning to the current surface | Focus contract fails; `focusReturnPending` must remain observable until a current-generation focus event. |
 | Same-generation callback arrives after close | Ignore it and keep the surface `Closed`; it must not restore visibility or focus. |
-| Source/lock/screenshot hash drifts | Read-only evidence check fails; explicit recapture required. |
-| Embedded surface source is absent from the evidence roots | Evidence schema/source validation fails. |
 
 ### 5. Good/Base/Bad Cases
 
-- Good: a physical Hyprland window receives one sanitized command through the
-  IME-capable input, raw PTY snapshots observe its marker, the screenshot is
-  non-uniform, close exits zero, and the report retains no output text.
-- Base: code, contract, package, and headless PDF checks pass while the current
-  session has no active monitor; the physical row stays blocked and the capture
-  runner remains ready for the next active-output session.
-- Bad: create a headless Hyprland output or reuse historical Terminal/PDF evidence and
-  label it a current physical Native Content pass.
-- Bad: bind `native_content.rs` but omit the embedded `pdf_surface.rs` from source
-  identity because the runner invokes only the outer workbench.
+- Good: one sanitized command flows through IME-capable input, raw PTY snapshots
+  observe its marker, close exits zero, and the report retains no output text.
+- Bad: create a second terminal persistence domain, or log PTY output, user content,
+  or private paths in a run report.
 
 ### 6. Tests Required
 
-- `cargo test -p vibex-content -p vibex-terminal -p vibex-desktop --locked`.
-- `pnpm check:native-content` and its zero-allocation/redaction assertions.
-- Assert the Native Content source roots include every directly embedded surface module.
-- On an active physical Linux output, run the capture writer, visually inspect the
-  screenshot at original resolution, then run the read-only check and negative
-  self-test.
-- Run terminal stress/soak and PDF/Office interaction protocols separately before
-  marking the aggregate Native Content gate complete.
-- Run the Native Content switch contract and assert seven bounded switches, stale/close
-  callback fencing, overlay focus return, latest bounds preservation, crash recovery,
-  one final visible/focused surface, and zero Web allocations. Run its negative
-  self-test before marking the integration row complete.
-- Run root `pnpm check` and the Linux package verifier before commit.
+- `cargo test -p vibex-content -p vibex-terminal -p vibex-desktop --locked` covers
+  switch fencing (seven bounded switches, stale/close callback handling), overlay
+  focus return, latest bounds preservation, crash recovery, one final
+  visible/focused surface, and zero Web allocations.
 
 ### 7. Wrong vs Correct
 
-#### Wrong
-
 ```text
-hyprctl output create headless -> inject command -> mark native Wayland physical pass
+Wrong: GPUI keeps its own PTY/session store, or a report collects command output.
+Correct: TerminalManager owns PTYs -> GPUI consumes bounded raw snapshots ->
+         reports store booleans and counts only.
 ```
 
-#### Correct
-
-```text
-require active physical monitor -> require xwayland=false -> inject sanitized input
--> observe raw PTY marker -> store booleans/counts only -> capture pixels -> close zero
-```
-
-## Scenario: GPUI Terminal Stress And Independent Xorg Evidence
+## Scenario: Terminal Stress And Resource Budgets
 
 ### 1. Scope / Trigger
 
-- Trigger: the product Terminal PTY/parser/surface, its memory or repaint budgets, or
-  Linux X11 Native Content evidence changes.
-- This is a cross-layer evidence boundary: `TerminalManager` owns PTYs and raw
-  snapshots, `TerminalSurfaceBackend` owns VT state, `TerminalFrameCache` owns damaged
-  cells, and the platform runner owns display identity.
+- Trigger: the product Terminal PTY/parser/surface, its memory or repaint budgets,
+  or the `vibex-terminal-stress` harness changes.
+- Ownership boundary: `TerminalManager` owns PTYs and raw snapshots,
+  `TerminalSurfaceBackend` owns VT state, `TerminalFrameCache` owns damaged cells.
 
 ### 2. Signatures
 
 ```text
 vibex-terminal-stress --soak-seconds <seconds> --output <report.json>
-pnpm capture:terminal-stress:linux
-pnpm check:terminal-stress:linux
-pnpm capture:native-content:x11:linux
-pnpm check:native-content:x11:linux
 
 terminal-stress-linux-run.v1 -> {
   throughput, burst { renderUpdates, fullRepaints, partialRepaints,
@@ -1132,19 +615,13 @@ terminal-stress-linux-run.v1 -> {
   resources { rssGrowthBytes, fdLeakObserved, childLeakObserved },
   privacy
 }
-
-native-content-x11-linux-evidence.v1 ->
-  status: passed | blocked
-  runner { displayBackend, syntheticDisplay, physicalXorgProcessObserved,
-           independentXorgAuthorized, xwaylandDetected, physicalConnector,
-           dri3Observed, xtestObserved }
 ```
 
 ### 3. Contracts
 
-- Task evidence runs at least 300 observed seconds under the workspace user's
-  2026-07-19 duration decision. A quick/zero-duration run may test code locally, but
-  cannot be committed as five-minute evidence.
+- A quick run may exercise code locally; the full soak runs at least 300 observed
+  seconds with recurring PTY writes, raw snapshots, parser sync, frame generation,
+  and frame-cache application. It permits no sequence gap or dropped raw chunk.
 - The 10 MiB fixture disables PTY output post-processing before hashing; otherwise
   `ONLCR` can turn LF into CRLF and create a false data-loss result.
 - Product polling calls `TerminalManager::raw_snapshot_from(terminalId, nextSequence)`.
@@ -1152,96 +629,53 @@ native-content-x11-linux-evidence.v1 ->
   older restored runtime, it returns the retained ring so the backend rebuilds. Do not
   clone the full 16 MiB ring every 16 ms after the parser has caught up.
 - A 120 FPS source burst must retain all 120 markers while the 16 ms surface frame path
-  coalesces work. Run the real parser and `TerminalFrameCache`; counting raw PTY bytes
-  alone is not bounded-repaint evidence.
+  coalesces work. Counting raw PTY bytes alone is not bounded-repaint verification.
 - Scrollback retains at most 10,000 history lines and the terminal model remains within
   128 MiB. Repeated create/kill/restore must leave no live sessions.
-- The soak performs recurring PTY writes, raw snapshots, parser sync, frame generation,
-  and frame-cache application. It permits no sequence gap or dropped raw chunk. Its
-  bounded-repaint load writes a unique counter to a stable viewport row with explicit
-  erase/home control sequences; newline-driven scrolling legitimately marks the whole
-  viewport damaged and must not be paired with a `fullRepaints <= 2` assertion.
+- The bounded-repaint load writes a unique counter to a stable viewport row with
+  explicit erase/home control sequences; newline-driven scrolling legitimately marks
+  the whole viewport damaged and must not be paired with a `fullRepaints <= 2`
+  assertion.
 - Each soak activity tick waits for its incremental raw snapshot to reach the parser.
   Empty polls are allowed, so `snapshots >= activityTicks`; every completed tick must
-  produce exactly one frame-cache update, at most two total full repaints, and at least
-  one partial repaint for a non-zero run.
-- Linux `/proc` samples bind parent RSS growth to 64 MiB and require final FD and direct-
-  child counts to return to baseline (FD tolerance: two observation descriptors).
-- X11 passes only on an authorized independent Xorg server with a non-virtual connected
-  output, DRI3, XTEST input, non-uniform pixels, a PTY marker, and clean exit.
-- `XWAYLAND`, Xvfb, Xephyr, an inaccessible SDDM Xorg, or a physical Xorg process whose
-  active output cannot be proved is `blocked`, never a physical X11 pass. Never store an
-  Xauthority path or cookie in evidence.
-- Reports retain hashes, counts, timings, booleans, stable blocker codes, and bounded
-  resource values only. Raw terminal output, markers, environment, workspace/home paths,
-  and authorization material are forbidden.
+  produce exactly one frame-cache update, at most two total full repaints, and at
+  least one partial repaint for a non-zero run.
+- `/proc` samples bind parent RSS growth to 64 MiB and require final FD and
+  direct-child counts to return to baseline (FD tolerance: two observation
+  descriptors).
+- Reports retain hashes, counts, timings, booleans, and bounded resource values only.
+  Raw terminal output, markers, environment, and home paths are forbidden.
 
 ### 4. Validation & Error Matrix
 
 | Condition | Required result |
 | --- | --- |
-| 10 MiB observed hash differs or raw chunks drop | Stress run fails; do not write passed evidence. |
-| Source burst loses a marker or frame-cache work is unbounded | Fail `terminal_120_fps_burst`. |
-| History exceeds 10,000 or model exceeds 128 MiB | Fail `terminal_10000_line_scrollback`. |
-| Injected sequence gap does not rebuild retained state | Fail `terminal_sequence_rebuild`. |
+| 10 MiB observed hash differs or raw chunks drop | Stress run fails. |
+| Source burst loses a marker or frame-cache work is unbounded | Fail the burst assertion. |
+| History exceeds 10,000 or model exceeds 128 MiB | Fail the scrollback assertion. |
+| Injected sequence gap does not rebuild retained state | Fail the sequence-rebuild assertion. |
 | Caught-up incremental snapshot retains bytes, or new snapshot equals the full ring | Fail the incremental raw-copy assertion. |
-| Soak is shorter than 300 seconds | Read-only evidence validator rejects it. |
-| Soak activity has no matching parser/frame update, or stable-row output repeatedly causes full repaint | Fail `terminal_five_minute_activity`. |
+| Soak activity has no matching parser/frame update, or stable-row output repeatedly causes full repaint | Fail the soak assertion. |
 | Final FD/direct-child count grows or RSS grows over 64 MiB | Stress run fails. |
-| `DISPLAY` advertises the `XWAYLAND` extension | Record `xwayland-rejected`; X11 claim remains blocked. |
-| Independent Xorg exists but authentication/output is unavailable | Record `physical-xorg-authorization-unavailable`; capture/run stay null. |
-| X11 report contains an auth path/cookie, terminal marker, or private path | Privacy validator fails. |
 
 ### 5. Good/Base/Bad Cases
 
 - Good: 10 MiB hashes match, 120 source frames coalesce into fewer damage-scoped frame
-  updates, 10,000 history lines stay under budget, 16 restore cycles close, and a real
-  five-minute run returns RSS/FD/child counts within budget.
-- Good: an authorized Xorg session reports a physical connector, injects `t` through
-  XTEST, captures non-uniform pixels, and exits through the window close path.
-- Base: the active desktop is Wayland, `DISPLAY` is XWayland, and an independent SDDM
-  Xorg cannot be authenticated. Commit a source-bound blocked row with no pixel/input
-  claim so the runner is ready for a later physical Xorg session.
-- Bad: edit `soakObservedSeconds` to 300 after a quick run, count only raw burst bytes,
-  drive the bounded-repaint soak with scrolling newlines, clone the entire raw ring on
-  every poll, or call XWayland an X11 physical matrix.
+  updates, 10,000 history lines stay under budget, 16 restore cycles close, and the
+  soak returns RSS/FD/child counts within budget.
+- Bad: drive the bounded-repaint soak with scrolling newlines, clone the entire raw
+  ring on every poll, or report fabricated durations.
 
 ### 6. Tests Required
 
 - Run `cargo test -p vibex-content -p vibex-terminal --locked` and the quick stress
-  binary while developing.
-- Before release evidence, run `pnpm capture:terminal-stress:linux`; assert exactly
-  10 MiB/hash equality, 120 markers, bounded repaint, 10,000-line cap, 16 restores,
-  300 observed seconds, one render update per activity tick, at most two soak full
-  repaints, zero gaps/drops, and bounded `/proc` metrics.
-- Run the stress negative self-test; it must reject short duration, hash/frame/repaint
-  drift, resource leaks, source drift, and retained output.
-- Run the X11 writer and negative self-test. A blocked run must have null capture/run/
-  process fields; a passed run must reject XWayland substitution, missing connector,
-  missing marker, and stale screenshot identity.
-- Rerun the aggregate Wayland Native Content capture after either source-bound evidence
-  changes, then run root `pnpm check`.
+  binary while developing; run the full soak on real hardware before a release claim.
 
 ### 7. Wrong vs Correct
 
-#### Wrong
-
 ```text
-DISPLAY=:1 (XWAYLAND extension) -> non-uniform pixels -> x11_native_matrix=passed
-quick stress --soak-seconds 0 -> edit JSON duration to 300 -> soak=passed
-soak tick -> print newline -> scroll viewport -> require fullRepaints <= 2
-```
-
-#### Correct
-
-```text
-probe server extension + connector + authorization
-  -> XWayland/inaccessible Xorg: blocked with null run
-  -> independent active Xorg: XTEST input + pixels + clean close
-
-run PTY + parser + frame cache for >=300 observed seconds
-  -> erase/home stable row + unique counter -> wait for incremental parser/frame update
-  -> bind source hashes -> validate negative mutations -> aggregate by exact SHA-256
+Wrong: soak tick -> print newline -> scroll viewport -> require fullRepaints <= 2
+Correct: erase/home stable row + unique counter -> wait for incremental parser/frame update
 ```
 
 ## Scenario: GPUI PDF Surface With Bounded Background Rendering
@@ -1304,11 +738,6 @@ pdf-surface-run.v1 -> {
 - A `ready` JSON report contains counts, budgets, booleans, and limitations only. It
   never contains the path, PDF text, password, or page pixels, and it does not prove
   native pixels, scrolling, keyboard, or pointer input.
-- Physical PDF/Office evidence is separately source-bound. Capture after Page 2 is
-  selected at Fit width, measure a fixed in-window PDF region, and require at least 100
-  colors plus non-zero entropy and standard deviation before accepting page pixels.
-  Then prove zoom input and Office close-to-zero residency; run the evidence's negative
-  self-test from the root check.
 - An encrypted document opened without a password writes a redacted `error` report with
   `pdf_password_required`, Retry and explicit System open availability, zero decoded/UI
   resident bytes, and no password field or value. The current surface does not persist a
@@ -1321,10 +750,6 @@ pdf-surface-run.v1 -> {
   a non-returning call is killed at the hard deadline with `pdf_worker_timeout`; a clean
   request after each failure proves restart. `resources` reports zero current native
   residency after exit, while `lastWorkerResources` reports only the bounded child peak.
-- Evidence source identities are byte-based across their declared source roots. Even a
-  formatting-only change under `apps/desktop/src` invalidates PDF feasibility,
-  controller, surface, Native Content, and package evidence that includes that tree;
-  binary equivalence does not make the older evidence current.
 
 ### 4. Validation & Error Matrix
 
@@ -1336,8 +761,8 @@ pdf-surface-run.v1 -> {
 | Estimated native page RGBA exceeds controller cache | `pdf_page_exceeds_cache_budget` before PDFium allocation. |
 | GPUI image copies exceed 3 pages / 72 MiB | Drop overscan by priority; current page must remain or return `pdf_ui_image_budget_exceeded`. |
 | Resize changes fit target | Debounced rerender; no identical-width work. |
-| Embedded columns have no full-height constraint, or fit uses whole-window width | Physical pixel capture fails because the page is blank/cropped; do not accept model counts alone. |
-| Selected page and visible page differ after navigation | Physical crop/state contract fails even when `currentPage` changed. |
+| Embedded columns have no full-height constraint, or fit uses whole-window width | The page renders blank/cropped in embedded/split surfaces; do not accept model counts alone. |
+| Selected page and visible page differ after navigation | State contract fails even when `currentPage` changed. |
 | Corrupt/encrypted/native failure | Typed error state with Retry and explicit System open; encrypted fixture reports `pdf_password_required` and zero resident bytes. |
 | Source exceeds 256 MiB | `pdf_source_size_invalid` before PDFium binding; zero decoded/UI bytes. |
 | Document has 10,001 pages | `pdf_page_count_unsupported`; zero decoded/UI bytes. |
@@ -1345,8 +770,6 @@ pdf-surface-run.v1 -> {
 | Native call crashes or exceeds a hard deadline | Kill/reap child; `pdf_worker_crashed` / `pdf_worker_timeout`; next isolated request succeeds. |
 | Worker report contains unsafe path or invalid bitmap length | `pdf_worker_protocol_failed`; no image publication; temporary directory removed. |
 | Close succeeds | Closed state, no metadata, active worker, controller/native cache, or UI images. |
-| No active physical monitor | Ready report may pass; pixel/input claim remains blocked. |
-| A declared source input changes after capture | Read-only evidence checks fail as stale; recapture through the owning writer. |
 
 ### 5. Good/Base/Bad Cases
 
@@ -1362,13 +785,11 @@ pdf-surface-run.v1 -> {
   exact typed error with Retry/System open and zero resident controller/UI image bytes.
 - Base: a 4K window clamps fit rendering to 2,048 pixels instead of allocating an
   unbounded full-width page.
-- Base: `rustfmt` changes only whitespace in the GPUI source tree; every evidence writer
-  whose source roots include that tree still requires recapture.
 - Bad: keep a controller behind a foreground mutex and render PDFium synchronously from
   a click handler.
 - Bad: treat the controller RGBA cache as the only memory budget while retaining an
   unbounded second set of GPUI `RenderImage` copies.
-- Bad: record `status=ready` and claim the page was physically visible or scrollable.
+- Bad: report `status=ready` while the page never rendered in its surface.
 - Bad: size Fit width from `window.viewport_size()` inside a split, or rely on
   `renderedPages > 0` while the page list/document columns have zero allocated height.
 - Bad: cancel a worker future without killing/reaping its child, or report the last
@@ -1380,38 +801,17 @@ pdf-surface-run.v1 -> {
   UI image current-page priority, and both resource metrics.
 - Controller tests must reject invalid dimensions and over-budget estimated RGBA before
   the native render call.
-- Worker supervisor evidence must run normal -> abort -> recovery -> hang -> recovery,
-  assert five children started/reaped, exact crash/timeout codes, and privacy. Its
-  negative self-test rejects missed failures, unreaped children, recovery drift, and
-  privacy leakage.
-- Worker soak evidence must run 49 Linux requests with the frozen 37 normal / four
-  cancel / four crash / four timeout matrix, prove 12 recoveries, reap all 49 children,
-  retain FD/direct-child/temp-directory baselines, keep current native residency zero,
-  and stay within 64 MiB parent RSS growth. Negative tests reject every leak dimension.
-- Real Linux smoke launches the standalone workbench with reviewed PDFium and the
-  12-page fixture, waits for `pdf-surface-run.v1`, and asserts page count,
-  `[0, 1]`, cache/image budgets, controls, and privacy. Terminating that smoke is not a
-  clean-window-close or physical-input claim.
-- Launch the same workbench with the deterministic encrypted fixture and no password;
-  assert typed error code, recovery controls, zero resident decoded/UI bytes, privacy,
-  and negative self-tests that reject a changed code or retained bytes.
-- Launch sparse oversized-source, deterministic 10,001-page, and extreme-page runs;
-  assert exact typed codes, recovery controls, zero resident bytes, and zero preflighted
-  native render requests where applicable.
-- Run controller evidence, Native Content blocked/current evidence, license/SBOM,
-  generic Linux package, Native Content package, and root `pnpm check` after source or
-  lock drift.
-- Run formatting before the final evidence pass. If formatting or another late source
-  edit occurs, recapture PDF feasibility, controller, surface, and Native Content
-  evidence; rebuild the generic Linux package; rebuild the Native Content package last
-  because both packagers share target artifact paths; then regenerate the feasibility
-  decision record before the final read-only gates.
-- On an active physical output, separately capture and inspect PDF scrolling, page-list
-  selection, fit/zoom, retry/error, system-open, resize, and clean close. The committed
-  interaction capture must bind source inputs, visibly show selected Page 2 at Fit width,
-  meet the PDF-region pixel thresholds, prove zoom and Office close, and pass negative
-  mutations for source drift, blank pixels, stale screenshot, missed input, cache leak,
-  and retained content.
+- Worker supervisor tests must run normal -> abort -> recovery -> hang -> recovery,
+  assert five children started/reaped, exact crash/timeout codes, and privacy. Negative
+  tests reject missed failures, unreaped children, recovery drift, and privacy leakage.
+- Worker soak runs 49 requests with the frozen 37 normal / four cancel / four crash /
+  four timeout matrix, proves 12 recoveries, reaps all 49 children, retains
+  FD/direct-child/temp-directory baselines, keeps current native residency zero, and
+  stays within 64 MiB parent RSS growth. Negative tests reject every leak dimension.
+- Linux smoke runs launch the standalone workbench with reviewed PDFium and the
+  deterministic fixtures (12 pages, encrypted without password, oversized source,
+  10,001 pages, extreme page) and assert exact typed codes, recovery controls,
+  cache/image budgets, privacy, and zero resident bytes where applicable.
 
 ### 7. Wrong vs Correct
 
@@ -1436,227 +836,10 @@ let worker = cx.background_spawn(async move {
 // Observe the surface element bounds, debounce Fit width, and paint only current_page.
 ```
 
-## Scenario: GPUI Hosted-Runner Evidence Scope
-
-### 1. Scope / Trigger
-
-- Trigger: macOS and Windows GPUI feasibility checks run without locally available
-  native machines.
-- GitHub-hosted evidence covers reproducible build, test, initialization, packaging,
-  lifecycle, artifact, and supply-chain claims. It does not close the overall
-  feasibility task or choose its final decision by itself.
-
-### 2. Signatures
-
-```text
-node scripts/capture-x11-first-frame.mjs --write-linux-native
-node scripts/check-hosted-runner-evidence.mjs --policy
-node scripts/check-hosted-runner-evidence.mjs --self-test
-.github/workflows/native-gate.yml -> workflow_dispatch
-
-hosted-runner-target-evidence.v1 -> {
-  policy, source, target, runner, toolchain,
-  checks[], skippedClaims[], probes, package, decisionSummary
-}
-
-hosted-runner-matrix-evidence.v1 -> {
-  policy, source, requiredTargets, targets[], skippedClaims[],
-  hostedGateSatisfied, decisionSummary, limitations[]
-}
-```
-
-### 3. Contracts
-
-- Pin the matrix to `macos-15` and `windows-2022`, Rust 1.97.0, Node 22, pnpm 11.3.0,
-  and cargo-packager 0.11.8. A latest alias or Linux cross-build cannot replace either
-  target.
-- Decision-bearing checks cover pinned toolchain, locked metadata/source identity,
-  workspace and GPUI tests, frontend quality, supply chain, release linking, bounded
-  platform initialization, minimal native packaging, install/probe/uninstall, and
-  artifact hashes.
-- The initialization check may launch the real process and require it to remain alive
-  for a bounded interval. It records no screenshot, native pixel, window correctness,
-  or real-input claim and terminates the process after observation.
-- macOS packages use an isolated copied `.app`; Windows uses an isolated current-user
-  NSIS install. The installed binary must return the same bounded `--probe` contract
-  and retain the linked release binary SHA-256 before uninstall.
-- Real-window screenshots/native pixels, IME, keyboard/pointer/clipboard/drag-drop
-  input, DPI/scale transitions, and multi-monitor behavior are exactly
-  `skipped_by_product_decision` with `decisionImpact: false`. A skip is excluded from
-  the denominator and is not a pass, failure, blocker, accepted deviation, or parity
-  evidence.
-- Per-target evidence binds the policy, lockfiles, source/config/scripts, SBOM,
-  notices, and workflow by SHA-256. The merge job accepts exactly one native artifact
-  from each required target and requires identical source inputs.
-- A failed decision-bearing hosted check keeps the hosted sub-gate false. A skipped
-  claim cannot change that result in either direction, and hosted scope never weakens
-  physical Linux pixels or Linux behavior-spike requirements.
-
-### 4. Validation & Error Matrix
-
-- Runner label, OS, architecture, package format, or tool version mismatches policy ->
-  reject the target artifact.
-- Required decision check is missing, duplicated, reordered, or marked non-decision ->
-  reject the artifact.
-- Failed check lacks a bounded failure summary, or a dependency-blocked check lacks
-  the failed dependency id -> reject the artifact.
-- Hosted skip is missing, renamed, marked decision-bearing, or presented as parity ->
-  reject the artifact.
-- `--probe` reports native pixels, the wrong platform/source revision, or an unknown
-  schema -> fail the probe check.
-- Platform process exits before the observation interval -> fail initialization; do
-  not substitute a screenshot or synthetic input.
-- Package is missing, installed binary hash changes, probe fails, or uninstall leaves
-  the executable -> fail the corresponding decision-bearing check.
-- Policy/source hash changes, target source inputs differ, or one target artifact is
-  missing -> reject the merged matrix as stale or incomplete.
-
-### 5. Good/Base/Bad Cases
-
-- Good: both pinned runners pass locked tests, initialize, package, install, probe,
-  hash, and uninstall; the merged hosted sub-gate passes while all five GUI claims
-  remain explicit non-decision skips.
-- Base: one release link fails, dependent package checks are recorded as blocked, the
-  target artifact is still uploaded, and the merged hosted sub-gate stays false.
-- Bad: call a five-second live process observation a real-window or input pass.
-- Bad: remove skipped rows to make the pass percentage appear higher, or count them as
-  blockers to force a final feasibility decision.
-
-### 6. Tests Required
-
-- Parse the workflow as YAML and run `--policy` plus `--self-test` locally.
-- Dispatch the workflow only from a committed source revision. Retain each native
-  package, per-target JSON, and merged matrix artifact.
-- Inspect failed action logs without editing target JSON by hand; rerun from a reviewed
-  source change when a decision-bearing check fails.
-- After downloading the merged artifact, run `--validate` before committing it.
-- Confirm the Windows installation and macOS copied app no longer exist after each
-  target job.
-
-### 7. Wrong vs Correct
-
-#### Wrong
-
-```json
-{
-  "target": "macos",
-  "nativePixels": "passed because the process stayed alive",
-  "ime": "assumed",
-  "decisionImpact": true
-}
-```
-
-#### Correct
-
-```json
-{
-  "id": "real_window_screenshots_native_pixels",
-  "status": "skipped_by_product_decision",
-  "decisionImpact": false,
-  "decisionDenominator": "excluded",
-  "notEvidenceOfParity": true
-}
-```
-
-## Scenario: GPUI Feasibility Decision Record
-
-### 1. Scope / Trigger
-
-- Trigger: a baseline/feasibility task closes with unresolved execution or release
-  work that product explicitly accepts rather than treating as passed.
-
-### 2. Signatures
-
-```text
-node scripts/check-feasibility-decision.mjs --write
-node scripts/check-feasibility-decision.mjs
-node scripts/check-feasibility-decision.mjs --self-test
-
-feasibility-decision.v1 -> {
-  decision, sources, evidence[], passedGates[], selectedRoutes,
-  hostedNonDecisionExclusions[], acceptedDeviations[], revisedEstimates[],
-  inheritedPrerequisites[], rollback, closure
-}
-```
-
-### 3. Contracts
-
-- The decision value is exactly `GO`, `GO_WITH_ACCEPTED_DEVIATIONS`, or `NO_GO`.
-- `GO_WITH_ACCEPTED_DEVIATIONS` enumerates every unrun or incomplete item with a
-  stable id, owner, rationale, follow-up, user impact, and reopen behavior. An
-  accepted deviation is never added to `passedGates`.
-- Bind every decision-bearing evidence, policy, workflow, budget, SBOM, and support
-  matrix input by path, byte length, and SHA-256. Normal checks verify; only the
-  explicit writer regenerates the record.
-- Route selection and distribution readiness are separate claims. A proven Linux
-  implementation route may be selected while cross-platform runtime, license notices,
-  or package registration remains an accepted follow-up.
-- A deferred performance record retains every numerical contract and owner, reports
-  no budget pass, and states whether later failure reopens the feasibility decision.
-- Hosted GUI exclusions remain outside the denominator. Pending hosted
-  decision-bearing checks are accepted only with an explicit reopen-on-failure rule.
-- Keep the current production shell and rollback path until release cutover passes.
-
-### 4. Validation & Error Matrix
-
-- Missing evidence or source hash drift -> reject the decision as stale.
-- Strict `GO` with any accepted deviation or incomplete hosted execution -> reject.
-- Accepted deviation missing owner/follow-up/user impact -> reject.
-- Deferred test represented in `passedGates` -> reject.
-- Selected native route silently registered as production-distributable without its
-  license/package evidence -> reject.
-- Performance sampling deferred with a dropped scenario or numerical target -> reject.
-- Reopen condition removed from a decision-bearing deferred check -> reject.
-
-### 5. Good/Base/Bad Cases
-
-- Good: Linux proves a PDF route, product selects it, and the record separately carries
-  macOS/Windows runtime plus binary-license/package work with reopen conditions.
-- Base: a hosted workflow is committed but not run; the decision may close with an
-  accepted deviation, while any decision-bearing failure reopens the gate.
-- Bad: mark WebView, performance, package release readiness, or hosted execution as
-  passed because the user allowed the task to continue.
-
-### 6. Tests Required
-
-- Run the verifier and negative self-test.
-- Mutate the value to strict `GO`, remove a deviation, fabricate hosted completion,
-  and remove a reopen condition; each mutation must be rejected.
-- Run the focused evidence validators, license gate, and root `pnpm check` before
-  committing the decision.
-
-### 7. Wrong vs Correct
-
-#### Wrong
-
-```json
-{
-  "decision": "GO",
-  "passedGates": ["webview", "performance", "hosted_packages"]
-}
-```
-
-#### Correct
-
-```json
-{
-  "decision": { "value": "GO_WITH_ACCEPTED_DEVIATIONS" },
-  "acceptedDeviations": [
-    {
-      "id": "hosted_native_execution_pending",
-      "status": "accepted",
-      "owner": "desktop-platform",
-      "reopenGateOnFailure": true
-    }
-  ]
-}
-```
-
 ## Performance Expectations
 
 - Virtualize long session timelines, file trees, Git diffs, and terminal output
   where needed.
-- Avoid loading Monaco/CodeMirror into Web/mobile remote bundles.
 - Keep terminal output rendering buffered and throttled.
 - Paginate history and large timeline fetches.
 
@@ -1668,265 +851,6 @@ feasibility-decision.v1 -> {
 - Approval buttons must include text labels.
 - Color cannot be the only signal for provider health, Git status, or security
   warnings.
-
-## Scenario: Composer Image Attachment UX
-
-### 1. Scope / Trigger
-
-- Trigger: Agent composer inputs accept uploaded or pasted images and render
-  pending image attachments before send.
-
-### 2. Signatures
-
-```text
-ComposerDraft { text: string, attachments: ComposerImageAttachment[] }
-ComposerImageAttachment extends MessageAttachment { id: string, previewUrl: string }
-SendAgentMessageRequest.attachments -> MessageAttachment[]
-```
-
-### 3. Contracts
-
-- Uploaded and pasted images must use the same composer attachment token UI.
-- Clipboard image file items and pasted HTML `data:image/*` sources must be
-  intercepted before the browser inserts a raw `<img>` into a contentEditable
-  composer.
-- ContentEditable composers must also sanitize any embedded `<img>` on input as
-  a fallback because browsers differ in paste payload shape.
-- Hover previews must render in a viewport-level/fixed layer, not as a child of
-  a token inside a clipped or height-animated composer container.
-- Clicking or keyboard-activating an image token must open an accessible Dialog
-  with a title, full-size image inspection, and a save/download action.
-- New-session composers and in-session composers must share the same attachment
-  behavior and must send the same `MessageAttachment[]` contract.
-
-### 4. Validation & Error Matrix
-
-- Unreadable image file -> skip that file without breaking the remaining paste
-  or upload operation.
-- Unsupported pasted image URL -> remove the raw image node rather than leaving
-  a large inline image inside the composer.
-- Empty text plus one or more attachments -> still allowed to send.
-
-### 5. Good/Base/Bad Cases
-
-- Good: screenshot paste creates a compact image token; hover shows an unclipped
-  preview; click opens a full-screen preview with save.
-- Base: plain-text paste remains text-only.
-- Bad: raw contentEditable paste leaves a large `<img>` in the input box.
-- Bad: token hover preview is absolutely positioned under an ancestor with
-  `overflow: hidden` and becomes invisible.
-
-### 6. Tests Required
-
-- `pnpm check:frontend` after composer changes.
-- Desktop build or browser smoke for dialog/import correctness.
-- Manual smoke should cover upload image, paste clipboard image, click preview,
-  save/download link presence, and new-session initial image attachment send.
-
-### 7. Wrong vs Correct
-
-#### Wrong
-
-```tsx
-<span className="composer-image-token">
-  <span className="absolute bottom-full">...</span>
-</span>
-```
-
-#### Correct
-
-```tsx
-<ComposerImageHoverPreview style={viewportFixedPosition} />
-<Dialog>
-  <DialogContent>
-    <DialogTitle>Image preview</DialogTitle>
-    ...
-  </DialogContent>
-</Dialog>
-```
-
-## shadcn / Vite Shell Verification
-
-- Tailwind class-based dark mode must be driven by explicit theme state or
-  `prefers-color-scheme`; do not hardcode `className="dark ..."` on app root
-  containers. Hardcoding dark mode makes light-mode regressions impossible to
-  see in screenshots.
-- Monaco or other embedded editors must receive the same resolved theme state
-  as the app shell, such as `theme={isDarkMode ? "vs-dark" : "vs"}`.
-- Generated or app-local `Dialog`, `CommandDialog`, `Sheet`, and `Drawer`
-  wrappers must keep their title component inside the content component. Use an
-  `sr-only` title when the design should not show visible heading text.
-- Browser screenshot checks must include first-party 4xx/5xx responses. Missing
-  assets such as `/favicon.ico` count as acceptance issues because they create
-  noisy console errors in clean browser sessions.
-
-#### Wrong
-
-```tsx
-<div className="dark flex min-h-full bg-background text-foreground" />
-
-<Dialog>
-  <DialogHeader className="sr-only">
-    <DialogTitle>Command Palette</DialogTitle>
-  </DialogHeader>
-  <DialogContent>{children}</DialogContent>
-</Dialog>
-```
-
-#### Correct
-
-```tsx
-<div className={cn(isDarkMode && "dark", "flex min-h-full bg-background text-foreground")} />
-
-<Dialog>
-  <DialogContent>
-    <DialogHeader className="sr-only">
-      <DialogTitle>Command Palette</DialogTitle>
-    </DialogHeader>
-    {children}
-  </DialogContent>
-</Dialog>
-```
-
-## Scenario: Phase 2 PC Workbench UI Shell
-
-### 1. Scope / Trigger
-
-- Trigger: Phase 2 replaces the session-only desktop screen with a PC workbench
-  shell that shows Agent, files/Monaco, Git diff/actions, terminal tabs, and a
-  right rail for one local workspace.
-- This is a frontend contract because layout, generated protocol types, browser
-  screenshot mocks, Monaco, xterm, TanStack Query, and Zustand state all need
-  consistent ownership.
-
-### 2. Signatures
-
-Feature ownership:
-
-```text
-app/App.tsx                         root providers only
-features/workspace/WorkspaceShell   shell, tabs, rails, active workspace
-features/files/*                    file tree, file read/save, Monaco pane
-features/git/*                      status, diff, stage/unstage/revert/commit
-features/terminal/*                 xterm surface and terminal mutations
-features/agent/*                    provider-neutral session/timeline UI
-lib/tauri.ts                        typed invoke wrapper and browser mock
-```
-
-State ownership:
-
-```text
-TanStack Query -> backend state from Tauri commands
-Zustand        -> local workbench selection, active tab, rail, editor buffers
-React state    -> form inputs and transient confirmations
-```
-
-### 3. Contracts
-
-- Frontend code consumes Vibex DTOs through the shared Rust Backend contracts; it must not redefine
-  transport contracts or branch on native Codex/Claude payloads.
-- Monaco belongs only in the desktop app and is lazy-loaded. Its container chain
-  must have explicit `flex`, `min-h-0`, and `h-full`/`flex-1` sizing before
-  using `height="100%"`.
-- File language ids must match Monaco ids: `.tsx` -> `typescriptreact` and
-  `.jsx` -> `javascriptreact`.
-- xterm.js owns raw terminal rendering. React should mutate xterm through refs
-  and snapshots rather than re-rendering per byte.
-- Browser screenshot mode may use `lib/tauri.ts` mock responses only when Tauri
-  internals are unavailable. Native desktop runtime must still call
-  `__TAURI_INTERNALS__`.
-
-### 4. Validation & Error Matrix
-
-- Missing workspace -> disable workspace-scoped actions and render an empty
-  state, not a throwing component.
-- Missing selected file -> render a no-file state; do not mount Monaco against
-  an undefined buffer.
-- Destructive file delete or Git revert -> require `window.confirm` before
-  invoking the mutation in this slice.
-- Terminal helper input generated by xterm -> add accessible metadata such as a
-  stable `name` after `terminal.open`.
-- Browser screenshot console -> Vite debug logs are acceptable; runtime errors
-  and unresolved accessibility issues should be fixed before acceptance.
-
-### 5. Good/Base/Bad Cases
-
-- Good: Agent, file tree/Monaco, Git diff/actions, terminal tabs, and right rail
-  are simultaneously visible for the selected workspace.
-- Base: the narrow browser screenshot viewport may compress panels, but text
-  must remain readable and controls must not overlap incoherently.
-- Bad: Monaco renders as a black or one-line pane because the parent height is
-  implicit; xterm initialization loops because callbacks are unstable effect
-  dependencies; browser mocks diverge from real command DTO names.
-
-### 6. Tests Required
-
-- `pnpm check:frontend` or root `pnpm check` for typecheck/lint.
-- Desktop `vite build` after adding Monaco/xterm dependencies.
-- For requested or high-risk visual changes, screenshots can be mapped to the
-  matching GPUI Desktop workbench surfaces: Agent/right rail, file explorer,
-  editor, Git diff, and terminal mode.
-- When screenshots are captured, check the browser console after reloads: no
-  runtime errors and no unresolved form-field accessibility issues from
-  first-party controls.
-
-### 7. Wrong vs Correct
-
-#### Wrong
-
-```tsx
-<div className="overflow-hidden">
-  <Editor height="100%" value={content} />
-</div>
-```
-
-The editor can collapse because no parent in the chain owns a real height.
-
-#### Correct
-
-```tsx
-<div className="flex min-h-0 flex-1 overflow-hidden">
-  <section className="flex h-full min-h-0 flex-1 flex-col overflow-hidden">
-    <Editor height="100%" value={content} />
-  </section>
-</div>
-```
-
-
-## Scenario: Phase 6 ACP Provider Settings Surface
-
-### 1. Scope / Trigger
-
-- Trigger: Phase 6 exposes bundled ACP catalog presets and editable ACP command
-  configuration in desktop Provider settings.
-- The UI consumes shared ACP/capability DTOs through the typed Backend facade.
-
-### 2. Contracts
-
-- Provider settings must not parse `ProviderProfile.providerOptions.entries`
-  for ACP config. It must call the typed ACP config command and render
-  `AcpProviderConfig`.
-- ACP preset creation must use `provider_create_acp_profile`; ACP config saves
-  must use `provider_update_acp_profile_config`.
-- Browser mocks may encode ACP config internally for fixture parity, but mock
-  UI consumers must still use typed API helpers.
-- Injection preview must show ACP command, args, cwd/options, and env references
-  as redacted Provider preview fields.
-- Browser mock catalog/profile examples must not contain plaintext secrets.
-- ACP capability status, source, freshness, and supported/unsupported flags must
-  render from `ProviderCapabilitySummary`, not by parsing
-  `ProviderProfile.providerOptions.entries`.
-- Capability refresh controls call `provider_run_capability_probes`; disabled
-  UI states are advisory only because backend runtime gates remain
-  authoritative.
-
-### 3. Tests Required
-
-- `pnpm --filter @vibex/desktop typecheck`.
-- `pnpm check:frontend` and root `pnpm check` before archiving.
-- For UI-changing ACP work, capture a Provider settings screenshot only when
-  requested, when visual regression risk is high, or when local browser
-  rendering is already part of validation.
 
 ## Scenario: GPUI Code Workbench Bounded And Wrapping Lists And Cross-Layer Types
 
@@ -1980,28 +904,17 @@ crates/core/src/file.rs -> vibex-backend -> GPUI
 - `crates/core` owns every public protocol leaf type, including `FileEncoding`
   and `FileLineEnding`; Backend traits and GPUI consumers import those types
   directly instead of defining parallel enums.
-- Physical evidence input roots include every source that can change the probe or
-  capture result. A contract producer such as `apps/desktop/src/testing.rs`
-  and the owning `crates/core` DTO source cannot be omitted merely because the
-  main renderer source is already listed.
-- Code Workbench evidence also binds the complete shared Backend facade/native
-  adapter source set and `crates/vibex-ui/src/shell.rs`. A facade, Terminal,
-  capability, or Shell change can alter the exercised workbench even when
-  `code_workbench.rs` itself is unchanged.
 
 ### 4. Validation & Error Matrix
 
 | Condition | Required result |
 | --- | --- |
 | Requested virtual range exceeds the eager bound | Clamp the returned range; never allocate all rows. |
-| A tracked `uniform_list` omits `.size_full()` | Source-contract/evidence check fails. |
-| A wrapping patch row is rendered in `uniform_list` or keeps a fixed height | Source-contract/evidence check fails; use the per-tab variable-height list. |
+| A tracked `uniform_list` omits `.size_full()` | Source contract test fails. |
+| A wrapping patch row is rendered in `uniform_list` or keeps a fixed height | Source contract test fails; use the per-tab variable-height list. |
 | Patch width, revision, or visible row count changes | Remeasure/reset the `ListState` without materializing the full patch; focused-file navigation still reaches the requested row. |
 | 360 px viewport renders a persisted horizontal split | Render panes vertically without mutating persisted direction. |
 | A Backend or GPUI layer redefines a Rust protocol leaf type | Rust compilation or protocol tests fail; import the canonical `crates/core` type. |
-| Probe-producing source is absent from evidence inputs | Evidence review fails; add the source and recapture. |
-| Shared Backend/Shell changes but Code Workbench source identity remains unchanged | Source binding is incomplete; add the producer and rerun capture plus self-test. |
-| Screenshot is blank, overlaps controls, or has wrong dimensions | Reject the capture even when model tests pass. |
 
 ### 5. Good/Base/Bad Cases
 
@@ -2023,13 +936,6 @@ crates/core/src/file.rs -> vibex-backend -> GPUI
   ranges/full-size tracked handles, one variable-height patch-list helper shared by
   working-tree and commit previews, wrapping diff text, and both desktop and
   360 x 620 layouts.
-- Run `pnpm check:code-workbench` and `pnpm check`.
-- `pnpm check:code-workbench` must run both ordinary verification and its
-  negative evidence self-test after Backend or Shell ownership changes.
-- After renderer or evidence-input changes, run
-  `pnpm capture:code-workbench` on the physical Wayland runner and inspect all
-  eight PNGs at original resolution: Files light desktop/narrow, Diff dark
-  desktop/narrow, and Markdown light/dark desktop/narrow.
 
 ### 7. Wrong vs Correct
 
@@ -2074,7 +980,7 @@ push_decl::<FileReadResponse>(&mut output);
 
 - Trigger: Agent timeline content or workspace Markdown preview changes parsing,
   rendering, navigation, selection/copy, resource handling, raw HTML, local math or
-  diagram artifacts, syntax highlighting, or related physical evidence.
+  diagram artifacts, or syntax highlighting.
 - The framework-neutral document and policy live in `vibex-markdown`; GPUI is one
   renderer of that contract. Product surfaces must not independently parse or
   rewrite Markdown before rendering.
@@ -2094,9 +1000,6 @@ ArtifactController::complete(request, result, view_id, revision, live_nodes)
 render_local_artifact_with_timeout(request, SvgPolicy, timeout)
   -> Result<Arc<SvgArtifact>, ArtifactError>
 SvgPolicy::sanitize(svg, id_prefix) -> Result<SvgArtifact, SvgPolicyError>
-
-pnpm capture:code-workbench -> eight physical Wayland PNGs plus bound evidence
-pnpm check:code-workbench   -> offline identity/contract check and negative self-test
 ```
 
 ### 3. Contracts
@@ -2134,12 +1037,6 @@ pnpm check:code-workbench   -> offline identity/contract check and negative self
 - Syntax highlighting is bounded and cached by node/theme through the selected
   `gpui-component` Tree-sitter registry. Unknown languages stay readable plain text;
   diff rows retain prefix/status cues in addition to theme-aware color.
-- Physical capture is fail-closed while any exact `hyprlock`, `swaylock`, `gtklock`,
-  or `waylock` process is active. The Code Workbench matrix contains exactly eight
-  original-resolution captures: Files light desktop/narrow, Diff dark
-  desktop/narrow, and Markdown light/dark desktop/narrow. Inspect every image for a
-  real application frame, nonblank math/diagrams, and text/control overlap before
-  accepting evidence.
 
 ### 4. Validation & Error Matrix
 
@@ -2153,8 +1050,6 @@ pnpm check:code-workbench   -> offline identity/contract check and negative self
 | SVG has DTD/entity, `script`, `foreignObject`, external URL/reference, unsafe CSS, duplicate root, or invalid dimensions | Reject before GPUI rasterization. |
 | MathJax has a large coordinate-space viewBox but bounded `ex`/`em` intrinsic dimensions | Validate viewBox bounds separately and budget pixels from intrinsic dimensions. |
 | Product source contains `TextView::markdown` or `project_markdown_for_host` | Fail the source audit; migrate the caller to the canonical document/view. |
-| Physical capture starts while a supported screen locker is active | Refuse before launching/capturing and write no replacement evidence. |
-| One of the eight PNGs is missing, stale, blank, lock-screen content, or overlaps | Reject the visual matrix even when unit and GPUI tests pass. |
 
 ### 5. Good / Base / Bad Cases
 
@@ -2187,14 +1082,9 @@ pnpm check:code-workbench   -> offline identity/contract check and negative self
 - Run `cargo clippy -p vibex-markdown --all-targets -- -D warnings`, the affected
   desktop model/GPUI tests, a locked no-default-feature check, and
   `rg -n 'TextView::markdown|project_markdown_for_host' apps/desktop crates/desktop-model`.
-- Run `cargo metadata --locked`, `pnpm check:graph`, and
-  `pnpm check:licenses`; regenerated notices/SBOM must bind the selected local
+- Run `pnpm check:licenses`; regenerated notices/SBOM must bind the selected local
   engines and contain no hidden browser, Node, JVM, remote-renderer, or separately
   downloaded Graphviz runtime.
-- After source/lock changes, capture the eight Code Workbench scenarios on unlocked
-  physical Wayland, inspect every PNG at original resolution, then run
-  `pnpm check:code-workbench`, the related dependency revalidation, and the
-  feasibility-decision writer/check.
 
 ### 7. Wrong vs Correct
 
@@ -2250,8 +1140,8 @@ OfficeDocumentController::open(path, bytes, generation) -> OfficeDocumentModel
 - The surface is read-only. It may retry, close, or explicitly request system open; it
   must not execute macros, formulas, embedded objects, or automatic external fallback.
 - Closing drops the rendered model and clears the controller's parsed model.
-- Diagnostics and physical evidence may store kind, counts, bounds, and action results,
-  but never document paths or extracted Office content.
+- Diagnostics may store kind, counts, bounds, and action results, but never document
+  paths or extracted Office content.
 
 ### 4. Validation & Error Matrix
 
@@ -2274,10 +1164,6 @@ OfficeDocumentController::open(path, bytes, generation) -> OfficeDocumentModel
 - `cargo test -p vibex-content --locked` for supported, legacy, malformed, oversized,
   cancellation, timeout, traversal, encoding, and zip-bomb behavior.
 - `cargo test -p vibex-desktop --locked` plus GPUI compile/Clippy coverage.
-- Physical Linux evidence must load deterministic bounded Office fixtures, inspect the
-  rendered model and explicit controls, close cleanly, and reject content/path leakage.
-- Keep PDF/Office physical interaction blocked until that active-output protocol passes;
-  controller unit tests or the presence of a status row are insufficient.
 
 ### 7. Wrong vs Correct
 
@@ -2306,11 +1192,10 @@ explicit user actions only.
 - Do not make dark mode depend on one global inversion hack.
 - Do not expose destructive actions as swipe-only or hover-only interactions.
 
-## Scenario: Native Mobile Device Evidence
+## Native Mobile Device Validation
 
-Native SDK/device evidence is tied to the exact source, Cargo lock, vendored Zed
-revision, and produced application artifact. A host-side check proves source and
-type contracts only.
+Device qualification is tied to the exact source, Cargo lock, and produced
+application artifact. A host-side check proves source and type contracts only.
 
 Required device scenarios are:
 
@@ -2323,7 +1208,7 @@ Required device scenarios are:
 - Direct/Tailnet/Relay route selection and credential persistence/redaction;
 - foreground/background lifecycle and network transition.
 
-Each scenario records `passed`, `failed`, or `not_tested`. Missing device evidence
-remains `not_tested`; it is never inferred from a successful Rust or Gradle/Xcode
-compile. Evidence stores hashes, bounded platform labels, and status only, never
-pairing links, tokens, device serials, prompts, file contents, or terminal bytes.
+Missing device scenarios remain untested and are never inferred from a successful
+Rust or Gradle/Xcode compile. Qualification notes store bounded platform labels and
+status only, never pairing links, tokens, device serials, prompts, file contents, or
+terminal bytes.
