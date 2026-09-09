@@ -141,14 +141,24 @@ peers are capped, and pairing codes live at most
 See `systemd.md` for a hardened unit that runs `vibex-server` directly on
 the host with the same environment contract.
 
-## Cloud server as a remote client (PC → cloud)
+## Desktop as a remote client (PC → cloud)
 
-A desktop can connect to a cloud runtime the same way the phone does: pair
-once with a code, then point the desktop's remote-client mode at the
-credential. The cloud server owns the room's authority seat; connected
-desktops and phones are clients. (Desktop client-mode UI is landing
-separately; the transport, credential, and pairing layers shipped here are
-the pieces it plugs into.)
+A desktop connects to a cloud runtime the same way the phone does:
+
+1. Open the desktop workbench and go to **Settings → Remote Runtime**.
+2. Enter the server address and the one-time pairing code the server printed
+   at startup, then press **Pair**.
+3. The workbench claims the code, pins the server identity, stores the
+   credential under the desktop home with restrictive permissions, and
+   switches to remote-client mode. Sessions, timelines, messaging, runtime
+   selection, and session management are driven over Remote v2.
+4. **Forget** clears the stored credential and boots the local runtime again.
+   A stored credential also reconnects automatically on the next launch;
+   set `VIBEX_DISABLE_REMOTE_CLIENT=1` to force the local authority once.
+
+Authority-local features degrade explicitly in remote-client mode: composer
+terminals, worktree rename, project deletion, and message editing require
+the local runtime and say so; the settings management page stays inert.
 
 ## Production Notes
 

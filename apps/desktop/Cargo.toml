@@ -41,6 +41,7 @@ vibex-core = { path = "../../crates/core" }
 vibex-desktop-model = { path = "../../crates/desktop-model" }
 vibex-desktop-runtime = { path = "../../crates/desktop-runtime" }
 vibex-backend = { path = "../../crates/vibex-backend", features = ["native"] }
+vibex-remote-client = { path = "../../crates/vibex-remote-client" }
 vibex-ui = { path = "../../crates/vibex-ui" }
 vibex-markdown = { path = "../../crates/vibex-markdown" }
 vibex-terminal = { path = "../../crates/terminal" }

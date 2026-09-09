@@ -163,6 +163,15 @@ headers only behind a trusted proxy. Deployment artifacts live in
 `deploy/server/` (Docker, compose, Caddy, systemd) and the protocol contract
 in `docs/remote/protocol-v2.md`.
 
+The desktop workbench participates in both seats. Natively it fills the
+authority role through `NativeBackend`; paired with a headless runtime it
+drives the identical facade through `WebRemoteBackend` (the "Remote Runtime"
+settings page, credential store under the desktop home). Authority-local
+concerns — the code-workbench file/git panels, composer terminals, message
+editing, durable submission locators — degrade with explicit messages in
+remote-client mode instead of silently failing. Live updates arrive through
+the same `BackendEvent` pump mapped onto the desktop event pipeline.
+
 Provider credentials belong to the runtime database. In cloud mode the
 operator's own host stores them, which is the accepted single-user threat
 model; multi-tenant hosting remains out of scope.

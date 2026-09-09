@@ -63,7 +63,8 @@ use vibex_agent::ReplaceUserMessageRequest;
 use vibex_agent_acp::build_runtime_option_catalog_for_agents;
 use vibex_app_update::{CheckReason, UpdateSnapshot, UpdateState};
 use vibex_backend::{
-    BackendError, BackendFacade, BackendOperation, MutationRequest, NativeBackend,
+    AgentBackend as _, BackendError, BackendEvent, BackendEventStream, BackendFacade,
+    BackendOperation, BackendProjection, BackendResult, MutationRequest, NativeBackend,
 };
 use vibex_config_switch::skills::LocalSkillScanRequest;
 use vibex_core::{
@@ -122,9 +123,10 @@ use vibex_desktop_model::{
     timeline_conversation_turns_with_reasoning_mode, timeline_row_delegation,
 };
 use vibex_desktop_runtime::{
-    DesktopEvent, DesktopRuntime, DesktopRuntimeConfig, DesktopRuntimeFacade, PREVIEW_APP_ID,
-    ProviderConfigChangePhase, RC_APP_ID, STABLE_DESKTOP_APP_ID, SidebarOrganizationRequest,
-    StorageCleanupKind, StorageCleanupReport, validate_external_open_url,
+    AuthoritativeRefetch, DesktopEvent, DesktopEventStream, DesktopRuntime, DesktopRuntimeConfig,
+    DesktopRuntimeFacade, PREVIEW_APP_ID, ProviderConfigChangePhase, RC_APP_ID,
+    STABLE_DESKTOP_APP_ID, SidebarOrganizationRequest, StorageCleanupKind, StorageCleanupReport,
+    validate_external_open_url,
 };
 use vibex_markdown::{
     Block, BlockNode, Inline, InlineNode, MarkdownDocument, MarkdownInput, MarkdownLimits,
@@ -163,16 +165,56 @@ use crate::platform::{
     send_system_notification, set_launch_at_login, storage_usage, ui_state_path,
 };
 use crate::remote_access_pairing::open_remote_access_pairing;
+use crate::remote_client::DesktopRemoteCredential;
 use crate::responsive::WorkbenchVisibility;
 use crate::terminal_surface::{TerminalSurface, available_shells, bind_terminal_keys};
 use crate::usage::UsageView;
 use crate::{DEFAULT_HEIGHT, DEFAULT_WIDTH, MIN_HEIGHT, MIN_WIDTH, resize_seam, theme};
+use vibex_remote_client::WebRemoteBackend;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RuntimeStatus {
     Starting,
     Ready,
     Failed { code: String, message: String },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RemoteClientSettingsMode {
+    Local,
+    Connecting,
+    Connected,
+}
+
+/// A paired remote runtime driving this workbench. Holds the persisted
+/// credential and the backend built from it; the workbench consumes the same
+/// facade slots the native backend fills, so no view knows which one is live.
+struct DesktopRemoteClient {
+    credential: DesktopRemoteCredential,
+    store: Arc<crate::remote_client::DesktopRemoteCredentialStore>,
+    backend: Arc<WebRemoteBackend>,
+}
+
+impl DesktopRemoteClient {
+    /// Builds the backend from the credential, verifies the handshake, and
+    /// only then persists the credential: a failed connect leaves no stored
+    /// grant behind.
+    async fn start(
+        credential: DesktopRemoteCredential,
+        home_dir: std::path::PathBuf,
+    ) -> BackendResult<Self> {
+        let store = Arc::new(crate::remote_client::DesktopRemoteCredentialStore::new(
+            &home_dir,
+        ));
+        let backend = credential.backend()?;
+        backend.connect().await?;
+        store.save(&credential)?;
+        Ok(Self {
+            credential,
+            store,
+            backend,
+        })
+    }
 }
 
 struct ForkSessionNotification;
@@ -258,6 +300,9 @@ const STARTUP_LOADING_INDICATOR_DELAY: Duration = Duration::from_secs(5);
 const STARTUP_LOADING_MIN_DURATION: Duration = Duration::from_secs(1);
 // Tauri parity: submission locators poll `agent_get_message_submission` every 500ms.
 const SUBMISSION_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Remote event pumps retry a failed subscription on this cadence; the
+/// transport itself also reconnects underneath, so this is a slow backstop.
+const REMOTE_EVENT_RETRY_DELAY: Duration = Duration::from_secs(2);
 const RUNTIME_UI_SIGNAL_BATCH_LIMIT: usize = 256;
 const RUNTIME_UI_SIGNAL_QUEUE_CAPACITY: usize = RUNTIME_UI_SIGNAL_BATCH_LIMIT;
 const RUNTIME_UI_SIGNAL_COALESCE_DELAY: Duration = Duration::from_millis(16);
@@ -2119,9 +2164,67 @@ impl ReleaseChannel {
     }
 }
 
+/// Bridges a backend failure into the runtime-error type the workbench's
+/// optimistic-completion helpers consume. Code and message survive verbatim.
+fn remote_error_into_vibex(error: BackendError) -> vibex_core::VibexError {
+    vibex_core::VibexError::new(vibex_core::ErrorCategory::Remote, error.code, error.message)
+}
+
+/// Maps a backend event onto its identical desktop twin. The payload types
+/// are the same `vibex_core` contracts the native event bridge passes
+/// through, so this is a lossless 1:1 conversion except for variants the
+/// desktop has no live counterpart for.
+fn map_backend_event(event: BackendEvent) -> Option<DesktopEvent> {
+    match event {
+        BackendEvent::Timeline(event) => Some(DesktopEvent::Timeline(event)),
+        BackendEvent::SessionUpdated(session) => Some(DesktopEvent::SessionUpdated(session)),
+        BackendEvent::Runtime(event) => Some(DesktopEvent::Runtime(event)),
+        BackendEvent::RuntimeSelection(event) => Some(DesktopEvent::RuntimeSelection(event)),
+        BackendEvent::ProjectionInvalidated(BackendProjection::Management) => {
+            Some(DesktopEvent::ProviderConfigChanged(
+                vibex_desktop_runtime::ProviderConfigChangedEvent {
+                    provider_profile_ids: Vec::new(),
+                    phase: ProviderConfigChangePhase::ProfilesChanged,
+                },
+            ))
+        }
+        BackendEvent::ProjectionInvalidated(BackendProjection::Usage) => {
+            Some(DesktopEvent::UsageInvalidated)
+        }
+        BackendEvent::ProjectionInvalidated(_) | BackendEvent::Notification(_) => None,
+        BackendEvent::Lagged {
+            stream,
+            skipped,
+            refetch,
+            ..
+        } => Some(DesktopEvent::Lagged {
+            stream: match stream {
+                BackendEventStream::Timeline => DesktopEventStream::Timeline,
+                BackendEventStream::Runtime => DesktopEventStream::Runtime,
+                BackendEventStream::RuntimeSelection => DesktopEventStream::RuntimeSelection,
+                BackendEventStream::Usage => DesktopEventStream::Usage,
+                BackendEventStream::Fanout => DesktopEventStream::Fanout,
+            },
+            skipped,
+            refetch: AuthoritativeRefetch {
+                session_id: refetch.session_id,
+                timeline: refetch.timeline,
+                runtime: refetch.runtime,
+                runtime_selection: refetch.runtime_selection,
+                usage: refetch.projection == Some(BackendProjection::Usage),
+            },
+        }),
+        BackendEvent::Disconnected => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RuntimeUiSignal {
     Event(Box<DesktopEvent>),
+    /// The remote transport dropped its connection. Unlike a runtime shutdown
+    /// the transport keeps retrying, so the drain loop stays alive and the UI
+    /// only shows a reconnect note.
+    RemoteReconnecting,
     Shutdown,
 }
 
@@ -4540,6 +4643,7 @@ pub struct VibexWorkbench {
     settings_snapshot: Option<DesktopUiStateV1>,
     open_settings_on_start: bool,
     settings_view: Entity<FoundationSettings>,
+    remote_client: Option<DesktopRemoteClient>,
     code_workbench: Entity<CodeWorkbench>,
     preview_fullscreen_active: bool,
     code_preview_visible: bool,
@@ -5310,6 +5414,7 @@ impl VibexWorkbench {
             settings_snapshot: None,
             open_settings_on_start: settings_open_on_start,
             settings_view,
+            remote_client: None,
             code_workbench,
             preview_fullscreen_active: false,
             code_preview_visible: false,
@@ -5662,6 +5767,13 @@ impl VibexWorkbench {
     }
 
     fn begin_runtime_start(&mut self, cx: &mut Context<Self>) {
+        // A paired remote credential switches the workbench into remote-client
+        // mode at boot. "Forget this runtime" in Remote Runtime settings clears
+        // it and returns the desktop to the local authority.
+        if let Some(credential) = self.stored_remote_client_credential() {
+            self.begin_remote_client_start(credential, cx);
+            return;
+        }
         let Some(config) = self.config.clone() else {
             self.finish_startup_loading(cx);
             self.runtime_status = RuntimeStatus::Failed {
@@ -5671,6 +5783,7 @@ impl VibexWorkbench {
             return;
         };
         self.runtime = None;
+        self.remote_client = None;
         self.backend = None;
         self.code_workbench
             .update(cx, |workbench, cx| workbench.clear_backend(cx));
@@ -6365,6 +6478,287 @@ impl VibexWorkbench {
         ));
     }
 
+    /// Claims a pairing code against a headless runtime and switches this
+    /// workbench to remote-client mode on success. The claim and handshake
+    /// happen off the UI thread; the stored credential pins the server
+    /// identity and is written only after the connect succeeded.
+    fn claim_remote_pairing_code(
+        &mut self,
+        server_url: String,
+        pairing_code: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.remote_client.is_some() || matches!(self.runtime_status, RuntimeStatus::Starting) {
+            return;
+        }
+        let Some(home_dir) = self.config.as_ref().map(|config| config.home_dir.clone()) else {
+            return;
+        };
+        self.detach_local_runtime(cx);
+        self.runtime_status = RuntimeStatus::Starting;
+        self.runtime_note = Some("Claiming pairing code…".to_string());
+        self.settings_view.update(cx, |settings, cx| {
+            settings.remote_connect_busy = true;
+            cx.notify();
+        });
+        let allow_insecure_local_dev = cfg!(debug_assertions);
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let credential = crate::remote_client::claim_server_pairing_code(
+                server_url,
+                pairing_code,
+                allow_insecure_local_dev,
+            )
+            .await?;
+            DesktopRemoteClient::start(credential, home_dir).await
+        });
+        self.boot_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                this.settings_view.update(cx, |settings, cx| {
+                    settings.remote_connect_busy = false;
+                    cx.notify();
+                });
+                match outcome {
+                    Ok(Ok(client)) => {
+                        this.install_remote_client(client, cx);
+                    }
+                    Ok(Err(error)) => this.finish_remote_client_failure(error, cx),
+                    Err(_) => this.finish_remote_client_failure(
+                        BackendError::offline(
+                            "desktop_remote_client_boot_task_failed",
+                            "the remote client connection task stopped unexpectedly",
+                        ),
+                        cx,
+                    ),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Wires the whole workbench to a freshly connected remote backend and
+    /// starts its event pump. Every consumer keeps using the same facade
+    /// slots the native path fills, so no view is aware of the transport.
+    fn install_remote_client(&mut self, client: DesktopRemoteClient, cx: &mut Context<Self>) {
+        let backend = client.backend.clone();
+        self.runtime = None;
+        self.remote_client = Some(client);
+        let facade = backend.facade();
+        self.shared_workflow = Some(AgentFileGitController::from_facade(&facade));
+        self.shared_terminal = Some(TerminalWorkflowController::new(
+            facade.terminal().clone(),
+            TerminalWorkflowCapabilities::from_backend(&facade.capabilities()),
+        ));
+        self.shared_management = Some(ManagementWorkflowController::new(
+            facade.management().clone(),
+            facade.device().clone(),
+            ManagementWorkflowCapabilities::from_backend(&facade.capabilities()),
+        ));
+        self.usage_view
+            .update(cx, |usage, cx| usage.set_backend(facade.clone(), cx));
+        self.code_workbench.update(cx, |workbench, cx| {
+            workbench.set_backend(facade.clone(), cx)
+        });
+        self.backend = Some(facade);
+        self.attach_remote_event_stream(backend, cx);
+        self.load_agent_overview(cx);
+        self.runtime_status = RuntimeStatus::Ready;
+        self.runtime_note = Some("Authoritative remote runtime connected".to_string());
+        self.finish_startup_loading(cx);
+        cx.notify();
+    }
+
+    /// A stored credential from an earlier pairing restores remote-client
+    /// mode across restarts. The escape hatch keeps the local authority
+    /// reachable when the paired server is being migrated.
+    fn stored_remote_client_credential(&self) -> Option<DesktopRemoteCredential> {
+        if std::env::var_os("VIBEX_DISABLE_REMOTE_CLIENT").is_some() {
+            return None;
+        }
+        let home_dir = self.config.as_ref()?.home_dir.clone();
+        crate::remote_client::DesktopRemoteCredentialStore::new(&home_dir).load()
+    }
+
+    /// Boot twin of [`Self::claim_remote_pairing_code`] for a stored
+    /// credential: reconnect to the paired runtime before the first frame.
+    fn begin_remote_client_start(
+        &mut self,
+        credential: DesktopRemoteCredential,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(home_dir) = self.config.as_ref().map(|config| config.home_dir.clone()) else {
+            self.finish_startup_loading(cx);
+            self.runtime_status = RuntimeStatus::Failed {
+                code: "desktop_runtime_config_unavailable".to_string(),
+                message: "The isolated GPUI runtime could not be configured.".to_string(),
+            };
+            return;
+        };
+        self.detach_local_runtime(cx);
+        self.runtime_status = RuntimeStatus::Starting;
+        self.runtime_note = None;
+        self.event_task = None;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            DesktopRemoteClient::start(credential, home_dir).await
+        });
+        self.boot_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(client)) => {
+                        this.install_remote_client(client, cx);
+                    }
+                    Ok(Err(error)) => this.finish_remote_client_failure(error, cx),
+                    Err(_) => this.finish_remote_client_failure(
+                        BackendError::offline(
+                            "desktop_remote_client_boot_task_failed",
+                            "the remote client connection task stopped unexpectedly",
+                        ),
+                        cx,
+                    ),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Drops the local runtime ownership without tearing the process down:
+    /// views are cleared so the remote install path can refill them.
+    fn detach_local_runtime(&mut self, cx: &mut Context<Self>) {
+        self.runtime = None;
+        self.backend = None;
+        self.remote_client = None;
+        self.code_workbench
+            .update(cx, |workbench, cx| workbench.clear_backend(cx));
+        self.shared_workflow = None;
+        self.shared_terminal = None;
+        self.shared_management = None;
+        self.management_view
+            .update(cx, |management, cx| management.clear_runtime(cx));
+        self.usage_view
+            .update(cx, |usage, cx| usage.clear_backend(cx));
+        self.event_task = None;
+    }
+
+    fn finish_remote_client_failure(&mut self, error: BackendError, cx: &mut Context<Self>) {
+        self.finish_startup_loading(cx);
+        self.runtime_status = RuntimeStatus::Failed {
+            code: error.code.clone(),
+            message: error.message.clone(),
+        };
+        self.set_settings_operation_note(Some(error.message.clone()), cx);
+    }
+
+    /// Returns the workbench to the local authority: drops the paired
+    /// credential and its backend, then boots the native runtime again.
+    fn disconnect_remote_client(&mut self, cx: &mut Context<Self>) {
+        if let Some(client) = self.remote_client.take()
+            && let Err(error) = client.store.clear()
+        {
+            tracing::warn!(
+                target: "vibex_desktop",
+                error_code = %error.code,
+                "Stored remote credential could not be removed"
+            );
+        }
+        self.detach_local_runtime(cx);
+        self.begin_runtime_start(cx);
+    }
+
+    /// Remote twin of [`Self::attach_event_stream`]: pumps backend events
+    /// into the same coalesced signal channel. `Disconnected` maps to a
+    /// reconnect note because the transport retries on its own; the pump
+    /// exits only when the drain task is dropped with the workbench swap.
+    fn attach_remote_event_stream(
+        &mut self,
+        backend: Arc<WebRemoteBackend>,
+        cx: &mut Context<Self>,
+    ) {
+        let (signal_tx, mut signal_rx) = mpsc::channel(RUNTIME_UI_SIGNAL_QUEUE_CAPACITY);
+        let agent_streaming_surface_visible = self.agent_streaming_surface_visible.clone();
+        let pump_backend = backend.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let Ok(mut subscription) = pump_backend.subscribe() else {
+                let _ = signal_tx.send(RuntimeUiSignal::RemoteReconnecting).await;
+                return;
+            };
+            loop {
+                match subscription.next().await {
+                    Ok(Some(BackendEvent::Disconnected)) => {
+                        if signal_tx
+                            .send(RuntimeUiSignal::RemoteReconnecting)
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Ok(Some(BackendEvent::Notification(_))) => {
+                        // Desktop notifications surface from the authoritative
+                        // timeline events; no separate push intent is needed.
+                    }
+                    Ok(Some(event)) => {
+                        let Some(desktop_event) = map_backend_event(event) else {
+                            continue;
+                        };
+                        if !agent_streaming_surface_visible.load(Ordering::Acquire)
+                            && matches!(&desktop_event, DesktopEvent::Timeline(event) if timeline_live_event_is_streaming_only(event))
+                        {
+                            continue;
+                        }
+                        if signal_tx
+                            .send(RuntimeUiSignal::Event(Box::new(desktop_event)))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Ok(None) | Err(_) => {
+                        if signal_tx
+                            .send(RuntimeUiSignal::RemoteReconnecting)
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        tokio::time::sleep(REMOTE_EVENT_RETRY_DELAY).await;
+                    }
+                }
+            }
+        });
+        self.event_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                while let Some(signal) = signal_rx.recv().await {
+                    let mut signals = vec![signal];
+                    if !matches!(signals.first(), Some(RuntimeUiSignal::Shutdown)) {
+                        cx.background_executor()
+                            .timer(RUNTIME_UI_SIGNAL_COALESCE_DELAY)
+                            .await;
+                    }
+                    while signals.len() < RUNTIME_UI_SIGNAL_BATCH_LIMIT {
+                        match signal_rx.try_recv() {
+                            Ok(signal) => signals.push(signal),
+                            Err(_) => break,
+                        }
+                    }
+                    let stopped = entity.update(cx, |this, cx| {
+                        let dirty = this.apply_runtime_ui_signals(signals, cx);
+                        if dirty {
+                            cx.notify();
+                        }
+                        dirty
+                    });
+                    if stopped.is_err() {
+                        break;
+                    }
+                }
+                drop(signal_rx);
+                let _ = runner.await;
+            },
+        ));
+    }
+
     fn apply_runtime_ui_signals(
         &mut self,
         signals: Vec<RuntimeUiSignal>,
@@ -6391,6 +6785,14 @@ impl VibexWorkbench {
                         self.apply_live_timeline_batch(std::mem::take(&mut timeline_events), cx);
                     }
                     self.runtime_note = Some("Runtime stopped".to_string());
+                    dirty = true;
+                }
+                RuntimeUiSignal::RemoteReconnecting => {
+                    if !timeline_events.is_empty() {
+                        self.apply_live_timeline_batch(std::mem::take(&mut timeline_events), cx);
+                    }
+                    self.runtime_note =
+                        Some("Remote runtime connection lost; reconnecting…".to_string());
                     dirty = true;
                 }
             }
@@ -7405,13 +7807,13 @@ impl VibexWorkbench {
         {
             return;
         }
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         let probe_session_id = session_id.clone();
         let request_session_id = probe_session_id.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
+            backend
                 .agent()
                 .fetch_timeline(FetchTimelineRequest {
                     session_id: request_session_id,
@@ -10328,7 +10730,7 @@ impl VibexWorkbench {
                 .remove(session_id.as_str());
             return;
         }
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
 
@@ -10342,29 +10744,21 @@ impl VibexWorkbench {
         self.runtime_selection_requests_in_flight
             .insert(session_key.clone());
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let outcome = runtime
+            let outcome = backend
                 .agent()
-                .runtime_selection()
-                .set_desired_runtime(SetDesiredAgentSessionRuntimeRequest {
+                .set_desired_runtime(MutationRequest::new(SetDesiredAgentSessionRuntimeRequest {
                     session_id: runner_session_id.clone(),
                     idempotency_key: format!("desktop-runtime:{}", unix_timestamp_ms()),
                     expected_revision,
                     expected_selection_revision,
                     desired,
                     interaction: RuntimeSelectionInteraction::Seamless,
-                })
+                }))
                 .await;
-            let observed = outcome
-                .is_err()
-                .then(|| {
-                    runtime
-                        .agent()
-                        .runtime_selection()
-                        .get_selection_state(&runner_session_id)
-                        .ok()
-                })
-                .flatten();
-            (outcome, observed)
+            // The native path also re-reads a cached selection state as an
+            // error fallback; remote clients re-render from the next
+            // authoritative RuntimeSelection event instead.
+            (outcome, None)
         });
         cx.spawn(
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
@@ -10583,9 +10977,10 @@ impl VibexWorkbench {
         if mark_agent_session_read(&mut self.unread_agent_completion_session_ids, &session_id) {
             self.publish_sidebar_invalidation();
         }
-        let Some(runtime) = self.runtime.clone() else {
+        let runtime = self.runtime.clone();
+        if runtime.is_none() && self.backend.is_none() {
             return;
-        };
+        }
         let navigation_changed = self.selected_session_id.as_ref() != Some(&session_id);
         let runtime_initializing = self
             .sessions
@@ -10595,17 +10990,18 @@ impl VibexWorkbench {
         if record_history && navigation_changed {
             self.sync_current_navigation_entry();
         }
-        if let Some(session) = self
-            .sessions
-            .iter()
-            .find(|session| session.id == session_id)
-            .cloned()
-        {
+        if let (Some(runtime), Some(session)) = (
+            runtime.clone(),
+            self.sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .cloned(),
+        ) {
             self.ui_state.workbench.selected_workspace_id =
                 Some(session.workspace_id.as_str().to_string());
             self.code_workbench.update(cx, |workbench, cx| {
                 workbench.sync_workspace(
-                    runtime.clone(),
+                    runtime,
                     session.workspace_id,
                     std::path::PathBuf::from(session.workspace_root),
                     cx,
@@ -10714,47 +11110,145 @@ impl VibexWorkbench {
             .iter()
             .find(|session| session.id == session_id)
             .map(|session| session.workspace_id.clone());
-        self.load_agent_session_timeline(
-            runtime.clone(),
-            session_id.clone(),
-            workspace_id.clone(),
-            generation,
-            cx,
-        );
-        self.load_agent_session_terminals(
-            runtime.clone(),
-            session_id.clone(),
-            workspace_id,
-            generation,
-            cx,
-        );
-        if runtime_initializing {
-            self.agent_projection_task = None;
-            self.runtime_heartbeat_task = None;
-            self.load_agent_session_projection(runtime.clone(), session_id.clone(), generation, cx);
-            if let Some(previous_session_id) = previous_session_id
-                && previous_session_id != session_id
-            {
-                let runtime_client_id = self.runtime_client_id.clone();
-                gpui_tokio::Tokio::spawn(cx, async move {
-                    runtime
-                        .agent()
-                        .runtime_lifecycle()
-                        .detach_runtime(
-                            DetachRuntimeRequest {
-                                session_id: previous_session_id,
-                                client_id: runtime_client_id,
-                            },
-                            "desktop",
-                        )
-                        .await
-                })
-                .detach();
+        if let Some(runtime) = runtime.clone() {
+            self.load_agent_session_timeline(
+                runtime.clone(),
+                session_id.clone(),
+                workspace_id.clone(),
+                generation,
+                cx,
+            );
+            self.load_agent_session_terminals(
+                runtime.clone(),
+                session_id.clone(),
+                workspace_id,
+                generation,
+                cx,
+            );
+            if runtime_initializing {
+                self.agent_projection_task = None;
+                self.runtime_heartbeat_task = None;
+                self.load_agent_session_projection(
+                    runtime.clone(),
+                    session_id.clone(),
+                    generation,
+                    cx,
+                );
+                if let Some(previous_session_id) = previous_session_id
+                    && previous_session_id != session_id
+                {
+                    let runtime_client_id = self.runtime_client_id.clone();
+                    gpui_tokio::Tokio::spawn(cx, async move {
+                        runtime
+                            .agent()
+                            .runtime_lifecycle()
+                            .detach_runtime(
+                                DetachRuntimeRequest {
+                                    session_id: previous_session_id,
+                                    client_id: runtime_client_id,
+                                },
+                                "desktop",
+                            )
+                            .await
+                    })
+                    .detach();
+                }
+            } else {
+                self.load_agent_session_projection(
+                    runtime.clone(),
+                    session_id.clone(),
+                    generation,
+                    cx,
+                );
+                self.start_runtime_heartbeat(
+                    runtime,
+                    previous_session_id,
+                    session_id,
+                    generation,
+                    cx,
+                );
             }
         } else {
-            self.load_agent_session_projection(runtime.clone(), session_id.clone(), generation, cx);
-            self.start_runtime_heartbeat(runtime, previous_session_id, session_id, generation, cx);
+            // Remote-client mode: the authoritative timeline arrives over the
+            // backend RPC; terminals, the projection cache, and the heartbeat
+            // are authority-local concerns.
+            self.load_agent_session_timeline_remote(session_id, generation, cx);
         }
+    }
+
+    /// Remote twin of [`Self::load_agent_session_timeline`]: pages the
+    /// authoritative timeline through the backend and applies the same
+    /// replacement bookkeeping the native loader performs.
+    fn load_agent_session_timeline_remote(
+        &mut self,
+        session_id: VibexSessionId,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let request_session_id = session_id.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let mut items = Vec::new();
+            let mut after_sequence = 0_i64;
+            loop {
+                let page = backend
+                    .agent()
+                    .fetch_timeline(FetchTimelineRequest {
+                        session_id: request_session_id.clone(),
+                        after_sequence: Some(after_sequence),
+                        limit: AGENT_TIMELINE_FETCH_PAGE_LIMIT,
+                    })
+                    .await?;
+                let next_cursor =
+                    next_authoritative_timeline_cursor(&request_session_id, after_sequence, &page)
+                        .map_err(TimelineRestoreError::into_vibex_error)?;
+                items.extend(page.items);
+                let Some(next_cursor) = next_cursor else {
+                    break;
+                };
+                after_sequence = next_cursor;
+            }
+            BackendResult::Ok(items)
+        });
+        self.agent_load_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    if this.session_generation != generation
+                        || this.selected_session_id.as_ref() != Some(&session_id)
+                    {
+                        return;
+                    }
+                    this.agent_loading = false;
+                    match outcome {
+                        Ok(Ok(items)) => {
+                            let content_changed = this.timeline.session_id.as_ref()
+                                != Some(&session_id)
+                                || this.timeline.items != items;
+                            if content_changed {
+                                this.invalidate_timeline_render_caches();
+                                this.invalidate_agent_generation_output_estimate();
+                                this.invalidate_agent_generation_compaction_count();
+                            }
+                            this.timeline
+                                .replace_authoritative(session_id.clone(), items);
+                            this.reconcile_optimistic_user_message();
+                            this.auto_continue_probe_tasks.remove(session_id.as_str());
+                            this.request_timeline_scroll_to_latest();
+                        }
+                        Ok(Err(error)) => {
+                            this.agent_error = Some(format!("{}: {}", error.code, error.message));
+                        }
+                        Err(error) => {
+                            this.agent_error = Some(format!("Agent action failed: {error}"));
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        ));
     }
 
     fn load_agent_session_timeline(
@@ -11034,9 +11528,13 @@ impl VibexWorkbench {
     }
 
     fn refresh_selected_agent_timeline(&mut self, cx: &mut Context<Self>) {
-        let (Some(runtime), Some(session_id)) =
-            (self.runtime.clone(), self.selected_session_id.clone())
-        else {
+        let (runtime, session_id) = (self.runtime.clone(), self.selected_session_id.clone());
+        let (Some(runtime), Some(session_id)) = (runtime, session_id) else {
+            if let Some(session_id) = self.selected_session_id.clone() {
+                self.timeline.mark_lagged();
+                let generation = self.session_generation;
+                self.load_agent_session_timeline_remote(session_id, generation, cx);
+            }
             return;
         };
         let workspace_id = self
@@ -13288,7 +13786,12 @@ impl VibexWorkbench {
         }) {
             return None;
         }
-        let runtime = self.runtime.clone()?;
+        let Some(runtime) = self.runtime.clone() else {
+            // Remote-client mode: command discovery is an authority-local
+            // capability, so manual slash expansion stays disabled and typed
+            // text is submitted verbatim.
+            return self.take_composer_message_remote(window, cx);
+        };
         let session_id = self.selected_session_id.clone()?;
         let Some(selection) = self.selected_runtime_selection() else {
             self.agent_error = Some("Runtime selection is not ready".into());
@@ -13337,6 +13840,154 @@ impl VibexWorkbench {
         self.composer_command_entry = None;
         self.clear_suggestions();
         Some(message)
+    }
+
+    /// Remote twin of [`Self::take_composer_message`]: identical payload
+    /// assembly without the authority-local command discovery. Manual slash
+    /// expansion stays off; catalog commands ride the remote send path.
+    fn take_composer_message_remote(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<ComposerQueueMessage> {
+        let session_id = self.selected_session_id.clone()?;
+        let Some(selection) = self.selected_runtime_selection() else {
+            self.agent_error = Some("Runtime selection is not ready".into());
+            return None;
+        };
+        let raw_text = self.composer_input.read(cx).value().to_string();
+        let (text, attachments) =
+            composer_submission_payload(&raw_text, &self.composer_attachments);
+        if text.trim().is_empty() && attachments.is_empty() {
+            return None;
+        }
+        self.composer_queue_serial = self.composer_queue_serial.saturating_add(1).max(1);
+        let message = ComposerQueueMessage {
+            id: self.composer_queue_serial,
+            session_id,
+            desired_runtime: selection,
+            text,
+            attachments,
+            command_invocation: None,
+        };
+        self.composer_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.composer_attachments.clear();
+        self.composer_command_entry = None;
+        self.clear_suggestions();
+        Some(message)
+    }
+
+    /// Remote twin of the composer dispatch: optimistic message plus a
+    /// single `send_message` RPC. Durable-submission locators and command
+    /// execution stay authority-local; live updates arrive through events.
+    fn dispatch_composer_message_remote(
+        &mut self,
+        message: ComposerQueueMessage,
+        backend: BackendFacade,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let session_id = message.session_id.clone();
+        let ComposerQueueMessage {
+            id: message_id,
+            desired_runtime: selection,
+            text,
+            attachments,
+            ..
+        } = message;
+        self.notification_suppressed_session_ids
+            .remove(session_id.as_str());
+        let generation = self.session_generation;
+        let submitted_session_id = session_id.clone();
+        let idempotency_key = format!(
+            "gpui-remote:{}:{}:{}:{}",
+            session_id.as_str(),
+            generation,
+            message_id,
+            unix_timestamp_ms()
+        );
+        let after_sequence = if self.timeline.session_id.as_ref() == Some(&session_id) {
+            self.timeline.authoritative_end_sequence.unwrap_or(0)
+        } else {
+            self.agent_session_view_cache
+                .get(session_id.as_str())
+                .and_then(|entry| entry.timeline.authoritative_end_sequence)
+                .unwrap_or(0)
+        };
+        self.install_optimistic_user_message(OptimisticUserMessage {
+            session_id: session_id.clone(),
+            item_id: TimelineItemId::new(),
+            after_sequence,
+            submitted_at_ms: unix_timestamp_ms(),
+            text: text.clone(),
+            attachments: attachments.clone(),
+        });
+        self.set_session_turn_pending(&session_id, true);
+        if self.auto_continue_enabled(&session_id) {
+            self.resume_auto_continue(&session_id, cx);
+        }
+        if self.selected_session_id.as_ref() == Some(&session_id) {
+            self.agent_error = None;
+        }
+        cx.notify();
+        let submit_key = idempotency_key.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let outcome = backend
+                .agent()
+                .send_message(MutationRequest::new(SendAgentMessageRequest {
+                    session_id: session_id.clone(),
+                    message_idempotency_key: idempotency_key,
+                    desired_runtime: selection,
+                    text,
+                    attachments,
+                    reasoning_effort: None,
+                    correlation_id: None,
+                }))
+                .await
+                .map(|_| ());
+            let session = backend.agent().open_session(session_id.clone()).await.ok();
+            (outcome, session)
+        });
+        cx.spawn_in(window, async move |entity, cx| {
+            let outcome = runner.await;
+            let _ = entity.update_in(cx, |this, window, cx| {
+                let completed = matches!(&outcome, Ok((Ok(_), _)));
+                if let Ok((_, Some(session))) = &outcome {
+                    this.upsert_session_snapshot(session.clone());
+                    this.reconcile_sidebar_state();
+                    this.publish_sidebar_invalidation();
+                }
+                if completed {
+                    this.composer_submission_locators
+                        .retain(|locator| locator.message_idempotency_key != submit_key);
+                    this.composer_submission_states
+                        .retain(|state| state.message_idempotency_key != submit_key);
+                }
+                this.set_session_turn_pending(&submitted_session_id, false);
+                this.sync_auto_continue_for_session(&submitted_session_id, cx);
+                let active = agent_turn_completion_is_active(
+                    this.session_generation,
+                    generation,
+                    this.selected_session_id.as_ref(),
+                    &submitted_session_id,
+                );
+                if active {
+                    match &outcome {
+                        Ok((Ok(_), _)) => this.refresh_selected_agent_timeline(cx),
+                        Ok((Err(error), _)) => {
+                            this.agent_error = Some(format!("{}: {}", error.code, error.message));
+                        }
+                        Err(error) => {
+                            this.agent_error = Some(format!("Agent action failed: {error}"));
+                        }
+                    }
+                }
+                let _ = window;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn agent_session_is_active(&self, session_id: &VibexSessionId) -> bool {
@@ -13393,16 +14044,20 @@ impl VibexWorkbench {
             return;
         }
         let Some(runtime) = self.runtime.clone() else {
-            let insert_at = self
-                .composer_queue
-                .iter()
-                .position(|queued| queued.session_id == session_id)
-                .unwrap_or(self.composer_queue.len());
-            self.composer_queue.insert(insert_at, message);
-            self.composer_queue_paused_session_ids
-                .insert(session_id.as_str().to_string());
-            self.agent_error = Some("Local runtime is not ready".into());
-            cx.notify();
+            let Some(backend) = self.backend.clone() else {
+                let insert_at = self
+                    .composer_queue
+                    .iter()
+                    .position(|queued| queued.session_id == session_id)
+                    .unwrap_or(self.composer_queue.len());
+                self.composer_queue.insert(insert_at, message);
+                self.composer_queue_paused_session_ids
+                    .insert(session_id.as_str().to_string());
+                self.agent_error = Some("Local runtime is not ready".into());
+                cx.notify();
+                return;
+            };
+            self.dispatch_composer_message_remote(message, backend, window, cx);
             return;
         };
         let ComposerQueueMessage {
@@ -16466,7 +17121,7 @@ impl VibexWorkbench {
         if self.agent_action_pending {
             return;
         }
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         let Some(session_id) = self.selected_session_id.clone() else {
@@ -16478,10 +17133,9 @@ impl VibexWorkbench {
         self.agent_action_pending = true;
         let generation = self.session_generation;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
+            backend
                 .agent()
-                .manager()
-                .resolve_permission(ResolvePermissionRequest {
+                .resolve_permission(MutationRequest::new(ResolvePermissionRequest {
                     session_id: session_id.clone(),
                     request_id: request_id.clone(),
                     resolution: PermissionResolution {
@@ -16493,7 +17147,7 @@ impl VibexWorkbench {
                         note: None,
                         resolved_at_ms: unix_timestamp_ms(),
                     },
-                })
+                }))
                 .await
         });
         self.agent_action_task = Some(cx.spawn(
@@ -16844,7 +17498,7 @@ impl VibexWorkbench {
         if expected_turn_updated_at_ms.is_some_and(|expected| expected != turn_updated_at_ms) {
             return;
         }
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         self.cancel_auto_continue_countdown(&session_id);
@@ -16864,14 +17518,15 @@ impl VibexWorkbench {
         let generation = self.session_generation;
         let continued_session_id = session_id.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let manager = runtime.agent().manager();
-            let outcome = manager
-                .continue_turn(ContinueAgentTurnRequest {
+            let outcome = backend
+                .agent()
+                .continue_turn(MutationRequest::new(ContinueAgentTurnRequest {
                     session_id: session_id.clone(),
                     correlation_id: None,
-                })
-                .await;
-            let session = manager.get_session(&session_id).await.ok();
+                }))
+                .await
+                .map(|_| ());
+            let session = backend.agent().open_session(session_id.clone()).await.ok();
             (outcome, session)
         });
         cx.spawn(
@@ -16934,6 +17589,17 @@ impl VibexWorkbench {
         let (Some(runtime), Some(source_session_id)) =
             (self.runtime.clone(), self.selected_session_id.clone())
         else {
+            if let (Some(backend), Some(source_session_id)) =
+                (self.backend.clone(), self.selected_session_id.clone())
+            {
+                self.fork_session_at_remote(
+                    backend,
+                    source_session_id,
+                    through_sequence,
+                    window,
+                    cx,
+                );
+            }
             return;
         };
         self.agent_action_pending = true;
@@ -19053,9 +19719,84 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Remote twin of [`Self::fork_session_at`]: a single fork RPC without
+    /// the creation announcement channel; the new session is navigated to
+    /// from the RPC result and sidebar updates arrive through events.
+    fn fork_session_at_remote(
+        &mut self,
+        backend: BackendFacade,
+        source_session_id: VibexSessionId,
+        through_sequence: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.agent_action_pending = true;
+        self.fork_session_pending = true;
+        self.agent_error = None;
+        window.push_notification(
+            Notification::info(locale::text(
+                "Creating forked session...",
+                "正在创建分叉会话...",
+                "正在建立分支會話...",
+            ))
+            .id::<ForkSessionNotification>()
+            .autohide(false),
+            cx,
+        );
+        let generation = self.session_generation;
+        let selected_source_session_id = source_session_id.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .agent()
+                .fork_session(MutationRequest::new(ForkAgentSessionRequest {
+                    source_session_id,
+                    through_sequence,
+                    expected_source_end_sequence: None,
+                }))
+                .await
+        });
+        self.fork_session_task = Some(cx.spawn_in(
+            window,
+            async move |entity: WeakEntity<Self>, cx| {
+                let outcome = runner.await;
+                let _ = entity.update_in(cx, |this, window, cx| {
+                    this.fork_session_pending = false;
+                    this.agent_action_pending = false;
+                    match outcome {
+                        Ok(Ok(session)) => {
+                            this.upsert_session_snapshot(session.clone());
+                            this.reconcile_sidebar_state();
+                            window.push_notification(
+                                Notification::info(locale::text(
+                                    "Fork created. Preparing its runtime...",
+                                    "分叉会话已创建，正在准备运行时...",
+                                    "分支會話已建立，正在準備執行環境...",
+                                ))
+                                .id::<ForkSessionNotification>()
+                                .autohide(false),
+                                cx,
+                            );
+                            if this.session_generation == generation {
+                                this.select_session_with_history(session.id.clone(), false, cx);
+                            }
+                        }
+                        Ok(Err(error)) => {
+                            this.agent_error = Some(format!("{}: {}", error.code, error.message));
+                        }
+                        Err(error) => {
+                            this.agent_error = Some(format!("Agent action failed: {error}"));
+                        }
+                    }
+                    let _ = selected_source_session_id;
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
     fn cancel_runtime_switch(&mut self, cx: &mut Context<Self>) {
-        let (Some(runtime), Some(session_id), Some(switch_id)) = (
-            self.runtime.clone(),
+        let (Some(backend), Some(session_id), Some(switch_id)) = (
+            self.backend.clone(),
             self.selected_session_id.clone(),
             self.runtime_selection
                 .as_ref()
@@ -19077,13 +19818,14 @@ impl VibexWorkbench {
         let generation = self.session_generation;
         let requested_session_id = session_id.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
+            backend
                 .agent()
-                .runtime_selection()
-                .cancel_switch(CancelAgentSessionRuntimeSwitchRequest {
-                    session_id,
-                    switch_id,
-                })
+                .cancel_runtime_switch(MutationRequest::new(
+                    CancelAgentSessionRuntimeSwitchRequest {
+                        session_id,
+                        switch_id,
+                    },
+                ))
                 .await
         });
         cx.spawn(
@@ -19484,7 +20226,7 @@ impl VibexWorkbench {
             cx.notify();
             return;
         }
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         let renamed_session_id = session_id.clone();
@@ -19493,10 +20235,12 @@ impl VibexWorkbench {
         self.agent_action_pending = true;
         let generation = self.session_generation;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
+            backend
                 .agent()
-                .manager()
-                .rename_session(RenameAgentSessionRequest { session_id, title })
+                .rename_session(MutationRequest::new(RenameAgentSessionRequest {
+                    session_id,
+                    title,
+                }))
                 .await
         });
         self.agent_action_task = Some(cx.spawn(
@@ -19603,7 +20347,7 @@ impl VibexWorkbench {
         {
             return;
         }
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         let session_id_set = BTreeSet::from([session_id.as_str().to_string()]);
@@ -19614,7 +20358,11 @@ impl VibexWorkbench {
         cx.notify();
         let generation = self.session_generation;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime.agent().manager().delete_session(&session_id).await
+            backend
+                .agent()
+                .delete_session(MutationRequest::new(session_id.clone()))
+                .await
+                .map_err(remote_error_into_vibex)
         });
         self.finish_optimistic_session_deletion(generation, session_id_set, runner, cx);
     }
@@ -19680,7 +20428,7 @@ impl VibexWorkbench {
             cx.notify();
             return;
         }
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             cx.notify();
             return;
         };
@@ -19697,10 +20445,13 @@ impl VibexWorkbench {
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             let mut first_error = None;
             for session_id in session_ids {
-                if let Err(error) = runtime.agent().manager().delete_session(&session_id).await
+                if let Err(error) = backend
+                    .agent()
+                    .delete_session(MutationRequest::new(session_id))
+                    .await
                     && first_error.is_none()
                 {
-                    first_error = Some(error);
+                    first_error = Some(remote_error_into_vibex(error));
                 }
             }
             if let Some(error) = first_error {
@@ -20256,6 +21007,15 @@ impl VibexWorkbench {
         }
         let Some(runtime) = self.runtime.clone() else {
             self.pending_project_deletion_ids.remove(&project_key);
+            self.agent_error = Some(
+                locale::text(
+                    "Project deletion is unavailable while connected to a remote runtime.",
+                    "连接远程运行时期间无法删除项目。",
+                    "連線遠端執行階段期間無法刪除專案。",
+                )
+                .to_string(),
+            );
+            cx.notify();
             return;
         };
         // The sidebar drops the project (and its sessions) in the same
@@ -44917,6 +45677,7 @@ fn mobile_pair_icon(hovered: bool, cx: &App) -> AnyElement {
 enum SettingsSection {
     General,
     Appearance,
+    RemoteRuntime,
     Workbench,
     Session,
     Terminal,
@@ -45267,6 +46028,24 @@ fn settings_search_candidates(strings: Strings) -> Vec<SettingsSearchCandidate> 
             strings.network_proxy_description,
             &[
                 "proxy", "network", "http", "https", "socks", "代理", "网络", "網路",
+            ],
+        ),
+        settings_search_candidate(
+            SettingsSection::RemoteRuntime,
+            locale::text("Remote Runtime", "远程运行时", "遠端執行階段"),
+            locale::text(
+                "Pair this desktop with a headless runtime and drive it over Remote v2.",
+                "将此桌面与无头运行时配对并通过 Remote v2 驱动它。",
+                "將此桌面與無頭執行階段配對並透過 Remote v2 驅動它。",
+            ),
+            &[
+                "remote",
+                "server",
+                "cloud",
+                "pairing",
+                "远程",
+                "服务器",
+                "雲端",
             ],
         ),
         settings_search_candidate(
@@ -45785,6 +46564,9 @@ fn settings_section_label(section: SettingsSection) -> &'static str {
     match section {
         SettingsSection::General => locale::text("General", "常规", "一般"),
         SettingsSection::Appearance => locale::text("Appearance", "外观", "外觀"),
+        SettingsSection::RemoteRuntime => {
+            locale::text("Remote Runtime", "远程运行时", "遠端執行階段")
+        }
         SettingsSection::Workbench => locale::text("Workbench", "工作台", "工作台"),
         SettingsSection::Session => locale::text("Session", "会话", "會話"),
         SettingsSection::Terminal => locale::text("Terminal", "终端", "終端機"),
@@ -46062,6 +46844,9 @@ struct FoundationSettings {
     reasoning_display_modes: Entity<SelectState<Vec<ReasoningDisplayChoice>>>,
     terminal_shells: Entity<SelectState<Vec<ShellChoice>>>,
     proxy_input: Entity<InputState>,
+    remote_server_url_input: Entity<InputState>,
+    remote_pairing_code_input: Entity<InputState>,
+    remote_connect_busy: bool,
     search: Entity<InputState>,
     search_selected_index: usize,
     search_scroll: ScrollHandle,
@@ -46139,6 +46924,20 @@ impl FoundationSettings {
             InputState::new(window, cx)
                 .default_value(ui_state.network_proxy.proxy_url.clone().unwrap_or_default())
                 .placeholder(strings.network_proxy_placeholder)
+        });
+        let remote_server_url_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(locale::text(
+                "https://vibex.example.com",
+                "https://vibex.example.com",
+                "https://vibex.example.com",
+            ))
+        });
+        let remote_pairing_code_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(locale::text(
+                "Pairing code (NNN-NNN-NNN)",
+                "配对码（NNN-NNN-NNN）",
+                "配對碼（NNN-NNN-NNN）",
+            ))
         });
         let search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(locale::text(
@@ -46264,6 +47063,9 @@ impl FoundationSettings {
                 reasoning_display_modes,
                 terminal_shells,
                 proxy_input,
+                remote_server_url_input,
+                remote_pairing_code_input,
+                remote_connect_busy: false,
                 search,
                 search_selected_index: 0,
                 search_scroll: ScrollHandle::new(),
@@ -47350,6 +48152,11 @@ impl FoundationSettings {
                 SettingsSection::Appearance,
                 strings.appearance,
                 IconName::Palette,
+            ),
+            (
+                SettingsSection::RemoteRuntime,
+                locale::text("Remote Runtime", "远程运行时", "遠端執行階段"),
+                IconName::Globe,
             ),
             (
                 SettingsSection::Workbench,
@@ -48904,6 +49711,161 @@ impl FoundationSettings {
         )
     }
 
+    fn render_remote_runtime_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
+        let (mode, server_url) = self
+            .workbench
+            .read_with(cx, |this, _| match &this.remote_client {
+                Some(client) => (
+                    RemoteClientSettingsMode::Connected,
+                    client.credential.record.server_url.clone(),
+                ),
+                None if matches!(this.runtime_status, RuntimeStatus::Starting) => {
+                    (RemoteClientSettingsMode::Connecting, String::new())
+                }
+                None => (RemoteClientSettingsMode::Local, String::new()),
+            })
+            .unwrap_or((RemoteClientSettingsMode::Local, String::new()));
+        let inputs_disabled = mode != RemoteClientSettingsMode::Local;
+        let mode_label = match mode {
+            RemoteClientSettingsMode::Local => locale::text(
+                "This desktop is the authority",
+                "本机为权威运行时",
+                "本機為權威執行階段",
+            ),
+            RemoteClientSettingsMode::Connecting => {
+                locale::text("Connecting...", "正在连接...", "正在連線...")
+            }
+            RemoteClientSettingsMode::Connected => locale::text(
+                "Connected to remote runtime",
+                "已连接远程运行时",
+                "已連線遠端執行階段",
+            ),
+        };
+        let mode_chip = settings_value_chip(mode_label, cx);
+        let server_summary = if server_url.is_empty() {
+            locale::text("—", "—", "—").to_string()
+        } else {
+            server_url
+        };
+        let server_url_input = self.remote_server_url_input.clone();
+        let pairing_code_input = self.remote_pairing_code_input.clone();
+        let connect_disabled = self.remote_connect_busy || inputs_disabled;
+        let connect_control = h_flex()
+            .items_center()
+            .gap_1()
+            .when(self.remote_connect_busy, |row| {
+                row.child(Spinner::new().xsmall())
+            })
+            .child(
+                div().w(px(240.0)).child(
+                    Input::new(&self.remote_server_url_input)
+                        .small()
+                        .h(px(28.0))
+                        .rounded(px(8.0)),
+                ),
+            )
+            .child(
+                div().w(px(150.0)).child(
+                    Input::new(&self.remote_pairing_code_input)
+                        .small()
+                        .h(px(28.0))
+                        .rounded(px(8.0)),
+                ),
+            )
+            .child(
+                Button::new("claim-server-pairing-code")
+                    .small()
+                    .outline()
+                    .label(locale::text("Pair", "配对", "配對"))
+                    .disabled(connect_disabled)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let server_url = server_url_input.read(cx).value().trim().to_string();
+                        let pairing_code = pairing_code_input.read(cx).value().trim().to_string();
+                        if server_url.is_empty() || pairing_code.is_empty() {
+                            this.operation_note = Some(
+                                locale::text(
+                                    "Enter the server address and the pairing code.",
+                                    "请输入服务器地址和配对码。",
+                                    "請輸入伺服器位址和配對碼。",
+                                )
+                                .to_string(),
+                            );
+                            cx.notify();
+                            return;
+                        }
+                        let _ = this.workbench.update(cx, |workbench, cx| {
+                            workbench.claim_remote_pairing_code(server_url, pairing_code, cx)
+                        });
+                    })),
+            );
+        let disconnect_control = Button::new("disconnect-remote-runtime")
+            .small()
+            .outline()
+            .danger()
+            .label(locale::text("Forget", "忘记", "忘記"))
+            .disabled(mode != RemoteClientSettingsMode::Connected)
+            .on_click(cx.listener(|this, _, _, cx| {
+                let _ = this
+                    .workbench
+                    .update(cx, |workbench, cx| workbench.disconnect_remote_client(cx));
+            }));
+        settings_page(
+            locale::text("Remote Runtime", "远程运行时", "遠端執行階段"),
+            locale::text(
+                "Pair with a headless vibex-server and use it as this workbench's authoritative runtime.",
+                "与无头 vibex-server 配对，并将其作为本工作台的权威运行时。",
+                "與無頭 vibex-server 配對，並將其作為本工作台的權威執行階段。",
+            ),
+            vec![
+                setting_row(
+                    locale::text("Mode", "模式", "模式"),
+                    locale::text(
+                        "The workbench drives either this machine's runtime or a paired remote one.",
+                        "工作台驱动本机运行时或已配对的远程运行时。",
+                        "工作台驅動本機執行階段或已配對的遠端執行階段。",
+                    ),
+                    mode_chip,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Server", "服务器", "伺服器"),
+                    locale::text(
+                        "The paired runtime this desktop is a client of.",
+                        "此桌面作为客户端连接的已配对运行时。",
+                        "此桌面作為客戶端連線的已配對執行階段。",
+                    ),
+                    settings_value_chip(server_summary, cx),
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Pair with pairing code", "配对码配对", "配對碼配對"),
+                    locale::text(
+                        "Enter the address and the one-time code the server printed at startup.",
+                        "输入服务器地址及其启动时打印的一次性配对码。",
+                        "輸入伺服器位址及其啟動時列印的一次性配對碼。",
+                    ),
+                    connect_control,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Forget this runtime", "忘记此运行时", "忘記此執行階段"),
+                    locale::text(
+                        "Clears the stored credential and returns the workbench to the local runtime.",
+                        "清除已存凭据并将工作台切回本机运行时。",
+                        "清除已存憑證並將工作台切回本機執行階段。",
+                    ),
+                    disconnect_control,
+                    stacked,
+                    cx,
+                ),
+            ],
+            cx,
+        )
+    }
+
     fn render_about_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
         let channel = release_channel()
             .map(|channel| format!("{channel:?}"))
@@ -49247,6 +50209,7 @@ impl Render for FoundationSettings {
             SettingsSection::Appearance => {
                 self.render_appearance_page(&appearance, stacked_rows, strings, cx)
             }
+            SettingsSection::RemoteRuntime => self.render_remote_runtime_page(stacked_rows, cx),
             SettingsSection::Session => {
                 self.render_session_page(&session, stacked_rows, strings, cx)
             }
@@ -56685,7 +57648,11 @@ mod tests {
             .find("let runner = gpui_tokio::Tokio::spawn")
             .expect("continuation should remain asynchronous");
         assert!(notify < dispatch);
-        assert!(continuation.contains("manager.get_session(&session_id).await.ok()"));
+        assert!(
+            continuation.contains(".open_session(session_id.clone())\n                .await")
+                || continuation.contains("open_session(session_id.clone())"),
+            "continuation should reconcile the session snapshot through the backend"
+        );
         assert!(continuation.contains("this.upsert_session_snapshot(session.clone());"));
         let clear = continuation
             .find("this.set_session_turn_pending(&continued_session_id, false);")
@@ -57656,18 +58623,25 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn start_submission_poll("))
             .map(|(body, _)| body)
             .expect("composer submission should remain inspectable");
-        let clear = submit
+        // Both the native dispatch and the remote twin must clear the
+        // captured draft before their own async dispatch begins.
+        let native_clear = submit
             .find("input.set_value(\"\", window, cx)")
             .expect("the submitted draft should be cleared");
-        let dispatch = submit
+        let native_dispatch = submit
             .find("let runner = gpui_tokio::Tokio::spawn")
             .expect("message dispatch should remain asynchronous");
+        assert!(native_clear < native_dispatch);
 
-        assert!(clear < dispatch);
-        assert_eq!(
-            submit.matches("input.set_value(\"\", window, cx)").count(),
-            1
-        );
+        let remote = source
+            .split_once("    fn take_composer_message_remote(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn dispatch_composer_message_remote("))
+            .map(|(body, _)| body)
+            .expect("remote composer take should remain inspectable");
+        let remote_clear = remote
+            .find("input.set_value(\"\", window, cx)")
+            .expect("the remote draft should be cleared");
+        assert!(remote_clear > 0);
     }
 
     #[test]
