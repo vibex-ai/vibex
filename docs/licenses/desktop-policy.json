@@ -125,61 +125,40 @@
     "MIT/Apache-2.0": "MIT OR Apache-2.0",
     "Unlicense/MIT": "Unlicense OR MIT"
   },
-  "packageLicenseOverrides": [
-    {
-      "name": "gpui_shared_string",
-      "version": "0.1.0",
-      "sourcePath": "vendor/zed/crates/gpui_shared_string",
-      "sourceRepository": "https://github.com/vibex-ai/zed.git",
-      "licenseExpression": "Apache-2.0",
-      "evidencePath": "LICENSE-APACHE",
-      "upstreamPath": "vendor/zed/crates/gpui_shared_string/LICENSE-APACHE@c9e8e611dbc279afa0914d28c4d37ad07f38c03b",
-      "evidenceSha256": "752daf2fb234ca4a1fa372c073fe127f44b7b90fd2529ae44273a64f9d53da7a"
-    },
-    {
-      "name": "gpui_util",
-      "version": "0.1.0",
-      "sourcePath": "vendor/zed/crates/gpui_util",
-      "sourceRepository": "https://github.com/vibex-ai/zed.git",
-      "licenseExpression": "Apache-2.0",
-      "evidencePath": "LICENSE-APACHE",
-      "upstreamPath": "vendor/zed/crates/gpui_util/LICENSE-APACHE@c9e8e611dbc279afa0914d28c4d37ad07f38c03b",
-      "evidenceSha256": "752daf2fb234ca4a1fa372c073fe127f44b7b90fd2529ae44273a64f9d53da7a"
-    }
-  ],
+  "packageLicenseOverrides": [],
   "assetInputs": [
     {
-      "id": "gpui-component-lucide-icons",
-      "name": "gpui-component bundled Lucide icon set",
+      "id": "gpui-kit-lucide-icons",
+      "name": "gpui-kit bundled Lucide icon set",
       "version": "Cargo.lock",
-      "ownerPackage": "gpui-component-assets",
+      "ownerPackage": "gpui-kit-assets",
       "packageRelativeRoot": "assets/icons",
       "extensions": [
         ".svg"
       ],
-      "expectedFileCount": 99,
-      "treeSha256": "6da0d2d4b0dd99f10536b9460c7f21691899183d50190655e2d21f2fac2bfdb8",
+      "expectedFileCount": 1830,
+      "treeSha256": "efafb5ab9a148d1285fd44755029b68d549a2d449921e70d57ca166fee94b58b",
       "licenseExpression": "Apache-2.0 AND ISC",
-      "source": "https://github.com/longbridge/gpui-component/tree/main/crates/assets/assets/icons"
+      "source": "https://github.com/longbridge/gpui-kit"
     },
     {
       "id": "vibex-desktop-reviewed-icons",
       "name": "Vibex Desktop GPUI reviewed icon bundle",
-      "version": "0.1.0-rc.1",
+      "version": "0.1.0-rc.2",
       "ownerPackage": "vibex-desktop",
       "root": "apps/desktop/assets/icons",
       "extensions": [
         ".svg"
       ],
-      "expectedFileCount": 183,
-      "treeSha256": "3467f8919e5f677fc9c3b1232bf9f18574ce792e74fe604ea86532d80951f001",
+      "expectedFileCount": 188,
+      "treeSha256": "f23fe8f66fd057971844223cd8cf26ee01a84064cd79304d79a84e1b160d563f",
       "licenseExpression": "AGPL-3.0-or-later AND ISC AND MIT AND CC0-1.0 AND LicenseRef-Third-Party-Brand-Marks",
       "source": "https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/icons",
-      "licenseEvidence": "73 Lucide SVGs (ISC); 15 SVG Logos and 3 Simple Icons SVGs (CC0-1.0); 1 Material Icon Theme and 1 VSCode Icons SVG (MIT); 1 Vibex mark (AGPL-3.0-or-later); 30 Agent brand SVGs from the Agent Client Protocol registry and official vendor sources; 59 OpenRouter model/provider brand SVGs vectorized from the OpenRouter model catalog and linked provider marks (third-party brand marks). Brand names and marks remain the property of their respective owners.",
+      "licenseEvidence": "75 Lucide SVGs (ISC); 15 SVG Logos and 3 Simple Icons SVGs (CC0-1.0); 1 Material Icon Theme, 1 VSCode Icons SVG, and 1 Ant Design icon (MIT); 1 Vibex mark and 2 drawn interface icons (AGPL-3.0-or-later); 30 Agent brand SVGs from the Agent Client Protocol registry and official vendor sources; 59 OpenRouter model/provider brand SVGs vectorized from the OpenRouter model catalog and linked provider marks (third-party brand marks). Brand names and marks remain the property of their respective owners.",
       "sourceComponents": [
         {
           "name": "Lucide",
-          "fileCount": 73,
+          "fileCount": 75,
           "licenseExpression": "ISC",
           "source": "https://github.com/lucide-icons/lucide"
         },
@@ -208,8 +187,8 @@
           "source": "https://github.com/vscode-icons/vscode-icons"
         },
         {
-          "name": "Vibex mark",
-          "fileCount": 1,
+          "name": "Vibex marks and drawn interface icons",
+          "fileCount": 3,
           "licenseExpression": "AGPL-3.0-or-later",
           "source": "https://github.com/vibex-ai/vibex"
         },
@@ -224,13 +203,19 @@
           "fileCount": 59,
           "licenseExpression": "LicenseRef-Third-Party-Brand-Marks",
           "source": "https://openrouter.ai/models"
+        },
+        {
+          "name": "Ant Design Icons",
+          "fileCount": 1,
+          "licenseExpression": "MIT",
+          "source": "https://github.com/ant-design/ant-design-icons"
         }
       ]
     },
     {
       "id": "vibex-desktop-application-icons",
       "name": "Vibex desktop application and tray icons",
-      "version": "0.1.0-rc.1",
+      "version": "0.1.0-rc.2",
       "ownerPackage": "vibex-desktop",
       "root": "apps/desktop/assets/app-icons",
       "extensions": [
@@ -245,7 +230,7 @@
     {
       "id": "vibex-mobile-brand-marks",
       "name": "Vibex native mobile brand mark",
-      "version": "0.1.0-rc.1",
+      "version": "0.1.0-rc.2",
       "ownerPackage": "vibex-ui",
       "root": "apps/mobile/assets/brand",
       "extensions": [
@@ -259,7 +244,7 @@
     {
       "id": "vibex-mobile-application-icons",
       "name": "Vibex native mobile application icons",
-      "version": "0.1.0-rc.1",
+      "version": "0.1.0-rc.2",
       "ownerPackage": "vibex-ui",
       "root": "apps/mobile/ios/Vibex/Assets.xcassets/AppIcon.appiconset",
       "extensions": [
@@ -274,14 +259,14 @@
     {
       "id": "vibex-mobile-native-icons",
       "name": "Vibex native mobile Lucide controls",
-      "version": "0.1.0-rc.1",
+      "version": "0.1.0-rc.2",
       "ownerPackage": "vibex-ui",
       "root": "apps/mobile/assets/icons",
       "extensions": [
         ".svg"
       ],
-      "expectedFileCount": 26,
-      "treeSha256": "6983b0fd270788511904836df5cfc2e082ae44613accc767c4dc82e2464d68e7",
+      "expectedFileCount": 34,
+      "treeSha256": "4ef261305bc4ba1ce560b10053b1ffe6fdb9637af3523117afaec8168832b14d",
       "licenseExpression": "ISC",
       "source": "https://github.com/lucide-icons/lucide",
       "licenseEvidence": "The native mobile toolbar controls are derived from Lucide SVG paths and redistributed under the Lucide ISC license."

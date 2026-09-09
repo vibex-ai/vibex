@@ -149,7 +149,7 @@ function parseMetrics(output) {
 function defaultUiState(theme, locale) {
   return {
     schemaVersion: 1,
-    sourceAppVersion: '0.1.0-rc.1',
+    sourceAppVersion: '0.1.0-rc.2',
     appearance: {
       theme,
       locale,
@@ -178,7 +178,10 @@ function defaultUiState(theme, locale) {
     preview: { focusedPaneId: null, pinnedTabIds: [], splitSizes: [1] },
     terminal: { tabOrder: [], selectedTerminalId: null },
     rightRail: { activityOrder: [], selectedActivityId: null },
-    migration: { importedFromTauri: false, sourceSchema: null }
+    migration: { importedFromTauri: false, sourceSchema: null },
+    // The tray feature defaults to keeping the app alive after the window
+    // closes; the graceful-close scenario needs an explicit opt-out.
+    desktopBehavior: { closeToTray: false }
   };
 }
 

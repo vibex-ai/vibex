@@ -22,8 +22,9 @@ use gpui_component::{
     date_picker::{DatePicker, DatePickerEvent, DatePickerState},
     dialog::{DialogAction, DialogClose, DialogFooter},
     h_flex,
-    input::{Editor, EditorState, Input, InputEvent, InputState, Position, Textarea,
-           TextareaState},
+    input::{
+        Editor, EditorState, Input, InputEvent, InputState, Position, Textarea, TextareaState,
+    },
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem},
     notification::Notification,
     resizable::{h_resizable, resizable_panel, v_resizable},

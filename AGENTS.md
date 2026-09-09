@@ -195,7 +195,7 @@ function tgit --wraps git; git --git-dir=(git rev-parse --show-toplevel)/.trelli
 
 ## 2. Project state
 
-Vibex is a Rust-first, local-first AI coding workbench, `0.1.0-rc.1`,
+Vibex is a Rust-first, local-first AI coding workbench, `0.1.0-rc.2`,
 AGPL-3.0-or-later. Two product clients share one GPUI design system:
 
 | Surface | Source | Stack |

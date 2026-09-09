@@ -1,27 +1,27 @@
 {
   "schemaVersion": "native-content-switch-evidence.v1",
   "status": "passed",
-  "capturedAt": "2026-08-13T09:06:43.645Z",
+  "capturedAt": "2026-09-09T14:30:28.343Z",
   "sourceInputs": [
     {
       "path": "Cargo.lock",
-      "bytes": 282904,
-      "sha256": "6a0deb409f2e43c799b072c9f39c9e7305951565ad9e5fcdabf7a55d028437f0"
+      "bytes": 285993,
+      "sha256": "82cdebf333ee8ac7f3b5199727053215993e9e0a2cd3279185f3482641579b39"
     },
     {
       "path": "Cargo.toml",
-      "bytes": 3309,
-      "sha256": "6e7ca15eea7119607e8c9ebaa683194e5fc0e01969fdbad8b9cf331d059df8b4"
+      "bytes": 4171,
+      "sha256": "19a1a8b09de20e5e061992fec68fb52eff19ad2961c97bb1990829c4cb5acedd"
     },
     {
       "path": "apps/desktop/Cargo.toml",
-      "bytes": 2000,
-      "sha256": "295f893f08a20772d29dc771b3d8a3d788e7acd34856214a732e2af8c2ea63a8"
+      "bytes": 2136,
+      "sha256": "3a551a683c8438971394bb46f343a0bc93ec3d54ae1c6d7597333be860df73ea"
     },
     {
       "path": "apps/desktop/src/main.rs",
-      "bytes": 15716,
-      "sha256": "0c46c5e9458b08ea6fd036fa0f9561512f51c3320c2df8ea3095f0cf54fb70c3"
+      "bytes": 16364,
+      "sha256": "207b55872da29b4ec595dedec63cbb45b9f8bec2332ea4d8b3c81cdc13072c3c"
     },
     {
       "path": "apps/desktop/src/native_content.rs",
@@ -31,7 +31,7 @@
     {
       "path": "crates/content/Cargo.toml",
       "bytes": 429,
-      "sha256": "5d246edd732923e093c6903f1da7d3c1adf02d4c6af5cf5208b91db2fb111081"
+      "sha256": "9852dc479de3672f1f86871372d18ca5c48fa7f7b60e79b2538e07dbd0a86a89"
     },
     {
       "path": "crates/content/src/lifecycle.rs",

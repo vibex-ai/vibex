@@ -1,97 +1,97 @@
 {
   "schemaVersion": "code-workbench-evidence.v1",
   "status": "model_passed_visual_pending",
-  "capturedAt": "2026-08-02T12:09:44.851Z",
+  "capturedAt": "2026-09-09T14:37:27.789Z",
   "sourceInputs": [
     {
       "path": "Cargo.lock",
-      "bytes": 294099,
-      "sha256": "acf88e88125ac99690ea30232df25ba13d221fd38da509cd42ad0742da12adbe"
+      "bytes": 285993,
+      "sha256": "82cdebf333ee8ac7f3b5199727053215993e9e0a2cd3279185f3482641579b39"
     },
     {
       "path": "Cargo.toml",
-      "bytes": 3229,
-      "sha256": "623a547e961cdc4244a7cce1fe6fee2f31cc0461fa95c62b0753cb9116fb8465"
+      "bytes": 4171,
+      "sha256": "19a1a8b09de20e5e061992fec68fb52eff19ad2961c97bb1990829c4cb5acedd"
     },
     {
       "path": "package.json",
-      "bytes": 8894,
-      "sha256": "329e7f442662014caf34eca3cb0d219587276b49339078595f544459a4b20058"
+      "bytes": 8279,
+      "sha256": "2908d1766001dea0c1a62359f42db91cc69d66165f507ed5b80923e63c8c48dc"
     },
     {
       "path": "apps/desktop/Cargo.toml",
-      "bytes": 2028,
-      "sha256": "0f8f1125905c7c1667298d7a0edb7c599667f554601e89721ec351987b0b7281"
+      "bytes": 2136,
+      "sha256": "3a551a683c8438971394bb46f343a0bc93ec3d54ae1c6d7597333be860df73ea"
     },
     {
       "path": "apps/desktop/src/actions.rs",
-      "bytes": 828,
-      "sha256": "d43713f0a4cc09b9bb70ccd9457b034457fa9f07c9de7e27646bed8ec55acb8b"
+      "bytes": 1348,
+      "sha256": "4abff7e6e58cc3c35541609a8f7a69f1f1c0552f288a744a154930a061db6ba7"
     },
     {
       "path": "apps/desktop/src/app.rs",
-      "bytes": 1307699,
-      "sha256": "4f2f67c84a6f884e52ce102a683a114a245ce8f83c0a05e72d55a91f215a7bee"
+      "bytes": 2640794,
+      "sha256": "69a65bdaab2bd9d19ed50e6e2af4ed7c2523803c3874d861511e82bf4f9b22c8"
     },
     {
       "path": "apps/desktop/src/code_workbench.rs",
-      "bytes": 507977,
-      "sha256": "3ebd71f32f45ea7cbfa40c2f768086766434783ae5914ae3f83162ca800dda2e"
+      "bytes": 668925,
+      "sha256": "eae1442063db3b7b741baf0a1645d36c6254a8279433a202540707aeedadd25b"
     },
     {
       "path": "apps/desktop/src/lib.rs",
-      "bytes": 4929,
-      "sha256": "4e52a9c3dba22bcb565bcc8f438097db01ab4aa1a6a230a3ec8103e72ce6cbc6"
+      "bytes": 5035,
+      "sha256": "2fef533308c92489c4a166e01b7e5da10a35e627161442fd7611a4c8596e177b"
     },
     {
       "path": "apps/desktop/src/main.rs",
-      "bytes": 16336,
-      "sha256": "7115185a420e3c92e08e86096a8925770fb332fa5ef0476c4d313a657f29f2e4"
+      "bytes": 16364,
+      "sha256": "207b55872da29b4ec595dedec63cbb45b9f8bec2332ea4d8b3c81cdc13072c3c"
     },
     {
       "path": "apps/desktop/src/platform/mod.rs",
-      "bytes": 18223,
-      "sha256": "e5d913e9260c6f865ada3c001f59798d0694f39cdfe67c6c0167a9b859f9526a"
+      "bytes": 37258,
+      "sha256": "74725746dbdb4611d57a860a9583066e95373b6d20c44bf948528659ff4a6d1a"
     },
     {
       "path": "apps/desktop/src/terminal_surface.rs",
-      "bytes": 73928,
-      "sha256": "8c80ae7b81564402d39456e94297626f80943cc507ceefff8ea0eeeb5646a70d"
+      "bytes": 82267,
+      "sha256": "425da57432a00b0f38c21077ee27b117db2559770fc3e4373a918b79a6d7d702"
     },
     {
       "path": "apps/desktop/src/testing.rs",
-      "bytes": 14085,
-      "sha256": "a7ce07ac73a98c0dce4be6e3f08c5684ab64f0908c4292c3d01d31e5c003bd8f"
+      "bytes": 12710,
+      "sha256": "0b070cdfab74445f9589999dba610ed793a5a3d38efc7d55fbd8ee4faf57320d"
     },
     {
       "path": "apps/desktop/src/theme.rs",
-      "bytes": 6381,
-      "sha256": "8df6a4fb142dbb3eb17a18c185ceb1076116a240e5fb18a3e03f5aa577bbc299"
+      "bytes": 15062,
+      "sha256": "c73febaf13a6843eda72e8104350514576ae2544b23c49d582a225d39a45245a"
     },
     {
       "path": "crates/vibex-ui/Cargo.toml",
-      "bytes": 556,
-      "sha256": "5e9b4bb8f36670e28042397639d82be29259d7b2cc80827b90ca41f45ce091c4"
+      "bytes": 502,
+      "sha256": "1fa067508ef9e83bb0e87414954af4880ff9fae127e7b2970d8600ebf452b2bb"
     },
     {
       "path": "crates/vibex-ui/src/generated_tokens.rs",
-      "bytes": 26286,
-      "sha256": "42fc7c81f3a2e9c16bdd9799f4ff86a85cc3a393fa159802a51ac2b550c831f5"
+      "bytes": 26285,
+      "sha256": "26875ccdc833c211344b49749aa6fa850d7d5ebe321770e3bb44456ce36a1d47"
     },
     {
       "path": "crates/vibex-ui/src/lib.rs",
-      "bytes": 2157,
-      "sha256": "6670714ebc28b5384db2653e37265c488e820f53bdecff92f196d180ce7c4795"
+      "bytes": 2065,
+      "sha256": "78de34ff06744360cde220e988f8433a4cf641104b7b4d697e865f3e24315afb"
     },
     {
       "path": "crates/vibex-ui/theme/tokens.json",
-      "bytes": 12652,
-      "sha256": "14ec0caacf494a73e270d0b3dfc83126769bc85a7c9d41fd9b49b93b176d767f"
+      "bytes": 12421,
+      "sha256": "df02e27063f652eeaeab570bb7560112e13fc5604820ef77225d4064e7079ddd"
     },
     {
       "path": "scripts/generate-tokens.mjs",
-      "bytes": 16529,
-      "sha256": "201788e51bacfaf3b46373d4adc92625162d9dca683de0608250125361d9c6f7"
+      "bytes": 16553,
+      "sha256": "db05d2689533d92e402c74398b3fdf39fadebf54d475df8d6c5917a86c9237ef"
     },
     {
       "path": "docs/parity/fixtures/desktop-behavioral-v1.json",
@@ -100,28 +100,28 @@
     },
     {
       "path": "crates/content/src/lifecycle.rs",
-      "bytes": 19869,
-      "sha256": "f22146f3ba6f308578baffc6f9d97d81f01e6b86b06e94d2ef577ceffd03f2b4"
+      "bytes": 18764,
+      "sha256": "1837e1beeb7d2e64d69b1e60c80b3af4fd0c6e937627cec59e1eac67ef592489"
     },
     {
       "path": "crates/core/src/file.rs",
-      "bytes": 3518,
-      "sha256": "faec2f72de58c3de7d9f046ce0cae0dbf91dccfc87e31acbb3960118412d1964"
+      "bytes": 5003,
+      "sha256": "d7467a5dfa8222675d13b13bfab8ad3714ac41b030143c94377187ed5ce95e6a"
     },
     {
       "path": "crates/core/src/lib.rs",
-      "bytes": 23699,
-      "sha256": "f705e2b3f692c1128fd3470b11b037b25f19ac8c0497846246f30dec396d24a6"
+      "bytes": 28938,
+      "sha256": "98b5d97fab8e1c544f2bb9d14151e33793c1a18f42c1c2d897451c66b8b74499"
     },
     {
       "path": "crates/desktop-model/Cargo.toml",
-      "bytes": 578,
-      "sha256": "e3c4551eabebc977efc9a96d4bad259534b6e30fd162f98273c70c5429808c2b"
+      "bytes": 557,
+      "sha256": "b9ff2f8509f4dcd0dd60b4853534725b85e581ec12af582611b7216cd2e5239b"
     },
     {
       "path": "crates/desktop-model/src/agent_workbench.rs",
-      "bytes": 72176,
-      "sha256": "63acdd992e77a19318f501f7c3cf554e21379a2b70f07adcb9ca5847d6cb7868"
+      "bytes": 127729,
+      "sha256": "40c62cd97b95fbe457f219cf2e639230850ed787420499f6595a300d216e3b29"
     },
     {
       "path": "crates/desktop-model/src/bin/vibex-code-workbench-probe.rs",
@@ -140,38 +140,38 @@
     },
     {
       "path": "crates/desktop-model/src/editor.rs",
-      "bytes": 20369,
-      "sha256": "91ed0d926c5dc23aed9d0dcf6436ed00448674a2f532537bb35edd3cc15c09ae"
+      "bytes": 21782,
+      "sha256": "f5bcd861a3ba5b98b9c9a481b4449d516f094f507b235ee0a8c2d23e8040dad5"
     },
     {
       "path": "crates/desktop-model/src/file_tree.rs",
-      "bytes": 59660,
-      "sha256": "8876265f8367a5f7b360bb5129142c294ea29cd51a645449e22da1a091e15ec0"
+      "bytes": 60209,
+      "sha256": "57a3b705abec782cb58d6b340d959a1507890ce471a6dbc7afdb57839490248f"
     },
     {
       "path": "crates/desktop-model/src/git_workbench.rs",
-      "bytes": 69036,
-      "sha256": "874474ac4f9c4e5a402bdf3d549ef6ee7559c31e11f855580d40fbaaf1b059f9"
+      "bytes": 71321,
+      "sha256": "5fc75003cba0ade37cc4a419fd56a29695eca7026cf960b82214799487005779"
     },
     {
       "path": "crates/desktop-model/src/lib.rs",
-      "bytes": 867,
-      "sha256": "0caa3cd724c6256ea2be2e7ad898163403e15052b511fe50c59ccfe838950f4e"
+      "bytes": 1016,
+      "sha256": "e62a3cde195f14f43c740c94ac2b0ca31a02be2796460b26b8bb55d6e5d32f94"
     },
     {
       "path": "crates/desktop-model/src/preview.rs",
-      "bytes": 39760,
-      "sha256": "cdef4f11f74f5fd0fa596a7db9f16bef292be97c92b7ae37c658ee316c0e9fa7"
+      "bytes": 39443,
+      "sha256": "da2f368cf25fdbd2c41cbc66c8cedf20e0e44f7abb19a5fa70a2c51761f889d4"
     },
     {
       "path": "crates/desktop-model/src/ui_state.rs",
-      "bytes": 47785,
-      "sha256": "925c68379898abc2cb91836906e796c5189cfa088fb1c45eba52d65385106a1f"
+      "bytes": 79840,
+      "sha256": "aa21ed34ec6d8d4c16cb8f22b1cc26219d440d8e817fcb07c6124f32b9d26fc1"
     },
     {
       "path": "crates/vibex-markdown/Cargo.toml",
       "bytes": 1596,
-      "sha256": "f928fb7d779723e0d1a52e7d8980c83faefc8527fde72b070e44f4f36be34de0"
+      "sha256": "ad5a4d339c08f24728d3792edfb781e955b3f6675a75ea2d0826c5197d9d426d"
     },
     {
       "path": "crates/vibex-markdown/fixtures/advanced.md",
@@ -195,8 +195,8 @@
     },
     {
       "path": "crates/vibex-markdown/src/gpui_view.rs",
-      "bytes": 152881,
-      "sha256": "53e0bf81e476d2ffe8aca75313c39f8b2d96867a2cfed67484000c9dee1689f1"
+      "bytes": 184770,
+      "sha256": "41ddc1067f46bfcfc693b1a76359ee87dc7f94ada74c4d84ed2768b14de9719f"
     },
     {
       "path": "crates/vibex-markdown/src/html.rs",
@@ -205,8 +205,8 @@
     },
     {
       "path": "crates/vibex-markdown/src/lib.rs",
-      "bytes": 442,
-      "sha256": "668df5768bfcb1e500a9135cd2782a86e960676980511c3e58bc55c050259bde"
+      "bytes": 531,
+      "sha256": "ffffb6c53fa8c118f7def1782dc7e3543e4747b78735f247e779bfdd5b035602"
     },
     {
       "path": "crates/vibex-markdown/src/limits.rs",
@@ -225,8 +225,8 @@
     },
     {
       "path": "crates/vibex-markdown/src/resource.rs",
-      "bytes": 8340,
-      "sha256": "0e495afe2596875557c3403169f1d60eded4d3aad27f718a92df51f1057b8f0b"
+      "bytes": 9681,
+      "sha256": "bc28a184cc3b317b86fd6e71435d199c5d35fdbe62450d34dfc38ba93182fb34"
     },
     {
       "path": "crates/vibex-markdown/src/svg.rs",
@@ -235,8 +235,8 @@
     },
     {
       "path": "crates/desktop-runtime/src/lib.rs",
-      "bytes": 66702,
-      "sha256": "64b81597f28382b74ed717016e14ce30cce68ba126b0c0ea082e34285e314d42"
+      "bytes": 122821,
+      "sha256": "97adfd013c8ce5574ea128b3d9cd60d79dfb9c411ab3c6ebe96356b196c9d2a7"
     },
     {
       "path": "crates/desktop-runtime/src/workbench.rs",
@@ -246,17 +246,17 @@
     {
       "path": "crates/vibex-backend/Cargo.toml",
       "bytes": 566,
-      "sha256": "1fcb0f13bf7c39f277ab4636c2fac9687add7d81b4226fccc9f5e7c095321e1e"
+      "sha256": "24eb5510c431102fe260c7a0e215644fc5499fb679fb53550fc395adf770dd2b"
     },
     {
       "path": "crates/vibex-backend/src/agent.rs",
-      "bytes": 4665,
-      "sha256": "df05f8f63ba9d6258a9607d4b3fbf48c29ef12c2651a593d78ee1592b4b15a41"
+      "bytes": 9866,
+      "sha256": "f3960811cf639fdfbd52623c58aacae32cc2f01f8abc8fa2563fb36d66102081"
     },
     {
       "path": "crates/vibex-backend/src/capability.rs",
-      "bytes": 6259,
-      "sha256": "4f875d1abeed2dc4c189a6f3b00713d617a12b97e47b09d8ea9ec3fd9c432d59"
+      "bytes": 7065,
+      "sha256": "de708ff451d3f79b740dfcb6e78cf94e46ad25a9be90fa333c06114650a0d829"
     },
     {
       "path": "crates/vibex-backend/src/device.rs",
@@ -265,8 +265,8 @@
     },
     {
       "path": "crates/vibex-backend/src/error.rs",
-      "bytes": 4083,
-      "sha256": "203c2ee80035f7d79474befe6233614cbf4f4de899445ad8d71b68bb365e97e8"
+      "bytes": 4240,
+      "sha256": "31a6e9e2b2ce3474d05e324f38f517a63d5320eb0ccedc2bd91531ea92f2efb9"
     },
     {
       "path": "crates/vibex-backend/src/facade.rs",
@@ -290,8 +290,8 @@
     },
     {
       "path": "crates/vibex-backend/src/management.rs",
-      "bytes": 1867,
-      "sha256": "77769be28cb5a3057a7d48f23b1e096eede909e74022775dd7e35c48910d0c06"
+      "bytes": 5553,
+      "sha256": "39b453ebe40faef63da42c5e6de72e743e870490c5bd0d6243bdd023b14a93c6"
     },
     {
       "path": "crates/vibex-backend/src/mutation.rs",
@@ -300,8 +300,8 @@
     },
     {
       "path": "crates/vibex-backend/src/native.rs",
-      "bytes": 43809,
-      "sha256": "c3684ff9d0f4e9b4873b324c3706f097bd2a26d276bc908b50383c99fdf1ff1a"
+      "bytes": 60568,
+      "sha256": "3221df1adea85e32b8fc9b2084f131b834a8023f47409242e536002d663f1b6a"
     },
     {
       "path": "crates/vibex-backend/src/terminal.rs",
@@ -310,13 +310,13 @@
     },
     {
       "path": "crates/vibex-backend/src/workspace.rs",
-      "bytes": 843,
-      "sha256": "6cfc8a21485069a0b2172eee35ebc1fd524cee79a5cf2bf5974ba01c097e4d9e"
+      "bytes": 1204,
+      "sha256": "e089c218f6b3e118b1db928f80246df4d8530f7cbad018676e2595ef24802de1"
     },
     {
       "path": "crates/vibex-terminal-ui/Cargo.toml",
       "bytes": 335,
-      "sha256": "54815413dda741b882b25bb32c607b5544ea08ea26af6d6f1043f797534e7f0f"
+      "sha256": "ee981d9e9b05322c8f6a91e805ee359d318448e0a886f564e42fe5305b40a1d1"
     },
     {
       "path": "crates/vibex-terminal-ui/src/emulator.rs",
@@ -335,33 +335,33 @@
     },
     {
       "path": "crates/vibex-ui/src/shell.rs",
-      "bytes": 15146,
-      "sha256": "234c92fbc1d958755e4b9c3fe087769b92d285adcfea35d37724691124288f81"
+      "bytes": 16652,
+      "sha256": "fb417343bec6bc43ca179950bcea7485922483b52911c6ec05cb4e0c7e5da408"
     },
     {
       "path": "crates/fs/Cargo.toml",
-      "bytes": 508,
-      "sha256": "c2d92f4b40914ff911ea29a734fe52d753d256274c754b91518ba72c7c95f9d0"
+      "bytes": 520,
+      "sha256": "b7b2889315b9cb4296b3c32f81f45fb78abd5bece4fe8cbe6fcd748af460e983"
     },
     {
       "path": "crates/fs/src/lib.rs",
-      "bytes": 68505,
-      "sha256": "d5454f0ac7a2bd4963500b31f12b446092a445a4802d02ce1efe693efb9d96b7"
+      "bytes": 82727,
+      "sha256": "d17ae5273934dc06ec6545317d1e5e759c8def5836fae67aed4e3dfe60cbe535"
     },
     {
       "path": "crates/git/Cargo.toml",
       "bytes": 374,
-      "sha256": "74f50f36dbfd914beb6d643a601cb4cceb25cce38b05403d4abbfab5f89f2260"
+      "sha256": "64df7e20902ffb4809ca76c26953e2f5bb073bc2d30b1e57fa58a62a0ecff9cd"
     },
     {
       "path": "crates/git/src/lib.rs",
-      "bytes": 104197,
-      "sha256": "70a85b3a7d0a05f0664f778214770101aaebc397ecb16d8591398260486199cd"
+      "bytes": 144627,
+      "sha256": "471540cad78ae2bebfd9ecc1a29d9bc699f1049a4814f03a3dc561be877337a7"
     },
     {
       "path": "crates/remote/src/lib.rs",
-      "bytes": 171783,
-      "sha256": "afad736ac3280a39c9b6bb55c73b0dcb8b932141b1cd92d0a8d53ec3cf35c902"
+      "bytes": 274126,
+      "sha256": "5adcaa7dcbee20ce3169e80ccd677bffb1dd18b441a6f771e90c063ec4e1889d"
     },
     {
       "path": "docs/parity/fixtures/code-workbench-lgtm-dual-run.rs",
@@ -370,13 +370,13 @@
     },
     {
       "path": "docs/parity/code-workbench.md",
-      "bytes": 1893,
-      "sha256": "560a90ed62e41af72ba5db3aa3de8f302f24277c1431bbfa6df63e56c322ccee"
+      "bytes": 1880,
+      "sha256": "47b92b146139bd9bd75807c045e656d094eb2f33e44016c3e1d246378ede78c8"
     },
     {
       "path": "scripts/capture-code-workbench.mjs",
-      "bytes": 38212,
-      "sha256": "cfe87f9d55a8ee37f7e681213666f8cb0d1621fdcb88fb2486ba9e0c04d50901"
+      "bytes": 38210,
+      "sha256": "4e3611380f9432c1557cea9f0111904c7421ea7e9e6835a7660f4143dc832f18"
     }
   ],
   "probe": {
@@ -392,9 +392,9 @@
       "searchVisibleRows": 3,
       "searchLeafFound": true,
       "staleLoadRejected": true,
-      "applyMicros": 108348,
-      "expandMicros": 142350,
-      "searchMicros": 34892,
+      "applyMicros": 124765,
+      "expandMicros": 165676,
+      "searchMicros": 37118,
       "operationLimitMicros": 15000000
     },
     "diff": {
@@ -406,9 +406,9 @@
       "deepFirstRowId": "diff:0:19500",
       "cachedWordRows": 2000,
       "cacheLimitRows": 2000,
-      "constructMicros": 2315,
-      "initialWindowMicros": 1092,
-      "deepWindowMicros": 125,
+      "constructMicros": 2265,
+      "initialWindowMicros": 408,
+      "deepWindowMicros": 139,
       "operationLimitMicros": 5000000
     },
     "caches": {
@@ -797,8 +797,8 @@
       "performance": {
         "inputLines": 20004,
         "iterations": 9,
-        "lgtmMedianMicros": 558,
-        "vibexMedianMicros": 597
+        "lgtmMedianMicros": 566,
+        "vibexMedianMicros": 670
       },
       "schemaVersion": "vibex-lgtm-dual-run.v1"
     }

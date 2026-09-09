@@ -11,7 +11,7 @@ android {
         minSdk 28
         targetSdk 35
         versionCode 1
-        versionName project.findProperty('vibexVersion') ?: '0.1.0-rc.1'
+        versionName project.findProperty('vibexVersion') ?: '0.1.0-rc.2'
 
         ndk {
             abiFilters 'arm64-v8a', 'x86_64'

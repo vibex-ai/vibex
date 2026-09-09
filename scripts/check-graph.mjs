@@ -3,11 +3,11 @@ import { dirname, join, relative, resolve, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
-  GPUI_COMPONENT_REPOSITORY,
   GPUI_DEPENDENCY_SOURCE_POLICY,
   UPSTREAM_ZED_REPOSITORY,
   ZED_REPOSITORY,
   ZED_SUBMODULE_PATH,
+  gpuiComponentIdentity,
   resolveZedSubmoduleRevision
 } from "./source-identities.mjs";
 
@@ -175,15 +175,13 @@ function reachablePackageNames(graph, rootPackageId) {
   return new Set([...visited].map((id) => packageById.get(id)?.name).filter(Boolean));
 }
 
-function assertUnqualifiedGitDependency(manifest, dependency, repository) {
+function assertRegistryDependency(manifest, dependency, requirement) {
   const escaped = dependency.replaceAll("-", "\\-");
-  const declaration = manifest.match(new RegExp(`^${escaped} = \\{[^\\n]+\\}$`, "m"))?.[0];
-  if (!declaration) fail(`missing workspace dependency ${dependency}`);
-  if (!declaration.includes(`git = "${repository}"`)) {
-    fail(`${dependency} must use upstream Git ${repository}: ${declaration}`);
-  }
-  if (/\b(?:rev|tag|branch)\s*=/.test(declaration)) {
-    fail(`${dependency} must not pin rev, tag, or branch: ${declaration}`);
+  const declaration = manifest.match(
+    new RegExp(`^${escaped} = "${requirement.replaceAll(".", "\\.")}"$`, "m")
+  )?.[0];
+  if (!declaration) {
+    fail(`${dependency} must pin the crates.io requirement "${requirement}" without Git selectors: ${declaration ?? "missing"}`);
   }
 }
 
@@ -221,29 +219,40 @@ function assertSinglePackage(packages, name, expectedVersion = null) {
   return matches[0];
 }
 
-function gitCommit(source, repository, packageName) {
-  const escaped = repository.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = source?.match(new RegExp(`^git\\+${escaped}#([a-f0-9]{40})$`));
-  if (!match) {
-    fail(`${packageName} must resolve from unqualified Git ${repository}: ${source ?? "path"}`);
+function assertRegistryPackage(packages, name, expectedVersion) {
+  const pkg = assertSinglePackage(packages, name, expectedVersion);
+  if (pkg.source !== REGISTRY_SOURCE) {
+    fail(`${name} must resolve from crates.io, found: ${pkg.source ?? "path"}`);
   }
-  return match[1];
+  return pkg;
 }
+
+const REGISTRY_SOURCE = "registry+https://github.com/rust-lang/crates.io-index";
 
 const rootManifest = readFileSync(join(ROOT, "Cargo.toml"), "utf8");
 const workspaceDependencies = manifestSection(rootManifest, "[workspace.dependencies]");
-for (const dependency of ["gpui", "gpui_platform", "gpui_tokio"]) {
+for (const dependency of ["gpui_platform", "gpui_tokio"]) {
   assertPathDependency(workspaceDependencies, dependency, `${ZED_SUBMODULE_PATH}/crates/${dependency}`);
 }
-for (const dependency of ["gpui-component", "gpui-component-assets"]) {
-  assertUnqualifiedGitDependency(rootManifest, dependency, GPUI_COMPONENT_REPOSITORY);
+// gpui is consumed as gpui-pre so gpui-component 0.6 sees the forked GPUI too.
+const gpuiDeclaration = workspaceDependencies.match(/^gpui = \{[^\n]+\}$/m)?.[0];
+if (!gpuiDeclaration?.includes('package = "gpui-pre"') || !gpuiDeclaration?.includes(`path = "${ZED_SUBMODULE_PATH}/crates/gpui"`)) {
+  fail(`gpui must alias the forked gpui-pre from the Zed submodule: ${gpuiDeclaration ?? "missing"}`);
+}
+for (const dependency of ["gpui-component", "gpui-kit-assets"]) {
+  assertRegistryDependency(rootManifest, dependency, "0.6.0");
 }
 if (!/^exclude = \["vendor\/zed"\]$/m.test(rootManifest)) {
   fail("the Zed submodule must be excluded from the Vibex workspace");
 }
-const zedPatch = manifestSection(rootManifest, `[patch."${UPSTREAM_ZED_REPOSITORY}"]`);
-for (const dependency of ["gpui", "gpui_macros"]) {
-  assertPathDependency(zedPatch, dependency, `${ZED_SUBMODULE_PATH}/crates/${dependency}`);
+const cratesPatch = manifestSection(rootManifest, "[patch.crates-io]");
+for (const dependency of [
+  "gpui-pre",
+  "gpui-pre-macros",
+  "gpui-pre-sum-tree"
+]) {
+  const submodulePath = `${ZED_SUBMODULE_PATH}/crates/${dependency === "gpui-pre-macros" ? "gpui_macros" : dependency === "gpui-pre-sum-tree" ? "sum_tree" : "gpui"}`;
+  assertPathDependency(cratesPatch, dependency, submodulePath);
 }
 
 const gitmodules = readFileSync(join(ROOT, ".gitmodules"), "utf8");
@@ -265,7 +274,7 @@ if (gitlink.status !== 0 || !/^160000 [a-f0-9]{40} 0\tvendor\/zed\s*$/.test(gitl
 }
 
 const desktopManifest = readFileSync(join(ROOT, "apps", "desktop", "Cargo.toml"), "utf8");
-for (const dependency of ["gpui-component", "gpui-component-assets"]) {
+for (const dependency of ["gpui-component", "gpui-kit-assets"]) {
   if (!new RegExp(`^${dependency}\\.workspace = true$`, "m").test(desktopManifest)) {
     fail(`${dependency} must use the root workspace dependency`);
   }
@@ -292,9 +301,9 @@ if (!workspaceNames.includes("vibex-ui")) {
 if (!workspaceNames.includes("vibex-backend")) {
   fail("vibex-backend is missing from workspace metadata");
 }
-const desktopPackage = assertSinglePackage(graph.packages, "vibex-desktop", "0.1.0-rc.1");
-const sharedUiPackage = assertSinglePackage(graph.packages, "vibex-ui", "0.1.0-rc.1");
-const sharedBackendPackage = assertSinglePackage(graph.packages, "vibex-backend", "0.1.0-rc.1");
+const desktopPackage = assertSinglePackage(graph.packages, "vibex-desktop", "0.1.0-rc.2");
+const sharedUiPackage = assertSinglePackage(graph.packages, "vibex-ui", "0.1.0-rc.2");
+const sharedBackendPackage = assertSinglePackage(graph.packages, "vibex-backend", "0.1.0-rc.2");
 if (!desktopPackage.dependencies.some((dependency) => dependency.name === sharedUiPackage.name)) {
   fail("desktop metadata does not depend on vibex-ui");
 }
@@ -308,7 +317,7 @@ if (!sharedUiPackage.dependencies.some((dependency) => dependency.name === share
 }
 
 const wasmGraph = metadata("wasm32-unknown-unknown");
-const wasmSharedUiPackage = assertSinglePackage(wasmGraph.packages, "vibex-ui", "0.1.0-rc.1");
+const wasmSharedUiPackage = assertSinglePackage(wasmGraph.packages, "vibex-ui", "0.1.0-rc.2");
 const wasmReachable = reachablePackageNames(wasmGraph, wasmSharedUiPackage.id);
 for (const dependency of [
   "vibex-desktop-runtime",
@@ -336,7 +345,13 @@ const zedPackages = graph.packages.filter(packageIsInZedSubmodule);
 if (!zedPackages.length) fail(`Cargo metadata contains no packages from ${ZED_SUBMODULE_PATH}`);
 const zedCommit = resolveZedSubmoduleRevision(ROOT);
 
-for (const name of ["gpui", "gpui_platform", "gpui_tokio"]) {
+// gpui is aliased to gpui-pre in the workspace so both the Vibex tree and
+// gpui-component 0.6 resolve one forked GPUI from the submodule.
+const gpuiPrePackage = assertSinglePackage(graph.packages, "gpui-pre");
+if (!packageIsInZedSubmodule(gpuiPrePackage)) {
+  fail(`gpui-pre does not resolve from ${ZED_SUBMODULE_PATH}`);
+}
+for (const name of ["gpui_platform", "gpui_tokio"]) {
   const pkg = assertSinglePackage(graph.packages, name);
   if (!packageIsInZedSubmodule(pkg)) {
     fail(`${name} does not resolve from ${ZED_SUBMODULE_PATH}`);
@@ -350,18 +365,10 @@ if (duplicateZedPackages.length) {
   fail(`duplicate Zed packages: ${duplicateZedPackages.map(([name]) => name).join(", ")}`);
 }
 
-const componentPackages = [
-  assertSinglePackage(graph.packages, "gpui-component", "0.5.2"),
-  assertSinglePackage(graph.packages, "gpui-component-assets", "0.5.1"),
-  assertSinglePackage(graph.packages, "gpui-component-macros", "0.5.1")
-];
-const componentCommits = new Set(
-  componentPackages.map((pkg) => gitCommit(pkg.source, GPUI_COMPONENT_REPOSITORY, pkg.name))
-);
-if (componentCommits.size !== 1) {
-  fail(`gpui-component packages resolve from multiple commits: ${[...componentCommits].join(", ")}`);
-}
-const componentCommit = [...componentCommits][0];
+assertRegistryPackage(graph.packages, "gpui-component", "0.6.0");
+assertRegistryPackage(graph.packages, "gpui-kit-assets", "0.6.1");
+assertRegistryPackage(graph.packages, "gpui-component-macros", "0.6.1");
+const componentCommit = gpuiComponentIdentity(ROOT, graph.packages);
 
 const tokenSource = JSON.parse(readFileSync(SHARED_TOKEN_SOURCE, "utf8"));
 if (
@@ -396,6 +403,6 @@ if (JSON.stringify(vendorEntries) !== JSON.stringify(["zed"])) {
 
 console.log(
   `GPUI graph verified: ${zedPackages.length} fork-submodule packages at ${zedCommit.slice(0, 12)}, ` +
-    `gpui-component at ${componentCommit.slice(0, 12)}, shared UI isolated, ` +
+    `gpui-component ${componentCommit.slice(0, 12)} from crates.io, shared UI isolated, ` +
     `shared backend wasm-isolated, no proc-macro-error2 exception, and forked Zed GPL tracing`
 );

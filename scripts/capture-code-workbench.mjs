@@ -380,12 +380,12 @@ function sourceContract() {
     ).length,
     variablePatchListCount: (renderSource.match(/\blist\(/g) || []).length,
     variablePatchListStatePresent:
-      workbench.includes('ListState::new(row_count, ListAlignment::Top') &&
-      workbench.includes('.with_uniform_item_height(px(DIFF_ROW_HEIGHT))') &&
-      workbench.includes('.reset_with_uniform_height(row_count, px(DIFF_ROW_HEIGHT))'),
+      workbench.includes('ListState::new(row_count, ListAlignment::Top, px(DIFF_LIST_OVERDRAW))') &&
+      workbench.includes('.with_uniform_item_height(px(row_height))') &&
+      workbench.includes('.reset_with_uniform_height(row_count, px(row_height))'),
     variablePatchListFullSize: patchListSource.includes('.size_full()'),
     wrappingDiffRowsPresent:
-      diffRowSource.includes('.min_h(px(DIFF_ROW_HEIGHT))') &&
+      diffRowSource.includes('.min_h(px(diff_row_height))') &&
       diffRowSource.includes('.whitespace_normal()') &&
       !diffRowSource.includes('.overflow_x_scrollbar()') &&
       !diffRowSource.includes('.whitespace_nowrap()'),
@@ -415,7 +415,7 @@ function sourceContract() {
     previewPaneNewButtonDoesNotOverrideHover: !previewPaneNewSource.includes('.hover('),
     saveShortcutPresent:
       actions.includes('pub struct SaveActiveFile;') &&
-      app.includes('KeyBinding::new("cmd-s", SaveActiveFile, None)'),
+      app.includes('("save_active_file", "cmd-s")'),
     agentPreviewProjectionPresent:
       app.includes('agent_markdown_summary(') && app.includes('TimelineRowKind::FileOperation'),
     fixtureModesPresent:

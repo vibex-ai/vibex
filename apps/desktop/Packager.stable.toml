@@ -1,6 +1,6 @@
 name = "vibex-desktop"
 productName = "Vibex"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 identifier = "dev.vibex.desktop"
 description = "Vibex stable candidate after approved identity transfer"
 authors = ["Vibex"]

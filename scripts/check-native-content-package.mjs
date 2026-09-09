@@ -13,11 +13,11 @@ const REVIEW = JSON.parse(
 );
 const DEB = resolve(
   ROOT,
-  "target/hosted-packages/vibex-desktop_0.1.0-rc.1_amd64.deb"
+  "target/hosted-packages/vibex-desktop_0.1.0-rc.2_amd64.deb"
 );
 const APPIMAGE = resolve(
   ROOT,
-  "target/hosted-packages/vibex-desktop_0.1.0-rc.1_x86_64.AppImage"
+  "target/hosted-packages/vibex-desktop_0.1.0-rc.2_x86_64.AppImage"
 );
 const PREPARED = resolve(ROOT, "target/native/pdfium/linux-x86_64");
 const PACKAGE_RESOURCE = "usr/lib/vibex-desktop/pdfium";

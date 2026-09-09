@@ -17,7 +17,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--or--later-blue?style=flat" alt="许可证: AGPL-3.0 或更高版本" /></a>
   <img src="https://img.shields.io/badge/Rust-1.97.0-black?style=flat&logo=rust&logoColor=white" alt="Rust 1.97.0" />
   <img src="https://img.shields.io/badge/UI-GPUI-2563eb?style=flat" alt="GPUI" />
-  <img src="https://img.shields.io/badge/status-0.1.0--rc.1-f97316?style=flat" alt="发布状态: 0.1.0-rc.1" />
+  <img src="https://img.shields.io/badge/status-0.1.0--rc.2-f97316?style=flat" alt="发布状态: 0.1.0-rc.2" />
 </p>
 
 <p align="center">

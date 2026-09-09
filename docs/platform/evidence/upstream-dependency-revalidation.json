@@ -3,11 +3,28 @@
   "status": "pending_physical_recapture",
   "currentSource": {
     "dependencySourcePolicy": "fork_submodule_root_cargo_lock",
-    "zedRevision": "53b7efce1ead525b8898cda74ccd2d7e0987d2d8",
-    "gpuiComponentRevision": "031555662e99a1b5a549990b47f246d475b8288a",
-    "cargoLockSha256": "70c29c15b94ea1f9621cb15c791b9a0b142fd72020c7f57c3f3c48a9e7b88a63"
+    "zedRevision": "81d3457d0f637fce3c737712f7add44c5dfb49e1",
+    "gpuiComponentRevision": "89ffa4c07d649933c01e70df41adfc7e05bd87c9",
+    "cargoLockSha256": "82cdebf333ee8ac7f3b5199727053215993e9e0a2cd3279185f3482641579b39"
   },
   "historicalSources": [
+    {
+      "source": {
+        "zedRevision": "7b7bad0fbcea1ec312db104af451b7bb31146e96",
+        "gpuiComponentRevision": "031555662e99a1b5a549990b47f246d475b8288a",
+        "cargoLockSha256": "2388c341d5946ce1c113b103285edcc401fa957e54ddd4e5ad865b3b5885fa14"
+      },
+      "evidence": [
+        "docs/platform/evidence/linux-native-first-frame.json",
+        "docs/platform/evidence/linux-x11-first-frame-xvfb.json",
+        "docs/platform/evidence/pdf-linux.json",
+        "docs/platform/evidence/terminal-linux.json"
+      ],
+      "sourceInputTreeSha256ByEvidence": {
+        "docs/platform/evidence/pdf-linux.json": "af96f2d4dbd4cbc444f69238bb093cbab8b26014f4119f4ae83db8754b126f0a",
+        "docs/platform/evidence/terminal-linux.json": "5cd75a82122c48ee8f520d4c75c2f837d3f704a0cbb0b8abdd6395aa41b1417f"
+      }
+    },
     {
       "source": {
         "zedRevision": "819fe337999551ce8177b14c8db1127645617ae4",
@@ -15,12 +32,9 @@
         "cargoLockSha256": "6bafd6ea8d8aa706f6a51a01d7884c6f00209247b716f5cb6ba4e4b8a3aa80a4"
       },
       "evidence": [
-        "docs/platform/evidence/linux-x11-first-frame-xvfb.json",
-        "docs/platform/evidence/linux-native-first-frame.json",
         "docs/platform/evidence/acp-lifecycle-linux.json",
         "docs/platform/evidence/composer-linux.json",
-        "docs/platform/evidence/foundation-linux.json",
-        "docs/platform/evidence/terminal-linux.json"
+        "docs/platform/evidence/foundation-linux.json"
       ]
     },
     {
@@ -30,8 +44,7 @@
         "cargoLockSha256": "7a5488b1882681707399417335bf61343f78b9afaa9fbe054a41c3c98c5db959"
       },
       "evidence": [
-        "docs/platform/evidence/native-content-x11-linux.json",
-        "docs/platform/evidence/pdf-linux.json"
+        "docs/platform/evidence/native-content-x11-linux.json"
       ],
       "sourceInputTreeSha256ByEvidence": {
         "docs/platform/evidence/native-content-x11-linux.json": "f7795d84b9fb19626b91f4cda1c1426b0a5f15cda66ece457ab041ad6ad119ef"

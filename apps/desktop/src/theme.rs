@@ -272,10 +272,10 @@ mod tests {
         assert_eq!(TOKEN_SCHEMA_VERSION, "vibex-design-tokens.v1");
         assert_eq!(TOKEN_PRODUCT_VISUAL_SOURCE, "apps/desktop");
         assert_eq!(TOKEN_SOURCE_PATH, "crates/vibex-ui/theme/tokens.json");
-        assert_eq!(GPUI_REVISION, "7b7bad0fbcea1ec312db104af451b7bb31146e96");
+        assert_eq!(GPUI_REVISION, "81d3457d0f637fce3c737712f7add44c5dfb49e1");
         assert_eq!(
             GPUI_COMPONENT_REVISION,
-            "94a313a72a2513aee2780240cd322d552b2395f0"
+            "89ffa4c07d649933c01e70df41adfc7e05bd87c9"
         );
         assert_eq!(semantic_token("background", false).unwrap().hex, "#ffffff");
         assert_eq!(semantic_token("foreground", true).unwrap().hex, "#e5e5e5");
