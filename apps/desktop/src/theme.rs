@@ -275,7 +275,7 @@ mod tests {
         assert_eq!(GPUI_REVISION, "7b7bad0fbcea1ec312db104af451b7bb31146e96");
         assert_eq!(
             GPUI_COMPONENT_REVISION,
-            "031555662e99a1b5a549990b47f246d475b8288a"
+            "94a313a72a2513aee2780240cd322d552b2395f0"
         );
         assert_eq!(semantic_token("background", false).unwrap().hex, "#ffffff");
         assert_eq!(semantic_token("foreground", true).unwrap().hex, "#e5e5e5");

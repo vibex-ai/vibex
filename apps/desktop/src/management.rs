@@ -18,10 +18,10 @@ use gpui::{
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Size,
     StyledExt as _, Theme, WindowExt as _,
-    animation::{Transition, ease_out_cubic},
+    animation::{EffectTransition as Transition, ease_out_cubic},
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{Input, InputEvent, InputState},
+    input::{Input, InputEvent, InputState, Textarea, TextareaState},
     notification::Notification,
     scroll::ScrollableElement as _,
     switch::Switch,
@@ -673,7 +673,7 @@ pub struct ManagementCenter {
     custom_agent_description: Entity<InputState>,
     custom_agent_command: Entity<InputState>,
     custom_agent_args: Entity<InputState>,
-    custom_agent_env: Entity<InputState>,
+    custom_agent_env: Entity<TextareaState>,
     mcp_search: Entity<InputState>,
     skill_search: Entity<InputState>,
     profile_name: Entity<InputState>,
@@ -737,8 +737,7 @@ impl ManagementCenter {
             ))
         });
         let custom_agent_env = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .rows(4)
                 .placeholder(management_locale_text(
                     "Environment: KEY=value, one per line (optional)",
@@ -10107,8 +10106,7 @@ impl ManagementCenter {
                                     )),
                             )
                             .child(
-                                Input::new(&self.custom_agent_env)
-                                    .small()
+                                Textarea::new(&self.custom_agent_env)
                                     .h(px(96.0))
                                     .w_full(),
                             )

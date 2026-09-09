@@ -15,7 +15,7 @@ gpui.workspace = true
 gpui_platform.workspace = true
 gpui_tokio.workspace = true
 gpui-component.workspace = true
-gpui-component-assets.workspace = true
+gpui-kit-assets.workspace = true
 image = { workspace = true, features = ["bmp", "gif", "ico", "jpeg", "png", "tiff", "webp"] }
 qrcode.workspace = true
 resvg.workspace = true

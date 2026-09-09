@@ -267,7 +267,6 @@ pub fn open_destructive_confirmation(
                     .cancel_text("Cancel")
                     .show_cancel(true),
             )
-            .overlay_closable(false)
             .keyboard(true)
             .on_ok(move |_, window, cx| {
                 on_confirm(window, cx);

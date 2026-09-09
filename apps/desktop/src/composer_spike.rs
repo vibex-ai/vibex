@@ -12,7 +12,7 @@ use gpui_component::{
     ActiveTheme as _, StyledExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{Input, InputEvent, InputState},
+    input::{InputEvent, Textarea, TextareaState},
     v_flex,
 };
 use serde::Serialize;
@@ -82,7 +82,7 @@ struct ComposerFailure {
 }
 
 pub struct ComposerSpikeView {
-    input: Entity<InputState>,
+    input: Entity<TextareaState>,
     output: PathBuf,
     progress_output: PathBuf,
     phase: &'static str,
@@ -111,7 +111,7 @@ impl ComposerSpikeView {
     pub fn new(output: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let progress_output = output.with_extension("progress.json");
         let input = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .auto_grow(3, 8)
                 .submit_on_enter(true)
                 .placeholder("Message the Agent")
@@ -180,7 +180,7 @@ impl ComposerSpikeView {
         }
     }
 
-    fn observe_input(&mut self, input: &Entity<InputState>, cx: &mut Context<Self>) {
+    fn observe_input(&mut self, input: &Entity<TextareaState>, cx: &mut Context<Self>) {
         let state = input.read(cx);
         let value = state.value().to_string();
         self.cjk_commit_observed |= value.chars().any(is_cjk);
@@ -405,7 +405,7 @@ impl Render for ComposerSpikeView {
                                                 .child("Image: fixture-image.png"),
                                         ),
                                     )
-                                    .child(Input::new(&self.input).appearance(false).h_full())
+                                    .child(Textarea::new(&self.input).appearance(false).h_full())
                                     .child(
                                         h_flex()
                                             .justify_between()

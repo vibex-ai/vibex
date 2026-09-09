@@ -22,7 +22,8 @@ use gpui_component::{
     date_picker::{DatePicker, DatePickerEvent, DatePickerState},
     dialog::{DialogAction, DialogClose, DialogFooter},
     h_flex,
-    input::{Input, InputEvent, InputState, Position},
+    input::{Editor, EditorState, Input, InputEvent, InputState, Position, Textarea,
+           TextareaState},
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem},
     notification::Notification,
     resizable::{h_resizable, resizable_panel, v_resizable},
@@ -353,7 +354,7 @@ struct PendingWorkspace {
 #[derive(Clone)]
 struct EditorBinding {
     id: u64,
-    input: Entity<InputState>,
+    input: Entity<EditorState>,
 }
 
 struct GotoLineOverlay {
@@ -730,7 +731,7 @@ struct CodeRightRailProjection {
     files: CodeRightRailFileProjection,
     git: CodeRightRailGitProjection,
     workspace_name: String,
-    commit_message: Entity<InputState>,
+    commit_message: Entity<TextareaState>,
     amend_commit: bool,
     selected_git_path: Option<String>,
     lifecycle_view: Option<WorktreeLifecycleView>,
@@ -940,7 +941,7 @@ pub struct CodeWorkbench {
     selected_file_path: Option<String>,
     selected_git_path: Option<String>,
     selected_terminal_id: Option<String>,
-    pub(crate) commit_message: Entity<InputState>,
+    pub(crate) commit_message: Entity<TextareaState>,
     pub(crate) amend_commit: bool,
     commit_reset_window: Option<AnyWindowHandle>,
     pub(crate) error: Option<String>,
@@ -1049,8 +1050,7 @@ impl CodeWorkbench {
         let mut editors = EditorBufferRegistry::default();
         editors.restore_recovery(recovery);
         let commit_message = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .rows(3)
                 .placeholder(locale::text("Commit message", "提交信息", "提交訊息"))
         });
@@ -3680,7 +3680,7 @@ impl CodeWorkbench {
         path: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Entity<InputState> {
+    ) -> Entity<EditorState> {
         if let Some(binding) = self.editor_bindings.get(path) {
             return binding.input.clone();
         }
@@ -3688,10 +3688,8 @@ impl CodeWorkbench {
         let binding_id = self.next_editor_binding_id;
         let language = language_for_path(path);
         let input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .code_editor(language)
-                .line_number(true)
-                .folding(true)
+            EditorState::new(window, cx)
+                .language(language)
                 .replaceable(true)
                 .soft_wrap(self.editor_soft_wrap)
                 .show_whitespaces(self.editor_show_whitespaces)
@@ -7181,7 +7179,7 @@ impl CodeWorkbench {
                         .text_size(px(f32::from(self.code_font_size)))
                         .font_weight(code_font_weight(cx))
                         .child(
-                            Input::new(&binding.input)
+                            Editor::new(&binding.input)
                                 .appearance(false)
                                 .h_full()
                                 .disabled(!editable),
@@ -11746,8 +11744,7 @@ impl CodeRightRail {
                         ),
                     )
                     .child(
-                        Input::new(&commit_message)
-                            .small()
+                        Textarea::new(&commit_message)
                             .h(px(GIT_COMMIT_MESSAGE_HEIGHT))
                             .w_full(),
                     )
@@ -11790,6 +11787,7 @@ impl CodeRightRail {
                                 DropdownButton::new("commit-actions")
                                     .button(
                                         Button::new("commit-changes")
+                                            .loading(pending || lifecycle_pending)
                                             .h(px(36.0))
                                             .px_3()
                                             .child(
@@ -11821,7 +11819,6 @@ impl CodeRightRail {
                                     )
                                     .outline()
                                     .with_size(Size::Size(px(36.0)))
-                                    .loading(pending || lifecycle_pending)
                                     .disabled(action_pending || selected_count == 0)
                                     .dropdown_menu_with_anchor(
                                         Anchor::BottomRight,
@@ -13871,7 +13868,7 @@ fn file_search_reveal_range(
     None
 }
 
-fn center_input_line(input: &mut InputState, line: u32, cx: &mut Context<InputState>) {
+fn center_input_line(input: &mut EditorState, line: u32, cx: &mut Context<EditorState>) {
     let (Some(visible_rows), Some(line_height)) = (input.visible_row_range(), input.line_height())
     else {
         return;

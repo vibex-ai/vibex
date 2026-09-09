@@ -9,7 +9,7 @@ use gpui::{
     Result as GpuiResult, SharedString, Styled as _, Window, img,
 };
 use gpui_component::{Icon, IconName};
-use gpui_component_assets::Assets as ComponentAssets;
+use gpui_kit_assets::Assets as ComponentAssets;
 use sha2::{Digest, Sha256};
 
 const INTER_PACKAGE_ROOT: &str = "../../../node_modules/.pnpm/@fontsource-variable+inter@5.2.8/node_modules/@fontsource-variable/inter";

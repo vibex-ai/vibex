@@ -75,11 +75,11 @@ reqwest = { version = "0.13.4", features = ["json", "stream", "socks"] }
 rcgen = { version = "0.14.9", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 fs2 = "0.4.3"
-gpui = { path = "vendor/zed/crates/gpui" }
+gpui = { package = "gpui-pre", path = "vendor/zed/crates/gpui" }
 gpui_platform = { path = "vendor/zed/crates/gpui_platform", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
 gpui_tokio = { path = "vendor/zed/crates/gpui_tokio" }
-gpui-component = { git = "https://github.com/longbridge/gpui-component" }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
+gpui-component = "0.6.0"
+gpui-kit-assets = "0.6.0"
 image = { version = "=0.25.10", default-features = false }
 tray-icon = { version = "0.24.2", default-features = false }
 markdown = { version = "=1.0.0", features = ["serde"] }
@@ -111,10 +111,12 @@ ropey = "=2.0.0-beta.1"
 x25519-dalek = { version = "2", default-features = false, features = ["alloc", "precomputed-tables", "static_secrets", "zeroize"] }
 zip = { version = "=8.4.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
-[patch."https://github.com/zed-industries/zed"]
-# gpui-component still names upstream Zed; keep that edge on the fork submodule too.
-gpui = { path = "vendor/zed/crates/gpui" }
-gpui_macros = { path = "vendor/zed/crates/gpui_macros" }
+[patch.crates-io]
+# gpui-component 0.6 consumes the gpui-pre-* family from crates.io; redirect the
+# whole family to the vendored vibex-ai/zed fork (gpui-mobile) so the tree has ONE gpui.
+gpui-pre = { path = "vendor/zed/crates/gpui" }
+gpui-pre-macros = { path = "vendor/zed/crates/gpui_macros" }
+gpui-pre-sum-tree = { path = "vendor/zed/crates/sum_tree" }
 
 [profile.dev]
 incremental = true

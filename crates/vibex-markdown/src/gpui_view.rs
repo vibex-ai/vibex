@@ -2947,7 +2947,10 @@ impl MarkdownViewState {
                 } else {
                     HighlightTheme::default_light()
                 };
-                Arc::new(highlighter.styles(&(0..source.len()), &theme))
+                Arc::new(highlighter.styles(
+                    &(0..source.len()),
+                    theme.as_ref() as &dyn gpui_component::input::HighlightStyleResolver,
+                ))
             })
             .clone()
     }

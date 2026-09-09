@@ -33,7 +33,7 @@ use gpui_component::{
     ActiveTheme as _, Colorize as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath,
     InteractiveElementExt as _, Root, Selectable as _, Sizable as _, StyledExt as _, Theme,
     TitleBar, VirtualListScrollHandle, WindowExt as _,
-    animation::Transition,
+    animation::EffectTransition as Transition,
     button::{Button, ButtonVariants as _},
     dialog::{DialogAction, DialogClose, DialogFooter},
     h_flex,
@@ -41,7 +41,7 @@ use gpui_component::{
         Backspace as InputBackspace, Copy as InputCopy, Delete as InputDelete, Enter as InputEnter,
         Escape as InputEscape, IndentInline as InputIndentInline, Input, InputEvent, InputState,
         MoveDown as InputMoveDown, MoveLeft as InputMoveLeft, MoveRight as InputMoveRight,
-        MoveUp as InputMoveUp, Paste as InputPaste,
+        MoveUp as InputMoveUp, Paste as InputPaste, Textarea, TextareaState,
     },
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem},
     notification::Notification,
@@ -828,7 +828,7 @@ impl VibexMessageClipboard {
     }
 }
 
-fn reveal_composer_cursor_after_layout(input: Entity<InputState>, window: &mut Window) {
+fn reveal_composer_cursor_after_layout(input: Entity<TextareaState>, window: &mut Window) {
     window.on_next_frame(move |window, _| {
         window.on_next_frame(move |_, cx| {
             input.update(cx, |input, cx| {
@@ -4672,14 +4672,14 @@ pub struct VibexWorkbench {
     session_search_highlight_item_id: Option<String>,
     session_search_highlight_query: Option<String>,
     sidebar_rename_input: Entity<InputState>,
-    user_message_edit_input: Entity<InputState>,
-    composer_queue_edit_input: Entity<InputState>,
-    composer_input: Entity<InputState>,
-    image_editor_text_input: Entity<InputState>,
+    user_message_edit_input: Entity<TextareaState>,
+    composer_queue_edit_input: Entity<TextareaState>,
+    composer_input: Entity<TextareaState>,
+    image_editor_text_input: Entity<TextareaState>,
     composer_input_session_id: Option<VibexSessionId>,
     composer_input_syncing: bool,
     composer_session_drafts: BTreeMap<String, ComposerSessionDraft>,
-    new_session_input: Entity<InputState>,
+    new_session_input: Entity<TextareaState>,
     new_session_worktree_name_input: Entity<InputState>,
     new_session_worktree_path_input: Entity<InputState>,
     new_session_project_search: Entity<InputState>,
@@ -5001,13 +5001,13 @@ impl VibexWorkbench {
             InputState::new(window, cx).placeholder(initial_strings.sidebar_rename_placeholder)
         });
         let user_message_edit_input = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .placeholder(locale::text("Edit message", "编辑消息", "編輯訊息"))
                 .auto_grow(2, 10)
                 .submit_on_enter(true)
         });
         let composer_queue_edit_input = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .placeholder(locale::text(
                     "Edit queued message",
                     "编辑排队消息",
@@ -5017,18 +5017,18 @@ impl VibexWorkbench {
                 .submit_on_enter(true)
         });
         let composer_input = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .auto_grow(2, 8)
                 .submit_on_enter(true)
                 .placeholder(initial_strings.message_agent)
         });
         let image_editor_text_input = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .auto_grow(1, 2)
                 .placeholder(locale::text("Text", "文字", "文字"))
         });
         let new_session_input = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .auto_grow(3, 8)
                 .submit_on_enter(true)
                 .placeholder(initial_strings.new_session_prompt_placeholder)
@@ -13072,7 +13072,7 @@ impl VibexWorkbench {
         self.suggestion_request_serial = self.suggestion_request_serial.saturating_add(1);
     }
 
-    fn input_for_composer_target(&self, target: ComposerTarget) -> Entity<InputState> {
+    fn input_for_composer_target(&self, target: ComposerTarget) -> Entity<TextareaState> {
         match target {
             ComposerTarget::Session => self.composer_input.clone(),
             ComposerTarget::NewSession => self.new_session_input.clone(),
@@ -13474,7 +13474,7 @@ impl VibexWorkbench {
     fn inline_attachment_key_action(
         &self,
         edit: InlineAttachmentEdit,
-        input: &Entity<InputState>,
+        input: &Entity<TextareaState>,
         attachments: &[InlineComposerAttachment],
         cx: &mut Context<Self>,
     ) -> InlineAttachmentKeyAction {
@@ -30640,7 +30640,7 @@ impl VibexWorkbench {
                                                         },
                                                     ))
                                                     .child(
-                                                        Input::new(&self.new_session_input)
+                                                        Textarea::new(&self.new_session_input)
                                                             .appearance(false)
                                                             .h_full(),
                                                     ),
@@ -33180,7 +33180,7 @@ impl VibexWorkbench {
                                             .rounded(px(6.0))
                                             .bg(cx.theme().background)
                                             .child(
-                                                Input::new(&text_input)
+                                                Textarea::new(&text_input)
                                                     .appearance(false)
                                                     .size_full(),
                                             ),
@@ -35521,7 +35521,7 @@ impl VibexWorkbench {
                         this.capture_user_message_edit_paste(window, cx)
                     }))
                     .child(
-                        Input::new(&self.user_message_edit_input)
+                        Textarea::new(&self.user_message_edit_input)
                             .appearance(false)
                             .w_full()
                             .disabled(pending),
@@ -39053,7 +39053,7 @@ impl VibexWorkbench {
                                     },
                                 ))
                                 .child(
-                                    Input::new(&self.composer_queue_edit_input)
+                                    Textarea::new(&self.composer_queue_edit_input)
                                         .appearance(false)
                                         .w_full(),
                                 ),
@@ -39846,7 +39846,7 @@ impl VibexWorkbench {
                                                 },
                                             ))
                                             .child(
-                                                Input::new(&self.composer_input)
+                                                Textarea::new(&self.composer_input)
                                                     .appearance(false),
                                             ),
                                     )
@@ -53284,7 +53284,7 @@ mod tests {
     }
 
     struct ComposerLayoutProbe {
-        input: Entity<InputState>,
+        input: Entity<TextareaState>,
         queue_width: Rc<Cell<f32>>,
         header_height: Rc<Cell<f32>>,
         composer_width: Rc<Cell<f32>>,
@@ -53295,7 +53295,7 @@ mod tests {
     }
 
     struct ComposerBottomAnchorProbe {
-        input: Entity<InputState>,
+        input: Entity<TextareaState>,
         root_bottom: Rc<Cell<f32>>,
         shell_bottom: Rc<Cell<f32>>,
         center_bottom: Rc<Cell<f32>>,
@@ -53320,7 +53320,7 @@ mod tests {
     }
 
     struct ComposerPasteScrollProbe {
-        input: Entity<InputState>,
+        input: Entity<TextareaState>,
     }
 
     impl Render for ComposerPasteScrollProbe {
@@ -53328,7 +53328,7 @@ mod tests {
             div()
                 .w(px(320.0))
                 .h(px(160.0))
-                .child(Input::new(&self.input).appearance(false).size_full())
+                .child(Textarea::new(&self.input).appearance(false).size_full())
         }
     }
 
@@ -53400,7 +53400,7 @@ mod tests {
                                                             ))
                                                             .flex_1()
                                                             .child(
-                                                                Input::new(&self.input)
+                                                                Textarea::new(&self.input)
                                                                     .appearance(false),
                                                             ),
                                                     ),
@@ -53684,7 +53684,7 @@ mod tests {
                                                 .pb_1()
                                                 .child(
                                                     div().min_w_0().h_full().flex_1().child(
-                                                        Input::new(&self.input)
+                                                        Textarea::new(&self.input)
                                                             .appearance(false)
                                                             .size_full(),
                                                     ),
@@ -53765,7 +53765,7 @@ mod tests {
         let observed_composer_top = composer_top.clone();
         let (_, cx) = cx.add_window_view(|window, cx| ComposerLayoutProbe {
             input: cx.new(|cx| {
-                InputState::new(window, cx)
+                TextareaState::new(window, cx)
                     .auto_grow(2, 8)
                     .submit_on_enter(true)
                     .placeholder("Ask for follow-up changes")
@@ -53833,7 +53833,7 @@ mod tests {
         let composer_bottom_for_view = composer_bottom.clone();
         let composer_height_for_view = composer_height.clone();
         let (_, cx) = cx.add_window_view(|window, cx| {
-            let input = cx.new(|cx| InputState::new(window, cx).auto_grow(2, 8));
+            let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 8));
             *input_slot.borrow_mut() = Some(input.clone());
             let probe = cx.new(|_| ComposerBottomAnchorProbe {
                 input,
@@ -58464,7 +58464,7 @@ mod tests {
         let input_slot = Rc::new(RefCell::new(None));
         let input_slot_for_view = input_slot.clone();
         let (_, cx) = cx.add_window_view(|window, cx| {
-            let input = cx.new(|cx| InputState::new(window, cx).auto_grow(2, 8));
+            let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 8));
             *input_slot_for_view.borrow_mut() = Some(input.clone());
             let probe = cx.new(|_| ComposerPasteScrollProbe { input });
             gpui_component::Root::new(probe, window, cx)
@@ -61352,7 +61352,7 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_user_message_row("))
             .map(|(body, _)| body)
             .expect("inline user message editor should remain inspectable");
-        assert!(editor.contains("Input::new(&self.user_message_edit_input)"));
+        assert!(editor.contains("Textarea::new(&self.user_message_edit_input)"));
         assert!(editor.contains("cancel-inline-message-edit"));
         assert!(editor.contains("submit-inline-message-edit"));
         assert!(!editor.contains(".border_1()"));
