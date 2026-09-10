@@ -211,7 +211,7 @@ pub(crate) fn timeline_turn_refs<'a>(
             }
             current.user_item = Some(item);
         } else {
-            if turn_ref_has_error(&current)
+            if current.failed
                 && item.kind != TimelineItemKind::Error
                 && matches!(
                     item.source,
@@ -221,6 +221,9 @@ pub(crate) fn timeline_turn_refs<'a>(
                 finish_turn_ref(&mut current);
                 turns.push(current);
                 current = empty_turn_ref();
+            }
+            if is_turn_boundary_error(item) {
+                current.failed = true;
             }
             current.response_items.push(item);
         }
@@ -289,12 +292,6 @@ fn finish_turn_ref(turn: &mut TimelineTurnRef<'_>) {
         .rev()
         .find(|item| is_turn_boundary_error(item) || is_final_agent_message(item))
         .map(|item| item.id.to_string());
-}
-
-fn turn_ref_has_error(turn: &TimelineTurnRef<'_>) -> bool {
-    turn.response_items
-        .iter()
-        .any(|item| is_turn_boundary_error(item))
 }
 
 fn is_turn_boundary_error(item: &TimelineItem) -> bool {

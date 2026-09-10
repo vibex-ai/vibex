@@ -283,11 +283,11 @@ and reuse the final block when its kind, start offset, and old source are a
 prefix of the new source. Keep a per-block measured flag so an already measured
 block can grow but cannot shrink while `MarkdownViewOptions::streaming` is true;
 after streaming ends, the normal measurement path may shrink it to the final
-intrinsic height. Streaming Agent documents enter block virtualization before
-the large-document threshold once they have at least 8 top-level blocks and 8
-KiB of source, so short structured answers keep the full renderer while long
-answers do not switch rendering modes only after substantial content is already
-laid out.
+intrinsic height. Streaming Agent and Thought documents enter block
+virtualization before the large-document threshold once they have at least 8
+top-level blocks and 8 KiB of source, so short structured answers keep the full
+renderer while long answers do not switch rendering modes only after substantial
+content is already laid out.
 
 ```rust
 // Wrong: every background parse throws away the visible block geometry.
@@ -1068,6 +1068,9 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   matching resolution, independently of the turn-level pending flag. The turn
   flag answers whether any request still blocks the turn; it must not keep an
   already resolved card actionable while a sibling request remains pending.
+  Track the turn's boundary-error state incrementally as items are appended;
+  rescanning the turn's already-collected items for every later item makes
+  projection quadratic in the streaming item count.
 - Timeline rows carry stable turn metadata (`turnId`, item count, failed,
   pending-permission, and conclusion) so virtual cards can expose conclusion
   and failure state without reparsing the full transcript in the renderer.
@@ -1076,21 +1079,26 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   virtualizes Turns, keeps an active Turn's process open, defaults completed
   process history closed, and never repeats Agent/Streaming attribution per
   delta row.
-- Turn virtualization is not sufficient for one extremely tall Agent message.
-  Long `MarkdownPresentation::Agent` documents must additionally virtualize
+- Turn virtualization is not sufficient for one extremely tall Agent message or
+  reasoning thought. Long `MarkdownPresentation::Agent` and
+  `MarkdownPresentation::Thought` documents must additionally virtualize
   top-level Markdown blocks against the outer timeline content mask, retain a
   bounded overscan window, and converge estimated block heights to measured
   heights. The virtual flow reserves the complete document height and continues
   to use the timeline's one vertical scroll handle; it must not add an inner
-  height cap or nested vertical scrollbar. Short Agent messages and non-Agent
-  document surfaces keep the full-render path. Markdown above the synchronous
-  parse budget parses in the background and applies only the latest generation.
+  height cap or nested vertical scrollbar. Short Agent/Thought messages and
+  non-streaming document surfaces (`MarkdownPresentation::Document`) keep the
+  full-render path. Markdown above the synchronous parse budget parses in the
+  background and applies only the latest generation.
 - Copying a complete streaming Markdown source is throttled per row (time and
   byte thresholds) while deltas arrive; a final or non-streaming row refreshes
-  immediately. Markdown and tool-card projection caches are both bounded by an
-  entry limit and a resident-byte budget, and a single oversized active value may
-  remain as the sole cached entry without allowing older entries to grow
-  unbounded.
+  immediately. The expanded live reasoning body has no `TimelineRow` and must
+  share the same throttled snapshot window, keyed on its own stable identity, so
+  an animated repaint or a fast delta stream cannot hand the whole growing
+  thought to a `MarkdownView` on every frame. Markdown and tool-card projection
+  caches are both bounded by an entry limit and a resident-byte budget, and a
+  single oversized active value may remain as the sole cached entry without
+  allowing older entries to grow unbounded.
 - Collapsed reasoning previews and tooltips are derived once per stable row
   revision and reused across animated repaints. The expanded reasoning path
   delegates parsing to the keyed background `MarkdownView`; it must not parse

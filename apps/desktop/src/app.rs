@@ -1309,32 +1309,43 @@ fn timeline_reasoning_summary_cached(
     timeline_reasoning_summary_cached_at(cache, key, sequence, source, false, Instant::now())
 }
 
+/// Copy a streaming Markdown source at most once per time/byte window.
+///
+/// `sequence` is the caller's content revision. The returned sequence is the
+/// revision that was actually snapshotted, so a throttled call keeps returning
+/// the previous revision and the downstream `MarkdownView` does not reparse a
+/// source it already holds. This is shared by timeline rows and the expanded
+/// live reasoning body, which has no `TimelineRow` of its own.
 fn timeline_markdown_source_snapshot(
     cache: &mut BTreeMap<String, (i64, TimelineMarkdownSourceSnapshot)>,
-    row: &TimelineRow,
+    key: &str,
+    source: &str,
+    sequence: i64,
+    streaming: bool,
     now: Instant,
     allow_throttle: bool,
 ) -> (Arc<str>, i64) {
-    if let Some((sequence, snapshot)) = cache.get(&row.id) {
-        if *sequence == row.last_sequence && snapshot.source.len() == row.body.len() {
-            return (snapshot.source.clone(), *sequence);
+    if let Some((cached_sequence, snapshot)) = cache.get(key) {
+        if *cached_sequence == sequence && snapshot.source.len() == source.len() {
+            return (snapshot.source.clone(), *cached_sequence);
         }
-        if row.streaming && allow_throttle {
-            let pending_bytes = row.body.len().abs_diff(snapshot.source.len());
-            if now.saturating_duration_since(snapshot.refreshed_at)
-                < TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL
+        if streaming && allow_throttle {
+            let pending_bytes = source.len().abs_diff(snapshot.source.len());
+            if source.len() > snapshot.source.len()
+                && now.saturating_duration_since(snapshot.refreshed_at)
+                    < TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL
                 && pending_bytes < TIMELINE_STREAMING_MARKDOWN_REFRESH_BYTES
             {
-                return (snapshot.source.clone(), *sequence);
+                return (snapshot.source.clone(), *cached_sequence);
             }
         }
     }
 
-    let source: Arc<str> = Arc::from(row.body.as_str());
+    let source: Arc<str> = Arc::from(source);
     insert_bounded_timeline_projection(
         cache,
-        row.id.clone(),
-        row.last_sequence,
+        key.to_string(),
+        sequence,
         TimelineMarkdownSourceSnapshot {
             source: source.clone(),
             refreshed_at: now,
@@ -1343,7 +1354,7 @@ fn timeline_markdown_source_snapshot(
         TIMELINE_MARKDOWN_SOURCE_CACHE_BYTES,
         |snapshot| snapshot.source.len(),
     );
-    (source, row.last_sequence)
+    (source, sequence)
 }
 
 fn agent_timeline_poll_interval(base_ms: u64, idle_poll_count: u16) -> Duration {
@@ -35055,9 +35066,31 @@ impl VibexWorkbench {
         });
         timeline_markdown_source_snapshot(
             &mut self.timeline_markdown_sources,
-            row,
+            row.id.as_str(),
+            row.body.as_str(),
+            row.last_sequence,
+            row.streaming,
             Instant::now(),
             allow_throttle,
+        )
+    }
+
+    /// Throttled Markdown source for the expanded live reasoning body.
+    ///
+    /// The live body has no `TimelineRow`; without this it would hand the whole
+    /// growing thought to a `MarkdownView` on every frame, forcing a background
+    /// reparse (and a document re-apply that resets selection) at animation
+    /// cadence. Reusing the row snapshot cache keeps the expanded thought on the
+    /// same time/byte window as every other streaming Markdown surface.
+    fn timeline_live_reasoning_source(&mut self, turn_id: &str, body: &str) -> (Arc<str>, i64) {
+        timeline_markdown_source_snapshot(
+            &mut self.timeline_markdown_sources,
+            &format!("reasoning-live:{turn_id}"),
+            body,
+            i64::try_from(body.len()).unwrap_or(i64::MAX),
+            true,
+            Instant::now(),
+            true,
         )
     }
 
@@ -36037,12 +36070,14 @@ impl VibexWorkbench {
         let tooltip = self.strings().agent_expand_process;
         let turn_id = turn.id.clone();
         if expanded {
-            let (first_line_source, remaining_source) = reasoning_source_parts(body);
+            let (source, sequence) = self.timeline_live_reasoning_source(&turn_id, body);
+            let revision = u64::try_from(sequence).unwrap_or_default();
+            let (first_line_source, remaining_source) = reasoning_source_parts(source.as_ref());
             let first_line = self
                 .reasoning_markdown_view(
                     format!("thought:{row_id}:first-line"),
                     Arc::<str>::from(first_line_source),
-                    u64::try_from(body.len()).unwrap_or_default(),
+                    revision,
                     true,
                     None,
                     cx,
@@ -36057,7 +36092,7 @@ impl VibexWorkbench {
                 self.reasoning_markdown_view(
                     format!("thought:{row_id}:remaining"),
                     Arc::<str>::from(source),
-                    u64::try_from(body.len()).unwrap_or_default(),
+                    revision,
                     true,
                     None,
                     cx,
@@ -52323,8 +52358,15 @@ mod tests {
             file_path: None,
         };
         let started_at = Instant::now();
-        let (first_source, first_sequence) =
-            timeline_markdown_source_snapshot(&mut cache, &row, started_at, false);
+        let (first_source, first_sequence) = timeline_markdown_source_snapshot(
+            &mut cache,
+            row.id.as_str(),
+            row.body.as_str(),
+            row.last_sequence,
+            row.streaming,
+            started_at,
+            false,
+        );
         assert_eq!(first_source.as_ref(), "first");
         assert_eq!(first_sequence, 1);
 
@@ -52332,7 +52374,10 @@ mod tests {
         row.last_sequence = 2;
         let (throttled_source, throttled_sequence) = timeline_markdown_source_snapshot(
             &mut cache,
-            &row,
+            row.id.as_str(),
+            row.body.as_str(),
+            row.last_sequence,
+            row.streaming,
             started_at + TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL / 2,
             true,
         );
@@ -52341,7 +52386,10 @@ mod tests {
 
         let (refreshed_source, refreshed_sequence) = timeline_markdown_source_snapshot(
             &mut cache,
-            &row,
+            row.id.as_str(),
+            row.body.as_str(),
+            row.last_sequence,
+            row.streaming,
             started_at + TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL,
             true,
         );
@@ -52353,7 +52401,10 @@ mod tests {
         row.streaming = false;
         let (final_source, final_sequence) = timeline_markdown_source_snapshot(
             &mut cache,
-            &row,
+            row.id.as_str(),
+            row.body.as_str(),
+            row.last_sequence,
+            row.streaming,
             started_at + TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL,
             false,
         );
@@ -52365,7 +52416,10 @@ mod tests {
         row.streaming = true;
         let (replacement_source, replacement_sequence) = timeline_markdown_source_snapshot(
             &mut cache,
-            &row,
+            row.id.as_str(),
+            row.body.as_str(),
+            row.last_sequence,
+            row.streaming,
             started_at + TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL,
             false,
         );

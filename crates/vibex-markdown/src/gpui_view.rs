@@ -861,7 +861,16 @@ impl MarkdownViewState {
     }
 
     fn should_virtualize_blocks(&self) -> bool {
-        if self.options.presentation != MarkdownPresentation::Agent {
+        // Agent answers and reasoning thoughts are the two streaming,
+        // unbounded-length surfaces. A long thought must virtualize for the
+        // same reason a long answer does: otherwise the outer timeline's
+        // per-frame repaint renders every block of a document that can reach
+        // hundreds of kilobytes. Document previews stay on the full-render
+        // path because they are opened, not streamed.
+        if !matches!(
+            self.options.presentation,
+            MarkdownPresentation::Agent | MarkdownPresentation::Thought
+        ) {
             return false;
         }
         let block_count = self.document.blocks.len();
@@ -1027,10 +1036,19 @@ impl MarkdownViewState {
     ) -> Option<AnyElement> {
         let block = self.document.blocks.get(index)?.clone();
         let is_last = index + 1 == self.document.blocks.len();
+        // Virtual blocks are prepainted outside the root's child chain, so the
+        // root's inherited text color does not reach them. Re-apply the same
+        // presentation color here; otherwise a virtualized Thought would lose
+        // its muted treatment and render at the default foreground.
+        let text_color = match self.options.presentation {
+            MarkdownPresentation::Thought => cx.theme().muted_foreground,
+            _ => cx.theme().foreground,
+        };
         Some(
             div()
                 .w_full()
                 .min_w_0()
+                .text_color(text_color)
                 .when(!is_last, |this| this.pb(px(AGENT_BLOCK_GAP_PX)))
                 .child(self.render_block(&block, window, cx))
                 .into_any_element(),
@@ -4226,6 +4244,33 @@ mod tests {
             state.options.streaming = false;
             assert!(state.record_virtual_block_heights(width, &[(tail, px(63.0))]));
             assert_eq!(state.virtual_block_sizes[tail], px(63.0));
+        });
+    }
+
+    #[::gpui::test]
+    fn long_thought_documents_enter_block_virtualization(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let source = (0..12)
+            .map(|index| format!("## Thought {index}\n\n{}", "reasoning detail ".repeat(96)))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let input = MarkdownInput::new(source, "", 1).surface(MarkdownSurface::Agent);
+        let document = Arc::new(parse_markdown(input.clone()));
+        let options = MarkdownViewOptions {
+            presentation: MarkdownPresentation::Thought,
+            streaming: true,
+            ..MarkdownViewOptions::default()
+        };
+        let (state, cx) = cx.add_window_view(|_, cx| {
+            MarkdownViewState::new("thought-virtual".into(), input, Some(document), options, cx)
+        });
+
+        state.update(cx, |state, _| {
+            assert!(state.document.blocks.len() >= AGENT_BLOCK_VIRTUALIZATION_MIN_LARGE_BLOCKS);
+            assert!(state.should_virtualize_blocks());
+            // Document previews are opened, not streamed, and stay full-render.
+            state.options.presentation = MarkdownPresentation::Document;
+            assert!(!state.should_virtualize_blocks());
         });
     }
 
