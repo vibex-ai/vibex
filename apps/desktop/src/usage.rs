@@ -207,6 +207,7 @@ impl UsageView {
                         this.stale = this.statistics.is_some();
                     }
                 }
+                this.sync_table_delegate(cx);
                 cx.notify();
             });
         }));
@@ -225,9 +226,7 @@ impl UsageView {
             self.request.dimension = dimension;
             // The leading table column is named after the dimension, so the
             // stored column groups must re-derive before the next paint.
-            if let Some(table) = &self.table {
-                table.update(cx, |table, cx| table.refresh(cx));
-            }
+            self.sync_table_delegate(cx);
             self.refresh(cx);
         }
     }
@@ -779,13 +778,51 @@ impl UsageView {
             .into_any_element()
     }
 
+    /// Push the state the table delegate paints into the `TableState`.
+    ///
+    /// The delegate owns its snapshot so that neither the table's refresh nor
+    /// its render has to read back into this view, which would panic while
+    /// the view is leased.
+    fn sync_table_delegate(&mut self, cx: &mut Context<Self>) {
+        let Some(table) = self.table.clone() else {
+            return;
+        };
+        let dimension = self.request.dimension;
+        let sort_metric = self.request.sort_metric;
+        let sort_direction = self.request.sort_direction;
+        let rows = self
+            .statistics
+            .as_ref()
+            .map(|statistics| statistics.dimension_rows.clone())
+            .unwrap_or_default();
+        table.update(cx, |table, cx| {
+            if table
+                .delegate_mut()
+                .apply_snapshot(dimension, sort_metric, sort_direction, rows)
+            {
+                table.refresh(cx);
+                cx.notify();
+            }
+        });
+    }
+
     fn render_usage_table(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let table = match &self.table {
             Some(table) => table.clone(),
             None => {
-                let view = cx.weak_entity();
+                let delegate = UsageTableDelegate {
+                    view: cx.weak_entity(),
+                    dimension: self.request.dimension,
+                    sort_metric: self.request.sort_metric,
+                    sort_direction: self.request.sort_direction,
+                    rows: self
+                        .statistics
+                        .as_ref()
+                        .map(|statistics| statistics.dimension_rows.clone())
+                        .unwrap_or_default(),
+                };
                 let table = cx.new(|cx| {
-                    TableState::new(UsageTableDelegate { view }, window, cx)
+                    TableState::new(delegate, window, cx)
                         .col_movable(false)
                         .col_resizable(false)
                         .row_selectable(false)
@@ -2073,11 +2110,43 @@ fn dimension_label(dimension: AgentUsageDimension) -> &'static str {
 
 const USAGE_TABLE_LABEL_WIDTH: f32 = 280.0;
 
+/// Renders the usage breakdown table.
+///
+/// The delegate owns every value it paints. It must not read back into
+/// `UsageView`: the `TableState` renders and refreshes from inside that
+/// view's own update, where reading the leased entity panics with
+/// "cannot read `UsageView` while it is already being updated".
 struct UsageTableDelegate {
     view: WeakEntity<UsageView>,
+    dimension: AgentUsageDimension,
+    sort_metric: AgentUsageSortMetric,
+    sort_direction: AgentUsageSortDirection,
+    rows: Vec<AgentUsageDimensionRow>,
 }
 
 impl UsageTableDelegate {
+    fn apply_snapshot(
+        &mut self,
+        dimension: AgentUsageDimension,
+        sort_metric: AgentUsageSortMetric,
+        sort_direction: AgentUsageSortDirection,
+        rows: Vec<AgentUsageDimensionRow>,
+    ) -> bool {
+        let columns_changed = self.dimension != dimension
+            || self.sort_metric != sort_metric
+            || self.sort_direction != sort_direction;
+        let rows_changed = self.rows != rows;
+        if columns_changed {
+            self.dimension = dimension;
+            self.sort_metric = sort_metric;
+            self.sort_direction = sort_direction;
+        }
+        if rows_changed {
+            self.rows = rows;
+        }
+        columns_changed || rows_changed
+    }
+
     fn sort_target(col_ix: usize) -> Option<AgentUsageSortMetric> {
         Some(match col_ix {
             1 => AgentUsageSortMetric::Requests,
@@ -2134,23 +2203,15 @@ impl TableDelegate for UsageTableDelegate {
         9
     }
 
-    fn rows_count(&self, cx: &App) -> usize {
-        self.view
-            .upgrade()
-            .and_then(|view| view.read(cx).statistics.as_ref())
-            .map(|statistics| statistics.dimension_rows.len())
-            .unwrap_or(0)
+    fn rows_count(&self, _cx: &App) -> usize {
+        self.rows.len()
     }
 
-    fn column(&self, col_ix: usize, cx: &App) -> Column {
-        let Some(view) = self.view.upgrade() else {
-            return Column::new("usage-missing", "");
-        };
-        let view = view.read(cx);
-        let sort_metric = view.request.sort_metric;
-        let sort_direction = view.request.sort_direction;
+    fn column(&self, col_ix: usize, _cx: &App) -> Column {
+        let sort_metric = self.sort_metric;
+        let sort_direction = self.sort_direction;
         match col_ix {
-            0 => Self::label_column(view.request.dimension),
+            0 => Self::label_column(self.dimension),
             1 => Self::sortable_column(
                 "requests",
                 locale::text("Requests", "请求", "請求"),
@@ -2283,15 +2344,7 @@ impl TableDelegate for UsageTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        let Some(view) = self.view.upgrade() else {
-            return div().into_any_element();
-        };
-        let view = view.read(cx);
-        let Some(row) = view
-            .statistics
-            .as_ref()
-            .and_then(|statistics| statistics.dimension_rows.get(row_ix))
-        else {
+        let Some(row) = self.rows.get(row_ix) else {
             return div().into_any_element();
         };
         let aggregate = &row.aggregate;
@@ -2377,16 +2430,8 @@ impl TableDelegate for UsageTableDelegate {
         }
     }
 
-    fn cell_text(&self, row_ix: usize, col_ix: usize, cx: &App) -> String {
-        let Some(view) = self.view.upgrade() else {
-            return String::new();
-        };
-        let view = view.read(cx);
-        let Some(row) = view
-            .statistics
-            .as_ref()
-            .and_then(|statistics| statistics.dimension_rows.get(row_ix))
-        else {
+    fn cell_text(&self, row_ix: usize, col_ix: usize, _cx: &App) -> String {
+        let Some(row) = self.rows.get(row_ix) else {
             return String::new();
         };
         let aggregate = &row.aggregate;
@@ -2719,6 +2764,104 @@ fn format_timestamp(timestamp_ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn usage_metric(value: u64, requests: u64) -> AgentUsageMetricValue {
+        AgentUsageMetricValue {
+            value: Some(value),
+            coverage: AgentUsageMetricCoverage::Complete,
+            known_requests: requests,
+            derived_requests: 0,
+            total_requests: requests,
+        }
+    }
+
+    fn usage_aggregate(requests: u64) -> AgentUsageAggregate {
+        AgentUsageAggregate {
+            requests,
+            api_requests: Some(requests),
+            total_tokens: usage_metric(requests * 100, requests),
+            input_tokens: usage_metric(requests * 60, requests),
+            output_tokens: usage_metric(requests * 40, requests),
+            cached_tokens: usage_metric(requests * 10, requests),
+            thought_tokens: usage_metric(0, requests),
+            cached_write_tokens: usage_metric(0, requests),
+            cache_hit_rate: vibex_core::AgentUsageCacheHitRate {
+                basis_points: Some(2_500),
+                cached_read_tokens: requests * 10,
+                denominator_tokens: requests * 40,
+                eligible_requests: requests,
+                total_requests: requests,
+                coverage: AgentUsageMetricCoverage::Complete,
+            },
+            coverage: vibex_core::AgentUsageCoverageSummary {
+                complete_requests: requests,
+                total_requests: requests,
+                ..Default::default()
+            },
+            last_activity_at_ms: Some(1_700_000_000_000),
+        }
+    }
+
+    fn usage_statistics() -> AgentUsageStatistics {
+        AgentUsageStatistics {
+            generated_at_ms: 1_700_000_000_000,
+            effective_range: vibex_core::AgentUsageEffectiveRange {
+                start_at_ms: 0,
+                end_at_ms: 86_400_000,
+                bucket_kind: "day".to_string(),
+            },
+            totals: usage_aggregate(3),
+            trend_buckets: vec![vibex_core::AgentUsageTrendBucket {
+                id: "0".to_string(),
+                label: "2026-09-10".to_string(),
+                start_at_ms: 0,
+                end_at_ms: 86_400_000,
+                aggregate: usage_aggregate(3),
+            }],
+            dimension_rows: vec![
+                AgentUsageDimensionRow {
+                    id: "agent-a".to_string(),
+                    label: "Agent A".to_string(),
+                    aggregate: usage_aggregate(2),
+                },
+                AgentUsageDimensionRow {
+                    id: "agent-b".to_string(),
+                    label: "Agent B".to_string(),
+                    aggregate: usage_aggregate(1),
+                },
+            ],
+            filter_options: vibex_core::AgentUsageFilterOptions::default(),
+            annual: None,
+        }
+    }
+
+    #[gpui::test]
+    fn usage_table_renders_and_reloads_columns_without_reading_the_view(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (view, cx) = cx.add_window_view(|_, _| UsageView::new());
+        view.update(cx, |view, cx| {
+            view.statistics = Some(usage_statistics());
+            view.loading = false;
+            view.stale = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        // Switching dimension re-derives the table columns from inside the
+        // view's own update, where the delegate must not read the view back.
+        view.update(cx, |view, cx| {
+            view.choose_dimension(AgentUsageDimension::Model, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+    }
 
     #[test]
     fn compact_numbers_and_rates_are_stable() {

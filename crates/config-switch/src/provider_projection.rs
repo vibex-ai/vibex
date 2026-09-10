@@ -4412,7 +4412,7 @@ mod tests {
             TypedProjectionExpectation {
                 agent_id: "deepseek-harness",
                 base_url_key: None,
-                secret_env_key: "VIBEX_DEEPSEEK_HARNESS_API_KEY",
+                secret_env_key: "DEEPSEEK_API_KEY",
                 model_env_key: None,
                 overlay_path: Some("settings.yaml"),
                 overlay_format: Some("yaml"),

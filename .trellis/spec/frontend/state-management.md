@@ -551,6 +551,17 @@ Regression coverage for parent-driven control synchronization must assert that
 the child method accepts the required state snapshots and contains no reverse
 access to the parent entity.
 
+Entity-backed component delegates follow the same rule. A `TableDelegate` is
+called from inside the parent view's update whenever the table state is
+created, refreshed, or rendered, so `columns_count`, `rows_count`, `column`,
+`render_td`, and `cell_text` must serve data the delegate already owns
+instead of upgrading and reading the parent view. Push an owned snapshot
+(dimension, sort state, rows) into the delegate through the child entity
+update, then re-derive the component from that snapshot — for example
+`TableState::refresh` plus `cx.notify()` on the table entity. Safe update
+points are the parent's own event handlers and async state transitions, not
+`render`.
+
 ## Scenario: Interface And Code Font Preferences
 
 ### 1. Scope / Trigger
@@ -1175,6 +1186,13 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
 - Session-row context menus reuse those captured typed targets. Pin/unpin must call
   the same persisted `SidebarState` mutation as the inline pin button; menu actions
   must not maintain a second pin projection or infer the target from selection.
+- A session row sizes its trailing time/status column to its own content, so a
+  long title ellipsizes as late as possible against the visible status. The
+  hover action cluster is the only fixed-width slot, and it paints the row's
+  live background so hovering covers the title's tail with the exact color the
+  row paints at every frame of the hover wash. Do not reserve the action-slot
+  width on the status column: that truncates long titles while the buttons are
+  hidden and leaves dead space next to the title.
 - Session-row drag/drop carries the typed session id, project id, and pin band. A
   direct row-to-row reorder may target only another session in the same project
   and pin band; a folder drop may change the parent only inside that same project.

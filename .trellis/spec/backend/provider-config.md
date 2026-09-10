@@ -332,9 +332,10 @@ environment key and the final ACP authentication decision.
 ### 2. Contracts
 
 - Declare Chat Completions, Responses, and Anthropic Messages as user-selectable model interfaces for DeepSeek Harness.
-- Materialize the selected Profile as a private `$DSH_HOME/settings.yaml` containing one `llm-pi-ai.providers` route and the matching `agent-default-model` selection. Do not reduce the projection to `DEEPSEEK_BASE_URL` / `DEEPSEEK_API_KEY`.
+- Materialize the selected Profile as a private `$DSH_HOME/settings.yaml` containing one `llm-pi-ai.providers` route and the matching `agent-default-model` selection. Do not reduce the projection to `DEEPSEEK_BASE_URL` / `DEEPSEEK_API_KEY` alone.
 - Map Vibex wire protocols to Harness API ids exactly: `openai_chat_completions` -> `openai-completions`, `openai_responses` -> `openai-responses`, and `anthropic_messages` -> `anthropic-messages`.
 - Keep the selected credential in a Profile-scoped environment reference named by `apiKeyEnv`; never write its value into `settings.yaml`.
+- Name that environment reference `DEEPSEEK_API_KEY`. The Harness gates `session/new`, `session/load`, and `session/resume` on its launch-level credential lookup, which resolves the default DeepSeek route by exactly that name; a Vibex-scoped alias such as `VIBEX_DEEPSEEK_HARNESS_API_KEY` satisfies `apiKeyEnv` but fails the gate with `Authentication required`.
 - Project the selected model's declared display name, context/output limits, and image modality. Use the Harness defaults of 262,144 context tokens, 32,768 output tokens, and text-only input when those capabilities are undeclared.
 - Provider, protocol, endpoint, credential, or model changes remain process-scoped and require restart and resume.
 

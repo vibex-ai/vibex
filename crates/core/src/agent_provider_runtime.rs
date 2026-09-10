@@ -352,7 +352,11 @@ fn catalog_projection_shape(
             )),
             "deepseek-harness" => Ok(overlay_projection_shape(
                 ConfigOverlayStrategy::DeepseekHarnessSettingsYaml,
-                "VIBEX_DEEPSEEK_HARNESS_API_KEY",
+                // The Harness resolves its launch-level credential by the
+                // exact DeepSeek route name before `session/new`, so the
+                // projected Secret must use that name rather than a
+                // Vibex-scoped alias.
+                "DEEPSEEK_API_KEY",
                 vec![
                     catalog_interface(WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, true, true),
                     catalog_interface(WIRE_PROTOCOL_OPENAI_RESPONSES, true, true),
