@@ -19,7 +19,6 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     "apps/mobile/Cargo.toml",
     "apps/mobile/src/lib.rs",
     "apps/mobile/src/app.rs",
-    "apps/mobile/src/input.rs",
     "apps/mobile/src/pairing.rs",
     "apps/mobile/src/scanner.rs",
     "apps/mobile/src/storage.rs",
@@ -49,7 +48,6 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   const manifest = read("apps/mobile/Cargo.toml");
   const entry = read("apps/mobile/src/lib.rs");
   const app = read("apps/mobile/src/app.rs");
-  const input = read("apps/mobile/src/input.rs");
   const pairing = read("apps/mobile/src/pairing.rs");
   const scanner = read("apps/mobile/src/scanner.rs");
   const storage = read("apps/mobile/src/storage.rs");
@@ -113,8 +111,14 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   );
   assert(entry.includes('target_os = "ios"'), "ios_rust_entry_missing");
   assert(entry.includes("assets::load_fonts(cx)"), "native_mobile_font_loading_missing");
-  assert(input.includes("self.focus_handle.focus(window, cx)"), "native_text_input_focus_missing");
-  assert(input.includes("window.show_soft_keyboard()"), "native_text_input_keyboard_missing");
+  // Text entry used to be a hand-rolled field that focused itself and asked for
+  // the soft keyboard directly. Both duties moved to the kit: the composer is a
+  // kit textarea, and the kit input element claims the window input handler that
+  // the platform turns into a soft keyboard. Assert each half so the guarantee
+  // is not quietly lost along with the field that used to provide it.
+  assert(app.includes("Textarea::new(&self.composer_input)"), "native_composer_kit_input_missing");
+  assert(entry.includes("gpui_component::init(cx)"), "native_component_init_missing");
+  assert(gpuiWindow.includes("show_soft_keyboard"), "native_text_input_keyboard_missing");
 
   assert(android.includes('android:name=".GpuiNativeActivity"'), "android_gpui_activity_missing");
   assert(android.includes('android:value="vibex_mobile"'), "android_native_library_name_invalid");
@@ -220,7 +224,7 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     assert(pairing.includes(marker), `native_pairing_contract_missing:${marker}`);
   }
 
-  const scopedSource = [manifest, entry, app, input, pairing, scanner, android, androidActivity, androidScanner, androidStyles, iosMain, iosProject, iosScanner, iosHeader].join("\n");
+  const scopedSource = [manifest, entry, app, pairing, scanner, android, androidActivity, androidScanner, androidStyles, iosMain, iosProject, iosScanner, iosHeader].join("\n");
   for (const forbidden of ["Capacitor", "capacitor", "wasm-bindgen", "mobile-wasm"]) {
     assert(!scopedSource.includes(forbidden), `legacy_mobile_technology_present:${forbidden}`);
   }
@@ -232,7 +236,6 @@ function runSelfTest() {
     ["apps/mobile/Cargo.toml", source("apps/mobile/Cargo.toml")],
     ["apps/mobile/src/lib.rs", source("apps/mobile/src/lib.rs")],
     ["apps/mobile/src/app.rs", source("apps/mobile/src/app.rs")],
-    ["apps/mobile/src/input.rs", source("apps/mobile/src/input.rs")],
     ["apps/mobile/src/pairing.rs", source("apps/mobile/src/pairing.rs")],
     ["apps/mobile/src/scanner.rs", source("apps/mobile/src/scanner.rs")],
     ["apps/mobile/src/storage.rs", source("apps/mobile/src/storage.rs")],

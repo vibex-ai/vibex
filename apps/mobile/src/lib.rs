@@ -7,7 +7,6 @@ mod app;
 mod assets;
 mod background_connection;
 mod discovery;
-mod input;
 mod lifecycle;
 mod locale;
 mod markdown;

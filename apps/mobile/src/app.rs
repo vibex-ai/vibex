@@ -53,10 +53,6 @@ use vibex_ui::{
 };
 
 use crate::discovery::{LanDiscoveryCandidate, LanDiscoveryEvent, LanDiscoveryMode};
-use crate::input::{
-    Backspace, Copy, Cut, Delete, Down, Enter, Left, NavigateBack, Paste, Right, SelectAll,
-    SelectDown, SelectLeft, SelectRight, SelectUp, TextInput, Up,
-};
 use crate::lifecycle::MobileLifecycleEvent;
 use crate::pairing::{
     MobileCredentialBundle, claim_pairing_link, claim_server_pairing_code,
@@ -70,7 +66,8 @@ use crate::sidebar::{
 use crate::storage::{AppSettings, CredentialStorage, MobileTimelineDisplaySettingsOverride};
 use crate::workbench::{MobileWorkbench, WorkbenchSurface};
 use crate::{locale, markdown, notifications, power, scanner, theme};
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::TextareaState;
+use gpui_component::input::{Input, InputState, Textarea};
 
 const TIMELINE_NEAR_BOTTOM_PX: f32 = 96.0;
 const TIMELINE_LIST_OVERDRAW_PX: f32 = 800.0;
@@ -534,31 +531,17 @@ fn apply_app_settings(settings: &AppSettings, cx: &App) {
     locale::set_preference(settings.language.unwrap_or_default());
 }
 
+// Pops the topmost screen from the app's back-navigation stack. Bound to the
+// Android "back" keystroke so the system back key/gesture walks up the page
+// stack instead of backgrounding the app.
+gpui::actions!(mobile_app, [NavigateBack]);
+
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         // Android's back key/gesture arrives as the "back" keystroke (mapped by
         // gpui_android). It pops the topmost screen; at the root the host
         // Activity already falls back to its own back behavior.
         KeyBinding::new("back", NavigateBack, None),
-        KeyBinding::new("backspace", Backspace, Some("MobileTextInput")),
-        KeyBinding::new("delete", Delete, Some("MobileTextInput")),
-        KeyBinding::new("enter", Enter, Some("MobileTextInput")),
-        KeyBinding::new("left", Left, Some("MobileTextInput")),
-        KeyBinding::new("right", Right, Some("MobileTextInput")),
-        KeyBinding::new("up", Up, Some("MobileTextInput")),
-        KeyBinding::new("down", Down, Some("MobileTextInput")),
-        KeyBinding::new("shift-left", SelectLeft, Some("MobileTextInput")),
-        KeyBinding::new("shift-right", SelectRight, Some("MobileTextInput")),
-        KeyBinding::new("shift-up", SelectUp, Some("MobileTextInput")),
-        KeyBinding::new("shift-down", SelectDown, Some("MobileTextInput")),
-        KeyBinding::new("cmd-a", SelectAll, Some("MobileTextInput")),
-        KeyBinding::new("ctrl-a", SelectAll, Some("MobileTextInput")),
-        KeyBinding::new("cmd-v", Paste, Some("MobileTextInput")),
-        KeyBinding::new("ctrl-v", Paste, Some("MobileTextInput")),
-        KeyBinding::new("cmd-c", Copy, Some("MobileTextInput")),
-        KeyBinding::new("ctrl-c", Copy, Some("MobileTextInput")),
-        KeyBinding::new("cmd-x", Cut, Some("MobileTextInput")),
-        KeyBinding::new("ctrl-x", Cut, Some("MobileTextInput")),
     ]);
 }
 
@@ -579,7 +562,11 @@ pub struct MobileApp {
     workbench: Option<Entity<MobileWorkbench>>,
     pending_workbench_surface: Option<WorkbenchSurface>,
     workbench_open: bool,
-    composer_input: Entity<TextInput>,
+    composer_input: Entity<TextareaState>,
+    /// Text to hand back to the composer if a send fails. The failure is
+    /// observed in an async task with no window, so the check-and-write is
+    /// deferred to the next paint.
+    pending_composer_restore: Option<String>,
     timeline_turns: Arc<Vec<TimelineConversationTurn>>,
     timeline_markdown_views: TimelineMarkdownViews,
     pending_user_message: Option<PendingMobileUserMessage>,
@@ -833,11 +820,15 @@ impl MobileApp {
             pending_workbench_surface: None,
             workbench_open: false,
             composer_input: cx.new(|cx| {
-                TextInput::new(
-                    locale::text("Message Vibex", "发送消息给 Vibex", "傳送訊息給 Vibex"),
-                    cx,
-                )
+                TextareaState::new(window, cx)
+                    .placeholder(locale::text(
+                        "Message Vibex",
+                        "发送消息给 Vibex",
+                        "傳送訊息給 Vibex",
+                    ))
+                    .auto_grow(1, 6)
             }),
+            pending_composer_restore: None,
             timeline_turns: Arc::new(Vec::new()),
             timeline_markdown_views: RefCell::new(BTreeMap::new()),
             pending_user_message: None,
@@ -4356,11 +4347,11 @@ impl MobileApp {
         cx.notify();
     }
 
-    fn send_message(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn send_message(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.operation_busy || self.runtime_switch_busy_generation.is_some() {
             return;
         }
-        let text = self.composer_input.read(cx).text().trim().to_string();
+        let text = self.composer_input.read(cx).value().trim().to_string();
         if text.is_empty() {
             return;
         }
@@ -4426,9 +4417,8 @@ impl MobileApp {
         let future = controller.send_message(request);
         self.pending_user_message = Some(pending_user_message);
         self.timeline_metadata_tip = None;
-        self.composer_input.update(cx, |input, cx| {
-            let _ = input.take(cx);
-        });
+        self.composer_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
         self.spawn_timeline_mutation(ticket, future, Some(restore_text), cx);
     }
 
@@ -4482,12 +4472,8 @@ impl MobileApp {
                     this.pending_user_message = None;
                 }
                 this.rebuild_timeline_turns();
-                if failed
-                    && let Some(text) = restore_composer
-                    && this.composer_input.read(cx).text().is_empty()
-                {
-                    this.composer_input
-                        .update(cx, |input, cx| input.set_text(text, cx));
+                if failed && let Some(text) = restore_composer {
+                    this.pending_composer_restore = Some(text);
                 }
                 cx.notify();
             });
@@ -10512,9 +10498,14 @@ impl MobileApp {
                     .border_color(theme::border_default())
                     .bg(theme::bg_card())
                     .flex()
-                    .items_center()
+                    .items_end()
                     .pl(px(theme::SPACING_XS))
-                    .child(div().flex_1().min_w_0().child(self.composer_input.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Textarea::new(&self.composer_input).appearance(false)),
+                    )
                     .child(
                         div()
                             .id(if running { "stop-turn" } else { "send-message" })
@@ -12389,6 +12380,14 @@ impl MobileApp {
 impl Render for MobileApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_elicitation_form(window, cx);
+        // Hand text back to the composer only if the user has not started a new
+        // message in the meantime, so a failed send never overwrites typing.
+        if let Some(text) = self.pending_composer_restore.take()
+            && self.composer_input.read(cx).value().is_empty()
+        {
+            self.composer_input
+                .update(cx, |input, cx| input.set_value(text, window, cx));
+        }
         // Writes recorded by paths that have no window. `InputState` refuses a
         // programmatic edit without one, so they land here instead.
         for (field, value) in std::mem::take(&mut self.pending_input_writes) {
