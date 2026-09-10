@@ -15,7 +15,8 @@ use gpui::{
     point, prelude::*, px, rgb, size,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, ElementExt as _, IconName, Selectable as _, Sizable as _,
+    ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Selectable as _,
+    Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -1464,9 +1465,19 @@ impl TerminalSurface {
             .when_some(active, |bar, index| bar.selected_index(index))
             .children(self.tabs.iter().map(|tab| {
                 let status = terminal_status_label(tab.session.status);
+                let title = tab.session.title.clone();
+                // `Tab` renders `icon` *instead of* `label` when both are set, so
+                // the session title rides the children slot and `aria_label`
+                // carries the accessible name.
                 Tab::new()
-                    .icon(IconName::SquareTerminal)
-                    .label(tab.session.title.clone())
+                    .aria_label(title.clone())
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(Icon::new(IconName::SquareTerminal).small())
+                            .child(title),
+                    )
                     .suffix(div().text_xs().child(status))
             }))
             .on_click(

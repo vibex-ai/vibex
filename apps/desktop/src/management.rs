@@ -7441,16 +7441,23 @@ impl ManagementCenter {
         let sections: Vec<ManagementSection> =
             items.iter().map(|(section, _, _)| *section).collect();
         TabBar::new("management-section-nav")
-            .large()
             .h(px(42.0))
             .w_full()
             .segmented()
             .selected_index(selected_index)
-            .children(
-                items
-                    .into_iter()
-                    .map(|(_, label, icon)| Tab::new().flex_1().icon(icon).label(label)),
-            )
+            .children(items.into_iter().map(|(_, label, icon)| {
+                // `Tab` renders its `icon` *instead of* its label when both are
+                // set (the icon branch sizes the tab to a square and drops the
+                // caption), so the icon and its label go in the `children` slot
+                // and `aria_label` carries the accessible name.
+                Tab::new().flex_1().aria_label(label).child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(Icon::new(icon).small())
+                        .child(label),
+                )
+            }))
             .on_click(cx.listener(move |this, index: &usize, window, cx| {
                 if let Some(section) = sections.get(*index) {
                     this.request_section_switch(*section, window, cx);
@@ -17188,6 +17195,25 @@ mod tests {
         assert!(renderer.contains("ManagementSection::Mcp"));
         assert!(renderer.contains("ManagementSection::Skills"));
         assert!(!renderer.contains("ManagementSection::Advanced"));
+    }
+
+    #[test]
+    fn management_primary_navigation_keeps_each_tab_caption_visible() {
+        let source = include_str!("management.rs");
+        let renderer = source
+            .split_once("    fn render_nav(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_content("))
+            .map(|(body, _)| body)
+            .expect("management primary navigation should remain inspectable");
+
+        // `Tab` renders `icon` *instead of* `label` when both are set, which
+        // silently dropped these captions once. The caption has to stay in the
+        // children slot (with `aria_label` carrying the accessible name) and the
+        // tabs have to keep `flex_1()` so the bar still fills its width.
+        assert!(renderer.contains(".aria_label(label)"));
+        assert!(renderer.contains(".child(label)"));
+        assert!(!renderer.contains(".label(label)"));
+        assert!(renderer.contains("Tab::new().flex_1()"));
     }
 
     #[test]
