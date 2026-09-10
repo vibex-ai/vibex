@@ -48751,55 +48751,75 @@ impl FoundationSettings {
                     stacked,
                     cx,
                 ),
-                setting_row(
-                    locale::text("Frosted glass", "磨砂玻璃", "磨砂玻璃"),
-                    locale::text(
-                        "Blur the content behind dialogs and floating menus.",
-                        "让对话框和浮出菜单背后的内容呈现模糊玻璃效果。",
-                        "讓對話框和浮出選單背後的內容呈現模糊玻璃效果。",
-                    ),
-                    Switch::new("glass-surfaces")
-                        .small()
-                        .checked(appearance.glass_surfaces)
-                        .on_click(cx.listener(|this, enabled, window, cx| {
-                            this.set_glass_surfaces(*enabled, window, cx)
-                        })),
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Glass blur strength", "玻璃模糊强度", "玻璃模糊強度"),
-                    locale::text(
-                        "Blur radius for frosted glass surfaces.",
-                        "磨砂玻璃表面的模糊半径。",
-                        "磨砂玻璃表面的模糊半徑。",
-                    ),
-                    settings_number_stepper(
-                        "glass-blur-radius",
-                        appearance.glass_blur_radius,
-                        Some("px"),
-                        4,
-                        64,
-                        cx.listener(|this, _, window, cx| {
-                            let current = this.appearance(cx).glass_blur_radius;
-                            this.set_glass_blur_radius(current.saturating_sub(4).max(4), window, cx)
-                        }),
-                        cx.listener(|this, _, window, cx| {
-                            let current = this.appearance(cx).glass_blur_radius;
-                            this.set_glass_blur_radius(
-                                current.saturating_add(4).min(64),
-                                window,
+            ]
+            .into_iter()
+            // Windows' DirectX renderer cannot snapshot the framebuffer,
+            // so frosted glass has no effect there and the controls would
+            // be dead ends; keep them to platforms with backdrop blur.
+            .chain({
+                // Windows' DirectX renderer cannot snapshot the framebuffer,
+                // so frosted glass has no effect there and the controls would
+                // be dead ends; keep them to platforms with backdrop blur.
+                if glass::platform_supports_backdrop_blur() {
+                    vec![
+                        setting_row(
+                            locale::text("Frosted glass", "磨砂玻璃", "磨砂玻璃"),
+                            locale::text(
+                                "Blur the content behind dialogs and floating menus.",
+                                "让对话框和浮出菜单背后的内容呈现模糊玻璃效果。",
+                                "讓對話框和浮出選單背後的內容呈現模糊玻璃效果。",
+                            ),
+                            Switch::new("glass-surfaces")
+                                .small()
+                                .checked(appearance.glass_surfaces)
+                                .on_click(cx.listener(|this, enabled, window, cx| {
+                                    this.set_glass_surfaces(*enabled, window, cx)
+                                })),
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            locale::text("Glass blur strength", "玻璃模糊强度", "玻璃模糊強度"),
+                            locale::text(
+                                "Blur radius for frosted glass surfaces.",
+                                "磨砂玻璃表面的模糊半径。",
+                                "磨砂玻璃表面的模糊半徑。",
+                            ),
+                            settings_number_stepper(
+                                "glass-blur-radius",
+                                appearance.glass_blur_radius,
+                                Some("px"),
+                                4,
+                                64,
+                                cx.listener(|this, _, window, cx| {
+                                    let current = this.appearance(cx).glass_blur_radius;
+                                    this.set_glass_blur_radius(
+                                        current.saturating_sub(4).max(4),
+                                        window,
+                                        cx,
+                                    )
+                                }),
+                                cx.listener(|this, _, window, cx| {
+                                    let current = this.appearance(cx).glass_blur_radius;
+                                    this.set_glass_blur_radius(
+                                        current.saturating_add(4).min(64),
+                                        window,
+                                        cx,
+                                    )
+                                }),
+                                locale::text("Decrease blur", "减小模糊", "減小模糊"),
+                                locale::text("Increase blur", "增大模糊", "增大模糊"),
                                 cx,
-                            )
-                        }),
-                        locale::text("Decrease blur", "减小模糊", "減小模糊"),
-                        locale::text("Increase blur", "增大模糊", "增大模糊"),
-                        cx,
-                    ),
-                    stacked,
-                    cx,
-                ),
-            ],
+                            ),
+                            stacked,
+                            cx,
+                        ),
+                    ]
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect(),
             cx,
         )
     }

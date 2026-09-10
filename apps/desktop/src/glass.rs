@@ -28,6 +28,25 @@ pub const DEFAULT_GLASS_BLUR_RADIUS: f32 = 24.0;
 /// the theme color's alpha yields to what the blur resolved behind the card.
 pub const DEFAULT_GLASS_TINT_OPACITY: f32 = 0.82;
 
+/// Whether the platform's GPUI renderer implements backdrop blur.
+///
+/// Windows renders through the vendored DirectX pipeline, which never reads
+/// `BackdropBlur` primitives, so frosted cards would silently degrade to
+/// translucent tints over an opaque window there. Linux, macOS, and the
+/// mobile/web renderers (wgpu / Metal) snapshot and blur the framebuffer. The
+/// appearance layer uses this to keep the preference off and hide its
+/// settings entries instead of exposing a control with no effect.
+pub fn platform_supports_backdrop_blur() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        false
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        true
+    }
+}
+
 /// Global frosted-glass preference.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GlassSettings {

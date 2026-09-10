@@ -54,7 +54,9 @@ fn shared_highlight_theme(is_dark: bool) -> Arc<HighlightTheme> {
 fn apply_glass_surfaces(appearance: &AppearanceUiState, cx: &mut App) {
     glass::apply_glass_settings(
         glass::GlassSettings {
-            enabled: appearance.glass_surfaces,
+            // Windows' DirectX renderer drops backdrop blurs entirely, so the
+            // preference is forced off there no matter what was persisted.
+            enabled: appearance.glass_surfaces && glass::platform_supports_backdrop_blur(),
             blur_radius: f32::from(appearance.glass_blur_radius.clamp(4, 64)),
             tint_opacity: glass::DEFAULT_GLASS_TINT_OPACITY,
         },
