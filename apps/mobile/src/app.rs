@@ -70,6 +70,7 @@ use crate::sidebar::{
 use crate::storage::{AppSettings, CredentialStorage, MobileTimelineDisplaySettingsOverride};
 use crate::workbench::{MobileWorkbench, WorkbenchSurface};
 use crate::{locale, markdown, notifications, power, scanner, theme};
+use gpui_component::input::{Input, InputState};
 
 const TIMELINE_NEAR_BOTTOM_PX: f32 = 96.0;
 const TIMELINE_LIST_OVERDRAW_PX: f32 = 800.0;
@@ -653,7 +654,10 @@ pub struct MobileApp {
     runtime_options_open: bool,
     runtime_options_target: RuntimeOptionsTarget,
     runtime_draft: Option<SessionRuntimeSelection>,
-    runtime_sheet_search: Option<Entity<TextInput>>,
+    runtime_sheet_search: Option<Entity<InputState>>,
+    /// Re-renders the sheet while the model search changes, so the list below
+    /// filters as the user types.
+    runtime_sheet_search_subscription: Option<gpui::Subscription>,
     /// Desktop agent snapshots keyed by id, providing the labels the desktop
     /// uses for brand lookup and the `order_index` ordering its menus show.
     runtime_agent_labels: BTreeMap<AgentId, String>,
@@ -915,6 +919,7 @@ impl MobileApp {
             runtime_options_target: RuntimeOptionsTarget::ActiveSession,
             runtime_draft: None,
             runtime_sheet_search: None,
+            runtime_sheet_search_subscription: None,
             runtime_agent_labels: BTreeMap::new(),
             runtime_agent_order: Vec::new(),
             runtime_agent_strip_scroll: ScrollHandle::new(),
@@ -1944,7 +1949,12 @@ impl MobileApp {
         cx.notify();
     }
 
-    fn open_runtime_options(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn open_runtime_options(
+        &mut self,
+        _: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.runtime_switch_busy_generation.is_some() || self.session_action.is_some() {
             return;
         }
@@ -1988,10 +1998,16 @@ impl MobileApp {
         self.runtime_options_open = true;
         self.push_back_screen(BackScreen::RuntimeOptions);
         self.runtime_switch_error = None;
-        self.runtime_sheet_search =
-            Some(cx.new(|cx| {
-                TextInput::new(locale::text("Search models", "搜索模型", "搜尋模型"), cx)
-            }));
+        let runtime_sheet_search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(locale::text(
+                "Search models",
+                "搜索模型",
+                "搜尋模型",
+            ))
+        });
+        self.runtime_sheet_search_subscription =
+            Some(cx.observe(&runtime_sheet_search, |_, _, cx| cx.notify()));
+        self.runtime_sheet_search = Some(runtime_sheet_search);
         self.refresh_runtime_agents(cx);
         self.sync_runtime_feature_inputs(cx);
         self.anchor_runtime_agent_strip();
@@ -2004,7 +2020,7 @@ impl MobileApp {
     fn open_new_session_runtime_options(
         &mut self,
         _: &MouseUpEvent,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.runtime_switch_busy_generation.is_some()
@@ -2067,10 +2083,16 @@ impl MobileApp {
         self.runtime_options_open = true;
         self.push_back_screen(BackScreen::RuntimeOptions);
         self.runtime_switch_error = None;
-        self.runtime_sheet_search =
-            Some(cx.new(|cx| {
-                TextInput::new(locale::text("Search models", "搜索模型", "搜尋模型"), cx)
-            }));
+        let runtime_sheet_search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(locale::text(
+                "Search models",
+                "搜索模型",
+                "搜尋模型",
+            ))
+        });
+        self.runtime_sheet_search_subscription =
+            Some(cx.observe(&runtime_sheet_search, |_, _, cx| cx.notify()));
+        self.runtime_sheet_search = Some(runtime_sheet_search);
         self.refresh_runtime_agents(cx);
         self.sync_runtime_feature_inputs(cx);
         self.anchor_runtime_agent_strip();
@@ -2107,6 +2129,7 @@ impl MobileApp {
     /// with a fresh input instead of the previous query).
     fn reset_runtime_search(&mut self) {
         self.runtime_sheet_search = None;
+        self.runtime_sheet_search_subscription = None;
     }
 
     /// Switching the session Agent also re-scopes the model list: the draft
@@ -7273,7 +7296,15 @@ impl MobileApp {
                     .text_color(theme::text_muted()),
             )
             .when_some(self.runtime_sheet_search.clone(), |row, input| {
-                row.child(div().flex_1().min_w_0().child(input))
+                // The row already draws the band's divider and background, so
+                // the kit input contributes only the text surface and its
+                // editing behavior (selection, IME, and the soft keyboard).
+                row.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(Input::new(&input).appearance(false)),
+                )
             })
             .into_any_element()
     }
@@ -7291,7 +7322,7 @@ impl MobileApp {
         let query = self
             .runtime_sheet_search
             .as_ref()
-            .map(|input| input.read(cx).text().trim().to_lowercase())
+            .map(|input| input.read(cx).value().trim().to_lowercase())
             .unwrap_or_default();
         let Some((catalog, draft)) = catalog.zip(draft) else {
             return div()
