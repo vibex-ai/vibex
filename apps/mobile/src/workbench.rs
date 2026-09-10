@@ -32,6 +32,7 @@ use vibex_ui::{
 use crate::input::TextInput;
 use crate::locale;
 use crate::theme;
+use gpui_component::input::{Input, InputState};
 
 const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(600);
 /// Cell metrics copied from the desktop terminal surface so both clients
@@ -100,15 +101,21 @@ pub struct MobileWorkbench {
     files: FileWorkflowController,
     git: GitWorkflowController,
     terminal: TerminalWorkflowController,
-    file_search_input: Entity<TextInput>,
+    file_search_input: Option<Entity<InputState>>,
     file_search_mode: MobileFileSearchMode,
     file_editor_input: Entity<TextInput>,
     /// A chosen file takes over the whole Files surface as its own screen
     /// with a back button, instead of rendering inline under the tree.
     file_screen_open: bool,
-    git_commit_input: Entity<TextInput>,
-    git_history_query_input: Entity<TextInput>,
-    terminal_input: Entity<TextInput>,
+    git_commit_input: Option<Entity<InputState>>,
+    git_history_query_input: Option<Entity<InputState>>,
+    terminal_input: Option<Entity<InputState>>,
+    // Programmatic edits need a window and the async paths below have none,
+    // so a clear is recorded here and applied on the next paint.
+    file_search_clear_pending: bool,
+    git_commit_clear_pending: bool,
+    git_history_query_clear_pending: bool,
+    terminal_clear_pending: bool,
     file_editor_path: Option<String>,
     git_diff: Option<GitDiffResponse>,
     /// One commit opened from the Commits list takes over the Git surface as
@@ -159,29 +166,19 @@ impl MobileWorkbench {
             files,
             git,
             terminal,
-            file_search_input: cx
-                .new(|cx| TextInput::new(locale::text("Search files", "搜索文件", "搜尋檔案"), cx)),
+            file_search_input: None,
             file_search_mode: MobileFileSearchMode::Name,
             file_editor_input: cx.new(|cx| {
                 TextInput::new(locale::text("File content", "文件内容", "檔案內容"), cx).multiline()
             }),
             file_screen_open: false,
-            git_commit_input: cx.new(|cx| {
-                TextInput::new(locale::text("Commit message", "提交消息", "提交訊息"), cx)
-            }),
-            git_history_query_input: cx.new(|cx| {
-                TextInput::new(
-                    locale::text(
-                        "Search commit information or code",
-                        "搜索提交信息或代码",
-                        "搜尋提交資訊或代碼",
-                    ),
-                    cx,
-                )
-            }),
-            terminal_input: cx.new(|cx| {
-                TextInput::new(locale::text("Type a command", "输入命令", "輸入命令"), cx)
-            }),
+            git_commit_input: None,
+            git_history_query_input: None,
+            terminal_input: None,
+            file_search_clear_pending: false,
+            git_commit_clear_pending: false,
+            git_history_query_clear_pending: false,
+            terminal_clear_pending: false,
             file_editor_path: None,
             git_diff: None,
             git_commit_detail: None,
@@ -234,8 +231,7 @@ impl MobileWorkbench {
         self.terminal_close_confirmation = None;
         self.git_history_loading = false;
         self.git_history_request_generation = self.git_history_request_generation.wrapping_add(1);
-        self.git_history_query_input
-            .update(cx, |input, cx| input.set_text("", cx));
+        self.git_history_query_clear_pending = true;
         self.stop_terminal_poll();
         self.refresh_all(cx);
     }
@@ -350,7 +346,7 @@ impl MobileWorkbench {
     }
 
     fn start_file_search(&mut self, cx: &mut Context<Self>) {
-        let query = self.file_search_input.read(cx).text().trim().to_string();
+        let query = input_value(&self.file_search_input, cx).trim().to_string();
         if query.is_empty() {
             self.files.state.search.clear();
             cx.notify();
@@ -394,16 +390,17 @@ impl MobileWorkbench {
         cx: &mut Context<Self>,
     ) {
         self.file_search_mode = self.file_search_mode.toggle();
-        if !self.file_search_input.read(cx).text().trim().is_empty() {
+        if !input_value(&self.file_search_input, cx).trim().is_empty() {
             self.start_file_search(cx);
         } else {
             cx.notify();
         }
     }
 
-    fn clear_file_search(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.file_search_input
-            .update(cx, |input, cx| input.set_text("", cx));
+    fn clear_file_search(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(input) = self.file_search_input.clone() {
+            input.update(cx, |input, cx| input.set_value("", window, cx));
+        }
         self.files.state.search.clear();
         cx.notify();
     }
@@ -593,11 +590,72 @@ impl MobileWorkbench {
         self.tasks.push(task);
     }
 
+    /// Create the kit input states on first paint and land any clear that was
+    /// requested from a path without a window.
+    ///
+    /// `InputState::new` and every programmatic edit take `&mut Window`, but the
+    /// workbench is built and mutated from async paths that have none. Painting
+    /// always has one, so the fields are born here and deferred clears apply here.
+    fn ensure_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.file_search_input.is_none() {
+            self.file_search_input = Some(cx.new(|cx| {
+                InputState::new(window, cx).placeholder(locale::text(
+                    "Search files",
+                    "搜索文件",
+                    "搜尋檔案",
+                ))
+            }));
+        }
+        if self.git_commit_input.is_none() {
+            self.git_commit_input = Some(cx.new(|cx| {
+                InputState::new(window, cx).placeholder(locale::text(
+                    "Commit message",
+                    "提交消息",
+                    "提交訊息",
+                ))
+            }));
+        }
+        if self.git_history_query_input.is_none() {
+            self.git_history_query_input = Some(cx.new(|cx| {
+                InputState::new(window, cx).placeholder(locale::text(
+                    "Search commit information or code",
+                    "搜索提交信息或代码",
+                    "搜尋提交資訊或代碼",
+                ))
+            }));
+        }
+        if self.terminal_input.is_none() {
+            self.terminal_input = Some(cx.new(|cx| {
+                InputState::new(window, cx).placeholder(locale::text(
+                    "Type a command",
+                    "输入命令",
+                    "輸入命令",
+                ))
+            }));
+        }
+
+        let clears = [
+            (&mut self.file_search_clear_pending, &self.file_search_input),
+            (&mut self.git_commit_clear_pending, &self.git_commit_input),
+            (
+                &mut self.git_history_query_clear_pending,
+                &self.git_history_query_input,
+            ),
+            (&mut self.terminal_clear_pending, &self.terminal_input),
+        ];
+        for (pending, input) in clears {
+            if !*pending {
+                continue;
+            }
+            *pending = false;
+            if let Some(input) = input.clone() {
+                input.update(cx, |input, cx| input.set_value("", window, cx));
+            }
+        }
+    }
+
     fn search_git_history(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let query = self
-            .git_history_query_input
-            .read(cx)
-            .text()
+        let query = input_value(&self.git_history_query_input, cx)
             .trim()
             .to_string();
         let mut filter = self.git.state.model.history_filter.clone();
@@ -609,11 +667,12 @@ impl MobileWorkbench {
     fn clear_git_history_search(
         &mut self,
         _: &MouseUpEvent,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.git_history_query_input
-            .update(cx, |input, cx| input.set_text("", cx));
+        if let Some(input) = self.git_history_query_input.clone() {
+            input.update(cx, |input, cx| input.set_value("", window, cx));
+        }
         let mut filter = self.git.state.model.history_filter.clone();
         filter.query = None;
         self.git.state.model.set_history_filter(filter);
@@ -835,7 +894,7 @@ impl MobileWorkbench {
         {
             return;
         }
-        let message = self.git_commit_input.read(cx).text().trim().to_string();
+        let message = input_value(&self.git_commit_input, cx).trim().to_string();
         let paths = self.git.state.model.selected_change_paths();
         if paths.is_empty() {
             self.error = Some(BackendError::failed(
@@ -888,9 +947,7 @@ impl MobileWorkbench {
                 this.busy = false;
                 this.error = this.git.state.last_error.clone();
                 if this.error.is_none() {
-                    this.git_commit_input.update(cx, |input, cx| {
-                        let _ = input.take(cx);
-                    });
+                    this.git_commit_clear_pending = true;
                     this.notice = Some(locale::common("Commit created on desktop").to_string());
                     this.refresh_git(cx);
                 }
@@ -1124,7 +1181,7 @@ impl MobileWorkbench {
     }
 
     fn send_terminal_input(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let value = self.terminal_input.read(cx).text().to_string();
+        let value = input_value(&self.terminal_input, cx).to_string();
         if value.is_empty() {
             return;
         }
@@ -1209,9 +1266,7 @@ impl MobileWorkbench {
                 this.busy = false;
                 this.error = this.terminal.state.last_error.clone();
                 if clear_input && this.error.is_none() {
-                    this.terminal_input.update(cx, |input, cx| {
-                        let _ = input.take(cx);
-                    });
+                    this.terminal_clear_pending = true;
                 }
                 if let Some(terminal_id) = this
                     .terminal
@@ -1482,7 +1537,7 @@ impl MobileWorkbench {
         let selected_path = view.selected_path.clone();
         let rows = view.rows.clone();
         let search = view.search.clone();
-        let query_present = !self.file_search_input.read(cx).text().trim().is_empty();
+        let query_present = !input_value(&self.file_search_input, cx).trim().is_empty();
         let search_loading = self.files.state.search.is_loading();
         let search_has_results = !search.is_empty();
 
@@ -1522,7 +1577,7 @@ impl MobileWorkbench {
                                 div()
                                     .min_w_0()
                                     .flex_1()
-                                    .child(self.file_search_input.clone()),
+                                    .child(input_element(self.file_search_input.as_ref())),
                             )
                             .when(search_loading, |bar| {
                                 bar.child(
@@ -2005,16 +2060,12 @@ impl MobileWorkbench {
                                         .text_color(theme::text_muted()),
                                 )
                                 .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .child(self.git_history_query_input.clone()),
+                                    div().min_w_0().flex_1().child(input_element(
+                                        self.git_history_query_input.as_ref(),
+                                    )),
                                 )
                                 .when(
-                                    !self
-                                        .git_history_query_input
-                                        .read(cx)
-                                        .text()
+                                    !input_value(&self.git_history_query_input, cx)
                                         .trim()
                                         .is_empty(),
                                     |bar| {
@@ -2767,7 +2818,7 @@ impl MobileWorkbench {
             .flex()
             .flex_col()
             .gap_1()
-            .child(input_shell(self.git_commit_input.clone()))
+            .child(input_shell(self.git_commit_input.as_ref()))
             .when(self.git_commit_confirmation, |panel| {
                 panel.child(
                     div()
@@ -3282,7 +3333,7 @@ impl MobileWorkbench {
                             .border_color(theme::border_subtle())
                             .flex()
                             .gap_2()
-                            .child(input_shell(self.terminal_input.clone()))
+                            .child(input_shell(self.terminal_input.as_ref()))
                             .child(
                                 action_button("send-terminal-input", locale::common("Send"))
                                     .when(can_input, |button| {
@@ -3470,7 +3521,8 @@ impl MobileWorkbench {
 }
 
 impl Render for MobileWorkbench {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ensure_inputs(window, cx);
         let surface = self.surface;
         div()
             .size_full()
@@ -3573,7 +3625,7 @@ impl Render for MobileWorkbench {
     }
 }
 
-fn input_shell(input: Entity<TextInput>) -> gpui::Div {
+fn input_shell(input: Option<&Entity<InputState>>) -> gpui::Div {
     div()
         .h(px(theme::TOUCH_TARGET))
         .flex_1()
@@ -3583,7 +3635,24 @@ fn input_shell(input: Entity<TextInput>) -> gpui::Div {
         .border_color(theme::border_default())
         .bg(theme::bg_card())
         .px_1()
-        .child(input)
+        .child(input_element(input))
+}
+
+/// The text of a lazily-created kit input, or empty before the first paint.
+fn input_value(input: &Option<Entity<InputState>>, cx: &gpui::App) -> gpui::SharedString {
+    input
+        .as_ref()
+        .map(|input| input.read(cx).value())
+        .unwrap_or_default()
+}
+
+/// The kit input for a field that is created on first paint. The container
+/// already draws the frame, so the input contributes only its text surface.
+fn input_element(input: Option<&Entity<InputState>>) -> gpui::AnyElement {
+    match input {
+        Some(input) => Input::new(input).appearance(false).into_any_element(),
+        None => div().into_any_element(),
+    }
 }
 
 fn icon_button(
