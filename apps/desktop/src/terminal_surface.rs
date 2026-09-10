@@ -19,6 +19,7 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
+    tab::{Tab, TabBar},
     v_flex,
 };
 use vibex_content::{
@@ -1457,26 +1458,20 @@ impl TerminalSurface {
 
     fn render_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
         let active = self.active_tab;
-        h_flex()
-            .h(px(34.0))
-            .flex_none()
-            .items_center()
-            .gap_1()
-            .px_2()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .children(self.tabs.iter().enumerate().map(|(index, tab)| {
+        TabBar::new("terminal-tab-bar")
+            .large()
+            .underline()
+            .when_some(active, |bar, index| bar.selected_index(index))
+            .children(self.tabs.iter().map(|tab| {
                 let status = terminal_status_label(tab.session.status);
-                Button::new(format!("terminal-tab-{index}"))
-                    .small()
-                    .ghost()
+                Tab::new()
                     .icon(IconName::SquareTerminal)
-                    .label(format!("{} · {status}", tab.session.title))
-                    .selected(active == Some(index))
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.select_tab(index, window, cx)),
-                    )
+                    .label(tab.session.title.clone())
+                    .suffix(div().text_xs().child(status))
             }))
+            .on_click(
+                cx.listener(|this, index: &usize, window, cx| this.select_tab(*index, window, cx)),
+            )
             .into_any_element()
     }
 

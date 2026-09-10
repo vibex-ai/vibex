@@ -17,6 +17,7 @@ use gpui::{
 use gpui_component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath, Rope,
     RopeExt as _, Selectable as _, Sizable as _, Size, StyledExt as _, Theme, WindowExt as _,
+    alert::Alert,
     button::{Button, ButtonRounded, ButtonVariants as _, DropdownButton},
     calendar::Date,
     date_picker::{DatePicker, DatePickerEvent, DatePickerState},
@@ -31,6 +32,7 @@ use gpui_component::{
     scroll::{ScrollableElement as _, ScrollbarAxis},
     searchable_list::SearchableListItem,
     select::{Select, SelectEvent, SelectState},
+    spinner::Spinner,
     tooltip::Tooltip,
     v_flex,
 };
@@ -7254,30 +7256,23 @@ impl CodeWorkbench {
                             .w(px(200.0))
                             .flex_none()
                             .items_center()
-                            .gap_1()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(cx.theme().border)
-                            .bg(cx.theme().background)
-                            .px_2()
-                            .py(px(3.0))
-                            .shadow_md()
                             .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(Input::new(&goto_input).small().appearance(false)),
-                            )
-                            .child(
-                                Button::new(format!("editor-goto-cancel:{path}"))
-                                    .xsmall()
-                                    .ghost()
-                                    .compact()
-                                    .icon(IconName::Close)
-                                    .text_color(cx.theme().muted_foreground)
-                                    .tooltip(locale::text("Close", "关闭", "關閉"))
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.cancel_goto_line(cx)),
+                                Input::new(&goto_input)
+                                    .small()
+                                    .h(px(30.0))
+                                    .w_full()
+                                    .shadow_md()
+                                    .suffix(
+                                        Button::new(format!("editor-goto-cancel:{path}"))
+                                            .xsmall()
+                                            .ghost()
+                                            .compact()
+                                            .icon(IconName::Close)
+                                            .text_color(cx.theme().muted_foreground)
+                                            .tooltip(locale::text("Close", "关闭", "關閉"))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.cancel_goto_line(cx)
+                                            })),
                                     ),
                             ),
                     )
@@ -7693,7 +7688,7 @@ impl CodeWorkbench {
             .gap_2()
             .p_6()
             .text_center()
-            .child(Icon::new(IconName::LoaderCircle).size(px(16.0)))
+            .child(Spinner::new())
             .child(
                 div()
                     .min_w_0()
@@ -7708,7 +7703,7 @@ impl CodeWorkbench {
         &self,
         title: &str,
         error: String,
-        cx: &Context<Self>,
+        _cx: &Context<Self>,
     ) -> AnyElement {
         v_flex()
             .size_full()
@@ -7716,34 +7711,10 @@ impl CodeWorkbench {
             .justify_center()
             .p_6()
             .child(
-                h_flex()
+                Alert::error("git-preview-error", error)
+                    .title(title.to_string())
                     .w_full()
-                    .max_w(px(576.0))
-                    .items_start()
-                    .gap_2()
-                    .rounded(px(6.0))
-                    .border_1()
-                    .border_color(cx.theme().danger.opacity(0.48))
-                    .bg(cx.theme().danger.opacity(0.08))
-                    .p_4()
-                    .child(
-                        Icon::new(IconName::TriangleAlert)
-                            .size(px(16.0))
-                            .text_color(cx.theme().danger),
-                    )
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .gap_1()
-                            .child(div().text_sm().font_medium().child(title.to_string()))
-                            .child(
-                                div()
-                                    .whitespace_normal()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(error),
-                            ),
-                    ),
+                    .max_w(px(576.0)),
             )
             .into_any_element()
     }
@@ -9258,6 +9229,83 @@ impl CodeRightRail {
         let query_present = !self.file_search_input.read(cx).value().is_empty();
         let mode = self.file_search_mode;
         let options = self.file_search_options;
+        // The inline search options ride the field's `suffix` slot, so the kit
+        // `Input` owns the border, background and focus ring.
+        let trailing = h_flex()
+            .min_w_0()
+            .gap_1()
+            .items_center()
+            .when(self.file_search_loading, |this| {
+                this.child(
+                    Spinner::new()
+                        .with_size(Size::Small)
+                        .color(cx.theme().muted_foreground),
+                )
+            })
+            .when(query_present, |this| {
+                this.child(
+                    Button::new("clear-file-search")
+                        .xsmall()
+                        .ghost()
+                        .compact()
+                        .icon(IconName::Close)
+                        .tooltip(locale::text("Clear search", "清除搜索", "清除搜尋"))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.clear_file_search(window, cx)),
+                        ),
+                )
+            })
+            .when(mode == FileSearchMode::Content, |this| {
+                this.child(
+                    Button::new("file-search-case-sensitive")
+                        .xsmall()
+                        .ghost()
+                        .compact()
+                        .label("Aa")
+                        .selected(options.case_sensitive)
+                        .tooltip(locale::text("Match case", "区分大小写", "區分大小寫"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_file_search_option(FileSearchOption::CaseSensitive, cx)
+                        })),
+                )
+                .child(
+                    Button::new("file-search-whole-word")
+                        .xsmall()
+                        .ghost()
+                        .compact()
+                        .label("ab")
+                        .selected(options.whole_word)
+                        .tooltip(locale::text("Match whole word", "匹配整个词", "符合整個詞"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_file_search_option(FileSearchOption::WholeWord, cx)
+                        })),
+                )
+                .child(
+                    Button::new("file-search-regex")
+                        .xsmall()
+                        .ghost()
+                        .compact()
+                        .label(".*")
+                        .selected(options.regex)
+                        .tooltip(locale::text(
+                            "Use regular expression",
+                            "使用正则表达式",
+                            "使用正規表示式",
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_file_search_option(FileSearchOption::Regex, cx)
+                        })),
+                )
+            })
+            .child(
+                Button::new("toggle-file-search-mode")
+                    .xsmall()
+                    .ghost()
+                    .compact()
+                    .label(mode.title())
+                    .tooltip(mode.toggle_label())
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_file_search_mode(cx))),
+            );
         v_flex()
             .w_full()
             .flex_none()
@@ -9265,108 +9313,14 @@ impl CodeRightRail {
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
-                h_flex()
-                    .h_8()
+                Input::new(&self.file_search_input)
                     .w_full()
-                    .min_w_0()
-                    .gap_1()
-                    .rounded(cx.theme().radius)
-                    .border_1()
-                    .border_color(cx.theme().input)
-                    .bg(cx.theme().background)
-                    .px_2()
-                    .child(
+                    .prefix(
                         Icon::new(IconName::Search)
                             .xsmall()
                             .text_color(cx.theme().muted_foreground),
                     )
-                    .child(
-                        div().min_w_0().flex_1().child(
-                            Input::new(&self.file_search_input)
-                                .small()
-                                .appearance(false),
-                        ),
-                    )
-                    .when(self.file_search_loading, |this| {
-                        this.child(
-                            Icon::new(IconName::Loader)
-                                .xsmall()
-                                .text_color(cx.theme().muted_foreground),
-                        )
-                    })
-                    .when(query_present, |this| {
-                        this.child(
-                            Button::new("clear-file-search")
-                                .xsmall()
-                                .ghost()
-                                .compact()
-                                .icon(IconName::Close)
-                                .tooltip(locale::text("Clear search", "清除搜索", "清除搜尋"))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.clear_file_search(window, cx)
-                                })),
-                        )
-                    })
-                    .when(mode == FileSearchMode::Content, |this| {
-                        this.child(
-                            Button::new("file-search-case-sensitive")
-                                .xsmall()
-                                .ghost()
-                                .compact()
-                                .label("Aa")
-                                .selected(options.case_sensitive)
-                                .tooltip(locale::text("Match case", "区分大小写", "區分大小寫"))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.toggle_file_search_option(
-                                        FileSearchOption::CaseSensitive,
-                                        cx,
-                                    )
-                                })),
-                        )
-                        .child(
-                            Button::new("file-search-whole-word")
-                                .xsmall()
-                                .ghost()
-                                .compact()
-                                .label("ab")
-                                .selected(options.whole_word)
-                                .tooltip(locale::text(
-                                    "Match whole word",
-                                    "匹配整个词",
-                                    "符合整個詞",
-                                ))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.toggle_file_search_option(FileSearchOption::WholeWord, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("file-search-regex")
-                                .xsmall()
-                                .ghost()
-                                .compact()
-                                .label(".*")
-                                .selected(options.regex)
-                                .tooltip(locale::text(
-                                    "Use regular expression",
-                                    "使用正则表达式",
-                                    "使用正規表示式",
-                                ))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.toggle_file_search_option(FileSearchOption::Regex, cx)
-                                })),
-                        )
-                    })
-                    .child(
-                        Button::new("toggle-file-search-mode")
-                            .xsmall()
-                            .ghost()
-                            .compact()
-                            .label(mode.title())
-                            .tooltip(mode.toggle_label())
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.toggle_file_search_mode(cx)),
-                            ),
-                    ),
+                    .suffix(trailing),
             )
             .into_any_element()
     }
@@ -9912,11 +9866,7 @@ impl CodeRightRail {
             .w(px(224.0))
             .min_w_0()
             .flex_none()
-            .child(
-                Input::new(&self.inline_path_input)
-                    .small()
-                    .appearance(false),
-            )
+            .child(Input::new(&self.inline_path_input).small().w_full())
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape" {
                     this.cancel_inline_file_action(cx);
@@ -10589,7 +10539,7 @@ impl CodeRightRail {
                                     ),
                             )
                             .when(loading || pending, |this| {
-                                this.child(Icon::new(IconName::LoaderCircle).size(px(14.0)))
+                                this.child(Spinner::new().with_size(Size::Small))
                             }),
                     )
                     .when(
@@ -11361,27 +11311,19 @@ impl CodeRightRail {
                     )
                     .when(history_active, |this| {
                         this.child(
-                            h_flex()
+                            Input::new(&history_search_input)
+                                .small()
                                 .h(px(28.0))
                                 .min_w_0()
                                 .ml_auto()
                                 .flex_none()
                                 .w(px(260.0))
-                                .gap_1()
-                                .rounded(cx.theme().radius)
-                                .border_1()
-                                .border_color(cx.theme().input)
-                                .bg(cx.theme().background)
-                                .px_1p5()
-                                .child(
+                                .prefix(
                                     Icon::new(IconName::Search)
                                         .xsmall()
                                         .text_color(cx.theme().muted_foreground),
                                 )
-                                .child(div().min_w_0().flex_1().child(
-                                    Input::new(&history_search_input).small().appearance(false),
-                                ))
-                                .child(
+                                .suffix(
                                     Button::new("clear-git-history-search-toolbar")
                                         .xsmall()
                                         .ghost()
@@ -14358,39 +14300,17 @@ fn preview_destructive_badge(
         .into_any_element()
 }
 
-fn render_truncated_alert(truncated: bool, cx: &Context<CodeWorkbench>) -> AnyElement {
+fn render_truncated_alert(truncated: bool, _cx: &Context<CodeWorkbench>) -> AnyElement {
     if !truncated {
         return div().h(px(0.0)).flex_none().into_any_element();
     }
-    h_flex()
-        .flex_none()
-        .items_start()
-        .gap_2()
-        .m_3()
-        .rounded(px(6.0))
-        .border_1()
-        .border_color(cx.theme().warning.opacity(0.45))
-        .bg(cx.theme().warning.opacity(0.08))
-        .p_3()
-        .child(
-            Icon::new(IconName::TriangleAlert)
-                .size(px(16.0))
-                .text_color(cx.theme().warning),
-        )
-        .child(
-            v_flex()
-                .min_w_0()
-                .gap_1()
-                .child(div().text_sm().font_medium().child("Patch truncated"))
-                .child(
-                    div()
-                        .whitespace_normal()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("This preview shows the first bounded portion of the Git patch."),
-                ),
-        )
-        .into_any_element()
+    Alert::warning(
+        "git-patch-truncated",
+        "This preview shows the first bounded portion of the Git patch.",
+    )
+    .title("Patch truncated")
+    .m_3()
+    .into_any_element()
 }
 
 fn render_commit_patch_row(

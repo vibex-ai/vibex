@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, AppContext as _, BoxShadow, ClickEvent, Context, Entity, Focusable as _,
-    FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _,
-    ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled, Task, Window, div,
+    AnyElement, App, AppContext as _, ClickEvent, Context, Entity, Focusable as _, FontWeight,
+    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, ScrollHandle,
+    SharedString, StatefulInteractiveElement as _, Styled, Task, Window, div,
     prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
@@ -432,12 +432,9 @@ impl gpui::Render for DirectoryPickerDialog {
         let muted = crate::theme::semantic_color("muted-foreground", is_dark);
         let border = crate::theme::semantic_color("border", is_dark);
         let muted_bg = crate::theme::semantic_color("muted", is_dark);
-        let input_color = crate::theme::semantic_color("input", is_dark);
-        let ring = crate::theme::semantic_color("ring", is_dark);
         let danger = cx.theme().danger;
         let primary = cx.theme().primary;
 
-        let search_focused = self.search_input.focus_handle(cx).is_focused(window);
         let rows = self.filtered_entries(cx);
         let loading = self.phase == BrowsePhase::Loading;
         let load_error = match &self.phase {
@@ -754,28 +751,15 @@ impl gpui::Render for DirectoryPickerDialog {
                     .gap_2()
                     .pb_2()
                     .child(
-                        div()
+                        // `Input` owns its border and focus ring, so the field
+                        // only needs the flex slot.
+                        Input::new(&self.search_input)
+                            .small()
                             .flex_1()
                             .min_w_0()
-                            .h(px(32.0))
-                            .rounded(px(8.0))
-                            .border_1()
-                            .border_color(if search_focused { ring } else { input_color })
-                            .bg(muted_bg.opacity(0.5))
-                            .when(search_focused, |field| {
-                                field.shadow(vec![
-                                    BoxShadow::new(px(0.0), px(0.0), ring.opacity(0.30))
-                                        .spread_radius(px(2.0)),
-                                ])
-                            })
-                            .child(
-                                Input::new(&self.search_input)
-                                    .small()
-                                    .h_full()
-                                    .appearance(false)
-                                    .text_sm()
-                                    .prefix(Icon::new(IconName::Search).small().text_color(muted)),
-                            ),
+                            .text_sm()
+                            .cleanable(true)
+                            .prefix(Icon::new(IconName::Search).small().text_color(muted)),
                     )
                     .child(
                         Button::new("directory-picker-up")

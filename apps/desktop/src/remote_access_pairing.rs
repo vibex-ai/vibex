@@ -6,13 +6,15 @@ use gpui::{
     px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Size, StyledExt as _,
     WindowExt as _,
     button::{Button, ButtonVariants as _},
     dialog::DialogButtonProps,
     h_flex,
     input::{Input, InputEvent, InputState},
+    spinner::Spinner,
     tab::{Tab, TabBar},
+    tag::Tag,
     v_flex,
 };
 use image::{Frame, Rgba, RgbaImage};
@@ -2171,9 +2173,9 @@ impl RemoteAccessPairing {
                 .gap_3()
                 .py(px(48.0))
                 .child(
-                    Icon::new(IconName::LoaderCircle)
-                        .size(px(20.0))
-                        .text_color(cx.theme().muted_foreground),
+                    Spinner::new()
+                        .with_size(Size::Size(px(20.0)))
+                        .color(cx.theme().muted_foreground),
                 )
                 .child(
                     div()
@@ -2312,9 +2314,9 @@ impl RemoteAccessPairing {
                     .items_center()
                     .justify_center()
                     .child(
-                        Icon::new(IconName::LoaderCircle)
-                            .size(px(24.0))
-                            .text_color(cx.theme().muted_foreground),
+                        Spinner::new()
+                            .with_size(Size::Large)
+                            .color(cx.theme().muted_foreground),
                     )
                     .into_any_element()
             });
@@ -3339,17 +3341,16 @@ fn icon_tile(icon: IconName, tile: gpui::Pixels, glyph: gpui::Pixels, cx: &App) 
         .child(Icon::new(icon).size(glyph).text_color(cx.theme().primary))
 }
 
-fn status_pill(label: impl Into<SharedString>, color: gpui::Hsla) -> gpui::Div {
-    div()
-        .flex_none()
+fn status_pill(label: impl Into<SharedString>, color: gpui::Hsla) -> gpui::AnyElement {
+    let surface = color.opacity(0.12);
+    Tag::custom(surface, color, surface)
+        .xsmall()
         .rounded_full()
-        .bg(color.opacity(0.12))
         .px_2()
         .py(px(2.0))
-        .text_xs()
         .font_medium()
-        .text_color(color)
         .child(label.into())
+        .into_any_element()
 }
 
 fn radio_dot(selected: bool, cx: &App) -> gpui::Div {

@@ -17,6 +17,7 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     scroll::ScrollableElement as _,
+    status_bar::StatusBar,
     v_flex,
 };
 use image::{Frame, RgbaImage};
@@ -1097,21 +1098,11 @@ impl Render for PdfSurface {
             .child(self.render_toolbar(cx))
             .child(self.render_body(cx))
             .child(
-                h_flex()
-                    .h(px(32.0))
-                    .flex_none()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .px_3()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(self.note.clone().unwrap_or_else(|| {
+                StatusBar::new()
+                    .left(self.note.clone().unwrap_or_else(|| {
                         "Only visible pages plus bounded overscan are decoded".into()
                     }))
-                    .child(if self.worker_task.is_some() {
+                    .right(if self.worker_task.is_some() {
                         "isolated worker active".into()
                     } else {
                         format!(

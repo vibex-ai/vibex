@@ -14,6 +14,7 @@ use gpui::{
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
     StyledExt as _, WindowExt as _,
+    alert::Alert,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -1582,34 +1583,12 @@ fn import_stat(label: &'static str, value: u32, value_color: gpui::Hsla, cx: &Ap
         .into_any_element()
 }
 
-fn error_banner(label: &'static str, error: &str, cx: &App) -> AnyElement {
-    h_flex()
-        .w_full()
-        .flex_none()
-        .items_center()
-        .gap_2()
-        .rounded(px(8.0))
-        .border_1()
-        .border_color(cx.theme().danger.opacity(0.35))
-        .bg(cx.theme().danger.opacity(0.08))
-        .px_3()
-        .py_2()
-        .child(
-            Icon::new(IconName::TriangleAlert)
-                .size(px(14.0))
-                .flex_none()
-                .text_color(cx.theme().danger),
-        )
-        .child(
-            div()
-                .min_w_0()
-                .flex_1()
-                .truncate()
-                .text_xs()
-                .text_color(cx.theme().danger)
-                .child(format!("{label}: {error}")),
-        )
-        .into_any_element()
+fn error_banner(label: &'static str, error: &str, _cx: &App) -> AnyElement {
+    Alert::error(
+        format!("local-history-error-{label}"),
+        format!("{label}: {error}"),
+    )
+    .into_any_element()
 }
 
 fn folder_name(path: &str) -> String {

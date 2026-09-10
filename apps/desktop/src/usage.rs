@@ -332,25 +332,20 @@ impl UsageView {
             ),
         ];
         let selected_range = self.request.range;
-        let mut range_control = h_flex()
-            .flex_none()
-            .gap(px(2.0))
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().muted.opacity(0.35))
-            .p(px(2.0));
-        for (range, label) in ranges {
-            range_control = range_control.child(
+        let range_control = ButtonGroup::new("usage-range")
+            .xsmall()
+            .outline()
+            .compact()
+            .children(ranges.iter().map(|(range, label)| {
                 Button::new(SharedString::from(format!("usage-range-{range:?}")))
-                    .xsmall()
-                    .ghost()
-                    .h(px(26.0))
-                    .selected(range == selected_range)
-                    .label(label)
-                    .on_click(cx.listener(move |this, _, _, cx| this.choose_range(range, cx))),
-            );
-        }
+                    .label(*label)
+                    .selected(*range == selected_range)
+            }))
+            .on_click(cx.listener(move |this, selected: &Vec<usize>, _, cx| {
+                if let Some((range, _)) = selected.first().and_then(|index| ranges.get(*index)) {
+                    this.choose_range(*range, cx);
+                }
+            }));
 
         let options = self
             .statistics

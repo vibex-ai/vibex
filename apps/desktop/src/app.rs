@@ -22,11 +22,11 @@ use gpui::{
     DragMoveEvent, ElementId, Empty, Entity, EntityInputHandler, ExternalPaths, FocusHandle,
     Focusable as _, FontWeight, Global, HighlightStyle, Hsla, Image, ImageFormat, IntoElement,
     KeyBinding, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit,
-    Orientation, ParentElement as _, PathBuilder, Pixels, Render, Rgba, Role, ScrollAnchor,
-    ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, Size,
+    Orientation, ParentElement as _, Pixels, Render, Rgba, Role, ScrollAnchor, ScrollDelta,
+    ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, Size,
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _, StyledText,
     Subscription, Task, Unbind, WeakEntity, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowDecorations, WindowOptions, canvas, div, img, linear_color_stop,
+    WindowControlArea, WindowDecorations, WindowOptions, div, img, linear_color_stop,
     linear_gradient, point, prelude::*, px, relative, rgb, size,
 };
 use gpui_component::{
@@ -29303,7 +29303,6 @@ impl VibexWorkbench {
         let popover_foreground = theme::semantic_color("popover-foreground", is_dark);
         let border_color = theme::semantic_color("border", is_dark);
         let input_color = theme::semantic_color("input", is_dark);
-        let ring_color = theme::semantic_color("ring", is_dark);
         let agent_tabs = if agent_choices.is_empty() {
             vec![
                 Button::new("new-session-add-agent")
@@ -29602,10 +29601,6 @@ impl VibexWorkbench {
             new_session_project_menu_height(project_row_count),
             NEW_SESSION_PROJECT_MENU_MAX_HEIGHT,
         );
-        let project_search_focused = self
-            .new_session_project_search
-            .focus_handle(cx)
-            .is_focused(window);
         let project_menu_panel = v_flex()
             .id("new-session-project-menu-content")
             .track_focus(&self.new_session_project_menu_focus)
@@ -29638,30 +29633,15 @@ impl VibexWorkbench {
                     .child(strings.new_session_project_label),
             )
             .child(
-                div()
+                Input::new(&self.new_session_project_search)
+                    .small()
                     .mb_1()
                     .h(px(32.0))
-                    .rounded(px(8.0))
-                    .border_1()
-                    .border_color(input_color)
                     .bg(muted_color.opacity(0.60))
-                    .when(project_search_focused, |this| {
-                        this.border_color(ring_color).shadow(vec![
-                            gpui::BoxShadow::new(px(0.0), px(0.0), ring_color.opacity(0.30))
-                                .spread_radius(px(2.0)),
-                        ])
-                    })
-                    .child(
-                        Input::new(&self.new_session_project_search)
+                    .prefix(
+                        Icon::new(IconName::Search)
                             .small()
-                            .h_full()
-                            .appearance(false)
-                            .text_xs()
-                            .prefix(
-                                Icon::new(IconName::Search)
-                                    .small()
-                                    .text_color(muted_foreground),
-                            ),
+                            .text_color(muted_foreground),
                     ),
             )
             .child(project_results)
@@ -29940,10 +29920,6 @@ impl VibexWorkbench {
                 .children(base_ref_rows)
                 .into_any_element()
         };
-        let base_ref_search_focused = self
-            .new_session_base_ref_search
-            .focus_handle(cx)
-            .is_focused(window);
         let base_ref_panel = v_flex()
             .w(px(282.0))
             .min_w_0()
@@ -29955,29 +29931,14 @@ impl VibexWorkbench {
             .text_color(popover_foreground)
             .shadow_lg()
             .child(
-                div()
+                Input::new(&self.new_session_base_ref_search)
+                    .small()
                     .mb_1()
                     .h(px(34.0))
-                    .rounded(px(7.0))
-                    .border_1()
-                    .border_color(input_color)
-                    .when(base_ref_search_focused, |this| {
-                        this.border_color(ring_color).shadow(vec![
-                            gpui::BoxShadow::new(px(0.0), px(0.0), ring_color.opacity(0.30))
-                                .spread_radius(px(2.0)),
-                        ])
-                    })
-                    .child(
-                        Input::new(&self.new_session_base_ref_search)
+                    .prefix(
+                        Icon::new(IconName::Search)
                             .small()
-                            .h_full()
-                            .appearance(false)
-                            .text_xs()
-                            .prefix(
-                                Icon::new(IconName::Search)
-                                    .small()
-                                    .text_color(muted_foreground),
-                            ),
+                            .text_color(muted_foreground),
                     ),
             )
             .child(base_ref_results);
@@ -30103,22 +30064,15 @@ impl VibexWorkbench {
                             )),
                     )
                     .child(
-                        div()
+                        Input::new(&self.new_session_worktree_name_input)
+                            .small()
                             .h(px(32.0))
-                            .rounded(px(6.0))
-                            .border_1()
                             .border_color(if worktree_name_invalid {
                                 cx.theme().danger
                             } else {
                                 input_color
                             })
-                            .child(
-                                Input::new(&self.new_session_worktree_name_input)
-                                    .small()
-                                    .appearance(false)
-                                    .h_full()
-                                    .disabled(settings_disabled),
-                            ),
+                            .disabled(settings_disabled),
                     )
                     .child(
                         div()
@@ -30142,22 +30096,15 @@ impl VibexWorkbench {
                             .child(locale::text("Path", "路径", "路徑")),
                     )
                     .child(
-                        div()
+                        Input::new(&self.new_session_worktree_path_input)
+                            .small()
                             .h(px(32.0))
-                            .rounded(px(6.0))
-                            .border_1()
                             .border_color(if custom_path_invalid {
                                 cx.theme().danger
                             } else {
                                 input_color
                             })
-                            .child(
-                                Input::new(&self.new_session_worktree_path_input)
-                                    .small()
-                                    .appearance(false)
-                                    .h_full()
-                                    .disabled(settings_disabled),
-                            ),
+                            .disabled(settings_disabled),
                     )
                     .child(
                         div()
@@ -33425,22 +33372,14 @@ impl VibexWorkbench {
                         .items_center()
                         .gap_2()
                         .child(
-                            div()
+                            Input::new(&self.conversation_find)
                                 .h(px(34.0))
                                 .min_w_0()
                                 .flex_1()
-                                .rounded(px(6.0))
-                                .bg(cx.theme().muted.opacity(0.42))
-                                .child(
-                                    Input::new(&self.conversation_find)
-                                        .h_full()
-                                        .w_full()
-                                        .appearance(false)
-                                        .prefix(
-                                            Icon::new(IconName::Search)
-                                                .small()
-                                                .text_color(cx.theme().muted_foreground),
-                                        ),
+                                .prefix(
+                                    Icon::new(IconName::Search)
+                                        .small()
+                                        .text_color(cx.theme().muted_foreground),
                                 ),
                         )
                         .child(
@@ -34225,15 +34164,10 @@ impl VibexWorkbench {
             vibex_core::ToolCallStatus::Completed => ("Completed", cx.theme().success),
             vibex_core::ToolCallStatus::Failed => ("Failed", cx.theme().danger),
         };
-        div()
-            .flex_none()
+        let surface = color.opacity(if cx.theme().is_dark() { 0.20 } else { 0.12 });
+        Tag::custom(surface, color, surface)
+            .xsmall()
             .rounded(px(5.0))
-            .bg(color.opacity(if cx.theme().is_dark() { 0.20 } else { 0.12 }))
-            .px_2()
-            .py(px(2.0))
-            .text_xs()
-            .font_medium()
-            .text_color(color)
             .child(label)
             .into_any_element()
     }
@@ -37187,36 +37121,37 @@ impl VibexWorkbench {
         in_progress: bool,
         cx: &App,
     ) -> AnyElement {
-        // Tauri parity: shadcn Badge — h-5 rounded-full px-2 text-[0.625rem] uppercase.
-        let badge = div()
-            .flex_none()
-            .h(px(20.0))
-            .flex()
-            .items_center()
-            .rounded_full()
-            .px_2()
-            .text_xs()
-            .font_medium()
-            .child(label.to_uppercase());
-        if failed {
+        // shadcn Badge parity: a compact, rounded-full status pill. `Tag::custom`
+        // keeps the app's translucent-surface/opaque-text color pair while the
+        // kit owns the pill's metrics and structure.
+        let badge = if failed {
             let alpha = if cx.theme().is_dark() { 0.20 } else { 0.10 };
-            badge
-                .bg(cx.theme().danger.opacity(alpha))
-                .text_color(cx.theme().danger)
-                .into_any_element()
+            Tag::custom(
+                cx.theme().danger.opacity(alpha),
+                cx.theme().danger,
+                cx.theme().danger.opacity(alpha),
+            )
         } else if in_progress {
-            badge
-                .bg(cx.theme().secondary)
-                .text_color(cx.theme().secondary_foreground)
-                .into_any_element()
+            Tag::custom(
+                cx.theme().secondary,
+                cx.theme().secondary_foreground,
+                cx.theme().secondary,
+            )
         } else {
-            badge
-                .border_1()
-                .border_color(cx.theme().border)
-                .bg(cx.theme().input.opacity(0.20))
-                .text_color(cx.theme().foreground)
-                .into_any_element()
-        }
+            Tag::custom(
+                cx.theme().input.opacity(0.20),
+                cx.theme().foreground,
+                cx.theme().border,
+            )
+        };
+        badge
+            .xsmall()
+            .rounded_full()
+            .h(px(20.0))
+            .px_2()
+            .font_medium()
+            .child(label.to_uppercase())
+            .into_any_element()
     }
 
     fn render_process_detail_value(&self, value: String, cx: &App) -> AnyElement {
@@ -40746,22 +40681,14 @@ impl VibexWorkbench {
                             .border_color(cx.theme().border)
                             .px_3()
                             .child(
-                                div()
+                                Input::new(&self.session_search)
                                     .h(px(40.0))
                                     .min_w_0()
                                     .flex_1()
-                                    .rounded(px(6.0))
-                                    .bg(cx.theme().muted.opacity(0.42))
-                                    .child(
-                                        Input::new(&self.session_search)
-                                            .h_full()
-                                            .w_full()
-                                            .appearance(false)
-                                            .prefix(
-                                                Icon::new(IconName::Search)
-                                                    .small()
-                                                    .text_color(cx.theme().muted_foreground),
-                                            ),
+                                    .prefix(
+                                        Icon::new(IconName::Search)
+                                            .small()
+                                            .text_color(cx.theme().muted_foreground),
                                     ),
                             )
                             .child(
@@ -45424,14 +45351,16 @@ fn format_compact_tokens(tokens: u64) -> String {
 
 fn render_cache_token_ring(usage: Option<&AgentTokenUsage>, cx: &mut App) -> AnyElement {
     let is_dark = cx.theme().is_dark();
-    let track_color = theme::semantic_color("muted", is_dark);
     let context_fraction = usage.and_then(context_window_usage_fraction);
+    // `ProgressCircle` paints its track from the progress color at reduced
+    // opacity, so the unreported state keeps the full muted-foreground tone to
+    // leave a visible empty ring.
     let progress_color = match context_fraction {
         Some(fraction) if fraction > 0.9 => theme::semantic_color("destructive", is_dark),
         Some(fraction) if fraction >= 0.7 => theme::semantic_color("warning", is_dark),
-        Some(_) => theme::semantic_color("muted-foreground", is_dark),
-        None => theme::semantic_color("muted-foreground", is_dark).opacity(0.45),
+        _ => theme::semantic_color("muted-foreground", is_dark),
     };
+    let context_percent = context_fraction.unwrap_or(0.0).clamp(0.0, 1.0) * 100.0;
     let overview_label = locale::text("Token usage", "Token 使用情况", "Token 使用情況");
     let context_value = match usage.and_then(|usage| {
         Some((
@@ -45521,77 +45450,9 @@ fn render_cache_token_ring(usage: Option<&AgentTokenUsage>, cx: &mut App) -> Any
         .items_center()
         .justify_center()
         .child(
-            canvas(
-                |_, _, _| (),
-                move |bounds, _, window, _| {
-                    let stroke_width = px(2.5);
-                    let radius = px(7.0);
-                    let center_x = bounds.origin.x + bounds.size.width / 2.0;
-                    let center_y = bounds.origin.y + bounds.size.height / 2.0;
-
-                    let mut track = PathBuilder::stroke(stroke_width);
-                    track.move_to(point(center_x + radius, center_y));
-                    track.arc_to(
-                        point(radius, radius),
-                        px(0.0),
-                        false,
-                        true,
-                        point(center_x - radius, center_y),
-                    );
-                    track.arc_to(
-                        point(radius, radius),
-                        px(0.0),
-                        false,
-                        true,
-                        point(center_x + radius, center_y),
-                    );
-                    track.close();
-                    if let Ok(path) = track.build() {
-                        window.paint_path(path, track_color);
-                    }
-
-                    let Some(progress) = context_fraction.filter(|progress| *progress > 0.0) else {
-                        return;
-                    };
-                    let mut foreground = PathBuilder::stroke(stroke_width);
-                    if progress >= 0.999 {
-                        foreground.move_to(point(center_x + radius, center_y));
-                        foreground.arc_to(
-                            point(radius, radius),
-                            px(0.0),
-                            false,
-                            true,
-                            point(center_x - radius, center_y),
-                        );
-                        foreground.arc_to(
-                            point(radius, radius),
-                            px(0.0),
-                            false,
-                            true,
-                            point(center_x + radius, center_y),
-                        );
-                        foreground.close();
-                    } else {
-                        foreground.move_to(point(center_x, center_y - radius));
-                        let angle =
-                            -std::f32::consts::PI / 2.0 + progress * 2.0 * std::f32::consts::PI;
-                        foreground.arc_to(
-                            point(radius, radius),
-                            px(0.0),
-                            progress > 0.5,
-                            true,
-                            point(
-                                center_x + radius * angle.cos(),
-                                center_y + radius * angle.sin(),
-                            ),
-                        );
-                    }
-                    if let Ok(path) = foreground.build() {
-                        window.paint_path(path, progress_color);
-                    }
-                },
-            )
-            .size(px(17.0)),
+            ProgressCircle::new("composer-cache-token-ring-progress")
+                .value(context_percent)
+                .color(progress_color),
         )
         .tooltip(move |window, cx| {
             let context_value = context_value.clone();

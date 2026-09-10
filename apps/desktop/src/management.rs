@@ -20,12 +20,15 @@ use gpui_component::{
     StyledExt as _, Theme, WindowExt as _,
     animation::{EffectTransition as Transition, ease_out_cubic},
     button::{Button, ButtonVariants as _},
+    description_list::{DescriptionItem, DescriptionList, DescriptionText},
     form::{Field, Form},
     h_flex,
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
     notification::Notification,
     scroll::ScrollableElement as _,
+    spinner::Spinner,
     switch::Switch,
+    tab::{Tab, TabBar},
     tag::Tag,
     tooltip::Tooltip,
     v_flex,
@@ -7431,39 +7434,29 @@ impl ManagementCenter {
             (ManagementSection::Mcp, copy.mcp, IconName::Network),
             (ManagementSection::Skills, copy.skills, IconName::BookOpen),
         ];
-        let mut nav = h_flex()
-            .id("management-section-nav")
-            .w_full()
+        let selected_index = items
+            .iter()
+            .position(|(section, _, _)| *section == active)
+            .unwrap_or(0);
+        let sections: Vec<ManagementSection> =
+            items.iter().map(|(section, _, _)| *section).collect();
+        TabBar::new("management-section-nav")
+            .large()
             .h(px(42.0))
-            .flex_none()
-            .items_center()
-            .gap_1()
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().muted.opacity(0.35))
-            .p_1();
-        for (section, label, icon) in items {
-            nav = nav.child(
-                Button::new(SharedString::from(format!(
-                    "management-primary-nav-{}",
-                    section.key()
-                )))
-                .small()
-                .ghost()
-                .flex_1()
-                .h(px(32.0))
-                .px_1()
-                .rounded(gpui_component::button::ButtonRounded::Size(px(6.0)))
-                .selected(section == active)
-                .icon(icon)
-                .label(label)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.request_section_switch(section, window, cx);
-                })),
-            );
-        }
-        nav.into_any_element()
+            .w_full()
+            .segmented()
+            .selected_index(selected_index)
+            .children(
+                items
+                    .into_iter()
+                    .map(|(_, label, icon)| Tab::new().flex_1().icon(icon).label(label)),
+            )
+            .on_click(cx.listener(move |this, index: &usize, window, cx| {
+                if let Some(section) = sections.get(*index) {
+                    this.request_section_switch(*section, window, cx);
+                }
+            }))
+            .into_any_element()
     }
 
     fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -11962,31 +11955,28 @@ impl ManagementCenter {
                                 ),
                         ),
                 )
-                .child(key_value(
-                    management_locale_text("Models", "模型", "模型"),
-                    &management_join_list(&draft.models),
-                    cx,
-                ))
-                .child(key_value(
-                    management_locale_text("Modes", "模式", "模式"),
-                    &management_join_list(&draft.modes),
-                    cx,
-                ))
-                .child(key_value(
-                    management_locale_text("Features", "能力", "能力"),
-                    &management_join_list(&draft.features),
-                    cx,
-                ))
-                .child(key_value(
-                    management_locale_text("Disabled tools", "已禁用工具", "已停用工具"),
-                    &management_join_list(&draft.disabled_tools),
-                    cx,
-                ))
-                .child(key_value(
-                    management_locale_text("Environment", "环境变量", "環境變數"),
-                    &management_join_list(&env_summary),
-                    cx,
-                ))
+                .child(description_rows([
+                    (
+                        management_locale_text("Models", "模型", "模型"),
+                        management_join_list(&draft.models),
+                    ),
+                    (
+                        management_locale_text("Modes", "模式", "模式"),
+                        management_join_list(&draft.modes),
+                    ),
+                    (
+                        management_locale_text("Features", "能力", "能力"),
+                        management_join_list(&draft.features),
+                    ),
+                    (
+                        management_locale_text("Disabled tools", "已禁用工具", "已停用工具"),
+                        management_join_list(&draft.disabled_tools),
+                    ),
+                    (
+                        management_locale_text("Environment", "环境变量", "環境變數"),
+                        management_join_list(&env_summary),
+                    ),
+                ]))
                 .when_some(capability, |card, capability| {
                     card.child(key_value(
                         management_locale_text("Capability source", "能力来源", "能力來源"),
@@ -12704,26 +12694,24 @@ impl ManagementCenter {
                         }),
                 ),
         )
-        .child(stat_line(
-            management_locale_text("Tasks", "任务", "任務"),
-            tasks.len().to_string(),
-            cx,
-        ))
-        .child(stat_line(
-            management_locale_text("Run history", "运行历史", "執行歷史"),
-            self.scheduled_runs.len().to_string(),
-            cx,
-        ))
-        .child(stat_line(
-            management_locale_text("Attention", "待处理", "待處理"),
-            self.scheduled_attention.len().to_string(),
-            cx,
-        ))
-        .child(stat_line(
-            management_locale_text("Audit", "审计", "稽核"),
-            self.scheduled_audit.len().to_string(),
-            cx,
-        ))
+        .child(description_rows([
+            (
+                management_locale_text("Tasks", "任务", "任務"),
+                tasks.len().to_string(),
+            ),
+            (
+                management_locale_text("Run history", "运行历史", "執行歷史"),
+                self.scheduled_runs.len().to_string(),
+            ),
+            (
+                management_locale_text("Attention", "待处理", "待處理"),
+                self.scheduled_attention.len().to_string(),
+            ),
+            (
+                management_locale_text("Audit", "审计", "稽核"),
+                self.scheduled_audit.len().to_string(),
+            ),
+        ]))
         .child(if tasks.is_empty() {
             empty_state(
                 management_locale_text("No scheduled tasks", "暂无定时任务", "暫無排程任務"),
@@ -13871,21 +13859,20 @@ impl ManagementCenter {
             false,
             cx,
         ))
-        .child(stat_line(
-            management_locale_text("Graphs", "自动化图", "自動化圖"),
-            graphs.len().to_string(),
-            cx,
-        ))
-        .child(stat_line(
-            management_locale_text("Run history", "运行历史", "執行歷史"),
-            self.automation_runs.len().to_string(),
-            cx,
-        ))
-        .child(stat_line(
-            management_locale_text("Visible steps", "可见步骤", "可見步驟"),
-            self.automation_steps.len().to_string(),
-            cx,
-        ))
+        .child(description_rows([
+            (
+                management_locale_text("Graphs", "自动化图", "自動化圖"),
+                graphs.len().to_string(),
+            ),
+            (
+                management_locale_text("Run history", "运行历史", "執行歷史"),
+                self.automation_runs.len().to_string(),
+            ),
+            (
+                management_locale_text("Visible steps", "可见步骤", "可見步驟"),
+                self.automation_steps.len().to_string(),
+            ),
+        ]))
         .child(graph_rows)
         .child(detail)
         .child(
@@ -14034,21 +14021,20 @@ impl ManagementCenter {
                         })),
                 ),
         )
-        .child(stat_line(
-            management_locale_text("Trusted devices", "受信任设备", "受信任裝置"),
-            self.device_count.to_string(),
-            cx,
-        ))
-        .child(stat_line(
-            management_locale_text("Revoked devices", "已撤销设备", "已撤銷裝置"),
-            self.revoked_device_count.to_string(),
-            cx,
-        ))
-        .child(stat_line(
-            management_locale_text("Audit records", "审计记录", "稽核記錄"),
-            self.audit_count.to_string(),
-            cx,
-        ))
+        .child(description_rows([
+            (
+                management_locale_text("Trusted devices", "受信任设备", "受信任裝置"),
+                self.device_count.to_string(),
+            ),
+            (
+                management_locale_text("Revoked devices", "已撤销设备", "已撤銷裝置"),
+                self.revoked_device_count.to_string(),
+            ),
+            (
+                management_locale_text("Audit records", "审计记录", "稽核記錄"),
+                self.audit_count.to_string(),
+            ),
+        ]))
         .child(device_rows)
         .into_any_element()
     }
@@ -14314,27 +14300,26 @@ impl ManagementCenter {
                     "選擇內容",
                 )),
         )
-        .child(key_value(
-            management_locale_text("Workspace", "工作区", "工作區"),
-            self.pairing
-                .workspace
-                .as_deref()
-                .unwrap_or(management_locale_text("None selected", "未选择", "未選擇")),
-            cx,
-        ))
-        .child(key_value(
-            management_locale_text("Session", "会话", "工作階段"),
-            self.pairing
-                .session_id
-                .as_deref()
-                .unwrap_or(management_locale_text("None selected", "未选择", "未選擇")),
-            cx,
-        ))
-        .child(key_value(
-            management_locale_text("Mode", "模式", "模式"),
-            &self.pairing.mode,
-            cx,
-        ))
+        .child(description_rows([
+            (
+                management_locale_text("Workspace", "工作区", "工作區"),
+                self.pairing
+                    .workspace
+                    .as_deref()
+                    .unwrap_or(management_locale_text("None selected", "未选择", "未選擇")),
+            ),
+            (
+                management_locale_text("Session", "会话", "工作階段"),
+                self.pairing
+                    .session_id
+                    .as_deref()
+                    .unwrap_or(management_locale_text("None selected", "未选择", "未選擇")),
+            ),
+            (
+                management_locale_text("Mode", "模式", "模式"),
+                self.pairing.mode.as_str(),
+            ),
+        ]))
         .child(
             div()
                 .mt_3()
@@ -14342,32 +14327,31 @@ impl ManagementCenter {
                 .font_semibold()
                 .child(management_locale_text("Diagnostics", "诊断", "診斷")),
         )
-        .child(key_value(
-            management_locale_text("Status", "状态", "狀態"),
-            &diagnostics_status,
-            cx,
-        ))
-        .child(key_value(
-            management_locale_text("Redaction", "脱敏验证", "遮罩驗證"),
-            if self.diagnostics.redaction_verified {
-                management_locale_text("Verified", "已验证", "已驗證")
-            } else {
-                management_locale_text("Failed", "失败", "失敗")
-            },
-            cx,
-        ))
-        .child(key_value(
-            management_locale_text("Destination", "导出位置", "匯出位置"),
-            self.diagnostics
-                .destination
-                .as_deref()
-                .unwrap_or(management_locale_text(
-                    "Not exported",
-                    "尚未导出",
-                    "尚未匯出",
-                )),
-            cx,
-        ))
+        .child(description_rows([
+            (
+                management_locale_text("Status", "状态", "狀態"),
+                diagnostics_status.as_str(),
+            ),
+            (
+                management_locale_text("Redaction", "脱敏验证", "遮罩驗證"),
+                if self.diagnostics.redaction_verified {
+                    management_locale_text("Verified", "已验证", "已驗證")
+                } else {
+                    management_locale_text("Failed", "失败", "失敗")
+                },
+            ),
+            (
+                management_locale_text("Destination", "导出位置", "匯出位置"),
+                self.diagnostics
+                    .destination
+                    .as_deref()
+                    .unwrap_or(management_locale_text(
+                        "Not exported",
+                        "尚未导出",
+                        "尚未匯出",
+                    )),
+            ),
+        ]))
         .child(
             h_flex()
                 .flex_wrap()
@@ -14467,24 +14451,24 @@ impl ManagementCenter {
                         })),
                 ),
         )
-        .child(key_value(
-            management_locale_text("Recovery phase", "恢复阶段", "復原階段"),
-            &recovery_phase,
-            cx,
-        ))
-        .child(key_value(
-            management_locale_text("Recovery progress", "恢复进度", "復原進度"),
-            &format!("{}%", self.recovery.progress_percent),
-            cx,
-        ))
-        .child(key_value(
-            management_locale_text("Recovery destination", "恢复位置", "復原位置"),
-            self.recovery
-                .destination
-                .as_deref()
-                .unwrap_or(management_locale_text("None", "无", "無")),
-            cx,
-        ))
+        .child(description_rows([
+            (
+                management_locale_text("Recovery phase", "恢复阶段", "復原階段"),
+                recovery_phase,
+            ),
+            (
+                management_locale_text("Recovery progress", "恢复进度", "復原進度"),
+                format!("{}%", self.recovery.progress_percent),
+            ),
+            (
+                management_locale_text("Recovery destination", "恢复位置", "復原位置"),
+                self.recovery
+                    .destination
+                    .as_deref()
+                    .unwrap_or(management_locale_text("None", "无", "無"))
+                    .to_string(),
+            ),
+        ]))
         .when_some(self.recovery.error_code.clone(), |this, code| {
             this.child(status_line(
                 match locale::current_locale() {
@@ -14605,7 +14589,7 @@ impl Render for ManagementImportDialog {
                     .p_3()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child(Icon::new(IconName::LoaderCircle).size(px(16.0)))
+                    .child(Spinner::new())
                     .child(management_locale_text(
                         "Detecting configurations from installed Agents...",
                         "正在从已安装的 Agent 中探测配置...",
@@ -15651,27 +15635,16 @@ fn management_search_input(
     state: &Entity<InputState>,
     cx: &mut Context<ManagementCenter>,
 ) -> AnyElement {
-    div()
-        .flex()
-        .h(px(36.0))
+    // `Input` owns its border, background and focus ring; the search field only
+    // adds the leading glyph and a clear affordance.
+    Input::new(state)
+        .small()
         .w_full()
-        .flex_none()
-        .items_center()
-        .rounded(px(6.0))
-        .border_1()
-        .border_color(cx.theme().border.opacity(0.70))
-        .bg(cx.theme().muted.opacity(0.20))
-        .child(
-            Input::new(state)
+        .cleanable(true)
+        .prefix(
+            Icon::new(IconName::Search)
                 .small()
-                .h_full()
-                .w_full()
-                .appearance(false)
-                .prefix(
-                    Icon::new(IconName::Search)
-                        .small()
-                        .text_color(cx.theme().muted_foreground),
-                ),
+                .text_color(cx.theme().muted_foreground),
         )
         .into_any_element()
 }
@@ -16812,6 +16785,23 @@ fn stat_line(
 
 fn key_value(label: &'static str, value: &str, cx: &mut Context<ManagementCenter>) -> AnyElement {
     stat_line(label, value.to_string(), cx)
+}
+
+/// Render a group of label/value rows as one bordered kit `DescriptionList`.
+///
+/// Prefer this over stacking [`key_value`] rows: the list owns the row
+/// separators, the label column width, and the label/value text colors, so a
+/// detail panel stops hand-rolling its own property table.
+fn description_rows(
+    rows: impl IntoIterator<Item = (impl Into<DescriptionText>, impl Into<DescriptionText>)>,
+) -> DescriptionList {
+    DescriptionList::new()
+        .columns(1)
+        .label_width(px(140.0))
+        .children(
+            rows.into_iter()
+                .map(|(label, value)| DescriptionItem::new(label).value(value)),
+        )
 }
 
 fn status_line(message: String, error: bool, cx: &mut Context<ManagementCenter>) -> AnyElement {
