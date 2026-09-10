@@ -379,6 +379,22 @@ with `runtime_switch_configuration_unavailable`, leaving the Logical Session
 stuck in `initializing`. Keep this alias capability scoped to CodeBuddy rather
 than exposing a provider-specific key in Core or UI contracts.
 
+### DeepSeek Harness ACP compatibility note
+
+DeepSeek Harness (`deepseek-harness-acp`) is a catalog-only Agent with no
+Registry descriptor, so it carries no `config_option_aliases`. It advertises
+reasoning as the `effort` select config option, and
+`extract_probe_reasoning_efforts` already treats that spelling as reasoning
+effort, so the model catalog exposes the effort values and the UI offers them.
+The canonical option resolver must therefore map `effort` to `reasoning_effort`
+without a Registry alias. Otherwise resolution accepts the selection from the
+catalog but the attachment planner reports the field `Unavailable`, and
+`apply_session_config` fails with `runtime_switch_configuration_unavailable`
+(the switch row fails while `spawn_process` and `create_session` already
+succeeded). Only `effort` is safe to treat as a built-in alias;
+`thinking_level`/`thought_level` stay alias-gated because some dialects
+advertise them as standalone option ids.
+
 ## Scenario: Claude ACP Extension And Transcript Compensation
 
 ### 1. Scope / Trigger

@@ -108,8 +108,8 @@ pub fn normalize_identifier(value: &str) -> String {
 }
 
 /// Resolves an Agent option id using explicit version-compatible aliases.  The
-/// four canonical spellings are safe on their own; alternate spellings need
-/// a Registry alias and collisions fail closed.
+/// four canonical spellings are safe on their own; alternate spellings need a
+/// Registry alias and collisions fail closed.
 pub fn resolve_canonical_option_key(
     raw_id: &str,
     aliases: &BTreeMap<String, Vec<String>>,
@@ -126,6 +126,22 @@ pub fn resolve_canonical_option_key(
     // to silently reinterpret the reserved field.
     if direct.is_reserved() {
         matches.insert(direct.clone());
+    }
+    // `effort` is the one reasoning-effort spelling shared by every ACP
+    // dialect, and the probe/catalog read path
+    // (`extract_probe_reasoning_efforts`) already treats it as reasoning
+    // effort. The planner must agree even for catalog-only agents that ship no
+    // Registry descriptor and therefore no alias, or the UI offers an effort
+    // that can never be applied. An explicit alias claiming `effort` for
+    // another key still collides and fails closed below. Other spellings
+    // (`thinking_level`, `thought_level`) stay alias-gated because some
+    // dialects advertise them as standalone option ids.
+    const REASONING_EFFORT_OPTION_IDS: [&str; 1] = ["effort"];
+    if REASONING_EFFORT_OPTION_IDS.contains(&normalized.as_str()) {
+        matches.insert(
+            CanonicalSessionConfigKey::parse(CANONICAL_REASONING_EFFORT)
+                .map_err(|_| CanonicalKeyError::Invalid(raw_id.to_string()))?,
+        );
     }
     for (canonical, values) in aliases {
         let canonical = CanonicalSessionConfigKey::parse(canonical)
@@ -2129,6 +2145,44 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn unaliased_effort_option_id_is_plannable_for_catalog_agents() {
+        // Catalog-only agents such as deepseek-harness advertise the
+        // reasoning-effort control as `effort` but ship no Registry descriptor,
+        // so no alias exists. The probe/catalog read path already treats
+        // `effort` as reasoning effort; the planner must resolve it the same
+        // way or the UI offers an effort that can never be applied.
+        let options = vec![option("effort", "high")];
+        let operations = BTreeMap::from([evidence(
+            AcpOperation::SessionSetConfigOption,
+            AcpWireEncoding::VersionedRaw,
+            1,
+        )]);
+        let planner =
+            SessionConfigPlanner::new("adapter=test@1", 1, BTreeMap::new(), operations, options);
+        let reasoning_key = CanonicalSessionConfigKey::parse(CANONICAL_REASONING_EFFORT).unwrap();
+        assert_eq!(
+            planner.option_for_key(&reasoning_key).unwrap().unwrap().id,
+            "effort"
+        );
+        let request = SessionConfigFieldRequest {
+            key: reasoning_key,
+            kind: SessionConfigFieldKind::ReasoningEffort,
+            value: "low".to_string(),
+        };
+        match planner.plan(&request).unwrap() {
+            SessionConfigPlan::Live {
+                operation,
+                option_id,
+                ..
+            } => {
+                assert_eq!(operation, AcpOperation::SessionSetConfigOption);
+                assert_eq!(option_id.as_deref(), Some("effort"));
+            }
+            _ => panic!("expected a live reasoning-effort plan for the `effort` option"),
+        }
     }
 
     #[test]
