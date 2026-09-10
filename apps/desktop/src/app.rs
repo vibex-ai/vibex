@@ -10249,6 +10249,21 @@ impl VibexWorkbench {
         if layout_width_changed || content_width_changed || turns_cache_changed {
             self.rebuild_timeline_sizes();
         }
+        // The streaming preserve policy keeps the largest measured extent while
+        // an in-flight turn keeps the same layout signature and body length.
+        // That extent can outlive the transient layout it captured, so a
+        // switched-to session would keep a blank band under its last row until
+        // the turn reshaped. Drop the restored measurement so the first paint
+        // re-measures the freshly rendered content instead of preserving it.
+        let streaming_last_turn_id = self.conversation_turns_cache.last().and_then(|turn| {
+            self.streaming_timeline_row_state(turn)
+                .map(|_| turn.id.clone())
+        });
+        if let Some(turn_id) = streaming_last_turn_id {
+            self.invalidate_timeline_turn_measurement(&turn_id);
+            self.timeline_estimated_turn_heights.remove(&turn_id);
+            self.rebuild_timeline_sizes();
+        }
         true
     }
 
@@ -12504,6 +12519,11 @@ impl VibexWorkbench {
         self.timeline_measured_turn_layout_signatures.clear();
         self.timeline_pending_turn_heights.clear();
         self.timeline_estimated_turn_heights.clear();
+        // The row table is derived from the measurements just cleared. Drop it
+        // so a caller that cannot rebuild immediately still cannot reuse stale
+        // heights against a different turn projection; the next render rebuilds
+        // from the estimator because the lengths no longer match.
+        self.timeline_row_sizes = Rc::new(Vec::new());
         self.timeline_markdown_sources.clear();
         self.timeline_reasoning_summaries.clear();
         self.timeline_tool_card_projections.clear();
@@ -31101,13 +31121,16 @@ impl VibexWorkbench {
         self.sync_selected_composer_draft(window, cx);
         self.prune_elicitation_forms();
         self.apply_pending_timeline_row_heights();
-        self.apply_pending_timeline_scroll();
         let selected = self.selected_session().cloned();
         let mut turns = self.conversation_turns_cached();
         if timeline_virtual_rows_need_rebuild(turns.len(), self.timeline_row_sizes.len()) {
             self.rebuild_timeline_sizes();
             turns = self.conversation_turns_cached();
         }
+        // Resolve a pending bottom scroll only after the row extent is rebuilt:
+        // an invalidated size table would otherwise swallow the request because
+        // `scroll_timeline_to_latest` skips an empty table.
+        self.apply_pending_timeline_scroll();
         let turns_summary = self.conversation_turns_summary;
         self.sync_timeline_duration_tick(turns_summary.has_incomplete_turn, cx);
         let rendered_turns = self.conversation_turns_render_cache.clone();
@@ -57405,6 +57428,32 @@ mod tests {
             .find("self.apply_pending_timeline_scroll();")
             .expect("pending bottom scroll should remain applied");
         assert!(apply < scroll);
+        let rebuild = workbench
+            .find("self.rebuild_timeline_sizes();")
+            .expect("the virtual row table should be rebuilt before rendering");
+        assert!(apply < rebuild && rebuild < scroll);
+    }
+
+    #[test]
+    fn restored_streaming_turn_reclaims_the_preserved_extent() {
+        let source = include_str!("app.rs");
+
+        let restore = source
+            .split_once("    fn restore_agent_session_view(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn refresh_agent_token_usage("))
+            .map(|(body, _)| body)
+            .expect("session view restoration should remain inspectable");
+        assert!(restore.contains("self.streaming_timeline_row_state(turn)"));
+        assert!(restore.contains("self.invalidate_timeline_turn_measurement(&turn_id);"));
+        assert!(restore.contains("self.timeline_estimated_turn_heights.remove(&turn_id);"));
+        assert!(restore.contains("self.rebuild_timeline_sizes();"));
+
+        let render_caches = source
+            .split_once("    fn invalidate_timeline_render_caches(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn invalidate_timeline_turn_measurement("))
+            .map(|(body, _)| body)
+            .expect("timeline render cache invalidation should remain inspectable");
+        assert!(render_caches.contains("self.timeline_row_sizes = Rc::new(Vec::new());"));
     }
 
     #[test]
