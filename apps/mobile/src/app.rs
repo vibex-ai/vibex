@@ -58,6 +58,7 @@ use crate::pairing::{
     MobileCredentialBundle, claim_pairing_link, claim_server_pairing_code,
     claim_zero_config_lan_pairing,
 };
+use crate::selection_menu::SelectionMenu;
 use crate::sidebar::{
     SidebarCard, SidebarCardEdge, SidebarDropPosition, SidebarDropTarget, SidebarProject,
     SidebarRow, SidebarRowInput, SidebarRowKind, SidebarWorkspace, ancestors_of, drop_target,
@@ -563,6 +564,8 @@ pub struct MobileApp {
     pending_workbench_surface: Option<WorkbenchSurface>,
     workbench_open: bool,
     composer_input: Entity<TextareaState>,
+    /// The long press selection toolbar and handles drawn over the composer.
+    selection_menu: Entity<SelectionMenu>,
     /// Text to hand back to the composer if a send fails. The failure is
     /// observed in an async task with no window, so the check-and-write is
     /// deferred to the next paint.
@@ -809,6 +812,18 @@ impl MobileApp {
             cx.observe_window_activation(window, move |this, _, cx| {
                 this.refresh_battery_allowlist(cx);
             });
+        let composer_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder(locale::text(
+                    "Message Vibex",
+                    "发送消息给 Vibex",
+                    "傳送訊息給 Vibex",
+                ))
+                .auto_grow(1, 6)
+        });
+        // The selection toolbar is its own view: it floats over the whole
+        // window, and the composer only hands it the long press that opens it.
+        let selection_menu = cx.new(|cx| SelectionMenu::new(composer_input.clone(), cx));
         let mut app = Self {
             storage,
             app_settings,
@@ -819,15 +834,8 @@ impl MobileApp {
             workbench: None,
             pending_workbench_surface: None,
             workbench_open: false,
-            composer_input: cx.new(|cx| {
-                TextareaState::new(window, cx)
-                    .placeholder(locale::text(
-                        "Message Vibex",
-                        "发送消息给 Vibex",
-                        "傳送訊息給 Vibex",
-                    ))
-                    .auto_grow(1, 6)
-            }),
+            composer_input,
+            selection_menu,
             pending_composer_restore: None,
             timeline_turns: Arc::new(Vec::new()),
             timeline_markdown_views: RefCell::new(BTreeMap::new()),
@@ -10501,10 +10509,24 @@ impl MobileApp {
                     .items_end()
                     .pl(px(theme::SPACING_XS))
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(Textarea::new(&self.composer_input).appearance(false)),
+                        div().flex_1().min_w_0().child(
+                            Textarea::new(&self.composer_input)
+                                .appearance(false)
+                                // The long press hook is the only signal the
+                                // platform gives for "the user selected this
+                                // word": open the touch toolbar instead of the
+                                // kit's keyboard-oriented menu, which would
+                                // take focus and collapse the keyboard.
+                                .context_menu({
+                                    let menu = self.selection_menu.downgrade();
+                                    move |items, _window, cx| {
+                                        if let Some(menu) = menu.upgrade() {
+                                            menu.update(cx, |menu, cx| menu.open(cx));
+                                        }
+                                        items
+                                    }
+                                }),
+                        ),
                     )
                     .child(
                         div()
@@ -12449,6 +12471,9 @@ impl Render for MobileApp {
                 RootMode::Connecting => self.render_connecting(cx).into_any_element(),
                 RootMode::Workspace => self.render_workspace(page_width, cx).into_any_element(),
             })
+            // Last child, so the selection toolbar sits above the composer it
+            // belongs to. It positions itself in window coordinates.
+            .child(self.selection_menu.clone())
     }
 }
 
@@ -17212,5 +17237,26 @@ mod tests {
 
         assert!(observed_drawer_scroll.offset().y < px(0.0));
         assert_eq!(observed_timeline_scroll.offset().y, px(0.0));
+    }
+
+    /// A long press on the composer has to reach the touch toolbar instead of
+    /// the kit's context menu. The kit's menu is a popup that takes focus, and
+    /// focus leaving the input is what collapses the keyboard the toolbar is
+    /// positioned against, so the two halves are one decision.
+    #[test]
+    fn composer_long_press_opens_the_touch_selection_toolbar() {
+        let source = include_str!("app.rs");
+        let composer = source
+            .split_once("Textarea::new(&self.composer_input)")
+            .map(|(_, tail)| tail)
+            .expect("the composer should still render the kit's textarea");
+        let hook = composer
+            .split_once("fn ")
+            .map(|(body, _)| body)
+            .expect("the composer's context menu hook should stay inspectable");
+
+        assert!(hook.contains(".context_menu("));
+        assert!(hook.contains("menu.open(cx)"));
+        assert!(source.contains("self.selection_menu.clone()"));
     }
 }

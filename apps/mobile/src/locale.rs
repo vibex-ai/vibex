@@ -317,6 +317,10 @@ pub fn common_for(locale: Locale, en: &'static str) -> &'static str {
         "Session renamed" => ("会话已重命名", "工作階段已重新命名"),
         "Session archived" => ("会话已归档", "工作階段已封存"),
         "Session deleted" => ("会话已删除", "工作階段已刪除"),
+        "Select All" => ("全选", "全選"),
+        "Cut" => ("剪切", "剪下"),
+        "Copy" => ("复制", "複製"),
+        "Paste" => ("粘贴", "貼上"),
         _ => return en,
     };
     text_for(locale, en, zh_cn, zh_tw)

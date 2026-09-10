@@ -14,6 +14,7 @@ mod notifications;
 mod pairing;
 mod power;
 mod scanner;
+mod selection_menu;
 mod sidebar;
 mod storage;
 mod theme;
