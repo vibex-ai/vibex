@@ -807,6 +807,11 @@ impl UsageView {
     }
 
     fn render_usage_table(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let row_count = self
+            .statistics
+            .as_ref()
+            .map(|statistics| statistics.dimension_rows.len())
+            .unwrap_or(0);
         let table = match &self.table {
             Some(table) => table.clone(),
             None => {
@@ -832,11 +837,17 @@ impl UsageView {
                 table
             }
         };
-        DataTable::new(&table)
-            .stripe(true)
-            .bordered(false)
-            .scrollbar_visible(false, true)
-            .with_size(Size::Size(px(42.0)))
+        div()
+            .w_full()
+            .debug_selector(|| "usage-table".to_string())
+            .h(px(usage_table_height(row_count)))
+            .child(
+                DataTable::new(&table)
+                    .stripe(true)
+                    .bordered(false)
+                    .scrollbar_visible(false, true)
+                    .with_size(Size::Size(px(USAGE_TABLE_ROW_HEIGHT))),
+            )
             .into_any_element()
     }
 
@@ -2109,6 +2120,25 @@ fn dimension_label(dimension: AgentUsageDimension) -> &'static str {
 }
 
 const USAGE_TABLE_LABEL_WIDTH: f32 = 280.0;
+const USAGE_TABLE_ROW_HEIGHT: f32 = 42.0;
+const USAGE_TABLE_HEADER_HEIGHT: f32 = 42.0;
+const USAGE_TABLE_EMPTY_BODY_HEIGHT: f32 = 96.0;
+
+/// Height that lets the `DataTable` paint every dimension row.
+///
+/// `DataTable` lays its body out through a virtualized `uniform_list` that
+/// fills its parent, so without a definite container height the body collapses
+/// to zero and only the header survives. The usage table is not a nested
+/// vertical scroll surface: the page owns vertical scrolling, so the table is
+/// sized to the rows it renders instead of a fixed viewport.
+fn usage_table_height(row_count: usize) -> f32 {
+    let body_height = if row_count == 0 {
+        USAGE_TABLE_EMPTY_BODY_HEIGHT
+    } else {
+        row_count as f32 * USAGE_TABLE_ROW_HEIGHT
+    };
+    USAGE_TABLE_HEADER_HEIGHT + body_height
+}
 
 /// Renders the usage breakdown table.
 ///
@@ -2851,6 +2881,17 @@ mod tests {
         cx.update(|window, cx| {
             let _ = window.draw(cx);
         });
+
+        // The DataTable body only paints rows when its container has a definite
+        // height, so the two fixture rows must reserve header plus two rows.
+        let table_bounds = cx
+            .debug_bounds("usage-table")
+            .expect("usage table should be laid out");
+        assert_eq!(table_bounds.size.height, px(usage_table_height(2)));
+        assert!(
+            table_bounds.size.height > px(USAGE_TABLE_HEADER_HEIGHT),
+            "usage table body must be taller than its header"
+        );
 
         // Switching dimension re-derives the table columns from inside the
         // view's own update, where the delegate must not read the view back.

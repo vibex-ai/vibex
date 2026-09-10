@@ -87,7 +87,10 @@ session entry is a standard `gpui_component::button::Button` wrapped with
 - The table has stable column widths, horizontal scrolling, sortable metrics,
   last activity, and coverage. While horizontal overflow exists, wheel input over
   the table is converted to horizontal movement and does not bubble into the page;
-  the table is not a nested vertical scroll surface. Summary columns adapt for
+  the table is not a nested vertical scroll surface. It renders through the shared
+  `DataTable`, whose virtualized body paints no rows unless its container supplies
+  a definite height, so the container is sized to the rendered rows instead of an
+  auto height. Summary columns adapt for
   narrow windows and toolbar controls wrap without overlap.
 - Loading, empty, unsupported/error, ready, and stale states are explicit.
   When retained statistics refresh in the background, keep the content geometry
