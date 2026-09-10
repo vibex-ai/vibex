@@ -10078,6 +10078,8 @@ dependencies = [
  "chrono",
  "futures-channel",
  "futures-util",
+ "gpui-component",
+ "gpui-kit-assets",
  "gpui-pre",
  "gpui_android",
  "gpui_platform",

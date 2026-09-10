@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
 use gpui::{App, AssetSource, Result, SharedString};
+use gpui_kit_assets::Assets as ComponentAssets;
 
 const IBM_PLEX_SANS_REGULAR: &[u8] =
     include_bytes!("../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
@@ -725,21 +726,29 @@ impl AssetSource for MobileAssets {
                 .find(|(asset, _)| *asset == path)
                 .map(|(_, bytes)| *bytes)
         });
-        Ok(bytes.map(Cow::Borrowed))
+        if let Some(bytes) = bytes {
+            return Ok(Some(Cow::Borrowed(bytes)));
+        }
+        // gpui-kit ships its own icon pack; the phone shares it with the desktop
+        // shell so a kit component always finds the glyph it asks for.
+        ComponentAssets.load(path)
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
-        Ok(ICONS
-            .iter()
-            .copied()
-            .chain(
-                VIBEX_BRAND_ASSETS
-                    .iter()
-                    .chain(VIBEX_MODEL_PROVIDER_ASSETS.iter())
-                    .map(|(asset, _)| *asset),
-            )
-            .filter(|item| item.starts_with(path))
-            .map(SharedString::from)
-            .collect())
+        let mut assets = ComponentAssets.list(path)?;
+        assets.extend(
+            ICONS
+                .iter()
+                .copied()
+                .chain(
+                    VIBEX_BRAND_ASSETS
+                        .iter()
+                        .chain(VIBEX_MODEL_PROVIDER_ASSETS.iter())
+                        .map(|(asset, _)| *asset),
+                )
+                .filter(|item| item.starts_with(path))
+                .map(SharedString::from),
+        );
+        Ok(assets)
     }
 }

@@ -34,12 +34,19 @@ fn run(data_dir: PathBuf) {
         .with_assets(assets::MobileAssets)
         .run(move |cx: &mut App| {
             gpui_tokio::init_from_handle(cx, tokio_handle.clone());
+            // gpui-kit registers the global theme and the overlay state every
+            // component reads, so it has to be initialized before the first
+            // window opens.
+            gpui_component::init(cx);
             app::bind_keys(cx);
             // Resolve the native platform's preferred language before the
             // first window is created so the initial pairing screen is never
             // rendered with a stale English fallback.
             let _ = locale::current();
             assets::load_fonts(cx).expect("failed to load bundled mobile fonts");
+            // Point the kit theme at the shared vibex tokens before the first
+            // paint, so no component is ever drawn from the framework palette.
+            theme::apply_component_theme(None, cx);
 
             let bounds = Bounds::centered(None, gpui::size(gpui::px(390.0), gpui::px(844.0)), cx);
             cx.open_window(
@@ -50,7 +57,13 @@ fn run(data_dir: PathBuf) {
                     show: true,
                     ..Default::default()
                 },
-                move |window, cx| cx.new(|cx| app::MobileApp::new(data_dir, window, cx)),
+                move |window, cx| {
+                    let view = cx.new(|cx| app::MobileApp::new(data_dir, window, cx));
+                    // `Root` owns the overlay layers (sheets, dialogs,
+                    // notifications, menus) and restores focus after one
+                    // closes. Phone windows are fullscreen, so no border.
+                    cx.new(|cx| gpui_component::Root::new(view, window, cx).bordered(false))
+                },
             )
             .expect("failed to open Vibex mobile window");
         });
