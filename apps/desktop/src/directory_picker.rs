@@ -959,6 +959,8 @@ fn detect_drives_sync() -> Vec<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn detect_drives_sync() -> Vec<PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+
     let mut roots: Vec<PathBuf> = Vec::new();
     let Ok(read_dir) = std::fs::read_dir("/Volumes") else {
         return roots;
@@ -972,7 +974,6 @@ fn detect_drives_sync() -> Vec<PathBuf> {
     // The boot volume appears under /Volumes but is the same filesystem as
     // "/", so the breadcrumb path already covers it.
     if let Ok(root_dev) = std::fs::metadata("/").map(|metadata| metadata.dev()) {
-        use std::os::unix::fs::MetadataExt as _;
         roots.retain(|path| {
             std::fs::metadata(path)
                 .map(|metadata| metadata.dev() != root_dev)
