@@ -394,6 +394,21 @@ enum DrawerPage {
     Workbench,
 }
 
+/// Which input a deferred write targets.
+///
+/// `InputState` only accepts programmatic edits through a `&mut Window`, and
+/// several call sites live in paths that have none. Those record the write here
+/// and `MobileApp::render` lands it on the next paint.
+#[derive(Clone, Copy, Debug)]
+enum InputField {
+    PairingServerUrl,
+    PairingCode,
+    NewSessionTitle,
+    NewSessionPrompt,
+    SidebarName,
+    SessionAction,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MobileOverlay {
     Hosts,
@@ -604,11 +619,12 @@ pub struct MobileApp {
     active_host_id: Option<String>,
     pairing_from_hosts: bool,
     elicitation_request_id: Option<RequestId>,
-    elicitation_inputs: BTreeMap<String, Entity<TextInput>>,
+    elicitation_inputs: BTreeMap<String, Entity<InputState>>,
     elicitation_draft: Option<ElicitationFormDraft>,
+    pending_input_writes: Vec<(InputField, String)>,
     pairing_busy: bool,
-    pairing_server_url_input: Entity<TextInput>,
-    pairing_code_input: Entity<TextInput>,
+    pairing_server_url_input: Entity<InputState>,
+    pairing_code_input: Entity<InputState>,
     nearby_pairing_state: NearbyPairingState,
     nearby_candidates: BTreeMap<String, LanDiscoveryCandidate>,
     nearby_discovery_generation: u64,
@@ -621,9 +637,9 @@ pub struct MobileApp {
     new_session_workspace_id: Option<String>,
     new_session_workspace_mode: WorkspaceMode,
     new_session_runtime: Option<SessionRuntimeSelection>,
-    new_session_title_input: Entity<TextInput>,
-    new_session_prompt_input: Entity<TextInput>,
-    new_project_input: Entity<TextInput>,
+    new_session_title_input: Entity<InputState>,
+    new_session_prompt_input: Entity<InputState>,
+    new_project_input: Entity<InputState>,
     new_project_busy: bool,
     new_project_error: Option<String>,
     session_action: Option<SessionActionPrompt>,
@@ -631,7 +647,7 @@ pub struct MobileApp {
     workspace_action_busy: bool,
     sidebar_row_menu: Option<SidebarRowMenu>,
     sidebar_name_prompt: Option<SidebarNamePrompt>,
-    sidebar_name_input: Entity<TextInput>,
+    sidebar_name_input: Entity<InputState>,
     /// The Desktop's sidebar tree, mirrored so the phone renders the layout the
     /// user arranged there rather than a second, divergent ordering.
     sidebar_view: SidebarOrganizationView,
@@ -649,7 +665,7 @@ pub struct MobileApp {
     /// Top edge and right edge of the row list in window space, recorded during
     /// paint so a touch pan can be resolved to a row without hit-test plumbing.
     sidebar_list_frame: Rc<Cell<(f32, f32)>>,
-    session_action_input: Entity<TextInput>,
+    session_action_input: Entity<InputState>,
     session_action_busy: bool,
     runtime_options_open: bool,
     runtime_options_target: RuntimeOptionsTarget,
@@ -857,12 +873,22 @@ impl MobileApp {
             elicitation_request_id: None,
             elicitation_inputs: BTreeMap::new(),
             elicitation_draft: None,
+            pending_input_writes: Vec::new(),
             pairing_busy: false,
             pairing_server_url_input: cx.new(|cx| {
-                TextInput::new(locale::text("Server URL", "服务器地址", "伺服器位址"), cx)
+                InputState::new(window, cx).placeholder(locale::text(
+                    "Server URL",
+                    "服务器地址",
+                    "伺服器位址",
+                ))
             }),
-            pairing_code_input: cx
-                .new(|cx| TextInput::new(locale::text("Pairing code", "配对码", "配對碼"), cx)),
+            pairing_code_input: cx.new(|cx| {
+                InputState::new(window, cx).placeholder(locale::text(
+                    "Pairing code",
+                    "配对码",
+                    "配對碼",
+                ))
+            }),
             nearby_pairing_state: NearbyPairingState::Idle,
             nearby_candidates: BTreeMap::new(),
             nearby_discovery_generation: 0,
@@ -876,19 +902,26 @@ impl MobileApp {
             new_session_workspace_mode: WorkspaceMode::CurrentCheckout,
             new_session_runtime: None,
             new_session_title_input: cx.new(|cx| {
-                TextInput::new(
-                    locale::text("Session title", "会话标题", "工作階段標題"),
-                    cx,
-                )
+                InputState::new(window, cx).placeholder(locale::text(
+                    "Session title",
+                    "会话标题",
+                    "工作階段標題",
+                ))
             }),
             new_session_prompt_input: cx.new(|cx| {
-                TextInput::new(
-                    locale::text("Initial prompt", "初始提示词", "初始提示詞"),
-                    cx,
-                )
+                InputState::new(window, cx).placeholder(locale::text(
+                    "Initial prompt",
+                    "初始提示词",
+                    "初始提示詞",
+                ))
             }),
-            new_project_input: cx
-                .new(|cx| TextInput::new(locale::text("Project path", "项目路径", "專案路徑"), cx)),
+            new_project_input: cx.new(|cx| {
+                InputState::new(window, cx).placeholder(locale::text(
+                    "Project path",
+                    "项目路径",
+                    "專案路徑",
+                ))
+            }),
             new_project_busy: false,
             new_project_error: None,
             session_action: None,
@@ -897,7 +930,11 @@ impl MobileApp {
             sidebar_row_menu: None,
             sidebar_name_prompt: None,
             sidebar_name_input: cx.new(|cx| {
-                TextInput::new(locale::text("Folder name", "文件夹名称", "資料夾名稱"), cx)
+                InputState::new(window, cx).placeholder(locale::text(
+                    "Folder name",
+                    "文件夹名称",
+                    "資料夾名稱",
+                ))
             }),
             sidebar_view: SidebarOrganizationView::default(),
             sidebar_selected_workspace_id: None,
@@ -913,7 +950,11 @@ impl MobileApp {
             sidebar_batch_mode: false,
             sidebar_list_frame: Rc::new(Cell::new((0.0, 0.0))),
             session_action_input: cx.new(|cx| {
-                TextInput::new(locale::text("Session name", "会话名称", "工作階段名稱"), cx)
+                InputState::new(window, cx).placeholder(locale::text(
+                    "Session name",
+                    "会话名称",
+                    "工作階段名稱",
+                ))
             }),
             session_action_busy: false,
             runtime_options_open: false,
@@ -1747,10 +1788,10 @@ impl MobileApp {
         let server_url = self
             .pairing_server_url_input
             .read(cx)
-            .text()
+            .value()
             .trim()
             .to_string();
-        let pairing_code = self.pairing_code_input.read(cx).text().trim().to_string();
+        let pairing_code = self.pairing_code_input.read(cx).value().trim().to_string();
         if server_url.is_empty() || pairing_code.is_empty() {
             self.error = Some(BackendError::failed(
                 "remote_pairing_code_request_invalid",
@@ -1775,12 +1816,10 @@ impl MobileApp {
                 this.pairing_busy = false;
                 match outcome {
                     Ok(Ok(bundle)) => {
-                        this.pairing_server_url_input.update(cx, |input, cx| {
-                            input.set_text("", cx);
-                        });
-                        this.pairing_code_input.update(cx, |input, cx| {
-                            input.set_text("", cx);
-                        });
+                        this.pending_input_writes
+                            .push((InputField::PairingServerUrl, String::new()));
+                        this.pending_input_writes
+                            .push((InputField::PairingCode, String::new()));
                         match this.storage.save(&bundle) {
                             Ok(()) => this.install_bundle(bundle, cx),
                             Err(error) => this.error = Some(error),
@@ -2642,10 +2681,10 @@ impl MobileApp {
                 });
         }
         self.apply_project_new_session_preference();
-        self.new_session_title_input
-            .update(cx, |input, cx| input.set_text("", cx));
-        self.new_session_prompt_input
-            .update(cx, |input, cx| input.set_text("", cx));
+        self.pending_input_writes
+            .push((InputField::NewSessionTitle, String::new()));
+        self.pending_input_writes
+            .push((InputField::NewSessionPrompt, String::new()));
         self.new_session_open = true;
         self.error = None;
         self.show_overlay(MobileOverlay::NewSession, window, cx);
@@ -2735,13 +2774,13 @@ impl MobileApp {
         let title = self
             .new_session_title_input
             .read(cx)
-            .text()
+            .value()
             .trim()
             .to_string();
         let prompt = self
             .new_session_prompt_input
             .read(cx)
-            .text()
+            .value()
             .trim()
             .to_string();
         let workspace_mode =
@@ -2816,8 +2855,8 @@ impl MobileApp {
             return;
         }
         if kind == SessionActionKind::Rename {
-            self.session_action_input
-                .update(cx, |input, cx| input.set_text(current_title.clone(), cx));
+            self.pending_input_writes
+                .push((InputField::SessionAction, current_title.clone()));
         }
         self.session_action = Some(SessionActionPrompt {
             kind,
@@ -2848,7 +2887,12 @@ impl MobileApp {
         };
         let future: BackendFuture<'static, SessionMutationOutcome> = match prompt.kind {
             SessionActionKind::Rename => {
-                let title = self.session_action_input.read(cx).text().trim().to_string();
+                let title = self
+                    .session_action_input
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .to_string();
                 let future =
                     controller.rename_session(MutationRequest::new(RenameAgentSessionRequest {
                         session_id: prompt.session_id.clone(),
@@ -2941,8 +2985,8 @@ impl MobileApp {
             return;
         }
         if kind == WorkspaceActionKind::Rename {
-            self.session_action_input
-                .update(cx, |input, cx| input.set_text(current_title.clone(), cx));
+            self.pending_input_writes
+                .push((InputField::SessionAction, current_title.clone()));
         }
         self.workspace_action = Some(WorkspaceActionPrompt {
             kind,
@@ -2978,7 +3022,12 @@ impl MobileApp {
             return;
         };
         if prompt.kind == WorkspaceActionKind::Rename {
-            let title = self.session_action_input.read(cx).text().trim().to_string();
+            let title = self
+                .session_action_input
+                .read(cx)
+                .value()
+                .trim()
+                .to_string();
             self.workspace_action = None;
             self.send_sidebar_mutation(
                 RemoteSidebarOrganizationMutation::SetWorktreeTitle {
@@ -3556,8 +3605,8 @@ impl MobileApp {
                 .map(|folder| folder.name.clone())
                 .unwrap_or_default(),
         };
-        self.sidebar_name_input
-            .update(cx, |input, cx| input.set_text(initial, cx));
+        self.pending_input_writes
+            .push((InputField::SidebarName, initial));
         self.sidebar_name_prompt = Some(prompt);
         cx.notify();
     }
@@ -3566,7 +3615,7 @@ impl MobileApp {
         let Some(prompt) = self.sidebar_name_prompt.clone() else {
             return;
         };
-        let name = self.sidebar_name_input.read(cx).text().trim().to_string();
+        let name = self.sidebar_name_input.read(cx).value().trim().to_string();
         if name.is_empty() {
             return;
         }
@@ -4080,12 +4129,10 @@ impl MobileApp {
         }
         self.new_project_error = None;
         self.new_project_input
-            .update(cx, |input, cx| input.set_text("", cx));
+            .update(cx, |input, cx| input.set_value("", window, cx));
         self.show_overlay(MobileOverlay::NewProject, window, cx);
         self.new_project_input
-            .read(cx)
-            .focus_handle(cx)
-            .focus(window, cx);
+            .update(cx, |input, cx| input.focus(window, cx));
         window.show_soft_keyboard();
     }
 
@@ -4093,7 +4140,7 @@ impl MobileApp {
         if self.new_project_busy {
             return;
         }
-        let root_path = self.new_project_input.read(cx).text().trim().to_string();
+        let root_path = self.new_project_input.read(cx).value().trim().to_string();
         if root_path.is_empty() {
             self.new_project_error = Some(
                 locale::text(
@@ -4539,7 +4586,7 @@ impl MobileApp {
         cx.notify();
     }
 
-    fn sync_elicitation_form(&mut self, cx: &mut Context<Self>) {
+    fn sync_elicitation_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let request = self.controller.as_ref().and_then(|controller| {
             controller
                 .state
@@ -4578,9 +4625,9 @@ impl MobileApp {
                     _ => return None,
                 };
                 let input = cx.new(|cx| {
-                    let mut input = TextInput::new(placeholder, cx);
-                    input.set_text(initial, cx);
-                    input
+                    InputState::new(window, cx)
+                        .placeholder(placeholder)
+                        .default_value(initial)
                 });
                 Some((field.id.clone(), input))
             })
@@ -4667,7 +4714,7 @@ impl MobileApp {
             .unwrap_or_else(|| ElicitationFormDraft::from_request(&request));
         for field in &request.fields {
             if let Some(input) = self.elicitation_inputs.get(&field.id) {
-                draft.set_text(field.id.clone(), input.read(cx).text().to_string());
+                draft.set_text(field.id.clone(), input.read(cx).value().to_string());
             }
         }
         let payload = match draft.resolve_request(&request, action, unix_timestamp_ms()) {
@@ -5538,14 +5585,14 @@ impl MobileApp {
                     .rounded(px(theme::RADIUS_CONTROL))
                     .border_1()
                     .border_color(theme::border_default())
-                    .child(self.pairing_server_url_input.clone()),
+                    .child(Input::new(&self.pairing_server_url_input).appearance(false)),
             )
             .child(
                 div()
                     .rounded(px(theme::RADIUS_CONTROL))
                     .border_1()
                     .border_color(theme::border_default())
-                    .child(self.pairing_code_input.clone()),
+                    .child(Input::new(&self.pairing_code_input).appearance(false)),
             )
             .child(
                 div()
@@ -6605,7 +6652,7 @@ impl MobileApp {
                             .px_3()
                             .flex()
                             .items_center()
-                            .child(self.sidebar_name_input.clone()),
+                            .child(Input::new(&self.sidebar_name_input).appearance(false)),
                     )
                     .child(
                         div()
@@ -6734,7 +6781,7 @@ impl MobileApp {
                                 .border_color(theme::border_default())
                                 .bg(theme::bg_primary())
                                 .px_1()
-                                .child(self.session_action_input.clone()),
+                                .child(Input::new(&self.session_action_input).appearance(false)),
                         )
                     })
                     .when(prompt.kind != SessionActionKind::Rename, |dialog| {
@@ -6873,7 +6920,7 @@ impl MobileApp {
                                 .border_color(theme::border_default())
                                 .bg(theme::bg_primary())
                                 .px_1()
-                                .child(self.session_action_input.clone()),
+                                .child(Input::new(&self.session_action_input).appearance(false)),
                         )
                     })
                     .when(!rename, |dialog| {
@@ -12334,7 +12381,20 @@ impl MobileApp {
 
 impl Render for MobileApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.sync_elicitation_form(cx);
+        self.sync_elicitation_form(window, cx);
+        // Writes recorded by paths that have no window. `InputState` refuses a
+        // programmatic edit without one, so they land here instead.
+        for (field, value) in std::mem::take(&mut self.pending_input_writes) {
+            let input = match field {
+                InputField::PairingServerUrl => &self.pairing_server_url_input,
+                InputField::PairingCode => &self.pairing_code_input,
+                InputField::NewSessionTitle => &self.new_session_title_input,
+                InputField::NewSessionPrompt => &self.new_session_prompt_input,
+                InputField::SidebarName => &self.sidebar_name_input,
+                InputField::SessionAction => &self.session_action_input,
+            };
+            input.update(cx, |input, cx| input.set_value(value.clone(), window, cx));
+        }
         // `reset_sidebar_ui` runs from async contexts that have no window, and
         // the kit input needs one to be cleared, so the reset lands here where
         // a window always exists. A closed search field must never reopen with
@@ -12871,7 +12931,7 @@ impl MobileApp {
                             .border_color(theme::border_default())
                             .bg(theme::bg_card())
                             .px(px(2.0))
-                            .child(self.new_session_title_input.clone()),
+                            .child(Input::new(&self.new_session_title_input).appearance(false)),
                     )
                     .child(
                         div()
@@ -12882,7 +12942,7 @@ impl MobileApp {
                             .border_color(theme::border_default())
                             .bg(theme::bg_card())
                             .px(px(2.0))
-                            .child(self.new_session_prompt_input.clone()),
+                            .child(Input::new(&self.new_session_prompt_input).appearance(false)),
                     )
                     .child(
                         div()
@@ -12954,7 +13014,7 @@ impl MobileApp {
                             .border_1()
                             .border_color(theme::border_default())
                             .bg(theme::bg_card())
-                            .child(self.new_project_input.clone()),
+                            .child(Input::new(&self.new_project_input).appearance(false)),
                     )
                     .when_some(self.new_project_error.as_ref(), |body, error| {
                         body.child(
@@ -16551,9 +16611,17 @@ mod tests {
         assert_eq!(sessions_button_target(true), 0.0);
     }
 
+    /// Building a `MobileApp` creates kit input states, which read kit globals.
+    /// Those globals are process-wide, so every test that builds one must
+    /// install them rather than relying on a sibling test having run first.
+    fn init_kit_globals(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+    }
+
     #[gpui::test]
     fn back_keystroke_pops_the_top_of_the_page_stack(cx: &mut TestAppContext) {
         cx.update(bind_keys);
+        init_kit_globals(cx);
         let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
         let (app, cx) = cx.add_window_view(|window, cx| {
             let mut app = MobileApp::new(data_dir.path().to_path_buf(), window, cx);
@@ -16587,6 +16655,7 @@ mod tests {
     #[gpui::test]
     fn back_keystroke_is_ignored_while_pairing(cx: &mut TestAppContext) {
         cx.update(bind_keys);
+        init_kit_globals(cx);
         let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
         let (app, cx) = cx.add_window_view(|window, cx| {
             MobileApp::new(data_dir.path().to_path_buf(), window, cx)
@@ -16607,6 +16676,7 @@ mod tests {
 
     #[gpui::test]
     fn rendered_workspace_pan_reconciles_after_touch_end(cx: &mut TestAppContext) {
+        init_kit_globals(cx);
         let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
         let (app, cx) = cx.add_window_view(|window, cx| {
             let mut app = MobileApp::new(data_dir.path().to_path_buf(), window, cx);
