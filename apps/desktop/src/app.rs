@@ -43,6 +43,7 @@ use gpui_component::{
         MoveDown as InputMoveDown, MoveLeft as InputMoveLeft, MoveRight as InputMoveRight,
         MoveUp as InputMoveUp, Paste as InputPaste, Textarea, TextareaState,
     },
+    marker::{Marker, MarkerIcon},
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem},
     notification::Notification,
     popover::Popover,
@@ -52,6 +53,8 @@ use gpui_component::{
     select::{Select, SelectDelegate, SelectEvent, SelectState},
     spinner::Spinner,
     switch::Switch,
+    tab::{Tab, TabBar},
+    tag::Tag,
     tooltip::Tooltip,
     v_flex, v_virtual_list,
 };
@@ -37107,15 +37110,9 @@ impl VibexWorkbench {
             row.body.clone()
         };
         let highlighted_summary = self.session_search_highlighted_row_text(row, summary, cx);
-        h_flex()
+        Marker::new()
             .id(row.id.clone())
-            .w_full()
-            .min_w_0()
-            .items_center()
-            .gap_2()
-            .text_sm()
-            .text_color(cx.theme().muted_foreground)
-            .child(icon.size(px(14.0)).flex_none())
+            .child(MarkerIcon::new().child(icon.size(px(14.0)).flex_none()))
             .child(
                 div()
                     .min_w_0()
@@ -48370,29 +48367,23 @@ impl FoundationSettings {
         let startup_new_session =
             desktop_behavior.startup_destination == StartupDestination::NewSession;
         let startup_control = settings_segmented_control(
+            "startup-mode",
             vec![
                 settings_segmented_option(
-                    "startup-restore",
                     locale::text("Restore", "恢复工作台", "還原工作台"),
                     !startup_new_session,
                     cx.listener(|this, _, _, cx| {
                         this.set_startup_destination(StartupDestination::RestoreWorkbench, cx)
                     }),
-                    cx,
-                )
-                .into_any_element(),
+                ),
                 settings_segmented_option(
-                    "startup-new-session",
                     locale::text("New session", "新会话", "新會話"),
                     startup_new_session,
                     cx.listener(|this, _, _, cx| {
                         this.set_startup_destination(StartupDestination::NewSession, cx)
                     }),
-                    cx,
-                )
-                .into_any_element(),
+                ),
             ],
-            cx,
         );
         let launch_at_login = Switch::new("launch-at-login")
             .small()
@@ -48549,44 +48540,61 @@ impl FoundationSettings {
         let light_selected = appearance.theme == ModelThemeMode::Light;
         let dark_selected = appearance.theme == ModelThemeMode::Dark;
         let theme_control = settings_segmented_control(
+            "theme-mode",
             vec![
                 settings_segmented_option(
-                    "theme-system",
-                    Icon::default()
-                        .path("icons/vibex/monitor.svg")
-                        .size(px(12.0)),
+                    div()
+                        .id("theme-system-icon")
+                        .px_2()
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            Icon::default()
+                                .path("icons/vibex/monitor.svg")
+                                .size(px(12.0)),
+                        )
+                        .tooltip(move |window, cx| Tooltip::new(strings.system).build(window, cx)),
                     system_selected,
                     cx.listener(|this, _, window, cx| {
                         this.set_theme(ModelThemeMode::System, window, cx)
                     }),
-                    cx,
                 )
-                .tooltip(strings.system)
-                .into_any_element(),
+                .aria_label(strings.system),
                 settings_segmented_option(
-                    "theme-light",
-                    Icon::new(IconName::Sun).size(px(12.0)),
+                    div()
+                        .id("theme-light-icon")
+                        .px_2()
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(Icon::new(IconName::Sun).size(px(12.0)))
+                        .tooltip(move |window, cx| Tooltip::new(strings.light).build(window, cx)),
                     light_selected,
                     cx.listener(|this, _, window, cx| {
                         this.set_theme(ModelThemeMode::Light, window, cx)
                     }),
-                    cx,
                 )
-                .tooltip(strings.light)
-                .into_any_element(),
+                .aria_label(strings.light),
                 settings_segmented_option(
-                    "theme-dark",
-                    Icon::new(IconName::Moon).size(px(12.0)),
+                    div()
+                        .id("theme-dark-icon")
+                        .px_2()
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(Icon::new(IconName::Moon).size(px(12.0)))
+                        .tooltip(move |window, cx| Tooltip::new(strings.dark).build(window, cx)),
                     dark_selected,
                     cx.listener(|this, _, window, cx| {
                         this.set_theme(ModelThemeMode::Dark, window, cx)
                     }),
-                    cx,
                 )
-                .tooltip(strings.dark)
-                .into_any_element(),
+                .aria_label(strings.dark),
             ],
-            cx,
         );
         let interface_font_select = settings_select(
             &self.interface_fonts,
@@ -48894,54 +48902,42 @@ impl FoundationSettings {
             })
             .unwrap_or(false);
         let queue_control = settings_segmented_control(
+            "queue-mode",
             vec![
                 settings_segmented_option(
-                    "queue-automatic",
                     locale::text("Automatic", "自动", "自動"),
                     !queue_manual,
                     cx.listener(|this, _, _, cx| {
                         this.set_queue_send_mode(ComposerQueueSendMode::Automatic, cx)
                     }),
-                    cx,
-                )
-                .into_any_element(),
+                ),
                 settings_segmented_option(
-                    "queue-manual",
                     locale::text("Manual", "手动", "手動"),
                     queue_manual,
                     cx.listener(|this, _, _, cx| {
                         this.set_queue_send_mode(ComposerQueueSendMode::Manual, cx)
                     }),
-                    cx,
-                )
-                .into_any_element(),
+                ),
             ],
-            cx,
         );
         let send_key_control = settings_segmented_control(
+            "send-key",
             vec![
                 settings_segmented_option(
-                    "send-enter",
                     "Enter",
                     !send_command,
                     cx.listener(|this, _, window, cx| {
                         this.set_message_send_key(MessageSendKey::Enter, window, cx)
                     }),
-                    cx,
-                )
-                .into_any_element(),
+                ),
                 settings_segmented_option(
-                    "send-command-enter",
                     locale::text("Cmd/Ctrl+Enter", "Cmd/Ctrl+Enter", "Cmd/Ctrl+Enter"),
                     send_command,
                     cx.listener(|this, _, window, cx| {
                         this.set_message_send_key(MessageSendKey::CommandEnter, window, cx)
                     }),
-                    cx,
-                )
-                .into_any_element(),
+                ),
             ],
-            cx,
         );
         let auto_continue = self
             .workbench
@@ -49146,9 +49142,9 @@ impl FoundationSettings {
             })
             .unwrap_or(0);
         let location_control = settings_segmented_control(
+            "default-session-location",
             vec![
                 settings_segmented_option(
-                    "default-current-checkout",
                     locale::text("Current checkout", "当前检出", "目前簽出"),
                     workbench.default_new_session_location == NewSessionLocation::CurrentCheckout,
                     cx.listener(|this, _, _, cx| {
@@ -49157,46 +49153,34 @@ impl FoundationSettings {
                             cx,
                         )
                     }),
-                    cx,
-                )
-                .into_any_element(),
+                ),
                 settings_segmented_option(
-                    "default-new-worktree",
                     "Worktree",
                     workbench.default_new_session_location == NewSessionLocation::NewWorktree,
                     cx.listener(|this, _, _, cx| {
                         this.set_default_new_session_location(NewSessionLocation::NewWorktree, cx)
                     }),
-                    cx,
-                )
-                .into_any_element(),
+                ),
             ],
-            cx,
         );
         let hierarchy_control = settings_segmented_control(
+            "sidebar-hierarchy",
             vec![
                 settings_segmented_option(
-                    "sidebar-compact",
                     locale::text("Session view", "会话视图", "會話視圖"),
                     hierarchy == SidebarHierarchyMode::Compact,
                     cx.listener(|this, _, _, cx| {
                         this.set_sidebar_hierarchy(SidebarHierarchyMode::Compact, cx)
                     }),
-                    cx,
-                )
-                .into_any_element(),
+                ),
                 settings_segmented_option(
-                    "sidebar-detailed",
                     locale::text("Workspace view", "工作区视图", "工作區視圖"),
                     hierarchy == SidebarHierarchyMode::Detailed,
                     cx.listener(|this, _, _, cx| {
                         this.set_sidebar_hierarchy(SidebarHierarchyMode::Detailed, cx)
                     }),
-                    cx,
-                )
-                .into_any_element(),
+                ),
             ],
-            cx,
         );
         let clear_overrides = Button::new("clear-project-location-overrides")
             .small()
@@ -49334,9 +49318,9 @@ impl FoundationSettings {
         );
         let cwd = preferences.working_directory;
         let cwd_control = settings_segmented_control(
+            "terminal-cwd",
             vec![
                 settings_segmented_option(
-                    "terminal-cwd-worktree",
                     locale::text("Worktree", "工作树", "工作樹"),
                     cwd == TerminalWorkingDirectory::CurrentWorktree,
                     cx.listener(|this, _, _, cx| {
@@ -49345,11 +49329,8 @@ impl FoundationSettings {
                             cx,
                         )
                     }),
-                    cx,
-                )
-                .into_any_element(),
+                ),
                 settings_segmented_option(
-                    "terminal-cwd-project",
                     locale::text("Project", "项目", "專案"),
                     cwd == TerminalWorkingDirectory::ProjectRoot,
                     cx.listener(|this, _, _, cx| {
@@ -49358,11 +49339,8 @@ impl FoundationSettings {
                             cx,
                         )
                     }),
-                    cx,
-                )
-                .into_any_element(),
+                ),
                 settings_segmented_option(
-                    "terminal-cwd-file",
                     locale::text("Current file", "当前文件", "目前檔案"),
                     cwd == TerminalWorkingDirectory::CurrentFile,
                     cx.listener(|this, _, _, cx| {
@@ -49371,11 +49349,8 @@ impl FoundationSettings {
                             cx,
                         )
                     }),
-                    cx,
-                )
-                .into_any_element(),
+                ),
             ],
-            cx,
         );
         settings_page(
             locale::text("Terminal", "终端", "終端機"),
@@ -49558,7 +49533,7 @@ impl FoundationSettings {
             .items_center()
             .gap_1()
             .when(storage_pending, |this| this.child(Spinner::new().xsmall()))
-            .child(settings_value_chip(storage_label, cx));
+            .child(settings_value_chip(storage_label));
         let open_home = home.clone();
         settings_page(
             locale::text("Data & Diagnostics", "数据与诊断", "資料與診斷"),
@@ -49761,7 +49736,7 @@ impl FoundationSettings {
                 "已連線遠端執行階段",
             ),
         };
-        let mode_chip = settings_value_chip(mode_label, cx);
+        let mode_chip = settings_value_chip(mode_label);
         let server_summary = if server_url.is_empty() {
             locale::text("—", "—", "—").to_string()
         } else {
@@ -49855,7 +49830,7 @@ impl FoundationSettings {
                         "此桌面作为客户端连接的已配对运行时。",
                         "此桌面作為客戶端連線的已配對執行階段。",
                     ),
-                    settings_value_chip(server_summary, cx),
+                    settings_value_chip(server_summary),
                     stacked,
                     cx,
                 ),
@@ -50109,7 +50084,7 @@ impl FoundationSettings {
                         "已安装的 Vibex 桌面版本和发布通道。",
                         "已安裝的 Vibex 桌面版本與發行通道。",
                     ),
-                    settings_value_chip(format!("{} · {}", env!("CARGO_PKG_VERSION"), channel), cx),
+                    settings_value_chip(format!("{} · {}", env!("CARGO_PKG_VERSION"), channel)),
                     stacked,
                     cx,
                 ),
@@ -50120,10 +50095,11 @@ impl FoundationSettings {
                         "当前操作系统和架构。",
                         "目前作業系統與架構。",
                     ),
-                    settings_value_chip(
-                        format!("{} · {}", std::env::consts::OS, std::env::consts::ARCH),
-                        cx,
-                    ),
+                    settings_value_chip(format!(
+                        "{} · {}",
+                        std::env::consts::OS,
+                        std::env::consts::ARCH
+                    )),
                     stacked,
                     cx,
                 ),
@@ -51131,62 +51107,29 @@ fn adjust_u16(value: u16, delta: i16, minimum: u16, maximum: u16) -> u16 {
 
 /// One segment of a [`settings_segmented_control`]: a ghost button that pops
 /// with a card-coloured chip when selected so the control reads as one unit.
+/// A single segment of [`settings_segmented_control`], backed by the
+/// gpui-component segmented [`Tab`] variant.
 fn settings_segmented_option(
-    id: impl Into<ElementId>,
     label: impl IntoElement,
     selected: bool,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-    cx: &App,
-) -> Button {
-    let is_dark = cx.theme().is_dark();
-    let foreground = theme::semantic_color("foreground", is_dark);
-    let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
-    let card = theme::semantic_color("card", is_dark);
-    Button::new(id)
-        .small()
-        .ghost()
-        .h_full()
-        .rounded(px(6.0))
-        .selected(selected)
-        .text_color(if selected {
-            foreground
-        } else {
-            muted_foreground
-        })
-        .when(selected, |this| this.bg(card))
+) -> Tab {
+    Tab::new()
         .child(label)
+        .selected(selected)
         .on_click(on_click)
 }
 
-/// Groups [`settings_segmented_option`] segments into one bordered pill shell
-/// shared with the settings selects and number steppers (28px, rounded 8px).
-fn settings_segmented_control(options: Vec<AnyElement>, cx: &App) -> AnyElement {
-    let is_dark = cx.theme().is_dark();
-    let input = theme::semantic_color("input", is_dark);
-    let input_background = input.opacity(if is_dark { 0.30 } else { 0.20 });
-    let mut children = Vec::with_capacity(options.len().saturating_mul(2));
-    for (index, option) in options.into_iter().enumerate() {
-        if index > 0 {
-            children.push(
-                div()
-                    .flex_none()
-                    .h_full()
-                    .w(px(1.0))
-                    .bg(input.opacity(0.75))
-                    .into_any_element(),
-            );
-        }
-        children.push(option);
-    }
-    h_flex()
+/// Groups [`settings_segmented_option`] segments into one segmented
+/// gpui-component [`TabBar`] sharing the 28px settings control shell metric.
+fn settings_segmented_control(id: impl Into<ElementId>, options: Vec<Tab>) -> AnyElement {
+    let selected_index = options.iter().position(|tab| tab.is_selected());
+    TabBar::new(id)
+        .segmented()
+        .small()
         .h(px(28.0))
-        .flex_none()
-        .rounded(px(8.0))
-        .border_1()
-        .border_color(input)
-        .bg(input_background)
-        .p(px(2.0))
-        .children(children)
+        .when_some(selected_index, |bar, ix| bar.selected_index(ix))
+        .children(options)
         .into_any_element()
 }
 
@@ -51225,23 +51168,14 @@ where
 }
 
 /// Presents a read-only informational value (usage totals, versions) as a
-/// muted chip so it reads as data rather than an interactive control.
-fn settings_value_chip(text: impl Into<SharedString>, cx: &App) -> AnyElement {
-    let is_dark = cx.theme().is_dark();
-    let foreground = theme::semantic_color("foreground", is_dark);
-    let muted = theme::semantic_color("muted", is_dark);
-    div()
-        .max_w_full()
-        .rounded(px(6.0))
-        .bg(muted.opacity(0.6))
-        .px_2()
-        .py(px(3.0))
-        .text_xs()
-        .font_medium()
+/// muted gpui-component [`Tag`] so it reads as data rather than an
+/// interactive control.
+fn settings_value_chip(text: impl Into<SharedString>) -> Tag {
+    Tag::secondary()
         .whitespace_normal()
-        .text_color(foreground)
+        .max_w_full()
+        .font_medium()
         .child(text.into())
-        .into_any_element()
 }
 
 fn decode_html_data_image(html: &str) -> Option<(gpui::ImageFormat, Vec<u8>)> {
@@ -61761,12 +61695,13 @@ mod tests {
         assert!(sidebar.contains("SidebarHierarchyMode::Detailed"));
         assert!(sidebar.contains("NewSessionOpenTarget::Workspace"));
         assert!(sidebar.contains("icons/vibex/git-branch.svg"));
-        assert!(
-            source.contains("settings_segmented_option(\n                    \"sidebar-compact\"")
-        );
-        assert!(
-            source.contains("settings_segmented_option(\n                    \"sidebar-detailed\"")
-        );
+        assert!(source.contains("settings_segmented_control(\n            \"sidebar-hierarchy\""));
+        assert!(source.contains(
+            "settings_segmented_option(\n                    locale::text(\"Session view\"",
+        ));
+        assert!(source.contains(
+            "settings_segmented_option(\n                    locale::text(\"Workspace view\"",
+        ));
         assert!(source.contains("locale::text(\"Session view\", \"会话视图\", \"會話視圖\")"));
         assert!(
             source.contains("locale::text(\"Workspace view\", \"工作区视图\", \"工作區視圖\")")

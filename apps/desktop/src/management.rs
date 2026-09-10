@@ -20,11 +20,13 @@ use gpui_component::{
     StyledExt as _, Theme, WindowExt as _,
     animation::{EffectTransition as Transition, ease_out_cubic},
     button::{Button, ButtonVariants as _},
+    form::{Field, Form},
     h_flex,
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
     notification::Notification,
     scroll::ScrollableElement as _,
     switch::Switch,
+    tag::Tag,
     tooltip::Tooltip,
     v_flex,
 };
@@ -10091,35 +10093,24 @@ impl ManagementCenter {
                         cx,
                     ))
                     .child(
-                        v_flex()
-                            .w_full()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_medium()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(management_locale_text(
-                                        "Environment variables",
-                                        "环境变量（可选）",
-                                        "環境變數（選填）",
-                                    )),
-                            )
-                            .child(
-                                Textarea::new(&self.custom_agent_env)
-                                    .h(px(96.0))
-                                    .w_full(),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(management_locale_text(
-                                        "Use KEY=value, one entry per line. Secrets remain in the desktop runtime configuration.",
-                                        "使用 KEY=value 格式，每行一个。敏感值保存在桌面运行时配置中。",
-                                        "使用 KEY=value 格式，每行一個。敏感值保存在桌面執行階段設定中。",
-                                    )),
-                            ),
+                        Form::new().child(
+                            Field::new()
+                                .label(management_locale_text(
+                                    "Environment variables",
+                                    "环境变量（可选）",
+                                    "環境變數（選填）",
+                                ))
+                                .description(management_locale_text(
+                                    "Use KEY=value, one entry per line. Secrets remain in the desktop runtime configuration.",
+                                    "使用 KEY=value 格式，每行一个。敏感值保存在桌面运行时配置中。",
+                                    "使用 KEY=value 格式，每行一個。敏感值保存在桌面執行階段設定中。",
+                                ))
+                                .child(
+                                    Textarea::new(&self.custom_agent_env)
+                                        .h(px(96.0))
+                                        .w_full(),
+                                ),
+                        ),
                     )
                     .child(
                         h_flex()
@@ -15566,19 +15557,8 @@ fn management_profile_glyph(
         .into_any_element()
 }
 
-fn management_status_badge(label: String, cx: &App) -> AnyElement {
-    div()
-        .flex_none()
-        .rounded(px(4.0))
-        .border_1()
-        .border_color(cx.theme().border.opacity(0.70))
-        .bg(cx.theme().muted.opacity(0.25))
-        .px_1p5()
-        .py(px(1.0))
-        .text_xs()
-        .text_color(cx.theme().muted_foreground)
-        .child(label)
-        .into_any_element()
+fn management_status_badge(label: String, _cx: &App) -> AnyElement {
+    Tag::secondary().xsmall().child(label).into_any_element()
 }
 
 fn provider_wire_api_label(wire_api: vibex_core::ProviderModelWireApi) -> &'static str {
@@ -15700,20 +15680,16 @@ fn management_input_field(
     label: impl Into<SharedString>,
     state: &Entity<InputState>,
     masked: bool,
-    cx: &mut Context<ManagementCenter>,
+    _cx: &mut Context<ManagementCenter>,
 ) -> AnyElement {
+    let label: SharedString = label.into();
     let input = Input::new(state).small().w_full();
-    v_flex()
-        .w_full()
-        .gap_1()
+    Form::new()
         .child(
-            div()
-                .text_xs()
-                .font_medium()
-                .text_color(cx.theme().muted_foreground)
-                .child(label.into()),
+            Field::new()
+                .label(label)
+                .child(if masked { input.mask_toggle() } else { input }),
         )
-        .child(if masked { input.mask_toggle() } else { input })
         .into_any_element()
 }
 
