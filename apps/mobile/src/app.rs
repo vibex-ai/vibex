@@ -577,7 +577,7 @@ pub struct MobileApp {
     timeline_list: ListState,
     drawer_scroll: UniformListScrollHandle,
     settings_scroll: ScrollHandle,
-    sidebar_search_input: Entity<TextInput>,
+    sidebar_search_input: Entity<InputState>,
     sidebar_search_open: bool,
     sidebar_projects_initialized: bool,
     _sidebar_search_subscription: gpui::Subscription,
@@ -792,7 +792,8 @@ impl MobileApp {
             .as_ref()
             .cloned()
             .unwrap_or_default();
-        let sidebar_search_input = cx.new(|cx| TextInput::new(locale::common("Search"), cx));
+        let sidebar_search_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(locale::common("Search")));
         let sidebar_search_subscription = cx.observe(&sidebar_search_input, |_, _, cx| cx.notify());
         // The battery-optimization dialog only pauses the activity, which does
         // not emit a Background phase on Android; track window activation so
@@ -1183,7 +1184,7 @@ impl MobileApp {
                     workbench.update(cx, |workbench, _| workbench.suspend());
                 }
                 self.reset_drawers();
-                self.reset_sidebar_ui(cx);
+                self.reset_sidebar_ui();
                 self.back_stack.clear();
                 self.workspaces.clear();
                 self.workspace_summaries.clear();
@@ -3364,7 +3365,7 @@ impl MobileApp {
             return;
         }
         let (list_top, list_right) = self.sidebar_list_frame.get();
-        let rows = self.mobile_sidebar_rows(self.sidebar_search_input.read(cx).text());
+        let rows = self.mobile_sidebar_rows(self.sidebar_search_input.read(cx).value().as_ref());
         let offset_y = f32::from(self.drawer_scroll.0.borrow().base_handle.offset().y);
         let position = row_at_position(
             f32::from(event.position.y),
@@ -3435,7 +3436,7 @@ impl MobileApp {
             return;
         };
         let index = drag.index;
-        let rows = self.mobile_sidebar_rows(self.sidebar_search_input.read(cx).text());
+        let rows = self.mobile_sidebar_rows(self.sidebar_search_input.read(cx).value().as_ref());
         let (list_top, _) = self.sidebar_list_frame.get();
         let offset_y = f32::from(self.drawer_scroll.0.borrow().base_handle.offset().y);
         let pointer_y = f32::from(event.position.y);
@@ -3483,7 +3484,7 @@ impl MobileApp {
         let Some(target) = drag.target.filter(|_| !cancelled) else {
             return;
         };
-        let rows = self.mobile_sidebar_rows(self.sidebar_search_input.read(cx).text());
+        let rows = self.mobile_sidebar_rows(self.sidebar_search_input.read(cx).value().as_ref());
         let Some(anchor) = rows.get(target.index) else {
             return;
         };
@@ -3620,7 +3621,7 @@ impl MobileApp {
         }
     }
 
-    fn reset_sidebar_ui(&mut self, cx: &mut Context<Self>) {
+    fn reset_sidebar_ui(&mut self) {
         self.sidebar_state = SidebarState::default();
         // The tree belongs to whichever desktop is paired, so switching hosts
         // must not leave the previous desktop's folders on screen.
@@ -3652,8 +3653,6 @@ impl MobileApp {
                 BackScreen::SidebarSearch | BackScreen::SidebarBatchMode
             )
         });
-        self.sidebar_search_input
-            .update(cx, |input, cx| input.set_text("", cx));
     }
 
     fn toggle_project(&mut self, project_id: String, cx: &mut Context<Self>) {
@@ -3900,7 +3899,7 @@ impl MobileApp {
             }
             parent = Some(SidebarOrganizationItem::Folder(folder_id));
         }
-        let query = self.sidebar_search_input.read(cx).text().to_string();
+        let query = self.sidebar_search_input.read(cx).value().to_string();
         if let Some(index) = self
             .mobile_sidebar_rows(&query)
             .iter()
@@ -3922,13 +3921,11 @@ impl MobileApp {
         if self.sidebar_search_open {
             self.push_back_screen(BackScreen::SidebarSearch);
             self.sidebar_search_input
-                .read(cx)
-                .focus_handle(cx)
-                .focus(window, cx);
+                .update(cx, |input, cx| input.focus(window, cx));
             window.show_soft_keyboard();
         } else {
             self.sidebar_search_input
-                .update(cx, |input, cx| input.set_text("", cx));
+                .update(cx, |input, cx| input.set_value("", window, cx));
             window.hide_soft_keyboard();
         }
         cx.notify();
@@ -4201,7 +4198,7 @@ impl MobileApp {
         self.error = None;
         self.workspaces.clear();
         self.workspace_summaries.clear();
-        self.reset_sidebar_ui(cx);
+        self.reset_sidebar_ui();
         window.hide_soft_keyboard();
         cx.notify();
     }
@@ -5158,7 +5155,7 @@ impl MobileApp {
         self.clear_overlay();
         self.workspaces.clear();
         self.workspace_summaries.clear();
-        self.reset_sidebar_ui(cx);
+        self.reset_sidebar_ui();
         self.known_hosts.clear();
         self.active_host_id = None;
         self.desktop_timeline_display_settings = AgentTimelineDisplaySettings::default();
@@ -11438,7 +11435,7 @@ impl MobileApp {
             .and_then(|controller| controller.state.sessions.value.as_ref())
             .cloned()
             .unwrap_or_default();
-        let search_query = self.sidebar_search_input.read(cx).text().to_string();
+        let search_query = self.sidebar_search_input.read(cx).value().to_string();
         let rows = self.mobile_sidebar_rows(&search_query);
         let capabilities = self
             .backend
@@ -11854,13 +11851,9 @@ impl MobileApp {
                                         .flex_shrink_0()
                                         .text_color(theme::sidebar_text_muted()),
                                 )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .h_full()
-                                        .child(self.sidebar_search_input.clone()),
-                                )
+                                .child(div().flex_1().min_w_0().h_full().child(
+                                    Input::new(&self.sidebar_search_input).appearance(false),
+                                ))
                                 .child(
                                     div()
                                         .id("mobile-drawer-search-close")
@@ -12342,6 +12335,14 @@ impl MobileApp {
 impl Render for MobileApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_elicitation_form(cx);
+        // `reset_sidebar_ui` runs from async contexts that have no window, and
+        // the kit input needs one to be cleared, so the reset lands here where
+        // a window always exists. A closed search field must never reopen with
+        // the previous query still in it.
+        if !self.sidebar_search_open && !self.sidebar_search_input.read(cx).value().is_empty() {
+            self.sidebar_search_input
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        }
         // When the focused text input unmounts (search closing, overlay
         // dismissing), GPUI drops focus entirely and keystroke bindings stop
         // dispatching. Reclaim the window root so back navigation keeps
