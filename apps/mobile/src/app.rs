@@ -681,7 +681,11 @@ pub struct MobileApp {
     /// Keeps the selected Agent logo inside the strip's viewport whenever the
     /// selection or the strip contents change.
     runtime_agent_strip_scroll: ScrollHandle,
-    runtime_feature_inputs: BTreeMap<String, Entity<TextInput>>,
+    runtime_feature_inputs: BTreeMap<String, Entity<InputState>>,
+    /// Runtime feature values waiting to be turned into kit inputs. The sync
+    /// function reads the runtime catalog from paths without a window, and
+    /// `InputState::new` needs one, so the swap happens on the next paint.
+    pending_runtime_features: Option<Vec<(String, String)>>,
     runtime_switch_generation: u64,
     runtime_switch_busy_generation: Option<u64>,
     runtime_switch_error: Option<BackendError>,
@@ -966,6 +970,7 @@ impl MobileApp {
             runtime_agent_order: Vec::new(),
             runtime_agent_strip_scroll: ScrollHandle::new(),
             runtime_feature_inputs: BTreeMap::new(),
+            pending_runtime_features: None,
             runtime_switch_generation: 0,
             runtime_switch_busy_generation: None,
             runtime_switch_error: None,
@@ -1979,7 +1984,7 @@ impl MobileApp {
                         });
                 }
                 if applied && this.runtime_options_open {
-                    this.sync_runtime_feature_inputs(cx);
+                    this.sync_runtime_feature_inputs();
                     this.anchor_runtime_agent_strip();
                 }
                 cx.notify();
@@ -2049,7 +2054,7 @@ impl MobileApp {
             Some(cx.observe(&runtime_sheet_search, |_, _, cx| cx.notify()));
         self.runtime_sheet_search = Some(runtime_sheet_search);
         self.refresh_runtime_agents(cx);
-        self.sync_runtime_feature_inputs(cx);
+        self.sync_runtime_feature_inputs();
         self.anchor_runtime_agent_strip();
         if !has_catalog {
             self.refresh_runtime_options(cx);
@@ -2134,7 +2139,7 @@ impl MobileApp {
             Some(cx.observe(&runtime_sheet_search, |_, _, cx| cx.notify()));
         self.runtime_sheet_search = Some(runtime_sheet_search);
         self.refresh_runtime_agents(cx);
-        self.sync_runtime_feature_inputs(cx);
+        self.sync_runtime_feature_inputs();
         self.anchor_runtime_agent_strip();
         if !has_catalog {
             self.refresh_runtime_options(cx);
@@ -2148,7 +2153,7 @@ impl MobileApp {
             self.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
             self.runtime_draft = None;
             self.reset_runtime_search();
-            self.runtime_feature_inputs.clear();
+            self.clear_runtime_feature_inputs();
             self.runtime_switch_error = None;
             cx.notify();
         }
@@ -2161,7 +2166,7 @@ impl MobileApp {
         self.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
         self.runtime_draft = None;
         self.reset_runtime_search();
-        self.runtime_feature_inputs.clear();
+        self.clear_runtime_feature_inputs();
         self.runtime_switch_error = None;
     }
 
@@ -2215,7 +2220,7 @@ impl MobileApp {
         }
         self.runtime_draft = Some(selection);
         self.runtime_switch_error = None;
-        self.sync_runtime_feature_inputs(cx);
+        self.sync_runtime_feature_inputs();
         cx.notify();
     }
 
@@ -2255,7 +2260,7 @@ impl MobileApp {
         cx.notify();
     }
 
-    fn sync_runtime_feature_inputs(&mut self, cx: &mut Context<Self>) {
+    fn sync_runtime_feature_inputs(&mut self) {
         let features = self
             .controller
             .as_ref()
@@ -2268,19 +2273,23 @@ impl MobileApp {
             .as_ref()
             .map(|draft| draft.config_values.clone())
             .unwrap_or_default();
-        self.runtime_feature_inputs = features
-            .into_iter()
-            .filter(|feature| feature.kind == SessionRuntimeFeatureKind::String)
-            .map(|feature| {
-                let value = config_values.get(&feature.id).cloned().unwrap_or_default();
-                let input = cx.new(|cx| {
-                    let mut input = TextInput::new(locale::common("Value"), cx);
-                    input.set_text(value, cx);
-                    input
-                });
-                (feature.id, input)
-            })
-            .collect();
+        self.pending_runtime_features = Some(
+            features
+                .into_iter()
+                .filter(|feature| feature.kind == SessionRuntimeFeatureKind::String)
+                .map(|feature| {
+                    let value = config_values.get(&feature.id).cloned().unwrap_or_default();
+                    (feature.id, value)
+                })
+                .collect(),
+        );
+    }
+
+    /// Drop both the live inputs and any swap still waiting for a paint, so a
+    /// stale pending list cannot resurrect fields that were just reset.
+    fn clear_runtime_feature_inputs(&mut self) {
+        self.runtime_feature_inputs.clear();
+        self.pending_runtime_features = None;
     }
 
     fn apply_runtime_feature_inputs(&mut self, cx: &mut Context<Self>) -> BackendResult<()> {
@@ -2288,7 +2297,7 @@ impl MobileApp {
             return Ok(());
         };
         for (feature_id, input) in &self.runtime_feature_inputs {
-            let value = input.read(cx).text().to_string();
+            let value = input.read(cx).value().to_string();
             match runtime_string_override(value)? {
                 Some(value) => {
                     draft.config_values.insert(feature_id.clone(), value);
@@ -2337,7 +2346,7 @@ impl MobileApp {
             self.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
             self.runtime_draft = None;
             self.reset_runtime_search();
-            self.runtime_feature_inputs.clear();
+            self.clear_runtime_feature_inputs();
             self.runtime_switch_error = None;
             self.notice = Some(
                 locale::text(
@@ -2403,7 +2412,7 @@ impl MobileApp {
                         this.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
                         this.runtime_draft = None;
                         this.reset_runtime_search();
-                        this.runtime_feature_inputs.clear();
+                        this.clear_runtime_feature_inputs();
                         this.runtime_switch_error = None;
                         this.notice =
                             Some(locale::common("Runtime selection sent to desktop").to_string());
@@ -7743,9 +7752,7 @@ impl MobileApp {
             });
         if feature.kind == SessionRuntimeFeatureKind::String {
             return match self.runtime_feature_inputs.get(&feature_id) {
-                Some(input) => row
-                    .child(runtime_feature_input(input.clone()))
-                    .into_any_element(),
+                Some(input) => row.child(runtime_feature_input(input)).into_any_element(),
                 None => row
                     .child(
                         div()
@@ -12395,6 +12402,19 @@ impl Render for MobileApp {
             };
             input.update(cx, |input, cx| input.set_value(value.clone(), window, cx));
         }
+        // The runtime feature fields are swapped in here for the same reason:
+        // their sync reads the catalog from a path without a window.
+        if let Some(features) = self.pending_runtime_features.take() {
+            self.runtime_feature_inputs.clear();
+            for (id, value) in features {
+                let input = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .placeholder(locale::common("Value"))
+                        .default_value(value)
+                });
+                self.runtime_feature_inputs.insert(id, input);
+            }
+        }
         // `reset_sidebar_ui` runs from async contexts that have no window, and
         // the kit input needs one to be cleared, so the reset lands here where
         // a window always exists. A closed search field must never reopen with
@@ -14968,7 +14988,7 @@ fn runtime_sheet_action_button(
         .child(label.into())
 }
 
-fn runtime_feature_input(input: Entity<TextInput>) -> gpui::Div {
+fn runtime_feature_input(input: &Entity<InputState>) -> gpui::Div {
     div()
         .h(px(theme::TOUCH_TARGET))
         .w_full()
@@ -14977,7 +14997,7 @@ fn runtime_feature_input(input: Entity<TextInput>) -> gpui::Div {
         .border_color(theme::border_default())
         .bg(theme::bg_card())
         .px_1()
-        .child(input)
+        .child(Input::new(input).appearance(false))
 }
 
 fn sidebar_item_ref(item: &SidebarOrganizationItem) -> RemoteSidebarItemRef {
