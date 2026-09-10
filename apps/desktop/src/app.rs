@@ -696,6 +696,39 @@ struct RuntimeChoiceMenuItem {
     action: RuntimeChoiceMenuAction,
 }
 
+/// One selectable base branch for the new-session worktree form.
+///
+/// The gpui-kit `Select` owns the menu, the search field, and the keyboard
+/// navigation here, so this type only has to describe a branch.
+#[derive(Clone)]
+struct NewSessionBaseRefChoice {
+    name: String,
+}
+
+impl SearchableListItem for NewSessionBaseRefChoice {
+    type Value = String;
+
+    fn title(&self) -> SharedString {
+        self.name.clone().into()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.name
+    }
+
+    fn render(&self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        h_flex()
+            .min_w_0()
+            .gap_2()
+            .child(
+                sidebar_icon("icons/vibex/git-branch.svg")
+                    .size(px(14.0))
+                    .text_color(cx.theme().muted_foreground),
+            )
+            .child(div().min_w_0().truncate().child(self.name.clone()))
+    }
+}
+
 #[derive(Debug, Default)]
 struct RuntimePreferenceWriteFence {
     epochs: BTreeMap<AgentId, u64>,
@@ -4700,7 +4733,10 @@ pub struct VibexWorkbench {
     new_session_worktree_name_input: Entity<InputState>,
     new_session_worktree_path_input: Entity<InputState>,
     new_session_project_search: Entity<InputState>,
-    new_session_base_ref_search: Entity<InputState>,
+    new_session_base_ref_select: Entity<SelectState<Vec<NewSessionBaseRefChoice>>>,
+    /// The choices currently loaded into [`Self::new_session_base_ref_select`],
+    /// so the select is only rebuilt when the worktree eligibility changes.
+    new_session_base_ref_choices: Vec<String>,
     new_session_project_menu_focus: FocusHandle,
     new_session_project_trigger_bounds: Option<Bounds<Pixels>>,
     workspaces: Vec<(ProjectRecord, WorkspaceRecord)>,
@@ -4758,7 +4794,6 @@ pub struct VibexWorkbench {
     new_session_composer_geometry: ComposerGeometry,
     new_session_workspace: NewSessionWorkspaceState,
     new_session_workspace_mode_menu_open: bool,
-    new_session_base_ref_menu_open: bool,
     new_session_worktree_input_syncing: bool,
     new_session_eligibility_error: Option<String>,
     workspace_contexts: BTreeMap<String, WorkspaceContextProjection>,
@@ -5067,13 +5102,8 @@ impl VibexWorkbench {
         let new_session_project_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(initial_strings.new_session_search_project)
         });
-        let new_session_base_ref_search = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(locale::text(
-                "Search branches",
-                "搜索分支",
-                "搜尋分支",
-            ))
-        });
+        let new_session_base_ref_select =
+            cx.new(|cx| SelectState::new(Vec::new(), None, window, cx).searchable(true));
         let new_session_runtime_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(locale::text(
                 "Search providers and models",
@@ -5155,9 +5185,15 @@ impl VibexWorkbench {
             cx.subscribe(&new_session_project_search, |_, _, _: &InputEvent, cx| {
                 cx.notify()
             }),
-            cx.subscribe(&new_session_base_ref_search, |_, _, _: &InputEvent, cx| {
-                cx.notify()
-            }),
+            cx.subscribe(
+                &new_session_base_ref_select,
+                |this, _, event: &SelectEvent<Vec<NewSessionBaseRefChoice>>, cx| {
+                    let SelectEvent::Confirm(base_ref) = event;
+                    if let Some(base_ref) = base_ref {
+                        this.set_new_session_base_ref(base_ref.clone(), cx);
+                    }
+                },
+            ),
             cx.subscribe(
                 &new_session_runtime_search,
                 |this, _, event: &InputEvent, cx| {
@@ -5471,7 +5507,8 @@ impl VibexWorkbench {
             new_session_worktree_name_input,
             new_session_worktree_path_input,
             new_session_project_search,
-            new_session_base_ref_search,
+            new_session_base_ref_select,
+            new_session_base_ref_choices: Vec::new(),
             new_session_project_menu_focus,
             new_session_project_trigger_bounds: None,
             workspaces: Vec::new(),
@@ -5528,7 +5565,6 @@ impl VibexWorkbench {
             new_session_composer_geometry: ComposerGeometry::default(),
             new_session_workspace,
             new_session_workspace_mode_menu_open: false,
-            new_session_base_ref_menu_open: false,
             new_session_worktree_input_syncing: false,
             new_session_eligibility_error: None,
             workspace_contexts: BTreeMap::new(),
@@ -29845,146 +29881,54 @@ impl VibexWorkbench {
             can_create_worktree,
         );
 
-        let selected_base_ref = self.new_session_workspace.base_ref.clone();
         let base_ref_options = self
             .new_session_workspace
             .eligibility
             .as_ref()
             .map(|eligibility| eligibility.selectable_base_refs.clone())
             .unwrap_or_default();
-        let base_ref_query = self
-            .new_session_base_ref_search
-            .read(cx)
-            .value()
-            .trim()
-            .to_lowercase();
-        let base_ref_rows = base_ref_options
-            .iter()
-            .filter(|base_ref| base_ref.to_lowercase().contains(&base_ref_query))
-            .map(|base_ref| {
-                let entity = cx.weak_entity();
-                let value = base_ref.clone();
-                let selected = selected_base_ref.as_ref() == Some(base_ref);
-                Button::new(format!("new-session-base-ref-option:{base_ref}"))
-                    .small()
-                    .ghost()
-                    .w_full()
-                    .h(px(32.0))
-                    .px_2()
-                    .selected(selected)
-                    .rounded(gpui_component::button::ButtonRounded::Size(px(7.0)))
-                    .text_color(popover_foreground)
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .min_w_0()
-                            .justify_between()
-                            .gap_2()
-                            .child(
-                                h_flex()
-                                    .min_w_0()
-                                    .gap_2()
-                                    .child(
-                                        sidebar_icon("icons/vibex/git-branch.svg").size(px(14.0)),
-                                    )
-                                    .child(div().min_w_0().truncate().child(base_ref.clone())),
-                            )
-                            .when(selected, |this| {
-                                this.child(Icon::new(IconName::Check).size(px(14.0)))
-                            }),
-                    )
-                    .on_click(move |_, window, cx| {
-                        let _ = entity.update(cx, |this, cx| {
-                            this.set_new_session_base_ref(value.clone(), cx);
-                            this.new_session_base_ref_menu_open = false;
-                            this.new_session_base_ref_search
-                                .update(cx, |input, cx| input.set_value("", window, cx));
-                            this.new_session_input
-                                .update(cx, |input, cx| input.focus(window, cx));
-                        });
-                    })
-                    .into_any_element()
-            })
-            .collect::<Vec<_>>();
-        let base_ref_results = if base_ref_rows.is_empty() {
-            div()
-                .px_2()
-                .py_3()
-                .text_xs()
-                .text_color(muted_foreground)
-                .child(locale::text("No branches", "没有匹配分支", "沒有符合分支"))
-                .into_any_element()
-        } else {
-            v_flex()
-                .max_h(px(240.0))
-                .overflow_y_scrollbar()
-                .children(base_ref_rows)
-                .into_any_element()
-        };
-        let base_ref_panel = v_flex()
-            .w(px(282.0))
-            .min_w_0()
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(border_color)
-            .bg(glass::glass_tint(popover_color, cx))
-            .p_2()
-            .text_color(popover_foreground)
-            .shadow_lg()
-            .child(
-                Input::new(&self.new_session_base_ref_search)
-                    .small()
-                    .mb_1()
-                    .h(px(34.0))
-                    .prefix(
-                        Icon::new(IconName::Search)
-                            .small()
-                            .text_color(muted_foreground),
-                    ),
-            )
-            .child(base_ref_results);
-        let base_ref_trigger = Button::new("new-session-base-ref")
-            .xsmall()
-            .ghost()
-            .h(px(32.0))
-            .max_w(px(208.0))
-            .px_2()
-            .selected(self.new_session_base_ref_menu_open)
-            .tooltip(locale::text("Base branch", "基于分支", "基於分支"))
-            .disabled(self.agent_action_pending || base_ref_options.is_empty())
-            .child(
-                h_flex()
-                    .min_w_0()
-                    .gap(px(6.0))
-                    .child(
-                        sidebar_icon("icons/vibex/git-branch.svg")
-                            .size(px(14.0))
-                            .text_color(muted_foreground),
-                    )
-                    .child(div().min_w_0().truncate().text_xs().child(
-                        selected_base_ref.clone().unwrap_or_else(|| {
-                            locale::text("Select base", "选择基线", "選擇基線").to_string()
-                        }),
-                    ))
-                    .child(Icon::new(IconName::ChevronDown).size(px(13.0))),
-            );
-        let base_ref_button = Popover::new("new-session-base-ref-popover")
-            .appearance(false)
-            .anchor(Anchor::TopLeft)
-            .open(self.new_session_base_ref_menu_open)
-            .on_open_change(cx.listener(|this, open, window, cx| {
-                this.new_session_base_ref_menu_open = *open;
-                if *open {
-                    this.new_session_base_ref_search
-                        .update(cx, |input, cx| input.focus(window, cx));
-                } else {
-                    this.new_session_base_ref_search
-                        .update(cx, |input, cx| input.set_value("", window, cx));
+        // The kit `Select` owns the menu, its search field, and the arrow/enter
+        // navigation, so the choices only have to be reloaded when Git reports a
+        // different set of base branches.
+        if self.new_session_base_ref_choices != base_ref_options {
+            self.new_session_base_ref_choices = base_ref_options.clone();
+            let choices = base_ref_options
+                .iter()
+                .map(|name| NewSessionBaseRefChoice { name: name.clone() })
+                .collect::<Vec<_>>();
+            let selected = self.new_session_workspace.base_ref.clone();
+            self.new_session_base_ref_select.update(cx, |select, cx| {
+                select.set_items(choices, window, cx);
+                match selected.as_ref() {
+                    Some(selected) => select.set_selected_value(selected, window, cx),
+                    None => select.set_selected_index(None, window, cx),
                 }
-                cx.notify();
-            }))
-            .trigger(base_ref_trigger)
-            .child(glass::frosted(8.0, base_ref_panel))
+            });
+        }
+        let base_ref_button = div()
+            .flex_none()
+            .max_w(px(208.0))
+            .child(
+                Select::new(&self.new_session_base_ref_select)
+                    .id("new-session-base-ref")
+                    .small()
+                    .h(px(32.0))
+                    .text_xs()
+                    .icon(Icon::default().path("icons/vibex/git-branch.svg"))
+                    .menu_width(px(282.0))
+                    .menu_max_h(px(240.0))
+                    .placeholder(locale::text("Select base", "选择基线", "選擇基線"))
+                    .search_placeholder(locale::text("Search branches", "搜索分支", "搜尋分支"))
+                    .empty(|_, _| {
+                        div()
+                            .px_2()
+                            .py_3()
+                            .text_xs()
+                            .child(locale::text("No branches", "没有匹配分支", "沒有符合分支"))
+                            .into_any_element()
+                    })
+                    .disabled(self.agent_action_pending || base_ref_options.is_empty()),
+            )
             .into_any_element();
 
         let custom_path = self.new_session_workspace.worktree_path.trim();
@@ -61612,8 +61556,12 @@ mod tests {
         assert!(!panel.contains("Checking Git status"));
         assert!(!panel.contains("项目不是 Git 工作目录"));
         assert!(panel.contains("new-session-base-ref"));
-        assert!(panel.contains("new-session-base-ref-popover"));
-        assert!(panel.contains("new_session_base_ref_search"));
+        // The base-ref picker is a gpui-kit `Select`, which owns its own search
+        // field and keyboard navigation, so it must not go back to hand-rolling a
+        // popover plus an `InputState` search box.
+        assert!(panel.contains("Select::new(&self.new_session_base_ref_select)"));
+        assert!(!panel.contains("new_session_base_ref_search"));
+        assert!(!panel.contains("new-session-base-ref-popover"));
         assert!(panel.contains("new-session-workspace-mode-menu"));
         assert!(!panel.contains("new-session-worktree-settings-popover"));
         assert!(panel.contains("new-session-default-worktree"));
