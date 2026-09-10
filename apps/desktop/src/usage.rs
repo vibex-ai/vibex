@@ -2,17 +2,18 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{Datelike as _, NaiveDate};
 use gpui::{
-    AnyElement, BorderStyle, Bounds, Context, Edges, Hsla, InteractiveElement as _, IntoElement,
-    Render, ScrollHandle, ScrollWheelEvent, SharedString, Styled as _, Task, Window, canvas, div,
-    point, prelude::*, px, quad, transparent_black,
+    AnyElement, App, BorderStyle, Bounds, Context, Edges, Entity, Hsla, InteractiveElement as _,
+    IntoElement, Render, SharedString, Styled as _, Task, WeakEntity, Window, canvas, div, point,
+    prelude::*, px, quad, transparent_black,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Size,
     StyledExt as _,
     button::{Button, ButtonGroup, ButtonVariants as _},
     h_flex,
     menu::{DropdownMenu as _, PopupMenuItem},
     scroll::ScrollableElement as _,
+    table::{Column, ColumnSort, DataTable, TableDelegate, TableState},
     tooltip::Tooltip,
     v_flex,
 };
@@ -33,7 +34,6 @@ const USAGE_HEATMAP_CELL_SIZE: f32 = 12.0;
 const USAGE_HEATMAP_GAP: f32 = 3.0;
 const USAGE_HEATMAP_MIN_WIDTH: f32 = 840.0;
 const USAGE_MODEL_CHART_MIN_WIDTH: f32 = 720.0;
-const USAGE_TABLE_MIN_WIDTH: f32 = 1040.0;
 const USAGE_SESSION_FILTER_MENU_WIDTH: f32 = 420.0;
 const USAGE_SESSION_FILTER_LABEL_MAX_WIDTH_UNITS: usize = 48;
 const USAGE_MODEL_LIMIT: usize = 10;
@@ -93,7 +93,7 @@ pub struct UsageView {
     trend_view: UsageTrendView,
     enabled_trend_metrics: Vec<AgentUsageTrendMetric>,
     model_metric: UsageModelMetric,
-    table_scroll: ScrollHandle,
+    table: Option<Entity<TableState<UsageTableDelegate>>>,
     generation: u64,
     refresh_task: Option<Task<()>>,
 }
@@ -120,7 +120,7 @@ impl UsageView {
                 AgentUsageTrendMetric::CachedTokens,
             ],
             model_metric: UsageModelMetric::TotalTokens,
-            table_scroll: ScrollHandle::new(),
+            table: None,
             generation: 0,
             refresh_task: None,
         }
@@ -223,6 +223,11 @@ impl UsageView {
     fn choose_dimension(&mut self, dimension: AgentUsageDimension, cx: &mut Context<Self>) {
         if self.request.dimension != dimension {
             self.request.dimension = dimension;
+            // The leading table column is named after the dimension, so the
+            // stored column groups must re-derive before the next paint.
+            if let Some(table) = &self.table {
+                table.update(cx, |table, cx| table.refresh(cx));
+            }
             self.refresh(cx);
         }
     }
@@ -257,17 +262,17 @@ impl UsageView {
         }
     }
 
-    fn choose_sort(&mut self, metric: AgentUsageSortMetric, cx: &mut Context<Self>) {
-        if self.request.sort_metric == metric {
-            self.request.sort_direction = match self.request.sort_direction {
-                AgentUsageSortDirection::Ascending => AgentUsageSortDirection::Descending,
-                AgentUsageSortDirection::Descending => AgentUsageSortDirection::Ascending,
-            };
-        } else {
+    fn apply_table_sort(
+        &mut self,
+        metric: AgentUsageSortMetric,
+        direction: AgentUsageSortDirection,
+        cx: &mut Context<Self>,
+    ) {
+        if self.request.sort_metric != metric || self.request.sort_direction != direction {
             self.request.sort_metric = metric;
-            self.request.sort_direction = AgentUsageSortDirection::Descending;
+            self.request.sort_direction = direction;
+            self.refresh(cx);
         }
-        self.refresh(cx);
     }
 
     fn clear_filter(&mut self, kind: UsageFilterKind, cx: &mut Context<Self>) {
@@ -712,11 +717,7 @@ impl UsageView {
             .into_any_element()
     }
 
-    fn render_dimensions(
-        &mut self,
-        statistics: &AgentUsageStatistics,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_dimensions(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let dimensions = [
             (
                 AgentUsageDimension::Time,
@@ -774,154 +775,31 @@ impl UsageView {
                     .border_color(cx.theme().border.opacity(0.55))
                     .child(controls),
             )
-            .child(self.render_table(statistics.dimension_rows.as_slice(), cx))
+            .child(self.render_usage_table(window, cx))
             .into_any_element()
     }
 
-    fn render_table(
-        &mut self,
-        rows: &[AgentUsageDimensionRow],
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let header = h_flex()
-            .h(px(34.0))
-            .w_full()
-            .flex_none()
-            .items_center()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().muted.opacity(0.22))
-            .child(table_label_header(
-                dimension_label(self.request.dimension),
-                cx,
-            ))
-            .child(self.render_sort_header(
-                locale::text("Requests", "请求", "請求"),
-                AgentUsageSortMetric::Requests,
-                84.0,
-                cx,
-            ))
-            .child(self.render_sort_header(
-                locale::text("Total", "总量", "總量"),
-                AgentUsageSortMetric::TotalTokens,
-                108.0,
-                cx,
-            ))
-            .child(self.render_sort_header(
-                locale::text("Input", "输入", "輸入"),
-                AgentUsageSortMetric::InputTokens,
-                100.0,
-                cx,
-            ))
-            .child(self.render_sort_header(
-                locale::text("Output", "输出", "輸出"),
-                AgentUsageSortMetric::OutputTokens,
-                100.0,
-                cx,
-            ))
-            .child(self.render_sort_header(
-                locale::text("Cache", "缓存", "快取"),
-                AgentUsageSortMetric::CachedTokens,
-                100.0,
-                cx,
-            ))
-            .child(self.render_sort_header(
-                locale::text("Hit rate", "命中率", "命中率"),
-                AgentUsageSortMetric::CacheHitRate,
-                92.0,
-                cx,
-            ))
-            .child(self.render_sort_header(
-                locale::text("Last activity", "最近活动", "最近活動"),
-                AgentUsageSortMetric::LastActivity,
-                126.0,
-                cx,
-            ))
-            .child(table_plain_header(
-                locale::text("Coverage", "上报覆盖", "回報覆蓋"),
-                118.0,
-                cx,
-            ));
-        let mut body = v_flex().w_full();
-        if rows.is_empty() {
-            body = body.child(
-                div()
-                    .h(px(96.0))
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(locale::text(
-                        "No usage facts match these filters",
-                        "没有符合筛选条件的用量记录",
-                        "沒有符合篩選條件的用量記錄",
-                    )),
-            );
-        } else {
-            let last_index = rows.len().saturating_sub(1);
-            for (index, row) in rows.iter().enumerate() {
-                body = body.child(render_table_row(index, row, index == last_index, cx));
+    fn render_usage_table(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let table = match &self.table {
+            Some(table) => table.clone(),
+            None => {
+                let view = cx.weak_entity();
+                let table = cx.new(|cx| {
+                    TableState::new(UsageTableDelegate { view }, window, cx)
+                        .col_movable(false)
+                        .col_resizable(false)
+                        .row_selectable(false)
+                        .col_selectable(false)
+                });
+                self.table = Some(table.clone());
+                table
             }
-        }
-        let wheel_scroll = self.table_scroll.clone();
-        div()
-            .id("usage-table-scroll")
-            .w_full()
-            .overflow_x_scroll()
-            .track_scroll(&self.table_scroll)
-            .on_scroll_wheel(cx.listener(move |_, event: &ScrollWheelEvent, window, cx| {
-                let max_x = wheel_scroll.max_offset().x;
-                if max_x <= px(0.0) {
-                    return;
-                }
-                let delta = event.delta.pixel_delta(window.line_height());
-                if delta.y.abs() > delta.x.abs() {
-                    let offset = wheel_scroll.offset();
-                    // GPUI applies delta.x before bubble listeners run.
-                    let next_x = (offset.x - delta.x + delta.y).clamp(-max_x, px(0.0));
-                    if next_x != offset.x {
-                        wheel_scroll.set_offset(point(next_x, offset.y));
-                        cx.notify();
-                    }
-                }
-                cx.stop_propagation();
-            }))
-            .child(
-                v_flex()
-                    .min_w(px(USAGE_TABLE_MIN_WIDTH))
-                    .w_full()
-                    .child(header)
-                    .child(body),
-            )
-            .into_any_element()
-    }
-
-    fn render_sort_header(
-        &mut self,
-        label: &'static str,
-        metric: AgentUsageSortMetric,
-        width: f32,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let active = self.request.sort_metric == metric;
-        let ascending = self.request.sort_direction == AgentUsageSortDirection::Ascending;
-        Button::new(SharedString::from(format!("usage-sort-{metric:?}")))
-            .xsmall()
-            .ghost()
-            .h_full()
-            .w(px(width))
-            .justify_end()
-            .label(label)
-            .when(active, |button| {
-                button.icon(if ascending {
-                    IconName::ArrowUp
-                } else {
-                    IconName::ArrowDown
-                })
-            })
-            .on_click(cx.listener(move |this, _, _, cx| this.choose_sort(metric, cx)))
+        };
+        DataTable::new(&table)
+            .stripe(true)
+            .bordered(false)
+            .scrollbar_visible(false, true)
+            .with_size(Size::Size(px(42.0)))
             .into_any_element()
     }
 
@@ -996,7 +874,7 @@ impl Render for UsageView {
                     .child(self.render_toolbar(cx))
                     .child(self.render_summary(&statistics.totals, viewport_width, cx))
                     .child(self.render_trend(&statistics, cx))
-                    .child(self.render_dimensions(&statistics, cx))
+                    .child(self.render_dimensions(window, cx))
                     .into_any_element()
             }
             UsageContentState::Loading => div()
@@ -2193,190 +2071,382 @@ fn dimension_label(dimension: AgentUsageDimension) -> &'static str {
     }
 }
 
-fn table_label_header(label: &'static str, cx: &mut Context<UsageView>) -> AnyElement {
-    div()
-        .min_w(px(210.0))
-        .flex_1()
-        .truncate()
-        .px_3()
-        .text_xs()
-        .font_medium()
-        .text_color(cx.theme().muted_foreground)
-        .child(label)
-        .into_any_element()
+const USAGE_TABLE_LABEL_WIDTH: f32 = 280.0;
+
+struct UsageTableDelegate {
+    view: WeakEntity<UsageView>,
 }
 
-fn table_plain_header(label: &'static str, width: f32, cx: &mut Context<UsageView>) -> AnyElement {
-    div()
-        .w(px(width))
-        .flex_none()
-        .truncate()
-        .px_2()
-        .text_right()
-        .text_xs()
-        .font_medium()
-        .text_color(cx.theme().muted_foreground)
-        .child(label)
-        .into_any_element()
+impl UsageTableDelegate {
+    fn sort_target(col_ix: usize) -> Option<AgentUsageSortMetric> {
+        Some(match col_ix {
+            1 => AgentUsageSortMetric::Requests,
+            2 => AgentUsageSortMetric::TotalTokens,
+            3 => AgentUsageSortMetric::InputTokens,
+            4 => AgentUsageSortMetric::OutputTokens,
+            5 => AgentUsageSortMetric::CachedTokens,
+            6 => AgentUsageSortMetric::CacheHitRate,
+            7 => AgentUsageSortMetric::LastActivity,
+            _ => return None,
+        })
+    }
+
+    fn label_column(dimension: AgentUsageDimension) -> Column {
+        Column::new("dimension", dimension_label(dimension))
+            .width(px(USAGE_TABLE_LABEL_WIDTH))
+            .paddings(Edges {
+                top: px(0.),
+                right: px(8.),
+                bottom: px(0.),
+                left: px(12.),
+            })
+    }
+
+    fn value_column(key: &'static str, label: &'static str, width: f32) -> Column {
+        Column::new(key, label)
+            .width(px(width))
+            .text_right()
+            .paddings(Edges::all(px(8.)))
+    }
+
+    fn sortable_column(
+        key: &'static str,
+        label: &'static str,
+        width: f32,
+        metric: AgentUsageSortMetric,
+        active_metric: AgentUsageSortMetric,
+        direction: AgentUsageSortDirection,
+    ) -> Column {
+        let column = Self::value_column(key, label, width).sortable();
+        if active_metric == metric {
+            match direction {
+                AgentUsageSortDirection::Ascending => column.ascending(),
+                AgentUsageSortDirection::Descending => column.descending(),
+            }
+        } else {
+            column
+        }
+    }
 }
 
-fn render_table_row(
-    index: usize,
-    row: &AgentUsageDimensionRow,
-    last: bool,
-    cx: &mut Context<UsageView>,
-) -> AnyElement {
-    let label_tooltip = row.label.clone();
-    h_flex()
-        .id(SharedString::from(format!("usage-row-{index}")))
-        .min_h(px(42.0))
-        .w_full()
-        .items_center()
-        .when(!last, |this| {
-            this.border_b_1()
-                .border_color(cx.theme().border.opacity(0.55))
-        })
-        .when(index % 2 == 1, |this| {
-            this.bg(cx.theme().muted.opacity(0.10))
-        })
-        .child(
-            div()
-                .id(SharedString::from(format!("usage-row-{index}-label")))
-                .min_w(px(210.0))
-                .flex_1()
-                .truncate()
-                .px_3()
-                .text_sm()
-                .font_medium()
-                .child(row.label.clone())
-                .tooltip(move |window, cx| Tooltip::new(label_tooltip.clone()).build(window, cx)),
-        )
-        .child(table_value(
-            SharedString::from(format!("usage-row-{index}-requests")),
-            format_compact_number(row.aggregate.requests),
-            84.0,
-            false,
-            Some(format!(
-                "{}: {}. {}",
+impl TableDelegate for UsageTableDelegate {
+    fn columns_count(&self, _cx: &App) -> usize {
+        9
+    }
+
+    fn rows_count(&self, cx: &App) -> usize {
+        self.view
+            .upgrade()
+            .and_then(|view| view.read(cx).statistics.as_ref())
+            .map(|statistics| statistics.dimension_rows.len())
+            .unwrap_or(0)
+    }
+
+    fn column(&self, col_ix: usize, cx: &App) -> Column {
+        let Some(view) = self.view.upgrade() else {
+            return Column::new("usage-missing", "");
+        };
+        let view = view.read(cx);
+        let sort_metric = view.request.sort_metric;
+        let sort_direction = view.request.sort_direction;
+        match col_ix {
+            0 => Self::label_column(view.request.dimension),
+            1 => Self::sortable_column(
+                "requests",
                 locale::text("Requests", "请求", "請求"),
-                format_full_number(row.aggregate.requests),
-                locale::text(
-                    "Dispatched prompt executions",
-                    "实际发送的 prompt 执行数",
-                    "實際傳送的 prompt 執行數",
-                )
-            )),
-            cx,
-        ))
-        .child(table_metric(
-            index,
-            "total",
-            locale::text("Total tokens", "总 Token", "總 Token"),
-            &row.aggregate.total_tokens,
-            108.0,
-            cx,
-        ))
-        .child(table_metric(
-            index,
-            "input",
-            locale::text("Input tokens", "输入 Token", "輸入 Token"),
-            &row.aggregate.input_tokens,
-            100.0,
-            cx,
-        ))
-        .child(table_metric(
-            index,
-            "output",
-            locale::text("Output tokens", "输出 Token", "輸出 Token"),
-            &row.aggregate.output_tokens,
-            100.0,
-            cx,
-        ))
-        .child(table_metric(
-            index,
-            "cached-read",
-            locale::text("Cached read tokens", "缓存读取 Token", "快取讀取 Token"),
-            &row.aggregate.cached_tokens,
-            100.0,
-            cx,
-        ))
-        .child(table_value(
-            SharedString::from(format!("usage-row-{index}-cache-hit")),
-            format_basis_points(row.aggregate.cache_hit_rate.basis_points),
-            92.0,
-            row.aggregate.cache_hit_rate.basis_points.is_none(),
-            Some(format!(
-                "{}: {}. {}",
-                locale::text("Cache hit rate", "缓存命中率", "快取命中率"),
-                format_basis_points(row.aggregate.cache_hit_rate.basis_points),
-                cache_hit_detail(&row.aggregate.cache_hit_rate)
-            )),
-            cx,
-        ))
-        .child(table_value(
-            SharedString::from(format!("usage-row-{index}-last-activity")),
-            row.aggregate
+                84.0,
+                AgentUsageSortMetric::Requests,
+                sort_metric,
+                sort_direction,
+            ),
+            2 => Self::sortable_column(
+                "total",
+                locale::text("Total", "总量", "總量"),
+                108.0,
+                AgentUsageSortMetric::TotalTokens,
+                sort_metric,
+                sort_direction,
+            ),
+            3 => Self::sortable_column(
+                "input",
+                locale::text("Input", "输入", "輸入"),
+                100.0,
+                AgentUsageSortMetric::InputTokens,
+                sort_metric,
+                sort_direction,
+            ),
+            4 => Self::sortable_column(
+                "output",
+                locale::text("Output", "输出", "輸出"),
+                100.0,
+                AgentUsageSortMetric::OutputTokens,
+                sort_metric,
+                sort_direction,
+            ),
+            5 => Self::sortable_column(
+                "cached",
+                locale::text("Cache", "缓存", "快取"),
+                100.0,
+                AgentUsageSortMetric::CachedTokens,
+                sort_metric,
+                sort_direction,
+            ),
+            6 => Self::sortable_column(
+                "cache-hit-rate",
+                locale::text("Hit rate", "命中率", "命中率"),
+                92.0,
+                AgentUsageSortMetric::CacheHitRate,
+                sort_metric,
+                sort_direction,
+            ),
+            7 => Self::sortable_column(
+                "last-activity",
+                locale::text("Last activity", "最近活动", "最近活動"),
+                126.0,
+                AgentUsageSortMetric::LastActivity,
+                sort_metric,
+                sort_direction,
+            ),
+            _ => Self::value_column(
+                "coverage",
+                locale::text("Coverage", "上报覆盖", "回報覆蓋"),
+                118.0,
+            ),
+        }
+    }
+
+    fn perform_sort(
+        &mut self,
+        col_ix: usize,
+        sort: ColumnSort,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) {
+        let Some(metric) = Self::sort_target(col_ix) else {
+            return;
+        };
+        // Cycling past ascending resets the table to its default ordering.
+        let (metric, direction) = match sort {
+            ColumnSort::Ascending => (metric, AgentUsageSortDirection::Ascending),
+            ColumnSort::Descending => (metric, AgentUsageSortDirection::Descending),
+            ColumnSort::Default => (
+                AgentUsageSortMetric::default(),
+                AgentUsageSortDirection::default(),
+            ),
+        };
+        let _ = self
+            .view
+            .update(cx, |view, cx| view.apply_table_sort(metric, direction, cx));
+    }
+
+    fn render_th(
+        &mut self,
+        col_ix: usize,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        let name = self.column(col_ix, cx).name;
+        if col_ix == 0 {
+            return div().size_full().child(name).into_any_element();
+        }
+        div()
+            .size_full()
+            .flex()
+            .justify_end()
+            .child(name)
+            .into_any_element()
+    }
+
+    fn render_empty(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        h_flex()
+            .h(px(96.0))
+            .w_full()
+            .items_center()
+            .justify_center()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child(locale::text(
+                "No usage facts match these filters",
+                "没有符合筛选条件的用量记录",
+                "沒有符合篩選條件的用量記錄",
+            ))
+    }
+
+    fn render_td(
+        &mut self,
+        row_ix: usize,
+        col_ix: usize,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        let Some(view) = self.view.upgrade() else {
+            return div().into_any_element();
+        };
+        let view = view.read(cx);
+        let Some(row) = view
+            .statistics
+            .as_ref()
+            .and_then(|statistics| statistics.dimension_rows.get(row_ix))
+        else {
+            return div().into_any_element();
+        };
+        let aggregate = &row.aggregate;
+        let id = SharedString::from(format!("usage-cell-{row_ix}-{col_ix}"));
+        match col_ix {
+            0 => usage_table_label_cell(id, row).into_any_element(),
+            1 => usage_table_value_cell(
+                id,
+                format_compact_number(aggregate.requests),
+                false,
+                Some(format!(
+                    "{}: {}. {}",
+                    locale::text("Requests", "请求", "請求"),
+                    format_full_number(aggregate.requests),
+                    locale::text(
+                        "Dispatched prompt executions",
+                        "实际发送的 prompt 执行数",
+                        "實際傳送的 prompt 執行數",
+                    )
+                )),
+                cx,
+            )
+            .into_any_element(),
+            2 => usage_table_metric_cell(
+                id,
+                locale::text("Total tokens", "总 Token", "總 Token"),
+                &aggregate.total_tokens,
+                cx,
+            )
+            .into_any_element(),
+            3 => usage_table_metric_cell(
+                id,
+                locale::text("Input tokens", "输入 Token", "輸入 Token"),
+                &aggregate.input_tokens,
+                cx,
+            )
+            .into_any_element(),
+            4 => usage_table_metric_cell(
+                id,
+                locale::text("Output tokens", "输出 Token", "輸出 Token"),
+                &aggregate.output_tokens,
+                cx,
+            )
+            .into_any_element(),
+            5 => usage_table_metric_cell(
+                id,
+                locale::text("Cached read tokens", "缓存读取 Token", "快取讀取 Token"),
+                &aggregate.cached_tokens,
+                cx,
+            )
+            .into_any_element(),
+            6 => usage_table_value_cell(
+                id,
+                format_basis_points(aggregate.cache_hit_rate.basis_points),
+                aggregate.cache_hit_rate.basis_points.is_none(),
+                Some(format!(
+                    "{}: {}. {}",
+                    locale::text("Cache hit rate", "缓存命中率", "快取命中率"),
+                    format_basis_points(aggregate.cache_hit_rate.basis_points),
+                    cache_hit_detail(&aggregate.cache_hit_rate)
+                )),
+                cx,
+            )
+            .into_any_element(),
+            7 => usage_table_value_cell(
+                id,
+                aggregate
+                    .last_activity_at_ms
+                    .map(format_timestamp)
+                    .unwrap_or_else(|| "-".to_string()),
+                aggregate.last_activity_at_ms.is_none(),
+                aggregate.last_activity_at_ms.map(|timestamp| {
+                    format!(
+                        "{}: {}",
+                        locale::text("Last activity", "最近活动", "最近活動"),
+                        format_timestamp(timestamp)
+                    )
+                }),
+                cx,
+            )
+            .into_any_element(),
+            _ => usage_table_coverage_cell(id, aggregate, cx).into_any_element(),
+        }
+    }
+
+    fn cell_text(&self, row_ix: usize, col_ix: usize, cx: &App) -> String {
+        let Some(view) = self.view.upgrade() else {
+            return String::new();
+        };
+        let view = view.read(cx);
+        let Some(row) = view
+            .statistics
+            .as_ref()
+            .and_then(|statistics| statistics.dimension_rows.get(row_ix))
+        else {
+            return String::new();
+        };
+        let aggregate = &row.aggregate;
+        match col_ix {
+            0 => row.label.clone(),
+            1 => format_compact_number(aggregate.requests),
+            2 => usage_metric_compact_text(&aggregate.total_tokens),
+            3 => usage_metric_compact_text(&aggregate.input_tokens),
+            4 => usage_metric_compact_text(&aggregate.output_tokens),
+            5 => usage_metric_compact_text(&aggregate.cached_tokens),
+            6 => format_basis_points(aggregate.cache_hit_rate.basis_points),
+            7 => aggregate
                 .last_activity_at_ms
                 .map(format_timestamp)
                 .unwrap_or_else(|| "-".to_string()),
-            126.0,
-            row.aggregate.last_activity_at_ms.is_none(),
-            row.aggregate.last_activity_at_ms.map(|timestamp| {
-                format!(
-                    "{}: {}",
-                    locale::text("Last activity", "最近活动", "最近活動"),
-                    format_timestamp(timestamp)
-                )
-            }),
-            cx,
-        ))
-        .child(table_coverage(index, &row.aggregate, 118.0, cx))
+            _ => coverage_compact_label(&aggregate.coverage).to_string(),
+        }
+    }
+}
+
+fn usage_table_label_cell(id: SharedString, row: &AgentUsageDimensionRow) -> AnyElement {
+    let tooltip = row.label.clone();
+    div()
+        .id(id)
+        .h_full()
+        .w_full()
+        .flex()
+        .items_center()
+        .child(
+            div()
+                .truncate()
+                .text_sm()
+                .font_medium()
+                .child(row.label.clone()),
+        )
+        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
         .into_any_element()
 }
 
-fn table_metric(
-    row_index: usize,
-    id: &'static str,
-    label: &'static str,
-    metric: &AgentUsageMetricValue,
-    width: f32,
-    cx: &mut Context<UsageView>,
-) -> AnyElement {
-    table_value(
-        SharedString::from(format!("usage-row-{row_index}-{id}")),
-        metric
-            .value
-            .map(format_compact_number)
-            .unwrap_or_else(|| "-".to_string()),
-        width,
-        metric.value.is_none(),
-        Some(format!(
-            "{label}: {}. {}",
-            metric_full_value(metric),
-            metric_detail(metric)
-        )),
-        cx,
-    )
-}
-
-fn table_value(
+fn usage_table_value_cell(
     id: SharedString,
     value: String,
-    width: f32,
     unknown: bool,
     tooltip: Option<String>,
-    cx: &mut Context<UsageView>,
+    cx: &App,
 ) -> AnyElement {
     let element = div()
         .id(id)
-        .w(px(width))
-        .flex_none()
-        .truncate()
-        .px_2()
-        .text_right()
-        .text_xs()
-        .when(unknown, |this| this.text_color(cx.theme().muted_foreground))
-        .child(value);
+        .h_full()
+        .w_full()
+        .flex()
+        .items_center()
+        .justify_end()
+        .child(
+            div()
+                .truncate()
+                .text_xs()
+                .when(unknown, |this| this.text_color(cx.theme().muted_foreground))
+                .child(value),
+        );
     match tooltip {
         Some(tooltip) => element
             .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
@@ -2385,28 +2455,55 @@ fn table_value(
     }
 }
 
-fn table_coverage(
-    row_index: usize,
-    aggregate: &AgentUsageAggregate,
-    width: f32,
-    cx: &mut Context<UsageView>,
+fn usage_table_metric_cell(
+    id: SharedString,
+    label: &'static str,
+    metric: &AgentUsageMetricValue,
+    cx: &App,
 ) -> AnyElement {
-    let coverage = &aggregate.coverage;
+    let tooltip = format!(
+        "{label}: {}. {}",
+        metric_full_value(metric),
+        metric_detail(metric)
+    );
+    usage_table_value_cell(
+        id,
+        usage_metric_compact_text(metric),
+        metric.value.is_none(),
+        Some(tooltip),
+        cx,
+    )
+}
+
+fn usage_table_coverage_cell(
+    id: SharedString,
+    aggregate: &AgentUsageAggregate,
+    cx: &App,
+) -> AnyElement {
     let tooltip = coverage_detail(aggregate);
     div()
-        .id(SharedString::from(format!(
-            "usage-row-{row_index}-coverage"
-        )))
-        .w(px(width))
-        .flex_none()
-        .truncate()
-        .px_2()
-        .text_right()
-        .text_xs()
-        .text_color(cx.theme().muted_foreground)
-        .child(coverage_compact_label(coverage))
+        .id(id)
+        .h_full()
+        .w_full()
+        .flex()
+        .items_center()
+        .justify_end()
+        .child(
+            div()
+                .truncate()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(coverage_compact_label(&aggregate.coverage)),
+        )
         .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
         .into_any_element()
+}
+
+fn usage_metric_compact_text(metric: &AgentUsageMetricValue) -> String {
+    metric
+        .value
+        .map(format_compact_number)
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn usage_content_state(requests: Option<u64>, loading: bool, has_error: bool) -> UsageContentState {
