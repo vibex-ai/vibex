@@ -889,8 +889,14 @@ RuntimeBinding {
 - Provider launches retain Provider projection and isolated Provider state-home
   behavior. Agent-account launches use the Agent default state home, omit
   Provider projection, and unset the Registry-declared credential/provider
-  environment keys. Login, model discovery, and session launch fingerprints
-  are derived from the same context.
+  environment keys. Login and model discovery derive the account catalog
+  identity from the same resource-free launch context: the catalog fingerprint
+  excludes session-scoped MCP servers (including the delegation bridge) and
+  skills, because discovery runs before any session exists. Session launch keeps
+  its own fingerprint, which does include those resources, for process reuse;
+  the catalog lookup must use the resource-free identity and never the launch
+  fingerprint, or every explicit-model Agent-account session fails with
+  `agent_auth_model_catalog_unavailable`.
 - `AgentDefault` omits a model override. Config convergence accepts a missing
   explicit model only for this semantic variant; a later Agent-reported model
   is effective evidence, not a rewrite of desired selection.
@@ -953,6 +959,9 @@ RuntimeBinding {
 
 - Resolver tests cover Provider and AgentAccount revision lookup, Agent/source
   mismatch, active authentication operations, and `AgentDefault` config shape.
+  They also install the session-scoped delegation MCP server and assert the
+  account catalog lookup still matches, proving session resources never leak
+  into the catalog identity.
 - Repository tests cover source kind/id/revision round trips, legacy Provider
   backfill, nullable legacy Profile columns, and source/revision commit fences.
 - Coordinator tests cover both switch directions, cross-Agent accounts,

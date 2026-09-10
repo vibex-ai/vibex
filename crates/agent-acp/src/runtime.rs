@@ -6778,6 +6778,9 @@ struct AcpSwitchTargetContext {
     process_strategy_effective: AcpProcessStrategy,
     pool_fallback_reason: Option<String>,
     spawn_snapshot: ProcessSpawnConfigSnapshot,
+    /// Resource-free identity used to look up the Agent-account model catalog.
+    /// Only present for `RuntimeAuthSource::AgentAccount`.
+    account_catalog_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -7010,6 +7013,21 @@ impl AcpRuntimeSwitchBridge {
                     (context.revision, config, runtime_resources, env_unsets)
                 }
             };
+        // Compute the catalog identity before the selection's startup model is
+        // folded into the config: the catalog is discovered without a selected
+        // model, so keying it by a selection-dependent config would miss too.
+        let account_catalog_fingerprint = match &selection.auth_source {
+            RuntimeAuthSource::AgentAccount { .. } => {
+                Some(self.client.agent_account_catalog_fingerprint(
+                    &selection.auth_source,
+                    auth_source_revision,
+                    &selection.agent_id,
+                    &config,
+                    &env_unsets,
+                )?)
+            }
+            RuntimeAuthSource::ProviderProfile { .. } => None,
+        };
         let mut config = config;
         apply_startup_model_to_config(
             &mut config,
@@ -7043,6 +7061,7 @@ impl AcpRuntimeSwitchBridge {
             process_strategy_effective,
             pool_fallback_reason,
             spawn_snapshot,
+            account_catalog_fingerprint,
         })
     }
 
@@ -7996,11 +8015,18 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
         };
         let account_snapshot = if let Some(auth_context_id) = selection.auth_context_id() {
             let conn = open_database(&self.db_path)?;
+            let catalog_fingerprint =
+                context
+                    .account_catalog_fingerprint
+                    .as_deref()
+                    .ok_or_else(|| {
+                        runtime_configuration_unavailable("agent_auth_model_catalog_unavailable")
+                    })?;
             AgentAuthModelCatalogRepository::get(
                 &conn,
                 auth_context_id,
                 context.auth_source_revision,
-                &context.spawn_snapshot.process_spawn_fingerprint(),
+                catalog_fingerprint,
             )?
         } else {
             None
@@ -9977,15 +10003,13 @@ impl AcpRuntimeClient {
             .get_agent_acp_runtime_config(&context.agent_id)?;
         let auth_source = RuntimeAuthSource::agent_account(context.id.clone());
         let env_unsets = self.agent_account_env_unsets(&context.agent_id);
-        let spawn_snapshot = self.process_spawn_config_snapshot_for_agent_account(
+        let runtime_fingerprint = self.agent_account_catalog_fingerprint(
             &auth_source,
             context.revision,
             &context.agent_id,
             &config,
-            &ProviderRuntimeResources::default(),
             &env_unsets,
         )?;
-        let runtime_fingerprint = spawn_snapshot.process_spawn_fingerprint();
         let attempted_at_ms = unix_timestamp_ms();
 
         let direct_capabilities = if self
@@ -11355,6 +11379,35 @@ impl AcpRuntimeClient {
                     env_unsets,
                 ),
         }
+    }
+
+    /// Identity of the Agent-account launch configuration *without* any
+    /// session-scoped runtime resources.
+    ///
+    /// The account model catalog is discovered before a session exists, so it
+    /// cannot include the per-session MCP servers (notably the delegation
+    /// bridge) or skills that `runtime_resources_for_session` injects at
+    /// launch time. Discovery and lookup must both use this resource-free
+    /// identity or the fingerprint never matches and every explicit-model
+    /// Agent-account session fails with `agent_auth_model_catalog_unavailable`.
+    fn agent_account_catalog_fingerprint(
+        &self,
+        auth_source: &RuntimeAuthSource,
+        auth_source_revision: i64,
+        agent_id: &AgentId,
+        config: &AcpProviderConfig,
+        env_unsets: &[String],
+    ) -> VibexResult<String> {
+        Ok(self
+            .process_spawn_config_snapshot_for_agent_account(
+                auth_source,
+                auth_source_revision,
+                agent_id,
+                config,
+                &ProviderRuntimeResources::default(),
+                env_unsets,
+            )?
+            .process_spawn_fingerprint())
     }
 
     fn process_spawn_config_snapshot_for_agent_account(
@@ -25821,6 +25874,18 @@ for line in sys.stdin:
         };
         let agent_id = AgentId::parse("codex").unwrap();
         configure_mock_agent_account_runtime(&fixture, &agent_id);
+        // Reproduce the production layout: every ACP session carries the
+        // session-scoped delegation MCP server. That resource must not leak
+        // into the account catalog identity, which is discovered before any
+        // session exists.
+        fixture
+            .manager
+            .install_delegation_tool(vibex_agent::AgentDelegationToolConfig {
+                command: std::path::PathBuf::from("/vibex-delegation-sidecar"),
+                broker_endpoint: "unix:///tmp/vibex-delegation.sock".to_string(),
+                capability_token: "test-delegation-capability-token".to_string(),
+            })
+            .unwrap();
         let conn = open_database(&fixture.fixture.db_path).unwrap();
         let initial = AgentAuthContextRepository::ensure_default(&conn, &agent_id).unwrap();
         let authenticated = AgentAuthContextRepository::compare_and_set(
@@ -25844,7 +25909,10 @@ for line in sys.stdin:
         let old_snapshot = AgentAuthModelCatalogSnapshot {
             auth_context_id: authenticated.id.clone(),
             auth_context_revision: authenticated.revision,
-            runtime_fingerprint: old_launch.spawn_snapshot.process_spawn_fingerprint(),
+            runtime_fingerprint: old_launch
+                .account_catalog_fingerprint
+                .clone()
+                .expect("account catalog fingerprint"),
             discovery_source: AgentModelDiscoverySource::SessionConfig,
             status: AgentAuthModelCatalogStatus::Available,
             models: vec![
@@ -25877,7 +25945,15 @@ for line in sys.stdin:
             .bridge
             .target_context(&fixture.session.id, &selection)
             .unwrap();
-        let current_fingerprint = current_launch.spawn_snapshot.process_spawn_fingerprint();
+        let current_fingerprint = current_launch
+            .account_catalog_fingerprint
+            .clone()
+            .expect("account catalog fingerprint");
+        assert_ne!(
+            current_launch.spawn_snapshot.process_spawn_fingerprint(),
+            current_fingerprint,
+            "session-scoped runtime resources must not change the account catalog identity"
+        );
         let error = fixture
             .bridge
             .resolve(&fixture.session.id, &selection, None)
