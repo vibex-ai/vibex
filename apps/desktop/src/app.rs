@@ -428,13 +428,15 @@ const NEW_SESSION_RUNTIME_MENU_MIN_HEIGHT: f32 = 104.0;
 const RUNTIME_MENU_VIEWPORT_MARGIN: f32 = 12.0;
 const RUNTIME_MENU_TRIGGER_GAP: f32 = 4.0;
 const COMPOSER_RUNTIME_CHOICE_ROW_HEIGHT: f32 = 36.0;
-const COMPOSER_RUNTIME_AGENT_MENU_CHROME_HEIGHT: f32 = 94.0;
-// Search row (34 + 4 margin), footer (1 border + 8 padding + 24 button), and
-// 12 panel padding must all stay visible above the scroll body.
-const COMPOSER_RUNTIME_PROFILE_MENU_CHROME_HEIGHT: f32 = 83.0;
+// Agent row (32 + 4 margin), search row (34 + 4 margin), footer (1 border +
+// 8 padding + 24 button), and 12 panel padding must all stay visible above the
+// scroll body.
+const COMPOSER_RUNTIME_PROFILE_MENU_CHROME_HEIGHT: f32 = 119.0;
 const COMPOSER_RUNTIME_MODEL_MENU_CHROME_HEIGHT: f32 = 55.0;
 const COMPOSER_RUNTIME_AGENT_PROFILE_ROW_HEIGHT: f32 = 40.0;
 const COMPOSER_RUNTIME_MODEL_ROW_HEIGHT: f32 = 48.0;
+/// Square Agent logo chip in the provider/model Agent row.
+const COMPOSER_RUNTIME_AGENT_CHIP_SIZE: f32 = 32.0;
 const IMAGE_PREVIEW_MIN_ZOOM: f32 = 0.25;
 const IMAGE_PREVIEW_MAX_ZOOM: f32 = 4.0;
 const IMAGE_PREVIEW_HORIZONTAL_PADDING: f32 = 24.0;
@@ -632,7 +634,6 @@ enum ComposerQueueDispatchBehavior {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ComposerRuntimeMenuView {
-    Agent,
     AuthSource,
     Authentication,
     Model,
@@ -888,10 +889,6 @@ fn composer_runtime_menu_height(
     max_height: f32,
 ) -> f32 {
     let (chrome_height, row_height) = match view {
-        ComposerRuntimeMenuView::Agent => (
-            COMPOSER_RUNTIME_AGENT_MENU_CHROME_HEIGHT,
-            COMPOSER_RUNTIME_AGENT_PROFILE_ROW_HEIGHT,
-        ),
         ComposerRuntimeMenuView::AuthSource => (
             COMPOSER_RUNTIME_PROFILE_MENU_CHROME_HEIGHT,
             COMPOSER_RUNTIME_AGENT_PROFILE_ROW_HEIGHT,
@@ -4859,6 +4856,8 @@ pub struct VibexWorkbench {
     composer_runtime_menu_agent_id: Option<AgentId>,
     composer_runtime_menu_auth_source: Option<RuntimeAuthSource>,
     composer_runtime_search: Entity<InputState>,
+    runtime_agent_row_scroll: ScrollHandle,
+    runtime_agent_row_reveal_pending: bool,
     runtime_provider_scroll: ScrollHandle,
     runtime_provider_scroll_to_selection: bool,
     runtime_provider_reveal_selection: Option<SessionRuntimeSelection>,
@@ -5626,11 +5625,13 @@ impl VibexWorkbench {
             token_usage: None,
             agent_generation_stats: None,
             composer_runtime_menu_open: false,
-            composer_runtime_menu_view: ComposerRuntimeMenuView::Agent,
+            composer_runtime_menu_view: ComposerRuntimeMenuView::AuthSource,
             composer_runtime_menu_agent_id: None,
             composer_runtime_menu_auth_source: None,
             composer_runtime_search,
             runtime_provider_scroll: ScrollHandle::new(),
+            runtime_agent_row_scroll: ScrollHandle::new(),
+            runtime_agent_row_reveal_pending: false,
             runtime_provider_scroll_to_selection: false,
             runtime_provider_reveal_selection: None,
             runtime_provider_keyboard_selection: None,
@@ -10105,6 +10106,12 @@ impl VibexWorkbench {
             self.ui_state.agent_tab_order.clone(),
         )
         .with_usage_counts(self.agent_usage_counts())
+    }
+
+    /// Enabled Agents in the shared ordering, consumed by the new-session home
+    /// selector and the provider/model Agent row.
+    fn runtime_agent_choices(&self) -> Vec<AgentSnapshotEntry> {
+        ordered_runtime_agent_choices(&self.agent_snapshots, &self.agent_ordering())
     }
 
     fn agent_usage_counts(&self) -> BTreeMap<String, u64> {
@@ -18679,18 +18686,25 @@ impl VibexWorkbench {
         if self.agent_action_pending {
             return;
         }
+        self.apply_new_session_agent(agent_id, cx);
+        self.new_session_runtime_menu_open = false;
+        self.new_session_runtime_menu_view = ComposerRuntimeMenuView::AuthSource;
+        self.new_session_runtime_menu_auth_source = None;
+        cx.notify();
+    }
+
+    /// Draft-local Agent switch shared by the new-session home chips and the
+    /// provider/model Agent row, so both surfaces derive the same provider and
+    /// model preference for the chosen Agent.
+    fn apply_new_session_agent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
         let preferred = self.preferred_new_session_runtime_for_agent(&agent_id);
         let selection = self.runtime_catalog.as_ref().and_then(|catalog| {
             new_session_runtime_selection_for_agent(catalog, Some(&agent_id), preferred.as_ref())
         });
         self.set_new_session_runtime_selection(selection);
         self.new_session_agent_id = Some(agent_id);
-        self.new_session_runtime_menu_open = false;
-        self.new_session_runtime_menu_view = ComposerRuntimeMenuView::AuthSource;
-        self.new_session_runtime_menu_auth_source = None;
         self.new_session_error = None;
         self.refresh_active_suggestions(ComposerTarget::NewSession, cx);
-        cx.notify();
     }
 
     fn submit_new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -19396,6 +19410,7 @@ impl VibexWorkbench {
         if open {
             self.runtime_choice_menu_open = None;
             self.runtime_provider_scroll_to_selection = true;
+            self.runtime_agent_row_reveal_pending = true;
             let selection = self.selected_runtime_selection();
             // Reopen at the selected provider/model group so an active session
             // does not make the user repeat the Agent selection step.
@@ -19410,6 +19425,7 @@ impl VibexWorkbench {
             self.composer_runtime_menu_agent_id = None;
             self.composer_runtime_menu_auth_source = None;
             self.runtime_provider_scroll_to_selection = false;
+            self.runtime_agent_row_reveal_pending = false;
         }
         cx.notify();
     }
@@ -19430,6 +19446,45 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Activate an Agent logo inside the provider/model layer.
+    ///
+    /// The current-session menu re-scopes the whole cascade to the chosen Agent
+    /// while staying on the provider/model layer, and the new-session menu
+    /// applies the draft Agent switch without dismissing the popup, so both
+    /// surfaces keep Agent and provider/model in one step.
+    fn choose_runtime_menu_agent(
+        &mut self,
+        agent_id: AgentId,
+        new_session: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.runtime_agent_row_reveal_pending = true;
+        // The chosen Agent's provider/model list must reveal its own selected
+        // model the same way the menu did when it opened.
+        self.runtime_provider_scroll_to_selection = true;
+        if new_session {
+            if self.agent_action_pending {
+                return;
+            }
+            self.apply_new_session_agent(agent_id, cx);
+            self.new_session_runtime_menu_view = ComposerRuntimeMenuView::AuthSource;
+            self.new_session_runtime_menu_auth_source = None;
+            // The popover hands focus to its own panel when it opens, and the
+            // Agent row lives inside that panel; keep the search field as the
+            // keyboard owner so arrow-key model navigation still works after a
+            // switch.
+            self.runtime_provider_search_focus_pending = true;
+            cx.notify();
+            return;
+        }
+        self.navigate_composer_runtime_menu(
+            ComposerRuntimeMenuView::AuthSource,
+            Some(agent_id),
+            None,
+            cx,
+        );
+    }
+
     fn set_new_session_runtime_menu_open(&mut self, open: bool, cx: &mut Context<Self>) {
         let open = open && !self.agent_action_pending && self.new_session_agent_id.is_some();
         self.new_session_runtime_menu_open = open;
@@ -19438,6 +19493,7 @@ impl VibexWorkbench {
         if open {
             self.runtime_choice_menu_open = None;
             self.runtime_provider_scroll_to_selection = true;
+            self.runtime_agent_row_reveal_pending = true;
             self.new_session_runtime_menu_view =
                 if let Some(selection) = self.new_session_runtime_selection.as_ref() {
                     self.new_session_runtime_menu_auth_source = Some(selection.auth_source.clone());
@@ -19449,6 +19505,7 @@ impl VibexWorkbench {
         } else {
             self.new_session_runtime_menu_auth_source = None;
             self.runtime_provider_scroll_to_selection = false;
+            self.runtime_agent_row_reveal_pending = false;
         }
         cx.notify();
     }
@@ -28459,6 +28516,99 @@ impl VibexWorkbench {
         }
     }
 
+    /// Agent logo row at the top of the provider/model layer.
+    ///
+    /// This row is what collapsed the former two-step Agent → provider/model
+    /// cascade into one surface: every enabled Agent is one click away, the
+    /// order matches the new-session home selector, the selected Agent is kept
+    /// in view, and the row scrolls horizontally so a long Agent list still fits
+    /// the fixed menu width.
+    fn render_runtime_agent_row(
+        &mut self,
+        catalog: &SessionRuntimeOptionCatalog,
+        selected_agent_id: &AgentId,
+        new_session: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let choices = self.runtime_agent_choices();
+        if choices.is_empty() {
+            return div().into_any_element();
+        }
+        let scroll = self.runtime_agent_row_scroll.clone();
+        let workbench = cx.weak_entity();
+        let menu_prefix = if new_session {
+            "new-session"
+        } else {
+            "composer"
+        };
+        let chips = choices.into_iter().map(|agent| {
+            let active = &agent.id == selected_agent_id;
+            let identity = agent_brand_identity(&agent);
+            let tooltip = format!(
+                "{} · {}",
+                agent.label,
+                runtime_profile_count_label(
+                    runtime_auth_sources_for_agent(catalog, &agent.id).len()
+                )
+            );
+            let aria_label = agent.label.clone();
+            let click_agent_id = agent.id.clone();
+            let reveal_workbench = workbench.clone();
+            let reveal_scroll = scroll.clone();
+            div()
+                .id(format!(
+                    "{menu_prefix}-runtime-agent-chip:{}",
+                    agent.id.as_str()
+                ))
+                .flex_none()
+                // Only the selected chip may consume the reveal request;
+                // otherwise the first painted chip would steal it.
+                .on_prepaint(move |bounds, window, cx| {
+                    if !active {
+                        return;
+                    }
+                    let should_reveal = reveal_workbench
+                        .update(cx, |this, _| {
+                            std::mem::take(&mut this.runtime_agent_row_reveal_pending)
+                        })
+                        .unwrap_or(false);
+                    if should_reveal {
+                        scroll_chip_into_view(&reveal_scroll, bounds, window);
+                    }
+                })
+                .child(button_with_aria_label(
+                    Button::new(format!("{menu_prefix}-runtime-agent:{}", agent.id.as_str()))
+                        .xsmall()
+                        .ghost()
+                        .compact()
+                        .size(px(COMPOSER_RUNTIME_AGENT_CHIP_SIZE))
+                        .rounded(gpui_component::button::ButtonRounded::Size(px(6.0)))
+                        .selected(active)
+                        .tooltip(tooltip)
+                        .child(runtime_agent_icon(&identity))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.choose_runtime_menu_agent(click_agent_id.clone(), new_session, cx)
+                        })),
+                    aria_label,
+                ))
+        });
+
+        h_flex()
+            .id(format!("{menu_prefix}-runtime-agent-row"))
+            .w_full()
+            .flex_none()
+            .min_w_0()
+            .items_center()
+            .gap(px(2.0))
+            .mb_1()
+            // x-only overflow keeps `runtime_agent_row_scroll` as the real
+            // scroll driver and lets a plain vertical wheel move the row.
+            .overflow_x_scroll()
+            .track_scroll(&self.runtime_agent_row_scroll)
+            .children(chips)
+            .into_any_element()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_provider_model_groups(
         &mut self,
@@ -28477,11 +28627,6 @@ impl VibexWorkbench {
         let provider_scroll = self.runtime_provider_scroll.clone();
         let workbench = cx.weak_entity();
         let keyboard_selection = self.runtime_provider_keyboard_selection.clone();
-        let agent_identity = self
-            .agent_snapshots
-            .iter()
-            .find(|agent| &agent.id == agent_id)
-            .map(agent_brand_identity);
         let mut visible_groups = Vec::new();
 
         for source in groups {
@@ -28710,42 +28855,12 @@ impl VibexWorkbench {
             visible_groups.push(v_flex().w_full().child(heading).children(rows));
         }
 
-        let agent_back = (!new_session).then(|| {
-            Button::new("composer-runtime-provider-back-agent")
-                .xsmall()
-                .ghost()
-                .compact()
-                .h(px(34.0))
-                .px_1()
-                .flex_none()
-                .tooltip(locale::text(
-                    "Back to Agent selection",
-                    "返回 Agent 选择",
-                    "返回 Agent 選擇",
-                ))
-                .text_color(cx.theme().muted_foreground)
-                .child(
-                    h_flex()
-                        .items_center()
-                        .gap(px(5.0))
-                        .child(Icon::new(IconName::ArrowLeft).size(px(14.0)))
-                        .child(runtime_agent_icon(
-                            agent_identity.as_deref().unwrap_or(agent_id.as_str()),
-                        )),
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.navigate_composer_runtime_menu(
-                        ComposerRuntimeMenuView::Agent,
-                        None,
-                        None,
-                        cx,
-                    )
-                }))
-        });
+        let agent_row = self.render_runtime_agent_row(catalog, agent_id, new_session, cx);
 
         v_flex()
             .h_full()
             .min_h_0()
+            .child(agent_row)
             .child(
                 h_flex()
                     .w_full()
@@ -28754,7 +28869,6 @@ impl VibexWorkbench {
                     .items_center()
                     .gap_1()
                     .mb_1()
-                    .children(agent_back)
                     .child({
                         // `Input` binds up/down/enter/escape as actions in its own key
                         // context, and gpui dispatches bindings before key listeners, so
@@ -28988,11 +29102,7 @@ impl VibexWorkbench {
             ),
             _ => Vec::new(),
         };
-        let menu_view = match self.new_session_runtime_menu_view {
-            ComposerRuntimeMenuView::Model => ComposerRuntimeMenuView::Model,
-            ComposerRuntimeMenuView::Authentication => ComposerRuntimeMenuView::Authentication,
-            _ => ComposerRuntimeMenuView::AuthSource,
-        };
+        let menu_view = self.new_session_runtime_menu_view;
         let menu_row_count = match menu_view {
             ComposerRuntimeMenuView::Model => model_choices.len(),
             ComposerRuntimeMenuView::Authentication => self
@@ -29001,7 +29111,7 @@ impl VibexWorkbench {
                 .and_then(|state| state.catalog.as_ref())
                 .map(|catalog| catalog.methods.len().saturating_add(2))
                 .unwrap_or(2),
-            ComposerRuntimeMenuView::AuthSource | ComposerRuntimeMenuView::Agent => catalog
+            ComposerRuntimeMenuView::AuthSource => catalog
                 .as_ref()
                 .zip(agent_id.as_ref())
                 .map(|(catalog, agent_id)| runtime_provider_model_menu_row_count(catalog, agent_id))
@@ -29054,20 +29164,18 @@ impl VibexWorkbench {
                 .bg(cx.theme().border.opacity(0.70))
         };
         let menu_content = match menu_view {
-            ComposerRuntimeMenuView::AuthSource | ComposerRuntimeMenuView::Agent => {
-                match (catalog.as_ref(), agent_id.as_ref()) {
-                    (Some(catalog), Some(agent_id)) => self.render_provider_model_groups(
-                        agent_id,
-                        catalog,
-                        selection.as_ref(),
-                        preferred_model_selection.as_ref(),
-                        self.new_session_runtime_search.clone(),
-                        true,
-                        cx,
-                    ),
-                    _ => runtime_menu_empty_state(cx),
-                }
-            }
+            ComposerRuntimeMenuView::AuthSource => match (catalog.as_ref(), agent_id.as_ref()) {
+                (Some(catalog), Some(agent_id)) => self.render_provider_model_groups(
+                    agent_id,
+                    catalog,
+                    selection.as_ref(),
+                    preferred_model_selection.as_ref(),
+                    self.new_session_runtime_search.clone(),
+                    true,
+                    cx,
+                ),
+                _ => runtime_menu_empty_state(cx),
+            },
             ComposerRuntimeMenuView::Authentication => {
                 match (agent_id.clone(), menu_auth_source.clone()) {
                     (Some(agent_id), Some(auth_source)) => {
@@ -29245,29 +29353,12 @@ impl VibexWorkbench {
                 .as_ref()
                 .map(|catalog| RuntimeCascadeProjection::from_catalog(catalog, selection))
         });
-        let mut agent_choices = self
-            .agent_snapshots
+        let agent_choices = self.runtime_agent_choices();
+        let agent_sort_manual_active = self
+            .ui_state
+            .agent_tab_order
             .iter()
-            .filter(|agent| is_new_session_agent_available(agent))
-            .cloned()
-            .collect::<Vec<_>>();
-        let agent_ordering = self.agent_ordering();
-        let ordered_agent_choice_ids = ordered_agent_ids(
-            &agent_choices
-                .iter()
-                .map(|agent| AgentOrderEntry {
-                    id: agent.id.as_str().to_string(),
-                    label: agent.label.clone(),
-                })
-                .collect::<Vec<_>>(),
-            &agent_ordering,
-        );
-        agent_choices.sort_by_key(|agent| {
-            ordered_agent_choice_ids
-                .iter()
-                .position(|id| id == agent.id.as_str())
-                .unwrap_or(usize::MAX)
-        });
+            .any(|id| agent_choices.iter().any(|agent| agent.id.as_str() == id));
         let is_dark = cx.theme().is_dark();
         let compact_runtime_controls =
             composer_runtime_controls_are_compact(self.last_visibility.layout.viewport_width);
@@ -29483,11 +29574,6 @@ impl VibexWorkbench {
         };
 
         let agent_sort_entity = cx.weak_entity();
-        let agent_sort_manual_active = self
-            .ui_state
-            .agent_tab_order
-            .iter()
-            .any(|id| ordered_agent_choice_ids.contains(id));
         let agent_sort_strategy = self.ui_state.agent_sort_strategy;
         let alphabetical_entity = agent_sort_entity.clone();
         let frequency_entity = agent_sort_entity;
@@ -31640,10 +31726,6 @@ impl VibexWorkbench {
             .composer_runtime_menu_auth_source
             .clone()
             .unwrap_or_else(|| desired.auth_source.clone());
-        let agent_choices = runtime_menu_agents(&self.agent_snapshots);
-        let mut auth_source_choices = runtime_auth_sources_for_agent(&catalog, &menu_agent_id);
-        auth_source_choices
-            .sort_by_key(|source| !matches!(source.kind, RuntimeAuthSourceKind::AgentAccount));
         let preferred_model_selection = if desired.agent_id == menu_agent_id {
             Some(desired.clone())
         } else {
@@ -31666,7 +31748,6 @@ impl VibexWorkbench {
             .clamp(160.0, COMPOSER_RUNTIME_MENU_MAX_HEIGHT);
         let menu_view = self.composer_runtime_menu_view;
         let menu_row_count = match menu_view {
-            ComposerRuntimeMenuView::Agent => agent_choices.len(),
             ComposerRuntimeMenuView::AuthSource => {
                 runtime_provider_model_menu_row_count(&catalog, &menu_agent_id)
             }
@@ -31694,110 +31775,6 @@ impl VibexWorkbench {
                 .bg(cx.theme().border.opacity(0.70))
         };
         let menu_content = match self.composer_runtime_menu_view {
-            ComposerRuntimeMenuView::Agent => {
-                let edit_agent_id = menu_agent_id.clone();
-                let edit_label = locale::text("Edit Agent", "编辑 Agent", "編輯 Agent");
-                let rows = agent_choices
-                    .into_iter()
-                    .map(|agent| {
-                        let auth_source_count =
-                            runtime_auth_sources_for_agent(&catalog, &agent.id).len();
-                        let identity = agent_brand_identity(&agent);
-                        let selected = agent.id == desired.agent_id;
-                        let agent_id = agent.id;
-                        Button::new(format!("composer-runtime-agent:{agent_id}"))
-                            .small()
-                            .ghost()
-                            .w_full()
-                            .h(px(40.0))
-                            .flex_none()
-                            .px_2()
-                            .justify_start()
-                            .selected(selected)
-                            .rounded(gpui_component::button::ButtonRounded::Size(px(6.0)))
-                            .child(
-                                h_flex()
-                                    .size_full()
-                                    .min_w_0()
-                                    .gap_2()
-                                    .child(runtime_agent_icon(&identity))
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .flex_1()
-                                            .truncate()
-                                            .text_sm()
-                                            .child(agent.label),
-                                    )
-                                    .when(selected, |this| {
-                                        this.child(new_session_selector_icon(
-                                            "icons/vibex/crosshair.svg",
-                                            cx.theme().primary,
-                                        ))
-                                    })
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(runtime_profile_count_label(auth_source_count)),
-                                    )
-                                    .child(
-                                        Icon::new(IconName::ChevronRight)
-                                            .size(px(14.0))
-                                            .text_color(cx.theme().muted_foreground),
-                                    ),
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.navigate_composer_runtime_menu(
-                                    ComposerRuntimeMenuView::AuthSource,
-                                    Some(agent_id.clone()),
-                                    None,
-                                    cx,
-                                )
-                            }))
-                    })
-                    .collect::<Vec<_>>();
-                v_flex()
-                    .h_full()
-                    .min_h_0()
-                    .child(
-                        div()
-                            .flex_none()
-                            .px_2()
-                            .py(px(6.0))
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("Agent"),
-                    )
-                    .child(separator())
-                    .child(
-                        v_flex()
-                            .min_h_0()
-                            .flex_1()
-                            .overflow_y_scrollbar()
-                            .when(rows.is_empty(), |this| {
-                                this.child(runtime_menu_empty_state(cx))
-                            })
-                            .children(rows),
-                    )
-                    .child(separator())
-                    .child(
-                        h_flex().w_full().flex_none().p_1().child(
-                            Button::new("composer-runtime-edit-agent")
-                                .small()
-                                .ghost()
-                                .w_full()
-                                .justify_start()
-                                .icon(IconName::Settings)
-                                .label(edit_label)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open_agent_auth_management(edit_agent_id.clone(), cx)
-                                })),
-                        ),
-                    )
-                    .into_any_element()
-            }
             ComposerRuntimeMenuView::AuthSource => self.render_provider_model_groups(
                 &menu_agent_id,
                 &catalog,
@@ -31815,6 +31792,7 @@ impl VibexWorkbench {
                 let auth_source_label = runtime_auth_source_label(&catalog, &menu_auth_source);
                 let agent_identity = format!("{} {agent_label}", menu_agent_id);
                 let breadcrumb_agent_id = menu_agent_id.clone();
+                let breadcrumb_back_agent_id = menu_agent_id.clone();
                 let rows = model_choices
                     .into_iter()
                     .map(|choice| {
@@ -31909,10 +31887,10 @@ impl VibexWorkbench {
                                             .child(runtime_agent_icon(&agent_identity))
                                             .child(div().min_w_0().truncate().child(agent_label)),
                                     )
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                    .on_click(cx.listener(move |this, _, _, cx| {
                                         this.navigate_composer_runtime_menu(
-                                            ComposerRuntimeMenuView::Agent,
-                                            None,
+                                            ComposerRuntimeMenuView::AuthSource,
+                                            Some(breadcrumb_back_agent_id.clone()),
                                             None,
                                             cx,
                                         )
@@ -44540,17 +44518,32 @@ fn runtime_agent_icon(identity: &str) -> AnyElement {
     agent_brand_icon(identity, px(16.0), None)
 }
 
-fn runtime_menu_agents(agents: &[AgentSnapshotEntry]) -> Vec<AgentSnapshotEntry> {
+/// Enabled Agents in the ordering shared with the new-session home selector, so
+/// the provider/model Agent row and the home-page Agent chips never disagree.
+fn ordered_runtime_agent_choices(
+    agents: &[AgentSnapshotEntry],
+    ordering: &AgentOrdering,
+) -> Vec<AgentSnapshotEntry> {
     let mut choices = agents
         .iter()
         .filter(|agent| is_new_session_agent_available(agent))
         .cloned()
         .collect::<Vec<_>>();
-    choices.sort_by(|left, right| {
-        left.order_index
-            .cmp(&right.order_index)
-            .then_with(|| left.label.cmp(&right.label))
-            .then_with(|| left.id.cmp(&right.id))
+    let ordered_ids = ordered_agent_ids(
+        &choices
+            .iter()
+            .map(|agent| AgentOrderEntry {
+                id: agent.id.as_str().to_string(),
+                label: agent.label.clone(),
+            })
+            .collect::<Vec<_>>(),
+        ordering,
+    );
+    choices.sort_by_key(|agent| {
+        ordered_ids
+            .iter()
+            .position(|id| id == agent.id.as_str())
+            .unwrap_or(usize::MAX)
     });
     choices
 }
@@ -44809,29 +44802,83 @@ fn runtime_auth_source_status_label(
     }
 }
 
+/// Axis a minimum-scroll reveal moves along.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RevealAxis {
+    Horizontal,
+    Vertical,
+}
+
+/// Overshoot between a child and its scroll viewport along one axis, or `None`
+/// when the child is already fully visible. Child and viewport bounds are both
+/// window coordinates captured in the same prepaint pass, so the overshoot can
+/// be read off directly.
+fn scroll_reveal_delta(
+    viewport: Bounds<Pixels>,
+    child_bounds: Bounds<Pixels>,
+    axis: RevealAxis,
+) -> Option<Pixels> {
+    let (child_start, child_end, viewport_start, viewport_end) = match axis {
+        RevealAxis::Horizontal => (
+            child_bounds.left(),
+            child_bounds.right(),
+            viewport.left(),
+            viewport.right(),
+        ),
+        RevealAxis::Vertical => (
+            child_bounds.top(),
+            child_bounds.bottom(),
+            viewport.top(),
+            viewport.bottom(),
+        ),
+    };
+    if child_start < viewport_start {
+        Some(viewport_start - child_start)
+    } else if child_end > viewport_end {
+        Some(viewport_end - child_end)
+    } else {
+        None
+    }
+}
+
 /// Scroll the provider/model list by the minimum amount needed to bring a row
 /// into view. `ScrollAnchor::scroll_to` aligns the anchored row to the viewport
 /// top, which makes arrow-key stepping feel like the list is jumping; a fully
-/// visible row must keep the current scroll offset untouched. Row and viewport
-/// bounds are both window coordinates captured in the same prepaint pass, so
-/// the overshoot can be read off directly. The offset is applied on the next
-/// frame because the scroll container translates its children from the handle
-/// offset that was current while this frame was being laid out.
+/// visible row must keep the current scroll offset untouched. The offset is
+/// applied on the next frame because the scroll container translates its
+/// children from the handle offset that was current while this frame was being
+/// laid out.
 fn scroll_row_into_view(handle: &ScrollHandle, row_bounds: Bounds<Pixels>, window: &mut Window) {
     let viewport = handle.bounds();
     if viewport.size.height <= px(0.0) {
         return;
     }
-    let delta_y = if row_bounds.top() < viewport.top() {
-        viewport.top() - row_bounds.top()
-    } else if row_bounds.bottom() > viewport.bottom() {
-        viewport.bottom() - row_bounds.bottom()
-    } else {
+    let Some(delta_y) = scroll_reveal_delta(viewport, row_bounds, RevealAxis::Vertical) else {
         return;
     };
     let offset = handle.offset();
     let max_offset = handle.max_offset();
     let target = point(offset.x, (offset.y + delta_y).clamp(-max_offset.y, px(0.0)));
+    let handle = handle.clone();
+    window.on_next_frame(move |_, _| handle.set_offset(target));
+}
+
+/// Horizontal twin of [`scroll_row_into_view`] for the Agent logo row, so the
+/// selected Agent is revealed with the minimum horizontal scroll and an already
+/// visible chip leaves the offset untouched. A vertical wheel over the row
+/// still scrolls it: GPUI maps an unused wheel axis onto the row's only
+/// scrollable axis.
+fn scroll_chip_into_view(handle: &ScrollHandle, chip_bounds: Bounds<Pixels>, window: &mut Window) {
+    let viewport = handle.bounds();
+    if viewport.size.width <= px(0.0) {
+        return;
+    }
+    let Some(delta_x) = scroll_reveal_delta(viewport, chip_bounds, RevealAxis::Horizontal) else {
+        return;
+    };
+    let offset = handle.offset();
+    let max_offset = handle.max_offset();
+    let target = point((offset.x + delta_x).clamp(-max_offset.x, px(0.0)), offset.y);
     let handle = handle.clone();
     window.on_next_frame(move |_, _| handle.set_offset(target));
 }
@@ -59052,26 +59099,18 @@ mod tests {
     }
 
     #[test]
-    fn composer_runtime_menu_reserves_header_and_model_rows_before_scrolling() {
-        assert_eq!(
-            composer_runtime_menu_height(ComposerRuntimeMenuView::Agent, 0, 448.0),
-            134.0
-        );
+    fn composer_runtime_menu_reserves_agent_row_search_and_model_rows_before_scrolling() {
         assert_eq!(
             composer_runtime_menu_height(ComposerRuntimeMenuView::AuthSource, 0, 448.0),
-            123.0
+            159.0
         );
         assert_eq!(
             composer_runtime_menu_height(ComposerRuntimeMenuView::Model, 0, 448.0),
             103.0
         );
         assert_eq!(
-            composer_runtime_menu_height(ComposerRuntimeMenuView::Agent, 2, 448.0),
-            174.0
-        );
-        assert_eq!(
             composer_runtime_menu_height(ComposerRuntimeMenuView::AuthSource, 2, 448.0),
-            163.0
+            199.0
         );
         assert_eq!(
             composer_runtime_menu_height(ComposerRuntimeMenuView::Model, 1, 448.0),
@@ -59319,6 +59358,47 @@ mod tests {
         assert!(!composer.contains(".overflow_x_scrollbar()"));
     }
 
+    #[test]
+    fn scroll_reveal_delta_only_moves_offscreen_children() {
+        let viewport = Bounds {
+            origin: point(px(100.0), px(40.0)),
+            size: size(px(160.0), px(32.0)),
+        };
+        let visible = Bounds {
+            origin: point(px(120.0), px(40.0)),
+            size: size(px(32.0), px(32.0)),
+        };
+        let past_trailing_edge = Bounds {
+            origin: point(px(240.0), px(40.0)),
+            size: size(px(32.0), px(32.0)),
+        };
+        let before_leading_edge = Bounds {
+            origin: point(px(60.0), px(40.0)),
+            size: size(px(32.0), px(32.0)),
+        };
+        let below_viewport = Bounds {
+            origin: point(px(120.0), px(80.0)),
+            size: size(px(32.0), px(32.0)),
+        };
+
+        assert_eq!(
+            scroll_reveal_delta(viewport, visible, RevealAxis::Horizontal),
+            None
+        );
+        assert_eq!(
+            scroll_reveal_delta(viewport, past_trailing_edge, RevealAxis::Horizontal),
+            Some(px(-12.0))
+        );
+        assert_eq!(
+            scroll_reveal_delta(viewport, before_leading_edge, RevealAxis::Horizontal),
+            Some(px(40.0))
+        );
+        assert_eq!(
+            scroll_reveal_delta(viewport, below_viewport, RevealAxis::Vertical),
+            Some(px(-40.0))
+        );
+    }
+
     #[gpui::test]
     fn runtime_popover_render_keeps_downward_menu_four_pixels_from_trigger(
         cx: &mut TestAppContext,
@@ -59367,7 +59447,8 @@ mod tests {
         agent.enabled = true;
         agent.installed = true;
 
-        let agents = runtime_menu_agents(std::slice::from_ref(&agent));
+        let agents =
+            ordered_runtime_agent_choices(std::slice::from_ref(&agent), &AgentOrdering::default());
         let catalog = SessionRuntimeOptionCatalog {
             revision: 1,
             agents: Vec::new(),
@@ -59378,6 +59459,60 @@ mod tests {
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].id, agent.id);
         assert!(runtime_auth_sources_for_agent(&catalog, &agent.id).is_empty());
+    }
+
+    #[test]
+    fn runtime_agent_row_reuses_the_new_session_agent_ordering() {
+        let mut agents = vibex_core::builtin_agent_definitions()
+            .iter()
+            .filter(|definition| vibex_core::is_user_visible_agent(&definition.id))
+            .take(3)
+            .map(|definition| {
+                let mut agent = AgentSnapshotEntry::from_definition(definition, None, None);
+                agent.added = true;
+                agent.enabled = true;
+                agent.installed = true;
+                agent
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(agents.len(), 3);
+        let entries = agents
+            .iter()
+            .map(|agent| AgentOrderEntry {
+                id: agent.id.as_str().to_string(),
+                label: agent.label.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        let alphabetical = ordered_runtime_agent_choices(&agents, &AgentOrdering::default());
+        assert_eq!(
+            alphabetical
+                .iter()
+                .map(|agent| agent.id.as_str().to_string())
+                .collect::<Vec<_>>(),
+            ordered_agent_ids(&entries, &AgentOrdering::default())
+        );
+
+        // A manual order (drag-adjusted on the new-session selector) wins over
+        // the strategy for the Agent row too.
+        let manual = AgentOrdering::new(
+            AgentSortStrategy::Alphabetical,
+            vec![
+                agents[2].id.as_str().to_string(),
+                agents[0].id.as_str().to_string(),
+            ],
+        );
+        let ordered = ordered_runtime_agent_choices(&agents, &manual);
+        assert_eq!(ordered[0].id, agents[2].id);
+        assert_eq!(ordered[1].id, agents[0].id);
+        assert_eq!(ordered[2].id, agents[1].id);
+
+        // Disabled Agents leave the row even when the manual order mentions them.
+        agents[2].enabled = false;
+        let ordered = ordered_runtime_agent_choices(&agents, &manual);
+        assert_eq!(ordered.len(), 2);
+        assert!(ordered.iter().all(|agent| agent.id != agents[2].id));
+        assert_eq!(ordered[0].id, agents[0].id);
     }
 
     #[test]
@@ -59442,6 +59577,16 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_new_session_runtime_cascade("))
             .map(|(body, _)| body)
             .expect("grouped provider/model renderer should remain inspectable");
+        let agent_row = source
+            .split_once("    fn render_runtime_agent_row(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_provider_model_groups("))
+            .map(|(body, _)| body)
+            .expect("provider/model Agent row should remain inspectable");
+        let agent_switch = source
+            .split_once("    fn choose_runtime_menu_agent(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn set_new_session_runtime_menu_open("))
+            .map(|(body, _)| body)
+            .expect("Agent row activation should remain inspectable");
         let new_session = source
             .split_once("    fn render_new_session_runtime_cascade(")
             .and_then(|(_, tail)| tail.split_once("\n    fn render_new_session_panel("))
@@ -59495,12 +59640,61 @@ mod tests {
             "opening the current-session selector must hand focus to the search field"
         );
         assert!(grouped_models.contains("runtime_model_choices("));
-        assert!(grouped_models.contains("composer-runtime-provider-back-agent"));
-        assert!(grouped_models.contains(".children(agent_back)"));
-        assert!(grouped_models.contains("IconName::ArrowLeft"));
-        assert!(grouped_models.contains(".compact()"));
-        assert!(grouped_models.contains(".h(px(34.0))"));
-        assert!(grouped_models.contains(".child(runtime_agent_icon("));
+        assert!(
+            grouped_models.contains("self.render_runtime_agent_row("),
+            "the provider/model layer must own the one-step Agent row"
+        );
+        assert!(
+            !grouped_models.contains("composer-runtime-provider-back-agent"),
+            "the provider/model layer must not send the user back to a separate Agent step"
+        );
+        assert!(
+            !grouped_models.contains("ComposerRuntimeMenuView::Agent"),
+            "the provider/model layer must not navigate to a separate Agent layer"
+        );
+        assert!(
+            agent_row.contains("self.runtime_agent_choices()"),
+            "the Agent row must use the ordering shared with the new-session selector"
+        );
+        assert!(
+            source.contains(
+                "ordered_runtime_agent_choices(&self.agent_snapshots, &self.agent_ordering())"
+            ),
+            "the Agent row and the new-session selector must share one ordering projection"
+        );
+        assert!(agent_row.contains(".track_scroll(&self.runtime_agent_row_scroll)"));
+        assert!(
+            agent_row.contains(".overflow_x_scroll()"),
+            "the Agent row must keep one x-only scroll driver so a vertical wheel            still moves it horizontally"
+        );
+        assert!(!agent_row.contains(".overflow_x_scrollbar()"));
+        assert!(agent_row.contains("scroll_chip_into_view(&reveal_scroll, bounds, window)"));
+        assert!(
+            agent_row.contains("runtime_agent_row_reveal_pending"),
+            "the selected Agent must be revealed inside the scrollable row"
+        );
+        assert!(agent_row.contains(".selected(active)"));
+        assert!(agent_row.contains(".tooltip(tooltip)"));
+        assert!(agent_row.contains(".child(runtime_agent_icon(&identity))"));
+        assert!(agent_row.contains("button_with_aria_label("));
+        assert!(agent_row.contains("this.choose_runtime_menu_agent("));
+        assert!(
+            agent_switch.contains("self.apply_new_session_agent(agent_id, cx)"),
+            "the new-session Agent row must reuse the home-chip Agent switch"
+        );
+        assert!(
+            agent_switch.contains("ComposerRuntimeMenuView::AuthSource"),
+            "an Agent switch must stay on the provider/model layer"
+        );
+        assert!(
+            !agent_switch.contains("new_session_runtime_menu_open = false"),
+            "switching Agent from the row must not dismiss the provider/model menu"
+        );
+        assert!(
+            agent_switch.contains("self.runtime_agent_row_reveal_pending = true;")
+                && agent_switch.contains("self.runtime_provider_scroll_to_selection = true;"),
+            "an Agent switch must re-arm both reveals for the newly scoped list"
+        );
         assert!(grouped_models.contains(".text_color(cx.theme().foreground.opacity(0.84))"));
         assert!(grouped_models.contains(".track_scroll(&provider_scroll)"));
         assert!(
@@ -59511,10 +59705,11 @@ mod tests {
         assert!(grouped_models.contains(".vertical_scrollbar(&provider_scroll)"));
         assert!(grouped_models.contains("scroll_row_into_view(&reveal_scroll, bounds, window)"));
         assert!(menu_opening.contains("runtime_provider_scroll_to_selection = true;"));
-        assert!(grouped_models.contains("ComposerRuntimeMenuView::Agent"));
-        assert!(current_session.contains("let selected = agent.id == desired.agent_id;"));
-        assert!(current_session.contains(".selected(selected)"));
-        assert!(current_session.contains("icons/vibex/crosshair.svg"));
+        assert!(menu_opening.contains("runtime_agent_row_reveal_pending = true;"));
+        assert!(
+            !current_session.contains("ComposerRuntimeMenuView::Agent"),
+            "the current-session cascade must not keep a separate Agent layer"
+        );
         for cascade in [new_session, current_session] {
             assert!(cascade.contains("render_provider_model_groups("));
             assert!(cascade.contains("ComposerRuntimeMenuView::Authentication"));
