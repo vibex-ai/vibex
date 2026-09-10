@@ -36,6 +36,7 @@ use gpui_component::{
     animation::EffectTransition as Transition,
     bubble::{Bubble, BubbleContent},
     button::{Button, ButtonVariants as _},
+    collapsible::Collapsible,
     dialog::{DialogAction, DialogClose, DialogFooter},
     h_flex,
     input::{
@@ -38584,18 +38585,24 @@ impl VibexWorkbench {
                 .border_color(cx.theme().border)
                 .bg(card_bg)
                 .child(header)
-                .when(expanded, |this| {
-                    this.child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .border_t_1()
-                            .border_color(cx.theme().border)
-                            .px_3()
-                            .py_2()
-                            .child(expanded_rows),
-                    )
-                })
+                // The body is already built for every frame, so the kit can own
+                // the reveal (and keep it mounted) without extra render cost.
+                .child(
+                    Collapsible::new()
+                        .w_full()
+                        .open(expanded)
+                        .motion_id("composer-collaboration-reveal")
+                        .content(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .border_t_1()
+                                .border_color(cx.theme().border)
+                                .px_3()
+                                .py_2()
+                                .child(expanded_rows),
+                        ),
+                )
                 .into_any_element(),
         )
     }
