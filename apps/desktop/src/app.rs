@@ -34,6 +34,7 @@ use gpui_component::{
     InteractiveElementExt as _, Root, Selectable as _, Sizable as _, StyledExt as _, Theme,
     TitleBar, VirtualListScrollHandle, WindowExt as _,
     animation::EffectTransition as Transition,
+    bubble::{Bubble, BubbleContent},
     button::{Button, ButtonVariants as _},
     dialog::{DialogAction, DialogClose, DialogFooter},
     h_flex,
@@ -45,6 +46,7 @@ use gpui_component::{
     },
     marker::{Marker, MarkerIcon},
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem},
+    message::MessageAlignment,
     notification::Notification,
     popover::Popover,
     progress::ProgressCircle,
@@ -35646,6 +35648,7 @@ impl VibexWorkbench {
             .group(hover_group.clone())
             .child(
                 v_flex()
+                    .id(row.id.clone())
                     .min_w_0()
                     .w(relative(0.78))
                     .items_end()
@@ -35656,7 +35659,6 @@ impl VibexWorkbench {
                             cx.theme().muted,
                             cx.theme().foreground,
                         )
-                        .id(row.id.clone())
                         .when(editing, |this| this.w_full()),
                     )
                     .when(!editing, |this| {
@@ -35764,18 +35766,16 @@ impl VibexWorkbench {
             .justify_end()
             .child(
                 v_flex()
+                    .id(row.id.clone())
                     .min_w_0()
                     .w(relative(0.78))
                     .items_end()
                     .gap_1()
-                    .child(
-                        render_user_message_bubble(
-                            inline_content,
-                            cx.theme().muted,
-                            cx.theme().foreground,
-                        )
-                        .id(row.id.clone()),
-                    ),
+                    .child(render_user_message_bubble(
+                        inline_content,
+                        cx.theme().muted,
+                        cx.theme().foreground,
+                    )),
             )
             .into_any_element()
     }
@@ -51444,21 +51444,26 @@ fn render_user_message_bubble(
     body: AnyElement,
     background: gpui::Hsla,
     foreground: gpui::Hsla,
-) -> gpui::Div {
-    // Codex-parity: compact rounded-xl pill.
-    v_flex()
-        .min_w_0()
-        .max_w_full()
+) -> gpui_component::bubble::Bubble {
+    // Codex-parity: compact rounded-xl pill rendered by the library Bubble.
+    // The 78% width contract stays on the definite-width row wrapper; the
+    // bubble hugs its content and shrinks when the wrapper is the constraint.
+    Bubble::new()
+        .alignment(MessageAlignment::End)
         .flex_shrink(1.0)
-        .rounded(px(12.0))
-        .bg(background)
-        .px(px(14.0))
-        .py(px(10.0))
-        .text_sm()
-        .line_height(gpui::relative(1.5))
-        .shadow_sm()
-        .text_color(foreground)
-        .child(body)
+        .max_w_full()
+        .content(
+            BubbleContent::new()
+                .bg(background)
+                .text_color(foreground)
+                .rounded(px(12.0))
+                .px(px(14.0))
+                .py(px(10.0))
+                .text_sm()
+                .line_height(relative(1.5))
+                .shadow_sm()
+                .child(body),
+        )
 }
 
 #[cfg(test)]
@@ -53216,20 +53221,23 @@ mod tests {
                     .w(relative(0.78))
                     .items_end()
                     .child(
-                        render_user_message_bubble(
-                            render_user_message_text_segment(
-                                "user-message-layout-probe",
-                                self.body.clone(),
-                                None,
-                            )
-                            .into_any_element(),
-                            theme::semantic_color("muted", true),
-                            theme::semantic_color("foreground", true),
-                        )
-                        .on_prepaint(move |bounds, _, _| {
-                            measured_width.set(f32::from(bounds.size.width));
-                            measured_height.set(f32::from(bounds.size.height));
-                        }),
+                        div()
+                            .min_w_0()
+                            .max_w_full()
+                            .on_prepaint(move |bounds, _, _| {
+                                measured_width.set(f32::from(bounds.size.width));
+                                measured_height.set(f32::from(bounds.size.height));
+                            })
+                            .child(render_user_message_bubble(
+                                render_user_message_text_segment(
+                                    "user-message-layout-probe",
+                                    self.body.clone(),
+                                    None,
+                                )
+                                .into_any_element(),
+                                theme::semantic_color("muted", true),
+                                theme::semantic_color("foreground", true),
+                            )),
                     )
                     // The hidden hover actions still participate in the row's intrinsic width.
                     .child(div().w(px(132.0)).h(px(24.0))),
@@ -62350,10 +62358,14 @@ mod tests {
             .map(|(body, _)| body)
             .expect("user-message bubble helper should remain inspectable");
 
+        // The 78% width contract stays on the definite-width row wrapper;
+        // the bubble hugs its content and shrinks under that constraint.
         assert!(row.contains(".w(relative(0.78))"));
         assert!(!row.contains(".max_w(relative(0.78))"));
+        assert!(helper.contains("Bubble::new()"));
+        assert!(helper.contains("MessageAlignment::End"));
+        assert!(helper.contains("BubbleContent::new()"));
         assert!(helper.contains(".flex_shrink(1.0)"));
-        assert!(helper.contains(".min_w_0()"));
         assert!(helper.contains(".max_w_full()"));
         assert!(helper.contains(".rounded(px(12.0))"));
         assert!(!helper.contains(".overflow_y_scrollbar()"));
