@@ -3152,11 +3152,18 @@ fn deepseek_harness_model_entry(
         serde_json::json!(context_window),
     );
     model_entry.insert("maxTokens".to_string(), serde_json::json!(max_tokens));
-    let mut input = vec!["text"];
-    if capabilities.and_then(|capabilities| capabilities.image_input) == Some(true) {
-        input.push("image");
+    // Only a declared modality is written. Emitting an explicit `["text"]` for
+    // an undeclared Model overrode the Harness's own answer: its pi-ai catalog
+    // knows which Models accept images, and a Model it describes as
+    // image-capable had every prompt image replaced with a text placeholder
+    // before the request left the process.
+    if let Some(image_input) = capabilities.and_then(|capabilities| capabilities.image_input) {
+        let mut input = vec!["text"];
+        if image_input {
+            input.push("image");
+        }
+        model_entry.insert("input".to_string(), serde_json::json!(input));
     }
-    model_entry.insert("input".to_string(), serde_json::json!(input));
     if capabilities.and_then(|capabilities| capabilities.reasoning) == Some(false) {
         model_entry.insert("reasoningEfforts".to_string(), serde_json::json!(false));
     }
@@ -3199,6 +3206,16 @@ fn deepseek_harness_overlay(
     route.insert(
         "api".to_string(),
         serde_json::json!(deepseek_harness_api(model)),
+    );
+    // Vibex-owned routes are unknown to the Harness's pi-ai catalog, so this
+    // route default is what every Model without its own declaration resolves
+    // to. Admitting images keeps attachments usable; a Model that declares
+    // `image_input: false` still writes its own text-only `input`, and a
+    // genuinely text-only endpoint rejects the image loudly instead of the
+    // Harness quietly swapping it for a placeholder.
+    route.insert(
+        "defaultInput".to_string(),
+        serde_json::json!(["text", "image"]),
     );
     json_string_if_present(
         &mut route,
@@ -4031,6 +4048,20 @@ mod tests {
 
     use super::*;
 
+    /// The string members of a YAML sequence, for overlay assertions that must
+    /// not depend on the serializer's JSON vocabulary.
+    fn yaml_strings(value: &serde_yaml::Value) -> Vec<&str> {
+        value
+            .as_sequence()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(serde_yaml::Value::as_str)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     #[test]
     fn deepseek_harness_overlay_projects_all_configurable_wire_protocols() {
         let (mut provider, _, binding, _) =
@@ -4077,6 +4108,7 @@ mod tests {
             assert_eq!(route["models"][0]["contextWindow"].as_u64(), Some(200_000));
             assert_eq!(route["models"][0]["maxTokens"].as_u64(), Some(16_384));
             assert_eq!(route["models"][0]["input"][1].as_str(), Some("image"));
+            assert_eq!(yaml_strings(&route["defaultInput"]), ["text", "image"]);
             assert_eq!(
                 settings["agent-default-model"]["provider"].as_str(),
                 Some("fake")
@@ -4087,6 +4119,61 @@ mod tests {
             );
             assert!(!overlay.contains("secret-value"));
         }
+    }
+
+    #[test]
+    fn deepseek_harness_overlay_leaves_undeclared_modality_to_the_harness() {
+        let (provider, _, binding, _) = fixture(ConfigOverlayStrategy::DeepseekHarnessSettingsYaml);
+        assert!(
+            provider.configured_models[0]
+                .capabilities
+                .image_input
+                .is_none(),
+            "fixture must not declare image input"
+        );
+
+        let overlay = deepseek_harness_overlay(
+            &provider,
+            &binding,
+            provider.endpoints.first(),
+            binding.configured_models.first(),
+            "VIBEX_DEEPSEEK_HARNESS_API_KEY",
+        )
+        .unwrap();
+        let settings: serde_yaml::Value = serde_yaml::from_str(&overlay).unwrap();
+        let route = &settings["llm-pi-ai"]["providers"]["fake"];
+
+        // An undeclared capability must stay absent so the Harness resolves it
+        // from its own catalog instead of reading an explicit text-only Model.
+        assert!(
+            route["models"][0].get("input").is_none(),
+            "undeclared modality must not project an `input` list: {overlay}"
+        );
+        // The route default is the only thing a Model the Harness catalog does
+        // not describe can fall back to, so it must keep images deliverable.
+        assert_eq!(yaml_strings(&route["defaultInput"]), ["text", "image"]);
+    }
+
+    #[test]
+    fn deepseek_harness_overlay_honors_a_declared_text_only_modality() {
+        let (mut provider, _, binding, _) =
+            fixture(ConfigOverlayStrategy::DeepseekHarnessSettingsYaml);
+        provider.configured_models[0].capabilities.image_input = Some(false);
+
+        let overlay = deepseek_harness_overlay(
+            &provider,
+            &binding,
+            provider.endpoints.first(),
+            binding.configured_models.first(),
+            "VIBEX_DEEPSEEK_HARNESS_API_KEY",
+        )
+        .unwrap();
+        let settings: serde_yaml::Value = serde_yaml::from_str(&overlay).unwrap();
+        let route = &settings["llm-pi-ai"]["providers"]["fake"];
+
+        // A declared `false` beats the route default, so a text-only endpoint
+        // keeps the Harness's placeholder projection.
+        assert_eq!(yaml_strings(&route["models"][0]["input"]), ["text"]);
     }
 
     #[test]

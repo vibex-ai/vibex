@@ -336,13 +336,16 @@ environment key and the final ACP authentication decision.
 - Map Vibex wire protocols to Harness API ids exactly: `openai_chat_completions` -> `openai-completions`, `openai_responses` -> `openai-responses`, and `anthropic_messages` -> `anthropic-messages`.
 - Keep the selected credential in a Profile-scoped environment reference named by `apiKeyEnv`; never write its value into `settings.yaml`.
 - Name that environment reference `DEEPSEEK_API_KEY`. The Harness gates `session/new`, `session/load`, and `session/resume` on its launch-level credential lookup, which resolves the default DeepSeek route by exactly that name; a Vibex-scoped alias such as `VIBEX_DEEPSEEK_HARNESS_API_KEY` satisfies `apiKeyEnv` but fails the gate with `Authentication required`.
-- Project the selected model's declared display name, context/output limits, and image modality. Use the Harness defaults of 262,144 context tokens, 32,768 output tokens, and text-only input when those capabilities are undeclared.
+- Project the selected model's declared display name, context/output limits, and image modality. Use the Harness defaults of 262,144 context tokens and 32,768 output tokens when those limits are undeclared.
+- Write the model `input` modality only when the Model declares it: `image_input: true` -> `[text, image]`, `image_input: false` -> `[text]`. An undeclared modality omits `input` entirely, because the Harness resolves an absent entry from its own pi-ai catalog first. Projecting an explicit `[text]` for an undeclared Model makes the Harness replace every prompt image with `[image omitted because this model accepts text only; ...]` before the request leaves the process, so the Agent never receives the image and no error surfaces.
+- Declare the route-level `defaultInput: [text, image]`. A Vibex-generated route id never matches a pi-ai catalog provider, so this route default is the only modality answer available to a Model the catalog does not describe. A declared `image_input: false` still wins for its own Model, and an image sent to a genuinely text-only endpoint fails loudly at the provider instead of being silently dropped.
 - Provider, protocol, endpoint, credential, or model changes remain process-scoped and require restart and resume.
 
 ### 3. Tests Required
 
 - Core descriptor tests assert all three protocols are advertised in stable order.
 - Projection tests parse `settings.yaml` for every protocol and assert route/default-model identity, model capabilities, and absence of Secret material.
+- Projection tests assert an undeclared modality writes no model `input`, a declared `false` writes `[text]`, a declared `true` writes `[text, image]`, and every route carries `defaultInput: [text, image]`.
 - The typed projector matrix asserts the private `settings.yaml`, `DSH_HOME`, and Vibex-scoped credential environment boundary.
 
 ## Scenario: Kimi Code CLI Provider Projection
