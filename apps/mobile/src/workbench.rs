@@ -29,10 +29,9 @@ use vibex_ui::{
     TerminalKey, TerminalKeyModifiers, TerminalWorkflowCapabilities, TerminalWorkflowController,
 };
 
-use crate::input::TextInput;
 use crate::locale;
 use crate::theme;
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{Input, InputState, Textarea, TextareaState};
 
 const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(600);
 /// Cell metrics copied from the desktop terminal surface so both clients
@@ -103,7 +102,7 @@ pub struct MobileWorkbench {
     terminal: TerminalWorkflowController,
     file_search_input: Option<Entity<InputState>>,
     file_search_mode: MobileFileSearchMode,
-    file_editor_input: Entity<TextInput>,
+    file_editor_input: Option<Entity<TextareaState>>,
     /// A chosen file takes over the whole Files surface as its own screen
     /// with a back button, instead of rendering inline under the tree.
     file_screen_open: bool,
@@ -116,6 +115,9 @@ pub struct MobileWorkbench {
     git_commit_clear_pending: bool,
     git_history_query_clear_pending: bool,
     terminal_clear_pending: bool,
+    /// File content waiting to be written into the editor. Loading a file
+    /// happens in an async task with no window.
+    pending_file_editor_content: Option<String>,
     file_editor_path: Option<String>,
     git_diff: Option<GitDiffResponse>,
     /// One commit opened from the Commits list takes over the Git surface as
@@ -168,9 +170,7 @@ impl MobileWorkbench {
             terminal,
             file_search_input: None,
             file_search_mode: MobileFileSearchMode::Name,
-            file_editor_input: cx.new(|cx| {
-                TextInput::new(locale::text("File content", "文件内容", "檔案內容"), cx).multiline()
-            }),
+            file_editor_input: None,
             file_screen_open: false,
             git_commit_input: None,
             git_history_query_input: None,
@@ -179,6 +179,7 @@ impl MobileWorkbench {
             git_commit_clear_pending: false,
             git_history_query_clear_pending: false,
             terminal_clear_pending: false,
+            pending_file_editor_content: None,
             file_editor_path: None,
             git_diff: None,
             git_commit_detail: None,
@@ -305,8 +306,7 @@ impl MobileWorkbench {
                 this.error = this.files.state.last_error.clone();
                 if let Some(content) = this.files.state.view().editor_content {
                     this.file_editor_path = Some(ticket.path.clone());
-                    this.file_editor_input
-                        .update(cx, |input, cx| input.set_text(content, cx));
+                    this.pending_file_editor_content = Some(content);
                     this.file_screen_open = true;
                 }
                 cx.notify();
@@ -406,7 +406,7 @@ impl MobileWorkbench {
     }
 
     fn save_file(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let content = self.file_editor_input.read(cx).text().to_string();
+        let content = textarea_value(&self.file_editor_input, cx).to_string();
         if let Err(error) = self.files.update_active_content(content) {
             self.error = Some(error);
             cx.notify();
@@ -460,8 +460,7 @@ impl MobileWorkbench {
             return;
         }
         if let Some(content) = self.files.state.view().editor_content {
-            self.file_editor_input
-                .update(cx, |input, cx| input.set_text(content, cx));
+            self.pending_file_editor_content = Some(content);
         }
         self.error = None;
         self.notice = Some(locale::common("Desktop file version loaded").to_string());
@@ -624,6 +623,15 @@ impl MobileWorkbench {
                 ))
             }));
         }
+        if self.file_editor_input.is_none() {
+            self.file_editor_input = Some(cx.new(|cx| {
+                TextareaState::new(window, cx).placeholder(locale::text(
+                    "File content",
+                    "文件内容",
+                    "檔案內容",
+                ))
+            }));
+        }
         if self.terminal_input.is_none() {
             self.terminal_input = Some(cx.new(|cx| {
                 InputState::new(window, cx).placeholder(locale::text(
@@ -643,6 +651,12 @@ impl MobileWorkbench {
             ),
             (&mut self.terminal_clear_pending, &self.terminal_input),
         ];
+        if let Some(content) = self.pending_file_editor_content.take()
+            && let Some(input) = self.file_editor_input.clone()
+        {
+            input.update(cx, |input, cx| input.set_value(content, window, cx));
+        }
+
         for (pending, input) in clears {
             if !*pending {
                 continue;
@@ -1363,7 +1377,7 @@ impl MobileWorkbench {
         let view = self.files.state.view();
         let input_dirty = view
             .editor_content
-            .is_some_and(|content| self.file_editor_input.read(cx).text() != content);
+            .is_some_and(|content| textarea_value(&self.file_editor_input, cx).as_ref() != content);
         let status = if input_dirty {
             "Unsaved"
         } else {
@@ -1471,7 +1485,7 @@ impl MobileWorkbench {
                     .border_color(theme::border_default())
                     .bg(theme::bg_card())
                     .overflow_hidden()
-                    .child(self.file_editor_input.clone()),
+                    .child(textarea_element(self.file_editor_input.as_ref())),
             )
             .child(
                 div()
@@ -1523,7 +1537,7 @@ impl MobileWorkbench {
         let view = self.files.state.view();
         let input_dirty = view
             .editor_content
-            .is_some_and(|content| self.file_editor_input.read(cx).text() != content);
+            .is_some_and(|content| textarea_value(&self.file_editor_input, cx).as_ref() != content);
         let status = if input_dirty {
             "Unsaved"
         } else {
@@ -3636,6 +3650,26 @@ fn input_shell(input: Option<&Entity<InputState>>) -> gpui::Div {
         .bg(theme::bg_card())
         .px_1()
         .child(input_element(input))
+}
+
+/// The kit textarea for a field created on first paint. The container already
+/// draws the frame, so the textarea contributes only its text surface.
+fn textarea_element(input: Option<&Entity<TextareaState>>) -> gpui::AnyElement {
+    match input {
+        Some(input) => Textarea::new(input)
+            .appearance(false)
+            .size_full()
+            .into_any_element(),
+        None => div().into_any_element(),
+    }
+}
+
+/// The text of the lazily-created kit textarea, or empty before the first paint.
+fn textarea_value(input: &Option<Entity<TextareaState>>, cx: &gpui::App) -> gpui::SharedString {
+    input
+        .as_ref()
+        .map(|input| input.read(cx).value())
+        .unwrap_or_default()
 }
 
 /// The text of a lazily-created kit input, or empty before the first paint.
