@@ -335,6 +335,30 @@ pub struct AgentRefreshSnapshotResponse {
     pub agent: AgentSnapshotEntry,
 }
 
+/// Requests the one-time Agent-owned runtime option probe for one Agent.
+///
+/// The probe is what populates the Agent's runtime option snapshot; it is a
+/// config mutation behind a read-shaped surface, so it carries no payload
+/// beyond the Agent it targets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRuntimeOptionProbeRequest {
+    pub agent_id: AgentId,
+}
+
+/// Outcome of one Agent runtime option probe.
+///
+/// `probed` means the probe ran and rewrote the snapshot, `cached` means an
+/// existing reusable snapshot was kept, and `failed` means the probe ran but
+/// the Agent could not be reached.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRuntimeOptionProbeResult {
+    pub probed_agent_ids: Vec<AgentId>,
+    pub failed_agent_ids: Vec<AgentId>,
+    pub cached_agent_ids: Vec<AgentId>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentCatalogListResponse {

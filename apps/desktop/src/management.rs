@@ -42,10 +42,11 @@ use vibex_core::{
     AgentAuthEnvironmentUpdateRequest, AgentAuthEnvironmentValue, AgentAuthMethodEffect,
     AgentAuthMethodKind, AgentAuthModelCatalogSnapshot, AgentAuthStatus, AgentAuthenticateRequest,
     AgentAuthenticationCancelRequest, AgentAuthenticationOperationId, AgentId, AgentListRequest,
-    AgentSnapshotEntry, AgentUpdateConfigRequest, AutomationGraphCreateRequest, AutomationGraphId,
-    AutomationGraphStatus, AutomationRun, AutomationRunCancelRequest, AutomationRunId,
-    AutomationRunResumeRequest, AutomationRunStartRequest, AutomationRunStatus, AutomationRunStep,
-    AutomationRunTrigger, ProviderKind, ScheduledTask, ScheduledTaskCreateRequest, ScheduledTaskId,
+    AgentRuntimeOptionProbeRequest, AgentSnapshotEntry, AgentUpdateConfigRequest,
+    AutomationGraphCreateRequest, AutomationGraphId, AutomationGraphStatus, AutomationRun,
+    AutomationRunCancelRequest, AutomationRunId, AutomationRunResumeRequest,
+    AutomationRunStartRequest, AutomationRunStatus, AutomationRunStep, AutomationRunTrigger,
+    ProviderKind, ScheduledTask, ScheduledTaskCreateRequest, ScheduledTaskId,
     ScheduledTaskIntervalSchedule, ScheduledTaskRun, ScheduledTaskSchedule,
     TerminalAuthActionDescriptor, VibexError, VibexResult, WorkspaceMode, unix_timestamp_ms,
 };
@@ -54,7 +55,7 @@ use vibex_desktop_model::{
     PairingContextProjection, ProviderCenterSnapshot, RecoveryOperationState,
     RedactedDiagnosticProjection, ordered_agent_ids,
 };
-use vibex_desktop_runtime::{DesktopRuntime, RuntimeOptionProbeResult, validate_external_open_url};
+use vibex_desktop_runtime::{DesktopRuntime, validate_external_open_url};
 use vibex_markdown::code_font_weight;
 use vibex_ui::{AgentProviderBindingEditorState, ProjectionCredentialSurface};
 
@@ -3243,7 +3244,7 @@ impl ManagementCenter {
     }
 
     fn start_agent_refresh(&mut self, cx: &mut Context<Self>) {
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             self.note_management_reads_unavailable(cx);
             return;
         };
@@ -3252,7 +3253,8 @@ impl ManagementCenter {
         self.loading = true;
         self.error = None;
         let entity = cx.weak_entity();
-        let runner = gpui_tokio::Tokio::spawn(cx, async move { load_agent_snapshot(runtime) });
+        let runner =
+            gpui_tokio::Tokio::spawn(cx, async move { load_agent_snapshot(backend).await });
         self.refresh_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
@@ -4997,7 +4999,7 @@ impl ManagementCenter {
             cx.notify();
             return;
         };
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         if added {
@@ -5011,12 +5013,20 @@ impl ManagementCenter {
             )),
             cx,
             async move {
-                let providers = runtime.management().providers().management();
+                let providers = backend.management();
                 if custom && !added {
-                    providers.delete_custom_agent(vibex_core::CustomAgentDeleteRequest {
-                        agent_id: parsed_agent_id.clone(),
-                    })?;
-                    runtime.agent().delete_auth_catalog(&parsed_agent_id)?;
+                    providers
+                        .delete_custom_agent(MutationRequest::new(
+                            vibex_core::CustomAgentDeleteRequest {
+                                agent_id: parsed_agent_id.clone(),
+                            },
+                        ))
+                        .await
+                        .map_err(crate::app::remote_error_into_vibex)?;
+                    providers
+                        .delete_agent_auth_catalog(MutationRequest::new(parsed_agent_id.clone()))
+                        .await
+                        .map_err(crate::app::remote_error_into_vibex)?;
                     return Ok(management_locale_text_for(
                         active_locale,
                         "Custom Agent deleted; session history was preserved",
@@ -5025,19 +5035,25 @@ impl ManagementCenter {
                     )
                     .to_string());
                 }
-                providers.update_agent_config(AgentUpdateConfigRequest {
-                    agent_id: parsed_agent_id.clone(),
-                    added: Some(added),
-                    enabled: Some(false),
-                    label_override: None,
-                    description_override: None,
-                    order_index: None,
-                    command: None,
-                    env: None,
-                    params: None,
-                })?;
+                providers
+                    .update_agent_config(MutationRequest::new(AgentUpdateConfigRequest {
+                        agent_id: parsed_agent_id.clone(),
+                        added: Some(added),
+                        enabled: Some(false),
+                        label_override: None,
+                        description_override: None,
+                        order_index: None,
+                        command: None,
+                        env: None,
+                        params: None,
+                    }))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?;
                 if !added {
-                    runtime.agent().delete_auth_catalog(&parsed_agent_id)?;
+                    providers
+                        .delete_agent_auth_catalog(MutationRequest::new(parsed_agent_id.clone()))
+                        .await
+                        .map_err(crate::app::remote_error_into_vibex)?;
                     return Ok(management_locale_text_for(
                         active_locale,
                         "Agent removed",
@@ -5046,23 +5062,28 @@ impl ManagementCenter {
                     )
                     .to_string());
                 }
-                let refreshed =
-                    providers.refresh_agent_snapshot(vibex_core::AgentRefreshSnapshotRequest {
+                let refreshed = providers
+                    .refresh_agent_snapshot(vibex_core::AgentRefreshSnapshotRequest {
                         agent_id: parsed_agent_id.clone(),
                         cwd_scope: None,
-                    })?;
+                    })
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?;
                 if refreshed.agent.installed {
-                    providers.update_agent_config(AgentUpdateConfigRequest {
-                        agent_id: parsed_agent_id.clone(),
-                        added: None,
-                        enabled: Some(true),
-                        label_override: None,
-                        description_override: None,
-                        order_index: None,
-                        command: None,
-                        env: None,
-                        params: None,
-                    })?;
+                    providers
+                        .update_agent_config(MutationRequest::new(AgentUpdateConfigRequest {
+                            agent_id: parsed_agent_id.clone(),
+                            added: None,
+                            enabled: Some(true),
+                            label_override: None,
+                            description_override: None,
+                            order_index: None,
+                            command: None,
+                            env: None,
+                            params: None,
+                        }))
+                        .await
+                        .map_err(crate::app::remote_error_into_vibex)?;
                     let message = management_locale_text_for(
                         active_locale,
                         "Agent added and enabled",
@@ -5070,11 +5091,15 @@ impl ManagementCenter {
                         "Agent 已新增並啟用",
                     )
                     .to_string();
-                    let refresh = runtime
+                    let refresh = backend
                         .agent()
-                        .runtime_catalog()
-                        .probe_agent(&parsed_agent_id)
-                        .await;
+                        .probe_agent_runtime_options(MutationRequest::new(
+                            AgentRuntimeOptionProbeRequest {
+                                agent_id: parsed_agent_id.clone(),
+                            },
+                        ))
+                        .await
+                        .map_err(crate::app::remote_error_into_vibex);
                     Ok(management_append_runtime_option_probe(
                         message,
                         refresh,
@@ -5102,41 +5127,52 @@ impl ManagementCenter {
             cx.notify();
             return;
         };
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         self.selected_agent_id = Some(agent_id.clone());
         let active_locale = locale::current_locale();
         self.begin_simple_task(ManagementMutation::AgentInstall(agent_id), cx, async move {
-            runtime
+            backend
+                .management()
+                .install_managed_agent(MutationRequest::new(parsed_agent_id.clone()))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)?;
+            backend
+                .management()
+                .update_agent_config(MutationRequest::new(AgentUpdateConfigRequest {
+                    agent_id: parsed_agent_id.clone(),
+                    added: if upgrading { None } else { Some(true) },
+                    enabled: Some(true),
+                    label_override: None,
+                    description_override: None,
+                    order_index: None,
+                    command: None,
+                    env: None,
+                    params: None,
+                }))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)?;
+            backend
+                .management()
+                .refresh_agent_snapshot(vibex_core::AgentRefreshSnapshotRequest {
+                    agent_id: parsed_agent_id.clone(),
+                    cwd_scope: None,
+                })
+                .await
+                .map_err(crate::app::remote_error_into_vibex)?;
+            let runtime_probe = backend
                 .agent()
-                .install_managed_agent(parsed_agent_id.clone())
-                .await?;
-            let providers = runtime.management().providers().management();
-            providers.update_agent_config(AgentUpdateConfigRequest {
-                agent_id: parsed_agent_id.clone(),
-                added: if upgrading { None } else { Some(true) },
-                enabled: Some(true),
-                label_override: None,
-                description_override: None,
-                order_index: None,
-                command: None,
-                env: None,
-                params: None,
-            })?;
-            providers.refresh_agent_snapshot(vibex_core::AgentRefreshSnapshotRequest {
-                agent_id: parsed_agent_id.clone(),
-                cwd_scope: None,
-            })?;
-            let runtime_probe = runtime
+                .probe_agent_runtime_options(MutationRequest::new(AgentRuntimeOptionProbeRequest {
+                    agent_id: parsed_agent_id.clone(),
+                }))
+                .await
+                .map_err(crate::app::remote_error_into_vibex);
+            let auth_probe = backend
                 .agent()
-                .runtime_catalog()
-                .probe_agent(&parsed_agent_id)
-                .await;
-            let auth_probe = runtime
-                .agent()
-                .refresh_auth_methods(parsed_agent_id, None)
-                .await;
+                .refresh_agent_auth_methods(MutationRequest::new(parsed_agent_id))
+                .await
+                .map_err(crate::app::remote_error_into_vibex);
             let mut message = management_locale_text_for(
                 active_locale,
                 if upgrading {
@@ -5190,7 +5226,7 @@ impl ManagementCenter {
         let Ok(parsed_agent_id) = AgentId::parse(agent_id.clone()) else {
             return;
         };
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         let active_locale = locale::current_locale();
@@ -5198,10 +5234,11 @@ impl ManagementCenter {
             ManagementMutation::AgentUpdateCheck(agent_id),
             cx,
             async move {
-                let state = runtime
-                    .agent()
-                    .check_managed_agent_update(parsed_agent_id.clone())
-                    .await?;
+                let state = backend
+                    .management()
+                    .check_managed_agent_update(MutationRequest::new(parsed_agent_id.clone()))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?;
                 let message =
                     if state.status == vibex_core::AgentManagedInstallStatus::UpdateAvailable {
                         management_locale_text_for(
@@ -5233,7 +5270,7 @@ impl ManagementCenter {
         let Ok(parsed_agent_id) = AgentId::parse(agent_id.clone()) else {
             return;
         };
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         let active_locale = locale::current_locale();
@@ -5241,10 +5278,11 @@ impl ManagementCenter {
             ManagementMutation::AgentUninstall(agent_id),
             cx,
             async move {
-                runtime
-                    .agent()
-                    .uninstall_managed_agent(parsed_agent_id)
-                    .await?;
+                backend
+                    .management()
+                    .uninstall_managed_agent(MutationRequest::new(parsed_agent_id))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?;
                 Ok(management_locale_text_for(
                     active_locale,
                     "Agent uninstalled",
@@ -5276,47 +5314,62 @@ impl ManagementCenter {
             cx.notify();
             return;
         }
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         let active_locale = locale::current_locale();
         self.begin_simple_task(ManagementMutation::AgentDiscovery, cx, async move {
-            let providers = runtime.management().providers().management();
-            let runtime_catalog = runtime.agent().runtime_catalog();
+            let providers = backend.management();
             let mut discovered_count = 0_usize;
-            let mut option_refresh = RuntimeOptionProbeResult::default();
+            let mut option_refresh = vibex_core::AgentRuntimeOptionProbeResult::default();
             let mut option_refresh_errors = 0_usize;
             for agent_id in candidates {
-                providers.update_agent_config(AgentUpdateConfigRequest {
-                    agent_id: agent_id.clone(),
-                    added: Some(true),
-                    enabled: Some(false),
-                    label_override: None,
-                    description_override: None,
-                    order_index: None,
-                    command: None,
-                    env: None,
-                    params: None,
-                })?;
-                let refreshed =
-                    providers.refresh_agent_snapshot(vibex_core::AgentRefreshSnapshotRequest {
+                providers
+                    .update_agent_config(MutationRequest::new(AgentUpdateConfigRequest {
                         agent_id: agent_id.clone(),
-                        cwd_scope: None,
-                    })?;
-                if refreshed.agent.installed {
-                    providers.update_agent_config(AgentUpdateConfigRequest {
-                        agent_id: agent_id.clone(),
-                        added: None,
-                        enabled: Some(true),
+                        added: Some(true),
+                        enabled: Some(false),
                         label_override: None,
                         description_override: None,
                         order_index: None,
                         command: None,
                         env: None,
                         params: None,
-                    })?;
+                    }))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?;
+                let refreshed = providers
+                    .refresh_agent_snapshot(vibex_core::AgentRefreshSnapshotRequest {
+                        agent_id: agent_id.clone(),
+                        cwd_scope: None,
+                    })
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?;
+                if refreshed.agent.installed {
+                    providers
+                        .update_agent_config(MutationRequest::new(AgentUpdateConfigRequest {
+                            agent_id: agent_id.clone(),
+                            added: None,
+                            enabled: Some(true),
+                            label_override: None,
+                            description_override: None,
+                            order_index: None,
+                            command: None,
+                            env: None,
+                            params: None,
+                        }))
+                        .await
+                        .map_err(crate::app::remote_error_into_vibex)?;
                     discovered_count = discovered_count.saturating_add(1);
-                    match runtime_catalog.probe_agent(&agent_id).await {
+                    match backend
+                        .agent()
+                        .probe_agent_runtime_options(MutationRequest::new(
+                            AgentRuntimeOptionProbeRequest {
+                                agent_id: agent_id.clone(),
+                            },
+                        ))
+                        .await
+                    {
                         Ok(result) => {
                             option_refresh
                                 .probed_agent_ids
@@ -5333,17 +5386,20 @@ impl ManagementCenter {
                         }
                     }
                 } else {
-                    providers.update_agent_config(AgentUpdateConfigRequest {
-                        agent_id: agent_id.clone(),
-                        added: Some(false),
-                        enabled: Some(false),
-                        label_override: None,
-                        description_override: None,
-                        order_index: None,
-                        command: None,
-                        env: None,
-                        params: None,
-                    })?;
+                    providers
+                        .update_agent_config(MutationRequest::new(AgentUpdateConfigRequest {
+                            agent_id: agent_id.clone(),
+                            added: Some(false),
+                            enabled: Some(false),
+                            label_override: None,
+                            description_override: None,
+                            order_index: None,
+                            command: None,
+                            env: None,
+                            params: None,
+                        }))
+                        .await
+                        .map_err(crate::app::remote_error_into_vibex)?;
                 }
             }
             let message = match (active_locale, discovered_count) {
@@ -5389,8 +5445,8 @@ impl ManagementCenter {
             .find(|agent| agent.id.as_str() == agent_id)
             .and_then(agent_install_url)
             .map(str::to_string);
-        let (Ok(agent_id), Some(runtime)) =
-            (AgentId::parse(agent_id.clone()), self.runtime.clone())
+        let (Ok(agent_id), Some(backend)) =
+            (AgentId::parse(agent_id.clone()), self.backend.clone())
         else {
             return;
         };
@@ -5399,24 +5455,29 @@ impl ManagementCenter {
             ManagementMutation::AgentToggle(format!("probe:{agent_id}")),
             cx,
             async move {
-                let providers = runtime.management().providers().management();
-                let response =
-                    providers.refresh_agent_snapshot(vibex_core::AgentRefreshSnapshotRequest {
+                let providers = backend.management();
+                let response = providers
+                    .refresh_agent_snapshot(vibex_core::AgentRefreshSnapshotRequest {
                         agent_id,
                         cwd_scope: None,
-                    })?;
+                    })
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?;
                 if response.agent.installed && !response.agent.enabled {
-                    providers.update_agent_config(AgentUpdateConfigRequest {
-                        agent_id: response.agent.id.clone(),
-                        added: None,
-                        enabled: Some(true),
-                        label_override: None,
-                        description_override: None,
-                        order_index: None,
-                        command: None,
-                        env: None,
-                        params: None,
-                    })?;
+                    providers
+                        .update_agent_config(MutationRequest::new(AgentUpdateConfigRequest {
+                            agent_id: response.agent.id.clone(),
+                            added: None,
+                            enabled: Some(true),
+                            label_override: None,
+                            description_override: None,
+                            order_index: None,
+                            command: None,
+                            env: None,
+                            params: None,
+                        }))
+                        .await
+                        .map_err(crate::app::remote_error_into_vibex)?;
                 }
                 if response.agent.installed {
                     let message = match active_locale {
@@ -5430,11 +5491,15 @@ impl ManagementCenter {
                             format!("已檢測到並啟用 {}", response.agent.label)
                         }
                     };
-                    let refresh = runtime
+                    let refresh = backend
                         .agent()
-                        .runtime_catalog()
-                        .probe_agent(&response.agent.id)
-                        .await;
+                        .probe_agent_runtime_options(MutationRequest::new(
+                            AgentRuntimeOptionProbeRequest {
+                                agent_id: response.agent.id.clone(),
+                            },
+                        ))
+                        .await
+                        .map_err(crate::app::remote_error_into_vibex);
                     return Ok(management_append_runtime_option_probe(
                         message,
                         refresh,
@@ -16479,7 +16544,7 @@ fn management_capability_probe_label() -> &'static str {
 }
 
 fn management_runtime_option_probe_message(
-    result: &RuntimeOptionProbeResult,
+    result: &vibex_core::AgentRuntimeOptionProbeResult,
     active_locale: ResolvedLocale,
 ) -> String {
     let detected = result.probed_agent_ids.len();
@@ -16530,7 +16595,7 @@ fn management_runtime_option_probe_message(
 
 fn management_append_runtime_option_probe(
     message: String,
-    result: Result<RuntimeOptionProbeResult, VibexError>,
+    result: Result<vibex_core::AgentRuntimeOptionProbeResult, VibexError>,
     active_locale: ResolvedLocale,
 ) -> String {
     match result {
@@ -16602,12 +16667,14 @@ fn management_no_skill_selection_description() -> &'static str {
     )
 }
 
-fn load_agent_snapshot(runtime: Arc<DesktopRuntime>) -> VibexResult<Vec<AgentSnapshotEntry>> {
-    let provider = runtime.management().providers().management();
-    Ok(provider
+async fn load_agent_snapshot(backend: BackendFacade) -> VibexResult<Vec<AgentSnapshotEntry>> {
+    Ok(backend
+        .management()
         .list_agents(AgentListRequest {
             include_disabled: true,
-        })?
+        })
+        .await
+        .map_err(crate::app::remote_error_into_vibex)?
         .agents
         .into_iter()
         .filter(|agent| {
@@ -17769,18 +17836,30 @@ mod tests {
             .map(|(body, _)| body)
             .expect("Agent install detection handler should remain inspectable");
 
-        assert!(!toggle.contains(".probe_agent("));
-        assert_eq!(add.matches(".probe_agent(").count(), 1);
-        assert_eq!(managed_install.matches(".probe_agent(").count(), 1);
-        assert!(managed_install.contains(".refresh_auth_methods("));
+        // Setup paths probe through the backend facade, so ordinary toggles
+        // must not reach for the runtime option probe at all.
+        assert!(!toggle.contains(".probe_agent_runtime_options("));
+        assert_eq!(add.matches(".probe_agent_runtime_options(").count(), 1);
+        assert_eq!(
+            managed_install
+                .matches(".probe_agent_runtime_options(")
+                .count(),
+            1
+        );
+        assert!(managed_install.contains(".refresh_agent_auth_methods("));
         let selection = source
             .split_once("    fn reconcile_selected_agent(")
             .and_then(|(_, tail)| tail.split_once("\n    fn apply_snapshot("))
             .map(|(body, _)| body)
             .expect("selected Agent reconciliation should remain inspectable");
         assert!(selection.contains("agent.managed_install.managed"));
-        assert_eq!(discover.matches(".probe_agent(").count(), 1);
-        assert_eq!(detect_after_install.matches(".probe_agent(").count(), 1);
+        assert_eq!(discover.matches(".probe_agent_runtime_options(").count(), 1);
+        assert_eq!(
+            detect_after_install
+                .matches(".probe_agent_runtime_options(")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -18448,11 +18527,10 @@ mod tests {
             .map(|(body, _)| body)
             .expect("Config Center refresh implementation should remain inspectable");
 
-        assert!(refresh.contains("load_agent_snapshot(runtime)"));
         assert!(refresh.contains("this.apply_agent_snapshot(agents, cx)"));
         assert!(refresh.contains("this.start_fast_snapshot(cx)"));
-        assert!(source.contains("load_snapshot(runtime, default_scope, false)"));
-        assert!(source.contains("load_snapshot(runtime, default_scope, true)"));
+        assert!(source.contains("load_snapshot(backend, default_scope, false)"));
+        assert!(source.contains("load_snapshot(backend, default_scope, true)"));
     }
 
     #[test]

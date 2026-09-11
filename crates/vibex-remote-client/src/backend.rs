@@ -19,29 +19,31 @@ use vibex_core::{
     AgentAuthContextMutationResult, AgentAuthContextRefreshModelsRequest,
     AgentAuthContextVerifyRequest, AgentAuthenticationOperation, AgentAuthenticationOperationId,
     AgentCatalogListResponse, AgentId, AgentListRequest, AgentListResponse,
-    AgentModelProviderProfileCreateRequest, AgentModelProviderProfileSecretValueResponse,
+    AgentManagedInstallState, AgentModelProviderProfileCreateRequest,
+    AgentModelProviderProfileSecretValueResponse,
     AgentModelProviderProfileSecretValueUpdateRequest, AgentModelProviderProfileUpdateRequest,
-    AgentNotificationIntent, AgentSession, AgentSessionRuntimeSelectionState, AgentSnapshotEntry,
-    AgentTimelineDisplaySettings, AgentUpdateConfigRequest, AutomationGraph,
-    AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest, AutomationGraphId,
-    AutomationGraphListRequest, AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun,
-    AutomationRunCancelRequest, AutomationRunListRequest, AutomationRunResumeRequest,
-    AutomationRunStartRequest, AutomationRunStep, AutomationRunStepListRequest,
-    CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
-    FetchTimelineRequest, FileMutationRequest, FileReadRequest, FileReadResponse,
-    FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest, FileWriteRequest,
-    ForkAgentSessionRequest, GetMessageSubmissionRequest, GitBranchListResponse, GitCommitDetail,
-    GitCommitDetailRequest, GitCommitRequest, GitCommitResult, GitDiffRequest, GitDiffResponse,
-    GitHistoryRequest, GitHistoryResponse, GitProjectEligibility, GitRemoteActionRequest,
-    GitRemoteActionResult, GitStageRequest, GitStatusSummary, GitWorktreeArchiveRequest,
-    GitWorktreeAssistanceSessionRequest, GitWorktreeConflictResolveRequest,
-    GitWorktreeConflictStageRequest, GitWorktreeCreateRequest, GitWorktreeCreateResult,
-    GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
-    GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeOperationRecord,
-    GitWorktreeOperationRequest, GitWorktreeReadinessRecord, GitWorktreeReadinessRequest,
-    GitWorktreeRestoreRequest, ManagementSnapshotPayload, MessageSubmissionState,
-    OpenWorkspaceRequest, ProjectId, ProjectWorkspaceSummary, ProviderHealthSummary,
-    ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
+    AgentNotificationIntent, AgentRefreshSnapshotRequest, AgentRefreshSnapshotResponse,
+    AgentRuntimeOptionProbeRequest, AgentRuntimeOptionProbeResult, AgentSession,
+    AgentSessionRuntimeSelectionState, AgentSnapshotEntry, AgentTimelineDisplaySettings,
+    AgentUpdateConfigRequest, AutomationGraph, AutomationGraphCreateRequest,
+    AutomationGraphDefinitionUpdateRequest, AutomationGraphId, AutomationGraphListRequest,
+    AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun, AutomationRunCancelRequest,
+    AutomationRunListRequest, AutomationRunResumeRequest, AutomationRunStartRequest,
+    AutomationRunStep, AutomationRunStepListRequest, CancelAgentSessionRuntimeSwitchRequest,
+    ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest, FileMutationRequest,
+    FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
+    FileTreeRequest, FileWriteRequest, ForkAgentSessionRequest, GetMessageSubmissionRequest,
+    GitBranchListResponse, GitCommitDetail, GitCommitDetailRequest, GitCommitRequest,
+    GitCommitResult, GitDiffRequest, GitDiffResponse, GitHistoryRequest, GitHistoryResponse,
+    GitProjectEligibility, GitRemoteActionRequest, GitRemoteActionResult, GitStageRequest,
+    GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
+    GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeCreateRequest,
+    GitWorktreeCreateResult, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
+    GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
+    GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeReadinessRecord,
+    GitWorktreeReadinessRequest, GitWorktreeRestoreRequest, ManagementSnapshotPayload,
+    MessageSubmissionState, OpenWorkspaceRequest, ProjectId, ProjectWorkspaceSummary,
+    ProviderHealthSummary, ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
     ProviderNativeExportListRequest, ProviderNativeExportPreview,
     ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
     ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
@@ -1197,6 +1199,33 @@ impl AgentBackend for WebRemoteBackend {
                 )
                 .await?;
             Ok(decode::<RemoteAgentRuntimeOptionsResponse>(value)?.catalog)
+        })
+    }
+
+    fn probe_agent_runtime_options(
+        &self,
+        request: MutationRequest<AgentRuntimeOptionProbeRequest>,
+    ) -> BackendFuture<'_, AgentRuntimeOptionProbeResult> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::ProbeAgentRuntimeOptions(
+                vibex_core::RemoteAgentProbeRuntimeOptionsRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentProbeRuntimeOptionsResponse>(value)?.result)
         })
     }
 
@@ -2634,6 +2663,140 @@ impl ManagementBackend for WebRemoteBackend {
             Ok(AgentListResponse {
                 agents: decode::<vibex_core::RemoteAgentListResponse>(value)?.agents,
             })
+        })
+    }
+
+    fn refresh_agent_snapshot(
+        &self,
+        request: AgentRefreshSnapshotRequest,
+    ) -> BackendFuture<'_, AgentRefreshSnapshotResponse> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::RefreshAgentSnapshot(
+                vibex_core::RemoteAgentRefreshAgentSnapshotRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentRefreshAgentSnapshotResponse>(value)?.response)
+        })
+    }
+
+    fn install_managed_agent(
+        &self,
+        request: MutationRequest<AgentId>,
+    ) -> BackendFuture<'_, AgentManagedInstallState> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::InstallManagedAgent(
+                vibex_core::RemoteAgentInstallManagedAgentRequest {
+                    auth: this.auth(),
+                    agent_id: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentInstallManagedAgentResponse>(value)?.state)
+        })
+    }
+
+    fn check_managed_agent_update(
+        &self,
+        request: MutationRequest<AgentId>,
+    ) -> BackendFuture<'_, AgentManagedInstallState> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::CheckManagedAgentUpdate(
+                vibex_core::RemoteAgentCheckManagedAgentUpdateRequest {
+                    auth: this.auth(),
+                    agent_id: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentCheckManagedAgentUpdateResponse>(value)?.state)
+        })
+    }
+
+    fn uninstall_managed_agent(
+        &self,
+        request: MutationRequest<AgentId>,
+    ) -> BackendFuture<'_, AgentManagedInstallState> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::UninstallManagedAgent(
+                vibex_core::RemoteAgentUninstallManagedAgentRequest {
+                    auth: this.auth(),
+                    agent_id: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentUninstallManagedAgentResponse>(value)?.state)
+        })
+    }
+
+    fn delete_agent_auth_catalog(
+        &self,
+        request: MutationRequest<AgentId>,
+    ) -> BackendFuture<'_, ()> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::DeleteAgentAuthCatalog(
+                vibex_core::RemoteAgentDeleteAgentAuthCatalogRequest {
+                    auth: this.auth(),
+                    agent_id: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            let _ = value;
+            Ok(())
         })
     }
 

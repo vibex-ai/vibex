@@ -1236,6 +1236,45 @@ impl vibex_remote::RemoteManagementSnapshotSource for ManagementSnapshotSource {
     }
 }
 
+/// Serves managed-Agent installation to the gateway.
+pub struct AgentInstallSource {
+    agent: AgentHandle,
+}
+
+impl AgentInstallSource {
+    pub fn new(agent: AgentHandle) -> Self {
+        Self { agent }
+    }
+}
+
+#[async_trait]
+impl vibex_remote::RemoteAgentInstallSource for AgentInstallSource {
+    async fn install_managed_agent(
+        &self,
+        agent_id: vibex_core::AgentId,
+    ) -> VibexResult<vibex_core::AgentManagedInstallState> {
+        self.agent.install_managed_agent(agent_id).await
+    }
+
+    async fn check_managed_agent_update(
+        &self,
+        agent_id: vibex_core::AgentId,
+    ) -> VibexResult<vibex_core::AgentManagedInstallState> {
+        self.agent.check_managed_agent_update(agent_id).await
+    }
+
+    async fn uninstall_managed_agent(
+        &self,
+        agent_id: vibex_core::AgentId,
+    ) -> VibexResult<vibex_core::AgentManagedInstallState> {
+        self.agent.uninstall_managed_agent(agent_id).await
+    }
+
+    async fn delete_agent_auth_catalog(&self, agent_id: vibex_core::AgentId) -> VibexResult<()> {
+        self.agent.delete_auth_catalog(&agent_id)
+    }
+}
+
 /// Adapts the authority's automation handle to the gateway's source trait.
 pub struct AutomationSource {
     handle: AutomationHandle,
@@ -1829,6 +1868,16 @@ impl DesktopRuntime {
             .with_scheduled_task_source(Arc::new(ScheduledTaskSource::new(ScheduledHandle {
                 db_path: db_path.clone(),
                 mutation_guard: ManagementMutationGuard::default(),
+            })))
+            .with_agent_install_source(Arc::new(AgentInstallSource::new(AgentHandle {
+                manager: manager.clone(),
+                runtime_selection: runtime_selection.clone(),
+                runtime_lifecycle: runtime_lifecycle.clone(),
+                message_submission: message_submission.clone(),
+                runtime_catalog: runtime_catalog.clone(),
+                auth_catalog: auth_catalog.clone(),
+                auth_contexts: auth_contexts.clone(),
+                install_service: install_service.clone(),
             })))
             .with_management_snapshot_source({
                 let (source, cell) = ManagementSnapshotSource::new();

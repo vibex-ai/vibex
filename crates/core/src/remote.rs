@@ -18,7 +18,9 @@ use crate::agent_auth::{
     AgentAuthenticationOperation,
 };
 use crate::agent_config::{
-    AgentCatalogListResponse, AgentConfigStatus, AgentId, AgentRuntimeStatus, AgentSnapshotEntry,
+    AgentCatalogListResponse, AgentConfigStatus, AgentId, AgentManagedInstallState,
+    AgentRefreshSnapshotRequest, AgentRefreshSnapshotResponse, AgentRuntimeOptionProbeRequest,
+    AgentRuntimeOptionProbeResult, AgentRuntimeStatus, AgentSnapshotEntry,
     AgentUpdateConfigRequest,
 };
 use crate::agent_provider_runtime::{
@@ -1647,6 +1649,12 @@ pub enum RemoteProviderOperationKind {
     ListFailoverRecommendations,
     ListAgents,
     UpdateAgentConfig,
+    RefreshAgentSnapshot,
+    ProbeAgentRuntimeOptions,
+    InstallManagedAgent,
+    CheckManagedAgentUpdate,
+    UninstallManagedAgent,
+    DeleteAgentAuthCatalog,
     CreateCustomAgent,
     DeleteCustomAgent,
     ListModelProviderProfiles,
@@ -1916,6 +1924,84 @@ pub struct RemoteProviderFailoverRecommendationListResponse {
 /// values are blanked, and native configuration paths and diagnostics are
 /// dropped before the entries leave the runtime; see
 /// [`redact_agent_snapshot_for_remote`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentRefreshAgentSnapshotRequest {
+    pub auth: RemoteAuthProof,
+    pub request: AgentRefreshSnapshotRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentRefreshAgentSnapshotResponse {
+    pub response: AgentRefreshSnapshotResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentProbeRuntimeOptionsRequest {
+    pub auth: RemoteAuthProof,
+    pub request: AgentRuntimeOptionProbeRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentProbeRuntimeOptionsResponse {
+    pub result: AgentRuntimeOptionProbeResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentInstallManagedAgentRequest {
+    pub auth: RemoteAuthProof,
+    pub agent_id: AgentId,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentInstallManagedAgentResponse {
+    pub state: AgentManagedInstallState,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentCheckManagedAgentUpdateRequest {
+    pub auth: RemoteAuthProof,
+    pub agent_id: AgentId,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentCheckManagedAgentUpdateResponse {
+    pub state: AgentManagedInstallState,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentUninstallManagedAgentRequest {
+    pub auth: RemoteAuthProof,
+    pub agent_id: AgentId,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentUninstallManagedAgentResponse {
+    pub state: AgentManagedInstallState,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentDeleteAgentAuthCatalogRequest {
+    pub auth: RemoteAuthProof,
+    pub agent_id: AgentId,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentDeleteAgentAuthCatalogResponse {
+    pub deleted: bool,
+}
+
 /// Updates an Agent's workspace membership, enabled flag, or overrides.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2795,6 +2881,12 @@ pub enum RemoteProviderRequest {
     ListFailoverRecommendations(RemoteProviderFailoverRecommendationListRequest),
     ListAgents(RemoteAgentListRequest),
     UpdateAgentConfig(RemoteAgentUpdateConfigRequest),
+    RefreshAgentSnapshot(RemoteAgentRefreshAgentSnapshotRequest),
+    ProbeAgentRuntimeOptions(RemoteAgentProbeRuntimeOptionsRequest),
+    InstallManagedAgent(RemoteAgentInstallManagedAgentRequest),
+    CheckManagedAgentUpdate(RemoteAgentCheckManagedAgentUpdateRequest),
+    UninstallManagedAgent(RemoteAgentUninstallManagedAgentRequest),
+    DeleteAgentAuthCatalog(RemoteAgentDeleteAgentAuthCatalogRequest),
     CreateCustomAgent(RemoteCustomAgentCreateRequest),
     DeleteCustomAgent(RemoteCustomAgentDeleteRequest),
     ListModelProviderProfiles(RemoteModelProviderProfileListRequest),
@@ -2888,6 +2980,12 @@ impl RemoteProviderRequest {
                 | Self::UpdateAgentModelProviderProfile(_)
                 | Self::MutateAgentModelProviderProfileSecret(_)
                 | Self::UpdateAgentConfig(_)
+                | Self::RefreshAgentSnapshot(_)
+                | Self::ProbeAgentRuntimeOptions(_)
+                | Self::InstallManagedAgent(_)
+                | Self::CheckManagedAgentUpdate(_)
+                | Self::UninstallManagedAgent(_)
+                | Self::DeleteAgentAuthCatalog(_)
         )
     }
 
@@ -2910,6 +3008,16 @@ impl RemoteProviderRequest {
             }
             Self::ListAgents(_) => RemoteProviderOperationKind::ListAgents,
             Self::UpdateAgentConfig(_) => RemoteProviderOperationKind::UpdateAgentConfig,
+            Self::RefreshAgentSnapshot(_) => RemoteProviderOperationKind::RefreshAgentSnapshot,
+            Self::ProbeAgentRuntimeOptions(_) => {
+                RemoteProviderOperationKind::ProbeAgentRuntimeOptions
+            }
+            Self::InstallManagedAgent(_) => RemoteProviderOperationKind::InstallManagedAgent,
+            Self::CheckManagedAgentUpdate(_) => {
+                RemoteProviderOperationKind::CheckManagedAgentUpdate
+            }
+            Self::UninstallManagedAgent(_) => RemoteProviderOperationKind::UninstallManagedAgent,
+            Self::DeleteAgentAuthCatalog(_) => RemoteProviderOperationKind::DeleteAgentAuthCatalog,
             Self::CreateCustomAgent(_) => RemoteProviderOperationKind::CreateCustomAgent,
             Self::DeleteCustomAgent(_) => RemoteProviderOperationKind::DeleteCustomAgent,
             Self::ListModelProviderProfiles(_) => {

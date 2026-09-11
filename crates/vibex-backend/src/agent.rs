@@ -4,7 +4,8 @@ use vibex_core::{
     AgentAuthContextId, AgentAuthContextLogoutPreview, AgentAuthContextLogoutRequest,
     AgentAuthContextMutationResult, AgentAuthContextRefreshModelsRequest,
     AgentAuthContextVerifyRequest, AgentAuthenticationOperation, AgentAuthenticationOperationId,
-    AgentId, AgentNotificationIntent, AgentSession, AgentSessionRuntimeSelectionEvent,
+    AgentId, AgentNotificationIntent, AgentRuntimeOptionProbeRequest,
+    AgentRuntimeOptionProbeResult, AgentSession, AgentSessionRuntimeSelectionEvent,
     AgentSessionRuntimeSelectionState, AgentTimelineDisplaySettings, AgentUsageStatistics,
     AgentUsageStatisticsRequest, CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest,
     CreateAgentSessionRequest, FetchTimelineRequest, ForkAgentSessionRequest,
@@ -167,6 +168,13 @@ pub trait AgentBackend: BackendBound {
     fn delete_session(&self, request: MutationRequest<VibexSessionId>) -> BackendFuture<'_, ()>;
 
     fn list_runtime_options(&self) -> BackendFuture<'_, SessionRuntimeOptionCatalog>;
+
+    /// Runs the one-time Agent-owned runtime option probe that populates the
+    /// Agent's runtime option snapshot.
+    fn probe_agent_runtime_options(
+        &self,
+        request: MutationRequest<AgentRuntimeOptionProbeRequest>,
+    ) -> BackendFuture<'_, AgentRuntimeOptionProbeResult>;
 
     fn list_agent_auth_contexts(&self) -> BackendFuture<'_, Vec<AgentAuthContext>> {
         Box::pin(async {

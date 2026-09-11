@@ -9,41 +9,42 @@ use vibex_core::{
     AgentAuthContextMutationResult, AgentAuthContextRefreshModelsRequest,
     AgentAuthContextVerifyRequest, AgentAuthenticationOperation, AgentAuthenticationOperationId,
     AgentCatalogListResponse, AgentId, AgentListRequest, AgentListResponse,
-    AgentModelProviderDisplayOrderListRequest, AgentModelProviderDisplayOrderListResponse,
-    AgentModelProviderDisplayOrderSetRequest, AgentModelProviderDisplayOrderSetResponse,
-    AgentModelProviderProfileCreateRequest, AgentModelProviderProfileDeleteRequest,
-    AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
-    AgentModelProviderProfileSecretValueResponse,
+    AgentManagedInstallState, AgentModelProviderDisplayOrderListRequest,
+    AgentModelProviderDisplayOrderListResponse, AgentModelProviderDisplayOrderSetRequest,
+    AgentModelProviderDisplayOrderSetResponse, AgentModelProviderProfileCreateRequest,
+    AgentModelProviderProfileDeleteRequest, AgentModelProviderProfileFetchModelsRequest,
+    AgentModelProviderProfileFetchModelsResponse, AgentModelProviderProfileSecretValueResponse,
     AgentModelProviderProfileSecretValueUpdateRequest, AgentModelProviderProfileTestRequest,
-    AgentModelProviderProfileTestResult, AgentModelProviderProfileUpdateRequest, AgentSession,
-    AgentSessionRuntimeSelectionState, AgentSnapshotEntry, AgentUpdateConfigRequest,
-    AgentUsageStatistics, AgentUsageStatisticsRequest, AutomationGraph,
-    AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest, AutomationGraphId,
-    AutomationGraphListRequest, AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun,
-    AutomationRunCancelRequest, AutomationRunListRequest, AutomationRunResumeRequest,
-    AutomationRunStartRequest, AutomationRunStep, AutomationRunStepListRequest,
-    CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
-    FetchTimelineRequest, FileMutationRequest, FileReadRequest, FileReadResponse,
-    FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest, FileWriteRequest,
-    ForkAgentSessionRequest, GitBranchListResponse, GitCommitDetail, GitCommitDetailRequest,
-    GitCommitRequest, GitCommitResult, GitDiffRequest, GitDiffResponse, GitHistoryRequest,
-    GitHistoryResponse, GitProjectEligibility, GitRemoteActionRequest, GitRemoteActionResult,
-    GitStageRequest, GitStatusSummary, GitWorktreeArchiveRequest,
-    GitWorktreeAssistanceSessionRequest, GitWorktreeConflictResolveRequest,
-    GitWorktreeConflictStageRequest, GitWorktreeCreateRequest, GitWorktreeCreateResult,
-    GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
-    GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeOperationRecord,
-    GitWorktreeOperationRequest, GitWorktreeReadinessRecord, GitWorktreeReadinessRequest,
-    GitWorktreeRestoreRequest, Hook, HookCreateRequest, HookDeleteRequest, HookInstallPreview,
-    HookInstallPreviewRequest, HookUpdateRequest, ManagementSnapshotPayload, McpServer,
-    McpServerAgentMatrix, McpServerAgentMatrixListRequest, McpServerCreateRequest,
-    McpServerDeleteRequest, McpServerDiscoverRequest, McpServerDiscoveryResponse,
-    McpServerImportRequest, McpServerImportResult, McpServerSetAgentMatrixRequest,
-    McpServerUpdateRequest, McpServerValidateRequest, McpServerValidationResult,
-    OpenWorkspaceRequest, ProjectId, Prompt, PromptCreateRequest, PromptDeleteRequest,
-    PromptUpdateRequest, PromptValidateRequest, PromptValidationResult, ProviderCapabilitySummary,
-    ProviderHealthSummary, ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
-    ProviderNativeExportListRequest, ProviderNativeExportPreview,
+    AgentModelProviderProfileTestResult, AgentModelProviderProfileUpdateRequest,
+    AgentRefreshSnapshotRequest, AgentRefreshSnapshotResponse, AgentRuntimeOptionProbeRequest,
+    AgentRuntimeOptionProbeResult, AgentSession, AgentSessionRuntimeSelectionState,
+    AgentSnapshotEntry, AgentUpdateConfigRequest, AgentUsageStatistics,
+    AgentUsageStatisticsRequest, AutomationGraph, AutomationGraphCreateRequest,
+    AutomationGraphDefinitionUpdateRequest, AutomationGraphId, AutomationGraphListRequest,
+    AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun, AutomationRunCancelRequest,
+    AutomationRunListRequest, AutomationRunResumeRequest, AutomationRunStartRequest,
+    AutomationRunStep, AutomationRunStepListRequest, CancelAgentSessionRuntimeSwitchRequest,
+    ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest, FileMutationRequest,
+    FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
+    FileTreeRequest, FileWriteRequest, ForkAgentSessionRequest, GitBranchListResponse,
+    GitCommitDetail, GitCommitDetailRequest, GitCommitRequest, GitCommitResult, GitDiffRequest,
+    GitDiffResponse, GitHistoryRequest, GitHistoryResponse, GitProjectEligibility,
+    GitRemoteActionRequest, GitRemoteActionResult, GitStageRequest, GitStatusSummary,
+    GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
+    GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeCreateRequest,
+    GitWorktreeCreateResult, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
+    GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
+    GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeReadinessRecord,
+    GitWorktreeReadinessRequest, GitWorktreeRestoreRequest, Hook, HookCreateRequest,
+    HookDeleteRequest, HookInstallPreview, HookInstallPreviewRequest, HookUpdateRequest,
+    ManagementSnapshotPayload, McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest,
+    McpServerCreateRequest, McpServerDeleteRequest, McpServerDiscoverRequest,
+    McpServerDiscoveryResponse, McpServerImportRequest, McpServerImportResult,
+    McpServerSetAgentMatrixRequest, McpServerUpdateRequest, McpServerValidateRequest,
+    McpServerValidationResult, OpenWorkspaceRequest, ProjectId, Prompt, PromptCreateRequest,
+    PromptDeleteRequest, PromptUpdateRequest, PromptValidateRequest, PromptValidationResult,
+    ProviderCapabilitySummary, ProviderHealthSummary, ProviderNativeExportApplyRequest,
+    ProviderNativeExportApplyResult, ProviderNativeExportListRequest, ProviderNativeExportPreview,
     ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
     ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
     ProviderNativeImportCreateRequest, ProviderNativeImportCreateResult,
@@ -447,6 +448,27 @@ impl AgentBackend for NativeBackend {
                 .list()
                 .await
                 .map_err(Into::into)
+        })
+    }
+
+    fn probe_agent_runtime_options(
+        &self,
+        request: MutationRequest<AgentRuntimeOptionProbeRequest>,
+    ) -> BackendFuture<'_, AgentRuntimeOptionProbeResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            let result = runtime
+                .agent()
+                .runtime_catalog()
+                .probe_agent(&request.payload.agent_id)
+                .await?;
+            Ok(AgentRuntimeOptionProbeResult {
+                probed_agent_ids: result.probed_agent_ids,
+                failed_agent_ids: result.failed_agent_ids,
+                cached_agent_ids: result.cached_agent_ids,
+            })
         })
     }
 
@@ -1417,6 +1439,85 @@ impl ManagementBackend for NativeBackend {
                 .providers()
                 .management()
                 .list_agents(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn refresh_agent_snapshot(
+        &self,
+        request: AgentRefreshSnapshotRequest,
+    ) -> BackendFuture<'_, AgentRefreshSnapshotResponse> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .refresh_agent_snapshot(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn install_managed_agent(
+        &self,
+        request: MutationRequest<AgentId>,
+    ) -> BackendFuture<'_, AgentManagedInstallState> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .install_managed_agent(request.payload)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn check_managed_agent_update(
+        &self,
+        request: MutationRequest<AgentId>,
+    ) -> BackendFuture<'_, AgentManagedInstallState> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .check_managed_agent_update(request.payload)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn uninstall_managed_agent(
+        &self,
+        request: MutationRequest<AgentId>,
+    ) -> BackendFuture<'_, AgentManagedInstallState> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .uninstall_managed_agent(request.payload)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn delete_agent_auth_catalog(
+        &self,
+        request: MutationRequest<AgentId>,
+    ) -> BackendFuture<'_, ()> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .delete_auth_catalog(&request.payload)
                 .map_err(Into::into)
         })
     }

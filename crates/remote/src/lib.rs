@@ -132,6 +132,7 @@ struct RemoteRouterState {
     scheduled_tasks: Option<Arc<dyn RemoteScheduledTaskSource>>,
     automation: Option<Arc<dyn RemoteAutomationSource>>,
     management_snapshot: Option<Arc<dyn RemoteManagementSnapshotSource>>,
+    agent_install: Option<Arc<dyn RemoteAgentInstallSource>>,
     sidebar_organization: Option<Arc<dyn RemoteSidebarOrganizationSource>>,
     workbench: Option<RemoteWorkbenchRuntime>,
     provider: Option<RemoteProviderRuntime>,
@@ -140,6 +141,14 @@ struct RemoteRouterState {
 #[async_trait]
 pub trait RemoteRuntimeOptionCatalogSource: Send + Sync {
     async fn list_runtime_options(&self) -> VibexResult<SessionRuntimeOptionCatalog>;
+
+    /// Runs the one-time Agent-owned runtime option probe. The catalog service
+    /// owns the probe guard and the snapshot cache, so the authority must
+    /// perform it in-process.
+    async fn probe_agent_runtime_options(
+        &self,
+        agent_id: vibex_core::AgentId,
+    ) -> VibexResult<vibex_core::AgentRuntimeOptionProbeResult>;
 }
 
 #[async_trait]
@@ -361,6 +370,30 @@ pub trait RemoteAutomationSource: Send + Sync {
 ///
 /// Installed by the runtime for the same reason as the other source traits:
 /// `vibex-remote` cannot reach the runtime's management handles itself.
+/// Authority-side managed-Agent installation.
+///
+/// The install service lives on the runtime's agent handle, which the gateway
+/// cannot reach, so the runtime installs this source.
+#[async_trait]
+pub trait RemoteAgentInstallSource: Send + Sync {
+    async fn install_managed_agent(
+        &self,
+        agent_id: vibex_core::AgentId,
+    ) -> VibexResult<vibex_core::AgentManagedInstallState>;
+
+    async fn check_managed_agent_update(
+        &self,
+        agent_id: vibex_core::AgentId,
+    ) -> VibexResult<vibex_core::AgentManagedInstallState>;
+
+    async fn uninstall_managed_agent(
+        &self,
+        agent_id: vibex_core::AgentId,
+    ) -> VibexResult<vibex_core::AgentManagedInstallState>;
+
+    async fn delete_agent_auth_catalog(&self, agent_id: vibex_core::AgentId) -> VibexResult<()>;
+}
+
 #[async_trait]
 pub trait RemoteManagementSnapshotSource: Send + Sync {
     async fn management_snapshot(
@@ -463,6 +496,7 @@ impl RemoteRouterState {
             agent_auth_contexts: None,
             scheduled_tasks: None,
             automation: None,
+            agent_install: None,
             management_snapshot: None,
             sidebar_organization: None,
             workbench: None,
@@ -484,6 +518,7 @@ impl RemoteRouterState {
             agent_auth_contexts: None,
             scheduled_tasks: None,
             automation: None,
+            agent_install: None,
             management_snapshot: None,
             sidebar_organization: None,
             workbench: None,
@@ -510,6 +545,7 @@ impl RemoteRouterState {
             agent_auth_contexts: None,
             scheduled_tasks: None,
             automation: None,
+            agent_install: None,
             management_snapshot: None,
             sidebar_organization: None,
             workbench: Some(workbench),
@@ -538,6 +574,7 @@ impl RemoteRouterState {
             agent_auth_contexts: None,
             scheduled_tasks: None,
             automation: None,
+            agent_install: None,
             management_snapshot: None,
             sidebar_organization: None,
             workbench: Some(workbench),
@@ -736,6 +773,11 @@ impl RemoteDispatcher {
     pub fn with_automation_source(mut self, source: Arc<dyn RemoteAutomationSource>) -> Self {
         self.state.automation = Some(source);
         self.state.capabilities.supports_automation = true;
+        self
+    }
+
+    pub fn with_agent_install_source(mut self, source: Arc<dyn RemoteAgentInstallSource>) -> Self {
+        self.state.agent_install = Some(source);
         self
     }
 
@@ -3323,6 +3365,138 @@ async fn dispatch_provider_request(
             serde_json::to_value(vibex_core::RemoteAgentUpdateConfigResponse { agent })
                 .map_err(remote_payload_encode_error)
         }
+        RemoteProviderRequest::RefreshAgentSnapshot(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = service.refresh_agent_snapshot(request.request)?;
+            serde_json::to_value(vibex_core::RemoteAgentRefreshAgentSnapshotResponse {
+                response: value,
+            })
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::ProbeAgentRuntimeOptions(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let result = remote_runtime_catalog(state)?
+                .probe_agent_runtime_options(request.request.agent_id)
+                .await?;
+            serde_json::to_value(vibex_core::RemoteAgentProbeRuntimeOptionsResponse { result })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::InstallManagedAgent(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth.clone(),
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let agent_id = request.agent_id.clone();
+            let source = agent_install_source(state)?;
+            let result = source.install_managed_agent(agent_id.clone()).await;
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "agent_install".to_string(),
+                "Managed Agent installed from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = result?;
+            serde_json::to_value(vibex_core::RemoteAgentInstallManagedAgentResponse {
+                state: value,
+            })
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::CheckManagedAgentUpdate(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth.clone(),
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let agent_id = request.agent_id.clone();
+            let source = agent_install_source(state)?;
+            let result = source.check_managed_agent_update(agent_id.clone()).await;
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "agent_update_check".to_string(),
+                "Managed Agent update checked from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = result?;
+            serde_json::to_value(vibex_core::RemoteAgentCheckManagedAgentUpdateResponse {
+                state: value,
+            })
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::UninstallManagedAgent(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth.clone(),
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let agent_id = request.agent_id.clone();
+            let source = agent_install_source(state)?;
+            let result = source.uninstall_managed_agent(agent_id.clone()).await;
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "agent_uninstall".to_string(),
+                "Managed Agent uninstalled from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = result?;
+            serde_json::to_value(vibex_core::RemoteAgentUninstallManagedAgentResponse {
+                state: value,
+            })
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::DeleteAgentAuthCatalog(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth.clone(),
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let agent_id = request.agent_id.clone();
+            let source = agent_install_source(state)?;
+            let result = source.delete_agent_auth_catalog(agent_id.clone()).await;
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "agent_auth_catalog_delete".to_string(),
+                "Agent auth catalog deleted from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            result?;
+            serde_json::to_value(vibex_core::RemoteAgentDeleteAgentAuthCatalogResponse {
+                deleted: true,
+            })
+            .map_err(remote_payload_encode_error)
+        }
         RemoteProviderRequest::ManagementSnapshot(request) => {
             authorize_provider_action(
                 runtime,
@@ -5110,6 +5284,17 @@ fn authorize_provider_action(
     Ok(auth)
 }
 
+fn agent_install_source(
+    state: &RemoteRouterState,
+) -> VibexResult<&Arc<dyn RemoteAgentInstallSource>> {
+    state.agent_install.as_ref().ok_or_else(|| {
+        VibexError::capability(
+            "remote_agent_install_unavailable",
+            "managed Agent installation is not available on this service",
+        )
+    })
+}
+
 fn open_migrated_database(path: &Path) -> VibexResult<DbConnection> {
     let mut conn = open_database(path)?;
     apply_migrations(&mut conn)?;
@@ -5689,6 +5874,7 @@ mod tests {
     struct TestRuntimeCatalogSource {
         catalog: SessionRuntimeOptionCatalog,
         calls: AtomicUsize,
+        probes: AtomicUsize,
     }
 
     use vibex_core::{
@@ -5788,6 +5974,7 @@ mod tests {
                     }],
                 },
                 calls: AtomicUsize::new(0),
+                probes: AtomicUsize::new(0),
             }
         }
     }
@@ -5896,6 +6083,17 @@ mod tests {
         async fn list_runtime_options(&self) -> VibexResult<SessionRuntimeOptionCatalog> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.catalog.clone())
+        }
+
+        async fn probe_agent_runtime_options(
+            &self,
+            agent_id: vibex_core::AgentId,
+        ) -> VibexResult<vibex_core::AgentRuntimeOptionProbeResult> {
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            Ok(vibex_core::AgentRuntimeOptionProbeResult {
+                probed_agent_ids: vec![agent_id],
+                ..Default::default()
+            })
         }
     }
 
@@ -7120,6 +7318,7 @@ mod tests {
                 scheduled_tasks: None,
                 automation: None,
                 management_snapshot: None,
+                agent_install: None,
                 sidebar_organization: None,
                 workbench: None,
                 provider: None,

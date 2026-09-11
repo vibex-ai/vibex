@@ -3,17 +3,18 @@ use std::sync::Arc;
 use vibex_core::{
     AcpProviderCatalogListResponse, AcpProviderConfig, AcpProviderProfileUpdateRequest,
     AgentAuthCatalog, AgentAuthContext, AgentCatalogListResponse, AgentId, AgentListRequest,
-    AgentListResponse, AgentModelProviderDisplayOrderListRequest,
+    AgentListResponse, AgentManagedInstallState, AgentModelProviderDisplayOrderListRequest,
     AgentModelProviderDisplayOrderListResponse, AgentModelProviderDisplayOrderSetRequest,
     AgentModelProviderDisplayOrderSetResponse, AgentModelProviderProfileCreateRequest,
     AgentModelProviderProfileDeleteRequest, AgentModelProviderProfileFetchModelsRequest,
     AgentModelProviderProfileFetchModelsResponse, AgentModelProviderProfileSecretValueResponse,
     AgentModelProviderProfileSecretValueUpdateRequest, AgentModelProviderProfileTestRequest,
-    AgentModelProviderProfileTestResult, AgentModelProviderProfileUpdateRequest, AgentSession,
-    AgentSessionRuntimeSelectionState, AgentSnapshotEntry, AgentUpdateConfigRequest,
-    AutomationGraph, AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest,
-    AutomationGraphId, AutomationGraphListRequest, AutomationGraphStatus,
-    AutomationGraphUpdateRequest, AutomationRun, AutomationRunCancelRequest,
+    AgentModelProviderProfileTestResult, AgentModelProviderProfileUpdateRequest,
+    AgentRefreshSnapshotRequest, AgentRefreshSnapshotResponse, AgentRuntimeOptionProbeRequest,
+    AgentRuntimeOptionProbeResult, AgentSession, AgentSessionRuntimeSelectionState,
+    AgentSnapshotEntry, AgentUpdateConfigRequest, AutomationGraph, AutomationGraphCreateRequest,
+    AutomationGraphDefinitionUpdateRequest, AutomationGraphId, AutomationGraphListRequest,
+    AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun, AutomationRunCancelRequest,
     AutomationRunListRequest, AutomationRunResumeRequest, AutomationRunStartRequest,
     AutomationRunStep, AutomationRunStepListRequest, CancelAgentSessionRuntimeSwitchRequest,
     ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest, FileMutationRequest,
@@ -197,6 +198,13 @@ impl AgentBackend for DisconnectedBackend {
     }
 
     fn list_runtime_options(&self) -> BackendFuture<'_, SessionRuntimeOptionCatalog> {
+        disconnected_future!()
+    }
+
+    fn probe_agent_runtime_options(
+        &self,
+        _request: MutationRequest<AgentRuntimeOptionProbeRequest>,
+    ) -> BackendFuture<'_, AgentRuntimeOptionProbeResult> {
         disconnected_future!()
     }
 
@@ -553,6 +561,41 @@ impl TerminalBackend for DisconnectedBackend {
 
 impl ManagementBackend for DisconnectedBackend {
     fn list_agents(&self, _request: AgentListRequest) -> BackendFuture<'_, AgentListResponse> {
+        disconnected_future!()
+    }
+
+    fn refresh_agent_snapshot(
+        &self,
+        _request: AgentRefreshSnapshotRequest,
+    ) -> BackendFuture<'_, AgentRefreshSnapshotResponse> {
+        disconnected_future!()
+    }
+
+    fn install_managed_agent(
+        &self,
+        _request: MutationRequest<AgentId>,
+    ) -> BackendFuture<'_, AgentManagedInstallState> {
+        disconnected_future!()
+    }
+
+    fn check_managed_agent_update(
+        &self,
+        _request: MutationRequest<AgentId>,
+    ) -> BackendFuture<'_, AgentManagedInstallState> {
+        disconnected_future!()
+    }
+
+    fn uninstall_managed_agent(
+        &self,
+        _request: MutationRequest<AgentId>,
+    ) -> BackendFuture<'_, AgentManagedInstallState> {
+        disconnected_future!()
+    }
+
+    fn delete_agent_auth_catalog(
+        &self,
+        _request: MutationRequest<AgentId>,
+    ) -> BackendFuture<'_, ()> {
         disconnected_future!()
     }
 

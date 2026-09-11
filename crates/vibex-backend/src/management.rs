@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use vibex_core::{
     AcpProviderCatalogListResponse, AcpProviderConfig, AcpProviderProfileUpdateRequest,
     AgentCatalogListResponse, AgentId, AgentListRequest, AgentListResponse,
-    AgentModelProviderBinding, AgentModelProviderBindingCreateRequest,
+    AgentManagedInstallState, AgentModelProviderBinding, AgentModelProviderBindingCreateRequest,
     AgentModelProviderBindingListRequest, AgentModelProviderBindingUpdateRequest,
     AgentModelProviderDisplayOrderListRequest, AgentModelProviderDisplayOrderListResponse,
     AgentModelProviderDisplayOrderSetRequest, AgentModelProviderDisplayOrderSetResponse,
@@ -13,12 +13,12 @@ use vibex_core::{
     AgentModelProviderProfileTestResult, AgentModelProviderProfileUpdateRequest,
     AgentProviderProjectionCapability, AgentProviderProjectionCapabilityRequest,
     AgentProviderProjectionPreview, AgentProviderProjectionPreviewRequest,
-    AgentRuntimeProbeCancelRequest, AgentRuntimeProbeListRequest, AgentRuntimeProbeRecord,
-    AgentRuntimeProbeStartRequest, AgentRuntimeProfile, AgentRuntimeProfileCreateRequest,
-    AgentRuntimeProfileUpdateRequest, AgentSnapshotEntry, AgentUpdateConfigRequest,
-    AutomationGraph, AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest,
-    AutomationGraphId, AutomationGraphListRequest, AutomationGraphStatus,
-    AutomationGraphUpdateRequest, AutomationRun, AutomationRunCancelRequest,
+    AgentRefreshSnapshotRequest, AgentRefreshSnapshotResponse, AgentRuntimeProbeCancelRequest,
+    AgentRuntimeProbeListRequest, AgentRuntimeProbeRecord, AgentRuntimeProbeStartRequest,
+    AgentRuntimeProfile, AgentRuntimeProfileCreateRequest, AgentRuntimeProfileUpdateRequest,
+    AgentSnapshotEntry, AgentUpdateConfigRequest, AutomationGraph, AutomationGraphCreateRequest,
+    AutomationGraphDefinitionUpdateRequest, AutomationGraphId, AutomationGraphListRequest,
+    AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun, AutomationRunCancelRequest,
     AutomationRunListRequest, AutomationRunResumeRequest, AutomationRunStartRequest,
     AutomationRunStep, AutomationRunStepListRequest, CustomAgentCreateRequest,
     CustomAgentDeleteRequest, Hook, HookCreateRequest, HookDeleteRequest, HookInstallPreview,
@@ -83,6 +83,31 @@ pub struct ManagementProfileSelectionRequest {
 
 pub trait ManagementBackend: BackendBound {
     fn list_agents(&self, request: AgentListRequest) -> BackendFuture<'_, AgentListResponse>;
+
+    /// Refreshes the authority's Agent snapshot for one Agent.
+    fn refresh_agent_snapshot(
+        &self,
+        request: AgentRefreshSnapshotRequest,
+    ) -> BackendFuture<'_, AgentRefreshSnapshotResponse>;
+
+    fn install_managed_agent(
+        &self,
+        request: MutationRequest<AgentId>,
+    ) -> BackendFuture<'_, AgentManagedInstallState>;
+
+    fn check_managed_agent_update(
+        &self,
+        request: MutationRequest<AgentId>,
+    ) -> BackendFuture<'_, AgentManagedInstallState>;
+
+    fn uninstall_managed_agent(
+        &self,
+        request: MutationRequest<AgentId>,
+    ) -> BackendFuture<'_, AgentManagedInstallState>;
+
+    /// Drops the persisted authentication catalog for an Agent.
+    fn delete_agent_auth_catalog(&self, request: MutationRequest<AgentId>)
+    -> BackendFuture<'_, ()>;
 
     fn update_agent_config(
         &self,

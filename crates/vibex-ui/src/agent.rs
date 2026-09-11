@@ -1462,7 +1462,8 @@ mod tests {
     use super::*;
     use vibex_backend::{BackendEventSubscription, MutationRequest};
     use vibex_core::{
-        AgentId, AgentMessagePayload, AgentSessionSafety, AgentSessionState, CorrelationId,
+        AgentId, AgentMessagePayload, AgentRuntimeOptionProbeRequest,
+        AgentRuntimeOptionProbeResult, AgentSessionSafety, AgentSessionState, CorrelationId,
         ElicitationAnswerValue, ElicitationField, ElicitationFieldKind, ElicitationOption,
         ElicitationRequest, ElicitationRequestStatus, ElicitationResolutionAction,
         PermissionActionDetail, PermissionRequest, PermissionResolution, PermissionResponseKind,
@@ -1648,6 +1649,13 @@ mod tests {
                     options: Vec::new(),
                 })
             })
+        }
+
+        fn probe_agent_runtime_options(
+            &self,
+            _request: MutationRequest<AgentRuntimeOptionProbeRequest>,
+        ) -> BackendFuture<'_, AgentRuntimeOptionProbeResult> {
+            Box::pin(async { Ok(AgentRuntimeOptionProbeResult::default()) })
         }
 
         fn runtime_selection(

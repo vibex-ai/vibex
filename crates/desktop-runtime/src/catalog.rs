@@ -962,6 +962,18 @@ impl RemoteRuntimeOptionCatalogSource for RuntimeOptionCatalogService {
     async fn list_runtime_options(&self) -> Result<SessionRuntimeOptionCatalog, VibexError> {
         self.list().await
     }
+
+    async fn probe_agent_runtime_options(
+        &self,
+        agent_id: vibex_core::AgentId,
+    ) -> Result<vibex_core::AgentRuntimeOptionProbeResult, VibexError> {
+        let result = self.probe_agent(&agent_id).await?;
+        Ok(vibex_core::AgentRuntimeOptionProbeResult {
+            probed_agent_ids: result.probed_agent_ids,
+            failed_agent_ids: result.failed_agent_ids,
+            cached_agent_ids: result.cached_agent_ids,
+        })
+    }
 }
 
 #[cfg(test)]

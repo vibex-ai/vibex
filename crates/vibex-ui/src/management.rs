@@ -1163,19 +1163,21 @@ mod tests {
 
     use vibex_core::{
         AcpProviderCatalogListResponse, AcpProviderConfig, AcpProviderProfileUpdateRequest,
-        AgentCatalogListResponse, AgentModelProviderDisplayOrderListRequest,
-        AgentModelProviderDisplayOrderListResponse, AgentModelProviderDisplayOrderSetRequest,
-        AgentModelProviderDisplayOrderSetResponse, AgentModelProviderProfileCreateRequest,
-        AgentModelProviderProfileDeleteRequest, AgentModelProviderProfileFetchModelsRequest,
-        AgentModelProviderProfileFetchModelsResponse, AgentModelProviderProfileSecretValueResponse,
+        AgentCatalogListResponse, AgentManagedInstallState,
+        AgentModelProviderDisplayOrderListRequest, AgentModelProviderDisplayOrderListResponse,
+        AgentModelProviderDisplayOrderSetRequest, AgentModelProviderDisplayOrderSetResponse,
+        AgentModelProviderProfileCreateRequest, AgentModelProviderProfileDeleteRequest,
+        AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
+        AgentModelProviderProfileSecretValueResponse,
         AgentModelProviderProfileSecretValueUpdateRequest, AgentModelProviderProfileTestRequest,
         AgentModelProviderProfileTestResult, AgentModelProviderProfileUpdateRequest,
-        AgentSnapshotEntry, AgentUpdateConfigRequest, AutomationGraph,
-        AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest, AutomationGraphId,
-        AutomationGraphListRequest, AutomationGraphStatus, AutomationGraphUpdateRequest,
-        AutomationRun, AutomationRunCancelRequest, AutomationRunListRequest,
-        AutomationRunResumeRequest, AutomationRunStartRequest, AutomationRunStep,
-        AutomationRunStepListRequest, ManagementSnapshotPayload, McpServer, McpServerAgentMatrix,
+        AgentRefreshSnapshotRequest, AgentRefreshSnapshotResponse, AgentSnapshotEntry,
+        AgentUpdateConfigRequest, AutomationGraph, AutomationGraphCreateRequest,
+        AutomationGraphDefinitionUpdateRequest, AutomationGraphId, AutomationGraphListRequest,
+        AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun,
+        AutomationRunCancelRequest, AutomationRunListRequest, AutomationRunResumeRequest,
+        AutomationRunStartRequest, AutomationRunStep, AutomationRunStepListRequest,
+        ManagementSnapshotPayload, McpServer, McpServerAgentMatrix,
         McpServerAgentMatrixListRequest, McpServerCreateRequest, McpServerDeleteRequest,
         McpServerDiscoverRequest, McpServerDiscoveryResponse, McpServerImportRequest,
         McpServerImportResult, McpServerSetAgentMatrixRequest, McpServerUpdateRequest,
@@ -1211,6 +1213,41 @@ mod tests {
             &self,
             _request: AgentListRequest,
         ) -> BackendFuture<'_, vibex_core::AgentListResponse> {
+            error_future()
+        }
+
+        fn refresh_agent_snapshot(
+            &self,
+            _request: AgentRefreshSnapshotRequest,
+        ) -> BackendFuture<'_, AgentRefreshSnapshotResponse> {
+            error_future()
+        }
+
+        fn install_managed_agent(
+            &self,
+            _request: MutationRequest<AgentId>,
+        ) -> BackendFuture<'_, AgentManagedInstallState> {
+            error_future()
+        }
+
+        fn check_managed_agent_update(
+            &self,
+            _request: MutationRequest<AgentId>,
+        ) -> BackendFuture<'_, AgentManagedInstallState> {
+            error_future()
+        }
+
+        fn uninstall_managed_agent(
+            &self,
+            _request: MutationRequest<AgentId>,
+        ) -> BackendFuture<'_, AgentManagedInstallState> {
+            error_future()
+        }
+
+        fn delete_agent_auth_catalog(
+            &self,
+            _request: MutationRequest<AgentId>,
+        ) -> BackendFuture<'_, ()> {
             error_future()
         }
 
