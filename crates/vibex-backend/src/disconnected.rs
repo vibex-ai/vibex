@@ -1,20 +1,26 @@
 use std::sync::Arc;
 
 use vibex_core::{
-    AgentListRequest, AgentListResponse, AgentSession, AgentSessionRuntimeSelectionState,
-    CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
-    FetchTimelineRequest, FileMutationRequest, FileReadRequest, FileReadResponse,
-    FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest, FileWriteRequest,
-    GitBranchListResponse, GitCommitDetail, GitCommitDetailRequest, GitCommitRequest,
-    GitCommitResult, GitDiffRequest, GitDiffResponse, GitHistoryRequest, GitHistoryResponse,
-    GitProjectEligibility, GitRemoteActionRequest, GitRemoteActionResult, GitStageRequest,
-    GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
-    GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeCreateRequest,
-    GitWorktreeCreateResult, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
-    GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
-    GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeReadinessRecord,
-    GitWorktreeReadinessRequest, GitWorktreeRestoreRequest, OpenWorkspaceRequest, ProjectId,
-    ProviderHealthSummary, ProviderProfileSummary, ProviderRunHealthProbesRequest,
+    AgentListRequest, AgentListResponse, AgentModelProviderDisplayOrderListRequest,
+    AgentModelProviderDisplayOrderListResponse, AgentModelProviderDisplayOrderSetRequest,
+    AgentModelProviderDisplayOrderSetResponse, AgentModelProviderProfileDeleteRequest,
+    AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
+    AgentModelProviderProfileTestRequest, AgentModelProviderProfileTestResult, AgentSession,
+    AgentSessionRuntimeSelectionState, CancelAgentSessionRuntimeSwitchRequest,
+    ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest, FileMutationRequest,
+    FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
+    FileTreeRequest, FileWriteRequest, GitBranchListResponse, GitCommitDetail,
+    GitCommitDetailRequest, GitCommitRequest, GitCommitResult, GitDiffRequest, GitDiffResponse,
+    GitHistoryRequest, GitHistoryResponse, GitProjectEligibility, GitRemoteActionRequest,
+    GitRemoteActionResult, GitStageRequest, GitStatusSummary, GitWorktreeArchiveRequest,
+    GitWorktreeAssistanceSessionRequest, GitWorktreeConflictResolveRequest,
+    GitWorktreeConflictStageRequest, GitWorktreeCreateRequest, GitWorktreeCreateResult,
+    GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
+    GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeOperationRecord,
+    GitWorktreeOperationRequest, GitWorktreeReadinessRecord, GitWorktreeReadinessRequest,
+    GitWorktreeRestoreRequest, OpenWorkspaceRequest, ProjectId, ProviderCapabilitySummary,
+    ProviderHealthSummary, ProviderProfileSummary, ProviderRunCapabilityProbesRequest,
+    ProviderRunCapabilityProbesResult, ProviderRunHealthProbesRequest,
     ProviderRunHealthProbesResult, RemoteAuditListRequest, RemoteAuditRecord,
     RemoteCancelPairingOfferRequest, RemoteCreatePairingCodeRequest,
     RemoteCreatePairingCodeResponse, RemoteCreatePairingOfferRequest,
@@ -655,6 +661,52 @@ impl ManagementBackend for DisconnectedBackend {
     }
 
     fn relay_status(&self) -> BackendFuture<'_, RelayStatusSummary> {
+        disconnected_future!()
+    }
+
+    fn delete_agent_model_provider_profile(
+        &self,
+        _request: MutationRequest<AgentModelProviderProfileDeleteRequest>,
+    ) -> BackendFuture<'_, ()> {
+        disconnected_future!()
+    }
+
+    fn agent_model_provider_display_order(
+        &self,
+        _request: AgentModelProviderDisplayOrderListRequest,
+    ) -> BackendFuture<'_, AgentModelProviderDisplayOrderListResponse> {
+        disconnected_future!()
+    }
+
+    fn set_agent_model_provider_display_order(
+        &self,
+        _request: MutationRequest<AgentModelProviderDisplayOrderSetRequest>,
+    ) -> BackendFuture<'_, AgentModelProviderDisplayOrderSetResponse> {
+        disconnected_future!()
+    }
+
+    fn test_agent_model_provider_profile(
+        &self,
+        _request: AgentModelProviderProfileTestRequest,
+    ) -> BackendFuture<'_, AgentModelProviderProfileTestResult> {
+        disconnected_future!()
+    }
+
+    fn fetch_agent_model_provider_profile_models(
+        &self,
+        _request: AgentModelProviderProfileFetchModelsRequest,
+    ) -> BackendFuture<'_, AgentModelProviderProfileFetchModelsResponse> {
+        disconnected_future!()
+    }
+
+    fn capability_summaries(&self) -> BackendFuture<'_, Vec<ProviderCapabilitySummary>> {
+        disconnected_future!()
+    }
+
+    fn run_capability_probes(
+        &self,
+        _request: MutationRequest<ProviderRunCapabilityProbesRequest>,
+    ) -> BackendFuture<'_, ProviderRunCapabilityProbesResult> {
         disconnected_future!()
     }
 }

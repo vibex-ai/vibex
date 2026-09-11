@@ -1873,6 +1873,132 @@ async fn dispatch_provider_request(
             serde_json::to_value(vibex_core::RemoteAgentModelProviderBindingResponse { binding })
                 .map_err(remote_payload_encode_error)
         }
+        RemoteProviderRequest::DeleteAgentModelProviderProfile(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let profile_id = request.request.provider_profile_id.clone();
+            let result = service.delete_agent_model_provider_profile(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                format!("agent_model_provider_profile:{profile_id}"),
+                "Agent model provider profile deleted from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            result?;
+            serde_json::to_value(vibex_core::RemoteAgentModelProviderProfileDeleteResponse {
+                deleted: true,
+            })
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::GetAgentModelProviderDisplayOrder(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let order = service.get_agent_model_provider_display_order(request.request)?;
+            serde_json::to_value(
+                vibex_core::RemoteAgentModelProviderDisplayOrderGetResponse { order },
+            )
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::SetAgentModelProviderDisplayOrder(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let agent_id = request.request.agent_id.clone();
+            let result = service.set_agent_model_provider_display_order(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                format!("agent_model_provider_display_order:{agent_id}"),
+                "Agent model provider display order updated from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let order = result?;
+            serde_json::to_value(
+                vibex_core::RemoteAgentModelProviderDisplayOrderSetResponse { order },
+            )
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::TestAgentModelProviderProfile(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let result = service.test_agent_model_provider_profile(request.request)?;
+            serde_json::to_value(vibex_core::RemoteAgentModelProviderProfileTestResponse { result })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::FetchAgentModelProviderProfileModels(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let response = service.fetch_agent_model_provider_profile_models(request.request)?;
+            serde_json::to_value(
+                vibex_core::RemoteAgentModelProviderProfileFetchModelsResponse { response },
+            )
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::ListCapabilitySummaries(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let summaries = service.list_capability_summaries()?;
+            serde_json::to_value(vibex_core::RemoteProviderCapabilitySummaryListResponse {
+                summaries,
+            })
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::RunCapabilityProbes(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = service.run_capability_probes(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "provider_capability_probe".to_string(),
+                "Provider capability probes run from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let result = result?;
+            serde_json::to_value(vibex_core::RemoteProviderRunCapabilityProbesResponse { result })
+                .map_err(remote_payload_encode_error)
+        }
         RemoteProviderRequest::MutateProviderCredentialSecret(request) => {
             let (proof, request) = request.into_request();
             let auth = authorize_provider_action(

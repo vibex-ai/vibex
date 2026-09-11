@@ -7,29 +7,34 @@ use vibex_core::{
     AgentAuthContextId, AgentAuthContextLogoutPreview, AgentAuthContextLogoutRequest,
     AgentAuthContextMutationResult, AgentAuthContextRefreshModelsRequest,
     AgentAuthContextVerifyRequest, AgentAuthenticationOperation, AgentAuthenticationOperationId,
-    AgentId, AgentListRequest, AgentListResponse, AgentSession, AgentSessionRuntimeSelectionState,
-    AgentUsageStatistics, AgentUsageStatisticsRequest, CancelAgentSessionRuntimeSwitchRequest,
-    ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest, FileMutationRequest,
-    FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
-    FileTreeRequest, FileWriteRequest, ForkAgentSessionRequest, GitBranchListResponse,
-    GitCommitDetail, GitCommitDetailRequest, GitCommitRequest, GitCommitResult, GitDiffRequest,
-    GitDiffResponse, GitHistoryRequest, GitHistoryResponse, GitProjectEligibility,
-    GitRemoteActionRequest, GitRemoteActionResult, GitStageRequest, GitStatusSummary,
-    GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
-    GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeCreateRequest,
-    GitWorktreeCreateResult, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
-    GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
-    GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeReadinessRecord,
-    GitWorktreeReadinessRequest, GitWorktreeRestoreRequest, OpenWorkspaceRequest, ProjectId,
-    ProviderHealthSummary, ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult,
-    RemoteAuditListRequest, RemoteAuditRecord, RemoteCreatePairingCodeRequest,
-    RemoteCreatePairingCodeResponse, RemoteCreatePairingOfferRequest,
-    RemoteCreatePairingOfferResponse, RemoteDeviceDetail, RemoteRevokeDeviceRequest,
-    RenameAgentSessionRequest, ReplaceUserMessagePayload, ResolveElicitationRequest,
-    ResolvePermissionRequest, SendAgentMessageRequest, SessionRuntimeOptionCatalog,
-    SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest, TerminalId, TerminalResizeRequest,
-    TerminalSession, TerminalSnapshot, TerminalStatus, TerminalWriteRequest, TimelineItem,
-    TimelinePage, VibexSessionId, WorkspaceId,
+    AgentId, AgentListRequest, AgentListResponse, AgentModelProviderDisplayOrderListRequest,
+    AgentModelProviderDisplayOrderListResponse, AgentModelProviderDisplayOrderSetRequest,
+    AgentModelProviderDisplayOrderSetResponse, AgentModelProviderProfileDeleteRequest,
+    AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
+    AgentModelProviderProfileTestRequest, AgentModelProviderProfileTestResult, AgentSession,
+    AgentSessionRuntimeSelectionState, AgentUsageStatistics, AgentUsageStatisticsRequest,
+    CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
+    FetchTimelineRequest, FileMutationRequest, FileReadRequest, FileReadResponse,
+    FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest, FileWriteRequest,
+    ForkAgentSessionRequest, GitBranchListResponse, GitCommitDetail, GitCommitDetailRequest,
+    GitCommitRequest, GitCommitResult, GitDiffRequest, GitDiffResponse, GitHistoryRequest,
+    GitHistoryResponse, GitProjectEligibility, GitRemoteActionRequest, GitRemoteActionResult,
+    GitStageRequest, GitStatusSummary, GitWorktreeArchiveRequest,
+    GitWorktreeAssistanceSessionRequest, GitWorktreeConflictResolveRequest,
+    GitWorktreeConflictStageRequest, GitWorktreeCreateRequest, GitWorktreeCreateResult,
+    GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
+    GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeOperationRecord,
+    GitWorktreeOperationRequest, GitWorktreeReadinessRecord, GitWorktreeReadinessRequest,
+    GitWorktreeRestoreRequest, OpenWorkspaceRequest, ProjectId, ProviderCapabilitySummary,
+    ProviderHealthSummary, ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
+    ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, RemoteAuditListRequest,
+    RemoteAuditRecord, RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
+    RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeviceDetail,
+    RemoteRevokeDeviceRequest, RenameAgentSessionRequest, ReplaceUserMessagePayload,
+    ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest,
+    SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest,
+    TerminalId, TerminalResizeRequest, TerminalSession, TerminalSnapshot, TerminalStatus,
+    TerminalWriteRequest, TimelineItem, TimelinePage, VibexSessionId, WorkspaceId,
 };
 use vibex_desktop_runtime::{
     AuthoritativeRefetch, DesktopEvent, DesktopEventReceiver, DesktopEventStream, DesktopRuntime,
@@ -1742,6 +1747,118 @@ impl ManagementBackend for NativeBackend {
                 .providers()
                 .management()
                 .run_health_probes(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn delete_agent_model_provider_profile(
+        &self,
+        request: MutationRequest<AgentModelProviderProfileDeleteRequest>,
+    ) -> BackendFuture<'_, ()> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .delete_agent_model_provider_profile(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn agent_model_provider_display_order(
+        &self,
+        request: AgentModelProviderDisplayOrderListRequest,
+    ) -> BackendFuture<'_, AgentModelProviderDisplayOrderListResponse> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .get_agent_model_provider_display_order(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn set_agent_model_provider_display_order(
+        &self,
+        request: MutationRequest<AgentModelProviderDisplayOrderSetRequest>,
+    ) -> BackendFuture<'_, AgentModelProviderDisplayOrderSetResponse> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .set_agent_model_provider_display_order(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn test_agent_model_provider_profile(
+        &self,
+        request: AgentModelProviderProfileTestRequest,
+    ) -> BackendFuture<'_, AgentModelProviderProfileTestResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .test_agent_model_provider_profile(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn fetch_agent_model_provider_profile_models(
+        &self,
+        request: AgentModelProviderProfileFetchModelsRequest,
+    ) -> BackendFuture<'_, AgentModelProviderProfileFetchModelsResponse> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .fetch_agent_model_provider_profile_models(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn capability_summaries(&self) -> BackendFuture<'_, Vec<ProviderCapabilitySummary>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .list_capability_summaries()
+                .map_err(Into::into)
+        })
+    }
+
+    fn run_capability_probes(
+        &self,
+        request: MutationRequest<ProviderRunCapabilityProbesRequest>,
+    ) -> BackendFuture<'_, ProviderRunCapabilityProbesResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .run_capability_probes(request.payload)
                 .map_err(Into::into)
         })
     }

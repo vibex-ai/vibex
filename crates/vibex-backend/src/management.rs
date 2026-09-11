@@ -2,16 +2,21 @@ use serde::{Deserialize, Serialize};
 use vibex_core::{
     AgentId, AgentListRequest, AgentListResponse, AgentModelProviderBinding,
     AgentModelProviderBindingCreateRequest, AgentModelProviderBindingListRequest,
-    AgentModelProviderBindingUpdateRequest, AgentProviderProjectionCapability,
-    AgentProviderProjectionCapabilityRequest, AgentProviderProjectionPreview,
-    AgentProviderProjectionPreviewRequest, AgentRuntimeProbeCancelRequest,
-    AgentRuntimeProbeListRequest, AgentRuntimeProbeRecord, AgentRuntimeProbeStartRequest,
-    AgentRuntimeProfile, AgentRuntimeProfileCreateRequest, AgentRuntimeProfileUpdateRequest,
-    AgentSnapshotEntry, CustomAgentCreateRequest, CustomAgentDeleteRequest, ModelProviderProfile,
-    ModelProviderProfileCreateRequest, ModelProviderProfileUpdateRequest,
+    AgentModelProviderBindingUpdateRequest, AgentModelProviderDisplayOrderListRequest,
+    AgentModelProviderDisplayOrderListResponse, AgentModelProviderDisplayOrderSetRequest,
+    AgentModelProviderDisplayOrderSetResponse, AgentModelProviderProfileDeleteRequest,
+    AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
+    AgentModelProviderProfileTestRequest, AgentModelProviderProfileTestResult,
+    AgentProviderProjectionCapability, AgentProviderProjectionCapabilityRequest,
+    AgentProviderProjectionPreview, AgentProviderProjectionPreviewRequest,
+    AgentRuntimeProbeCancelRequest, AgentRuntimeProbeListRequest, AgentRuntimeProbeRecord,
+    AgentRuntimeProbeStartRequest, AgentRuntimeProfile, AgentRuntimeProfileCreateRequest,
+    AgentRuntimeProfileUpdateRequest, AgentSnapshotEntry, CustomAgentCreateRequest,
+    CustomAgentDeleteRequest, ModelProviderProfile, ModelProviderProfileCreateRequest,
+    ModelProviderProfileUpdateRequest, ProviderCapabilitySummary,
     ProviderCredentialSecretMutationRequest, ProviderHealthSummary, ProviderProfileId,
-    ProviderProfileSummary, ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult,
-    RelayPeerId, RelayRoomId,
+    ProviderProfileSummary, ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
+    ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, RelayPeerId, RelayRoomId,
 };
 
 use crate::{BackendBound, BackendFuture, MutationRequest};
@@ -152,4 +157,39 @@ pub trait ManagementBackend: BackendBound {
     ) -> BackendFuture<'_, ProviderRunHealthProbesResult>;
 
     fn relay_status(&self) -> BackendFuture<'_, RelayStatusSummary>;
+
+    /// Deletes a per-Agent model provider profile.
+    fn delete_agent_model_provider_profile(
+        &self,
+        request: MutationRequest<AgentModelProviderProfileDeleteRequest>,
+    ) -> BackendFuture<'_, ()>;
+
+    fn agent_model_provider_display_order(
+        &self,
+        request: AgentModelProviderDisplayOrderListRequest,
+    ) -> BackendFuture<'_, AgentModelProviderDisplayOrderListResponse>;
+
+    fn set_agent_model_provider_display_order(
+        &self,
+        request: MutationRequest<AgentModelProviderDisplayOrderSetRequest>,
+    ) -> BackendFuture<'_, AgentModelProviderDisplayOrderSetResponse>;
+
+    /// Probes a provider profile's live endpoint without persisting anything.
+    fn test_agent_model_provider_profile(
+        &self,
+        request: AgentModelProviderProfileTestRequest,
+    ) -> BackendFuture<'_, AgentModelProviderProfileTestResult>;
+
+    /// Fetches the model catalogue a provider profile exposes.
+    fn fetch_agent_model_provider_profile_models(
+        &self,
+        request: AgentModelProviderProfileFetchModelsRequest,
+    ) -> BackendFuture<'_, AgentModelProviderProfileFetchModelsResponse>;
+
+    fn capability_summaries(&self) -> BackendFuture<'_, Vec<ProviderCapabilitySummary>>;
+
+    fn run_capability_probes(
+        &self,
+        request: MutationRequest<ProviderRunCapabilityProbesRequest>,
+    ) -> BackendFuture<'_, ProviderRunCapabilityProbesResult>;
 }

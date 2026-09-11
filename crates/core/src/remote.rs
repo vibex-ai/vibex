@@ -39,10 +39,10 @@ use crate::ids::{
     RuntimeProcessId, TerminalId, VibexSessionId,
 };
 use crate::provider::{
-    ProviderFailoverRecommendation, ProviderFailoverRecommendationRequest, ProviderHealthSummary,
-    ProviderInjectionPreview, ProviderInjectionPreviewRequest, ProviderProfileSummary,
-    ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, ProviderUsageListRequest,
-    ProviderUsageSummary,
+    ProviderCapabilitySummary, ProviderFailoverRecommendation,
+    ProviderFailoverRecommendationRequest, ProviderHealthSummary, ProviderInjectionPreview,
+    ProviderInjectionPreviewRequest, ProviderProfileSummary, ProviderRunHealthProbesRequest,
+    ProviderRunHealthProbesResult, ProviderUsageListRequest, ProviderUsageSummary,
 };
 use crate::provider_projection::{
     AgentProviderProjectionCapability, AgentProviderProjectionCapabilityRequest,
@@ -1574,6 +1574,13 @@ pub enum RemoteProviderOperationKind {
     UpdateAgentModelProviderBinding,
     MutateProviderCredentialSecret,
     SetAgentModelProviderDefault,
+    DeleteAgentModelProviderProfile,
+    GetAgentModelProviderDisplayOrder,
+    SetAgentModelProviderDisplayOrder,
+    TestAgentModelProviderProfile,
+    FetchAgentModelProviderProfileModels,
+    ListCapabilitySummaries,
+    RunCapabilityProbes,
 }
 
 /// Redacted Agent configuration state for remote management surfaces. Command
@@ -2006,6 +2013,96 @@ pub struct RemoteAgentModelProviderDefaultRequest {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RemoteAgentModelProviderProfileDeleteRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::AgentModelProviderProfileDeleteRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentModelProviderDisplayOrderGetRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::AgentModelProviderDisplayOrderListRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentModelProviderDisplayOrderSetRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::AgentModelProviderDisplayOrderSetRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentModelProviderProfileTestRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::AgentModelProviderProfileTestRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentModelProviderProfileFetchModelsRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::AgentModelProviderProfileFetchModelsRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderCapabilitySummaryListRequest {
+    pub auth: RemoteAuthProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderCapabilitySummaryListResponse {
+    pub summaries: Vec<ProviderCapabilitySummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderRunCapabilityProbesRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::ProviderRunCapabilityProbesRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderRunCapabilityProbesResponse {
+    pub result: crate::ProviderRunCapabilityProbesResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentModelProviderProfileDeleteResponse {
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentModelProviderDisplayOrderGetResponse {
+    pub order: crate::AgentModelProviderDisplayOrderListResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentModelProviderDisplayOrderSetResponse {
+    pub order: crate::AgentModelProviderDisplayOrderSetResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentModelProviderProfileTestResponse {
+    pub result: crate::AgentModelProviderProfileTestResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentModelProviderProfileFetchModelsResponse {
+    pub response: crate::AgentModelProviderProfileFetchModelsResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RemoteAgentModelProviderDefaultResponse {
     pub selection: crate::AgentModelProviderDefaultSelection,
 }
@@ -2040,6 +2137,13 @@ pub enum RemoteProviderRequest {
     UpdateAgentModelProviderBinding(RemoteAgentModelProviderBindingUpdateRequest),
     MutateProviderCredentialSecret(RemoteProviderCredentialSecretMutationRequest),
     SetAgentModelProviderDefault(RemoteAgentModelProviderDefaultRequest),
+    DeleteAgentModelProviderProfile(RemoteAgentModelProviderProfileDeleteRequest),
+    GetAgentModelProviderDisplayOrder(RemoteAgentModelProviderDisplayOrderGetRequest),
+    SetAgentModelProviderDisplayOrder(RemoteAgentModelProviderDisplayOrderSetRequest),
+    TestAgentModelProviderProfile(RemoteAgentModelProviderProfileTestRequest),
+    FetchAgentModelProviderProfileModels(RemoteAgentModelProviderProfileFetchModelsRequest),
+    ListCapabilitySummaries(RemoteProviderCapabilitySummaryListRequest),
+    RunCapabilityProbes(RemoteProviderRunCapabilityProbesRequest),
 }
 
 impl RemoteProviderRequest {
@@ -2117,6 +2221,25 @@ impl RemoteProviderRequest {
             Self::SetAgentModelProviderDefault(_) => {
                 RemoteProviderOperationKind::SetAgentModelProviderDefault
             }
+            Self::DeleteAgentModelProviderProfile(_) => {
+                RemoteProviderOperationKind::DeleteAgentModelProviderProfile
+            }
+            Self::GetAgentModelProviderDisplayOrder(_) => {
+                RemoteProviderOperationKind::GetAgentModelProviderDisplayOrder
+            }
+            Self::SetAgentModelProviderDisplayOrder(_) => {
+                RemoteProviderOperationKind::SetAgentModelProviderDisplayOrder
+            }
+            Self::TestAgentModelProviderProfile(_) => {
+                RemoteProviderOperationKind::TestAgentModelProviderProfile
+            }
+            Self::FetchAgentModelProviderProfileModels(_) => {
+                RemoteProviderOperationKind::FetchAgentModelProviderProfileModels
+            }
+            Self::ListCapabilitySummaries(_) => {
+                RemoteProviderOperationKind::ListCapabilitySummaries
+            }
+            Self::RunCapabilityProbes(_) => RemoteProviderOperationKind::RunCapabilityProbes,
         }
     }
 }

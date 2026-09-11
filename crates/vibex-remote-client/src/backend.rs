@@ -3152,6 +3152,185 @@ impl ManagementBackend for WebRemoteBackend {
         })
     }
 
+    fn delete_agent_model_provider_profile(
+        &self,
+        request: MutationRequest<vibex_core::AgentModelProviderProfileDeleteRequest>,
+    ) -> BackendFuture<'_, ()> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::DeleteAgentModelProviderProfile(
+                vibex_core::RemoteAgentModelProviderProfileDeleteRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            this.rpc(
+                RemoteOperationKind::ProviderSettings,
+                payload,
+                Some(request.request_id),
+                Some((&key, request.expected_revision.as_deref(), None)),
+                vibex_core::RemoteTimeoutClass::Standard,
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn agent_model_provider_display_order(
+        &self,
+        request: vibex_core::AgentModelProviderDisplayOrderListRequest,
+    ) -> BackendFuture<'_, vibex_core::AgentModelProviderDisplayOrderListResponse> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::GetAgentModelProviderDisplayOrder(
+                vibex_core::RemoteAgentModelProviderDisplayOrderGetRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentModelProviderDisplayOrderGetResponse>(value)?.order)
+        })
+    }
+
+    fn set_agent_model_provider_display_order(
+        &self,
+        request: MutationRequest<vibex_core::AgentModelProviderDisplayOrderSetRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentModelProviderDisplayOrderSetResponse> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::SetAgentModelProviderDisplayOrder(
+                vibex_core::RemoteAgentModelProviderDisplayOrderSetRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentModelProviderDisplayOrderSetResponse>(value)?.order)
+        })
+    }
+
+    fn test_agent_model_provider_profile(
+        &self,
+        request: vibex_core::AgentModelProviderProfileTestRequest,
+    ) -> BackendFuture<'_, vibex_core::AgentModelProviderProfileTestResult> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::TestAgentModelProviderProfile(
+                vibex_core::RemoteAgentModelProviderProfileTestRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentModelProviderProfileTestResponse>(value)?.result)
+        })
+    }
+
+    fn fetch_agent_model_provider_profile_models(
+        &self,
+        request: vibex_core::AgentModelProviderProfileFetchModelsRequest,
+    ) -> BackendFuture<'_, vibex_core::AgentModelProviderProfileFetchModelsResponse> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::FetchAgentModelProviderProfileModels(
+                vibex_core::RemoteAgentModelProviderProfileFetchModelsRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(
+                decode::<vibex_core::RemoteAgentModelProviderProfileFetchModelsResponse>(value)?
+                    .response,
+            )
+        })
+    }
+
+    fn capability_summaries(
+        &self,
+    ) -> BackendFuture<'_, Vec<vibex_core::ProviderCapabilitySummary>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::ListCapabilitySummaries(
+                vibex_core::RemoteProviderCapabilitySummaryListRequest { auth: this.auth() },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderCapabilitySummaryListResponse>(value)?.summaries)
+        })
+    }
+
+    fn run_capability_probes(
+        &self,
+        request: MutationRequest<vibex_core::ProviderRunCapabilityProbesRequest>,
+    ) -> BackendFuture<'_, vibex_core::ProviderRunCapabilityProbesResult> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::RunCapabilityProbes(
+                vibex_core::RemoteProviderRunCapabilityProbesRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderRunCapabilityProbesResponse>(value)?.result)
+        })
+    }
+
     fn relay_status(&self) -> BackendFuture<'_, RelayStatusSummary> {
         self.unsupported(
             "remote_relay_status_unavailable",
@@ -3565,6 +3744,30 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
                 ),
                 (
                     BackendOperation::ManagementProviderSecretMutate,
+                    has_provider_management && permits(RemoteActionClass::MutateProviderSettings),
+                ),
+                (
+                    BackendOperation::ManagementProviderDisplayOrderRead,
+                    permits(RemoteActionClass::ReadProviderSettings),
+                ),
+                (
+                    BackendOperation::ManagementProviderDisplayOrderMutate,
+                    has_provider_management && permits(RemoteActionClass::MutateProviderSettings),
+                ),
+                (
+                    BackendOperation::ManagementProviderProfileTest,
+                    permits(RemoteActionClass::ReadProviderSettings),
+                ),
+                (
+                    BackendOperation::ManagementProviderModelFetch,
+                    permits(RemoteActionClass::ReadProviderSettings),
+                ),
+                (
+                    BackendOperation::ManagementCapabilityRead,
+                    permits(RemoteActionClass::ReadProviderSettings),
+                ),
+                (
+                    BackendOperation::ManagementCapabilityProbe,
                     has_provider_management && permits(RemoteActionClass::MutateProviderSettings),
                 ),
                 (

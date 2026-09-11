@@ -1161,6 +1161,15 @@ mod tests {
         AgentId, ProviderKind, ProviderProfileId, ProviderProfileStatus, ProviderSecretSetupState,
     };
 
+    use vibex_core::{
+        AgentModelProviderDisplayOrderListRequest, AgentModelProviderDisplayOrderListResponse,
+        AgentModelProviderDisplayOrderSetRequest, AgentModelProviderDisplayOrderSetResponse,
+        AgentModelProviderProfileDeleteRequest, AgentModelProviderProfileFetchModelsRequest,
+        AgentModelProviderProfileFetchModelsResponse, AgentModelProviderProfileTestRequest,
+        AgentModelProviderProfileTestResult, ProviderCapabilitySummary,
+        ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
+    };
+
     fn error_future<T: 'static>() -> BackendFuture<'static, T> {
         Box::pin(async { Err(BackendError::unsupported("mock", "unused mock operation")) })
     }
@@ -1355,6 +1364,52 @@ mod tests {
         }
 
         fn relay_status(&self) -> BackendFuture<'_, RelayStatusSummary> {
+            error_future()
+        }
+
+        fn delete_agent_model_provider_profile(
+            &self,
+            _request: MutationRequest<AgentModelProviderProfileDeleteRequest>,
+        ) -> BackendFuture<'_, ()> {
+            error_future()
+        }
+
+        fn agent_model_provider_display_order(
+            &self,
+            _request: AgentModelProviderDisplayOrderListRequest,
+        ) -> BackendFuture<'_, AgentModelProviderDisplayOrderListResponse> {
+            error_future()
+        }
+
+        fn set_agent_model_provider_display_order(
+            &self,
+            _request: MutationRequest<AgentModelProviderDisplayOrderSetRequest>,
+        ) -> BackendFuture<'_, AgentModelProviderDisplayOrderSetResponse> {
+            error_future()
+        }
+
+        fn test_agent_model_provider_profile(
+            &self,
+            _request: AgentModelProviderProfileTestRequest,
+        ) -> BackendFuture<'_, AgentModelProviderProfileTestResult> {
+            error_future()
+        }
+
+        fn fetch_agent_model_provider_profile_models(
+            &self,
+            _request: AgentModelProviderProfileFetchModelsRequest,
+        ) -> BackendFuture<'_, AgentModelProviderProfileFetchModelsResponse> {
+            error_future()
+        }
+
+        fn capability_summaries(&self) -> BackendFuture<'_, Vec<ProviderCapabilitySummary>> {
+            error_future()
+        }
+
+        fn run_capability_probes(
+            &self,
+            _request: MutationRequest<ProviderRunCapabilityProbesRequest>,
+        ) -> BackendFuture<'_, ProviderRunCapabilityProbesResult> {
             error_future()
         }
     }
