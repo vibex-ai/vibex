@@ -44,7 +44,8 @@ use vibex_core::{
     RemoteAuditListRequest, RemoteAuditRecord, RemoteCancelPairingOfferRequest,
     RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
     RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeviceDetail,
-    RemotePairingOfferSummary, RemoteRevokeDeviceRequest, RenameAgentSessionRequest,
+    RemotePairingOfferSummary, RemoteProviderManagementSnapshot,
+    RemoteProviderManagementSnapshotRequest, RemoteRevokeDeviceRequest, RenameAgentSessionRequest,
     ReplaceUserMessagePayload, ResolveElicitationRequest, ResolvePermissionRequest,
     ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
     ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord, ScheduledTaskCreateRequest,
@@ -1010,6 +1011,13 @@ impl ManagementBackend for DisconnectedBackend {
         &self,
         _request: ProviderUsageListRequest,
     ) -> BackendFuture<'_, Vec<ProviderUsageSummary>> {
+        disconnected_future!()
+    }
+
+    fn management_snapshot(
+        &self,
+        _request: RemoteProviderManagementSnapshotRequest,
+    ) -> BackendFuture<'_, RemoteProviderManagementSnapshot> {
         disconnected_future!()
     }
 

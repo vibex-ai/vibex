@@ -50,6 +50,7 @@ use vibex_core::{
     ProviderUsageSummary, RemoteAuditListRequest, RemoteAuditRecord,
     RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
     RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeviceDetail,
+    RemoteProviderManagementSnapshot, RemoteProviderManagementSnapshotRequest,
     RemoteRevokeDeviceRequest, RenameAgentSessionRequest, ReplaceUserMessagePayload,
     ResolveElicitationRequest, ResolvePermissionRequest, ScheduledTaskAttentionListRequest,
     ScheduledTaskAttentionSummary, ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord,
@@ -2827,6 +2828,23 @@ impl ManagementBackend for NativeBackend {
                 .management()
                 .list_usage_summaries(request)
                 .map_err(Into::into)
+        })
+    }
+
+    fn management_snapshot(
+        &self,
+        request: RemoteProviderManagementSnapshotRequest,
+    ) -> BackendFuture<'_, RemoteProviderManagementSnapshot> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            vibex_desktop_runtime::assemble_management_snapshot(
+                &runtime.management(),
+                request.default_scope,
+                request.refresh_agent_versions,
+            )
+            .await
+            .map_err(Into::into)
         })
     }
 

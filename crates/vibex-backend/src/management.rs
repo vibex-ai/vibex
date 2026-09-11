@@ -36,7 +36,8 @@ use vibex_core::{
     ProviderProfileId, ProviderProfileSummary, ProviderRunCapabilityProbesRequest,
     ProviderRunCapabilityProbesResult, ProviderRunHealthProbesRequest,
     ProviderRunHealthProbesResult, ProviderUsageListRequest, ProviderUsageSummary, RelayPeerId,
-    RelayRoomId, ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
+    RelayRoomId, RemoteProviderManagementSnapshot, RemoteProviderManagementSnapshotRequest,
+    ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
     ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord, ScheduledTaskCreateRequest,
     ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun, ScheduledTaskRunListRequest,
     ScheduledTaskUpdateRequest, Skill, SkillAgentMatrix, SkillAgentMatrixListRequest,
@@ -218,6 +219,11 @@ pub trait ManagementBackend: BackendBound {
         &self,
         request: ProviderUsageListRequest,
     ) -> BackendFuture<'_, Vec<ProviderUsageSummary>>;
+
+    fn management_snapshot(
+        &self,
+        request: RemoteProviderManagementSnapshotRequest,
+    ) -> BackendFuture<'_, RemoteProviderManagementSnapshot>;
 
     fn run_capability_probes(
         &self,

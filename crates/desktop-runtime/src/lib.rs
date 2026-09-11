@@ -905,6 +905,311 @@ impl GitHandle {
     }
 }
 
+/// Assembles the Config Center read bundle from the authority's own handles.
+///
+/// This mirrors what the desktop Config Center computes locally, but produces
+/// the raw inputs in one place so a paired client fetches them in a single
+/// round trip instead of two dozen. Both the local backend adapter and the
+/// gateway source call it, so a local and a remote authority return byte-equal
+/// bundles.
+pub async fn assemble_management_snapshot(
+    management: &ManagementHandle,
+    default_scope: vibex_core::ProviderProfileDefaultScope,
+    refresh_agent_versions: bool,
+) -> VibexResult<vibex_core::RemoteProviderManagementSnapshot> {
+    let provider = management.providers().management();
+
+    // Config Center refresh is the explicit, bounded slow path for installed
+    // versioned Agent CLIs. Ordinary Agent catalog reads remain process-free.
+    if refresh_agent_versions {
+        provider.refresh_detected_agent_versions()?;
+    }
+
+    let agents = provider
+        .list_agents(vibex_core::AgentListRequest {
+            include_disabled: true,
+        })?
+        .agents
+        .into_iter()
+        .filter(|agent| {
+            agent.source_kind == vibex_core::AgentSourceKind::Custom
+                || vibex_core::is_user_visible_agent(&agent.id)
+        })
+        .collect::<Vec<_>>();
+
+    let mut catalog = provider.list_agent_catalog()?;
+    catalog
+        .agents
+        .retain(|agent| vibex_core::is_user_visible_agent(&agent.id));
+
+    let profiles = provider.list_profiles()?;
+    let native_import_preview = provider
+        .preview_native_import(vibex_core::ProviderNativeImportPreviewRequest {
+            sources: vec![
+                vibex_core::ProviderNativeImportSource::Codex,
+                vibex_core::ProviderNativeImportSource::Claude,
+                vibex_core::ProviderNativeImportSource::CcSwitch,
+            ],
+        })
+        .ok();
+
+    let mut acp_configs = Vec::new();
+    for profile in profiles
+        .iter()
+        .filter(|profile| profile.kind == vibex_core::ProviderKind::Acp)
+    {
+        if let Ok(config) = provider.get_acp_profile_config(profile.id.clone()) {
+            acp_configs.push(vibex_core::RemoteAcpProfileConfigEntry {
+                provider_profile_id: profile.id.clone(),
+                config,
+            });
+        }
+    }
+
+    let mut agent_details = Vec::new();
+    for agent in agents.iter().filter(|agent| agent.added) {
+        let response = provider.list_agent_model_provider_profiles(
+            vibex_core::AgentModelProviderProfileListRequest {
+                agent_id: agent.id.clone(),
+                include_disabled: true,
+            },
+        )?;
+        let scoped_default = provider.get_agent_model_provider_default(
+            vibex_core::AgentModelProviderDefaultRequest {
+                scope: default_scope.clone(),
+                agent_id: agent.id.clone(),
+            },
+        )?;
+        let runtime_profiles = provider.list_agent_runtime_profiles(&agent.id)?;
+        let bindings = provider.list_agent_model_provider_bindings(
+            vibex_core::AgentModelProviderBindingListRequest {
+                agent_id: Some(agent.id.clone()),
+                model_provider_profile_id: None,
+            },
+        )?;
+
+        let mut projections = Vec::new();
+        for runtime_profile in &runtime_profiles {
+            let runtime_bindings = bindings
+                .iter()
+                .filter(|binding| binding.runtime_profile_id == runtime_profile.id)
+                .collect::<Vec<_>>();
+            if runtime_bindings.is_empty() {
+                if let Ok(capability) = provider.agent_provider_projection_capability(
+                    vibex_core::AgentProviderProjectionCapabilityRequest {
+                        runtime_profile_id: runtime_profile.id.clone(),
+                        binding_id: None,
+                    },
+                ) {
+                    projections.push(vibex_core::RemoteAgentProjectionEntry {
+                        runtime_profile_id: runtime_profile.id.clone(),
+                        binding_id: None,
+                        capability,
+                        preview: None,
+                    });
+                }
+                continue;
+            }
+            for binding in runtime_bindings {
+                let Ok(capability) = provider.agent_provider_projection_capability(
+                    vibex_core::AgentProviderProjectionCapabilityRequest {
+                        runtime_profile_id: runtime_profile.id.clone(),
+                        binding_id: Some(binding.id.clone()),
+                    },
+                ) else {
+                    continue;
+                };
+                let preview = provider
+                    .preview_agent_provider_projection(
+                        vibex_core::AgentProviderProjectionPreviewRequest {
+                            binding_id: binding.id.clone(),
+                            workspace_key: projection_workspace_key(&default_scope),
+                        },
+                    )
+                    .ok();
+                projections.push(vibex_core::RemoteAgentProjectionEntry {
+                    runtime_profile_id: runtime_profile.id.clone(),
+                    binding_id: Some(binding.id.clone()),
+                    capability,
+                    preview,
+                });
+            }
+        }
+
+        agent_details.push(vibex_core::RemoteManagementAgentDetail {
+            agent_id: agent.id.clone(),
+            profiles: response.profiles,
+            default_profile_id: scoped_default.provider_profile_id.clone(),
+            runtime_profiles,
+            bindings,
+            projections,
+        });
+    }
+
+    let mcp_servers = provider.list_mcp_servers()?;
+    let skills = provider.list_skills()?;
+    let prompts = provider.list_prompts()?;
+    let hooks = provider.list_hooks()?;
+    let health_summaries = provider.list_health_summaries()?;
+    let capability_summaries = provider.list_capability_summaries()?;
+    let usage_summaries = provider.list_usage_summaries(vibex_core::ProviderUsageListRequest {
+        provider_profile_ids: None,
+        include_empty: true,
+    })?;
+    let native_exports =
+        provider.list_native_exports(vibex_core::ProviderNativeExportListRequest {
+            provider_profile_id: None,
+            limit: Some(50),
+        })?;
+
+    let scheduled = management
+        .scheduled()
+        .list(vibex_core::ScheduledTaskListRequest {
+            workspace_id: None,
+            status: None,
+            include_deleted: false,
+            limit: Some(100),
+        })?;
+    let scheduled_runs =
+        management
+            .scheduled()
+            .list_runs(vibex_core::ScheduledTaskRunListRequest {
+                task_id: None,
+                session_id: None,
+                status: None,
+                limit: Some(100),
+            })?;
+    let scheduled_attention =
+        management
+            .scheduled()
+            .list_attention(vibex_core::ScheduledTaskAttentionListRequest {
+                workspace_id: None,
+                limit: Some(100),
+            })?;
+    let scheduled_audit =
+        management
+            .scheduled()
+            .list_audit(vibex_core::ScheduledTaskAuditListRequest {
+                workspace_id: None,
+                status: None,
+                limit: Some(100),
+            })?;
+
+    let automation_graphs =
+        management
+            .automation()
+            .list(vibex_core::AutomationGraphListRequest {
+                workspace_id: None,
+                status: None,
+                include_deleted: false,
+                limit: Some(100),
+            })?;
+    let selected_graph_id = automation_graphs.first().map(|graph| graph.id.clone());
+    let automation_runs =
+        management
+            .automation()
+            .list_runs(vibex_core::AutomationRunListRequest {
+                graph_id: selected_graph_id,
+                status: None,
+                limit: Some(100),
+            })?;
+    let automation_steps =
+        management
+            .automation()
+            .list_steps(vibex_core::AutomationRunStepListRequest {
+                run_id: None,
+                node_id: None,
+                status: None,
+                limit: Some(500),
+            })?;
+
+    let devices = management.remote().list_devices()?;
+    let audit_count = management
+        .remote()
+        .list_audit(vibex_core::RemoteAuditListRequest {
+            device_id: None,
+            limit: Some(100),
+        })?
+        .len();
+
+    Ok(vibex_core::RemoteProviderManagementSnapshot {
+        agents,
+        catalog,
+        profiles,
+        native_import_preview,
+        acp_configs,
+        agent_details,
+        mcp_servers,
+        skills,
+        prompts,
+        hooks,
+        health_summaries,
+        capability_summaries,
+        usage_summaries,
+        native_exports,
+        scheduled,
+        scheduled_runs,
+        scheduled_attention,
+        scheduled_audit,
+        automation_graphs,
+        automation_runs,
+        automation_steps,
+        devices,
+        audit_count,
+    })
+}
+
+fn projection_workspace_key(scope: &vibex_core::ProviderProfileDefaultScope) -> String {
+    scope
+        .workspace_id
+        .as_ref()
+        .map(|workspace_id| workspace_id.as_str().to_string())
+        .or_else(|| {
+            scope
+                .project_id
+                .as_ref()
+                .map(|project_id| project_id.as_str().to_string())
+        })
+        .unwrap_or_else(|| "management-global".to_string())
+}
+
+/// Serves the Config Center read bundle to the gateway.
+///
+/// The dispatcher is built before the runtime that owns the management handles,
+/// so the handle slot is filled once the runtime exists.
+pub struct ManagementSnapshotSource {
+    management: Arc<std::sync::OnceLock<ManagementHandle>>,
+}
+
+impl ManagementSnapshotSource {
+    pub fn new() -> (Self, Arc<std::sync::OnceLock<ManagementHandle>>) {
+        let cell = Arc::new(std::sync::OnceLock::new());
+        (
+            Self {
+                management: cell.clone(),
+            },
+            cell,
+        )
+    }
+}
+
+#[async_trait]
+impl vibex_remote::RemoteManagementSnapshotSource for ManagementSnapshotSource {
+    async fn management_snapshot(
+        &self,
+        default_scope: vibex_core::ProviderProfileDefaultScope,
+        refresh_agent_versions: bool,
+    ) -> VibexResult<vibex_core::RemoteProviderManagementSnapshot> {
+        let management = self.management.get().ok_or_else(|| {
+            VibexError::process(
+                "desktop_management_handle_unavailable",
+                "the runtime management handle is not installed yet",
+            )
+        })?;
+        assemble_management_snapshot(management, default_scope, refresh_agent_versions).await
+    }
+}
+
 /// Adapts the authority's automation handle to the gateway's source trait.
 pub struct AutomationSource {
     handle: AutomationHandle,
@@ -1489,6 +1794,7 @@ impl DesktopRuntime {
             RemoteWorkbenchRuntime::new(db_path.clone(), terminals.clone())
                 .with_worktree_snapshot_source(Arc::new(git.clone())),
         );
+        let management_snapshot_cell;
         let sidebar_organization = SidebarOrganizationBridge::new();
         let timeline_display_settings = TimelineDisplaySettingsBridge::new();
         let remote_dispatcher = remote_dispatcher
@@ -1498,6 +1804,11 @@ impl DesktopRuntime {
                 db_path: db_path.clone(),
                 mutation_guard: ManagementMutationGuard::default(),
             })))
+            .with_management_snapshot_source({
+                let (source, cell) = ManagementSnapshotSource::new();
+                management_snapshot_cell = cell;
+                Arc::new(source)
+            })
             .with_automation_source(Arc::new(AutomationSource::new(AutomationHandle {
                 db_path: db_path.clone(),
                 manager: manager.clone(),
@@ -1614,6 +1925,7 @@ impl DesktopRuntime {
                 })?
                 .push(task);
         }
+        let _ = management_snapshot_cell.set(runtime.management());
         startup_stage("usage_consumer_start", || {
             runtime.spawn_usage_consumer(usage_receiver)
         })?;

@@ -1184,7 +1184,8 @@ mod tests {
         ProviderNativeImportCreateRequest, ProviderNativeImportCreateResult,
         ProviderNativeImportPreview, ProviderNativeImportPreviewRequest, ProviderProfile,
         ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
-        ProviderUsageListRequest, ProviderUsageSummary, ScheduledTaskAttentionListRequest,
+        ProviderUsageListRequest, ProviderUsageSummary, RemoteProviderManagementSnapshot,
+        RemoteProviderManagementSnapshotRequest, ScheduledTaskAttentionListRequest,
         ScheduledTaskAttentionSummary, ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord,
         ScheduledTaskCreateRequest, ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun,
         ScheduledTaskRunListRequest, ScheduledTaskUpdateRequest,
@@ -1690,6 +1691,13 @@ mod tests {
             &self,
             _request: ProviderUsageListRequest,
         ) -> BackendFuture<'_, Vec<ProviderUsageSummary>> {
+            error_future()
+        }
+
+        fn management_snapshot(
+            &self,
+            _request: RemoteProviderManagementSnapshotRequest,
+        ) -> BackendFuture<'_, RemoteProviderManagementSnapshot> {
             error_future()
         }
 

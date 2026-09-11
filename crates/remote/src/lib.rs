@@ -131,6 +131,7 @@ struct RemoteRouterState {
     agent_auth_contexts: Option<Arc<dyn RemoteAgentAuthContextSource>>,
     scheduled_tasks: Option<Arc<dyn RemoteScheduledTaskSource>>,
     automation: Option<Arc<dyn RemoteAutomationSource>>,
+    management_snapshot: Option<Arc<dyn RemoteManagementSnapshotSource>>,
     sidebar_organization: Option<Arc<dyn RemoteSidebarOrganizationSource>>,
     workbench: Option<RemoteWorkbenchRuntime>,
     provider: Option<RemoteProviderRuntime>,
@@ -346,6 +347,19 @@ pub trait RemoteAutomationSource: Send + Sync {
     ) -> VibexResult<vibex_core::AutomationRun>;
 }
 
+/// Authority-side Config Center read bundle.
+///
+/// Installed by the runtime for the same reason as the other source traits:
+/// `vibex-remote` cannot reach the runtime's management handles itself.
+#[async_trait]
+pub trait RemoteManagementSnapshotSource: Send + Sync {
+    async fn management_snapshot(
+        &self,
+        default_scope: vibex_core::ProviderProfileDefaultScope,
+        refresh_agent_versions: bool,
+    ) -> VibexResult<vibex_core::RemoteProviderManagementSnapshot>;
+}
+
 #[async_trait]
 pub trait RemoteWorktreeSnapshotSource: Send + Sync {
     async fn worktree_eligibility(
@@ -439,6 +453,7 @@ impl RemoteRouterState {
             agent_auth_contexts: None,
             scheduled_tasks: None,
             automation: None,
+            management_snapshot: None,
             sidebar_organization: None,
             workbench: None,
             provider: None,
@@ -459,6 +474,7 @@ impl RemoteRouterState {
             agent_auth_contexts: None,
             scheduled_tasks: None,
             automation: None,
+            management_snapshot: None,
             sidebar_organization: None,
             workbench: None,
             provider: None,
@@ -484,6 +500,7 @@ impl RemoteRouterState {
             agent_auth_contexts: None,
             scheduled_tasks: None,
             automation: None,
+            management_snapshot: None,
             sidebar_organization: None,
             workbench: Some(workbench),
             provider: Some(provider),
@@ -511,6 +528,7 @@ impl RemoteRouterState {
             agent_auth_contexts: None,
             scheduled_tasks: None,
             automation: None,
+            management_snapshot: None,
             sidebar_organization: None,
             workbench: Some(workbench),
             provider: Some(provider),
@@ -667,6 +685,10 @@ impl RemoteDispatcher {
         self.state.automation.is_some()
     }
 
+    pub fn has_management_snapshot_source(&self) -> bool {
+        self.state.management_snapshot.is_some()
+    }
+
     pub fn with_sidebar_organization_source(
         mut self,
         source: Arc<dyn RemoteSidebarOrganizationSource>,
@@ -704,6 +726,15 @@ impl RemoteDispatcher {
     pub fn with_automation_source(mut self, source: Arc<dyn RemoteAutomationSource>) -> Self {
         self.state.automation = Some(source);
         self.state.capabilities.supports_automation = true;
+        self
+    }
+
+    pub fn with_management_snapshot_source(
+        mut self,
+        source: Arc<dyn RemoteManagementSnapshotSource>,
+    ) -> Self {
+        self.state.management_snapshot = Some(source);
+        self.state.capabilities.supports_management_snapshot = true;
         self
     }
 
@@ -3183,6 +3214,26 @@ async fn dispatch_provider_request(
                 exports: value,
             })
             .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::ManagementSnapshot(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let source = state.management_snapshot.as_ref().ok_or_else(|| {
+                VibexError::capability(
+                    "remote_management_snapshot_unavailable",
+                    "the Config Center snapshot is not available on this service",
+                )
+            })?;
+            let snapshot = source
+                .management_snapshot(request.default_scope, request.refresh_agent_versions)
+                .await?;
+            serde_json::to_value(vibex_core::RemoteProviderManagementSnapshotResponse { snapshot })
+                .map_err(remote_payload_encode_error)
         }
         RemoteProviderRequest::MutateProviderCredentialSecret(request) => {
             let (proof, request) = request.into_request();
@@ -6875,6 +6926,7 @@ mod tests {
                 agent_auth_contexts: None,
                 scheduled_tasks: None,
                 automation: None,
+                management_snapshot: None,
                 sidebar_organization: None,
                 workbench: None,
                 provider: None,

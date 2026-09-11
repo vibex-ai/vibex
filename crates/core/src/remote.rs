@@ -47,30 +47,32 @@ use crate::ids::{
     RuntimeProcessId, TerminalId, VibexSessionId,
 };
 use crate::provider::{
-    AcpProviderCatalogListResponse, AcpProviderConfig, AcpProviderProfileUpdateRequest, Hook,
-    HookCreateRequest, HookDeleteRequest, HookInstallPreview, HookInstallPreviewRequest,
-    HookUpdateRequest, McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest,
-    McpServerCreateRequest, McpServerDeleteRequest, McpServerDiscoverRequest,
-    McpServerDiscoveryResponse, McpServerImportRequest, McpServerImportResult,
-    McpServerSetAgentMatrixRequest, McpServerUpdateRequest, McpServerValidateRequest,
-    McpServerValidationResult, Prompt, PromptCreateRequest, PromptDeleteRequest,
-    PromptUpdateRequest, PromptValidateRequest, PromptValidationResult, ProviderCapabilitySummary,
-    ProviderFailoverRecommendation, ProviderFailoverRecommendationRequest, ProviderHealthSummary,
-    ProviderInjectionPreview, ProviderInjectionPreviewRequest, ProviderNativeExportApplyRequest,
+    AcpProviderCatalogListResponse, AcpProviderConfig, AcpProviderProfileUpdateRequest,
+    AgentModelProviderProfile, Hook, HookCreateRequest, HookDeleteRequest, HookInstallPreview,
+    HookInstallPreviewRequest, HookUpdateRequest, McpServer, McpServerAgentMatrix,
+    McpServerAgentMatrixListRequest, McpServerCreateRequest, McpServerDeleteRequest,
+    McpServerDiscoverRequest, McpServerDiscoveryResponse, McpServerImportRequest,
+    McpServerImportResult, McpServerSetAgentMatrixRequest, McpServerUpdateRequest,
+    McpServerValidateRequest, McpServerValidationResult, Prompt, PromptCreateRequest,
+    PromptDeleteRequest, PromptUpdateRequest, PromptValidateRequest, PromptValidationResult,
+    ProviderCapabilitySummary, ProviderFailoverRecommendation,
+    ProviderFailoverRecommendationRequest, ProviderHealthSummary, ProviderInjectionPreview,
+    ProviderInjectionPreviewRequest, ProviderNativeExportApplyRequest,
     ProviderNativeExportApplyResult, ProviderNativeExportListRequest, ProviderNativeExportPreview,
     ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
     ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
     ProviderNativeImportCreateRequest, ProviderNativeImportCreateResult,
-    ProviderNativeImportPreview, ProviderNativeImportPreviewRequest, ProviderProfileSummary,
-    ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, ProviderUsageListRequest,
-    ProviderUsageSummary, Skill, SkillAgentMatrix, SkillAgentMatrixListRequest, SkillCreateRequest,
-    SkillDeleteRequest, SkillDiscoverRequest, SkillDiscoveryResponse, SkillImportRequest,
-    SkillImportResult, SkillSetAgentMatrixRequest, SkillUpdateRequest, SkillValidateRequest,
-    SkillValidationResult,
+    ProviderNativeImportPreview, ProviderNativeImportPreviewRequest, ProviderProfile,
+    ProviderProfileDefaultScope, ProviderProfileSummary, ProviderRunHealthProbesRequest,
+    ProviderRunHealthProbesResult, ProviderUsageListRequest, ProviderUsageSummary, Skill,
+    SkillAgentMatrix, SkillAgentMatrixListRequest, SkillCreateRequest, SkillDeleteRequest,
+    SkillDiscoverRequest, SkillDiscoveryResponse, SkillImportRequest, SkillImportResult,
+    SkillSetAgentMatrixRequest, SkillUpdateRequest, SkillValidateRequest, SkillValidationResult,
 };
 use crate::provider_projection::{
-    AgentProviderProjectionCapability, AgentProviderProjectionCapabilityRequest,
-    AgentProviderProjectionPreview, AgentProviderProjectionPreviewRequest,
+    AgentModelProviderBinding, AgentProviderProjectionCapability,
+    AgentProviderProjectionCapabilityRequest, AgentProviderProjectionPreview,
+    AgentProviderProjectionPreviewRequest, AgentRuntimeProfile,
 };
 use crate::runtime::{
     AgentSessionRuntimeSelectionState, AgentSessionRuntimeSnapshot, AttachRuntimeRequest,
@@ -142,6 +144,9 @@ pub struct RemoteCapabilitySummary {
     /// Automation graph and run management is exposed to paired devices.
     #[serde(default)]
     pub supports_automation: bool,
+    /// The aggregated Config Center read bundle is served to paired devices.
+    #[serde(default)]
+    pub supports_management_snapshot: bool,
     pub live_event_channels: Vec<RemoteLiveEventChannel>,
 }
 
@@ -164,6 +169,7 @@ impl RemoteCapabilitySummary {
             supports_provider_management: false,
             supports_scheduled_tasks: false,
             supports_automation: false,
+            supports_management_snapshot: false,
             live_event_channels: vec![RemoteLiveEventChannel::System],
         }
     }
@@ -1629,6 +1635,7 @@ pub enum RemoteProviderOperationKind {
     DiscoverMcpSources,
     ImportMcpServers,
     ValidateMcpServer,
+    ManagementSnapshot,
     RefreshDetectedAgentVersions,
     ListAgentCatalog,
     ListAcpCatalogPresets,
@@ -2719,6 +2726,7 @@ pub enum RemoteProviderRequest {
     DiscoverMcpSources(RemoteProviderMcpDiscoverRequest),
     ImportMcpServers(RemoteProviderMcpImportRequest),
     ValidateMcpServer(RemoteProviderMcpValidateRequest),
+    ManagementSnapshot(RemoteProviderManagementSnapshotRequest),
     RefreshDetectedAgentVersions(RemoteProviderRefreshDetectedAgentVersionsRequest),
     ListAgentCatalog(RemoteProviderListAgentCatalogRequest),
     ListAcpCatalogPresets(RemoteProviderListAcpCatalogPresetsRequest),
@@ -2863,6 +2871,7 @@ impl RemoteProviderRequest {
             Self::DiscoverMcpSources(_) => RemoteProviderOperationKind::DiscoverMcpSources,
             Self::ImportMcpServers(_) => RemoteProviderOperationKind::ImportMcpServers,
             Self::ValidateMcpServer(_) => RemoteProviderOperationKind::ValidateMcpServer,
+            Self::ManagementSnapshot(_) => RemoteProviderOperationKind::ManagementSnapshot,
             Self::RefreshDetectedAgentVersions(_) => {
                 RemoteProviderOperationKind::RefreshDetectedAgentVersions
             }
@@ -3133,6 +3142,85 @@ pub struct RemoteAutomationRunCancelRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAutomationRunResponse {
     pub run: AutomationRun,
+}
+
+/// One authoritative Config Center read bundle.
+///
+/// The desktop Config Center used to issue roughly two dozen sequential reads
+/// against a local runtime. Over Remote v2 that would become two dozen round
+/// trips, so the authority assembles the bundle once and the client derives its
+/// projections from it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderManagementSnapshotRequest {
+    pub auth: RemoteAuthProof,
+    pub default_scope: ProviderProfileDefaultScope,
+    #[serde(default)]
+    pub refresh_agent_versions: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderManagementSnapshotResponse {
+    pub snapshot: RemoteProviderManagementSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderManagementSnapshot {
+    pub agents: Vec<AgentSnapshotEntry>,
+    pub catalog: AgentCatalogListResponse,
+    pub profiles: Vec<ProviderProfile>,
+    pub native_import_preview: Option<ProviderNativeImportPreview>,
+    pub acp_configs: Vec<RemoteAcpProfileConfigEntry>,
+    pub agent_details: Vec<RemoteManagementAgentDetail>,
+    pub mcp_servers: Vec<McpServer>,
+    pub skills: Vec<Skill>,
+    pub prompts: Vec<Prompt>,
+    pub hooks: Vec<Hook>,
+    pub health_summaries: Vec<ProviderHealthSummary>,
+    pub capability_summaries: Vec<ProviderCapabilitySummary>,
+    pub usage_summaries: Vec<ProviderUsageSummary>,
+    pub native_exports: Vec<ProviderNativeExportRecordSummary>,
+    pub scheduled: Vec<ScheduledTask>,
+    pub scheduled_runs: Vec<ScheduledTaskRun>,
+    pub scheduled_attention: Vec<ScheduledTaskAttentionSummary>,
+    pub scheduled_audit: Vec<ScheduledTaskAuditRecord>,
+    pub automation_graphs: Vec<AutomationGraph>,
+    pub automation_runs: Vec<AutomationRun>,
+    pub automation_steps: Vec<AutomationRunStep>,
+    pub devices: Vec<RemoteDeviceDetail>,
+    pub audit_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAcpProfileConfigEntry {
+    pub provider_profile_id: crate::ids::ProviderProfileId,
+    pub config: AcpProviderConfig,
+}
+
+/// Per-Agent inputs the Config Center needs to build its provider projections.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteManagementAgentDetail {
+    pub agent_id: AgentId,
+    pub profiles: Vec<AgentModelProviderProfile>,
+    pub default_profile_id: Option<crate::ids::ProviderProfileId>,
+    pub runtime_profiles: Vec<AgentRuntimeProfile>,
+    pub bindings: Vec<AgentModelProviderBinding>,
+    /// Capability and preview entries in the same order the desktop builds
+    /// them locally, so the client derivation stays identical.
+    pub projections: Vec<RemoteAgentProjectionEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentProjectionEntry {
+    pub runtime_profile_id: crate::ids::AgentRuntimeProfileId,
+    pub binding_id: Option<crate::ids::AgentModelProviderBindingId>,
+    pub capability: AgentProviderProjectionCapability,
+    pub preview: Option<AgentProviderProjectionPreview>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -90,7 +90,8 @@ use vibex_core::{
     RemoteGitWorktreeEligibilityResponse, RemoteGitWorktreeRenameBranchRequest,
     RemoteGitWorktreeSnapshotRequest, RemoteGitWorktreeSnapshotResponse, RemoteOperationKind,
     RemotePairingOfferSummary, RemoteProviderHealthSummaryListRequest,
-    RemoteProviderHealthSummaryListResponse, RemoteProviderRequest,
+    RemoteProviderHealthSummaryListResponse, RemoteProviderManagementSnapshot,
+    RemoteProviderManagementSnapshotRequest, RemoteProviderRequest,
     RemoteProviderRunHealthProbesRequest, RemoteProviderRunHealthProbesResponse,
     RemoteRevokeDeviceRequest, RemoteTerminalCreateRequest, RemoteTerminalCreateResponse,
     RemoteTerminalKillRequest, RemoteTerminalKillResponse, RemoteTerminalListRequest,
@@ -4862,6 +4863,32 @@ impl ManagementBackend for WebRemoteBackend {
                 )
                 .await?;
             Ok(decode::<vibex_core::RemoteProviderUsageSummaryListResponse>(value)?.summaries)
+        })
+    }
+
+    fn management_snapshot(
+        &self,
+        request: RemoteProviderManagementSnapshotRequest,
+    ) -> BackendFuture<'_, RemoteProviderManagementSnapshot> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::ManagementSnapshot(
+                vibex_core::RemoteProviderManagementSnapshotRequest {
+                    auth: this.auth(),
+                    default_scope: request.default_scope,
+                    refresh_agent_versions: request.refresh_agent_versions,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderManagementSnapshotResponse>(value)?.snapshot)
         })
     }
 
