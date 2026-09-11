@@ -2290,9 +2290,6 @@ impl ManagementCenter {
             agent_id: parsed_agent_id,
         };
         let operation_id_for_runner = operation_id.clone();
-        // The legacy polling fallback below still needs the local runtime; the
-        // context-scoped cancel above rides the backend facade.
-        let runtime_for_legacy_cancel = self.runtime.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             if let Some((auth_context_id, expected_context_revision)) = auth_context {
                 backend
@@ -2308,14 +2305,12 @@ impl ManagementCenter {
                     .map_err(crate::app::remote_error_into_vibex)?;
                 return Ok::<_, VibexError>(true);
             }
-            let Some(runtime) = runtime_for_legacy_cancel else {
-                return Ok::<_, VibexError>(false);
-            };
             for attempt in 0..40 {
-                if runtime
+                if backend
                     .agent()
-                    .cancel_authentication(request.clone())
-                    .await?
+                    .cancel_agent_authentication(MutationRequest::new(request.clone()))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?
                 {
                     return Ok::<_, VibexError>(true);
                 }
@@ -2396,8 +2391,8 @@ impl ManagementCenter {
     }
 
     fn verify_agent_auth_context(&mut self, cx: &mut Context<Self>) {
-        let (Some(runtime), Some(context), Some(scope)) = (
-            self.runtime.clone(),
+        let (Some(backend), Some(context), Some(scope)) = (
+            self.backend.clone(),
             self.agent_auth_context.clone(),
             self.current_agent_auth_scope(),
         ) else {
@@ -2418,14 +2413,15 @@ impl ManagementCenter {
         self.agent_auth_logout_preview = None;
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
+            backend
                 .agent()
-                .verify_auth_context(AgentAuthContextVerifyRequest {
+                .verify_agent_auth_context(MutationRequest::new(AgentAuthContextVerifyRequest {
                     auth_context_id: context.id,
                     expected_context_revision: context.revision,
                     operation_id: None,
-                })
+                }))
                 .await
+                .map_err(crate::app::remote_error_into_vibex)
         });
         let completed_mutation = mutation;
         let agent_id_for_callback = agent_id_key.clone();
@@ -2487,8 +2483,8 @@ impl ManagementCenter {
     }
 
     fn refresh_agent_auth_models(&mut self, cx: &mut Context<Self>) {
-        let (Some(runtime), Some(context), Some(scope)) = (
-            self.runtime.clone(),
+        let (Some(backend), Some(context), Some(scope)) = (
+            self.backend.clone(),
             self.agent_auth_context.clone(),
             self.current_agent_auth_scope(),
         ) else {
@@ -2508,13 +2504,16 @@ impl ManagementCenter {
         self.agent_auth_error = None;
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
+            backend
                 .agent()
-                .refresh_auth_context_models(AgentAuthContextRefreshModelsRequest {
-                    auth_context_id: context.id,
-                    expected_context_revision: context.revision,
-                })
+                .refresh_agent_auth_models(MutationRequest::new(
+                    AgentAuthContextRefreshModelsRequest {
+                        auth_context_id: context.id,
+                        expected_context_revision: context.revision,
+                    },
+                ))
                 .await
+                .map_err(crate::app::remote_error_into_vibex)
         });
         let completed_mutation = mutation;
         let agent_id_for_callback = agent_id_key.clone();
@@ -2688,8 +2687,8 @@ impl ManagementCenter {
         scope: (String, Option<String>),
         cx: &mut Context<Self>,
     ) {
-        let (Some(runtime), Some(context)) =
-            (self.runtime.clone(), self.agent_auth_context.clone())
+        let (Some(backend), Some(context)) =
+            (self.backend.clone(), self.agent_auth_context.clone())
         else {
             return;
         };
@@ -2707,7 +2706,11 @@ impl ManagementCenter {
         self.agent_auth_error = None;
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime.agent().preview_auth_context_logout(&context.id)
+            backend
+                .agent()
+                .preview_agent_auth_logout(context.id)
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
         });
         let completed_mutation = mutation;
         let agent_id_for_callback = agent_id_key.clone();
@@ -2764,8 +2767,8 @@ impl ManagementCenter {
     }
 
     fn confirm_agent_auth_context_logout(&mut self, cx: &mut Context<Self>) {
-        let (Some(runtime), Some(preview), Some(scope)) = (
-            self.runtime.clone(),
+        let (Some(backend), Some(preview), Some(scope)) = (
+            self.backend.clone(),
             self.agent_auth_logout_preview.clone(),
             self.current_agent_auth_scope(),
         ) else {
@@ -2787,14 +2790,15 @@ impl ManagementCenter {
         let affected_count = preview.affected_session_ids.len();
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
+            backend
                 .agent()
-                .logout_auth_context(AgentAuthContextLogoutRequest {
+                .logout_agent_auth_context(MutationRequest::new(AgentAuthContextLogoutRequest {
                     auth_context_id: preview.context.id,
                     expected_context_revision: preview.context.revision,
                     confirmed_affected_session_count: affected_count,
-                })
+                }))
                 .await
+                .map_err(crate::app::remote_error_into_vibex)
         });
         let completed_mutation = mutation;
         let agent_id_for_callback = agent_id_key.clone();
@@ -18637,10 +18641,13 @@ mod tests {
         assert!(render.contains("Models available to this account"));
         assert!(render.contains("Signing out also affects the external CLI and Vibex sessions"));
         assert!(render.contains("agent-auth-logout-confirm"));
-        assert!(lifecycle.contains("verify_auth_context("));
-        assert!(lifecycle.contains("refresh_auth_context_models("));
-        assert!(lifecycle.contains("preview_auth_context_logout("));
-        assert!(lifecycle.contains("logout_auth_context("));
+        // The lifecycle rides the backend contract so a paired runtime serves
+        // it too; each call names the facade operation rather than a local
+        // runtime handle.
+        assert!(lifecycle.contains("verify_agent_auth_context("));
+        assert!(lifecycle.contains("refresh_agent_auth_models("));
+        assert!(lifecycle.contains("preview_agent_auth_logout("));
+        assert!(lifecycle.contains("logout_agent_auth_context("));
         assert!(lifecycle.contains("confirmed_affected_session_count"));
     }
 
