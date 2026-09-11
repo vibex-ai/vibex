@@ -684,6 +684,12 @@ impl ManagementWorkflowCapabilities {
             _ => &self.device,
         };
         let label = management_operation_label(operation);
+        if domain.requires_permission(operation) {
+            return Err(BackendError::permission(
+                format!("{label}_permission_required"),
+                "the paired device does not permit this management action",
+            ));
+        }
         let error = match domain.availability {
             vibex_backend::CapabilityAvailability::Offline => BackendError::offline(
                 format!("{label}_offline"),
@@ -714,6 +720,11 @@ fn filter_domain(
     DomainCapabilities {
         availability: source.availability,
         operations: source.operations.intersection(allowed).copied().collect(),
+        permission_required: source
+            .permission_required
+            .intersection(allowed)
+            .copied()
+            .collect(),
     }
 }
 

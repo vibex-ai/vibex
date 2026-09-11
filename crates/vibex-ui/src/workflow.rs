@@ -87,6 +87,12 @@ impl AgentFileGitCapabilities {
             return Ok(());
         }
         let label = operation_label(operation);
+        if domain.requires_permission(operation) {
+            return Err(BackendError::permission(
+                format!("{label}_permission_required"),
+                "the paired device is not permitted to perform this operation",
+            ));
+        }
         match domain.availability {
             CapabilityAvailability::Offline => Err(BackendError::offline(
                 format!("{label}_offline"),
@@ -146,6 +152,11 @@ fn filter_domain<const N: usize>(
     DomainCapabilities {
         availability: source.availability,
         operations: source.operations.intersection(&allowed).copied().collect(),
+        permission_required: source
+            .permission_required
+            .intersection(&allowed)
+            .copied()
+            .collect(),
     }
 }
 

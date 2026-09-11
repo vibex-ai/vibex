@@ -675,6 +675,12 @@ fn git_capability_error(
         BackendOperation::GitCommit => "git_commit",
         _ => "git_operation",
     };
+    if capabilities.requires_permission(operation) {
+        return BackendError::permission(
+            format!("{label}_permission_required"),
+            "the current device lacks permission for this Git operation",
+        );
+    }
     match capabilities.availability {
         CapabilityAvailability::Offline => BackendError::offline(
             format!("{label}_offline"),

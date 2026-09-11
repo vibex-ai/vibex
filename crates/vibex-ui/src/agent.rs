@@ -1415,6 +1415,12 @@ fn capability_error(
 ) -> BackendError {
     use vibex_backend::CapabilityAvailability;
     let code = format!("{}_unavailable", agent_operation_label(operation));
+    if capabilities.requires_permission(operation) {
+        return BackendError::permission(
+            code,
+            "the current device lacks permission for this Agent operation",
+        );
+    }
     match capabilities.availability {
         CapabilityAvailability::Offline => {
             BackendError::offline(code, "the authoritative Agent backend is offline")

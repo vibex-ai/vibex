@@ -109,6 +109,11 @@ pub enum CapabilityAvailability {
 pub struct DomainCapabilities {
     pub availability: CapabilityAvailability,
     pub operations: BTreeSet<BackendOperation>,
+    /// Operations the authority supports but this client's grant does not
+    /// permit. Keeping them separate lets a client report "permission
+    /// required" instead of claiming the operation is unsupported.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub permission_required: BTreeSet<BackendOperation>,
 }
 
 impl DomainCapabilities {
@@ -116,12 +121,19 @@ impl DomainCapabilities {
         Self {
             availability: CapabilityAvailability::Available,
             operations: operations.into_iter().collect(),
+            permission_required: BTreeSet::new(),
         }
     }
 
     pub fn supports(&self, operation: BackendOperation) -> bool {
         self.availability == CapabilityAvailability::Available
             && self.operations.contains(&operation)
+    }
+
+    /// True when the authority recognizes `operation` but the paired device's
+    /// permission level denies it.
+    pub fn requires_permission(&self, operation: BackendOperation) -> bool {
+        self.permission_required.contains(&operation)
     }
 }
 
@@ -294,5 +306,29 @@ mod tests {
             serde_json::from_str(&encoded).expect("capability snapshot deserializes");
 
         assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
+    fn permission_required_operations_stay_out_of_the_allowed_set() {
+        let mut domain = DomainCapabilities::available([BackendOperation::FileRead]);
+        domain
+            .permission_required
+            .insert(BackendOperation::FileWrite);
+
+        assert!(domain.supports(BackendOperation::FileRead));
+        assert!(!domain.supports(BackendOperation::FileWrite));
+        assert!(domain.requires_permission(BackendOperation::FileWrite));
+        assert!(!domain.requires_permission(BackendOperation::FileRead));
+
+        let encoded = serde_json::to_string(&domain).expect("domain serializes");
+        assert!(encoded.contains("permissionRequired"));
+        let decoded: DomainCapabilities =
+            serde_json::from_str(&encoded).expect("domain deserializes");
+        assert_eq!(decoded, domain);
+
+        let legacy: DomainCapabilities =
+            serde_json::from_str(r#"{"availability":"available","operations":["file_read"]}"#)
+                .expect("legacy payloads without the field still decode");
+        assert!(legacy.permission_required.is_empty());
     }
 }

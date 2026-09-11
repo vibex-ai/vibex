@@ -5677,7 +5677,48 @@ fn summary_to_backend(summary: ProjectWorkspaceSummary) -> WorkspaceSummary {
     }
 }
 
+/// Capability snapshot derived from the server's advertised features and the
+/// device grant.
+///
+/// The granted snapshot is diffed against the authority's support set so
+/// operations the server accepts but this device may not perform are reported
+/// as `RequiresPermission` instead of silently disappearing from the set.
 fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> BackendCapabilitySnapshot {
+    let supported = remote_capabilities_for_grant(info, true);
+    let mut granted = remote_capabilities_for_grant(info, false);
+    granted.agent = mark_permission_required(supported.agent, granted.agent);
+    granted.workspace = mark_permission_required(supported.workspace, granted.workspace);
+    granted.file = mark_permission_required(supported.file, granted.file);
+    granted.git = mark_permission_required(supported.git, granted.git);
+    granted.terminal = mark_permission_required(supported.terminal, granted.terminal);
+    granted.management = mark_permission_required(supported.management, granted.management);
+    granted.device = mark_permission_required(supported.device, granted.device);
+    granted
+}
+
+fn mark_permission_required(
+    supported: DomainCapabilities,
+    mut granted: DomainCapabilities,
+) -> DomainCapabilities {
+    let denied = supported
+        .operations
+        .difference(&granted.operations)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if denied.is_empty() {
+        return granted;
+    }
+    if granted.operations.is_empty() {
+        granted.availability = vibex_backend::CapabilityAvailability::RequiresPermission;
+    }
+    granted.permission_required = denied;
+    granted
+}
+
+fn remote_capabilities_for_grant(
+    info: Option<&vibex_core::RemoteServerInfoV2>,
+    assume_permitted: bool,
+) -> BackendCapabilitySnapshot {
     use BackendOperation::*;
     let features = info
         .map(|info| {
@@ -5702,6 +5743,9 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
     let has_recovery = features.contains("recovery");
     let has_device_pairing = features.contains("device_pairing");
     let permits = |action: RemoteActionClass| {
+        if assume_permitted {
+            return true;
+        }
         info.and_then(|info| {
             if info.device_permissions.is_empty() {
                 None
@@ -6093,6 +6137,7 @@ fn unavailable() -> DomainCapabilities {
     DomainCapabilities {
         availability: vibex_backend::CapabilityAvailability::Unsupported,
         operations: BTreeSet::new(),
+        permission_required: BTreeSet::new(),
     }
 }
 
@@ -6822,6 +6867,71 @@ mod tests {
         let snapshot = remote_capabilities(Some(&read_only));
         assert!(snapshot.agent.supports(BackendOperation::AgentAuthRead));
         assert!(!snapshot.agent.supports(BackendOperation::AgentAuthManage));
+    }
+
+    #[test]
+    fn elicitation_responses_follow_the_advertised_permission_list() {
+        let mut approve_only = full_control_server_info(&["agent"]);
+        approve_only.device_permissions = vibex_core::remote_permissions_for_level(
+            vibex_core::RemoteDevicePermissionLevel::ApproveOnly,
+        );
+        let snapshot = remote_capabilities(Some(&approve_only));
+        assert!(
+            snapshot
+                .agent
+                .supports(BackendOperation::AgentResolveApproval)
+        );
+        assert!(
+            snapshot
+                .agent
+                .supports(BackendOperation::AgentRespondElicitation),
+            "an approving device must see the elicitation form the server accepts"
+        );
+
+        let mut read_only = full_control_server_info(&["agent"]);
+        read_only.device_permissions = vibex_core::remote_permissions_for_level(
+            vibex_core::RemoteDevicePermissionLevel::ReadOnly,
+        );
+        let snapshot = remote_capabilities(Some(&read_only));
+        assert!(
+            !snapshot
+                .agent
+                .supports(BackendOperation::AgentRespondElicitation)
+        );
+    }
+
+    #[test]
+    fn restricted_devices_report_permission_required_operations() {
+        let mut read_only = full_control_server_info(&["agent", "device_management"]);
+        read_only.device_permissions = vibex_core::remote_permissions_for_level(
+            vibex_core::RemoteDevicePermissionLevel::ReadOnly,
+        );
+        let snapshot = remote_capabilities(Some(&read_only));
+        assert!(snapshot.agent.supports(BackendOperation::AgentListSessions));
+        assert!(
+            snapshot
+                .agent
+                .requires_permission(BackendOperation::AgentSendMessage)
+        );
+        assert!(
+            !snapshot
+                .agent
+                .requires_permission(BackendOperation::AgentListSessions)
+        );
+        assert_eq!(
+            snapshot.device.availability,
+            vibex_backend::CapabilityAvailability::RequiresPermission,
+            "a read-only device is denied every device-management operation"
+        );
+        assert!(
+            snapshot
+                .device
+                .requires_permission(BackendOperation::DeviceList)
+        );
+
+        let full = remote_capabilities(Some(&full_control_server_info(&["agent"])));
+        assert!(full.agent.permission_required.is_empty());
+        assert!(full.device.permission_required.is_empty());
     }
 
     #[test]

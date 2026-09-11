@@ -885,6 +885,12 @@ fn file_capability_error(
         BackendOperation::FileWrite => "file_write",
         _ => "file_operation",
     };
+    if capabilities.requires_permission(operation) {
+        return BackendError::permission(
+            format!("{label}_permission_required"),
+            "the current device lacks permission for this file operation",
+        );
+    }
     match capabilities.availability {
         CapabilityAvailability::Offline => BackendError::offline(
             format!("{label}_offline"),

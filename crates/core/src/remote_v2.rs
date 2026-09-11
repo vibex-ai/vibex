@@ -1397,6 +1397,11 @@ pub fn remote_permissions_for_level(
         RemoteDevicePermissionLevel::ApproveOnly | RemoteDevicePermissionLevel::FullControl
     ) {
         permissions.push(RemoteActionClass::ResolvePermission);
+        // Elicitation responses are the same approval gesture as permission
+        // prompts. The enforcing policy (`permission_allows`) already grants
+        // them to ApproveOnly, so the advertised list must match or clients
+        // hide the form the server would accept.
+        permissions.push(RemoteActionClass::ResolveElicitation);
     }
     if permission_level == RemoteDevicePermissionLevel::FullControl {
         permissions.extend([
@@ -1421,6 +1426,25 @@ mod tests {
         crate::RemoteProtocolVersion {
             major: REMOTE_PROTOCOL_V2_MAJOR,
             minor: REMOTE_PROTOCOL_V2_MINOR,
+        }
+    }
+
+    #[test]
+    fn advertise_elicitation_resolution_for_approving_devices() {
+        let read_only = remote_permissions_for_level(RemoteDevicePermissionLevel::ReadOnly);
+        assert!(!read_only.contains(&RemoteActionClass::ResolveElicitation));
+        assert!(!read_only.contains(&RemoteActionClass::ResolvePermission));
+
+        for level in [
+            RemoteDevicePermissionLevel::ApproveOnly,
+            RemoteDevicePermissionLevel::FullControl,
+        ] {
+            let permissions = remote_permissions_for_level(level);
+            assert!(permissions.contains(&RemoteActionClass::ResolvePermission));
+            assert!(
+                permissions.contains(&RemoteActionClass::ResolveElicitation),
+                "{level:?} must advertise elicitation responses"
+            );
         }
     }
 

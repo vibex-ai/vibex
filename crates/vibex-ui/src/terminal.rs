@@ -651,6 +651,12 @@ impl TerminalWorkflowCapabilities {
                     .intersection(&allowed)
                     .copied()
                     .collect(),
+                permission_required: snapshot
+                    .terminal
+                    .permission_required
+                    .intersection(&allowed)
+                    .copied()
+                    .collect(),
             },
         }
     }
@@ -664,6 +670,12 @@ impl TerminalWorkflowCapabilities {
             return Ok(());
         }
         let label = terminal_operation_label(operation);
+        if self.domain.requires_permission(operation) {
+            return Err(BackendError::permission(
+                format!("{label}_permission_required"),
+                "terminal permission is required by the paired device",
+            ));
+        }
         let error = match self.domain.availability {
             vibex_backend::CapabilityAvailability::Offline => BackendError::offline(
                 format!("{label}_offline"),
