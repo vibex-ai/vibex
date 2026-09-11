@@ -20,8 +20,8 @@ use vibex_core::{
     AgentAuthContextVerifyRequest, AgentAuthEnvironmentUpdateRequest, AgentAuthenticateRequest,
     AgentAuthenticateResult, AgentAuthenticationCancelRequest, AgentAuthenticationOperation,
     AgentAuthenticationOperationId, AgentCatalogListResponse, AgentId, AgentListRequest,
-    AgentListResponse, AgentManagedInstallState, AgentModelProviderProfileCreateRequest,
-    AgentModelProviderProfileSecretValueResponse,
+    AgentListResponse, AgentLogoutRequest, AgentManagedInstallState,
+    AgentModelProviderProfileCreateRequest, AgentModelProviderProfileSecretValueResponse,
     AgentModelProviderProfileSecretValueUpdateRequest, AgentModelProviderProfileUpdateRequest,
     AgentNotificationIntent, AgentRefreshSnapshotRequest, AgentRefreshSnapshotResponse,
     AgentRuntimeOptionProbeRequest, AgentRuntimeOptionProbeResult, AgentSession,
@@ -1349,6 +1349,28 @@ impl AgentBackend for WebRemoteBackend {
                 )
                 .await?;
             Ok(decode::<vibex_core::RemoteAgentUpdateAuthEnvironmentResponse>(value)?.profile)
+        })
+    }
+
+    fn logout_agent(&self, request: MutationRequest<AgentLogoutRequest>) -> BackendFuture<'_, ()> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteAgentRequest::LogoutAgent(vibex_core::RemoteAgentLogoutRequest {
+                auth: this.auth(),
+                agent_id: request.payload.agent_id,
+                provider_profile_id: request.payload.provider_profile_id,
+            });
+            this.rpc(
+                RemoteOperationKind::AgentSession,
+                payload,
+                Some(request.request_id),
+                Some((&key, request.expected_revision.as_deref(), None)),
+                vibex_core::RemoteTimeoutClass::Standard,
+            )
+            .await?;
+            Ok(())
         })
     }
 

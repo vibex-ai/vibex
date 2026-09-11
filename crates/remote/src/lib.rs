@@ -4048,6 +4048,35 @@ async fn dispatch_agent_request(
             })
             .map_err(remote_payload_encode_error)
         }
+        RemoteAgentRequest::LogoutAgent(request) => {
+            let agent_id = request.agent_id.clone();
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentAuthentication,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = manager
+                .logout_agent(vibex_core::AgentLogoutRequest {
+                    agent_id: request.agent_id,
+                    provider_profile_id: request.provider_profile_id,
+                })
+                .await;
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentSession,
+                agent_id.as_str(),
+                "Agent credentials released",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            result?;
+            serde_json::to_value(vibex_core::RemoteAgentLogoutResponse { logged_out: true })
+                .map_err(remote_payload_encode_error)
+        }
         RemoteAgentRequest::DiscoverCommands(request) => {
             authorize_agent_action(
                 &manager,

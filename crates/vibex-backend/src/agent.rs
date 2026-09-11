@@ -6,16 +6,16 @@ use vibex_core::{
     AgentAuthContextVerifyRequest, AgentAuthEnvironmentUpdateRequest, AgentAuthenticateRequest,
     AgentAuthenticateResult, AgentAuthenticationCancelRequest, AgentAuthenticationOperation,
     AgentAuthenticationOperationId, AgentCommandDiscoverRequest, AgentCommandDiscovery, AgentId,
-    AgentNotificationIntent, AgentRuntimeOptionProbeRequest, AgentRuntimeOptionProbeResult,
-    AgentSession, AgentSessionRuntimeSelectionEvent, AgentSessionRuntimeSelectionState,
-    AgentTimelineDisplaySettings, AgentUsageStatistics, AgentUsageStatisticsRequest,
-    CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
-    FetchTimelineRequest, ForkAgentSessionRequest, GetMessageSubmissionRequest,
-    MessageSubmissionState, ProviderProfile, RemoteDeepLinkResolution, RenameAgentSessionRequest,
-    ReplaceUserMessagePayload, ResolveElicitationRequest, ResolvePermissionRequest,
-    RuntimeSessionEvent, SendAgentMessageRequest, SessionRuntimeOptionCatalog,
-    SetDesiredAgentSessionRuntimeRequest, TimelineItem, TimelineLiveEvent, TimelinePage,
-    VibexSessionId,
+    AgentLogoutRequest, AgentNotificationIntent, AgentRuntimeOptionProbeRequest,
+    AgentRuntimeOptionProbeResult, AgentSession, AgentSessionRuntimeSelectionEvent,
+    AgentSessionRuntimeSelectionState, AgentTimelineDisplaySettings, AgentUsageStatistics,
+    AgentUsageStatisticsRequest, CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest,
+    CreateAgentSessionRequest, FetchTimelineRequest, ForkAgentSessionRequest,
+    GetMessageSubmissionRequest, MessageSubmissionState, ProviderProfile, RemoteDeepLinkResolution,
+    RenameAgentSessionRequest, ReplaceUserMessagePayload, ResolveElicitationRequest,
+    ResolvePermissionRequest, RuntimeSessionEvent, SendAgentMessageRequest,
+    SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, TimelineItem,
+    TimelineLiveEvent, TimelinePage, VibexSessionId,
 };
 
 use crate::{BackendBound, BackendFuture, BackendResult, MutationRequest};
@@ -208,6 +208,16 @@ pub trait AgentBackend: BackendBound {
         &self,
         request: MutationRequest<AgentId>,
     ) -> BackendFuture<'_, AgentAuthCatalog>;
+
+    /// Releases the credentials stored for one Agent and Provider profile.
+    fn logout_agent(&self, _request: MutationRequest<AgentLogoutRequest>) -> BackendFuture<'_, ()> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_account_auth_unavailable",
+                "Agent account authentication is unavailable on this backend",
+            ))
+        })
+    }
 
     /// Resolves one composer trigger against the authority's Agent catalogue,
     /// workspace file tree and Skills.

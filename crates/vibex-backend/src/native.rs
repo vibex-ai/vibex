@@ -10,11 +10,12 @@ use vibex_core::{
     AgentAuthContextVerifyRequest, AgentAuthEnvironmentUpdateRequest, AgentAuthenticateRequest,
     AgentAuthenticateResult, AgentAuthenticationCancelRequest, AgentAuthenticationOperation,
     AgentAuthenticationOperationId, AgentCatalogListResponse, AgentId, AgentListRequest,
-    AgentListResponse, AgentManagedInstallState, AgentModelProviderDisplayOrderListRequest,
-    AgentModelProviderDisplayOrderListResponse, AgentModelProviderDisplayOrderSetRequest,
-    AgentModelProviderDisplayOrderSetResponse, AgentModelProviderProfileCreateRequest,
-    AgentModelProviderProfileDeleteRequest, AgentModelProviderProfileFetchModelsRequest,
-    AgentModelProviderProfileFetchModelsResponse, AgentModelProviderProfileSecretValueResponse,
+    AgentListResponse, AgentLogoutRequest, AgentManagedInstallState,
+    AgentModelProviderDisplayOrderListRequest, AgentModelProviderDisplayOrderListResponse,
+    AgentModelProviderDisplayOrderSetRequest, AgentModelProviderDisplayOrderSetResponse,
+    AgentModelProviderProfileCreateRequest, AgentModelProviderProfileDeleteRequest,
+    AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
+    AgentModelProviderProfileSecretValueResponse,
     AgentModelProviderProfileSecretValueUpdateRequest, AgentModelProviderProfileTestRequest,
     AgentModelProviderProfileTestResult, AgentModelProviderProfileUpdateRequest,
     AgentRefreshSnapshotRequest, AgentRefreshSnapshotResponse, AgentRuntimeOptionProbeRequest,
@@ -522,6 +523,19 @@ impl AgentBackend for NativeBackend {
             runtime
                 .agent()
                 .list_auth_methods(agent_id, None)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn logout_agent(&self, request: MutationRequest<AgentLogoutRequest>) -> BackendFuture<'_, ()> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .logout(request.payload)
                 .await
                 .map_err(Into::into)
         })

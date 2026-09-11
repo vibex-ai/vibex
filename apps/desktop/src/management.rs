@@ -2583,7 +2583,7 @@ impl ManagementCenter {
         if self.mutation.is_some() {
             return;
         }
-        let (Some(runtime), Some(scope)) = (self.runtime.clone(), self.current_agent_auth_scope())
+        let (Some(backend), Some(scope)) = (self.backend.clone(), self.current_agent_auth_scope())
         else {
             return;
         };
@@ -2615,17 +2615,19 @@ impl ManagementCenter {
         let entity = cx.weak_entity();
         let scope_for_callback = scope.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
+            backend
                 .agent()
-                .logout(vibex_core::AgentLogoutRequest {
+                .logout_agent(MutationRequest::new(vibex_core::AgentLogoutRequest {
                     agent_id: agent_id.clone(),
-                    provider_profile_id: provider_profile_id.clone(),
-                })
-                .await?;
-            let mut catalog = runtime
+                    provider_profile_id,
+                }))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)?;
+            let mut catalog = backend
                 .agent()
-                .refresh_auth_methods(agent_id, provider_profile_id)
-                .await?;
+                .refresh_agent_auth_methods(MutationRequest::new(agent_id))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)?;
             catalog.status = AgentAuthStatus::AuthenticationRequired;
             Ok::<_, VibexError>(catalog)
         });
