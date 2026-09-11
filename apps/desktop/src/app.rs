@@ -17342,7 +17342,11 @@ impl VibexWorkbench {
         if self.agent_action_pending {
             return;
         }
-        let Some(runtime) = self.runtime.clone() else {
+        // Elicitation resolution is an authoritative session mutation, so it
+        // rides the backend facade. The local runtime used to own this path,
+        // which made the Approve/Decline controls silently inert whenever the
+        // workbench was paired with a remote runtime.
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         let request_id = request.id.to_string();
@@ -17383,10 +17387,9 @@ impl VibexWorkbench {
         self.agent_action_pending = true;
         let generation = self.session_generation;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
+            backend
                 .agent()
-                .manager()
-                .resolve_elicitation(resolution)
+                .resolve_elicitation(MutationRequest::new(resolution))
                 .await
         });
         self.agent_action_task = Some(cx.spawn(
