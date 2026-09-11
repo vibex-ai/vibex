@@ -148,7 +148,7 @@ match `VIBEX_ALLOWED_ORIGINS` (`403` otherwise). Native clients send no
 | `VIBEX_INSTALL_MANAGED_ADAPTERS` | `true` | Provision managed agent runtimes at boot. |
 | `VIBEX_EVENT_CAPACITY` | `512` | Runtime broadcast event backlog. |
 | `VIBEX_APPLICATION_ID` | `dev.vibex.server` | Home-lock application identity. |
-| `VIBEX_DELEGATION_SIDECAR_COMMAND` | unset | Optional agent delegation sidecar command. |
+| `VIBEX_DELEGATION_SIDECAR_COMMAND` | `vibex-server` itself | Executable that serves `--agent-delegation-mcp`. The headless binary implements that entry point, so sub-agent delegation works without a second artifact. |
 
 All limits stay bounded: oversized bodies are rejected before parse, tracked
 peers are capped, and pairing codes live at most

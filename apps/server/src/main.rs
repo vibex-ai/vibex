@@ -12,18 +12,29 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let command = Command::parse(std::env::args().skip(1).collect())?;
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    // The delegation broker spawns this same executable once per session that
+    // uses sub-agents, so the headless runtime serves delegation from the
+    // binary that already owns the agent manager.
+    if arguments.len() == 1 && arguments[0] == "--agent-delegation-mcp" {
+        if let Err(error) = vibex_agent::run_delegation_mcp_stdio() {
+            eprintln!("Agent delegation MCP sidecar failed: {error}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    let command = Command::parse(arguments)?;
     match command {
         Command::Help => print_help(),
         Command::Version => println!("vibex-server {VERSION}"),
         Command::ConfigCheck => {
-            let config = DesktopRuntimeConfig::headless_from_environment()?;
+            let config = headless_config()?;
             config_check(&config)?;
             println!("configuration=valid");
             print_config_summary(&config);
         }
         Command::PairingCode { permission, ttl_ms } => {
-            let config = DesktopRuntimeConfig::headless_from_environment()?;
+            let config = headless_config()?;
             config_check(&config)?;
             let response = create_pairing_code(&config, permission, ttl_ms)?;
             println!("pairing_code={}", response.pairing_code);
@@ -113,7 +124,7 @@ impl Command {
 }
 
 async fn serve(print_pairing: bool) -> Result<(), Box<dyn Error>> {
-    let config = DesktopRuntimeConfig::headless_from_environment()?;
+    let config = headless_config()?;
     config_check(&config)?;
     let runtime = DesktopRuntime::start(config.clone()).await?;
     let status = runtime.remote().gateway().status();
@@ -257,6 +268,17 @@ fn option_value(args: &[String], name: &str) -> Option<String> {
     args.windows(2)
         .find(|pair| pair[0] == name)
         .map(|pair| pair[1].clone())
+}
+
+/// Headless configuration with the delegation sidecar defaulted to this
+/// binary, which serves `--agent-delegation-mcp` itself. Deployments can still
+/// override the executable through `VIBEX_DELEGATION_SIDECAR_COMMAND`.
+fn headless_config() -> Result<DesktopRuntimeConfig, VibexError> {
+    let mut config = DesktopRuntimeConfig::headless_from_environment()?;
+    if config.delegation_sidecar_command.is_none() {
+        config.delegation_sidecar_command = std::env::current_exe().ok();
+    }
+    Ok(config)
 }
 
 fn parse_permission(value: &str) -> Result<RemoteDevicePermissionLevel, VibexError> {

@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 tokio.workspace = true
+vibex-agent = { path = "../../crates/agent" }
 vibex-core = { path = "../../crates/core" }
 vibex-db = { path = "../../crates/db" }
 vibex-desktop-runtime = { path = "../../crates/desktop-runtime" }
