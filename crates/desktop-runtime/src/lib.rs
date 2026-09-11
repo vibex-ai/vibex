@@ -905,6 +905,102 @@ impl GitHandle {
     }
 }
 
+/// Adapts the authority's automation handle to the gateway's source trait.
+pub struct AutomationSource {
+    handle: AutomationHandle,
+}
+
+impl AutomationSource {
+    pub fn new(handle: AutomationHandle) -> Self {
+        Self { handle }
+    }
+}
+
+#[async_trait]
+impl vibex_remote::RemoteAutomationSource for AutomationSource {
+    async fn list_graphs(
+        &self,
+        request: vibex_core::AutomationGraphListRequest,
+    ) -> VibexResult<Vec<vibex_core::AutomationGraph>> {
+        self.handle.list(request)
+    }
+
+    async fn create_graph(
+        &self,
+        request: vibex_core::AutomationGraphCreateRequest,
+    ) -> VibexResult<vibex_core::AutomationGraph> {
+        self.handle.create(request)
+    }
+
+    async fn update_graph(
+        &self,
+        request: vibex_core::AutomationGraphUpdateRequest,
+    ) -> VibexResult<vibex_core::AutomationGraph> {
+        self.handle.update(request)
+    }
+
+    async fn replace_definition(
+        &self,
+        request: vibex_core::AutomationGraphDefinitionUpdateRequest,
+    ) -> VibexResult<vibex_core::AutomationGraph> {
+        self.handle.replace_definition(request)
+    }
+
+    async fn set_status(
+        &self,
+        graph_id: &vibex_core::AutomationGraphId,
+        status: vibex_core::AutomationGraphStatus,
+    ) -> VibexResult<vibex_core::AutomationGraph> {
+        if status == vibex_core::AutomationGraphStatus::Paused {
+            self.handle.pause(graph_id)
+        } else {
+            self.handle.resume(graph_id)
+        }
+    }
+
+    async fn archive_graph(
+        &self,
+        graph_id: &vibex_core::AutomationGraphId,
+    ) -> VibexResult<vibex_core::AutomationGraph> {
+        self.handle.archive(graph_id)
+    }
+
+    async fn list_runs(
+        &self,
+        request: vibex_core::AutomationRunListRequest,
+    ) -> VibexResult<Vec<vibex_core::AutomationRun>> {
+        self.handle.list_runs(request)
+    }
+
+    async fn list_steps(
+        &self,
+        request: vibex_core::AutomationRunStepListRequest,
+    ) -> VibexResult<Vec<vibex_core::AutomationRunStep>> {
+        self.handle.list_steps(request)
+    }
+
+    async fn start_run(
+        &self,
+        request: vibex_core::AutomationRunStartRequest,
+    ) -> VibexResult<vibex_core::AutomationRun> {
+        self.handle.start_run(request).await
+    }
+
+    async fn resume_run(
+        &self,
+        request: vibex_core::AutomationRunResumeRequest,
+    ) -> VibexResult<vibex_core::AutomationRun> {
+        self.handle.resume_run(request).await
+    }
+
+    async fn cancel_run(
+        &self,
+        request: vibex_core::AutomationRunCancelRequest,
+    ) -> VibexResult<vibex_core::AutomationRun> {
+        self.handle.cancel_run(request)
+    }
+}
+
 /// Adapts the authority's scheduled-task handle to the gateway's source trait.
 ///
 /// `vibex-remote` sits below this crate, so the runtime installs the source
@@ -1400,6 +1496,11 @@ impl DesktopRuntime {
             .with_agent_auth_context_source(auth_contexts.clone())
             .with_scheduled_task_source(Arc::new(ScheduledTaskSource::new(ScheduledHandle {
                 db_path: db_path.clone(),
+                mutation_guard: ManagementMutationGuard::default(),
+            })))
+            .with_automation_source(Arc::new(AutomationSource::new(AutomationHandle {
+                db_path: db_path.clone(),
+                manager: manager.clone(),
                 mutation_guard: ManagementMutationGuard::default(),
             })))
             .with_agent_runtime_probe_source(Arc::new(providers.clone()))

@@ -11,15 +11,19 @@ use vibex_core::{
     AgentProviderProjectionPreview, AgentProviderProjectionPreviewRequest,
     AgentRuntimeProbeCancelRequest, AgentRuntimeProbeListRequest, AgentRuntimeProbeRecord,
     AgentRuntimeProbeStartRequest, AgentRuntimeProfile, AgentRuntimeProfileCreateRequest,
-    AgentRuntimeProfileUpdateRequest, AgentSnapshotEntry, CustomAgentCreateRequest,
-    CustomAgentDeleteRequest, Hook, HookCreateRequest, HookDeleteRequest, HookInstallPreview,
-    HookInstallPreviewRequest, HookUpdateRequest, McpServer, McpServerAgentMatrix,
-    McpServerAgentMatrixListRequest, McpServerCreateRequest, McpServerDeleteRequest,
-    McpServerDiscoverRequest, McpServerDiscoveryResponse, McpServerImportRequest,
-    McpServerImportResult, McpServerSetAgentMatrixRequest, McpServerUpdateRequest,
-    McpServerValidateRequest, McpServerValidationResult, ModelProviderProfile,
-    ModelProviderProfileCreateRequest, ModelProviderProfileUpdateRequest, Prompt,
-    PromptCreateRequest, PromptDeleteRequest, PromptUpdateRequest, PromptValidateRequest,
+    AgentRuntimeProfileUpdateRequest, AgentSnapshotEntry, AutomationGraph,
+    AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest, AutomationGraphId,
+    AutomationGraphListRequest, AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun,
+    AutomationRunCancelRequest, AutomationRunListRequest, AutomationRunResumeRequest,
+    AutomationRunStartRequest, AutomationRunStep, AutomationRunStepListRequest,
+    CustomAgentCreateRequest, CustomAgentDeleteRequest, Hook, HookCreateRequest, HookDeleteRequest,
+    HookInstallPreview, HookInstallPreviewRequest, HookUpdateRequest, McpServer,
+    McpServerAgentMatrix, McpServerAgentMatrixListRequest, McpServerCreateRequest,
+    McpServerDeleteRequest, McpServerDiscoverRequest, McpServerDiscoveryResponse,
+    McpServerImportRequest, McpServerImportResult, McpServerSetAgentMatrixRequest,
+    McpServerUpdateRequest, McpServerValidateRequest, McpServerValidationResult,
+    ModelProviderProfile, ModelProviderProfileCreateRequest, ModelProviderProfileUpdateRequest,
+    Prompt, PromptCreateRequest, PromptDeleteRequest, PromptUpdateRequest, PromptValidateRequest,
     PromptValidationResult, ProviderCapabilitySummary, ProviderCredentialSecretMutationRequest,
     ProviderHealthSummary, ProviderProfileId, ProviderProfileSummary,
     ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
@@ -287,6 +291,62 @@ pub trait ManagementBackend: BackendBound {
         task_id: ScheduledTaskId,
         now_ms: i64,
     ) -> BackendFuture<'_, Option<ScheduledTaskRun>>;
+
+    fn automation_graphs(
+        &self,
+        request: AutomationGraphListRequest,
+    ) -> BackendFuture<'_, Vec<AutomationGraph>>;
+
+    fn create_automation_graph(
+        &self,
+        request: MutationRequest<AutomationGraphCreateRequest>,
+    ) -> BackendFuture<'_, AutomationGraph>;
+
+    fn update_automation_graph(
+        &self,
+        request: MutationRequest<AutomationGraphUpdateRequest>,
+    ) -> BackendFuture<'_, AutomationGraph>;
+
+    fn replace_automation_definition(
+        &self,
+        request: MutationRequest<AutomationGraphDefinitionUpdateRequest>,
+    ) -> BackendFuture<'_, AutomationGraph>;
+
+    fn set_automation_graph_status(
+        &self,
+        graph_id: AutomationGraphId,
+        status: AutomationGraphStatus,
+    ) -> BackendFuture<'_, AutomationGraph>;
+
+    fn archive_automation_graph(
+        &self,
+        graph_id: AutomationGraphId,
+    ) -> BackendFuture<'_, AutomationGraph>;
+
+    fn automation_runs(
+        &self,
+        request: AutomationRunListRequest,
+    ) -> BackendFuture<'_, Vec<AutomationRun>>;
+
+    fn automation_run_steps(
+        &self,
+        request: AutomationRunStepListRequest,
+    ) -> BackendFuture<'_, Vec<AutomationRunStep>>;
+
+    fn start_automation_run(
+        &self,
+        request: MutationRequest<AutomationRunStartRequest>,
+    ) -> BackendFuture<'_, AutomationRun>;
+
+    fn resume_automation_run(
+        &self,
+        request: MutationRequest<AutomationRunResumeRequest>,
+    ) -> BackendFuture<'_, AutomationRun>;
+
+    fn cancel_automation_run(
+        &self,
+        request: MutationRequest<AutomationRunCancelRequest>,
+    ) -> BackendFuture<'_, AutomationRun>;
 
     fn validate_mcp_server(
         &self,

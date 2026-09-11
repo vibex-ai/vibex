@@ -13,27 +13,31 @@ use vibex_core::{
     AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
     AgentModelProviderProfileTestRequest, AgentModelProviderProfileTestResult, AgentSession,
     AgentSessionRuntimeSelectionState, AgentUsageStatistics, AgentUsageStatisticsRequest,
-    CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
-    FetchTimelineRequest, FileMutationRequest, FileReadRequest, FileReadResponse,
-    FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest, FileWriteRequest,
-    ForkAgentSessionRequest, GitBranchListResponse, GitCommitDetail, GitCommitDetailRequest,
-    GitCommitRequest, GitCommitResult, GitDiffRequest, GitDiffResponse, GitHistoryRequest,
-    GitHistoryResponse, GitProjectEligibility, GitRemoteActionRequest, GitRemoteActionResult,
-    GitStageRequest, GitStatusSummary, GitWorktreeArchiveRequest,
-    GitWorktreeAssistanceSessionRequest, GitWorktreeConflictResolveRequest,
-    GitWorktreeConflictStageRequest, GitWorktreeCreateRequest, GitWorktreeCreateResult,
-    GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
-    GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeOperationRecord,
-    GitWorktreeOperationRequest, GitWorktreeReadinessRecord, GitWorktreeReadinessRequest,
-    GitWorktreeRestoreRequest, Hook, HookCreateRequest, HookDeleteRequest, HookInstallPreview,
-    HookInstallPreviewRequest, HookUpdateRequest, McpServer, McpServerAgentMatrix,
-    McpServerAgentMatrixListRequest, McpServerCreateRequest, McpServerDeleteRequest,
-    McpServerDiscoverRequest, McpServerDiscoveryResponse, McpServerImportRequest,
-    McpServerImportResult, McpServerSetAgentMatrixRequest, McpServerUpdateRequest,
-    McpServerValidateRequest, McpServerValidationResult, OpenWorkspaceRequest, ProjectId, Prompt,
-    PromptCreateRequest, PromptDeleteRequest, PromptUpdateRequest, PromptValidateRequest,
-    PromptValidationResult, ProviderCapabilitySummary, ProviderHealthSummary,
-    ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
+    AutomationGraph, AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest,
+    AutomationGraphId, AutomationGraphListRequest, AutomationGraphStatus,
+    AutomationGraphUpdateRequest, AutomationRun, AutomationRunCancelRequest,
+    AutomationRunListRequest, AutomationRunResumeRequest, AutomationRunStartRequest,
+    AutomationRunStep, AutomationRunStepListRequest, CancelAgentSessionRuntimeSwitchRequest,
+    ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest, FileMutationRequest,
+    FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
+    FileTreeRequest, FileWriteRequest, ForkAgentSessionRequest, GitBranchListResponse,
+    GitCommitDetail, GitCommitDetailRequest, GitCommitRequest, GitCommitResult, GitDiffRequest,
+    GitDiffResponse, GitHistoryRequest, GitHistoryResponse, GitProjectEligibility,
+    GitRemoteActionRequest, GitRemoteActionResult, GitStageRequest, GitStatusSummary,
+    GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
+    GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeCreateRequest,
+    GitWorktreeCreateResult, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
+    GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
+    GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeReadinessRecord,
+    GitWorktreeReadinessRequest, GitWorktreeRestoreRequest, Hook, HookCreateRequest,
+    HookDeleteRequest, HookInstallPreview, HookInstallPreviewRequest, HookUpdateRequest, McpServer,
+    McpServerAgentMatrix, McpServerAgentMatrixListRequest, McpServerCreateRequest,
+    McpServerDeleteRequest, McpServerDiscoverRequest, McpServerDiscoveryResponse,
+    McpServerImportRequest, McpServerImportResult, McpServerSetAgentMatrixRequest,
+    McpServerUpdateRequest, McpServerValidateRequest, McpServerValidationResult,
+    OpenWorkspaceRequest, ProjectId, Prompt, PromptCreateRequest, PromptDeleteRequest,
+    PromptUpdateRequest, PromptValidateRequest, PromptValidationResult, ProviderCapabilitySummary,
+    ProviderHealthSummary, ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
     ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, RemoteAuditListRequest,
     RemoteAuditRecord, RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
     RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeviceDetail,
@@ -2450,6 +2454,182 @@ impl ManagementBackend for NativeBackend {
                 .management()
                 .scheduled()
                 .claim_due(&task_id, now_ms)
+                .map_err(Into::into)
+        })
+    }
+
+    fn automation_graphs(
+        &self,
+        request: AutomationGraphListRequest,
+    ) -> BackendFuture<'_, Vec<AutomationGraph>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .automation()
+                .list(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn create_automation_graph(
+        &self,
+        request: MutationRequest<AutomationGraphCreateRequest>,
+    ) -> BackendFuture<'_, AutomationGraph> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .automation()
+                .create(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn update_automation_graph(
+        &self,
+        request: MutationRequest<AutomationGraphUpdateRequest>,
+    ) -> BackendFuture<'_, AutomationGraph> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .automation()
+                .update(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn replace_automation_definition(
+        &self,
+        request: MutationRequest<AutomationGraphDefinitionUpdateRequest>,
+    ) -> BackendFuture<'_, AutomationGraph> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .automation()
+                .replace_definition(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn set_automation_graph_status(
+        &self,
+        graph_id: AutomationGraphId,
+        status: AutomationGraphStatus,
+    ) -> BackendFuture<'_, AutomationGraph> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            let handle = runtime.management().automation();
+            if status == vibex_core::AutomationGraphStatus::Paused {
+                handle.pause(&graph_id)
+            } else {
+                handle.resume(&graph_id)
+            }
+            .map_err(Into::into)
+        })
+    }
+
+    fn archive_automation_graph(
+        &self,
+        graph_id: AutomationGraphId,
+    ) -> BackendFuture<'_, AutomationGraph> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .automation()
+                .archive(&graph_id)
+                .map_err(Into::into)
+        })
+    }
+
+    fn automation_runs(
+        &self,
+        request: AutomationRunListRequest,
+    ) -> BackendFuture<'_, Vec<AutomationRun>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .automation()
+                .list_runs(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn automation_run_steps(
+        &self,
+        request: AutomationRunStepListRequest,
+    ) -> BackendFuture<'_, Vec<AutomationRunStep>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .automation()
+                .list_steps(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn start_automation_run(
+        &self,
+        request: MutationRequest<AutomationRunStartRequest>,
+    ) -> BackendFuture<'_, AutomationRun> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .automation()
+                .start_run(request.payload)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn resume_automation_run(
+        &self,
+        request: MutationRequest<AutomationRunResumeRequest>,
+    ) -> BackendFuture<'_, AutomationRun> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .automation()
+                .resume_run(request.payload)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn cancel_automation_run(
+        &self,
+        request: MutationRequest<AutomationRunCancelRequest>,
+    ) -> BackendFuture<'_, AutomationRun> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .automation()
+                .cancel_run(request.payload)
                 .map_err(Into::into)
         })
     }

@@ -1166,16 +1166,20 @@ mod tests {
         AgentModelProviderDisplayOrderSetRequest, AgentModelProviderDisplayOrderSetResponse,
         AgentModelProviderProfileDeleteRequest, AgentModelProviderProfileFetchModelsRequest,
         AgentModelProviderProfileFetchModelsResponse, AgentModelProviderProfileTestRequest,
-        AgentModelProviderProfileTestResult, McpServer, McpServerAgentMatrix,
-        McpServerAgentMatrixListRequest, McpServerCreateRequest, McpServerDeleteRequest,
-        McpServerDiscoverRequest, McpServerDiscoveryResponse, McpServerImportRequest,
-        McpServerImportResult, McpServerSetAgentMatrixRequest, McpServerUpdateRequest,
-        McpServerValidateRequest, McpServerValidationResult, ProviderCapabilitySummary,
-        ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
-        ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
-        ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord, ScheduledTaskCreateRequest,
-        ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun, ScheduledTaskRunListRequest,
-        ScheduledTaskUpdateRequest,
+        AgentModelProviderProfileTestResult, AutomationGraph, AutomationGraphCreateRequest,
+        AutomationGraphDefinitionUpdateRequest, AutomationGraphId, AutomationGraphListRequest,
+        AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun,
+        AutomationRunCancelRequest, AutomationRunListRequest, AutomationRunResumeRequest,
+        AutomationRunStartRequest, AutomationRunStep, AutomationRunStepListRequest, McpServer,
+        McpServerAgentMatrix, McpServerAgentMatrixListRequest, McpServerCreateRequest,
+        McpServerDeleteRequest, McpServerDiscoverRequest, McpServerDiscoveryResponse,
+        McpServerImportRequest, McpServerImportResult, McpServerSetAgentMatrixRequest,
+        McpServerUpdateRequest, McpServerValidateRequest, McpServerValidationResult,
+        ProviderCapabilitySummary, ProviderRunCapabilityProbesRequest,
+        ProviderRunCapabilityProbesResult, ScheduledTaskAttentionListRequest,
+        ScheduledTaskAttentionSummary, ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord,
+        ScheduledTaskCreateRequest, ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun,
+        ScheduledTaskRunListRequest, ScheduledTaskUpdateRequest,
     };
 
     fn error_future<T: 'static>() -> BackendFuture<'static, T> {
@@ -1525,6 +1529,84 @@ mod tests {
             &self,
             _request: ScheduledTaskAuditListRequest,
         ) -> BackendFuture<'_, Vec<ScheduledTaskAuditRecord>> {
+            error_future()
+        }
+
+        fn automation_graphs(
+            &self,
+            _request: AutomationGraphListRequest,
+        ) -> BackendFuture<'_, Vec<AutomationGraph>> {
+            error_future()
+        }
+
+        fn create_automation_graph(
+            &self,
+            _request: MutationRequest<AutomationGraphCreateRequest>,
+        ) -> BackendFuture<'_, AutomationGraph> {
+            error_future()
+        }
+
+        fn update_automation_graph(
+            &self,
+            _request: MutationRequest<AutomationGraphUpdateRequest>,
+        ) -> BackendFuture<'_, AutomationGraph> {
+            error_future()
+        }
+
+        fn replace_automation_definition(
+            &self,
+            _request: MutationRequest<AutomationGraphDefinitionUpdateRequest>,
+        ) -> BackendFuture<'_, AutomationGraph> {
+            error_future()
+        }
+
+        fn set_automation_graph_status(
+            &self,
+            _graph_id: AutomationGraphId,
+            _status: AutomationGraphStatus,
+        ) -> BackendFuture<'_, AutomationGraph> {
+            error_future()
+        }
+
+        fn archive_automation_graph(
+            &self,
+            _graph_id: AutomationGraphId,
+        ) -> BackendFuture<'_, AutomationGraph> {
+            error_future()
+        }
+
+        fn automation_runs(
+            &self,
+            _request: AutomationRunListRequest,
+        ) -> BackendFuture<'_, Vec<AutomationRun>> {
+            error_future()
+        }
+
+        fn automation_run_steps(
+            &self,
+            _request: AutomationRunStepListRequest,
+        ) -> BackendFuture<'_, Vec<AutomationRunStep>> {
+            error_future()
+        }
+
+        fn start_automation_run(
+            &self,
+            _request: MutationRequest<AutomationRunStartRequest>,
+        ) -> BackendFuture<'_, AutomationRun> {
+            error_future()
+        }
+
+        fn resume_automation_run(
+            &self,
+            _request: MutationRequest<AutomationRunResumeRequest>,
+        ) -> BackendFuture<'_, AutomationRun> {
+            error_future()
+        }
+
+        fn cancel_automation_run(
+            &self,
+            _request: MutationRequest<AutomationRunCancelRequest>,
+        ) -> BackendFuture<'_, AutomationRun> {
             error_future()
         }
 

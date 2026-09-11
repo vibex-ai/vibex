@@ -22,6 +22,12 @@ use crate::agent_provider_runtime::{
     AgentRuntimeProbeCancelRequest, AgentRuntimeProbeListRequest, AgentRuntimeProbeRecord,
     AgentRuntimeProbeStartRequest,
 };
+use crate::automation_graph::{
+    AutomationGraph, AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest,
+    AutomationGraphListRequest, AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun,
+    AutomationRunCancelRequest, AutomationRunListRequest, AutomationRunResumeRequest,
+    AutomationRunStartRequest, AutomationRunStep, AutomationRunStepListRequest,
+};
 use crate::error::VibexError;
 use crate::file::{
     FileMutationRequest, FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult,
@@ -125,6 +131,9 @@ pub struct RemoteCapabilitySummary {
     /// omit the field.
     #[serde(default)]
     pub supports_scheduled_tasks: bool,
+    /// Automation graph and run management is exposed to paired devices.
+    #[serde(default)]
+    pub supports_automation: bool,
     pub live_event_channels: Vec<RemoteLiveEventChannel>,
 }
 
@@ -146,6 +155,7 @@ impl RemoteCapabilitySummary {
             supports_provider_settings: false,
             supports_provider_management: false,
             supports_scheduled_tasks: false,
+            supports_automation: false,
             live_event_channels: vec![RemoteLiveEventChannel::System],
         }
     }
@@ -2753,7 +2763,186 @@ pub enum RemoteOperationKind {
     ProviderSettings,
     DeviceManagement,
     ScheduledTasks,
+    Automation,
     Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteAutomationOperationKind {
+    ListGraphs,
+    CreateGraph,
+    UpdateGraph,
+    ReplaceDefinition,
+    SetStatus,
+    ArchiveGraph,
+    ListRuns,
+    ListSteps,
+    StartRun,
+    ResumeRun,
+    CancelRun,
+}
+
+/// Automation graph and run management requests.
+///
+/// The authority owns the graph store and the run engine, so the Management
+/// Center's Automation section drives both through these requests.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum RemoteAutomationRequest {
+    ListGraphs(RemoteAutomationGraphListRequest),
+    CreateGraph(RemoteAutomationGraphCreateRequest),
+    UpdateGraph(RemoteAutomationGraphUpdateRequest),
+    ReplaceDefinition(RemoteAutomationDefinitionUpdateRequest),
+    SetStatus(RemoteAutomationSetStatusRequest),
+    ArchiveGraph(RemoteAutomationArchiveRequest),
+    ListRuns(RemoteAutomationRunListRequest),
+    ListSteps(RemoteAutomationStepListRequest),
+    StartRun(RemoteAutomationRunStartRequest),
+    ResumeRun(RemoteAutomationRunResumeRequest),
+    CancelRun(RemoteAutomationRunCancelRequest),
+}
+
+impl RemoteAutomationRequest {
+    pub const fn operation_kind(&self) -> RemoteAutomationOperationKind {
+        match self {
+            Self::ListGraphs(_) => RemoteAutomationOperationKind::ListGraphs,
+            Self::CreateGraph(_) => RemoteAutomationOperationKind::CreateGraph,
+            Self::UpdateGraph(_) => RemoteAutomationOperationKind::UpdateGraph,
+            Self::ReplaceDefinition(_) => RemoteAutomationOperationKind::ReplaceDefinition,
+            Self::SetStatus(_) => RemoteAutomationOperationKind::SetStatus,
+            Self::ArchiveGraph(_) => RemoteAutomationOperationKind::ArchiveGraph,
+            Self::ListRuns(_) => RemoteAutomationOperationKind::ListRuns,
+            Self::ListSteps(_) => RemoteAutomationOperationKind::ListSteps,
+            Self::StartRun(_) => RemoteAutomationOperationKind::StartRun,
+            Self::ResumeRun(_) => RemoteAutomationOperationKind::ResumeRun,
+            Self::CancelRun(_) => RemoteAutomationOperationKind::CancelRun,
+        }
+    }
+
+    /// Whether the request mutates the authoritative automation store or
+    /// advances a run.
+    pub const fn is_mutation(&self) -> bool {
+        matches!(
+            self,
+            Self::CreateGraph(_)
+                | Self::UpdateGraph(_)
+                | Self::ReplaceDefinition(_)
+                | Self::SetStatus(_)
+                | Self::ArchiveGraph(_)
+                | Self::StartRun(_)
+                | Self::ResumeRun(_)
+                | Self::CancelRun(_)
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAutomationGraphListRequest {
+    pub auth: RemoteAuthProof,
+    pub request: AutomationGraphListRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAutomationGraphListResponse {
+    pub graphs: Vec<AutomationGraph>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAutomationGraphCreateRequest {
+    pub auth: RemoteAuthProof,
+    pub request: AutomationGraphCreateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAutomationGraphUpdateRequest {
+    pub auth: RemoteAuthProof,
+    pub request: AutomationGraphUpdateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAutomationDefinitionUpdateRequest {
+    pub auth: RemoteAuthProof,
+    pub request: AutomationGraphDefinitionUpdateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAutomationSetStatusRequest {
+    pub auth: RemoteAuthProof,
+    pub graph_id: crate::ids::AutomationGraphId,
+    pub status: AutomationGraphStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAutomationArchiveRequest {
+    pub auth: RemoteAuthProof,
+    pub graph_id: crate::ids::AutomationGraphId,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAutomationGraphResponse {
+    pub graph: AutomationGraph,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAutomationRunListRequest {
+    pub auth: RemoteAuthProof,
+    pub request: AutomationRunListRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAutomationRunListResponse {
+    pub runs: Vec<AutomationRun>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAutomationStepListRequest {
+    pub auth: RemoteAuthProof,
+    pub request: AutomationRunStepListRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAutomationStepListResponse {
+    pub steps: Vec<AutomationRunStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAutomationRunStartRequest {
+    pub auth: RemoteAuthProof,
+    pub request: AutomationRunStartRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAutomationRunResumeRequest {
+    pub auth: RemoteAuthProof,
+    pub request: AutomationRunResumeRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAutomationRunCancelRequest {
+    pub auth: RemoteAuthProof,
+    pub request: AutomationRunCancelRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAutomationRunResponse {
+    pub run: AutomationRun,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

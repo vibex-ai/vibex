@@ -18,7 +18,11 @@ use vibex_core::{
     AgentAuthContextMutationResult, AgentAuthContextRefreshModelsRequest,
     AgentAuthContextVerifyRequest, AgentAuthenticationOperation, AgentAuthenticationOperationId,
     AgentId, AgentListRequest, AgentListResponse, AgentNotificationIntent, AgentSession,
-    AgentSessionRuntimeSelectionState, AgentTimelineDisplaySettings,
+    AgentSessionRuntimeSelectionState, AgentTimelineDisplaySettings, AutomationGraph,
+    AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest, AutomationGraphId,
+    AutomationGraphListRequest, AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun,
+    AutomationRunCancelRequest, AutomationRunListRequest, AutomationRunResumeRequest,
+    AutomationRunStartRequest, AutomationRunStep, AutomationRunStepListRequest,
     CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
     FetchTimelineRequest, FileMutationRequest, FileReadRequest, FileReadResponse,
     FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest, FileWriteRequest,
@@ -4271,6 +4275,295 @@ impl ManagementBackend for WebRemoteBackend {
         })
     }
 
+    fn automation_graphs(
+        &self,
+        request: AutomationGraphListRequest,
+    ) -> BackendFuture<'_, Vec<AutomationGraph>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = vibex_core::RemoteAutomationRequest::ListGraphs(
+                vibex_core::RemoteAutomationGraphListRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::Automation,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAutomationGraphListResponse>(value)?.graphs)
+        })
+    }
+
+    fn create_automation_graph(
+        &self,
+        request: MutationRequest<AutomationGraphCreateRequest>,
+    ) -> BackendFuture<'_, AutomationGraph> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = vibex_core::RemoteAutomationRequest::CreateGraph(
+                vibex_core::RemoteAutomationGraphCreateRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::Automation,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAutomationGraphResponse>(value)?.graph)
+        })
+    }
+
+    fn update_automation_graph(
+        &self,
+        request: MutationRequest<AutomationGraphUpdateRequest>,
+    ) -> BackendFuture<'_, AutomationGraph> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = vibex_core::RemoteAutomationRequest::UpdateGraph(
+                vibex_core::RemoteAutomationGraphUpdateRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::Automation,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAutomationGraphResponse>(value)?.graph)
+        })
+    }
+
+    fn replace_automation_definition(
+        &self,
+        request: MutationRequest<AutomationGraphDefinitionUpdateRequest>,
+    ) -> BackendFuture<'_, AutomationGraph> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = vibex_core::RemoteAutomationRequest::ReplaceDefinition(
+                vibex_core::RemoteAutomationDefinitionUpdateRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::Automation,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAutomationGraphResponse>(value)?.graph)
+        })
+    }
+
+    fn set_automation_graph_status(
+        &self,
+        graph_id: AutomationGraphId,
+        status: AutomationGraphStatus,
+    ) -> BackendFuture<'_, AutomationGraph> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = vibex_core::RemoteAutomationRequest::SetStatus(
+                vibex_core::RemoteAutomationSetStatusRequest {
+                    auth: this.auth(),
+                    graph_id,
+                    status,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::Automation,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAutomationGraphResponse>(value)?.graph)
+        })
+    }
+
+    fn archive_automation_graph(
+        &self,
+        graph_id: AutomationGraphId,
+    ) -> BackendFuture<'_, AutomationGraph> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = vibex_core::RemoteAutomationRequest::ArchiveGraph(
+                vibex_core::RemoteAutomationArchiveRequest {
+                    auth: this.auth(),
+                    graph_id,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::Automation,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAutomationGraphResponse>(value)?.graph)
+        })
+    }
+
+    fn automation_runs(
+        &self,
+        request: AutomationRunListRequest,
+    ) -> BackendFuture<'_, Vec<AutomationRun>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = vibex_core::RemoteAutomationRequest::ListRuns(
+                vibex_core::RemoteAutomationRunListRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::Automation,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAutomationRunListResponse>(value)?.runs)
+        })
+    }
+
+    fn automation_run_steps(
+        &self,
+        request: AutomationRunStepListRequest,
+    ) -> BackendFuture<'_, Vec<AutomationRunStep>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = vibex_core::RemoteAutomationRequest::ListSteps(
+                vibex_core::RemoteAutomationStepListRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::Automation,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAutomationStepListResponse>(value)?.steps)
+        })
+    }
+
+    fn start_automation_run(
+        &self,
+        request: MutationRequest<AutomationRunStartRequest>,
+    ) -> BackendFuture<'_, AutomationRun> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = vibex_core::RemoteAutomationRequest::StartRun(
+                vibex_core::RemoteAutomationRunStartRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::Automation,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAutomationRunResponse>(value)?.run)
+        })
+    }
+
+    fn resume_automation_run(
+        &self,
+        request: MutationRequest<AutomationRunResumeRequest>,
+    ) -> BackendFuture<'_, AutomationRun> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = vibex_core::RemoteAutomationRequest::ResumeRun(
+                vibex_core::RemoteAutomationRunResumeRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::Automation,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAutomationRunResponse>(value)?.run)
+        })
+    }
+
+    fn cancel_automation_run(
+        &self,
+        request: MutationRequest<AutomationRunCancelRequest>,
+    ) -> BackendFuture<'_, AutomationRun> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = vibex_core::RemoteAutomationRequest::CancelRun(
+                vibex_core::RemoteAutomationRunCancelRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::Automation,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAutomationRunResponse>(value)?.run)
+        })
+    }
+
     fn relay_status(&self) -> BackendFuture<'_, RelayStatusSummary> {
         self.unsupported(
             "remote_relay_status_unavailable",
@@ -4440,6 +4733,7 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
     let has_provider = features.is_empty() || features.contains("provider_settings");
     let has_provider_management = has_provider && features.contains("provider_management");
     let has_scheduled_tasks = features.contains("scheduled_tasks");
+    let has_automation = features.contains("automation");
     let has_device = features.contains("device_management");
     let has_device_pairing = features.contains("device_pairing");
     let permits = |action: RemoteActionClass| {
@@ -4750,6 +5044,16 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
                 (
                     BackendOperation::ManagementScheduledMutate,
                     has_scheduled_tasks
+                        && has_provider_management
+                        && permits(RemoteActionClass::MutateProviderSettings),
+                ),
+                (
+                    BackendOperation::ManagementAutomationRead,
+                    has_automation && permits(RemoteActionClass::ReadProviderSettings),
+                ),
+                (
+                    BackendOperation::ManagementAutomationMutate,
+                    has_automation
                         && has_provider_management
                         && permits(RemoteActionClass::MutateProviderSettings),
                 ),

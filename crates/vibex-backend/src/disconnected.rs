@@ -6,7 +6,11 @@ use vibex_core::{
     AgentModelProviderDisplayOrderSetResponse, AgentModelProviderProfileDeleteRequest,
     AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
     AgentModelProviderProfileTestRequest, AgentModelProviderProfileTestResult, AgentSession,
-    AgentSessionRuntimeSelectionState, CancelAgentSessionRuntimeSwitchRequest,
+    AgentSessionRuntimeSelectionState, AutomationGraph, AutomationGraphCreateRequest,
+    AutomationGraphDefinitionUpdateRequest, AutomationGraphId, AutomationGraphListRequest,
+    AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun, AutomationRunCancelRequest,
+    AutomationRunListRequest, AutomationRunResumeRequest, AutomationRunStartRequest,
+    AutomationRunStep, AutomationRunStepListRequest, CancelAgentSessionRuntimeSwitchRequest,
     ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest, FileMutationRequest,
     FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
     FileTreeRequest, FileWriteRequest, GitBranchListResponse, GitCommitDetail,
@@ -843,6 +847,84 @@ impl ManagementBackend for DisconnectedBackend {
         _task_id: ScheduledTaskId,
         _now_ms: i64,
     ) -> BackendFuture<'_, Option<ScheduledTaskRun>> {
+        disconnected_future!()
+    }
+
+    fn automation_graphs(
+        &self,
+        _request: AutomationGraphListRequest,
+    ) -> BackendFuture<'_, Vec<AutomationGraph>> {
+        disconnected_future!()
+    }
+
+    fn create_automation_graph(
+        &self,
+        _request: MutationRequest<AutomationGraphCreateRequest>,
+    ) -> BackendFuture<'_, AutomationGraph> {
+        disconnected_future!()
+    }
+
+    fn update_automation_graph(
+        &self,
+        _request: MutationRequest<AutomationGraphUpdateRequest>,
+    ) -> BackendFuture<'_, AutomationGraph> {
+        disconnected_future!()
+    }
+
+    fn replace_automation_definition(
+        &self,
+        _request: MutationRequest<AutomationGraphDefinitionUpdateRequest>,
+    ) -> BackendFuture<'_, AutomationGraph> {
+        disconnected_future!()
+    }
+
+    fn set_automation_graph_status(
+        &self,
+        _graph_id: AutomationGraphId,
+        _status: AutomationGraphStatus,
+    ) -> BackendFuture<'_, AutomationGraph> {
+        disconnected_future!()
+    }
+
+    fn archive_automation_graph(
+        &self,
+        _graph_id: AutomationGraphId,
+    ) -> BackendFuture<'_, AutomationGraph> {
+        disconnected_future!()
+    }
+
+    fn automation_runs(
+        &self,
+        _request: AutomationRunListRequest,
+    ) -> BackendFuture<'_, Vec<AutomationRun>> {
+        disconnected_future!()
+    }
+
+    fn automation_run_steps(
+        &self,
+        _request: AutomationRunStepListRequest,
+    ) -> BackendFuture<'_, Vec<AutomationRunStep>> {
+        disconnected_future!()
+    }
+
+    fn start_automation_run(
+        &self,
+        _request: MutationRequest<AutomationRunStartRequest>,
+    ) -> BackendFuture<'_, AutomationRun> {
+        disconnected_future!()
+    }
+
+    fn resume_automation_run(
+        &self,
+        _request: MutationRequest<AutomationRunResumeRequest>,
+    ) -> BackendFuture<'_, AutomationRun> {
+        disconnected_future!()
+    }
+
+    fn cancel_automation_run(
+        &self,
+        _request: MutationRequest<AutomationRunCancelRequest>,
+    ) -> BackendFuture<'_, AutomationRun> {
         disconnected_future!()
     }
 
