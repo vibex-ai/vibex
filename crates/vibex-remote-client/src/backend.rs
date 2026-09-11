@@ -89,7 +89,10 @@ use vibex_core::{
     RemoteWorkbenchListWorkspacesRequest, RemoteWorkbenchListWorkspacesResponse,
     RemoteWorkbenchOpenWorkspaceRequest, RemoteWorkbenchOpenWorkspaceResponse,
     RemoteWorkbenchRequest, RenameAgentSessionRequest, ReplaceUserMessagePayload,
-    ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest,
+    ResolveElicitationRequest, ResolvePermissionRequest, ScheduledTaskAttentionListRequest,
+    ScheduledTaskAttentionSummary, ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord,
+    ScheduledTaskCreateRequest, ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun,
+    ScheduledTaskRunListRequest, ScheduledTaskUpdateRequest, SendAgentMessageRequest,
     SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest,
     TerminalId, TerminalResizeRequest, TerminalSession, TerminalSnapshot, TerminalWriteRequest,
     TimelineItem, TimelineLiveEvent, TimelinePage, VibexSessionId, WorkspaceId,
@@ -4038,6 +4041,236 @@ impl ManagementBackend for WebRemoteBackend {
         })
     }
 
+    fn scheduled_tasks(
+        &self,
+        request: ScheduledTaskListRequest,
+    ) -> BackendFuture<'_, Vec<vibex_core::ScheduledTask>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload =
+                vibex_core::RemoteScheduledRequest::List(vibex_core::RemoteScheduledListRequest {
+                    auth: this.auth(),
+                    request,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ScheduledTasks,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteScheduledListResponse>(value)?.tasks)
+        })
+    }
+
+    fn create_scheduled_task(
+        &self,
+        request: MutationRequest<ScheduledTaskCreateRequest>,
+    ) -> BackendFuture<'_, vibex_core::ScheduledTask> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = vibex_core::RemoteScheduledRequest::Create(
+                vibex_core::RemoteScheduledCreateRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ScheduledTasks,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteScheduledTaskResponse>(value)?.task)
+        })
+    }
+
+    fn update_scheduled_task(
+        &self,
+        request: MutationRequest<ScheduledTaskUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::ScheduledTask> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = vibex_core::RemoteScheduledRequest::Update(
+                vibex_core::RemoteScheduledUpdateRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ScheduledTasks,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteScheduledTaskResponse>(value)?.task)
+        })
+    }
+
+    fn set_scheduled_task_status(
+        &self,
+        task_id: ScheduledTaskId,
+        paused: bool,
+    ) -> BackendFuture<'_, vibex_core::ScheduledTask> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = vibex_core::RemoteScheduledRequest::SetStatus(
+                vibex_core::RemoteScheduledSetStatusRequest {
+                    auth: this.auth(),
+                    task_id,
+                    paused,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ScheduledTasks,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteScheduledTaskResponse>(value)?.task)
+        })
+    }
+
+    fn delete_scheduled_task(&self, task_id: ScheduledTaskId) -> BackendFuture<'_, ()> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = vibex_core::RemoteScheduledRequest::Delete(
+                vibex_core::RemoteScheduledDeleteRequest {
+                    auth: this.auth(),
+                    task_id,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ScheduledTasks,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            let _ = value;
+            Ok(())
+        })
+    }
+
+    fn scheduled_task_runs(
+        &self,
+        request: ScheduledTaskRunListRequest,
+    ) -> BackendFuture<'_, Vec<ScheduledTaskRun>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = vibex_core::RemoteScheduledRequest::ListRuns(
+                vibex_core::RemoteScheduledRunListRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ScheduledTasks,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteScheduledRunListResponse>(value)?.runs)
+        })
+    }
+
+    fn scheduled_task_attention(
+        &self,
+        request: ScheduledTaskAttentionListRequest,
+    ) -> BackendFuture<'_, Vec<ScheduledTaskAttentionSummary>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = vibex_core::RemoteScheduledRequest::ListAttention(
+                vibex_core::RemoteScheduledAttentionListRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ScheduledTasks,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteScheduledAttentionListResponse>(value)?.attention)
+        })
+    }
+
+    fn scheduled_task_audit(
+        &self,
+        request: ScheduledTaskAuditListRequest,
+    ) -> BackendFuture<'_, Vec<ScheduledTaskAuditRecord>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = vibex_core::RemoteScheduledRequest::ListAudit(
+                vibex_core::RemoteScheduledAuditListRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ScheduledTasks,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteScheduledAuditListResponse>(value)?.audit)
+        })
+    }
+
+    fn claim_due_scheduled_task(
+        &self,
+        task_id: ScheduledTaskId,
+        now_ms: i64,
+    ) -> BackendFuture<'_, Option<ScheduledTaskRun>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = vibex_core::RemoteScheduledRequest::ClaimDue(
+                vibex_core::RemoteScheduledClaimDueRequest {
+                    auth: this.auth(),
+                    task_id,
+                    now_ms,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ScheduledTasks,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteScheduledClaimDueResponse>(value)?.run)
+        })
+    }
+
     fn relay_status(&self) -> BackendFuture<'_, RelayStatusSummary> {
         self.unsupported(
             "remote_relay_status_unavailable",
@@ -4206,6 +4439,7 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
     let has_terminal = features.is_empty() || features.contains("terminal");
     let has_provider = features.is_empty() || features.contains("provider_settings");
     let has_provider_management = has_provider && features.contains("provider_management");
+    let has_scheduled_tasks = features.contains("scheduled_tasks");
     let has_device = features.contains("device_management");
     let has_device_pairing = features.contains("device_pairing");
     let permits = |action: RemoteActionClass| {
@@ -4508,6 +4742,16 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
                 (
                     BackendOperation::ManagementHooksMutate,
                     has_provider_management && permits(RemoteActionClass::MutateProviderSettings),
+                ),
+                (
+                    BackendOperation::ManagementScheduledRead,
+                    has_scheduled_tasks && permits(RemoteActionClass::ReadProviderSettings),
+                ),
+                (
+                    BackendOperation::ManagementScheduledMutate,
+                    has_scheduled_tasks
+                        && has_provider_management
+                        && permits(RemoteActionClass::MutateProviderSettings),
                 ),
                 (
                     BackendOperation::ManagementRuntimeProbeRead,

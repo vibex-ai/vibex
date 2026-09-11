@@ -905,6 +905,89 @@ impl GitHandle {
     }
 }
 
+/// Adapts the authority's scheduled-task handle to the gateway's source trait.
+///
+/// `vibex-remote` sits below this crate, so the runtime installs the source
+/// instead of the gateway reaching into the handle itself.
+pub struct ScheduledTaskSource {
+    handle: ScheduledHandle,
+}
+
+impl ScheduledTaskSource {
+    pub fn new(handle: ScheduledHandle) -> Self {
+        Self { handle }
+    }
+}
+
+#[async_trait]
+impl vibex_remote::RemoteScheduledTaskSource for ScheduledTaskSource {
+    async fn list(
+        &self,
+        request: vibex_core::ScheduledTaskListRequest,
+    ) -> VibexResult<Vec<vibex_core::ScheduledTask>> {
+        self.handle.list(request)
+    }
+
+    async fn create(
+        &self,
+        request: vibex_core::ScheduledTaskCreateRequest,
+    ) -> VibexResult<vibex_core::ScheduledTask> {
+        self.handle.create(request)
+    }
+
+    async fn update(
+        &self,
+        request: vibex_core::ScheduledTaskUpdateRequest,
+    ) -> VibexResult<vibex_core::ScheduledTask> {
+        self.handle.update(request)
+    }
+
+    async fn set_status(
+        &self,
+        task_id: &vibex_core::ScheduledTaskId,
+        paused: bool,
+    ) -> VibexResult<vibex_core::ScheduledTask> {
+        if paused {
+            self.handle.pause(task_id)
+        } else {
+            self.handle.resume(task_id)
+        }
+    }
+
+    async fn delete(&self, task_id: &vibex_core::ScheduledTaskId) -> VibexResult<()> {
+        self.handle.delete(task_id).map(|_| ())
+    }
+
+    async fn list_runs(
+        &self,
+        request: vibex_core::ScheduledTaskRunListRequest,
+    ) -> VibexResult<Vec<vibex_core::ScheduledTaskRun>> {
+        self.handle.list_runs(request)
+    }
+
+    async fn list_attention(
+        &self,
+        request: vibex_core::ScheduledTaskAttentionListRequest,
+    ) -> VibexResult<Vec<vibex_core::ScheduledTaskAttentionSummary>> {
+        self.handle.list_attention(request)
+    }
+
+    async fn list_audit(
+        &self,
+        request: vibex_core::ScheduledTaskAuditListRequest,
+    ) -> VibexResult<Vec<vibex_core::ScheduledTaskAuditRecord>> {
+        self.handle.list_audit(request)
+    }
+
+    async fn claim_due(
+        &self,
+        task_id: &vibex_core::ScheduledTaskId,
+        now_ms: i64,
+    ) -> VibexResult<Option<vibex_core::ScheduledTaskRun>> {
+        self.handle.claim_due(task_id, now_ms)
+    }
+}
+
 #[async_trait]
 impl RemoteWorktreeSnapshotSource for GitHandle {
     async fn worktree_eligibility(
@@ -1315,6 +1398,10 @@ impl DesktopRuntime {
         let remote_dispatcher = remote_dispatcher
             .with_runtime_option_catalog_source(runtime_catalog.clone())
             .with_agent_auth_context_source(auth_contexts.clone())
+            .with_scheduled_task_source(Arc::new(ScheduledTaskSource::new(ScheduledHandle {
+                db_path: db_path.clone(),
+                mutation_guard: ManagementMutationGuard::default(),
+            })))
             .with_agent_runtime_probe_source(Arc::new(providers.clone()))
             .with_sidebar_organization_source(sidebar_organization.clone())
             .with_timeline_display_settings_source(timeline_display_settings.clone());

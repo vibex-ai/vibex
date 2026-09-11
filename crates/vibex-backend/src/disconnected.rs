@@ -32,7 +32,10 @@ use vibex_core::{
     RemoteCreatePairingCodeResponse, RemoteCreatePairingOfferRequest,
     RemoteCreatePairingOfferResponse, RemoteDeviceDetail, RemotePairingOfferSummary,
     RemoteRevokeDeviceRequest, RenameAgentSessionRequest, ReplaceUserMessagePayload,
-    ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest,
+    ResolveElicitationRequest, ResolvePermissionRequest, ScheduledTaskAttentionListRequest,
+    ScheduledTaskAttentionSummary, ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord,
+    ScheduledTaskCreateRequest, ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun,
+    ScheduledTaskRunListRequest, ScheduledTaskUpdateRequest, SendAgentMessageRequest,
     SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, Skill, SkillAgentMatrix,
     SkillAgentMatrixListRequest, SkillCreateRequest, SkillDeleteRequest, SkillDiscoverRequest,
     SkillDiscoveryResponse, SkillImportRequest, SkillImportResult, SkillSetAgentMatrixRequest,
@@ -778,6 +781,68 @@ impl ManagementBackend for DisconnectedBackend {
         &self,
         _request: HookInstallPreviewRequest,
     ) -> BackendFuture<'_, HookInstallPreview> {
+        disconnected_future!()
+    }
+
+    fn scheduled_tasks(
+        &self,
+        _request: ScheduledTaskListRequest,
+    ) -> BackendFuture<'_, Vec<vibex_core::ScheduledTask>> {
+        disconnected_future!()
+    }
+
+    fn create_scheduled_task(
+        &self,
+        _request: MutationRequest<ScheduledTaskCreateRequest>,
+    ) -> BackendFuture<'_, vibex_core::ScheduledTask> {
+        disconnected_future!()
+    }
+
+    fn update_scheduled_task(
+        &self,
+        _request: MutationRequest<ScheduledTaskUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::ScheduledTask> {
+        disconnected_future!()
+    }
+
+    fn set_scheduled_task_status(
+        &self,
+        _task_id: ScheduledTaskId,
+        _paused: bool,
+    ) -> BackendFuture<'_, vibex_core::ScheduledTask> {
+        disconnected_future!()
+    }
+
+    fn delete_scheduled_task(&self, _task_id: ScheduledTaskId) -> BackendFuture<'_, ()> {
+        disconnected_future!()
+    }
+
+    fn scheduled_task_runs(
+        &self,
+        _request: ScheduledTaskRunListRequest,
+    ) -> BackendFuture<'_, Vec<ScheduledTaskRun>> {
+        disconnected_future!()
+    }
+
+    fn scheduled_task_attention(
+        &self,
+        _request: ScheduledTaskAttentionListRequest,
+    ) -> BackendFuture<'_, Vec<ScheduledTaskAttentionSummary>> {
+        disconnected_future!()
+    }
+
+    fn scheduled_task_audit(
+        &self,
+        _request: ScheduledTaskAuditListRequest,
+    ) -> BackendFuture<'_, Vec<ScheduledTaskAuditRecord>> {
+        disconnected_future!()
+    }
+
+    fn claim_due_scheduled_task(
+        &self,
+        _task_id: ScheduledTaskId,
+        _now_ms: i64,
+    ) -> BackendFuture<'_, Option<ScheduledTaskRun>> {
         disconnected_future!()
     }
 

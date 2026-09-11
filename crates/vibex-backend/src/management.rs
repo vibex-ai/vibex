@@ -23,10 +23,14 @@ use vibex_core::{
     PromptValidationResult, ProviderCapabilitySummary, ProviderCredentialSecretMutationRequest,
     ProviderHealthSummary, ProviderProfileId, ProviderProfileSummary,
     ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
-    ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, RelayPeerId, RelayRoomId, Skill,
-    SkillAgentMatrix, SkillAgentMatrixListRequest, SkillCreateRequest, SkillDeleteRequest,
-    SkillDiscoverRequest, SkillDiscoveryResponse, SkillImportRequest, SkillImportResult,
-    SkillSetAgentMatrixRequest, SkillUpdateRequest, SkillValidateRequest, SkillValidationResult,
+    ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, RelayPeerId, RelayRoomId,
+    ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
+    ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord, ScheduledTaskCreateRequest,
+    ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun, ScheduledTaskRunListRequest,
+    ScheduledTaskUpdateRequest, Skill, SkillAgentMatrix, SkillAgentMatrixListRequest,
+    SkillCreateRequest, SkillDeleteRequest, SkillDiscoverRequest, SkillDiscoveryResponse,
+    SkillImportRequest, SkillImportResult, SkillSetAgentMatrixRequest, SkillUpdateRequest,
+    SkillValidateRequest, SkillValidationResult,
 };
 
 use crate::{BackendBound, BackendFuture, MutationRequest};
@@ -239,6 +243,50 @@ pub trait ManagementBackend: BackendBound {
         &self,
         request: MutationRequest<McpServerImportRequest>,
     ) -> BackendFuture<'_, McpServerImportResult>;
+
+    fn scheduled_tasks(
+        &self,
+        request: ScheduledTaskListRequest,
+    ) -> BackendFuture<'_, Vec<vibex_core::ScheduledTask>>;
+
+    fn create_scheduled_task(
+        &self,
+        request: MutationRequest<ScheduledTaskCreateRequest>,
+    ) -> BackendFuture<'_, vibex_core::ScheduledTask>;
+
+    fn update_scheduled_task(
+        &self,
+        request: MutationRequest<ScheduledTaskUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::ScheduledTask>;
+
+    fn set_scheduled_task_status(
+        &self,
+        task_id: ScheduledTaskId,
+        paused: bool,
+    ) -> BackendFuture<'_, vibex_core::ScheduledTask>;
+
+    fn delete_scheduled_task(&self, task_id: ScheduledTaskId) -> BackendFuture<'_, ()>;
+
+    fn scheduled_task_runs(
+        &self,
+        request: ScheduledTaskRunListRequest,
+    ) -> BackendFuture<'_, Vec<ScheduledTaskRun>>;
+
+    fn scheduled_task_attention(
+        &self,
+        request: ScheduledTaskAttentionListRequest,
+    ) -> BackendFuture<'_, Vec<ScheduledTaskAttentionSummary>>;
+
+    fn scheduled_task_audit(
+        &self,
+        request: ScheduledTaskAuditListRequest,
+    ) -> BackendFuture<'_, Vec<ScheduledTaskAuditRecord>>;
+
+    fn claim_due_scheduled_task(
+        &self,
+        task_id: ScheduledTaskId,
+        now_ms: i64,
+    ) -> BackendFuture<'_, Option<ScheduledTaskRun>>;
 
     fn validate_mcp_server(
         &self,

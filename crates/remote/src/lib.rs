@@ -129,6 +129,7 @@ struct RemoteRouterState {
     runtime_catalog: Option<Arc<dyn RemoteRuntimeOptionCatalogSource>>,
     runtime_probes: Option<Arc<dyn RemoteAgentRuntimeProbeSource>>,
     agent_auth_contexts: Option<Arc<dyn RemoteAgentAuthContextSource>>,
+    scheduled_tasks: Option<Arc<dyn RemoteScheduledTaskSource>>,
     sidebar_organization: Option<Arc<dyn RemoteSidebarOrganizationSource>>,
     workbench: Option<RemoteWorkbenchRuntime>,
     provider: Option<RemoteProviderRuntime>,
@@ -228,6 +229,59 @@ pub trait RemoteAgentRuntimeProbeSource: Send + Sync {
     ) -> VibexResult<vibex_core::AgentRuntimeProbeRecord>;
 }
 
+/// Authority-side scheduled-task management consumed by the gateway.
+///
+/// `vibex-remote` sits below `vibex-desktop-runtime`, so it cannot construct the
+/// runtime's management handles itself. The runtime installs this source, which
+/// keeps one implementation for both the local and headless seats.
+#[async_trait]
+pub trait RemoteScheduledTaskSource: Send + Sync {
+    async fn list(
+        &self,
+        request: vibex_core::ScheduledTaskListRequest,
+    ) -> VibexResult<Vec<vibex_core::ScheduledTask>>;
+
+    async fn create(
+        &self,
+        request: vibex_core::ScheduledTaskCreateRequest,
+    ) -> VibexResult<vibex_core::ScheduledTask>;
+
+    async fn update(
+        &self,
+        request: vibex_core::ScheduledTaskUpdateRequest,
+    ) -> VibexResult<vibex_core::ScheduledTask>;
+
+    async fn set_status(
+        &self,
+        task_id: &vibex_core::ScheduledTaskId,
+        paused: bool,
+    ) -> VibexResult<vibex_core::ScheduledTask>;
+
+    async fn delete(&self, task_id: &vibex_core::ScheduledTaskId) -> VibexResult<()>;
+
+    async fn list_runs(
+        &self,
+        request: vibex_core::ScheduledTaskRunListRequest,
+    ) -> VibexResult<Vec<vibex_core::ScheduledTaskRun>>;
+
+    async fn list_attention(
+        &self,
+        request: vibex_core::ScheduledTaskAttentionListRequest,
+    ) -> VibexResult<Vec<vibex_core::ScheduledTaskAttentionSummary>>;
+
+    async fn list_audit(
+        &self,
+        request: vibex_core::ScheduledTaskAuditListRequest,
+    ) -> VibexResult<Vec<vibex_core::ScheduledTaskAuditRecord>>;
+
+    /// Claims one due task through the same atomic path the scheduler uses.
+    async fn claim_due(
+        &self,
+        task_id: &vibex_core::ScheduledTaskId,
+        now_ms: i64,
+    ) -> VibexResult<Option<vibex_core::ScheduledTaskRun>>;
+}
+
 #[async_trait]
 pub trait RemoteWorktreeSnapshotSource: Send + Sync {
     async fn worktree_eligibility(
@@ -319,6 +373,7 @@ impl RemoteRouterState {
             runtime_catalog: None,
             runtime_probes: None,
             agent_auth_contexts: None,
+            scheduled_tasks: None,
             sidebar_organization: None,
             workbench: None,
             provider: None,
@@ -337,6 +392,7 @@ impl RemoteRouterState {
             runtime_catalog: None,
             runtime_probes: None,
             agent_auth_contexts: None,
+            scheduled_tasks: None,
             sidebar_organization: None,
             workbench: None,
             provider: None,
@@ -360,6 +416,7 @@ impl RemoteRouterState {
             runtime_catalog: None,
             runtime_probes: None,
             agent_auth_contexts: None,
+            scheduled_tasks: None,
             sidebar_organization: None,
             workbench: Some(workbench),
             provider: Some(provider),
@@ -385,6 +442,7 @@ impl RemoteRouterState {
             runtime_catalog: None,
             runtime_probes: None,
             agent_auth_contexts: None,
+            scheduled_tasks: None,
             sidebar_organization: None,
             workbench: Some(workbench),
             provider: Some(provider),
@@ -533,6 +591,10 @@ impl RemoteDispatcher {
         self.state.timeline_display_settings.is_some()
     }
 
+    pub fn has_scheduled_task_source(&self) -> bool {
+        self.state.scheduled_tasks.is_some()
+    }
+
     pub fn with_sidebar_organization_source(
         mut self,
         source: Arc<dyn RemoteSidebarOrganizationSource>,
@@ -555,6 +617,15 @@ impl RemoteDispatcher {
     ) -> Self {
         self.state.agent_auth_contexts = Some(source);
         self.state.capabilities.supports_agent_account_auth = true;
+        self
+    }
+
+    pub fn with_scheduled_task_source(
+        mut self,
+        source: Arc<dyn RemoteScheduledTaskSource>,
+    ) -> Self {
+        self.state.scheduled_tasks = Some(source);
+        self.state.capabilities.supports_scheduled_tasks = true;
         self
     }
 
@@ -1180,6 +1251,7 @@ async fn handle_request(
         | RemoteOperationKind::Git
         | RemoteOperationKind::Terminal => handle_workbench_request(state, request).await,
         RemoteOperationKind::ProviderSettings => handle_provider_request(state, request).await,
+        RemoteOperationKind::ScheduledTasks => handle_scheduled_request(state, request).await,
         _ => unsupported_operation_response(request),
     }
 }
@@ -1396,6 +1468,159 @@ fn decode_provider_request(request: &RemoteRequestEnvelope) -> VibexResult<Remot
         )
         .with_diagnostic("error", err.to_string())
     })
+}
+
+async fn handle_scheduled_request(
+    state: &RemoteRouterState,
+    request: RemoteRequestEnvelope,
+) -> RemoteResponseEnvelope {
+    let request_id = request.request_id.clone();
+    let correlation_id = request.correlation_id.clone();
+    let payload = request.payload.clone().unwrap_or(serde_json::Value::Null);
+    let decoded = match serde_json::from_value::<vibex_core::RemoteScheduledRequest>(payload) {
+        Ok(decoded) => decoded,
+        Err(_) => {
+            return unsupported_operation_response(request);
+        }
+    };
+    match dispatch_scheduled_request(state, request_id, correlation_id, decoded).await {
+        Ok(payload) => {
+            RemoteResponseEnvelope::ok(request.request_id, request.correlation_id, payload)
+        }
+        Err(error) => {
+            RemoteResponseEnvelope::error(request.request_id, request.correlation_id, error)
+        }
+    }
+}
+
+async fn dispatch_scheduled_request(
+    state: &RemoteRouterState,
+    request_id: RequestId,
+    correlation_id: Option<vibex_core::CorrelationId>,
+    request: vibex_core::RemoteScheduledRequest,
+) -> VibexResult<serde_json::Value> {
+    let provider = state.provider.as_ref().ok_or_else(|| {
+        VibexError::capability(
+            "remote_scheduled_tasks_unavailable",
+            "scheduled task management is not available on this service",
+        )
+    })?;
+    let source = state.scheduled_tasks.as_ref().ok_or_else(|| {
+        VibexError::capability(
+            "remote_scheduled_tasks_unavailable",
+            "scheduled task management is not available on this service",
+        )
+    })?;
+    let mutate = request.is_mutation();
+    let action = if mutate {
+        RemoteActionClass::MutateProviderSettings
+    } else {
+        RemoteActionClass::ReadProviderSettings
+    };
+    macro_rules! authorize {
+        ($auth:expr) => {
+            authorize_provider_action(
+                provider,
+                $auth,
+                action,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?
+        };
+    }
+    // The audit trail records which device changed the authoritative task store.
+    macro_rules! audited {
+        ($auth:expr, $label:expr, $result:expr) => {{
+            let auth = authorize!($auth);
+            let result = $result;
+            audit_provider_mutation(
+                provider,
+                &auth,
+                $label.to_string(),
+                "Scheduled task changed from a paired device",
+                result.is_ok(),
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            result?
+        }};
+    }
+    match request {
+        vibex_core::RemoteScheduledRequest::List(request) => {
+            authorize!(request.auth);
+            let tasks = source.list(request.request).await?;
+            serde_json::to_value(vibex_core::RemoteScheduledListResponse { tasks })
+                .map_err(remote_payload_encode_error)
+        }
+        vibex_core::RemoteScheduledRequest::Create(request) => {
+            let task_id = request.request.title.clone();
+            let task = audited!(
+                request.auth,
+                format!("scheduled_task:{task_id}"),
+                source.create(request.request).await
+            );
+            serde_json::to_value(vibex_core::RemoteScheduledTaskResponse { task })
+                .map_err(remote_payload_encode_error)
+        }
+        vibex_core::RemoteScheduledRequest::Update(request) => {
+            let task_id = request.request.id.clone();
+            let task = audited!(
+                request.auth,
+                format!("scheduled_task:{task_id}"),
+                source.update(request.request).await
+            );
+            serde_json::to_value(vibex_core::RemoteScheduledTaskResponse { task })
+                .map_err(remote_payload_encode_error)
+        }
+        vibex_core::RemoteScheduledRequest::SetStatus(request) => {
+            let task_id = request.task_id.clone();
+            let task = audited!(
+                request.auth,
+                format!("scheduled_task:{task_id}"),
+                source.set_status(&request.task_id, request.paused).await
+            );
+            serde_json::to_value(vibex_core::RemoteScheduledTaskResponse { task })
+                .map_err(remote_payload_encode_error)
+        }
+        vibex_core::RemoteScheduledRequest::Delete(request) => {
+            let task_id = request.task_id.clone();
+            audited!(
+                request.auth,
+                format!("scheduled_task:{task_id}"),
+                source.delete(&request.task_id).await
+            );
+            serde_json::to_value(vibex_core::RemoteScheduledDeleteResponse { deleted: true })
+                .map_err(remote_payload_encode_error)
+        }
+        vibex_core::RemoteScheduledRequest::ListRuns(request) => {
+            authorize!(request.auth);
+            let runs = source.list_runs(request.request).await?;
+            serde_json::to_value(vibex_core::RemoteScheduledRunListResponse { runs })
+                .map_err(remote_payload_encode_error)
+        }
+        vibex_core::RemoteScheduledRequest::ListAttention(request) => {
+            authorize!(request.auth);
+            let attention = source.list_attention(request.request).await?;
+            serde_json::to_value(vibex_core::RemoteScheduledAttentionListResponse { attention })
+                .map_err(remote_payload_encode_error)
+        }
+        vibex_core::RemoteScheduledRequest::ListAudit(request) => {
+            authorize!(request.auth);
+            let audit = source.list_audit(request.request).await?;
+            serde_json::to_value(vibex_core::RemoteScheduledAuditListResponse { audit })
+                .map_err(remote_payload_encode_error)
+        }
+        vibex_core::RemoteScheduledRequest::ClaimDue(request) => {
+            let task_id = request.task_id.clone();
+            let run = audited!(
+                request.auth,
+                format!("scheduled_task:{task_id}"),
+                source.claim_due(&request.task_id, request.now_ms).await
+            );
+            serde_json::to_value(vibex_core::RemoteScheduledClaimDueResponse { run })
+                .map_err(remote_payload_encode_error)
+        }
+    }
 }
 
 async fn dispatch_provider_request(
@@ -6196,6 +6421,7 @@ mod tests {
                 runtime_catalog: None,
                 runtime_probes: None,
                 agent_auth_contexts: None,
+                scheduled_tasks: None,
                 sidebar_organization: None,
                 workbench: None,
                 provider: None,

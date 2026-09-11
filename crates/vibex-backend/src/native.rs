@@ -38,7 +38,10 @@ use vibex_core::{
     RemoteAuditRecord, RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
     RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeviceDetail,
     RemoteRevokeDeviceRequest, RenameAgentSessionRequest, ReplaceUserMessagePayload,
-    ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest,
+    ResolveElicitationRequest, ResolvePermissionRequest, ScheduledTaskAttentionListRequest,
+    ScheduledTaskAttentionSummary, ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord,
+    ScheduledTaskCreateRequest, ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun,
+    ScheduledTaskRunListRequest, ScheduledTaskUpdateRequest, SendAgentMessageRequest,
     SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, Skill, SkillAgentMatrix,
     SkillAgentMatrixListRequest, SkillCreateRequest, SkillDeleteRequest, SkillDiscoverRequest,
     SkillDiscoveryResponse, SkillImportRequest, SkillImportResult, SkillSetAgentMatrixRequest,
@@ -2309,6 +2312,144 @@ impl ManagementBackend for NativeBackend {
                 .providers()
                 .management()
                 .preview_hook_install(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn scheduled_tasks(
+        &self,
+        request: ScheduledTaskListRequest,
+    ) -> BackendFuture<'_, Vec<vibex_core::ScheduledTask>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .scheduled()
+                .list(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn create_scheduled_task(
+        &self,
+        request: MutationRequest<ScheduledTaskCreateRequest>,
+    ) -> BackendFuture<'_, vibex_core::ScheduledTask> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .scheduled()
+                .create(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn update_scheduled_task(
+        &self,
+        request: MutationRequest<ScheduledTaskUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::ScheduledTask> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .scheduled()
+                .update(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn set_scheduled_task_status(
+        &self,
+        task_id: ScheduledTaskId,
+        paused: bool,
+    ) -> BackendFuture<'_, vibex_core::ScheduledTask> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            if paused {
+                runtime.management().scheduled().pause(&task_id)
+            } else {
+                runtime.management().scheduled().resume(&task_id)
+            }
+            .map_err(Into::into)
+        })
+    }
+
+    fn delete_scheduled_task(&self, task_id: ScheduledTaskId) -> BackendFuture<'_, ()> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .scheduled()
+                .delete(&task_id)
+                .map(|_| ())
+                .map_err(Into::into)
+        })
+    }
+
+    fn scheduled_task_runs(
+        &self,
+        request: ScheduledTaskRunListRequest,
+    ) -> BackendFuture<'_, Vec<ScheduledTaskRun>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .scheduled()
+                .list_runs(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn scheduled_task_attention(
+        &self,
+        request: ScheduledTaskAttentionListRequest,
+    ) -> BackendFuture<'_, Vec<ScheduledTaskAttentionSummary>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .scheduled()
+                .list_attention(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn scheduled_task_audit(
+        &self,
+        request: ScheduledTaskAuditListRequest,
+    ) -> BackendFuture<'_, Vec<ScheduledTaskAuditRecord>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .scheduled()
+                .list_audit(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn claim_due_scheduled_task(
+        &self,
+        task_id: ScheduledTaskId,
+        now_ms: i64,
+    ) -> BackendFuture<'_, Option<ScheduledTaskRun>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .scheduled()
+                .claim_due(&task_id, now_ms)
                 .map_err(Into::into)
         })
     }

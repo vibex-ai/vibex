@@ -4736,6 +4736,7 @@ fn operation_from_wire(operation: &str) -> Option<RemoteOperationKind> {
         "terminal" => Some(RemoteOperationKind::Terminal),
         "provider_settings" => Some(RemoteOperationKind::ProviderSettings),
         "device_management" => Some(RemoteOperationKind::DeviceManagement),
+        "scheduled_tasks" => Some(RemoteOperationKind::ScheduledTasks),
         _ => None,
     }
 }
@@ -4795,6 +4796,7 @@ fn mutation_event_domain(operation: RemoteOperationKind) -> Option<&'static str>
         RemoteOperationKind::Git => Some("git"),
         RemoteOperationKind::ProviderSettings => Some("provider"),
         RemoteOperationKind::DeviceManagement => Some("device"),
+        RemoteOperationKind::ScheduledTasks => Some("scheduled"),
         RemoteOperationKind::Handshake
         | RemoteOperationKind::Health
         | RemoteOperationKind::Info
@@ -5463,6 +5465,9 @@ fn gateway_features(state: &GatewayState) -> Vec<String> {
         .unwrap_or(false)
     {
         features.push("device_pairing".to_string());
+    }
+    if state.dispatcher.has_scheduled_task_source() {
+        features.push("scheduled_tasks".to_string());
     }
     features
 }

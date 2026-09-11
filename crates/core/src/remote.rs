@@ -64,6 +64,12 @@ use crate::runtime::{
     DetachRuntimeResponse, GetRuntimeEventsRequest, RuntimeEventBatch, RuntimeProcessSnapshot,
     SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest,
 };
+use crate::scheduled_task::{
+    ScheduledTask, ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
+    ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord, ScheduledTaskCreateRequest,
+    ScheduledTaskListRequest, ScheduledTaskRun, ScheduledTaskRunListRequest,
+    ScheduledTaskUpdateRequest,
+};
 use crate::terminal::{
     TerminalCreateRequest, TerminalResizeRequest, TerminalSession, TerminalSnapshot,
     TerminalWriteRequest,
@@ -115,6 +121,10 @@ pub struct RemoteCapabilitySummary {
     /// exposed to full-control devices. Older runtimes omit the field.
     #[serde(default)]
     pub supports_provider_management: bool,
+    /// Scheduled-task management is exposed to paired devices. Older runtimes
+    /// omit the field.
+    #[serde(default)]
+    pub supports_scheduled_tasks: bool,
     pub live_event_channels: Vec<RemoteLiveEventChannel>,
 }
 
@@ -135,6 +145,7 @@ impl RemoteCapabilitySummary {
             supports_terminal: false,
             supports_provider_settings: false,
             supports_provider_management: false,
+            supports_scheduled_tasks: false,
             live_event_channels: vec![RemoteLiveEventChannel::System],
         }
     }
@@ -2741,7 +2752,175 @@ pub enum RemoteOperationKind {
     Terminal,
     ProviderSettings,
     DeviceManagement,
+    ScheduledTasks,
     Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteScheduledOperationKind {
+    List,
+    Create,
+    Update,
+    SetStatus,
+    Delete,
+    ListRuns,
+    ListAttention,
+    ListAudit,
+    ClaimDue,
+}
+
+/// Scheduled-task management requests.
+///
+/// The authority owns the task store, so the Management Center's Scheduled
+/// section reads and mutates it through these requests.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum RemoteScheduledRequest {
+    List(RemoteScheduledListRequest),
+    Create(RemoteScheduledCreateRequest),
+    Update(RemoteScheduledUpdateRequest),
+    SetStatus(RemoteScheduledSetStatusRequest),
+    Delete(RemoteScheduledDeleteRequest),
+    ListRuns(RemoteScheduledRunListRequest),
+    ListAttention(RemoteScheduledAttentionListRequest),
+    ListAudit(RemoteScheduledAuditListRequest),
+    ClaimDue(RemoteScheduledClaimDueRequest),
+}
+
+impl RemoteScheduledRequest {
+    pub const fn operation_kind(&self) -> RemoteScheduledOperationKind {
+        match self {
+            Self::List(_) => RemoteScheduledOperationKind::List,
+            Self::Create(_) => RemoteScheduledOperationKind::Create,
+            Self::Update(_) => RemoteScheduledOperationKind::Update,
+            Self::SetStatus(_) => RemoteScheduledOperationKind::SetStatus,
+            Self::Delete(_) => RemoteScheduledOperationKind::Delete,
+            Self::ListRuns(_) => RemoteScheduledOperationKind::ListRuns,
+            Self::ListAttention(_) => RemoteScheduledOperationKind::ListAttention,
+            Self::ListAudit(_) => RemoteScheduledOperationKind::ListAudit,
+            Self::ClaimDue(_) => RemoteScheduledOperationKind::ClaimDue,
+        }
+    }
+
+    /// Whether the request mutates the authoritative task store.
+    pub const fn is_mutation(&self) -> bool {
+        matches!(
+            self,
+            Self::Create(_)
+                | Self::Update(_)
+                | Self::SetStatus(_)
+                | Self::Delete(_)
+                | Self::ClaimDue(_)
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteScheduledListRequest {
+    pub auth: RemoteAuthProof,
+    pub request: ScheduledTaskListRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteScheduledListResponse {
+    pub tasks: Vec<ScheduledTask>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteScheduledCreateRequest {
+    pub auth: RemoteAuthProof,
+    pub request: ScheduledTaskCreateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteScheduledUpdateRequest {
+    pub auth: RemoteAuthProof,
+    pub request: ScheduledTaskUpdateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteScheduledSetStatusRequest {
+    pub auth: RemoteAuthProof,
+    pub task_id: crate::ids::ScheduledTaskId,
+    pub paused: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteScheduledDeleteRequest {
+    pub auth: RemoteAuthProof,
+    pub task_id: crate::ids::ScheduledTaskId,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteScheduledRunListRequest {
+    pub auth: RemoteAuthProof,
+    pub request: ScheduledTaskRunListRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteScheduledRunListResponse {
+    pub runs: Vec<ScheduledTaskRun>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteScheduledAttentionListRequest {
+    pub auth: RemoteAuthProof,
+    pub request: ScheduledTaskAttentionListRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteScheduledAttentionListResponse {
+    pub attention: Vec<ScheduledTaskAttentionSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteScheduledAuditListRequest {
+    pub auth: RemoteAuthProof,
+    pub request: ScheduledTaskAuditListRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteScheduledAuditListResponse {
+    pub audit: Vec<ScheduledTaskAuditRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteScheduledClaimDueRequest {
+    pub auth: RemoteAuthProof,
+    pub task_id: crate::ids::ScheduledTaskId,
+    pub now_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteScheduledTaskResponse {
+    pub task: ScheduledTask,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteScheduledClaimDueResponse {
+    pub run: Option<ScheduledTaskRun>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteScheduledDeleteResponse {
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

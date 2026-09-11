@@ -1172,6 +1172,10 @@ mod tests {
         McpServerImportResult, McpServerSetAgentMatrixRequest, McpServerUpdateRequest,
         McpServerValidateRequest, McpServerValidationResult, ProviderCapabilitySummary,
         ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
+        ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
+        ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord, ScheduledTaskCreateRequest,
+        ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun, ScheduledTaskRunListRequest,
+        ScheduledTaskUpdateRequest,
     };
 
     fn error_future<T: 'static>() -> BackendFuture<'static, T> {
@@ -1467,6 +1471,68 @@ mod tests {
             &self,
             _request: MutationRequest<McpServerImportRequest>,
         ) -> BackendFuture<'_, McpServerImportResult> {
+            error_future()
+        }
+
+        fn scheduled_tasks(
+            &self,
+            _request: ScheduledTaskListRequest,
+        ) -> BackendFuture<'_, Vec<vibex_core::ScheduledTask>> {
+            error_future()
+        }
+
+        fn create_scheduled_task(
+            &self,
+            _request: MutationRequest<ScheduledTaskCreateRequest>,
+        ) -> BackendFuture<'_, vibex_core::ScheduledTask> {
+            error_future()
+        }
+
+        fn update_scheduled_task(
+            &self,
+            _request: MutationRequest<ScheduledTaskUpdateRequest>,
+        ) -> BackendFuture<'_, vibex_core::ScheduledTask> {
+            error_future()
+        }
+
+        fn set_scheduled_task_status(
+            &self,
+            _task_id: ScheduledTaskId,
+            _paused: bool,
+        ) -> BackendFuture<'_, vibex_core::ScheduledTask> {
+            error_future()
+        }
+
+        fn delete_scheduled_task(&self, _task_id: ScheduledTaskId) -> BackendFuture<'_, ()> {
+            error_future()
+        }
+
+        fn scheduled_task_runs(
+            &self,
+            _request: ScheduledTaskRunListRequest,
+        ) -> BackendFuture<'_, Vec<ScheduledTaskRun>> {
+            error_future()
+        }
+
+        fn scheduled_task_attention(
+            &self,
+            _request: ScheduledTaskAttentionListRequest,
+        ) -> BackendFuture<'_, Vec<ScheduledTaskAttentionSummary>> {
+            error_future()
+        }
+
+        fn scheduled_task_audit(
+            &self,
+            _request: ScheduledTaskAuditListRequest,
+        ) -> BackendFuture<'_, Vec<ScheduledTaskAuditRecord>> {
+            error_future()
+        }
+
+        fn claim_due_scheduled_task(
+            &self,
+            _task_id: ScheduledTaskId,
+            _now_ms: i64,
+        ) -> BackendFuture<'_, Option<ScheduledTaskRun>> {
             error_future()
         }
 
