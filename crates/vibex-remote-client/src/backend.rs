@@ -4956,12 +4956,27 @@ impl DeviceBackend for WebRemoteBackend {
 
     fn audit_records(
         &self,
-        _request: RemoteAuditListRequest,
+        request: RemoteAuditListRequest,
     ) -> BackendFuture<'_, Vec<RemoteAuditRecord>> {
-        self.unsupported(
-            "remote_audit_unavailable",
-            "remote audit administration remains local to the desktop",
-        )
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = vibex_core::RemoteDeviceRequest::ListAudit(
+                vibex_core::RemoteDeviceAuditListRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::DeviceManagement,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteDeviceAuditListResponse>(value)?.records)
+        })
     }
 }
 
@@ -5362,6 +5377,10 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
                 (
                     BackendOperation::DeviceRevoke,
                     permits(RemoteActionClass::MutateDeviceManagement),
+                ),
+                (
+                    BackendOperation::DeviceAudit,
+                    permits(RemoteActionClass::ReadDeviceManagement),
                 ),
             ])
         } else {

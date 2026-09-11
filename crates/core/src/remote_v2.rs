@@ -1139,6 +1139,7 @@ pub enum RemoteDeviceOperationKind {
     CancelPairingOffer,
     ListDevices,
     RevokeDevice,
+    ListAudit,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1239,6 +1240,24 @@ pub enum RemoteDeviceRequest {
     CancelPairingOffer(RemoteDeviceCancelPairingOfferRequest),
     ListDevices(RemoteDeviceListRequest),
     RevokeDevice(RemoteDeviceRevokeRequest),
+    ListAudit(RemoteDeviceAuditListRequest),
+}
+
+/// Reads the trust-service audit trail for paired devices.
+///
+/// The Management Center shows an audit count next to the device list, and the
+/// records live in the authority's trust store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDeviceAuditListRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::remote::RemoteAuditListRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDeviceAuditListResponse {
+    pub records: Vec<crate::remote::RemoteAuditRecord>,
 }
 
 impl RemoteDeviceRequest {
@@ -1248,6 +1267,7 @@ impl RemoteDeviceRequest {
             Self::CancelPairingOffer(_) => RemoteDeviceOperationKind::CancelPairingOffer,
             Self::ListDevices(_) => RemoteDeviceOperationKind::ListDevices,
             Self::RevokeDevice(_) => RemoteDeviceOperationKind::RevokeDevice,
+            Self::ListAudit(_) => RemoteDeviceOperationKind::ListAudit,
         }
     }
 }

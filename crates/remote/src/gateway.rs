@@ -4442,6 +4442,10 @@ fn process_device_management_rpc(
             request.auth.clone(),
             RemoteActionClass::MutateDeviceManagement,
         ),
+        RemoteDeviceRequest::ListAudit(request) => (
+            request.auth.clone(),
+            RemoteActionClass::ReadDeviceManagement,
+        ),
     };
     let auth = authorize_device_management(
         &connection,
@@ -4465,6 +4469,10 @@ fn process_device_management_rpc(
                 request.request,
                 &state.pairing_routes,
             )?)
+        }
+        RemoteDeviceRequest::ListAudit(request) => {
+            let records = vibex_db::RemoteAuditRepository::list(&connection, &request.request)?;
+            serde_json::to_value(vibex_core::RemoteDeviceAuditListResponse { records })
         }
         RemoteDeviceRequest::CancelPairingOffer(request) => serde_json::to_value(
             RemoteTrustService::cancel_pairing_offer(&connection, request.request)?,
