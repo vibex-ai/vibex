@@ -4373,7 +4373,7 @@ impl ManagementCenter {
     }
 
     fn run_provider_health_probe(&mut self, cx: &mut Context<Self>) {
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         let active_locale = locale::current_locale();
@@ -4381,14 +4381,16 @@ impl ManagementCenter {
             ManagementMutation::ProviderProbe("health".into()),
             cx,
             async move {
-                runtime
+                backend
                     .management()
-                    .providers()
-                    .management()
-                    .run_health_probes(vibex_core::ProviderRunHealthProbesRequest {
-                        provider_profile_ids: None,
-                        probe_kinds: None,
-                    })
+                    .run_health_probes(MutationRequest::new(
+                        vibex_core::ProviderRunHealthProbesRequest {
+                            provider_profile_ids: None,
+                            probe_kinds: None,
+                        },
+                    ))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)
                     .map(|result| match active_locale {
                         ResolvedLocale::En => {
                             format!("Completed {} health probe(s)", result.results.len())
@@ -4405,7 +4407,7 @@ impl ManagementCenter {
     }
 
     fn run_provider_capability_probe(&mut self, cx: &mut Context<Self>) {
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         let active_locale = locale::current_locale();
@@ -4413,14 +4415,16 @@ impl ManagementCenter {
             ManagementMutation::ProviderProbe("capability".into()),
             cx,
             async move {
-                runtime
+                backend
                     .management()
-                    .providers()
-                    .management()
-                    .run_capability_probes(vibex_core::ProviderRunCapabilityProbesRequest {
-                        provider_profile_ids: None,
-                        force_refresh: true,
-                    })
+                    .run_capability_probes(MutationRequest::new(
+                        vibex_core::ProviderRunCapabilityProbesRequest {
+                            provider_profile_ids: None,
+                            force_refresh: true,
+                        },
+                    ))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)
                     .map(|result| match active_locale {
                         ResolvedLocale::En => {
                             format!("Completed {} capability probe(s)", result.results.len())
@@ -5923,20 +5927,20 @@ impl ManagementCenter {
     }
 
     fn discover_mcp_servers(&mut self, cx: &mut Context<Self>) {
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         self.mutation = Some(ManagementMutation::McpAction("discover".into()));
         self.error = None;
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
-                .management()
-                .providers()
+            backend
                 .management()
                 .discover_mcp_sources(vibex_core::McpServerDiscoverRequest {
                     source_agent_id: None,
                 })
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
         });
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
@@ -5994,7 +5998,7 @@ impl ManagementCenter {
         let Some(selection) = mcp_import_selection_from_discovery(item) else {
             return;
         };
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         let mutation = ManagementMutation::McpAction(format!("import:{discovery_id}"));
@@ -6003,13 +6007,13 @@ impl ManagementCenter {
         let active_locale = locale::current_locale();
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
+            backend
                 .management()
-                .providers()
-                .management()
-                .import_mcp_servers(vibex_core::McpServerImportRequest {
+                .import_mcp_servers(MutationRequest::new(vibex_core::McpServerImportRequest {
                     selections: vec![selection],
-                })
+                }))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
         });
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
@@ -6182,7 +6186,7 @@ impl ManagementCenter {
     }
 
     fn discover_skills(&mut self, cx: &mut Context<Self>) {
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         let workspace_id = self.pairing_workspace_id.clone().or_else(|| {
@@ -6201,14 +6205,14 @@ impl ManagementCenter {
         self.error = None;
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
-                .management()
-                .providers()
+            backend
                 .management()
                 .discover_skill_sources(vibex_core::SkillDiscoverRequest {
                     source_agent_id: None,
                     workspace_id,
                 })
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
         });
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
@@ -6266,7 +6270,7 @@ impl ManagementCenter {
         let Some(selection) = skill_import_selection_from_discovery(item) else {
             return;
         };
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         self.mutation = Some(ManagementMutation::SkillAction(format!(
@@ -6276,11 +6280,13 @@ impl ManagementCenter {
         let active_locale = locale::current_locale();
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime.management().providers().management().import_skills(
-                vibex_core::SkillImportRequest {
+            backend
+                .management()
+                .import_skills(MutationRequest::new(vibex_core::SkillImportRequest {
                     selections: vec![selection],
-                },
-            )
+                }))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
         });
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
@@ -6467,18 +6473,16 @@ impl ManagementCenter {
         } else {
             body
         };
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         self.begin_simple_task(
             ManagementMutation::PromptAction("create".into()),
             cx,
             async move {
-                runtime
+                backend
                     .management()
-                    .providers()
-                    .management()
-                    .create_prompt(vibex_core::PromptCreateRequest {
+                    .create_prompt(MutationRequest::new(vibex_core::PromptCreateRequest {
                         display_name,
                         kind: vibex_core::PromptKind::ReusablePrompt,
                         status: vibex_core::PromptStatus::Enabled,
@@ -6488,7 +6492,9 @@ impl ManagementCenter {
                         body,
                         description: None,
                         tags: Vec::new(),
-                    })
+                    }))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)
                     .map(|prompt| match active_locale {
                         ResolvedLocale::En => format!("Created Prompt {}", prompt.display_name),
                         ResolvedLocale::ZhCn => format!("已创建提示词 {}", prompt.display_name),
@@ -6512,18 +6518,16 @@ impl ManagementCenter {
             .selected_management_provider_profile()
             .map(|profile| profile.kind)
             .unwrap_or(ProviderKind::Acp);
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         self.begin_simple_task(
             ManagementMutation::HookAction("create".into()),
             cx,
             async move {
-                runtime
+                backend
                     .management()
-                    .providers()
-                    .management()
-                    .create_hook(vibex_core::HookCreateRequest {
+                    .create_hook(MutationRequest::new(vibex_core::HookCreateRequest {
                         display_name,
                         provider_kind,
                         event_kind: vibex_core::HookEventKind::PermissionRequest,
@@ -6531,7 +6535,9 @@ impl ManagementCenter {
                         command_preview: (!command_preview.is_empty()).then_some(command_preview),
                         managed_marker: None,
                         description: None,
-                    })
+                    }))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)
                     .map(|hook| match active_locale {
                         ResolvedLocale::En => format!("Created Hook {}", hook.display_name),
                         ResolvedLocale::ZhCn => format!("已创建 Hook {}", hook.display_name),
@@ -6749,7 +6755,7 @@ impl ManagementCenter {
                 return;
             }
         };
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             self.error = Some(
                 management_error_text(
                     "Management runtime is not connected",
@@ -6765,10 +6771,11 @@ impl ManagementCenter {
         self.mutation = Some(ManagementMutation::AutomationSave);
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
+            backend
                 .management()
-                .automation()
-                .replace_definition(request)
+                .replace_automation_definition(MutationRequest::new(request))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
         });
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
@@ -6906,7 +6913,7 @@ impl ManagementCenter {
             nodes,
             edges,
         };
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             self.error = Some(
                 management_error_text(
                     "Management runtime is not connected",
@@ -6922,7 +6929,11 @@ impl ManagementCenter {
         self.mutation = Some(ManagementMutation::AutomationCreate);
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime.management().automation().create(request)
+            backend
+                .management()
+                .create_automation_graph(MutationRequest::new(request))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
         });
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
