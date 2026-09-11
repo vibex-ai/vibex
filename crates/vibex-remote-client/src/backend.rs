@@ -22,18 +22,19 @@ use vibex_core::{
     CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
     FetchTimelineRequest, FileMutationRequest, FileReadRequest, FileReadResponse,
     FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest, FileWriteRequest,
-    ForkAgentSessionRequest, GetMessageSubmissionRequest, GitCommitDetail, GitCommitDetailRequest,
-    GitCommitRequest, GitCommitResult, GitDiffRequest, GitDiffResponse, GitHistoryRequest,
-    GitHistoryResponse, GitProjectEligibility, GitRemoteActionResult, GitStageRequest,
-    GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
-    GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeCreateRequest,
-    GitWorktreeCreateResult, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
-    GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
-    GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeReadinessRecord,
-    GitWorktreeReadinessRequest, GitWorktreeRestoreRequest, MessageSubmissionState,
-    OpenWorkspaceRequest, ProjectId, ProjectWorkspaceSummary, ProviderHealthSummary,
-    ProviderProfileSummary, ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult,
-    RemoteActionClass, RemoteAgentAuthContextListRequest, RemoteAgentAuthContextListResponse,
+    ForkAgentSessionRequest, GetMessageSubmissionRequest, GitBranchListResponse, GitCommitDetail,
+    GitCommitDetailRequest, GitCommitRequest, GitCommitResult, GitDiffRequest, GitDiffResponse,
+    GitHistoryRequest, GitHistoryResponse, GitProjectEligibility, GitRemoteActionRequest,
+    GitRemoteActionResult, GitStageRequest, GitStatusSummary, GitWorktreeArchiveRequest,
+    GitWorktreeAssistanceSessionRequest, GitWorktreeConflictResolveRequest,
+    GitWorktreeConflictStageRequest, GitWorktreeCreateRequest, GitWorktreeCreateResult,
+    GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
+    GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeOperationRecord,
+    GitWorktreeOperationRequest, GitWorktreeReadinessRecord, GitWorktreeReadinessRequest,
+    GitWorktreeRestoreRequest, MessageSubmissionState, OpenWorkspaceRequest, ProjectId,
+    ProjectWorkspaceSummary, ProviderHealthSummary, ProviderProfileSummary,
+    ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, RemoteActionClass,
+    RemoteAgentAuthContextListRequest, RemoteAgentAuthContextListResponse,
     RemoteAgentAuthContextMutationResponse, RemoteAgentAuthLogoutPreviewRequest,
     RemoteAgentAuthLogoutPreviewResponse, RemoteAgentAuthMethodListRequest,
     RemoteAgentAuthMethodListResponse, RemoteAgentAuthenticateContextRequest,
@@ -63,15 +64,16 @@ use vibex_core::{
     RemoteCreatePairingOfferResponse, RemoteDeepLinkResolution,
     RemoteDeviceCancelPairingOfferRequest, RemoteDeviceCreatePairingOfferRequest,
     RemoteDeviceDetail, RemoteDeviceListRequest, RemoteDeviceListResponse, RemoteDeviceRequest,
-    RemoteDeviceRevokeRequest, RemoteFileDeleteResponse, RemoteFileMutationRequest,
-    RemoteFileReadRequest, RemoteFileReadResponse, RemoteFileRenameResponse,
-    RemoteFileSearchRequest, RemoteFileSearchResponse, RemoteFileTreeRequest,
-    RemoteFileTreeResponse, RemoteFileWriteRequest, RemoteFileWriteResponse,
-    RemoteGitCommitDetailRequest, RemoteGitCommitDetailResponse, RemoteGitCommitRequest,
-    RemoteGitCommitResponse, RemoteGitDiffRequest, RemoteGitDiffResponse, RemoteGitHistoryRequest,
-    RemoteGitHistoryResponse, RemoteGitRemoteActionRequest, RemoteGitRemoteActionResponse,
-    RemoteGitStageRequest, RemoteGitStatusMutationResponse, RemoteGitStatusRequest,
-    RemoteGitStatusResponse, RemoteGitWorktreeEligibilityRequest,
+    RemoteDeviceRevokeRequest, RemoteFileCopyResponse, RemoteFileCreateDirectoryResponse,
+    RemoteFileDeleteResponse, RemoteFileMutationRequest, RemoteFileReadRequest,
+    RemoteFileReadResponse, RemoteFileRenameResponse, RemoteFileSearchRequest,
+    RemoteFileSearchResponse, RemoteFileTreeRequest, RemoteFileTreeResponse,
+    RemoteFileWriteRequest, RemoteFileWriteResponse, RemoteGitBranchListRequest,
+    RemoteGitBranchListResponse, RemoteGitCommitDetailRequest, RemoteGitCommitDetailResponse,
+    RemoteGitCommitRequest, RemoteGitCommitResponse, RemoteGitDiffRequest, RemoteGitDiffResponse,
+    RemoteGitHistoryRequest, RemoteGitHistoryResponse, RemoteGitRemoteActionRequest,
+    RemoteGitRemoteActionResponse, RemoteGitStageRequest, RemoteGitStatusMutationResponse,
+    RemoteGitStatusRequest, RemoteGitStatusResponse, RemoteGitWorktreeEligibilityRequest,
     RemoteGitWorktreeEligibilityResponse, RemoteGitWorktreeSnapshotRequest,
     RemoteGitWorktreeSnapshotResponse, RemoteOperationKind, RemotePairingOfferSummary,
     RemoteProviderHealthSummaryListRequest, RemoteProviderHealthSummaryListResponse,
@@ -1613,6 +1615,25 @@ impl FileBackend for WebRemoteBackend {
         })
     }
 
+    fn read_file_bytes(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+        max_bytes: usize,
+    ) -> BackendFuture<'_, Vec<u8>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let bytes = WebRemoteBackend::download_file(&this, workspace_id, path).await?;
+            if bytes.len() > max_bytes {
+                return Err(BackendError::unsupported(
+                    "remote_file_too_large",
+                    "remote file exceeds the bounded transfer size for this surface",
+                ));
+            }
+            Ok(bytes)
+        })
+    }
+
     fn write_file(
         &self,
         request: MutationRequest<FileWriteRequest>,
@@ -1640,22 +1661,52 @@ impl FileBackend for WebRemoteBackend {
 
     fn create_directory(
         &self,
-        _request: MutationRequest<FileMutationRequest>,
+        request: MutationRequest<FileMutationRequest>,
     ) -> BackendFuture<'_, FileTreeEntry> {
-        self.unsupported(
-            "remote_file_directory_create_unavailable",
-            "remote directory creation is not exposed by this Gateway",
-        )
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteWorkbenchRequest::FileCreateDirectory(RemoteFileMutationRequest {
+                auth: this.auth(),
+                request: request.payload,
+            });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::WorkspaceFile,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<RemoteFileCreateDirectoryResponse>(value)?.entry)
+        })
     }
 
     fn copy_path(
         &self,
-        _request: MutationRequest<FileMutationRequest>,
+        request: MutationRequest<FileMutationRequest>,
     ) -> BackendFuture<'_, FileTreeEntry> {
-        self.unsupported(
-            "remote_file_copy_unavailable",
-            "remote path copying is not exposed by this Gateway",
-        )
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteWorkbenchRequest::FileCopy(RemoteFileMutationRequest {
+                auth: this.auth(),
+                request: request.payload,
+            });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::WorkspaceFile,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<RemoteFileCopyResponse>(value)?.entry)
+        })
     }
 
     fn rename_path(
@@ -2004,6 +2055,115 @@ impl GitBackend for WebRemoteBackend {
                 )
                 .await?;
             Ok(decode::<RemoteGitCommitResponse>(value)?.result)
+        })
+    }
+
+    fn git_history(&self, request: GitHistoryRequest) -> BackendFuture<'_, GitHistoryResponse> {
+        let this = self.clone();
+        Box::pin(async move { WebRemoteBackend::git_history(&this, request).await })
+    }
+
+    fn git_commit_detail(
+        &self,
+        request: GitCommitDetailRequest,
+    ) -> BackendFuture<'_, GitCommitDetail> {
+        let this = self.clone();
+        Box::pin(async move { WebRemoteBackend::git_commit_detail(&this, request).await })
+    }
+
+    fn git_branch_list(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BackendFuture<'_, GitBranchListResponse> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteWorkbenchRequest::GitBranchList(RemoteGitBranchListRequest {
+                auth: this.auth(),
+                workspace_id: workspace_id.clone(),
+            });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::Git,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            let branches = decode::<RemoteGitBranchListResponse>(value)?.branches;
+            if branches.workspace_id != workspace_id {
+                return Err(BackendError::failed(
+                    "remote_git_workspace_mismatch",
+                    "remote Git response workspace does not match the request",
+                ));
+            }
+            Ok(branches)
+        })
+    }
+
+    fn git_revert(
+        &self,
+        request: MutationRequest<GitStageRequest>,
+    ) -> BackendFuture<'_, GitStatusSummary> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let workspace_id = request.payload.workspace_id.clone();
+            let payload = RemoteWorkbenchRequest::GitRevert(RemoteGitStageRequest {
+                auth: this.auth(),
+                request: request.payload,
+            });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::Git,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            let status = decode::<RemoteGitStatusMutationResponse>(value)?.status;
+            if status.workspace_id != workspace_id {
+                return Err(BackendError::failed(
+                    "remote_git_workspace_mismatch",
+                    "remote Git response workspace does not match the request",
+                ));
+            }
+            Ok(status)
+        })
+    }
+
+    fn git_remote_action(
+        &self,
+        request: MutationRequest<GitRemoteActionRequest>,
+    ) -> BackendFuture<'_, GitRemoteActionResult> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let workspace_id = request.payload.workspace_id.clone();
+            let payload = RemoteWorkbenchRequest::GitRemoteAction(RemoteGitRemoteActionRequest {
+                auth: this.auth(),
+                request: request.payload,
+            });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::Git,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            let result = decode::<RemoteGitRemoteActionResponse>(value)?.result;
+            if result.workspace_id != workspace_id {
+                return Err(BackendError::failed(
+                    "remote_git_workspace_mismatch",
+                    "remote Git response workspace does not match the request",
+                ));
+            }
+            Ok(result)
         })
     }
 }
@@ -3213,6 +3373,14 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
                     BackendOperation::FileWrite,
                     permits(RemoteActionClass::MutateFile),
                 ),
+                (
+                    BackendOperation::FileCreateDirectory,
+                    permits(RemoteActionClass::MutateFile),
+                ),
+                (
+                    BackendOperation::FileCopy,
+                    permits(RemoteActionClass::MutateFile),
+                ),
             ])
         } else {
             unavailable()
@@ -3237,6 +3405,26 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
                 ),
                 (
                     BackendOperation::GitCommit,
+                    permits(RemoteActionClass::MutateGit),
+                ),
+                (
+                    BackendOperation::GitHistory,
+                    permits(RemoteActionClass::ReadProject),
+                ),
+                (
+                    BackendOperation::GitCommitDetail,
+                    permits(RemoteActionClass::ReadProject),
+                ),
+                (
+                    BackendOperation::GitBranchList,
+                    permits(RemoteActionClass::ReadProject),
+                ),
+                (
+                    BackendOperation::GitRevert,
+                    permits(RemoteActionClass::MutateGit),
+                ),
+                (
+                    BackendOperation::GitRemoteAction,
                     permits(RemoteActionClass::MutateGit),
                 ),
                 (

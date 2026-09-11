@@ -5926,8 +5926,18 @@ impl VibexWorkbench {
                             ));
                             this.usage_view
                                 .update(cx, |usage, cx| usage.set_backend(facade.clone(), cx));
+                            let terminal_manager = runtime.terminals().manager();
                             this.code_workbench.update(cx, |workbench, cx| {
-                                workbench.set_backend(facade.clone(), cx)
+                                workbench.set_backend(facade.clone(), cx);
+                                // A local authority renders terminals from its
+                                // in-process manager; a remote authority installs
+                                // the Remote v2 transport instead.
+                                workbench.set_terminal_transport(
+                                    Some(crate::code_workbench::TerminalSurfaceTransport {
+                                        manager: terminal_manager,
+                                    }),
+                                    cx,
+                                );
                             });
                             this.backend = Some(facade);
                             this.management_view.update(cx, |management, cx| {
@@ -6551,9 +6561,15 @@ impl VibexWorkbench {
         self.detach_local_runtime(cx);
         self.runtime_status = RuntimeStatus::Starting;
         self.runtime_note = Some("Claiming pairing code…".to_string());
-        self.settings_view.update(cx, |settings, cx| {
-            settings.remote_connect_busy = true;
-            cx.notify();
+        // The Pair button listener runs inside FoundationSettings::update. Defer
+        // the busy-flag update of that same entity until the GPUI update cycle
+        // finishes to avoid a re-entrant borrow panic.
+        let settings_view = self.settings_view.clone();
+        cx.defer(move |cx| {
+            settings_view.update(cx, |settings, cx| {
+                settings.remote_connect_busy = true;
+                cx.notify();
+            });
         });
         let allow_insecure_local_dev = cfg!(debug_assertions);
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
@@ -6611,7 +6627,8 @@ impl VibexWorkbench {
         self.usage_view
             .update(cx, |usage, cx| usage.set_backend(facade.clone(), cx));
         self.code_workbench.update(cx, |workbench, cx| {
-            workbench.set_backend(facade.clone(), cx)
+            workbench.set_backend(facade.clone(), cx);
+            workbench.set_terminal_transport(None, cx);
         });
         self.backend = Some(facade);
         self.attach_remote_event_stream(backend, cx);
@@ -8799,10 +8816,10 @@ impl VibexWorkbench {
 
     fn activate_workspace(&mut self, workspace: WorkspaceRecord, cx: &mut Context<Self>) {
         self.ui_state.workbench.selected_workspace_id = Some(workspace.id.as_str().to_string());
-        if let Some(runtime) = self.runtime.clone() {
+        if let Some(backend) = self.backend.clone() {
             self.code_workbench.update(cx, |workbench, cx| {
                 workbench.sync_workspace(
-                    runtime,
+                    backend,
                     workspace.id,
                     std::path::PathBuf::from(workspace.root_path),
                     cx,
@@ -11065,8 +11082,8 @@ impl VibexWorkbench {
         if record_history && navigation_changed {
             self.sync_current_navigation_entry();
         }
-        if let (Some(runtime), Some(session)) = (
-            runtime.clone(),
+        if let (Some(backend), Some(session)) = (
+            self.backend.clone(),
             self.sessions
                 .iter()
                 .find(|session| session.id == session_id)
@@ -11076,7 +11093,7 @@ impl VibexWorkbench {
                 Some(session.workspace_id.as_str().to_string());
             self.code_workbench.update(cx, |workbench, cx| {
                 workbench.sync_workspace(
-                    runtime,
+                    backend,
                     session.workspace_id,
                     std::path::PathBuf::from(session.workspace_root),
                     cx,
@@ -33856,12 +33873,12 @@ impl VibexWorkbench {
         let Some(session) = self.selected_session().cloned() else {
             return;
         };
-        let review_ready = if let Some(runtime) = self.runtime.clone() {
+        let review_ready = if let Some(backend) = self.backend.clone() {
             let workspace_id = session.workspace_id.clone();
             self.ui_state.workbench.selected_workspace_id = Some(workspace_id.as_str().to_string());
             let review_ready = self.code_workbench.update(cx, |workbench, cx| {
                 workbench.sync_workspace(
-                    runtime,
+                    backend,
                     workspace_id.clone(),
                     std::path::PathBuf::from(session.workspace_root),
                     cx,

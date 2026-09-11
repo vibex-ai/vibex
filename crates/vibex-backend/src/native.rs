@@ -11,8 +11,10 @@ use vibex_core::{
     AgentUsageStatistics, AgentUsageStatisticsRequest, CancelAgentSessionRuntimeSwitchRequest,
     ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest, FileMutationRequest,
     FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
-    FileTreeRequest, FileWriteRequest, ForkAgentSessionRequest, GitCommitRequest, GitCommitResult,
-    GitDiffRequest, GitDiffResponse, GitProjectEligibility, GitStageRequest, GitStatusSummary,
+    FileTreeRequest, FileWriteRequest, ForkAgentSessionRequest, GitBranchListResponse,
+    GitCommitDetail, GitCommitDetailRequest, GitCommitRequest, GitCommitResult, GitDiffRequest,
+    GitDiffResponse, GitHistoryRequest, GitHistoryResponse, GitProjectEligibility,
+    GitRemoteActionRequest, GitRemoteActionResult, GitStageRequest, GitStatusSummary,
     GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
     GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeCreateRequest,
     GitWorktreeCreateResult, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
@@ -682,6 +684,22 @@ impl FileBackend for NativeBackend {
         })
     }
 
+    fn read_file_bytes(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+        max_bytes: usize,
+    ) -> BackendFuture<'_, Vec<u8>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .files()
+                .read_bytes(&workspace_id, &path, max_bytes)
+                .map_err(Into::into)
+        })
+    }
+
     fn write_file(
         &self,
         request: MutationRequest<FileWriteRequest>,
@@ -1068,6 +1086,63 @@ impl GitBackend for NativeBackend {
             request.validate()?;
             runtime.ensure_accepting_actions()?;
             runtime.git().commit(&request.payload).map_err(Into::into)
+        })
+    }
+
+    fn git_history(&self, request: GitHistoryRequest) -> BackendFuture<'_, GitHistoryResponse> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime.git().history(&request).map_err(Into::into)
+        })
+    }
+
+    fn git_commit_detail(
+        &self,
+        request: GitCommitDetailRequest,
+    ) -> BackendFuture<'_, GitCommitDetail> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime.git().commit_detail(&request).map_err(Into::into)
+        })
+    }
+
+    fn git_branch_list(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BackendFuture<'_, GitBranchListResponse> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime.git().branch_list(&workspace_id).map_err(Into::into)
+        })
+    }
+
+    fn git_revert(
+        &self,
+        request: MutationRequest<GitStageRequest>,
+    ) -> BackendFuture<'_, GitStatusSummary> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime.git().revert(&request.payload).map_err(Into::into)
+        })
+    }
+
+    fn git_remote_action(
+        &self,
+        request: MutationRequest<GitRemoteActionRequest>,
+    ) -> BackendFuture<'_, GitRemoteActionResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .git()
+                .remote_action(&request.payload)
+                .map_err(Into::into)
         })
     }
 }

@@ -708,7 +708,9 @@ mod tests {
 
     use super::*;
     use vibex_core::{
-        GitProjectEligibility, GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
+        GitBranchListResponse, GitCommitDetail, GitCommitDetailRequest, GitHistoryRequest,
+        GitHistoryResponse, GitProjectEligibility, GitRemoteActionRequest, GitRemoteActionResult,
+        GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
         GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest,
         GitWorktreeCreateRequest, GitWorktreeCreateResult, GitWorktreeDestructivePreflight,
         GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan,
@@ -951,6 +953,63 @@ mod tests {
             let repo = self.repo.clone();
             Box::pin(async move {
                 vibex_git::commit(
+                    request.payload.workspace_id.clone(),
+                    repo.as_path(),
+                    &request.payload,
+                )
+                .map_err(Into::into)
+            })
+        }
+
+        fn git_history(&self, request: GitHistoryRequest) -> BackendFuture<'_, GitHistoryResponse> {
+            let repo = self.repo.clone();
+            Box::pin(
+                async move { vibex_git::history(repo.as_path(), &request).map_err(Into::into) },
+            )
+        }
+
+        fn git_commit_detail(
+            &self,
+            request: GitCommitDetailRequest,
+        ) -> BackendFuture<'_, GitCommitDetail> {
+            let repo = self.repo.clone();
+            Box::pin(async move {
+                vibex_git::commit_detail(repo.as_path(), &request).map_err(Into::into)
+            })
+        }
+
+        fn git_branch_list(
+            &self,
+            workspace_id: WorkspaceId,
+        ) -> BackendFuture<'_, GitBranchListResponse> {
+            let repo = self.repo.clone();
+            Box::pin(async move {
+                vibex_git::branch_list(workspace_id, repo.as_path()).map_err(Into::into)
+            })
+        }
+
+        fn git_revert(
+            &self,
+            request: MutationRequest<GitStageRequest>,
+        ) -> BackendFuture<'_, GitStatusSummary> {
+            let repo = self.repo.clone();
+            Box::pin(async move {
+                vibex_git::revert(
+                    request.payload.workspace_id.clone(),
+                    repo.as_path(),
+                    &request.payload,
+                )
+                .map_err(Into::into)
+            })
+        }
+
+        fn git_remote_action(
+            &self,
+            request: MutationRequest<GitRemoteActionRequest>,
+        ) -> BackendFuture<'_, GitRemoteActionResult> {
+            let repo = self.repo.clone();
+            Box::pin(async move {
+                vibex_git::remote_action(
                     request.payload.workspace_id.clone(),
                     repo.as_path(),
                     &request.payload,

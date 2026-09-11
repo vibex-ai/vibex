@@ -5,23 +5,25 @@ use vibex_core::{
     CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
     FetchTimelineRequest, FileMutationRequest, FileReadRequest, FileReadResponse,
     FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest, FileWriteRequest,
-    GitCommitRequest, GitCommitResult, GitDiffRequest, GitDiffResponse, GitProjectEligibility,
-    GitStageRequest, GitStatusSummary, GitWorktreeArchiveRequest,
-    GitWorktreeAssistanceSessionRequest, GitWorktreeConflictResolveRequest,
-    GitWorktreeConflictStageRequest, GitWorktreeCreateRequest, GitWorktreeCreateResult,
-    GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
-    GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeOperationRecord,
-    GitWorktreeOperationRequest, GitWorktreeReadinessRecord, GitWorktreeReadinessRequest,
-    GitWorktreeRestoreRequest, OpenWorkspaceRequest, ProjectId, ProviderHealthSummary,
-    ProviderProfileSummary, ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult,
-    RemoteAuditListRequest, RemoteAuditRecord, RemoteCancelPairingOfferRequest,
-    RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
-    RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeviceDetail,
-    RemotePairingOfferSummary, RemoteRevokeDeviceRequest, RenameAgentSessionRequest,
-    ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest,
-    SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest,
-    TerminalId, TerminalResizeRequest, TerminalSession, TerminalSnapshot, TerminalWriteRequest,
-    TimelineItem, TimelinePage, VibexSessionId, WorkspaceId,
+    GitBranchListResponse, GitCommitDetail, GitCommitDetailRequest, GitCommitRequest,
+    GitCommitResult, GitDiffRequest, GitDiffResponse, GitHistoryRequest, GitHistoryResponse,
+    GitProjectEligibility, GitRemoteActionRequest, GitRemoteActionResult, GitStageRequest,
+    GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
+    GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeCreateRequest,
+    GitWorktreeCreateResult, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
+    GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
+    GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeReadinessRecord,
+    GitWorktreeReadinessRequest, GitWorktreeRestoreRequest, OpenWorkspaceRequest, ProjectId,
+    ProviderHealthSummary, ProviderProfileSummary, ProviderRunHealthProbesRequest,
+    ProviderRunHealthProbesResult, RemoteAuditListRequest, RemoteAuditRecord,
+    RemoteCancelPairingOfferRequest, RemoteCreatePairingCodeRequest,
+    RemoteCreatePairingCodeResponse, RemoteCreatePairingOfferRequest,
+    RemoteCreatePairingOfferResponse, RemoteDeviceDetail, RemotePairingOfferSummary,
+    RemoteRevokeDeviceRequest, RenameAgentSessionRequest, ResolveElicitationRequest,
+    ResolvePermissionRequest, SendAgentMessageRequest, SessionRuntimeOptionCatalog,
+    SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest, TerminalId, TerminalResizeRequest,
+    TerminalSession, TerminalSnapshot, TerminalWriteRequest, TimelineItem, TimelinePage,
+    VibexSessionId, WorkspaceId,
 };
 
 use crate::{
@@ -202,6 +204,15 @@ impl FileBackend for DisconnectedBackend {
     }
 
     fn read_file(&self, _request: FileReadRequest) -> BackendFuture<'_, FileReadResponse> {
+        disconnected_future!()
+    }
+
+    fn read_file_bytes(
+        &self,
+        _workspace_id: WorkspaceId,
+        _path: String,
+        _max_bytes: usize,
+    ) -> BackendFuture<'_, Vec<u8>> {
         disconnected_future!()
     }
 
@@ -391,6 +402,38 @@ impl GitBackend for DisconnectedBackend {
         &self,
         _request: MutationRequest<GitCommitRequest>,
     ) -> BackendFuture<'_, GitCommitResult> {
+        disconnected_future!()
+    }
+
+    fn git_history(&self, _request: GitHistoryRequest) -> BackendFuture<'_, GitHistoryResponse> {
+        disconnected_future!()
+    }
+
+    fn git_commit_detail(
+        &self,
+        _request: GitCommitDetailRequest,
+    ) -> BackendFuture<'_, GitCommitDetail> {
+        disconnected_future!()
+    }
+
+    fn git_branch_list(
+        &self,
+        _workspace_id: WorkspaceId,
+    ) -> BackendFuture<'_, GitBranchListResponse> {
+        disconnected_future!()
+    }
+
+    fn git_revert(
+        &self,
+        _request: MutationRequest<GitStageRequest>,
+    ) -> BackendFuture<'_, GitStatusSummary> {
+        disconnected_future!()
+    }
+
+    fn git_remote_action(
+        &self,
+        _request: MutationRequest<GitRemoteActionRequest>,
+    ) -> BackendFuture<'_, GitRemoteActionResult> {
         disconnected_future!()
     }
 }

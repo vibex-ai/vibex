@@ -1025,6 +1025,8 @@ pub enum RemoteWorkbenchOperationKind {
     FileWrite,
     FileDelete,
     FileRename,
+    FileCreateDirectory,
+    FileCopy,
     GitStatus,
     GitDiff,
     GitStage,
@@ -1154,6 +1156,18 @@ pub struct RemoteFileDeleteResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteFileRenameResponse {
+    pub entry: FileTreeEntry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteFileCreateDirectoryResponse {
+    pub entry: FileTreeEntry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteFileCopyResponse {
     pub entry: FileTreeEntry,
 }
 
@@ -1405,6 +1419,8 @@ pub enum RemoteWorkbenchRequest {
     FileWrite(RemoteFileWriteRequest),
     FileDelete(RemoteFileMutationRequest),
     FileRename(RemoteFileMutationRequest),
+    FileCreateDirectory(RemoteFileMutationRequest),
+    FileCopy(RemoteFileMutationRequest),
     GitStatus(RemoteGitStatusRequest),
     GitDiff(RemoteGitDiffRequest),
     GitStage(RemoteGitStageRequest),
@@ -1440,6 +1456,8 @@ impl RemoteWorkbenchRequest {
             Self::FileWrite(_) => RemoteWorkbenchOperationKind::FileWrite,
             Self::FileDelete(_) => RemoteWorkbenchOperationKind::FileDelete,
             Self::FileRename(_) => RemoteWorkbenchOperationKind::FileRename,
+            Self::FileCreateDirectory(_) => RemoteWorkbenchOperationKind::FileCreateDirectory,
+            Self::FileCopy(_) => RemoteWorkbenchOperationKind::FileCopy,
             Self::GitStatus(_) => RemoteWorkbenchOperationKind::GitStatus,
             Self::GitDiff(_) => RemoteWorkbenchOperationKind::GitDiff,
             Self::GitStage(_) => RemoteWorkbenchOperationKind::GitStage,

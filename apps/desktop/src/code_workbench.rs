@@ -55,12 +55,12 @@ use vibex_core::{
     GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeOperationStatus,
     GitWorktreeReadinessRequest, GitWorktreeReadinessState, GitWorktreeRestoreRequest,
     GitWorktreeRisk, GitWorktreeRiskKind, RequestId, TerminalId, TerminalSession, TerminalStatus,
-    VibexError, VibexResult, WorkspaceId, unix_timestamp_ms,
+    VibexError, WorkspaceId, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     BoundedImageCache, ContentPreviewKind, EditorBufferAvailability, EditorBufferRegistry,
-    EditorExternalState, EditorRecoverySnapshot, FileExplorerRow, FileIconKind, FileMutationKind,
-    FileTreeLoadState, FileTreeProjection, GitCommitPatchRow, GitMutationKind,
+    EditorExternalState, EditorRecoverySnapshot, FILE_TREE_POLL_MS, FileExplorerRow, FileIconKind,
+    FileMutationKind, FileTreeLoadState, FileTreeProjection, GitCommitPatchRow, GitMutationKind,
     GitPathSelectionState, GitQueryKind, GitSelectionKey, GitTreeRow, GitTreeRowKind,
     GitWorkbenchMode, GitWorkbenchState, ImageCacheKey, PendingFileMutation,
     PreviewCloseDisposition, PreviewPane, PreviewSplitNode, PreviewSplitPosition, PreviewState,
@@ -68,11 +68,12 @@ use vibex_desktop_model::{
     WorktreeLifecycleView, content_preview_kind, content_preview_kind_for_path,
     file_icon_descriptor, mutation_scope,
 };
-use vibex_desktop_runtime::{DesktopRuntime, GitHandle, validate_external_open_url};
+use vibex_desktop_runtime::validate_external_open_url;
 use vibex_markdown::{
     MarkdownDocument, MarkdownInput, MarkdownSurface, MarkdownView, ResolvedResource, ResourceKind,
     ResourcePolicy, ResourceRole, code_font_weight, parse_markdown,
 };
+use vibex_terminal::TerminalManager;
 
 use crate::app::VibexWorkbench;
 use crate::assets::{file_tree_asset_icon, open_tool_brand_icon};
@@ -349,7 +350,7 @@ impl WorkspaceGenerationFence {
 
 #[derive(Clone)]
 struct PendingWorkspace {
-    runtime: Arc<DesktopRuntime>,
+    backend: BackendFacade,
     id: WorkspaceId,
     root: PathBuf,
 }
@@ -396,7 +397,11 @@ enum FilePresentation {
 }
 
 impl FilePresentation {
-    fn error(error: VibexError) -> Self {
+    /// Builds the error presentation from a backend failure.
+    ///
+    /// The workbench reports failures from either a local runtime or a remote
+    /// backend, and both reach it as a [`BackendError`].
+    fn backend_error(error: BackendError) -> Self {
         Self::Error {
             code: error.code,
             message: error.message,
@@ -913,10 +918,40 @@ fn worktree_lifecycle_primary_action(
     }
 }
 
+/// Supplies the raw-terminal rendering transport for the workbench.
+///
+/// The terminal surface paints from raw PTY observation. When the workbench
+/// talks to a local authority that transport is the in-process
+/// `TerminalManager`; a remote authority delivers the same frames over the
+/// Remote v2 binary attachment channel. The workbench never owns the
+/// transport, so it stays authority-agnostic and a remote transport can be
+/// installed without touching the file/Git surfaces.
+#[derive(Clone)]
+pub(crate) struct TerminalSurfaceTransport {
+    pub manager: TerminalManager,
+}
+
+/// A Git mutation the workbench can run through the backend facade.
+///
+/// The workbench describes the operation instead of closing over a local Git
+/// handle so the same code path runs against a local runtime or a paired
+/// remote authority.
+enum GitMutationOperation {
+    Revert(GitStageRequest),
+    Commit {
+        request: GitCommitRequest,
+        status_workspace: WorkspaceId,
+    },
+    RemoteAction {
+        request: GitRemoteActionRequest,
+        status_workspace: WorkspaceId,
+    },
+}
+
 pub struct CodeWorkbench {
     parent: Option<WeakEntity<VibexWorkbench>>,
-    runtime: Option<Arc<DesktopRuntime>>,
     backend: Option<BackendFacade>,
+    terminal_transport: Option<TerminalSurfaceTransport>,
     workspace: Option<WorkbenchWorkspace>,
     pending_workspace: Option<PendingWorkspace>,
     workspace_generation: u64,
@@ -961,6 +996,7 @@ pub struct CodeWorkbench {
     status_task: Option<Task<()>>,
     history_task: Option<Task<()>>,
     branch_task: Option<Task<()>>,
+    terminal_list_task: Option<Task<()>>,
     lifecycle_task: Option<Task<()>>,
     lifecycle_action_task: Option<Task<()>>,
     file_tasks: BTreeMap<String, Task<()>>,
@@ -1059,8 +1095,8 @@ impl CodeWorkbench {
         });
         Self {
             parent,
-            runtime: None,
             backend: None,
+            terminal_transport: None,
             workspace: None,
             pending_workspace: None,
             workspace_generation: 0,
@@ -1105,6 +1141,7 @@ impl CodeWorkbench {
             status_task: None,
             history_task: None,
             branch_task: None,
+            terminal_list_task: None,
             lifecycle_task: None,
             lifecycle_action_task: None,
             file_tasks: BTreeMap::new(),
@@ -1675,7 +1712,7 @@ impl CodeWorkbench {
 
     pub fn sync_workspace(
         &mut self,
-        runtime: Arc<DesktopRuntime>,
+        backend: BackendFacade,
         workspace_id: WorkspaceId,
         root: PathBuf,
         cx: &mut Context<Self>,
@@ -1685,12 +1722,12 @@ impl CodeWorkbench {
             .as_ref()
             .is_some_and(|workspace| workspace.id == workspace_id)
         {
-            self.runtime = Some(runtime);
+            self.backend = Some(backend);
             return;
         }
         if self.editors.dirty_paths().next().is_some() && self.workspace.is_some() {
             self.pending_workspace = Some(PendingWorkspace {
-                runtime,
+                backend,
                 id: workspace_id,
                 root,
             });
@@ -1701,7 +1738,26 @@ impl CodeWorkbench {
             cx.notify();
             return;
         }
-        self.apply_workspace(runtime, workspace_id, root, cx);
+        self.apply_workspace(backend, workspace_id, root, cx);
+    }
+
+    /// Installs the raw-terminal rendering transport.
+    ///
+    /// A local authority passes its in-process manager; a remote authority
+    /// installs the Remote v2 terminal transport instead. `None` means the
+    /// desktop has no terminal transport for the current authority, and the
+    /// terminal UI says so instead of silently doing nothing.
+    pub(crate) fn set_terminal_transport(
+        &mut self,
+        transport: Option<TerminalSurfaceTransport>,
+        cx: &mut Context<Self>,
+    ) {
+        self.terminal_transport = transport;
+        if self.terminal_transport.is_none() {
+            self.terminal_surfaces.clear();
+            self.active_terminal_surface_ids.clear();
+        }
+        cx.notify();
     }
 
     pub(crate) fn set_backend(&mut self, backend: BackendFacade, cx: &mut Context<Self>) {
@@ -1713,6 +1769,7 @@ impl CodeWorkbench {
 
     pub(crate) fn clear_backend(&mut self, cx: &mut Context<Self>) {
         self.backend = None;
+        self.terminal_transport = None;
         self.lifecycle_task = None;
         self.lifecycle_action_task = None;
         self.lifecycle_loading = false;
@@ -1727,12 +1784,12 @@ impl CodeWorkbench {
             return;
         };
         self.editors = EditorBufferRegistry::default();
-        self.apply_workspace(pending.runtime, pending.id, pending.root, cx);
+        self.apply_workspace(pending.backend, pending.id, pending.root, cx);
     }
 
     fn apply_workspace(
         &mut self,
-        runtime: Arc<DesktopRuntime>,
+        backend: BackendFacade,
         workspace_id: WorkspaceId,
         root: PathBuf,
         cx: &mut Context<Self>,
@@ -1766,16 +1823,11 @@ impl CodeWorkbench {
             root,
             generation: self.workspace_generation,
         });
-        self.terminals = runtime
-            .list_terminals(&workspace_id)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|terminal| terminal.status == TerminalStatus::Running)
-            .collect();
+        self.terminals.clear();
         self.reconcile_terminal_selection();
         self.terminal_surfaces.clear();
         self.active_terminal_surface_ids.clear();
-        self.runtime = Some(runtime);
+        self.backend = Some(backend.clone());
         self.pending_workspace = None;
         self.presentations.clear();
         self.markdown_edit_paths.clear();
@@ -1810,6 +1862,7 @@ impl CodeWorkbench {
         self.note = Some("Workspace files and Git state are loading".to_string());
         self.load_tree(cx);
         self.refresh_git(cx);
+        self.load_workspace_terminals(backend, cx);
         self.start_workspace_polling(cx);
         self.persist(cx);
         self.persist_editor_recovery(cx);
@@ -1848,6 +1901,50 @@ impl CodeWorkbench {
                 .first()
                 .map(|terminal| terminal.id.as_str().to_string());
         }
+    }
+
+    /// Loads the workspace's running terminals through the backend facade.
+    ///
+    /// Terminal sessions belong to the authority, so the workbench always reads
+    /// them over the facade rather than from a local handle. That keeps the
+    /// desktop identical whether the authority is this machine or a paired
+    /// remote runtime.
+    fn load_workspace_terminals(&mut self, backend: BackendFacade, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.clone() else {
+            return;
+        };
+        let fence = WorkspaceGenerationFence::capture(&workspace);
+        let workspace_id = workspace.id.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend.terminal().list_terminals(workspace_id).await
+        });
+        self.terminal_list_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                if !fence.matches(this.workspace.as_ref()) {
+                    return;
+                }
+                match outcome {
+                    Ok(Ok(terminals)) => {
+                        this.terminals = terminals
+                            .into_iter()
+                            .filter(|terminal| terminal.status == TerminalStatus::Running)
+                            .collect();
+                    }
+                    Ok(Err(error)) => {
+                        this.terminals.clear();
+                        tracing::debug!(
+                            target: "vibex_desktop",
+                            error_code = %error.code,
+                            "Workspace terminal list is unavailable"
+                        );
+                    }
+                    Err(_) => this.terminals.clear(),
+                }
+                this.reconcile_terminal_selection();
+                cx.notify();
+            });
+        }));
     }
 
     pub(crate) fn restore_navigation_selection(
@@ -2081,10 +2178,10 @@ impl CodeWorkbench {
     }
 
     fn start_workspace_polling(&mut self, cx: &mut Context<Self>) {
-        let Some(runtime) = self.runtime.as_ref() else {
-            return;
-        };
-        let file_tree_interval = Duration::from_millis(runtime.polling_policy().file_tree_ms);
+        // Poll cadence is a client concern: the workbench decides how often it
+        // re-reads authoritative state, and the authority is asked over the
+        // backend facade either way.
+        let file_tree_interval = Duration::from_millis(FILE_TREE_POLL_MS);
         let background = cx.background_executor().clone();
         self.workspace_poll_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             loop {
@@ -2166,7 +2263,7 @@ impl CodeWorkbench {
         {
             return;
         }
-        let (Some(runtime), Some(workspace)) = (self.runtime.clone(), self.workspace.clone())
+        let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
         else {
             return;
         };
@@ -2176,19 +2273,18 @@ impl CodeWorkbench {
         self.tree_refreshing = true;
         let request_workspace_id = workspace.id.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            paths
-                .into_iter()
-                .map(|path| {
-                    let request = FileTreeRequest {
-                        workspace_id: request_workspace_id.clone(),
-                        path: (!path.is_empty()).then_some(path.clone()),
-                        max_depth: Some(if path.is_empty() { 4 } else { 8 }),
-                        include_hidden: true,
-                    };
-                    let result = runtime.files().list_native_tree(&request);
-                    (path, result)
-                })
-                .collect::<Vec<_>>()
+            let mut results = Vec::with_capacity(paths.len());
+            for path in paths {
+                let request = FileTreeRequest {
+                    workspace_id: request_workspace_id.clone(),
+                    path: (!path.is_empty()).then_some(path.clone()),
+                    max_depth: Some(if path.is_empty() { 4 } else { 8 }),
+                    include_hidden: true,
+                };
+                let result = backend.file().file_tree(request).await;
+                results.push((path, result));
+            }
+            results
         });
         self.tree_refresh_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
@@ -2231,7 +2327,7 @@ impl CodeWorkbench {
     }
 
     fn load_tree_path(&mut self, path: String, cx: &mut Context<Self>) {
-        let (Some(runtime), Some(workspace)) = (self.runtime.clone(), self.workspace.clone())
+        let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
         else {
             return;
         };
@@ -2248,10 +2344,7 @@ impl CodeWorkbench {
         }
         self.error = None;
         let runner =
-            gpui_tokio::Tokio::spawn(
-                cx,
-                async move { runtime.files().list_native_tree(&request) },
-            );
+            gpui_tokio::Tokio::spawn(cx, async move { backend.file().file_tree(request).await });
         let task_path = path.clone();
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
@@ -2384,7 +2477,7 @@ impl CodeWorkbench {
     }
 
     fn load_git_status(&mut self, cx: &mut Context<Self>) {
-        let (Some(runtime), Some(workspace)) = (self.runtime.clone(), self.workspace.clone())
+        let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
         else {
             return;
         };
@@ -2394,7 +2487,10 @@ impl CodeWorkbench {
         self.status_loading = true;
         let workspace_id = workspace.id.clone();
         let runner =
-            gpui_tokio::Tokio::spawn(cx, async move { runtime.git().status(&workspace_id) });
+            gpui_tokio::Tokio::spawn(
+                cx,
+                async move { backend.git().git_status(workspace_id).await },
+            );
         self.status_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
@@ -3211,7 +3307,7 @@ impl CodeWorkbench {
     }
 
     pub(crate) fn load_history(&mut self, append: bool, cx: &mut Context<Self>) {
-        let (Some(runtime), Some(workspace)) = (self.runtime.clone(), self.workspace.clone())
+        let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
         else {
             return;
         };
@@ -3258,7 +3354,8 @@ impl CodeWorkbench {
             authored_before_ms: self.git.history_filter.authored_before_ms,
         };
         self.history_loading = true;
-        let runner = gpui_tokio::Tokio::spawn(cx, async move { runtime.git().history(&request) });
+        let runner =
+            gpui_tokio::Tokio::spawn(cx, async move { backend.git().git_history(request).await });
         self.history_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
@@ -3286,7 +3383,7 @@ impl CodeWorkbench {
     }
 
     fn load_branches(&mut self, cx: &mut Context<Self>) {
-        let (Some(runtime), Some(workspace)) = (self.runtime.clone(), self.workspace.clone())
+        let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
         else {
             return;
         };
@@ -3294,8 +3391,9 @@ impl CodeWorkbench {
             return;
         };
         let workspace_id = workspace.id;
-        let runner =
-            gpui_tokio::Tokio::spawn(cx, async move { runtime.git().branch_list(&workspace_id) });
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend.git().git_branch_list(workspace_id).await
+        });
         self.branch_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
@@ -3551,22 +3649,22 @@ impl CodeWorkbench {
         if self.terminal_surfaces.contains_key(terminal_id.as_str()) {
             return true;
         }
-        let (Some(runtime), Some(workspace)) = (self.runtime.clone(), self.workspace.clone())
-        else {
+        let Some(workspace) = self.workspace.clone() else {
+            return false;
+        };
+        let Some(transport) = self.terminal_transport.clone() else {
+            self.error = Some(
+                "Terminals are unavailable because this workbench has no terminal transport for the current runtime"
+                    .into(),
+            );
+            cx.notify();
             return false;
         };
         let session = self
             .terminals
             .iter()
             .find(|terminal| &terminal.id == terminal_id)
-            .cloned()
-            .or_else(|| {
-                runtime
-                    .list_terminals(&workspace.id)
-                    .ok()?
-                    .into_iter()
-                    .find(|terminal| &terminal.id == terminal_id)
-            });
+            .cloned();
         let Some(session) = session else {
             self.error = Some("Terminal session is no longer available".into());
             return false;
@@ -3575,7 +3673,7 @@ impl CodeWorkbench {
             terminal_id.as_str().to_string(),
             cx.new(|cx| {
                 TerminalSurface::from_preview_shared_session(
-                    runtime.terminals().manager(),
+                    transport.manager,
                     workspace.root,
                     session,
                     window,
@@ -3631,51 +3729,127 @@ impl CodeWorkbench {
     }
 
     fn open_pdf(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        let result = self.resolve_workspace_path(&path);
-        match result {
-            Ok(absolute) => {
-                let surface = cx.new(|cx| {
-                    PdfSurface::new(
-                        vibex_content::PdfiumEngine::discover_library_path(),
-                        Some(absolute),
-                        None,
-                        window,
-                        cx,
-                    )
-                });
-                self.presentations
-                    .insert(path, FilePresentation::Pdf(surface));
-            }
-            Err(error) => {
-                self.presentations
-                    .insert(path, FilePresentation::error(error));
-            }
-        }
+        let Some(backend) = self.backend.clone() else {
+            self.presentations.insert(
+                path,
+                FilePresentation::Error {
+                    code: "workspace_not_selected".into(),
+                    message: "select a workspace before opening a file".into(),
+                },
+            );
+            return;
+        };
+        let Some(workspace) = self.workspace.clone() else {
+            self.presentations.insert(
+                path,
+                FilePresentation::Error {
+                    code: "workspace_not_selected".into(),
+                    message: "select a workspace before opening a file".into(),
+                },
+            );
+            return;
+        };
+        self.presentations
+            .insert(path.clone(), FilePresentation::Loading);
+        let request_path = path.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            materialize_preview_file(&backend, &workspace.id, &request_path).await
+        });
+        let task_path = path.clone();
+        let task = cx.spawn_in(window, async move |entity: WeakEntity<Self>, cx| {
+            let outcome = runner.await;
+            let _ = entity.update_in(cx, |this, window, cx| {
+                this.presentations.remove(&task_path);
+                match outcome {
+                    Ok(Ok(absolute)) => {
+                        let surface = cx.new(|cx| {
+                            PdfSurface::new(
+                                vibex_content::PdfiumEngine::discover_library_path(),
+                                Some(absolute),
+                                None,
+                                window,
+                                cx,
+                            )
+                        });
+                        this.presentations
+                            .insert(task_path, FilePresentation::Pdf(surface));
+                    }
+                    Ok(Err(error)) => {
+                        this.presentations
+                            .insert(task_path, FilePresentation::backend_error(error));
+                    }
+                    Err(_) => {
+                        this.presentations.insert(
+                            task_path,
+                            FilePresentation::Error {
+                                code: "preview_materialize_failed".into(),
+                                message: "the preview task stopped unexpectedly".into(),
+                            },
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.file_tasks.insert(format!("pdf:{path}"), task);
     }
 
     fn open_office(&mut self, path: String, cx: &mut Context<Self>) {
-        let result = self.resolve_workspace_path(&path);
-        match result {
-            Ok(absolute) => {
-                let surface = cx.new(|cx| OfficeSurface::new(Some(absolute), cx));
-                self.presentations
-                    .insert(path, FilePresentation::Office(surface));
-            }
-            Err(error) => {
-                self.presentations
-                    .insert(path, FilePresentation::error(error));
-            }
-        }
-    }
-
-    fn resolve_workspace_path(&self, path: &str) -> VibexResult<PathBuf> {
-        let (Some(runtime), Some(workspace)) = (&self.runtime, &self.workspace) else {
-            return Err(VibexError::validation(
-                "workspace_not_selected",
-                "select a workspace before opening a file",
-            ));
+        let Some(backend) = self.backend.clone() else {
+            self.presentations.insert(
+                path,
+                FilePresentation::Error {
+                    code: "workspace_not_selected".into(),
+                    message: "select a workspace before opening a file".into(),
+                },
+            );
+            return;
         };
-        runtime.files().resolve_existing_path(&workspace.id, path)
+        let Some(workspace) = self.workspace.clone() else {
+            self.presentations.insert(
+                path,
+                FilePresentation::Error {
+                    code: "workspace_not_selected".into(),
+                    message: "select a workspace before opening a file".into(),
+                },
+            );
+            return;
+        };
+        self.presentations
+            .insert(path.clone(), FilePresentation::Loading);
+        let request_path = path.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            materialize_preview_file(&backend, &workspace.id, &request_path).await
+        });
+        let task_path = path.clone();
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                this.presentations.remove(&task_path);
+                match outcome {
+                    Ok(Ok(absolute)) => {
+                        let surface = cx.new(|cx| OfficeSurface::new(Some(absolute), cx));
+                        this.presentations
+                            .insert(task_path, FilePresentation::Office(surface));
+                    }
+                    Ok(Err(error)) => {
+                        this.presentations
+                            .insert(task_path, FilePresentation::backend_error(error));
+                    }
+                    Err(_) => {
+                        this.presentations.insert(
+                            task_path,
+                            FilePresentation::Error {
+                                code: "preview_materialize_failed".into(),
+                                message: "the preview task stopped unexpectedly".into(),
+                            },
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.file_tasks.insert(format!("office:{path}"), task);
     }
 
     fn ensure_editor_binding(
@@ -3814,7 +3988,7 @@ impl CodeWorkbench {
     }
 
     fn load_file(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(runtime), Some(workspace)) = (self.runtime.clone(), self.workspace.clone())
+        let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
         else {
             return;
         };
@@ -3825,7 +3999,8 @@ impl CodeWorkbench {
             path: path.clone(),
             max_bytes: Some(FILE_PREVIEW_MAX_BYTES),
         };
-        let runner = gpui_tokio::Tokio::spawn(cx, async move { runtime.files().read(&request) });
+        let runner =
+            gpui_tokio::Tokio::spawn(cx, async move { backend.file().read_file(request).await });
         let task_path = path.clone();
         let task = cx.spawn_in(window, async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
@@ -3883,7 +4058,7 @@ impl CodeWorkbench {
                     }
                     Ok(Err(error)) => {
                         this.presentations
-                            .insert(task_path.clone(), FilePresentation::error(error));
+                            .insert(task_path.clone(), FilePresentation::backend_error(error));
                     }
                     Err(error) => {
                         this.presentations.insert(
@@ -3911,7 +4086,7 @@ impl CodeWorkbench {
     }
 
     fn load_markdown_assets(&mut self, path: String, cx: &mut Context<Self>) {
-        let (Some(runtime), Some(workspace)) = (self.runtime.clone(), self.workspace.clone())
+        let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
         else {
             return;
         };
@@ -3933,15 +4108,20 @@ impl CodeWorkbench {
         }
         let workspace_id = workspace.id.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let files = runtime.files();
             let mut resolved = Vec::new();
             let mut total_bytes = 0_usize;
             for (source, asset_path) in assets {
                 if resolved.len() >= MARKDOWN_LOCAL_IMAGE_LIMIT {
                     break;
                 }
-                let Ok(bytes) =
-                    files.read_bytes(&workspace_id, &asset_path, IMAGE_SOURCE_MAX_BYTES)
+                let Ok(bytes) = backend
+                    .file()
+                    .read_file_bytes(
+                        workspace_id.clone(),
+                        asset_path.clone(),
+                        IMAGE_SOURCE_MAX_BYTES,
+                    )
+                    .await
                 else {
                     continue;
                 };
@@ -3954,7 +4134,7 @@ impl CodeWorkbench {
                 total_bytes = total_bytes.saturating_add(bytes.len());
                 resolved.push((source, mime.to_string(), bytes));
             }
-            Ok::<_, VibexError>(resolved)
+            resolved
         });
         let task_path = path.clone();
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
@@ -3965,7 +4145,7 @@ impl CodeWorkbench {
                 {
                     return;
                 }
-                if let Ok(Ok(assets)) = outcome
+                if let Ok(assets) = outcome
                     && let Some(FilePresentation::Markdown { images, .. }) =
                         this.presentations.get_mut(&task_path)
                 {
@@ -3984,7 +4164,7 @@ impl CodeWorkbench {
     }
 
     fn load_image(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(runtime), Some(workspace)) = (self.runtime.clone(), self.workspace.clone())
+        let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
         else {
             return;
         };
@@ -4006,14 +4186,16 @@ impl CodeWorkbench {
         };
         let byte_path = path.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let files = runtime.files();
-            let metadata = files.read(&request)?;
-            let bytes = files.read_bytes(&workspace_id, &byte_path, IMAGE_SOURCE_MAX_BYTES)?;
+            let metadata = backend.file().read_file(request).await?;
+            let bytes = backend
+                .file()
+                .read_file_bytes(workspace_id, byte_path, IMAGE_SOURCE_MAX_BYTES)
+                .await?;
             let image = Image::from_bytes(format, bytes);
-            let rendered = image.to_image_data(svg_renderer).map_err(|error| {
-                VibexError::validation("image_decode_failed", error.to_string())
-            })?;
-            Ok::<_, VibexError>((metadata, rendered))
+            let rendered = image
+                .to_image_data(svg_renderer)
+                .map_err(|error| BackendError::failed("image_decode_failed", error.to_string()))?;
+            Ok::<_, BackendError>((metadata, rendered))
         });
         let task_path = path.clone();
         let task = cx.spawn_in(window, async move |entity: WeakEntity<Self>, cx| {
@@ -4065,8 +4247,10 @@ impl CodeWorkbench {
                         }
                     }
                     Ok(Err(error)) => {
-                        this.presentations
-                            .insert(task_path.clone(), FilePresentation::error(error));
+                        this.presentations.insert(
+                            task_path.clone(),
+                            FilePresentation::backend_error(error),
+                        );
                     }
                     Err(error) => {
                         this.presentations.insert(
@@ -4155,7 +4339,7 @@ impl CodeWorkbench {
         }
     }
 
-    fn cleanup_closed_tab(&mut self, tab_id: &str, force: bool) {
+    fn cleanup_closed_tab(&mut self, tab_id: &str, force: bool, cx: &mut Context<Self>) {
         self.close_lifecycle(tab_id);
         self.preview_diff_lists.remove(tab_id);
         self.preview_commit_lists.remove(tab_id);
@@ -4164,14 +4348,29 @@ impl CodeWorkbench {
         if let Some(terminal_id) = tab_id.strip_prefix("terminal:")
             && let Ok(terminal_id) = TerminalId::parse(terminal_id)
         {
-            if let Some(runtime) = self.runtime.as_ref()
-                && let Err(error) = runtime.kill_terminal(&terminal_id)
-                && error.code != "terminal_not_found"
-            {
-                self.error = Some(format!(
-                    "Terminal close failed: {}: {}",
-                    error.code, error.message
-                ));
+            if let Some(backend) = self.backend.clone() {
+                let killed_id = terminal_id.clone();
+                let runner = gpui_tokio::Tokio::spawn(cx, async move {
+                    backend
+                        .terminal()
+                        .close_terminal(MutationRequest::new(killed_id))
+                        .await
+                });
+                cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+                    if let Ok(Err(error)) = runner.await
+                        && error.code != "terminal_not_found"
+                        && let Some(this) = entity.upgrade()
+                    {
+                        this.update(cx, |this, cx| {
+                            this.error = Some(format!(
+                                "Terminal close failed: {}: {}",
+                                error.code, error.message
+                            ));
+                            cx.notify();
+                        });
+                    }
+                })
+                .detach();
             }
             self.terminals.retain(|terminal| terminal.id != terminal_id);
             self.terminal_surfaces.remove(terminal_id.as_str());
@@ -4196,10 +4395,15 @@ impl CodeWorkbench {
         }
     }
 
-    fn cleanup_closed_tabs(&mut self, outcomes: &[(String, PreviewCloseDisposition)], force: bool) {
+    fn cleanup_closed_tabs(
+        &mut self,
+        outcomes: &[(String, PreviewCloseDisposition)],
+        force: bool,
+        cx: &mut Context<Self>,
+    ) {
         for (tab_id, disposition) in outcomes {
             if *disposition == PreviewCloseDisposition::Closed {
-                self.cleanup_closed_tab(tab_id, force);
+                self.cleanup_closed_tab(tab_id, force, cx);
             }
         }
     }
@@ -4306,7 +4510,7 @@ impl CodeWorkbench {
     }
 
     pub(crate) fn save_editor(&mut self, path: String, cx: &mut Context<Self>) {
-        let (Some(runtime), Some(workspace)) = (self.runtime.clone(), self.workspace.clone())
+        let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
         else {
             return;
         };
@@ -4318,7 +4522,12 @@ impl CodeWorkbench {
         let request_id = ticket.request_id;
         let request = ticket.into_request(workspace.id);
         let task_path = path.clone();
-        let runner = gpui_tokio::Tokio::spawn(cx, async move { runtime.files().write(&request) });
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .file()
+                .write_file(MutationRequest::new(request))
+                .await
+        });
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
@@ -4487,7 +4696,7 @@ impl CodeWorkbench {
             .close_guarded(&tab_id, force, &self.protected_tab_ids());
         match disposition {
             PreviewCloseDisposition::Closed => {
-                self.cleanup_closed_tab(&tab_id, force);
+                self.cleanup_closed_tab(&tab_id, force, cx);
                 if was_active
                     && let Some(neighbor) = neighbor
                     && self.preview.tabs.contains_key(&neighbor)
@@ -4534,7 +4743,7 @@ impl CodeWorkbench {
         let outcomes = self
             .preview
             .close_other_tabs(&tab_id, &pane_id, &self.protected_tab_ids());
-        self.cleanup_closed_tabs(&outcomes, false);
+        self.cleanup_closed_tabs(&outcomes, false, cx);
         if outcomes.iter().any(|(_, disposition)| {
             matches!(
                 disposition,
@@ -4554,7 +4763,7 @@ impl CodeWorkbench {
         let outcomes = self
             .preview
             .close_all_tabs(&pane_id, &self.protected_tab_ids());
-        self.cleanup_closed_tabs(&outcomes, false);
+        self.cleanup_closed_tabs(&outcomes, false, cx);
         if outcomes.iter().any(|(_, disposition)| {
             matches!(
                 disposition,
@@ -4596,7 +4805,7 @@ impl CodeWorkbench {
                 self.preview
                     .close_guarded(&candidate, false, &self.protected_tab_ids());
             match disposition {
-                PreviewCloseDisposition::Closed => self.cleanup_closed_tab(&candidate, false),
+                PreviewCloseDisposition::Closed => self.cleanup_closed_tab(&candidate, false, cx),
                 PreviewCloseDisposition::Pinned | PreviewCloseDisposition::Protected => {
                     kept_protected = true;
                 }
@@ -4669,7 +4878,7 @@ impl CodeWorkbench {
         for tab_id in tab_ids {
             let disposition = self.preview.close_guarded(&tab_id, true, &BTreeSet::new());
             if disposition == PreviewCloseDisposition::Closed {
-                self.cleanup_closed_tab(&tab_id, true);
+                self.cleanup_closed_tab(&tab_id, true, cx);
             }
         }
         self.set_preview_panel_fullscreen(false, cx);
@@ -4730,7 +4939,7 @@ impl CodeWorkbench {
     }
 
     pub(crate) fn create_file(&mut self, path: String, cx: &mut Context<Self>) {
-        let (Some(runtime), Some(workspace)) = (self.runtime.clone(), self.workspace.clone())
+        let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
         else {
             return;
         };
@@ -4747,13 +4956,22 @@ impl CodeWorkbench {
             FileMutationKind::CreateFile,
             request.path.clone(),
             None,
-            move || runtime.files().write(&request).map(|_| ()),
+            move || {
+                let backend = backend.clone();
+                async move {
+                    backend
+                        .file()
+                        .write_file(MutationRequest::new(request))
+                        .await
+                        .map(|_| ())
+                }
+            },
             cx,
         );
     }
 
     pub(crate) fn create_directory(&mut self, path: String, cx: &mut Context<Self>) {
-        let (Some(runtime), Some(workspace)) = (self.runtime.clone(), self.workspace.clone())
+        let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
         else {
             return;
         };
@@ -4768,7 +4986,16 @@ impl CodeWorkbench {
             FileMutationKind::CreateDirectory,
             request.path.clone(),
             None,
-            move || runtime.files().create_directory(&request).map(|_| ()),
+            move || {
+                let backend = backend.clone();
+                async move {
+                    backend
+                        .file()
+                        .create_directory(MutationRequest::new(request))
+                        .await
+                        .map(|_| ())
+                }
+            },
             cx,
         );
     }
@@ -4780,7 +5007,7 @@ impl CodeWorkbench {
         recursive: bool,
         cx: &mut Context<Self>,
     ) {
-        let (Some(runtime), Some(workspace)) = (self.runtime.clone(), self.workspace.clone())
+        let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
         else {
             return;
         };
@@ -4795,7 +5022,16 @@ impl CodeWorkbench {
             FileMutationKind::Copy,
             source,
             Some(destination),
-            move || runtime.files().copy(&request).map(|_| ()),
+            move || {
+                let backend = backend.clone();
+                async move {
+                    backend
+                        .file()
+                        .copy_path(MutationRequest::new(request))
+                        .await
+                        .map(|_| ())
+                }
+            },
             cx,
         );
     }
@@ -4806,7 +5042,7 @@ impl CodeWorkbench {
         destination: String,
         cx: &mut Context<Self>,
     ) {
-        let (Some(runtime), Some(workspace)) = (self.runtime.clone(), self.workspace.clone())
+        let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
         else {
             return;
         };
@@ -4823,8 +5059,17 @@ impl CodeWorkbench {
             FileMutationKind::Rename,
             source,
             Some(destination),
-            move || runtime.files().rename(&request).map(|_| ()),
-            move |this| {
+            move || {
+                let backend = backend.clone();
+                async move {
+                    backend
+                        .file()
+                        .rename_path(MutationRequest::new(request))
+                        .await
+                        .map(|_| ())
+                }
+            },
+            move |this, _cx| {
                 this.file_tree.move_path(&apply_source, &apply_destination);
                 this.preview.move_path(&apply_source, &apply_destination);
                 this.editors.move_path(&apply_source, &apply_destination);
@@ -4836,7 +5081,7 @@ impl CodeWorkbench {
     }
 
     pub(crate) fn delete_path(&mut self, path: String, cx: &mut Context<Self>) {
-        let (Some(runtime), Some(workspace)) = (self.runtime.clone(), self.workspace.clone())
+        let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
         else {
             return;
         };
@@ -4852,8 +5097,16 @@ impl CodeWorkbench {
             FileMutationKind::Delete,
             path,
             None,
-            move || runtime.files().delete(&request),
-            move |this| {
+            move || {
+                let backend = backend.clone();
+                async move {
+                    backend
+                        .file()
+                        .delete_path(MutationRequest::new(request))
+                        .await
+                }
+            },
+            move |this, cx| {
                 let protected = this.protected_tab_ids();
                 let removed_tab_ids = this
                     .preview
@@ -4870,7 +5123,7 @@ impl CodeWorkbench {
                 this.editors.delete_path(&apply_path);
                 this.git.delete_path(&apply_path);
                 for tab_id in removed_tab_ids {
-                    this.cleanup_closed_tab(&tab_id, true);
+                    this.cleanup_closed_tab(&tab_id, true, cx);
                 }
                 this.presentations
                     .retain(|path, _| !path_is_equal_or_descendant(path, &apply_path));
@@ -4881,7 +5134,7 @@ impl CodeWorkbench {
         );
     }
 
-    fn start_file_mutation<F>(
+    fn start_file_mutation<F, Fut>(
         &mut self,
         kind: FileMutationKind,
         source: String,
@@ -4889,12 +5142,13 @@ impl CodeWorkbench {
         operation: F,
         cx: &mut Context<Self>,
     ) where
-        F: FnOnce() -> VibexResult<()> + Send + 'static,
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), BackendError>> + Send + 'static,
     {
-        self.start_file_mutation_with_apply(kind, source, destination, operation, |_| {}, cx);
+        self.start_file_mutation_with_apply(kind, source, destination, operation, |_, _| {}, cx);
     }
 
-    fn start_file_mutation_with_apply<F, A>(
+    fn start_file_mutation_with_apply<F, Fut, A>(
         &mut self,
         kind: FileMutationKind,
         source: String,
@@ -4903,8 +5157,9 @@ impl CodeWorkbench {
         apply: A,
         cx: &mut Context<Self>,
     ) where
-        F: FnOnce() -> VibexResult<()> + Send + 'static,
-        A: FnOnce(&mut Self) + 'static,
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), BackendError>> + Send + 'static,
+        A: FnOnce(&mut Self, &mut Context<Self>) + 'static,
     {
         if self.file_mutation_pending {
             self.error = Some("Another file mutation is already running".into());
@@ -4921,7 +5176,7 @@ impl CodeWorkbench {
         });
         self.file_mutation_pending = true;
         self.error = None;
-        let runner = gpui_tokio::Tokio::spawn(cx, async move { operation() });
+        let runner = gpui_tokio::Tokio::spawn(cx, async move { operation().await });
         self.mutation_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
@@ -4929,7 +5184,7 @@ impl CodeWorkbench {
                 this.file_tree.finish_pending(&operation_id);
                 match outcome {
                     Ok(Ok(())) => {
-                        apply(this);
+                        apply(this, cx);
                         this.sync_terminal_surface_activity(cx);
                         this.note = Some("File operation completed".into());
                         this.load_tree(cx);
@@ -4963,19 +5218,31 @@ impl CodeWorkbench {
     }
 
     pub(crate) fn reveal_in_file_manager(&mut self, path: String, cx: &mut Context<Self>) {
-        let absolute = match self.resolve_workspace_path(&path) {
-            Ok(path) => path,
-            Err(error) => {
-                self.error = Some(format!("{}: {}", error.code, error.message));
-                cx.notify();
-                return;
-            }
+        let Some(local) = self.local_materialized_path(&path, cx) else {
+            return;
         };
-        match reveal_path_in_file_manager(&absolute) {
-            Ok(()) => self.note = Some(format!("Revealed {path}")),
-            Err(error) => self.error = Some(format!("{}: {}", error.code, error.message)),
-        }
-        cx.notify();
+        let task_path = path.clone();
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = local.await;
+            if let Some(this) = entity.upgrade() {
+                this.update(cx, |this, cx| {
+                    match outcome {
+                        Ok(Ok(absolute)) => match reveal_path_in_file_manager(&absolute) {
+                            Ok(()) => this.note = Some(format!("Revealed {task_path}")),
+                            Err(error) => {
+                                this.error = Some(format!("{}: {}", error.code, error.message))
+                            }
+                        },
+                        Ok(Err(error)) => {
+                            this.error = Some(format!("{}: {}", error.code, error.message))
+                        }
+                        Err(_) => this.error = Some(format!("Revealing {task_path} failed")),
+                    }
+                    cx.notify();
+                });
+            }
+        });
+        self.file_tasks.insert(format!("reveal:{path}"), task);
     }
 
     fn open_external(
@@ -4985,30 +5252,74 @@ impl CodeWorkbench {
         terminal: bool,
         cx: &mut Context<Self>,
     ) {
-        let absolute = match self.resolve_workspace_path(&path) {
-            Ok(path) => path,
-            Err(error) => {
-                self.error = Some(format!("{}: {}", error.code, error.message));
-                cx.notify();
-                return;
+        let Some(local) = self.local_materialized_path(&path, cx) else {
+            return;
+        };
+        let task_path = path.clone();
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = match local.await {
+                Ok(Ok(absolute)) => {
+                    if terminal {
+                        open_native_terminal_for_path(&absolute)
+                    } else if let Some(tool) = tool {
+                        open_path_with_external_tool(&tool, &absolute)
+                    } else {
+                        open_path_with_default_app(&absolute)
+                    }
+                }
+                Ok(Err(error)) => Err(vibex_core::VibexError::new(
+                    vibex_core::ErrorCategory::Remote,
+                    error.code,
+                    error.message,
+                )),
+                Err(_) => Err(VibexError::process(
+                    "external_open_task_failed",
+                    "the external open task stopped unexpectedly",
+                )),
+            };
+            if let Some(this) = entity.upgrade() {
+                this.update(cx, |this, cx| {
+                    match outcome {
+                        Ok(()) => this.note = Some(format!("Opened {task_path}")),
+                        Err(error) => {
+                            this.error = Some(format!("{}: {}", error.code, error.message))
+                        }
+                    }
+                    cx.notify();
+                });
             }
+        });
+        self.file_tasks.insert(format!("external:{path}"), task);
+    }
+
+    /// Resolves a workspace-relative path to a path on **this** machine.
+    ///
+    /// Opening a file in an external tool, revealing it in the OS file manager,
+    /// or handing it to a native renderer are all client-side actions, so the
+    /// desktop materializes the authoritative bytes locally first. That keeps
+    /// the behaviour identical for a local and a remote authority.
+    fn local_materialized_path(
+        &self,
+        path: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Result<Result<PathBuf, BackendError>, tokio::task::JoinError>>> {
+        let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
+        else {
+            let this = cx.entity();
+            this.update(cx, |this, cx| {
+                this.error = Some("Select a workspace before opening a file".into());
+                cx.notify();
+            });
+            return None;
         };
-        let outcome = if terminal {
-            open_native_terminal_for_path(&absolute)
-        } else if let Some(tool) = tool {
-            open_path_with_external_tool(&tool, &absolute)
-        } else {
-            open_path_with_default_app(&absolute)
-        };
-        match outcome {
-            Ok(()) => self.note = Some(format!("Opened {path}")),
-            Err(error) => self.error = Some(format!("{}: {}", error.code, error.message)),
-        }
-        cx.notify();
+        let path = path.to_string();
+        Some(gpui_tokio::Tokio::spawn(cx, async move {
+            materialize_preview_file(&backend, &workspace.id, &path).await
+        }))
     }
 
     pub(crate) fn open_diff(&mut self, key: GitSelectionKey, cx: &mut Context<Self>) {
-        if self.runtime.is_none() || self.workspace.is_none() {
+        if self.backend.is_none() || self.workspace.is_none() {
             return;
         }
         let Some(path) = normalized_relative_path(&key.path) else {
@@ -5046,7 +5357,7 @@ impl CodeWorkbench {
         if self.git.diffs.contains_key(&key) || self.diff_tasks.contains_key(&key) {
             return;
         }
-        let (Some(runtime), Some(workspace)) = (self.runtime.clone(), self.workspace.clone())
+        let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
         else {
             return;
         };
@@ -5061,7 +5372,8 @@ impl CodeWorkbench {
             path: key.path.clone(),
             staged: key.staged,
         };
-        let runner = gpui_tokio::Tokio::spawn(cx, async move { runtime.git().diff(&request) });
+        let runner =
+            gpui_tokio::Tokio::spawn(cx, async move { backend.git().git_diff(request).await });
         let task_key = key.clone();
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
@@ -5092,7 +5404,7 @@ impl CodeWorkbench {
     }
 
     pub(crate) fn open_commit(&mut self, hash: String, subject: String, cx: &mut Context<Self>) {
-        if self.runtime.is_none() || self.workspace.is_none() {
+        if self.backend.is_none() || self.workspace.is_none() {
             return;
         }
         let hash = hash.trim().to_string();
@@ -5126,7 +5438,7 @@ impl CodeWorkbench {
         if self.git.commit_patch_ready(&hash) || self.commit_detail_tasks.contains_key(&hash) {
             return;
         }
-        let (Some(runtime), Some(workspace)) = (self.runtime.clone(), self.workspace.clone())
+        let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
         else {
             return;
         };
@@ -5144,7 +5456,10 @@ impl CodeWorkbench {
             include_patch: true,
         };
         let runner =
-            gpui_tokio::Tokio::spawn(cx, async move { runtime.git().commit_detail(&request) });
+            gpui_tokio::Tokio::spawn(
+                cx,
+                async move { backend.git().git_commit_detail(request).await },
+            );
         let task_hash = hash.clone();
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
@@ -5182,7 +5497,7 @@ impl CodeWorkbench {
         path: String,
         cx: &mut Context<Self>,
     ) {
-        if self.runtime.is_none() || self.workspace.is_none() {
+        if self.backend.is_none() || self.workspace.is_none() {
             return;
         }
         let hash = hash.trim().to_string();
@@ -5231,7 +5546,7 @@ impl CodeWorkbench {
                 paths,
                 None,
             ),
-            move |git| git.revert(&request).map(Some),
+            GitMutationOperation::Revert(request),
             Some(window),
             cx,
         );
@@ -5243,7 +5558,7 @@ impl CodeWorkbench {
         window: AnyWindowHandle,
         cx: &mut Context<Self>,
     ) {
-        let (Some(workspace), Some(_)) = (self.workspace.clone(), self.runtime.clone()) else {
+        let (Some(workspace), Some(_)) = (self.workspace.clone(), self.backend.clone()) else {
             return;
         };
         let message = self.commit_message.read(cx).value().trim().to_string();
@@ -5275,9 +5590,9 @@ impl CodeWorkbench {
         self.commit_reset_window = Some(window);
         self.run_git_mutation(
             mutation_scope(RequestId::new().as_str(), kind, request.paths.clone(), None),
-            move |git| {
-                git.commit(&request)?;
-                git.status(&status_workspace).map(Some)
+            GitMutationOperation::Commit {
+                request,
+                status_workspace,
             },
             None,
             cx,
@@ -5306,29 +5621,23 @@ impl CodeWorkbench {
         let status_workspace = workspace.id;
         self.run_git_mutation(
             mutation_scope(RequestId::new().as_str(), mutation_kind, Vec::new(), None),
-            move |git| {
-                let result = git.remote_action(&request)?;
-                if let Some(status) = result.status_after {
-                    Ok(Some(status))
-                } else {
-                    git.status(&status_workspace).map(Some)
-                }
+            GitMutationOperation::RemoteAction {
+                request,
+                status_workspace,
             },
             Some(window),
             cx,
         );
     }
 
-    fn run_git_mutation<F>(
+    fn run_git_mutation(
         &mut self,
         scope: vibex_desktop_model::GitMutationScope,
-        operation: F,
+        operation: GitMutationOperation,
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
-    ) where
-        F: FnOnce(GitHandle) -> VibexResult<Option<GitStatusSummary>> + Send + 'static,
-    {
-        let Some(runtime) = self.runtime.clone() else {
+    ) {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         let reset_commit_form =
@@ -5346,7 +5655,32 @@ impl CodeWorkbench {
         let notification_window = window.map(|window| window.window_handle());
         let mutation_kind = scope.kind;
         let operation_id = scope.operation_id;
-        let runner = gpui_tokio::Tokio::spawn(cx, async move { operation(runtime.git()) });
+        let git = backend.git().clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            match operation {
+                GitMutationOperation::Revert(request) => git
+                    .git_revert(MutationRequest::new(request))
+                    .await
+                    .map(Some),
+                GitMutationOperation::Commit {
+                    request,
+                    status_workspace,
+                } => {
+                    git.commit(MutationRequest::new(request)).await?;
+                    git.git_status(status_workspace).await.map(Some)
+                }
+                GitMutationOperation::RemoteAction {
+                    request,
+                    status_workspace,
+                } => {
+                    let result = git.git_remote_action(MutationRequest::new(request)).await?;
+                    match result.status_after {
+                        Some(status) => Ok(Some(status)),
+                        None => git.git_status(status_workspace).await.map(Some),
+                    }
+                }
+            }
+        });
         self.mutation_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
@@ -5538,7 +5872,7 @@ impl CodeWorkbench {
         let empty_terminal_pane_id = pane_id.clone();
         let tabs_menu_entity = cx.weak_entity();
         let tabs_menu_pane_id = pane_id.clone();
-        let terminal_available = self.workspace.is_some() && self.runtime.is_some();
+        let terminal_available = self.workspace.is_some() && self.terminal_transport.is_some();
         let tab_group_drop_active = cx.has_active_drag()
             && self
                 .preview_pane_drop_target
@@ -6020,7 +6354,7 @@ impl CodeWorkbench {
             .as_deref()
             .is_some_and(|path| file_can_open_in_editor(path, FileEntryKind::File));
         let workspace_available = self.workspace.is_some();
-        let terminal_available = workspace_available && self.runtime.is_some();
+        let terminal_available = workspace_available && self.terminal_transport.is_some();
         let dirty = tab
             .id
             .strip_prefix("file:")
@@ -7775,7 +8109,7 @@ impl Render for CodeWorkbench {
         self.git_preview_errors
             .retain(|tab_id, _| tab_ids.contains(tab_id));
         let is_fullscreen = self.preview_panel_fullscreen;
-        let terminal_available = self.workspace.is_some() && self.runtime.is_some();
+        let terminal_available = self.workspace.is_some() && self.terminal_transport.is_some();
         let root = self.preview.root.clone();
         let side_preview = self.preview.side_preview_tab_id.clone();
         v_flex()
@@ -8420,11 +8754,11 @@ impl CodeRightRail {
             cx.notify();
             return;
         }
-        let (runtime, workspace) = {
+        let (backend, workspace) = {
             let workbench = self.workbench.read(cx);
-            (workbench.runtime.clone(), workbench.workspace.clone())
+            (workbench.backend.clone(), workbench.workspace.clone())
         };
-        let (Some(runtime), Some(workspace)) = (runtime, workspace) else {
+        let (Some(backend), Some(workspace)) = (backend, workspace) else {
             self.file_search_loading = false;
             self.file_search_results.clear();
             self.file_search_error = Some(
@@ -8458,7 +8792,10 @@ impl CodeRightRail {
                 cx.background_executor().timer(delay).await;
             }
             let runner =
-                gpui_tokio::Tokio::spawn(cx, async move { runtime.files().search(&request) });
+                gpui_tokio::Tokio::spawn(
+                    cx,
+                    async move { backend.file().search_files(request).await },
+                );
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
                 if this.file_search_generation != generation {
@@ -13983,6 +14320,63 @@ fn tab_tooltip(target: &PreviewTarget, label: &str) -> String {
         }
         _ => label.to_string(),
     }
+}
+
+/// Max bytes the desktop will pull across the authority boundary to render a
+/// local preview surface (PDF / Office).
+const PREVIEW_MATERIALIZE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Materializes a workspace-relative file locally so a local renderer can open
+/// it.
+///
+/// The authority owns the bytes and the desktop owns rendering, so a remote
+/// authority streams the file over the backend and the desktop caches it on
+/// disk before handing the path to the PDF/Office engine. The same path works
+/// for a local authority, which keeps the two modes identical.
+async fn materialize_preview_file(
+    backend: &BackendFacade,
+    workspace_id: &WorkspaceId,
+    path: &str,
+) -> Result<PathBuf, BackendError> {
+    let bytes = backend
+        .file()
+        .read_file_bytes(
+            workspace_id.clone(),
+            path.to_string(),
+            PREVIEW_MATERIALIZE_MAX_BYTES,
+        )
+        .await?;
+    let cache_dir = preview_cache_directory();
+    std::fs::create_dir_all(&cache_dir).map_err(|_| {
+        BackendError::failed(
+            "preview_cache_create_failed",
+            "the desktop preview cache directory could not be created",
+        )
+    })?;
+    let digest = Sha256::digest(path.as_bytes());
+    let mut file_name = String::with_capacity(80);
+    for byte in digest.iter().take(16) {
+        file_name.push_str(&format!("{byte:02x}"));
+    }
+    if let Some(extension) = std::path::Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+    {
+        file_name.push('.');
+        file_name.push_str(&extension.chars().take(16).collect::<String>());
+    }
+    let target = cache_dir.join(file_name);
+    std::fs::write(&target, bytes).map_err(|_| {
+        BackendError::failed(
+            "preview_cache_write_failed",
+            "the desktop preview cache file could not be written",
+        )
+    })?;
+    Ok(target)
+}
+
+fn preview_cache_directory() -> PathBuf {
+    std::env::temp_dir().join("vibex-desktop-preview-cache")
 }
 
 fn git_diff_tab_id(key: &GitSelectionKey) -> String {

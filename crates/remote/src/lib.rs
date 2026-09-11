@@ -36,12 +36,13 @@ use vibex_core::{
     RemoteAuditTargetKind, RemoteAuthContext, RemoteAuthProof, RemoteCapabilitySummary,
     RemoteClaimPairingCodeRequest, RemoteClaimPairingCodeResponse, RemoteCreatePairingCodeRequest,
     RemoteCreatePairingCodeResponse, RemoteDeepLinkResolution, RemoteDeepLinkResolutionStatus,
-    RemoteDeviceDetail, RemoteDevicePermissionLevel, RemoteDeviceStatus, RemoteFileDeleteResponse,
-    RemoteFileReadResponse, RemoteFileRenameResponse, RemoteFileSearchResponse,
-    RemoteFileTreeResponse, RemoteFileWriteResponse, RemoteGitBlameResponse,
-    RemoteGitBranchListResponse, RemoteGitCommitDetailResponse, RemoteGitCommitResponse,
-    RemoteGitDiffResponse, RemoteGitHistoryResponse, RemoteGitRemoteActionResponse,
-    RemoteGitStatusMutationResponse, RemoteGitStatusResponse, RemoteGitWorktreeEligibilityResponse,
+    RemoteDeviceDetail, RemoteDevicePermissionLevel, RemoteDeviceStatus, RemoteFileCopyResponse,
+    RemoteFileCreateDirectoryResponse, RemoteFileDeleteResponse, RemoteFileReadResponse,
+    RemoteFileRenameResponse, RemoteFileSearchResponse, RemoteFileTreeResponse,
+    RemoteFileWriteResponse, RemoteGitBlameResponse, RemoteGitBranchListResponse,
+    RemoteGitCommitDetailResponse, RemoteGitCommitResponse, RemoteGitDiffResponse,
+    RemoteGitHistoryResponse, RemoteGitRemoteActionResponse, RemoteGitStatusMutationResponse,
+    RemoteGitStatusResponse, RemoteGitWorktreeEligibilityResponse,
     RemoteGitWorktreeSnapshotResponse, RemoteHandshakeResponse, RemoteHealthState,
     RemoteHealthStatus, RemoteLiveEventChannel, RemoteLiveEventEnvelope, RemoteOperationKind,
     RemotePairingCode, RemoteProtocolVersion, RemoteProviderFailoverRecommendationListResponse,
@@ -3014,6 +3015,60 @@ async fn dispatch_workbench_request(
             )?;
             let entry = result?;
             serde_json::to_value(RemoteFileRenameResponse { entry })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteWorkbenchRequest::FileCreateDirectory(request) => {
+            let auth = authorize_workbench_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateFile,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let (_conn, service) =
+                file_service_for_workspace(&runtime.db_path, &request.request.workspace_id)?;
+            let result = service.create_directory(&request.request);
+            audit_workbench_mutation(
+                runtime,
+                &auth,
+                RemoteAuditTargetKind::WorkspaceFile,
+                "file_create_directory",
+                format!("File create directory: {}", request.request.path),
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let entry = result?;
+            serde_json::to_value(RemoteFileCreateDirectoryResponse { entry })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteWorkbenchRequest::FileCopy(request) => {
+            let auth = authorize_workbench_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateFile,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let (_conn, service) =
+                file_service_for_workspace(&runtime.db_path, &request.request.workspace_id)?;
+            let result = service.copy_path(&request.request);
+            audit_workbench_mutation(
+                runtime,
+                &auth,
+                RemoteAuditTargetKind::WorkspaceFile,
+                "file_copy",
+                format!(
+                    "File copy: {} -> {}",
+                    request.request.path,
+                    request.request.new_path.as_deref().unwrap_or("[missing]")
+                ),
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let entry = result?;
+            serde_json::to_value(RemoteFileCopyResponse { entry })
                 .map_err(remote_payload_encode_error)
         }
         RemoteWorkbenchRequest::GitStatus(request) => {

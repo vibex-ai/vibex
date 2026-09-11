@@ -970,6 +970,21 @@ mod tests {
             })
         }
 
+        fn read_file_bytes(
+            &self,
+            _workspace_id: WorkspaceId,
+            _path: String,
+            _max_bytes: usize,
+        ) -> BackendFuture<'_, Vec<u8>> {
+            let file = self.file.clone();
+            Box::pin(async move {
+                let file = file
+                    .lock()
+                    .map_err(|_| BackendError::failed("mock", "mock poisoned"))?;
+                Ok(file.content.clone().unwrap_or_default().into_bytes())
+            })
+        }
+
         fn write_file(
             &self,
             request: MutationRequest<FileWriteRequest>,

@@ -1,12 +1,13 @@
 use vibex_core::{
-    GitCommitRequest, GitCommitResult, GitDiffRequest, GitDiffResponse, GitProjectEligibility,
-    GitStageRequest, GitStatusSummary, GitWorktreeArchiveRequest,
-    GitWorktreeAssistanceSessionRequest, GitWorktreeConflictResolveRequest,
-    GitWorktreeConflictStageRequest, GitWorktreeCreateRequest, GitWorktreeCreateResult,
-    GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
-    GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeOperationRecord,
-    GitWorktreeOperationRequest, GitWorktreeReadinessRecord, GitWorktreeReadinessRequest,
-    GitWorktreeRestoreRequest, WorkspaceId,
+    GitBranchListResponse, GitCommitDetail, GitCommitDetailRequest, GitCommitRequest,
+    GitCommitResult, GitDiffRequest, GitDiffResponse, GitHistoryRequest, GitHistoryResponse,
+    GitProjectEligibility, GitRemoteActionRequest, GitRemoteActionResult, GitStageRequest,
+    GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
+    GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeCreateRequest,
+    GitWorktreeCreateResult, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
+    GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
+    GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeReadinessRecord,
+    GitWorktreeReadinessRequest, GitWorktreeRestoreRequest, WorkspaceId,
 };
 
 use crate::{BackendBound, BackendFuture, MutationRequest};
@@ -120,4 +121,32 @@ pub trait GitBackend: BackendBound {
         &self,
         request: MutationRequest<GitCommitRequest>,
     ) -> BackendFuture<'_, GitCommitResult>;
+
+    /// Paged commit history for the workbench Git rail.
+    ///
+    /// The compact mobile workflow deliberately skips this, but the desktop
+    /// workbench renders history, commit detail, and branch divergence, so the
+    /// contract has to carry them for the desktop client to run fully against a
+    /// remote authority.
+    fn git_history(&self, request: GitHistoryRequest) -> BackendFuture<'_, GitHistoryResponse>;
+
+    fn git_commit_detail(
+        &self,
+        request: GitCommitDetailRequest,
+    ) -> BackendFuture<'_, GitCommitDetail>;
+
+    fn git_branch_list(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BackendFuture<'_, GitBranchListResponse>;
+
+    fn git_revert(
+        &self,
+        request: MutationRequest<GitStageRequest>,
+    ) -> BackendFuture<'_, GitStatusSummary>;
+
+    fn git_remote_action(
+        &self,
+        request: MutationRequest<GitRemoteActionRequest>,
+    ) -> BackendFuture<'_, GitRemoteActionResult>;
 }
