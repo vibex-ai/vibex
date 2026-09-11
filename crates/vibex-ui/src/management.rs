@@ -1166,7 +1166,11 @@ mod tests {
         AgentModelProviderDisplayOrderSetRequest, AgentModelProviderDisplayOrderSetResponse,
         AgentModelProviderProfileDeleteRequest, AgentModelProviderProfileFetchModelsRequest,
         AgentModelProviderProfileFetchModelsResponse, AgentModelProviderProfileTestRequest,
-        AgentModelProviderProfileTestResult, ProviderCapabilitySummary,
+        AgentModelProviderProfileTestResult, McpServer, McpServerAgentMatrix,
+        McpServerAgentMatrixListRequest, McpServerCreateRequest, McpServerDeleteRequest,
+        McpServerDiscoverRequest, McpServerDiscoveryResponse, McpServerImportRequest,
+        McpServerImportResult, McpServerSetAgentMatrixRequest, McpServerUpdateRequest,
+        McpServerValidateRequest, McpServerValidationResult, ProviderCapabilitySummary,
         ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
     };
 
@@ -1410,6 +1414,66 @@ mod tests {
             &self,
             _request: MutationRequest<ProviderRunCapabilityProbesRequest>,
         ) -> BackendFuture<'_, ProviderRunCapabilityProbesResult> {
+            error_future()
+        }
+
+        fn mcp_servers(&self) -> BackendFuture<'_, Vec<McpServer>> {
+            error_future()
+        }
+
+        fn create_mcp_server(
+            &self,
+            _request: MutationRequest<McpServerCreateRequest>,
+        ) -> BackendFuture<'_, McpServer> {
+            error_future()
+        }
+
+        fn update_mcp_server(
+            &self,
+            _request: MutationRequest<McpServerUpdateRequest>,
+        ) -> BackendFuture<'_, McpServer> {
+            error_future()
+        }
+
+        fn delete_mcp_server(
+            &self,
+            _request: MutationRequest<McpServerDeleteRequest>,
+        ) -> BackendFuture<'_, ()> {
+            error_future()
+        }
+
+        fn set_mcp_server_agent_matrix(
+            &self,
+            _request: MutationRequest<McpServerSetAgentMatrixRequest>,
+        ) -> BackendFuture<'_, McpServer> {
+            error_future()
+        }
+
+        fn mcp_server_agent_matrix(
+            &self,
+            _request: McpServerAgentMatrixListRequest,
+        ) -> BackendFuture<'_, Vec<McpServerAgentMatrix>> {
+            error_future()
+        }
+
+        fn discover_mcp_sources(
+            &self,
+            _request: McpServerDiscoverRequest,
+        ) -> BackendFuture<'_, McpServerDiscoveryResponse> {
+            error_future()
+        }
+
+        fn import_mcp_servers(
+            &self,
+            _request: MutationRequest<McpServerImportRequest>,
+        ) -> BackendFuture<'_, McpServerImportResult> {
+            error_future()
+        }
+
+        fn validate_mcp_server(
+            &self,
+            _request: McpServerValidateRequest,
+        ) -> BackendFuture<'_, McpServerValidationResult> {
             error_future()
         }
     }

@@ -25,7 +25,11 @@ use vibex_core::{
     GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
     GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeOperationRecord,
     GitWorktreeOperationRequest, GitWorktreeReadinessRecord, GitWorktreeReadinessRequest,
-    GitWorktreeRestoreRequest, OpenWorkspaceRequest, ProjectId, ProviderCapabilitySummary,
+    GitWorktreeRestoreRequest, McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest,
+    McpServerCreateRequest, McpServerDeleteRequest, McpServerDiscoverRequest,
+    McpServerDiscoveryResponse, McpServerImportRequest, McpServerImportResult,
+    McpServerSetAgentMatrixRequest, McpServerUpdateRequest, McpServerValidateRequest,
+    McpServerValidationResult, OpenWorkspaceRequest, ProjectId, ProviderCapabilitySummary,
     ProviderHealthSummary, ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
     ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, RemoteAuditListRequest,
     RemoteAuditRecord, RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
@@ -1859,6 +1863,152 @@ impl ManagementBackend for NativeBackend {
                 .providers()
                 .management()
                 .run_capability_probes(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn mcp_servers(&self) -> BackendFuture<'_, Vec<McpServer>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .list_mcp_servers()
+                .map_err(Into::into)
+        })
+    }
+
+    fn create_mcp_server(
+        &self,
+        request: MutationRequest<McpServerCreateRequest>,
+    ) -> BackendFuture<'_, McpServer> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .create_mcp_server(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn update_mcp_server(
+        &self,
+        request: MutationRequest<McpServerUpdateRequest>,
+    ) -> BackendFuture<'_, McpServer> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .update_mcp_server(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn delete_mcp_server(
+        &self,
+        request: MutationRequest<McpServerDeleteRequest>,
+    ) -> BackendFuture<'_, ()> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .delete_mcp_server(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn set_mcp_server_agent_matrix(
+        &self,
+        request: MutationRequest<McpServerSetAgentMatrixRequest>,
+    ) -> BackendFuture<'_, McpServer> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .set_mcp_server_agent_matrix(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn mcp_server_agent_matrix(
+        &self,
+        request: McpServerAgentMatrixListRequest,
+    ) -> BackendFuture<'_, Vec<McpServerAgentMatrix>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .list_mcp_server_agent_matrix(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn discover_mcp_sources(
+        &self,
+        request: McpServerDiscoverRequest,
+    ) -> BackendFuture<'_, McpServerDiscoveryResponse> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .discover_mcp_sources(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn import_mcp_servers(
+        &self,
+        request: MutationRequest<McpServerImportRequest>,
+    ) -> BackendFuture<'_, McpServerImportResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .import_mcp_servers(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn validate_mcp_server(
+        &self,
+        request: McpServerValidateRequest,
+    ) -> BackendFuture<'_, McpServerValidationResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .validate_mcp_server(request)
                 .map_err(Into::into)
         })
     }

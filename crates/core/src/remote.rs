@@ -39,6 +39,10 @@ use crate::ids::{
     RuntimeProcessId, TerminalId, VibexSessionId,
 };
 use crate::provider::{
+    McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest, McpServerCreateRequest,
+    McpServerDeleteRequest, McpServerDiscoverRequest, McpServerDiscoveryResponse,
+    McpServerImportRequest, McpServerImportResult, McpServerSetAgentMatrixRequest,
+    McpServerUpdateRequest, McpServerValidateRequest, McpServerValidationResult,
     ProviderCapabilitySummary, ProviderFailoverRecommendation,
     ProviderFailoverRecommendationRequest, ProviderHealthSummary, ProviderInjectionPreview,
     ProviderInjectionPreviewRequest, ProviderProfileSummary, ProviderRunHealthProbesRequest,
@@ -1581,6 +1585,15 @@ pub enum RemoteProviderOperationKind {
     FetchAgentModelProviderProfileModels,
     ListCapabilitySummaries,
     RunCapabilityProbes,
+    ListMcpServers,
+    CreateMcpServer,
+    UpdateMcpServer,
+    DeleteMcpServer,
+    SetMcpServerAgentMatrix,
+    ListMcpServerAgentMatrix,
+    DiscoverMcpSources,
+    ImportMcpServers,
+    ValidateMcpServer,
 }
 
 /// Redacted Agent configuration state for remote management surfaces. Command
@@ -2013,6 +2026,110 @@ pub struct RemoteAgentModelProviderDefaultRequest {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RemoteProviderMcpListRequest {
+    pub auth: RemoteAuthProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderMcpListResponse {
+    pub servers: Vec<McpServer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderMcpCreateRequest {
+    pub auth: RemoteAuthProof,
+    pub request: McpServerCreateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderMcpUpdateRequest {
+    pub auth: RemoteAuthProof,
+    pub request: McpServerUpdateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderMcpDeleteRequest {
+    pub auth: RemoteAuthProof,
+    pub request: McpServerDeleteRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderMcpAgentMatrixSetRequest {
+    pub auth: RemoteAuthProof,
+    pub request: McpServerSetAgentMatrixRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderMcpAgentMatrixListRequest {
+    pub auth: RemoteAuthProof,
+    pub request: McpServerAgentMatrixListRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderMcpAgentMatrixListResponse {
+    pub matrix: Vec<McpServerAgentMatrix>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderMcpDiscoverRequest {
+    pub auth: RemoteAuthProof,
+    pub request: McpServerDiscoverRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderMcpDiscoverResponse {
+    pub discovery: McpServerDiscoveryResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderMcpImportRequest {
+    pub auth: RemoteAuthProof,
+    pub request: McpServerImportRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderMcpImportResponse {
+    pub result: McpServerImportResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderMcpValidateRequest {
+    pub auth: RemoteAuthProof,
+    pub request: McpServerValidateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderMcpValidateResponse {
+    pub result: McpServerValidationResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderMcpMutationResponse {
+    pub server: McpServer,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderMcpDeleteResponse {
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RemoteAgentModelProviderProfileDeleteRequest {
     pub auth: RemoteAuthProof,
     pub request: crate::AgentModelProviderProfileDeleteRequest,
@@ -2144,6 +2261,15 @@ pub enum RemoteProviderRequest {
     FetchAgentModelProviderProfileModels(RemoteAgentModelProviderProfileFetchModelsRequest),
     ListCapabilitySummaries(RemoteProviderCapabilitySummaryListRequest),
     RunCapabilityProbes(RemoteProviderRunCapabilityProbesRequest),
+    ListMcpServers(RemoteProviderMcpListRequest),
+    CreateMcpServer(RemoteProviderMcpCreateRequest),
+    UpdateMcpServer(RemoteProviderMcpUpdateRequest),
+    DeleteMcpServer(RemoteProviderMcpDeleteRequest),
+    SetMcpServerAgentMatrix(RemoteProviderMcpAgentMatrixSetRequest),
+    ListMcpServerAgentMatrix(RemoteProviderMcpAgentMatrixListRequest),
+    DiscoverMcpSources(RemoteProviderMcpDiscoverRequest),
+    ImportMcpServers(RemoteProviderMcpImportRequest),
+    ValidateMcpServer(RemoteProviderMcpValidateRequest),
 }
 
 impl RemoteProviderRequest {
@@ -2240,6 +2366,19 @@ impl RemoteProviderRequest {
                 RemoteProviderOperationKind::ListCapabilitySummaries
             }
             Self::RunCapabilityProbes(_) => RemoteProviderOperationKind::RunCapabilityProbes,
+            Self::ListMcpServers(_) => RemoteProviderOperationKind::ListMcpServers,
+            Self::CreateMcpServer(_) => RemoteProviderOperationKind::CreateMcpServer,
+            Self::UpdateMcpServer(_) => RemoteProviderOperationKind::UpdateMcpServer,
+            Self::DeleteMcpServer(_) => RemoteProviderOperationKind::DeleteMcpServer,
+            Self::SetMcpServerAgentMatrix(_) => {
+                RemoteProviderOperationKind::SetMcpServerAgentMatrix
+            }
+            Self::ListMcpServerAgentMatrix(_) => {
+                RemoteProviderOperationKind::ListMcpServerAgentMatrix
+            }
+            Self::DiscoverMcpSources(_) => RemoteProviderOperationKind::DiscoverMcpSources,
+            Self::ImportMcpServers(_) => RemoteProviderOperationKind::ImportMcpServers,
+            Self::ValidateMcpServer(_) => RemoteProviderOperationKind::ValidateMcpServer,
         }
     }
 }

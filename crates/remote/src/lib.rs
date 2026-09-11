@@ -1999,6 +1999,168 @@ async fn dispatch_provider_request(
             serde_json::to_value(vibex_core::RemoteProviderRunCapabilityProbesResponse { result })
                 .map_err(remote_payload_encode_error)
         }
+        RemoteProviderRequest::ListMcpServers(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let servers = service.list_mcp_servers()?;
+            serde_json::to_value(vibex_core::RemoteProviderMcpListResponse { servers })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::CreateMcpServer(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let name = request.request.display_name.clone();
+            let result = service.create_mcp_server(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                format!("mcp_server:{name}"),
+                "MCP server created from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let server = result?;
+            serde_json::to_value(vibex_core::RemoteProviderMcpMutationResponse { server })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::UpdateMcpServer(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let id = request.request.mcp_server_id.clone();
+            let result = service.update_mcp_server(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                format!("mcp_server:{id}"),
+                "MCP server updated from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let server = result?;
+            serde_json::to_value(vibex_core::RemoteProviderMcpMutationResponse { server })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::DeleteMcpServer(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let id = request.request.mcp_server_id.clone();
+            let result = service.delete_mcp_server(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                format!("mcp_server:{id}"),
+                "MCP server deleted from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            result?;
+            serde_json::to_value(vibex_core::RemoteProviderMcpDeleteResponse { deleted: true })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::SetMcpServerAgentMatrix(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let id = request.request.mcp_server_id.clone();
+            let result = service.set_mcp_server_agent_matrix(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                format!("mcp_server:{id}"),
+                "MCP server Agent matrix updated from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let server = result?;
+            serde_json::to_value(vibex_core::RemoteProviderMcpMutationResponse { server })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::ListMcpServerAgentMatrix(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let matrix = service.list_mcp_server_agent_matrix(request.request)?;
+            serde_json::to_value(vibex_core::RemoteProviderMcpAgentMatrixListResponse { matrix })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::DiscoverMcpSources(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let discovery = service.discover_mcp_sources(request.request)?;
+            serde_json::to_value(vibex_core::RemoteProviderMcpDiscoverResponse { discovery })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::ImportMcpServers(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = service.import_mcp_servers(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "mcp_server_import".to_string(),
+                "MCP servers imported from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let result = result?;
+            serde_json::to_value(vibex_core::RemoteProviderMcpImportResponse { result })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::ValidateMcpServer(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let result = service.validate_mcp_server(request.request)?;
+            serde_json::to_value(vibex_core::RemoteProviderMcpValidateResponse { result })
+                .map_err(remote_payload_encode_error)
+        }
         RemoteProviderRequest::MutateProviderCredentialSecret(request) => {
             let (proof, request) = request.into_request();
             let auth = authorize_provider_action(

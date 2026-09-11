@@ -3331,6 +3331,235 @@ impl ManagementBackend for WebRemoteBackend {
         })
     }
 
+    fn mcp_servers(&self) -> BackendFuture<'_, Vec<vibex_core::McpServer>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload =
+                RemoteProviderRequest::ListMcpServers(vibex_core::RemoteProviderMcpListRequest {
+                    auth: this.auth(),
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderMcpListResponse>(value)?.servers)
+        })
+    }
+
+    fn create_mcp_server(
+        &self,
+        request: MutationRequest<vibex_core::McpServerCreateRequest>,
+    ) -> BackendFuture<'_, vibex_core::McpServer> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::CreateMcpServer(
+                vibex_core::RemoteProviderMcpCreateRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderMcpMutationResponse>(value)?.server)
+        })
+    }
+
+    fn update_mcp_server(
+        &self,
+        request: MutationRequest<vibex_core::McpServerUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::McpServer> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::UpdateMcpServer(
+                vibex_core::RemoteProviderMcpUpdateRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderMcpMutationResponse>(value)?.server)
+        })
+    }
+
+    fn delete_mcp_server(
+        &self,
+        request: MutationRequest<vibex_core::McpServerDeleteRequest>,
+    ) -> BackendFuture<'_, ()> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::DeleteMcpServer(
+                vibex_core::RemoteProviderMcpDeleteRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            this.rpc(
+                RemoteOperationKind::ProviderSettings,
+                payload,
+                Some(request.request_id),
+                Some((&key, request.expected_revision.as_deref(), None)),
+                vibex_core::RemoteTimeoutClass::Standard,
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn set_mcp_server_agent_matrix(
+        &self,
+        request: MutationRequest<vibex_core::McpServerSetAgentMatrixRequest>,
+    ) -> BackendFuture<'_, vibex_core::McpServer> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::SetMcpServerAgentMatrix(
+                vibex_core::RemoteProviderMcpAgentMatrixSetRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderMcpMutationResponse>(value)?.server)
+        })
+    }
+
+    fn mcp_server_agent_matrix(
+        &self,
+        request: vibex_core::McpServerAgentMatrixListRequest,
+    ) -> BackendFuture<'_, Vec<vibex_core::McpServerAgentMatrix>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::ListMcpServerAgentMatrix(
+                vibex_core::RemoteProviderMcpAgentMatrixListRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderMcpAgentMatrixListResponse>(value)?.matrix)
+        })
+    }
+
+    fn discover_mcp_sources(
+        &self,
+        request: vibex_core::McpServerDiscoverRequest,
+    ) -> BackendFuture<'_, vibex_core::McpServerDiscoveryResponse> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::DiscoverMcpSources(
+                vibex_core::RemoteProviderMcpDiscoverRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderMcpDiscoverResponse>(value)?.discovery)
+        })
+    }
+
+    fn import_mcp_servers(
+        &self,
+        request: MutationRequest<vibex_core::McpServerImportRequest>,
+    ) -> BackendFuture<'_, vibex_core::McpServerImportResult> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::ImportMcpServers(
+                vibex_core::RemoteProviderMcpImportRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderMcpImportResponse>(value)?.result)
+        })
+    }
+
+    fn validate_mcp_server(
+        &self,
+        request: vibex_core::McpServerValidateRequest,
+    ) -> BackendFuture<'_, vibex_core::McpServerValidationResult> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::ValidateMcpServer(
+                vibex_core::RemoteProviderMcpValidateRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderMcpValidateResponse>(value)?.result)
+        })
+    }
+
     fn relay_status(&self) -> BackendFuture<'_, RelayStatusSummary> {
         self.unsupported(
             "remote_relay_status_unavailable",
@@ -3768,6 +3997,14 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
                 ),
                 (
                     BackendOperation::ManagementCapabilityProbe,
+                    has_provider_management && permits(RemoteActionClass::MutateProviderSettings),
+                ),
+                (
+                    BackendOperation::ManagementMcpRead,
+                    permits(RemoteActionClass::ReadProviderSettings),
+                ),
+                (
+                    BackendOperation::ManagementMcpMutate,
                     has_provider_management && permits(RemoteActionClass::MutateProviderSettings),
                 ),
                 (

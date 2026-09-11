@@ -18,7 +18,11 @@ use vibex_core::{
     GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
     GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeOperationRecord,
     GitWorktreeOperationRequest, GitWorktreeReadinessRecord, GitWorktreeReadinessRequest,
-    GitWorktreeRestoreRequest, OpenWorkspaceRequest, ProjectId, ProviderCapabilitySummary,
+    GitWorktreeRestoreRequest, McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest,
+    McpServerCreateRequest, McpServerDeleteRequest, McpServerDiscoverRequest,
+    McpServerDiscoveryResponse, McpServerImportRequest, McpServerImportResult,
+    McpServerSetAgentMatrixRequest, McpServerUpdateRequest, McpServerValidateRequest,
+    McpServerValidationResult, OpenWorkspaceRequest, ProjectId, ProviderCapabilitySummary,
     ProviderHealthSummary, ProviderProfileSummary, ProviderRunCapabilityProbesRequest,
     ProviderRunCapabilityProbesResult, ProviderRunHealthProbesRequest,
     ProviderRunHealthProbesResult, RemoteAuditListRequest, RemoteAuditRecord,
@@ -707,6 +711,66 @@ impl ManagementBackend for DisconnectedBackend {
         &self,
         _request: MutationRequest<ProviderRunCapabilityProbesRequest>,
     ) -> BackendFuture<'_, ProviderRunCapabilityProbesResult> {
+        disconnected_future!()
+    }
+
+    fn mcp_servers(&self) -> BackendFuture<'_, Vec<McpServer>> {
+        disconnected_future!()
+    }
+
+    fn create_mcp_server(
+        &self,
+        _request: MutationRequest<McpServerCreateRequest>,
+    ) -> BackendFuture<'_, McpServer> {
+        disconnected_future!()
+    }
+
+    fn update_mcp_server(
+        &self,
+        _request: MutationRequest<McpServerUpdateRequest>,
+    ) -> BackendFuture<'_, McpServer> {
+        disconnected_future!()
+    }
+
+    fn delete_mcp_server(
+        &self,
+        _request: MutationRequest<McpServerDeleteRequest>,
+    ) -> BackendFuture<'_, ()> {
+        disconnected_future!()
+    }
+
+    fn set_mcp_server_agent_matrix(
+        &self,
+        _request: MutationRequest<McpServerSetAgentMatrixRequest>,
+    ) -> BackendFuture<'_, McpServer> {
+        disconnected_future!()
+    }
+
+    fn mcp_server_agent_matrix(
+        &self,
+        _request: McpServerAgentMatrixListRequest,
+    ) -> BackendFuture<'_, Vec<McpServerAgentMatrix>> {
+        disconnected_future!()
+    }
+
+    fn discover_mcp_sources(
+        &self,
+        _request: McpServerDiscoverRequest,
+    ) -> BackendFuture<'_, McpServerDiscoveryResponse> {
+        disconnected_future!()
+    }
+
+    fn import_mcp_servers(
+        &self,
+        _request: MutationRequest<McpServerImportRequest>,
+    ) -> BackendFuture<'_, McpServerImportResult> {
+        disconnected_future!()
+    }
+
+    fn validate_mcp_server(
+        &self,
+        _request: McpServerValidateRequest,
+    ) -> BackendFuture<'_, McpServerValidationResult> {
         disconnected_future!()
     }
 }

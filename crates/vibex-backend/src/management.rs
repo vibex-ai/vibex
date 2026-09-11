@@ -12,7 +12,11 @@ use vibex_core::{
     AgentRuntimeProbeCancelRequest, AgentRuntimeProbeListRequest, AgentRuntimeProbeRecord,
     AgentRuntimeProbeStartRequest, AgentRuntimeProfile, AgentRuntimeProfileCreateRequest,
     AgentRuntimeProfileUpdateRequest, AgentSnapshotEntry, CustomAgentCreateRequest,
-    CustomAgentDeleteRequest, ModelProviderProfile, ModelProviderProfileCreateRequest,
+    CustomAgentDeleteRequest, McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest,
+    McpServerCreateRequest, McpServerDeleteRequest, McpServerDiscoverRequest,
+    McpServerDiscoveryResponse, McpServerImportRequest, McpServerImportResult,
+    McpServerSetAgentMatrixRequest, McpServerUpdateRequest, McpServerValidateRequest,
+    McpServerValidationResult, ModelProviderProfile, ModelProviderProfileCreateRequest,
     ModelProviderProfileUpdateRequest, ProviderCapabilitySummary,
     ProviderCredentialSecretMutationRequest, ProviderHealthSummary, ProviderProfileId,
     ProviderProfileSummary, ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
@@ -192,4 +196,46 @@ pub trait ManagementBackend: BackendBound {
         &self,
         request: MutationRequest<ProviderRunCapabilityProbesRequest>,
     ) -> BackendFuture<'_, ProviderRunCapabilityProbesResult>;
+
+    fn mcp_servers(&self) -> BackendFuture<'_, Vec<McpServer>>;
+
+    fn create_mcp_server(
+        &self,
+        request: MutationRequest<McpServerCreateRequest>,
+    ) -> BackendFuture<'_, McpServer>;
+
+    fn update_mcp_server(
+        &self,
+        request: MutationRequest<McpServerUpdateRequest>,
+    ) -> BackendFuture<'_, McpServer>;
+
+    fn delete_mcp_server(
+        &self,
+        request: MutationRequest<McpServerDeleteRequest>,
+    ) -> BackendFuture<'_, ()>;
+
+    fn set_mcp_server_agent_matrix(
+        &self,
+        request: MutationRequest<McpServerSetAgentMatrixRequest>,
+    ) -> BackendFuture<'_, McpServer>;
+
+    fn mcp_server_agent_matrix(
+        &self,
+        request: McpServerAgentMatrixListRequest,
+    ) -> BackendFuture<'_, Vec<McpServerAgentMatrix>>;
+
+    fn discover_mcp_sources(
+        &self,
+        request: McpServerDiscoverRequest,
+    ) -> BackendFuture<'_, McpServerDiscoveryResponse>;
+
+    fn import_mcp_servers(
+        &self,
+        request: MutationRequest<McpServerImportRequest>,
+    ) -> BackendFuture<'_, McpServerImportResult>;
+
+    fn validate_mcp_server(
+        &self,
+        request: McpServerValidateRequest,
+    ) -> BackendFuture<'_, McpServerValidationResult>;
 }
