@@ -1170,27 +1170,28 @@ mod tests {
         AgentModelProviderProfileFetchModelsResponse, AgentModelProviderProfileSecretValueResponse,
         AgentModelProviderProfileSecretValueUpdateRequest, AgentModelProviderProfileTestRequest,
         AgentModelProviderProfileTestResult, AgentModelProviderProfileUpdateRequest,
-        AutomationGraph, AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest,
-        AutomationGraphId, AutomationGraphListRequest, AutomationGraphStatus,
-        AutomationGraphUpdateRequest, AutomationRun, AutomationRunCancelRequest,
-        AutomationRunListRequest, AutomationRunResumeRequest, AutomationRunStartRequest,
-        AutomationRunStep, AutomationRunStepListRequest, ManagementSnapshotPayload, McpServer,
-        McpServerAgentMatrix, McpServerAgentMatrixListRequest, McpServerCreateRequest,
-        McpServerDeleteRequest, McpServerDiscoverRequest, McpServerDiscoveryResponse,
-        McpServerImportRequest, McpServerImportResult, McpServerSetAgentMatrixRequest,
-        McpServerUpdateRequest, McpServerValidateRequest, McpServerValidationResult,
-        ProviderCapabilitySummary, ProviderNativeExportApplyRequest,
-        ProviderNativeExportApplyResult, ProviderNativeExportListRequest,
-        ProviderNativeExportPreview, ProviderNativeExportPreviewRequest,
-        ProviderNativeExportRecordSummary, ProviderNativeExportRollbackRequest,
-        ProviderNativeExportRollbackResult, ProviderNativeImportCreateRequest,
-        ProviderNativeImportCreateResult, ProviderNativeImportPreview,
-        ProviderNativeImportPreviewRequest, ProviderProfile, ProviderRunCapabilityProbesRequest,
-        ProviderRunCapabilityProbesResult, ProviderUsageListRequest, ProviderUsageSummary,
-        RemoteProviderManagementSnapshot, ScheduledTaskAttentionListRequest,
-        ScheduledTaskAttentionSummary, ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord,
-        ScheduledTaskCreateRequest, ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun,
-        ScheduledTaskRunListRequest, ScheduledTaskUpdateRequest,
+        AgentSnapshotEntry, AgentUpdateConfigRequest, AutomationGraph,
+        AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest, AutomationGraphId,
+        AutomationGraphListRequest, AutomationGraphStatus, AutomationGraphUpdateRequest,
+        AutomationRun, AutomationRunCancelRequest, AutomationRunListRequest,
+        AutomationRunResumeRequest, AutomationRunStartRequest, AutomationRunStep,
+        AutomationRunStepListRequest, ManagementSnapshotPayload, McpServer, McpServerAgentMatrix,
+        McpServerAgentMatrixListRequest, McpServerCreateRequest, McpServerDeleteRequest,
+        McpServerDiscoverRequest, McpServerDiscoveryResponse, McpServerImportRequest,
+        McpServerImportResult, McpServerSetAgentMatrixRequest, McpServerUpdateRequest,
+        McpServerValidateRequest, McpServerValidationResult, ProviderCapabilitySummary,
+        ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
+        ProviderNativeExportListRequest, ProviderNativeExportPreview,
+        ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
+        ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
+        ProviderNativeImportCreateRequest, ProviderNativeImportCreateResult,
+        ProviderNativeImportPreview, ProviderNativeImportPreviewRequest, ProviderProfile,
+        ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
+        ProviderUsageListRequest, ProviderUsageSummary, RemoteProviderManagementSnapshot,
+        ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
+        ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord, ScheduledTaskCreateRequest,
+        ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun, ScheduledTaskRunListRequest,
+        ScheduledTaskUpdateRequest,
     };
 
     fn error_future<T: 'static>() -> BackendFuture<'static, T> {
@@ -1210,6 +1211,13 @@ mod tests {
             &self,
             _request: AgentListRequest,
         ) -> BackendFuture<'_, vibex_core::AgentListResponse> {
+            error_future()
+        }
+
+        fn update_agent_config(
+            &self,
+            _request: MutationRequest<AgentUpdateConfigRequest>,
+        ) -> BackendFuture<'_, AgentSnapshotEntry> {
             error_future()
         }
 

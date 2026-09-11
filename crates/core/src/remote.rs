@@ -19,6 +19,7 @@ use crate::agent_auth::{
 };
 use crate::agent_config::{
     AgentCatalogListResponse, AgentConfigStatus, AgentId, AgentRuntimeStatus, AgentSnapshotEntry,
+    AgentUpdateConfigRequest,
 };
 use crate::agent_provider_runtime::{
     AgentRuntimeProbeCancelRequest, AgentRuntimeProbeListRequest, AgentRuntimeProbeRecord,
@@ -1645,6 +1646,7 @@ pub enum RemoteProviderOperationKind {
     ListUsageSummaries,
     ListFailoverRecommendations,
     ListAgents,
+    UpdateAgentConfig,
     CreateCustomAgent,
     DeleteCustomAgent,
     ListModelProviderProfiles,
@@ -1914,6 +1916,20 @@ pub struct RemoteProviderFailoverRecommendationListResponse {
 /// values are blanked, and native configuration paths and diagnostics are
 /// dropped before the entries leave the runtime; see
 /// [`redact_agent_snapshot_for_remote`].
+/// Updates an Agent's workspace membership, enabled flag, or overrides.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentUpdateConfigRequest {
+    pub auth: RemoteAuthProof,
+    pub request: AgentUpdateConfigRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentUpdateConfigResponse {
+    pub agent: AgentSnapshotEntry,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAgentListRequest {
@@ -2778,6 +2794,7 @@ pub enum RemoteProviderRequest {
     ListUsageSummaries(RemoteProviderUsageSummaryListRequest),
     ListFailoverRecommendations(RemoteProviderFailoverRecommendationListRequest),
     ListAgents(RemoteAgentListRequest),
+    UpdateAgentConfig(RemoteAgentUpdateConfigRequest),
     CreateCustomAgent(RemoteCustomAgentCreateRequest),
     DeleteCustomAgent(RemoteCustomAgentDeleteRequest),
     ListModelProviderProfiles(RemoteModelProviderProfileListRequest),
@@ -2870,6 +2887,7 @@ impl RemoteProviderRequest {
                 | Self::CreateAgentModelProviderProfile(_)
                 | Self::UpdateAgentModelProviderProfile(_)
                 | Self::MutateAgentModelProviderProfileSecret(_)
+                | Self::UpdateAgentConfig(_)
         )
     }
 
@@ -2891,6 +2909,7 @@ impl RemoteProviderRequest {
                 RemoteProviderOperationKind::ListFailoverRecommendations
             }
             Self::ListAgents(_) => RemoteProviderOperationKind::ListAgents,
+            Self::UpdateAgentConfig(_) => RemoteProviderOperationKind::UpdateAgentConfig,
             Self::CreateCustomAgent(_) => RemoteProviderOperationKind::CreateCustomAgent,
             Self::DeleteCustomAgent(_) => RemoteProviderOperationKind::DeleteCustomAgent,
             Self::ListModelProviderProfiles(_) => {

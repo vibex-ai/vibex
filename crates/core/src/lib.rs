@@ -308,6 +308,7 @@ pub use remote::{
     RemoteAgentSetDesiredRuntimeResponse, RemoteAgentTimelineCursor,
     RemoteAgentTimelineDisplaySettingsRequest, RemoteAgentTimelineDisplaySettingsResponse,
     RemoteAgentTimelineFetchRequest, RemoteAgentTimelineFetchResponse,
+    RemoteAgentUpdateConfigRequest, RemoteAgentUpdateConfigResponse,
     RemoteAgentVerifyAuthContextRequest, RemoteAuditAction, RemoteAuditListRequest,
     RemoteAuditListResponse, RemoteAuditOutcome, RemoteAuditRecord, RemoteAuditTargetKind,
     RemoteAuthContext, RemoteAuthProof, RemoteAutomationArchiveRequest,

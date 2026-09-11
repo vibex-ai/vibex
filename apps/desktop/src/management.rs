@@ -4820,7 +4820,7 @@ impl ManagementCenter {
             cx.notify();
             return;
         };
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         let active_locale = locale::current_locale();
@@ -4828,11 +4828,9 @@ impl ManagementCenter {
             ManagementMutation::AgentToggle(agent_id.as_str().to_string()),
             cx,
             async move {
-                runtime
+                backend
                     .management()
-                    .providers()
-                    .management()
-                    .update_agent_config(AgentUpdateConfigRequest {
+                    .update_agent_config(MutationRequest::new(AgentUpdateConfigRequest {
                         agent_id: agent_id.clone(),
                         added: None,
                         enabled: Some(enabled),
@@ -4842,7 +4840,9 @@ impl ManagementCenter {
                         command: None,
                         env: None,
                         params: None,
-                    })?;
+                    }))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?;
                 Ok(management_locale_text_for(
                     active_locale,
                     "Agent updated",

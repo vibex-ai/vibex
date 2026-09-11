@@ -15,14 +15,15 @@ use vibex_core::{
     AgentProviderProjectionPreview, AgentProviderProjectionPreviewRequest,
     AgentRuntimeProbeCancelRequest, AgentRuntimeProbeListRequest, AgentRuntimeProbeRecord,
     AgentRuntimeProbeStartRequest, AgentRuntimeProfile, AgentRuntimeProfileCreateRequest,
-    AgentRuntimeProfileUpdateRequest, AgentSnapshotEntry, AutomationGraph,
-    AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest, AutomationGraphId,
-    AutomationGraphListRequest, AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun,
-    AutomationRunCancelRequest, AutomationRunListRequest, AutomationRunResumeRequest,
-    AutomationRunStartRequest, AutomationRunStep, AutomationRunStepListRequest,
-    CustomAgentCreateRequest, CustomAgentDeleteRequest, Hook, HookCreateRequest, HookDeleteRequest,
-    HookInstallPreview, HookInstallPreviewRequest, HookUpdateRequest, ManagementSnapshotPayload,
-    McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest, McpServerCreateRequest,
+    AgentRuntimeProfileUpdateRequest, AgentSnapshotEntry, AgentUpdateConfigRequest,
+    AutomationGraph, AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest,
+    AutomationGraphId, AutomationGraphListRequest, AutomationGraphStatus,
+    AutomationGraphUpdateRequest, AutomationRun, AutomationRunCancelRequest,
+    AutomationRunListRequest, AutomationRunResumeRequest, AutomationRunStartRequest,
+    AutomationRunStep, AutomationRunStepListRequest, CustomAgentCreateRequest,
+    CustomAgentDeleteRequest, Hook, HookCreateRequest, HookDeleteRequest, HookInstallPreview,
+    HookInstallPreviewRequest, HookUpdateRequest, ManagementSnapshotPayload, McpServer,
+    McpServerAgentMatrix, McpServerAgentMatrixListRequest, McpServerCreateRequest,
     McpServerDeleteRequest, McpServerDiscoverRequest, McpServerDiscoveryResponse,
     McpServerImportRequest, McpServerImportResult, McpServerSetAgentMatrixRequest,
     McpServerUpdateRequest, McpServerValidateRequest, McpServerValidationResult,
@@ -82,6 +83,11 @@ pub struct ManagementProfileSelectionRequest {
 
 pub trait ManagementBackend: BackendBound {
     fn list_agents(&self, request: AgentListRequest) -> BackendFuture<'_, AgentListResponse>;
+
+    fn update_agent_config(
+        &self,
+        request: MutationRequest<AgentUpdateConfigRequest>,
+    ) -> BackendFuture<'_, AgentSnapshotEntry>;
 
     fn create_custom_agent(
         &self,

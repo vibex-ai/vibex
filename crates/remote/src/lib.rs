@@ -3300,6 +3300,29 @@ async fn dispatch_provider_request(
             )
             .map_err(remote_payload_encode_error)
         }
+        RemoteProviderRequest::UpdateAgentConfig(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let agent_id = request.request.agent_id.as_str().to_string();
+            let result = service.update_agent_config(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                format!("agent:{agent_id}"),
+                "Agent configuration updated from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let agent = result?;
+            serde_json::to_value(vibex_core::RemoteAgentUpdateConfigResponse { agent })
+                .map_err(remote_payload_encode_error)
+        }
         RemoteProviderRequest::ManagementSnapshot(request) => {
             authorize_provider_action(
                 runtime,

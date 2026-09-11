@@ -10,9 +10,10 @@ use vibex_core::{
     AgentModelProviderProfileFetchModelsResponse, AgentModelProviderProfileSecretValueResponse,
     AgentModelProviderProfileSecretValueUpdateRequest, AgentModelProviderProfileTestRequest,
     AgentModelProviderProfileTestResult, AgentModelProviderProfileUpdateRequest, AgentSession,
-    AgentSessionRuntimeSelectionState, AutomationGraph, AutomationGraphCreateRequest,
-    AutomationGraphDefinitionUpdateRequest, AutomationGraphId, AutomationGraphListRequest,
-    AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun, AutomationRunCancelRequest,
+    AgentSessionRuntimeSelectionState, AgentSnapshotEntry, AgentUpdateConfigRequest,
+    AutomationGraph, AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest,
+    AutomationGraphId, AutomationGraphListRequest, AutomationGraphStatus,
+    AutomationGraphUpdateRequest, AutomationRun, AutomationRunCancelRequest,
     AutomationRunListRequest, AutomationRunResumeRequest, AutomationRunStartRequest,
     AutomationRunStep, AutomationRunStepListRequest, CancelAgentSessionRuntimeSwitchRequest,
     ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest, FileMutationRequest,
@@ -552,6 +553,13 @@ impl TerminalBackend for DisconnectedBackend {
 
 impl ManagementBackend for DisconnectedBackend {
     fn list_agents(&self, _request: AgentListRequest) -> BackendFuture<'_, AgentListResponse> {
+        disconnected_future!()
+    }
+
+    fn update_agent_config(
+        &self,
+        _request: MutationRequest<AgentUpdateConfigRequest>,
+    ) -> BackendFuture<'_, AgentSnapshotEntry> {
         disconnected_future!()
     }
 

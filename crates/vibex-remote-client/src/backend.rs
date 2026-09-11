@@ -21,26 +21,27 @@ use vibex_core::{
     AgentCatalogListResponse, AgentId, AgentListRequest, AgentListResponse,
     AgentModelProviderProfileCreateRequest, AgentModelProviderProfileSecretValueResponse,
     AgentModelProviderProfileSecretValueUpdateRequest, AgentModelProviderProfileUpdateRequest,
-    AgentNotificationIntent, AgentSession, AgentSessionRuntimeSelectionState,
-    AgentTimelineDisplaySettings, AutomationGraph, AutomationGraphCreateRequest,
-    AutomationGraphDefinitionUpdateRequest, AutomationGraphId, AutomationGraphListRequest,
-    AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun, AutomationRunCancelRequest,
-    AutomationRunListRequest, AutomationRunResumeRequest, AutomationRunStartRequest,
-    AutomationRunStep, AutomationRunStepListRequest, CancelAgentSessionRuntimeSwitchRequest,
-    ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest, FileMutationRequest,
-    FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
-    FileTreeRequest, FileWriteRequest, ForkAgentSessionRequest, GetMessageSubmissionRequest,
-    GitBranchListResponse, GitCommitDetail, GitCommitDetailRequest, GitCommitRequest,
-    GitCommitResult, GitDiffRequest, GitDiffResponse, GitHistoryRequest, GitHistoryResponse,
-    GitProjectEligibility, GitRemoteActionRequest, GitRemoteActionResult, GitStageRequest,
-    GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
-    GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeCreateRequest,
-    GitWorktreeCreateResult, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
-    GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
-    GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeReadinessRecord,
-    GitWorktreeReadinessRequest, GitWorktreeRestoreRequest, ManagementSnapshotPayload,
-    MessageSubmissionState, OpenWorkspaceRequest, ProjectId, ProjectWorkspaceSummary,
-    ProviderHealthSummary, ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
+    AgentNotificationIntent, AgentSession, AgentSessionRuntimeSelectionState, AgentSnapshotEntry,
+    AgentTimelineDisplaySettings, AgentUpdateConfigRequest, AutomationGraph,
+    AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest, AutomationGraphId,
+    AutomationGraphListRequest, AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun,
+    AutomationRunCancelRequest, AutomationRunListRequest, AutomationRunResumeRequest,
+    AutomationRunStartRequest, AutomationRunStep, AutomationRunStepListRequest,
+    CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
+    FetchTimelineRequest, FileMutationRequest, FileReadRequest, FileReadResponse,
+    FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest, FileWriteRequest,
+    ForkAgentSessionRequest, GetMessageSubmissionRequest, GitBranchListResponse, GitCommitDetail,
+    GitCommitDetailRequest, GitCommitRequest, GitCommitResult, GitDiffRequest, GitDiffResponse,
+    GitHistoryRequest, GitHistoryResponse, GitProjectEligibility, GitRemoteActionRequest,
+    GitRemoteActionResult, GitStageRequest, GitStatusSummary, GitWorktreeArchiveRequest,
+    GitWorktreeAssistanceSessionRequest, GitWorktreeConflictResolveRequest,
+    GitWorktreeConflictStageRequest, GitWorktreeCreateRequest, GitWorktreeCreateResult,
+    GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
+    GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeOperationRecord,
+    GitWorktreeOperationRequest, GitWorktreeReadinessRecord, GitWorktreeReadinessRequest,
+    GitWorktreeRestoreRequest, ManagementSnapshotPayload, MessageSubmissionState,
+    OpenWorkspaceRequest, ProjectId, ProjectWorkspaceSummary, ProviderHealthSummary,
+    ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
     ProviderNativeExportListRequest, ProviderNativeExportPreview,
     ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
     ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
@@ -2633,6 +2634,33 @@ impl ManagementBackend for WebRemoteBackend {
             Ok(AgentListResponse {
                 agents: decode::<vibex_core::RemoteAgentListResponse>(value)?.agents,
             })
+        })
+    }
+
+    fn update_agent_config(
+        &self,
+        request: MutationRequest<AgentUpdateConfigRequest>,
+    ) -> BackendFuture<'_, AgentSnapshotEntry> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::UpdateAgentConfig(
+                vibex_core::RemoteAgentUpdateConfigRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentUpdateConfigResponse>(value)?.agent)
         })
     }
 
