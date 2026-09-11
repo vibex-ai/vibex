@@ -33,6 +33,7 @@ use gpui_component::{
     tooltip::Tooltip,
     v_flex,
 };
+use vibex_backend::{BackendFacade, MutationRequest};
 use vibex_core::{
     AgentAuthCatalog, AgentAuthContext, AgentAuthContextAuthenticateRequest,
     AgentAuthContextCancelAuthenticationRequest, AgentAuthContextLogoutPreview,
@@ -581,6 +582,10 @@ impl ManagedDeleteTarget {
 
 pub struct ManagementCenter {
     runtime: Option<Arc<DesktopRuntime>>,
+    /// Authority-agnostic handle for the sections whose Remote v2 contract is
+    /// implemented. A paired runtime leaves `runtime` empty, so these sections
+    /// are the only ones that can drive a headless authority.
+    backend: Option<BackendFacade>,
     navigation: ManagementNavigation,
     snapshot: ProviderCenterSnapshot,
     agent_ordering: AgentOrdering,
@@ -1092,6 +1097,7 @@ impl ManagementCenter {
         ];
         Self {
             runtime: None,
+            backend: None,
             navigation: ManagementNavigation::default(),
             snapshot: ProviderCenterSnapshot::default(),
             agent_ordering: AgentOrdering::default(),
@@ -1216,6 +1222,20 @@ impl ManagementCenter {
             restore_target,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// Installs the authority-agnostic backend handle.
+    ///
+    /// A local authority also installs `runtime`; a paired remote authority
+    /// installs only this, and every section reads the capabilities it needs
+    /// from the facade instead of assuming a local runtime exists.
+    pub fn set_backend(&mut self, backend: BackendFacade, cx: &mut Context<Self>) {
+        self.backend = Some(backend);
+        self.error = None;
+        if self.runtime.is_none() {
+            self.notice = None;
+        }
+        self.refresh(cx);
     }
 
     /// Adopt the shared Agent ordering maintained by the workbench so the
@@ -1358,6 +1378,7 @@ impl ManagementCenter {
     pub fn clear_runtime(&mut self, cx: &mut Context<Self>) {
         self.clear_agent_auth_terminal();
         self.runtime = None;
+        self.backend = None;
         self.generation = self.generation.saturating_add(1);
         self.loading = false;
         self.details_ready = false;
@@ -13000,33 +13021,36 @@ impl ManagementCenter {
             cx.notify();
             return;
         }
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         let mutation = ManagementMutation::ScheduledUpdate(task.id.as_str().to_string());
         let active_locale = locale::current_locale();
         self.begin_simple_task(mutation, cx, async move {
-            runtime
+            backend
                 .management()
-                .scheduled()
-                .update(vibex_core::ScheduledTaskUpdateRequest {
-                    id: task.id,
-                    title: Some(title),
-                    prompt: Some(prompt),
-                    project_id: None,
-                    clear_project_id: false,
-                    workspace_id: None,
-                    clear_workspace_id: false,
-                    workspace_root: None,
-                    workspace_mode: None,
-                    provider_kind: None,
-                    provider_profile_id: None,
-                    clear_provider_profile_id: false,
-                    schedule: None,
-                    safety: None,
-                    next_run_at_ms: None,
-                    clear_next_run_at_ms: false,
-                })
+                .update_scheduled_task(MutationRequest::new(
+                    vibex_core::ScheduledTaskUpdateRequest {
+                        id: task.id,
+                        title: Some(title),
+                        prompt: Some(prompt),
+                        project_id: None,
+                        clear_project_id: false,
+                        workspace_id: None,
+                        clear_workspace_id: false,
+                        workspace_root: None,
+                        workspace_mode: None,
+                        provider_kind: None,
+                        provider_profile_id: None,
+                        clear_provider_profile_id: false,
+                        schedule: None,
+                        safety: None,
+                        next_run_at_ms: None,
+                        clear_next_run_at_ms: false,
+                    },
+                ))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
                 .map(|task| match active_locale {
                     ResolvedLocale::En => format!("Updated scheduled task {}", task.title),
                     ResolvedLocale::ZhCn => format!("已更新定时任务 {}", task.title),
@@ -13080,7 +13104,7 @@ impl ManagementCenter {
             safety: None,
             next_run_at_ms: Some(now),
         };
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             self.error = Some(
                 management_error_text(
                     "Management runtime is not connected",
@@ -13108,7 +13132,11 @@ impl ManagementCenter {
         self.mutation = Some(ManagementMutation::ScheduledCreate);
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime.management().scheduled().create(request)
+            backend
+                .management()
+                .create_scheduled_task(MutationRequest::new(request))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
         });
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;

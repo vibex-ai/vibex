@@ -2247,7 +2247,7 @@ impl ReleaseChannel {
 
 /// Bridges a backend failure into the runtime-error type the workbench's
 /// optimistic-completion helpers consume. Code and message survive verbatim.
-fn remote_error_into_vibex(error: BackendError) -> vibex_core::VibexError {
+pub(crate) fn remote_error_into_vibex(error: BackendError) -> vibex_core::VibexError {
     vibex_core::VibexError::new(vibex_core::ErrorCategory::Remote, error.code, error.message)
 }
 
@@ -5973,10 +5973,11 @@ impl VibexWorkbench {
                                     cx,
                                 );
                             });
-                            this.backend = Some(facade);
                             this.management_view.update(cx, |management, cx| {
-                                management.set_runtime(runtime.clone(), cx)
+                                management.set_backend(facade.clone(), cx);
+                                management.set_runtime(runtime.clone(), cx);
                             });
+                            this.backend = Some(facade);
                             this.attach_update_status(runtime.clone(), cx);
                             this.attach_event_stream(runtime, cx);
                             this.load_agent_overview(cx);
@@ -6663,6 +6664,9 @@ impl VibexWorkbench {
         self.code_workbench.update(cx, |workbench, cx| {
             workbench.set_backend(facade.clone(), cx);
             workbench.set_terminal_transport(None, cx);
+        });
+        self.management_view.update(cx, |management, cx| {
+            management.set_backend(facade.clone(), cx)
         });
         self.backend = Some(facade);
         self.attach_remote_event_stream(backend, cx);
