@@ -24,6 +24,7 @@ pub mod resize_seam;
 pub mod responsive;
 pub mod system_tray;
 pub mod terminal_surface;
+pub mod terminal_transport;
 pub mod testing;
 pub mod theme;
 pub mod usage;

@@ -8,11 +8,11 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, Bounds, ClipboardItem, Context, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, FontWeight, Hsla, IntoElement, KeyBinding, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta,
-    ScrollWheelEvent, Subscription, Task, UTF16Selection, WeakEntity, Window, actions, canvas, div,
-    point, prelude::*, px, rgb, size,
+    AnyElement, App, BackgroundExecutor, Bounds, ClipboardItem, Context, ElementInputHandler,
+    Entity, EntityInputHandler, FocusHandle, FontWeight, Hsla, IntoElement, KeyBinding,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
+    ScrollDelta, ScrollWheelEvent, Subscription, Task, UTF16Selection, WeakEntity, Window, actions,
+    canvas, div, point, prelude::*, px, rgb, size,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Selectable as _,
@@ -37,6 +37,11 @@ use vibex_markdown::code_font_weight;
 use vibex_terminal::{
     TerminalCellColor, TerminalCellSnapshot, TerminalCursorShape, TerminalFrameSnapshot,
     TerminalGridPoint, TerminalManager,
+};
+
+use crate::terminal_transport::{
+    LocalTerminalTransport, TerminalTransport, TerminalTransportError, TerminalTransportFuture,
+    TerminalTransportResult,
 };
 
 const TERMINAL_BASE_FONT_SIZE: f32 = 13.0;
@@ -131,7 +136,7 @@ impl TerminalTab {
 struct TerminalPollWork {
     terminal_id: TerminalId,
     next_sequence: i64,
-    manager: TerminalManager,
+    transport: Arc<dyn TerminalTransport>,
     backend: SharedTerminalBackend,
 }
 
@@ -173,7 +178,8 @@ pub struct TerminalPhysicalObservation {
 }
 
 pub struct TerminalSurface {
-    manager: TerminalManager,
+    transport: Arc<dyn TerminalTransport>,
+    background: BackgroundExecutor,
     workspace_root: PathBuf,
     workspace_id: WorkspaceId,
     tabs: Vec<TerminalTab>,
@@ -215,13 +221,13 @@ impl TerminalSurface {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let manager = new_ui_terminal_manager();
+        let transport = LocalTerminalTransport::new(new_ui_terminal_manager());
         let workspace_root = std::env::var_os("VIBEX_NATIVE_CONTENT_WORKSPACE_ROOT")
             .map(PathBuf::from)
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
         let workspace_id = WorkspaceId::new();
-        let initial = manager.create(
+        let initial = transport.create_now(
             &workspace_root,
             TerminalCreateRequest {
                 workspace_id: workspace_id.clone(),
@@ -247,7 +253,7 @@ impl TerminalSurface {
             ),
         };
         Self::build(
-            manager,
+            Arc::new(transport),
             workspace_root,
             workspace_id,
             tabs,
@@ -270,9 +276,64 @@ impl TerminalSurface {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::from_shared_session_with_transport(
+            Arc::new(LocalTerminalTransport::new(manager)),
+            workspace_root,
+            session,
+            window,
+            cx,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn from_preview_shared_session(
+        manager: TerminalManager,
+        workspace_root: PathBuf,
+        session: TerminalSession,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::from_preview_shared_session_with_transport(
+            Arc::new(LocalTerminalTransport::new(manager)),
+            workspace_root,
+            session,
+            window,
+            cx,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn from_embedded_shared_session(
+        manager: TerminalManager,
+        workspace_root: PathBuf,
+        session: TerminalSession,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::from_embedded_shared_session_with_transport(
+            Arc::new(LocalTerminalTransport::new(manager)),
+            workspace_root,
+            session,
+            window,
+            cx,
+        )
+    }
+
+    /// Attaches an existing session through an explicit transport.
+    ///
+    /// The `from_*_shared_session` constructors keep the native manager; this
+    /// one lets a remote authority serve the same surface.
+    #[allow(dead_code)]
+    pub fn from_shared_session_with_transport(
+        transport: Arc<dyn TerminalTransport>,
+        workspace_root: PathBuf,
+        session: TerminalSession,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let workspace_id = session.workspace_id.clone();
         Self::build(
-            manager,
+            transport,
             workspace_root,
             workspace_id,
             vec![TerminalTab::new(session)],
@@ -287,9 +348,10 @@ impl TerminalSurface {
         )
     }
 
+    /// Attaches an existing Preview session through an explicit transport.
     #[allow(dead_code)]
-    pub fn from_preview_shared_session(
-        manager: TerminalManager,
+    pub fn from_preview_shared_session_with_transport(
+        transport: Arc<dyn TerminalTransport>,
         workspace_root: PathBuf,
         session: TerminalSession,
         window: &mut Window,
@@ -297,7 +359,7 @@ impl TerminalSurface {
     ) -> Self {
         let workspace_id = session.workspace_id.clone();
         Self::build(
-            manager,
+            transport,
             workspace_root,
             workspace_id,
             vec![TerminalTab::new(session)],
@@ -312,9 +374,10 @@ impl TerminalSurface {
         )
     }
 
+    /// Attaches an existing Composer session through an explicit transport.
     #[allow(dead_code)]
-    pub fn from_embedded_shared_session(
-        manager: TerminalManager,
+    pub fn from_embedded_shared_session_with_transport(
+        transport: Arc<dyn TerminalTransport>,
         workspace_root: PathBuf,
         session: TerminalSession,
         window: &mut Window,
@@ -322,7 +385,7 @@ impl TerminalSurface {
     ) -> Self {
         let workspace_id = session.workspace_id.clone();
         Self::build(
-            manager,
+            transport,
             workspace_root,
             workspace_id,
             vec![TerminalTab::new(session)],
@@ -339,7 +402,7 @@ impl TerminalSurface {
 
     #[allow(clippy::too_many_arguments)]
     fn build(
-        manager: TerminalManager,
+        transport: Arc<dyn TerminalTransport>,
         workspace_root: PathBuf,
         workspace_id: WorkspaceId,
         tabs: Vec<TerminalTab>,
@@ -359,12 +422,12 @@ impl TerminalSurface {
         });
         let focus = cx.focus_handle();
         let focus_in = cx.on_focus_in(&focus, window, |this, window, cx| {
-            this.send_focus(true);
+            this.send_focus(true, cx);
             window.invalidate_character_coordinates();
             cx.notify();
         });
         let focus_out = cx.on_focus_out(&focus, window, |this, _, window, cx| {
-            this.send_focus(false);
+            this.send_focus(false, cx);
             if this.marked_text.take().is_some() {
                 window.invalidate_character_coordinates();
                 cx.notify();
@@ -380,7 +443,8 @@ impl TerminalSurface {
             BTreeSet::new()
         };
         let mut this = Self {
-            manager,
+            transport,
+            background: cx.background_executor().clone(),
             workspace_root,
             workspace_id,
             tabs,
@@ -566,7 +630,13 @@ impl TerminalSurface {
                     continue;
                 }
                 let results = background
-                    .spawn(async move { work.into_iter().map(run_poll_work).collect::<Vec<_>>() })
+                    .spawn(async move {
+                        let mut results = Vec::with_capacity(work.len());
+                        for item in work {
+                            results.push(run_poll_work(item).await);
+                        }
+                        results
+                    })
                     .await;
                 let Ok(interval) = entity.update(cx, |this, cx| {
                     if !this.foreground_active {
@@ -633,7 +703,7 @@ impl TerminalSurface {
                     .lock()
                     .map(|backend| backend.next_sequence())
                     .unwrap_or(1),
-                manager: self.manager.clone(),
+                transport: self.transport.clone(),
                 backend: tab.backend.clone(),
             })
             .collect()
@@ -762,30 +832,39 @@ impl TerminalSurface {
         let Ok(Some(request)) = self.resize.observe(terminal_id.clone(), width, height) else {
             return;
         };
-        match self.manager.resize(&request) {
-            Ok(session) => {
-                if let Some(tab) = self
-                    .tabs
-                    .iter_mut()
-                    .find(|tab| tab.session.id == terminal_id)
-                {
-                    tab.session = session;
-                    if let Ok(mut backend) = tab.backend.lock() {
-                        backend.resize(request.rows, request.cols);
-                        let frame = backend.frame();
-                        tab.frame.force_full_repaint();
-                        tab.frame.apply(&frame);
+        let transport = self.transport.clone();
+        let resize_request = request.clone();
+        let future = Box::pin(async move { transport.resize_terminal(&resize_request).await });
+        self.run_transport_operation(
+            future,
+            move |this, result, cx| {
+                match result {
+                    Ok(session) => {
+                        if let Some(tab) = this
+                            .tabs
+                            .iter_mut()
+                            .find(|tab| tab.session.id == terminal_id)
+                        {
+                            tab.session = session;
+                            if let Ok(mut backend) = tab.backend.lock() {
+                                backend.resize(request.rows, request.cols);
+                                let frame = backend.frame();
+                                tab.frame.force_full_repaint();
+                                tab.frame.apply(&frame);
+                            }
+                        }
+                        this.note = format!("{} rows x {} columns", request.rows, request.cols);
+                        this.last_error_code = None;
+                    }
+                    Err(error) => {
+                        this.note = format!("Resize failed: {}", error.message);
+                        this.last_error_code = Some("terminal_resize_failed");
                     }
                 }
-                self.note = format!("{} rows x {} columns", request.rows, request.cols);
-                self.last_error_code = None;
-            }
-            Err(error) => {
-                self.note = format!("Resize failed: {}", error.message);
-                self.last_error_code = Some("terminal_resize_failed");
-            }
-        }
-        cx.notify();
+                cx.notify();
+            },
+            cx,
+        );
     }
 
     fn active_runtime(&self) -> Option<(TerminalId, SharedTerminalBackend)> {
@@ -802,6 +881,46 @@ impl TerminalSurface {
         self.mode.vertical_padding()
     }
 
+    /// Runs a transport operation and applies its result to the surface.
+    ///
+    /// The operation runs on the foreground executor so transport calls stay
+    /// ordered with the input that triggered them, and the state transition
+    /// happens once the authority answers.
+    fn run_transport_operation<T, A>(
+        &mut self,
+        future: TerminalTransportFuture<'static, T>,
+        apply: A,
+        cx: &mut Context<Self>,
+    ) where
+        T: Send + 'static,
+        A: FnOnce(&mut Self, TerminalTransportResult<T>, &mut Context<Self>) + 'static,
+    {
+        cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let result = future.await;
+            let _ = entity.update(cx, |this, cx| apply(this, result, cx));
+        })
+        .detach();
+    }
+
+    /// Sends focus or mouse bytes, which have always ignored write failures.
+    fn send_terminal_bytes(
+        &mut self,
+        terminal_id: TerminalId,
+        bytes: Vec<u8>,
+        cx: &mut Context<Self>,
+    ) {
+        let transport = self.transport.clone();
+        cx.spawn(async move |_: WeakEntity<Self>, _| {
+            let _ = transport.write_bytes(&terminal_id, &bytes).await;
+        })
+        .detach();
+    }
+
+    fn record_terminal_write_failure(&mut self, error: TerminalTransportError) {
+        self.note = format!("Terminal write failed: {}", error.message);
+        self.last_error_code = Some("terminal_write_failed");
+    }
+
     fn write_active(&mut self, bytes: &[u8], cx: &mut Context<Self>) -> Result<(), ()> {
         let Some((terminal_id, _)) = self.active_runtime() else {
             self.note = "No active terminal".into();
@@ -810,12 +929,17 @@ impl TerminalSurface {
         };
         #[cfg(test)]
         self.input_log.push(bytes.to_vec());
-        self.manager
-            .write_bytes(&terminal_id, bytes)
-            .map_err(|error| {
-                self.note = format!("Terminal write failed: {}", error.message);
-                self.last_error_code = Some("terminal_write_failed");
-            })?;
+        let transport = self.transport.clone();
+        let bytes = bytes.to_vec();
+        cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            if let Err(error) = transport.write_bytes(&terminal_id, &bytes).await {
+                let _ = entity.update(cx, |this, cx| {
+                    this.record_terminal_write_failure(error);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
         self.wake_polling_after_input(cx);
         Ok(())
     }
@@ -884,7 +1008,7 @@ impl TerminalSurface {
         );
     }
 
-    fn send_focus(&mut self, focused: bool) {
+    fn send_focus(&mut self, focused: bool, cx: &mut Context<Self>) {
         let Some((terminal_id, backend)) = self.active_runtime() else {
             return;
         };
@@ -893,38 +1017,50 @@ impl TerminalSurface {
             .ok()
             .and_then(|backend| backend.encode_focus(focused).map(<[u8]>::to_vec));
         if let Some(sequence) = sequence {
-            let _ = self.manager.write_bytes(&terminal_id, &sequence);
+            self.send_terminal_bytes(terminal_id, sequence, cx);
         }
     }
 
     fn new_tab(&mut self, shell: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         let number = self.tabs.len().saturating_add(1);
-        match self.manager.create(
-            &self.workspace_root,
-            TerminalCreateRequest {
-                workspace_id: self.workspace_id.clone(),
-                title: Some(format!("Terminal {number}")),
-                shell,
-                cwd: Some(self.workspace_root.display().to_string()),
-                rows: 20,
-                cols: 100,
+        let transport = self.transport.clone();
+        let workspace_root = self.workspace_root.clone();
+        let request = TerminalCreateRequest {
+            workspace_id: self.workspace_id.clone(),
+            title: Some(format!("Terminal {number}")),
+            shell,
+            cwd: Some(self.workspace_root.display().to_string()),
+            rows: 20,
+            cols: 100,
+        };
+        let focus = self.focus.clone();
+        let window_handle = window.window_handle();
+        let future =
+            Box::pin(async move { transport.create_terminal(&workspace_root, request).await });
+        self.run_transport_operation(
+            future,
+            move |this, result, cx| {
+                match result {
+                    Ok(session) => {
+                        this.owned_terminal_ids
+                            .insert(session.id.as_str().to_string());
+                        this.tabs.push(TerminalTab::new(session));
+                        this.active_tab = Some(this.tabs.len() - 1);
+                        this.clear_interaction_state();
+                        this.last_error_code = None;
+                        let _ = cx.update_window(window_handle, |_, window, cx| {
+                            focus.focus(window, cx);
+                        });
+                    }
+                    Err(error) => {
+                        this.note = format!("New terminal failed: {}", error.message);
+                        this.last_error_code = Some("terminal_create_failed");
+                    }
+                }
+                cx.notify();
             },
-        ) {
-            Ok(session) => {
-                self.owned_terminal_ids
-                    .insert(session.id.as_str().to_string());
-                self.tabs.push(TerminalTab::new(session));
-                self.active_tab = Some(self.tabs.len() - 1);
-                self.clear_interaction_state();
-                self.focus.focus(window, cx);
-                self.last_error_code = None;
-            }
-            Err(error) => {
-                self.note = format!("New terminal failed: {}", error.message);
-                self.last_error_code = Some("terminal_create_failed");
-            }
-        }
-        cx.notify();
+            cx,
+        );
     }
 
     fn select_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -944,10 +1080,10 @@ impl TerminalSurface {
         };
         let tab = self.tabs.remove(index);
         self.owned_terminal_ids.remove(tab.session.id.as_str());
-        let manager = self.manager.clone();
+        let transport = self.transport.clone();
         let terminal_id = tab.session.id;
         cx.background_spawn(async move {
-            let _ = manager.kill(&terminal_id);
+            let _ = transport.close_terminal(&terminal_id).await;
         })
         .detach();
         self.active_tab = if self.tabs.is_empty() {
@@ -969,43 +1105,67 @@ impl TerminalSurface {
             return;
         };
         let session = self.tabs[index].session.clone();
-        let _ = self.manager.kill(&session.id);
-        match self.manager.restore(&self.workspace_root, session) {
-            Ok(session) => {
-                self.tabs[index] = TerminalTab::new(session);
-                self.note = "Terminal restarted with the same Vibex id".into();
-                self.last_error_code = None;
-            }
-            Err(error) => {
-                self.note = format!("Restart failed: {}", error.message);
-                self.last_error_code = Some("terminal_restart_failed");
-            }
-        }
-        self.clear_interaction_state();
-        cx.notify();
+        let transport = self.transport.clone();
+        let workspace_root = self.workspace_root.clone();
+        let future = Box::pin(async move {
+            let _ = transport.close_terminal(&session.id).await;
+            transport.restore_terminal(&workspace_root, session).await
+        });
+        self.run_transport_operation(
+            future,
+            move |this, result, cx| {
+                match result {
+                    Ok(session) => {
+                        if let Some(tab) = this.tabs.get_mut(index) {
+                            *tab = TerminalTab::new(session);
+                        }
+                        this.note = "Terminal restarted with the same Vibex id".into();
+                        this.last_error_code = None;
+                    }
+                    Err(error) => {
+                        this.note = format!("Restart failed: {}", error.message);
+                        this.last_error_code = Some("terminal_restart_failed");
+                    }
+                }
+                this.clear_interaction_state();
+                cx.notify();
+            },
+            cx,
+        );
     }
 
     fn switch_shell(&mut self, shell: String, cx: &mut Context<Self>) {
         let Some(index) = self.active_tab else {
             return;
         };
-        let terminal_id = self.tabs[index].session.id.clone();
-        match self
-            .manager
-            .switch_shell(&TerminalSwitchShellRequest { terminal_id, shell })
-        {
-            Ok(session) => {
-                self.tabs[index] = TerminalTab::new(session);
-                self.note = "Shell switched without creating a second terminal domain".into();
-                self.last_error_code = None;
-            }
-            Err(error) => {
-                self.note = format!("Shell switch failed: {}", error.message);
-                self.last_error_code = Some("terminal_shell_switch_failed");
-            }
-        }
-        self.clear_interaction_state();
-        cx.notify();
+        let request = TerminalSwitchShellRequest {
+            terminal_id: self.tabs[index].session.id.clone(),
+            shell,
+        };
+        let transport = self.transport.clone();
+        let future = Box::pin(async move { transport.switch_shell(request).await });
+        self.run_transport_operation(
+            future,
+            move |this, result, cx| {
+                match result {
+                    Ok(session) => {
+                        if let Some(tab) = this.tabs.get_mut(index) {
+                            *tab = TerminalTab::new(session);
+                        }
+                        this.note =
+                            "Shell switched without creating a second terminal domain".into();
+                        this.last_error_code = None;
+                    }
+                    Err(error) => {
+                        this.note = format!("Shell switch failed: {}", error.message);
+                        this.last_error_code = Some("terminal_shell_switch_failed");
+                    }
+                }
+                this.clear_interaction_state();
+                cx.notify();
+            },
+            cx,
+        );
     }
 
     fn clear_interaction_state(&mut self) {
@@ -1145,6 +1305,7 @@ impl TerminalSurface {
                 mouse_button_code(event.button),
                 point,
                 terminal_modifiers(event.modifiers),
+                cx,
             );
         } else {
             self.selection_anchor = Some(point);
@@ -1167,6 +1328,7 @@ impl TerminalSurface {
                     0,
                     point,
                     terminal_modifiers(event.modifiers),
+                    cx,
                 );
             }
         }
@@ -1189,6 +1351,7 @@ impl TerminalSurface {
                 mouse_button_code(event.button),
                 point,
                 terminal_modifiers(event.modifiers),
+                cx,
             );
         } else if self.selection_anchor == Some(point) {
             self.active_hyperlink = hyperlink;
@@ -1203,6 +1366,7 @@ impl TerminalSurface {
         button: u8,
         point: TerminalGridPoint,
         modifiers: TerminalModifiers,
+        cx: &mut Context<Self>,
     ) {
         let Some((terminal_id, backend)) = self.active_runtime() else {
             return;
@@ -1217,7 +1381,7 @@ impl TerminalSurface {
             })
         });
         if let Some(bytes) = bytes {
-            let _ = self.manager.write_bytes(&terminal_id, &bytes);
+            self.send_terminal_bytes(terminal_id, bytes, cx);
         }
     }
 
@@ -1245,6 +1409,7 @@ impl TerminalSurface {
                 0,
                 TerminalGridPoint { row: 0, column: 0 },
                 terminal_modifiers(event.modifiers),
+                cx,
             );
             return;
         }
@@ -1892,19 +2057,22 @@ impl Drop for TerminalSurface {
         if terminal_ids.is_empty() {
             return;
         }
-        let manager = self.manager.clone();
-        let _ = std::thread::spawn(move || {
-            for terminal_id in terminal_ids {
-                let _ = manager.kill(&terminal_id);
-            }
-        });
+        let transport = self.transport.clone();
+        self.background
+            .spawn(async move {
+                for terminal_id in terminal_ids {
+                    let _ = transport.close_terminal(&terminal_id).await;
+                }
+            })
+            .detach();
     }
 }
 
-fn run_poll_work(work: TerminalPollWork) -> TerminalPollResult {
+async fn run_poll_work(work: TerminalPollWork) -> TerminalPollResult {
     let snapshot = match work
-        .manager
-        .raw_snapshot_from(&work.terminal_id, work.next_sequence)
+        .transport
+        .poll_terminal(&work.terminal_id, work.next_sequence)
+        .await
     {
         Ok(snapshot) => snapshot,
         Err(error) => {
