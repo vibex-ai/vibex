@@ -354,6 +354,19 @@ fn catalog_projection_shape(
                     catalog_interface(WIRE_PROTOCOL_ANTHROPIC_MESSAGES, true, true),
                 ],
             )),
+            // Cline's ACP bridge reads its provider id, key, and model from the
+            // environment and its provider settings from
+            // `<CLINE_DATA_DIR>/settings/providers.json`. Only the two
+            // OpenAI-shaped provider ids accept a caller-supplied base URL, so
+            // those are the only interfaces Vibex can project.
+            "cline" => Ok(overlay_projection_shape(
+                ConfigOverlayStrategy::ClineProvidersJson,
+                "CLINE_API_KEY",
+                vec![
+                    catalog_interface(WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, true, true),
+                    catalog_interface(WIRE_PROTOCOL_OPENAI_RESPONSES, true, true),
+                ],
+            )),
             "codewhale" => Ok(environment_projection_shape(
                 "CODEWHALE_BASE_URL",
                 "OPENAI_API_KEY",
@@ -689,9 +702,7 @@ fn catalog_interface(
 
 fn conservative_replaceable_shape(agent_id: &str) -> VibexResult<CatalogProjectionShape> {
     let diagnostic = match agent_id {
-        "cline" | "dimcode" | "minion-code" | "nova" => {
-            "agent_projection_auth_boundary_not_runtime_verified"
-        }
+        "dimcode" | "minion-code" | "nova" => "agent_projection_auth_boundary_not_runtime_verified",
         "deepagents" => "agent_projection_environment_contract_not_runtime_verified",
         _ => {
             return Err(VibexError::validation(
@@ -810,6 +821,26 @@ pub fn model_provider_configurable_agent_ids() -> VibexResult<BTreeSet<AgentId>>
         .filter(AgentProviderRolloutManifestEntry::supports_model_provider_configuration)
         .map(|entry| entry.agent_id)
         .collect())
+}
+
+/// Cline's ACP bridge selects both its wire protocol and its Model catalogue
+/// through a single provider id, and it only accepts a caller-supplied base URL
+/// for the OpenAI-shaped ids (`error: base URL is only supported for OpenAI and
+/// OpenAI-compatible providers`). The id is therefore derived from the Vibex
+/// wire protocol rather than chosen freely.
+pub fn cline_provider_id(wire_protocol_id: &str) -> Option<&'static str> {
+    match wire_protocol_id {
+        WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS => Some("openai-compatible"),
+        WIRE_PROTOCOL_OPENAI_RESPONSES => Some("openai-native"),
+        _ => None,
+    }
+}
+
+/// True when the Agent, not the Provider endpoint, owns the selectable Model
+/// catalogue. Vibex cannot enumerate these Models over HTTP; it has to launch
+/// the Agent and read the list the bridge advertises for a provider id.
+pub fn agent_owns_model_catalog(agent_id: &AgentId) -> bool {
+    agent_id.as_str() == "cline"
 }
 
 pub fn validate_rollout_manifest(entries: &[AgentProviderRolloutManifestEntry]) -> VibexResult<()> {
@@ -1654,6 +1685,7 @@ mod tests {
             "antigravity",
             "copilot",
             "codewhale",
+            "cline",
             "crow-cli",
             "deepseek-harness",
             "dirac",
@@ -1671,9 +1703,9 @@ mod tests {
             "stakpak",
             "vtcode",
         ];
-        let blocked_projectors = ["cline", "deepagents", "dimcode", "minion-code", "nova"];
-        assert_eq!(typed_projectors.len(), 19);
-        assert_eq!(blocked_projectors.len(), 5);
+        let blocked_projectors = ["deepagents", "dimcode", "minion-code", "nova"];
+        assert_eq!(typed_projectors.len(), 20);
+        assert_eq!(blocked_projectors.len(), 4);
 
         for descriptor in descriptors
             .iter()
@@ -1792,11 +1824,71 @@ mod tests {
                 "{agent_id} has a typed model-provider projector"
             );
         }
-        let unsupported_agent_id = "cline";
         assert!(
-            !supported.contains(&AgentId::parse(unsupported_agent_id).unwrap()),
-            "{unsupported_agent_id} must not expose model-provider configuration"
+            supported.contains(&AgentId::parse("cline").unwrap()),
+            "cline projects a provider id, key, Model, and provider store"
         );
+        // Agent-managed Agents keep their own account and catalogue, so they
+        // must stay out of the model-provider editor.
+        for unsupported_agent_id in ["cursor", "devin"] {
+            assert!(
+                !supported.contains(&AgentId::parse(unsupported_agent_id).unwrap()),
+                "{unsupported_agent_id} must not expose model-provider configuration"
+            );
+        }
+    }
+
+    #[test]
+    fn cline_provider_ids_cover_only_base_url_capable_protocols() {
+        assert_eq!(
+            cline_provider_id(WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS),
+            Some("openai-compatible")
+        );
+        assert_eq!(
+            cline_provider_id(WIRE_PROTOCOL_OPENAI_RESPONSES),
+            Some("openai-native")
+        );
+        // Cline refuses a caller-supplied base URL for every other provider it
+        // ships, so those protocols must not project an endpoint.
+        for protocol in [
+            WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
+            WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI,
+            WIRE_PROTOCOL_GOOGLE_VERTEX,
+            WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE,
+        ] {
+            assert_eq!(cline_provider_id(protocol), None, "{protocol}");
+        }
+
+        let descriptors = catalog_projection_descriptors().unwrap();
+        let cline = descriptors
+            .iter()
+            .find(|descriptor| descriptor.route.agent_id.as_str() == "cline")
+            .unwrap();
+        let declared = cline
+            .model_interfaces
+            .iter()
+            .map(|interface| interface.wire_protocol_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            declared,
+            vec![
+                WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+                WIRE_PROTOCOL_OPENAI_RESPONSES,
+            ]
+        );
+        assert!(
+            declared
+                .iter()
+                .all(|protocol| cline_provider_id(protocol).is_some()),
+            "every declared cline interface must map to a provider id"
+        );
+
+        assert!(agent_owns_model_catalog(&AgentId::parse("cline").unwrap()));
+        for agent_id in ["codex", "gemini", "pi", "opencode"] {
+            assert!(!agent_owns_model_catalog(
+                &AgentId::parse(agent_id).unwrap()
+            ));
+        }
     }
 
     #[test]
@@ -1949,7 +2041,7 @@ mod tests {
         let mut descriptor = catalog_projection_descriptors()
             .unwrap()
             .into_iter()
-            .find(|descriptor| descriptor.route.agent_id.as_str() == "cline")
+            .find(|descriptor| descriptor.route.agent_id.as_str() == "deepagents")
             .unwrap();
         descriptor.evidence.diagnostic_code = None;
         assert_eq!(
@@ -1958,7 +2050,7 @@ mod tests {
         );
 
         descriptor.evidence.diagnostic_code =
-            Some("agent_projection_auth_boundary_not_runtime_verified".to_string());
+            Some("agent_projection_environment_contract_not_runtime_verified".to_string());
         descriptor
             .credential_kinds
             .push(AgentCredentialKind::ApiKey);

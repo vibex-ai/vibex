@@ -16170,10 +16170,12 @@ mod tests {
         supported.status = ProviderProfileStatus::Enabled;
         ProviderProfileRepository::insert(&conn, &supported).unwrap();
 
+        // Cursor is Agent-managed, so it stays out of the model-provider
+        // editor while keeping its Agent-owned runtime profiles.
         let mut unsupported = ProviderProfile::local_default(ProviderKind::Acp);
         unsupported.id = ProviderProfileId::new();
-        unsupported.agent_id = AgentId::parse("cline").unwrap();
-        unsupported.display_name = "Cline internal profile".to_string();
+        unsupported.agent_id = AgentId::parse("cursor").unwrap();
+        unsupported.display_name = "Cursor internal profile".to_string();
         unsupported.status = ProviderProfileStatus::Enabled;
         ProviderProfileRepository::insert(&conn, &unsupported).unwrap();
 

@@ -520,6 +520,20 @@ pub trait AcpClient: Send + Sync {
         ))
     }
 
+    /// Enumerates the Model catalogue an Agent owns for itself, under a
+    /// provider selector supplied as environment overrides. Clients whose
+    /// Models come from the endpoint keep the capability error default.
+    async fn discover_runtime_model_catalog(
+        &self,
+        _provider_profile_id: &ProviderProfileId,
+        _env_overrides: Vec<(String, String)>,
+    ) -> VibexResult<AcpRuntimeSessionProbe> {
+        Err(VibexError::capability(
+            "agent_model_catalog_agent_owned_unsupported",
+            "this Agent does not own its Model catalogue",
+        ))
+    }
+
     /// Stateless session-config probe. The default keeps model discovery
     /// working for clients that only implement `list_runtime_models`.
     async fn probe_runtime_session_config(
@@ -2175,6 +2189,25 @@ impl AgentProvider for AcpAgentProvider {
             modes: probed.modes,
             reasoning_efforts: probed.reasoning_efforts,
             options: probed.options,
+        })
+    }
+
+    async fn discover_model_catalog(
+        &self,
+        provider_profile_id: &ProviderProfileId,
+        env_overrides: Vec<(String, String)>,
+    ) -> VibexResult<AgentSessionConfigProbe> {
+        let probed = self
+            .client
+            .discover_runtime_model_catalog(provider_profile_id, env_overrides)
+            .await?;
+        Ok(AgentSessionConfigProbe {
+            // Only the catalogue is meaningful here; the selector environment
+            // is not the profile's real launch configuration.
+            models: probed.models,
+            modes: Vec::new(),
+            reasoning_efforts: Vec::new(),
+            options: Vec::new(),
         })
     }
 

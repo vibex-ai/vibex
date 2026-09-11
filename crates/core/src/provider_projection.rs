@@ -692,6 +692,10 @@ pub enum ConfigOverlayStrategy {
     StructuredJsonOverlay,
     StructuredTomlOverlay,
     StructuredYamlOverlay,
+    /// Cline CLI's `<CLINE_DATA_DIR>/settings/providers.json`. The bridge reads
+    /// the provider id, base URL and Model from this store, and the same
+    /// provider id has to be present in `CLINE_PROVIDER`.
+    ClineProvidersJson,
     CrowCliYaml,
     DiracToml,
     FactoryDroidJson,

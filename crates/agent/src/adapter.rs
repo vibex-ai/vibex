@@ -520,6 +520,20 @@ pub trait AgentProvider: Send + Sync {
         })
     }
 
+    /// Enumerates the Model catalogue an Agent owns for itself, for a provider
+    /// selector passed as environment overrides. Providers whose Models come
+    /// from the endpoint return a capability error instead.
+    async fn discover_model_catalog(
+        &self,
+        _provider_profile_id: &ProviderProfileId,
+        _env_overrides: Vec<(String, String)>,
+    ) -> VibexResult<AgentSessionConfigProbe> {
+        Err(VibexError::capability(
+            "agent_model_catalog_agent_owned_unsupported",
+            "this Agent does not own its Model catalogue",
+        ))
+    }
+
     /// Stateless probe for session-level configuration choices (modes,
     /// reasoning efforts). Providers without discovery return empty evidence;
     /// callers apply their own fallbacks.

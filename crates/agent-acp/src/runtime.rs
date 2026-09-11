@@ -17743,6 +17743,44 @@ impl AcpClient for AcpRuntimeClient {
         .await
     }
 
+    /// Enumerates the Model catalogue an Agent owns for itself.
+    ///
+    /// Some bridges (Cline) publish their selectable Models per provider id
+    /// instead of asking the endpoint, so discovery has to launch the Agent,
+    /// override the provider selector, and read back the list it advertises.
+    /// `env_overrides` replaces the profile's projected environment for the
+    /// probe only, which keeps the caller's real launch configuration intact.
+    async fn discover_runtime_model_catalog(
+        &self,
+        provider_profile_id: &ProviderProfileId,
+        env_overrides: Vec<(String, String)>,
+    ) -> VibexResult<AcpRuntimeSessionProbe> {
+        let config = self.profile_config(provider_profile_id)?;
+        let profile = self
+            .config_service
+            .get_profile(provider_profile_id)?
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "provider_profile_not_found",
+                    "Provider Profile was not found for model catalogue discovery",
+                )
+            })?;
+        let auth_source = RuntimeAuthSource::provider_profile(provider_profile_id.clone());
+        probe_runtime_session_config_with_config(
+            self,
+            AcpAuthSourceLaunchContext {
+                auth_source: &auth_source,
+                auth_source_revision: profile.updated_at_ms,
+                agent_id: &profile.agent_id,
+                config: &config,
+                env_unsets: &[],
+            },
+            Some(env_overrides),
+            None,
+        )
+        .await
+    }
+
     async fn probe_runtime_session_config_for_model(
         &self,
         provider_profile_id: &ProviderProfileId,

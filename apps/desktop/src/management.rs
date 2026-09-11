@@ -4045,6 +4045,33 @@ impl ManagementCenter {
         }
     }
 
+    /// Selects a Model from the Agent-owned catalogue.
+    ///
+    /// The catalogue entry also carries the wire protocol it was advertised
+    /// under, so picking a Model picks the protocol the projection writes
+    /// instead of leaving the previous selection in place.
+    fn set_profile_model_id_from_catalog(
+        &mut self,
+        index: usize,
+        model_id: String,
+        wire_api: Option<vibex_core::ProviderModelWireApi>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.profile_model_edit_index != Some(index) {
+            return;
+        }
+        self.profile_model_edit_id
+            .update(cx, |state, cx| state.set_value(model_id, window, cx));
+        if let Some(wire_api) = wire_api
+            && self.projection_editor.accepts_wire_api(wire_api)
+        {
+            self.profile_model_edit_wire_api = Some(wire_api);
+        }
+        self.navigation.mark_dirty(ManagementSection::Agents, true);
+        cx.notify();
+    }
+
     fn duplicate_provider_profile(&mut self, profile_id: String, cx: &mut Context<Self>) {
         let Some(profile) = self
             .provider_profiles
@@ -4450,17 +4477,36 @@ impl ManagementCenter {
         self.error = None;
         let active_locale = locale::current_locale();
         let entity = cx.weak_entity();
+        let agent_owns_catalog = vibex_core::agent_owns_model_catalog(&agent_id);
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
-                .management()
-                .providers()
-                .management()
-                .fetch_agent_model_provider_profile_models(
-                    vibex_core::AgentModelProviderProfileFetchModelsRequest {
-                        agent_id,
-                        provider_profile_id,
-                    },
-                )
+            if agent_owns_catalog {
+                // The Agent owns the catalogue, so discovery launches the
+                // installed bridge instead of asking a Provider endpoint.
+                runtime
+                    .agent()
+                    .runtime_catalog()
+                    .discover_agent_owned_model_catalog(&agent_id, &provider_profile_id)
+                    .await
+                    .map(
+                        |models| vibex_core::AgentModelProviderProfileFetchModelsResponse {
+                            agent_id: agent_id.clone(),
+                            provider_profile_id: provider_profile_id.clone(),
+                            models,
+                            diagnostics: Vec::new(),
+                        },
+                    )
+            } else {
+                runtime
+                    .management()
+                    .providers()
+                    .management()
+                    .fetch_agent_model_provider_profile_models(
+                        vibex_core::AgentModelProviderProfileFetchModelsRequest {
+                            agent_id,
+                            provider_profile_id,
+                        },
+                    )
+            }
         });
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
@@ -4469,7 +4515,17 @@ impl ManagementCenter {
                 match outcome {
                     Ok(Ok(result)) => {
                         let count = result.models.len();
-                        merge_provider_models(&mut this.profile_configured_models, result.models);
+                        if agent_owns_catalog {
+                            // An authoritative catalogue replaces the draft:
+                            // ids the bridge no longer advertises cannot be
+                            // selected, so keeping them would offer dead rows.
+                            this.profile_configured_models = result.models;
+                        } else {
+                            merge_provider_models(
+                                &mut this.profile_configured_models,
+                                result.models,
+                            );
+                        }
                         this.profile_model_edit_index = None;
                         this.profile_model_edit_wire_api = None;
                         this.navigation.mark_dirty(ManagementSection::Agents, true);
@@ -8235,6 +8291,20 @@ impl ManagementCenter {
     ) -> AnyElement {
         let pending =
             self.mutation.is_some() || self.agent_mutations.contains_key(&selected_agent_id);
+        // Agents that own their Model catalogue accept only the ids they
+        // advertise, so their Model field is a closed choice list rather than a
+        // free-text id.
+        let agent_owns_catalog = AgentId::parse(selected_agent_id.clone())
+            .is_ok_and(|agent_id| vibex_core::agent_owns_model_catalog(&agent_id));
+        let catalog_choices = if agent_owns_catalog {
+            self.profile_configured_models
+                .iter()
+                .filter(|model| model.enabled)
+                .map(|model| (model.id.clone(), model.wire_api))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let wire_api_choices = self.projection_editor.wire_api_choices();
         let shows_wire_api = self
             .projection_editor
@@ -8420,12 +8490,72 @@ impl ManagementCenter {
                                         })),
                                 ),
                         )
-                        .child(management_input_field(
-                            management_locale_text("Model ID", "模型 ID", "模型 ID"),
-                            &self.profile_model_edit_id,
-                            false,
-                            cx,
-                        ))
+                        .when(agent_owns_catalog, |editor| {
+                            let mut choices = v_flex().w_full().gap_2();
+                            choices = choices.child(div().text_xs().font_medium().child(
+                                management_locale_text(
+                                    "Model (from the installed Agent)",
+                                    "模型（来自已安装的 Agent）",
+                                    "模型（來自已安裝的 Agent）",
+                                ),
+                            ));
+                            if catalog_choices.is_empty() {
+                                choices = choices.child(div().text_xs().opacity(0.7).child(
+                                    management_locale_text(
+                                        "Fetch models to load the catalogue this Agent advertises.",
+                                        "请先拉取模型，以载入该 Agent 自带的模型目录。",
+                                        "請先拉取模型，以載入該 Agent 自帶的模型目錄。",
+                                    ),
+                                ));
+                            } else {
+                                let mut options = h_flex().w_full().flex_wrap().gap_1();
+                                for (model_id, model_wire_api) in catalog_choices.iter().cloned() {
+                                    let selected =
+                                        self.profile_model_edit_id.read(cx).value().trim()
+                                            == model_id;
+                                    let label = model_wire_api.map_or_else(
+                                        || model_id.clone(),
+                                        |wire_api| {
+                                            format!(
+                                                "{model_id} · {}",
+                                                provider_wire_api_label(wire_api)
+                                            )
+                                        },
+                                    );
+                                    let click_id = model_id.clone();
+                                    options =
+                                        options.child(
+                                            Button::new(SharedString::from(format!(
+                                                "provider-model-catalog-{index}-{model_id}"
+                                            )))
+                                            .small()
+                                            .ghost()
+                                            .selected(selected)
+                                            .label(label)
+                                            .disabled(pending)
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.set_profile_model_id_from_catalog(
+                                                    index,
+                                                    click_id.clone(),
+                                                    model_wire_api,
+                                                    window,
+                                                    cx,
+                                                )
+                                            })),
+                                        );
+                                }
+                                choices = choices.child(options);
+                            }
+                            editor.child(choices)
+                        })
+                        .when(!agent_owns_catalog, |editor| {
+                            editor.child(management_input_field(
+                                management_locale_text("Model ID", "模型 ID", "模型 ID"),
+                                &self.profile_model_edit_id,
+                                false,
+                                cx,
+                            ))
+                        })
                         .child(management_input_field(
                             management_locale_text("Display name", "显示名称", "顯示名稱"),
                             &self.profile_model_edit_name,

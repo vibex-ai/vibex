@@ -23,6 +23,13 @@ use vibex_remote::RemoteRuntimeOptionCatalogSource;
 
 use crate::AgentAuthContextService;
 
+/// Placeholder credential for Agent-owned catalogue discovery.
+///
+/// Cline's ACP bridge only demands that *some* key is present before it will
+/// create a session, and the catalogue it advertises depends on the provider id
+/// alone. No provider is contacted, so no real Secret is read or projected.
+const CLINE_CATALOG_PROBE_KEY: &str = "vibex-catalog-discovery";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeOptionSnapshotSummary {
     pub agent_id: AgentId,
@@ -402,6 +409,78 @@ impl RuntimeOptionCatalogService {
             }
         }
         Ok(result)
+    }
+
+    /// Enumerates the Model catalogue an Agent owns for itself.
+    ///
+    /// Cline's ACP bridge publishes its selectable Models per provider id
+    /// instead of asking the configured endpoint, and only accepts a
+    /// caller-supplied base URL for its OpenAI-shaped ids. Discovery therefore
+    /// launches the Agent once per declared interface with that interface's
+    /// provider selector and a placeholder key, which is enough to pass the
+    /// bridge's authentication gate without contacting any provider.
+    ///
+    /// The returned Models carry the wire protocol of the interface they came
+    /// from, so selecting one also selects the protocol the projection writes.
+    pub async fn discover_agent_owned_model_catalog(
+        &self,
+        agent_id: &AgentId,
+        provider_profile_id: &ProviderProfileId,
+    ) -> Result<Vec<vibex_core::ProviderConfiguredModel>, VibexError> {
+        // The declared interfaces are static catalog data, so discovery does
+        // not need a resolved runtime identity: only the protocol list and the
+        // provider id each protocol maps to.
+        let descriptor = vibex_core::catalog_projection_descriptors()?
+            .into_iter()
+            .find(|descriptor| &descriptor.route.agent_id == agent_id)
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "agent_model_catalog_descriptor_missing",
+                    "Agent has no catalog projection descriptor for catalogue discovery",
+                )
+            })?;
+        let interfaces = descriptor.model_interfaces;
+
+        let mut discovered = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for interface in &interfaces {
+            let Some(provider_id) = vibex_core::cline_provider_id(&interface.wire_protocol_id)
+            else {
+                continue;
+            };
+            let probe = self
+                .manager
+                .discover_model_catalog(
+                    agent_id.clone(),
+                    provider_profile_id.clone(),
+                    vec![
+                        ("CLINE_PROVIDER".to_string(), provider_id.to_string()),
+                        (
+                            "CLINE_API_KEY".to_string(),
+                            CLINE_CATALOG_PROBE_KEY.to_string(),
+                        ),
+                    ],
+                )
+                .await?;
+            let Some(wire_api) = vibex_core::ProviderModelWireApi::from_wire_protocol_id(
+                &interface.wire_protocol_id,
+            ) else {
+                continue;
+            };
+            for model_id in probe.models {
+                if !seen.insert((provider_id.to_string(), model_id.clone())) {
+                    continue;
+                }
+                discovered.push(vibex_core::ProviderConfiguredModel {
+                    id: model_id,
+                    display_name: None,
+                    enabled: true,
+                    wire_api: Some(wire_api),
+                    capabilities: Default::default(),
+                });
+            }
+        }
+        Ok(discovered)
     }
 
     /// Performs the one-time Agent-owned runtime option probe. A successful

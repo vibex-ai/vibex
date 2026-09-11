@@ -3541,7 +3541,22 @@ ProviderConfigService::{
   Responses, Anthropic Messages; `hermes` = Chat Completions, Responses,
   Anthropic Messages, Bedrock Converse; `deepseek-harness` = Chat Completions,
   Responses, Anthropic Messages; `zcode` = Chat Completions, Anthropic Messages;
-  `codebuddy-code` = Chat Completions.
+  `codebuddy-code` = Chat Completions; `cline` = Chat Completions, Responses.
+- Cline CLI selects its provider, wire protocol, and Model catalogue through one
+  provider id, and it rejects a caller-supplied base URL for every id except its
+  OpenAI-shaped pair (`openai-compatible` = Chat Completions,
+  `openai-native` = Responses). Vibex therefore derives the id from the Model's
+  wire protocol instead of offering the id list, and projects
+  `CLINE_PROVIDER` / `CLINE_API_KEY` / `CLINE_MODEL` alongside
+  `<CLINE_DATA_DIR>/settings/providers.json`.
+- Cline owns that catalogue: the selectable ids are whatever the installed
+  bridge advertises for the chosen provider id, and an id outside it is silently
+  replaced rather than rejected. Discovery therefore launches the Agent with
+  `agent_owns_model_catalog` + `discover_runtime_model_catalog` instead of
+  calling a Provider model-list endpoint, and the provider form renders the
+  result as a closed choice list. The probe passes a placeholder key because the
+  bridge only requires that some key is present; no Provider is contacted and no
+  real Secret is read.
 - Google Vertex is a distinct wire protocol rather than a `google_generative_ai`
   endpoint, because the Agents that speak both read a different origin variable
   per protocol (`GOOGLE_GEMINI_BASE_URL` vs `GOOGLE_VERTEX_BASE_URL`) and the

@@ -3512,6 +3512,23 @@ impl AgentManager {
         }
     }
 
+    /// Enumerates the Model catalogue an Agent owns for itself, under a
+    /// provider selector supplied as environment overrides. Returns a
+    /// capability error for Agents whose Models come from the endpoint.
+    pub async fn discover_model_catalog(
+        &self,
+        agent_id: AgentId,
+        provider_profile_id: ProviderProfileId,
+        env_overrides: Vec<(String, String)>,
+    ) -> VibexResult<AgentSessionConfigProbe> {
+        let resolved_agent =
+            self.resolve_enabled_agent(Some(agent_id), ProviderKind::Acp, false)?;
+        let provider = self.runtime(&self.route_for_agent(&resolved_agent.agent_id)?)?;
+        provider
+            .discover_model_catalog(&provider_profile_id, env_overrides)
+            .await
+    }
+
     /// Stateless session-config discovery for one Agent Provider Profile.
     /// Returns empty evidence when the provider has no discovery support;
     /// catalog callers layer their own registry fallbacks on top.

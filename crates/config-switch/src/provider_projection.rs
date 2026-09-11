@@ -1582,6 +1582,10 @@ fn inline_overlay_env_key(strategy: &ConfigOverlayStrategy) -> Option<&'static s
 fn private_home_env_key(agent_id: &str) -> Option<&'static str> {
     match agent_id {
         "antigravity" => Some("GEMINI_HOME"),
+        // Cline reads and writes its provider store under
+        // `<CLINE_DATA_DIR>/settings/`, so the projected root is the data dir
+        // itself rather than a home directory.
+        "cline" => Some("CLINE_DATA_DIR"),
         "copilot" => Some("COPILOT_HOME"),
         "codewhale" => Some("CODEWHALE_HOME"),
         "codex" => Some("CODEX_HOME"),
@@ -1678,6 +1682,17 @@ fn apply_agent_projection_defaults(
                 );
             }
         }
+        // Cline resolves the provider id from `CLINE_PROVIDER` and the Model
+        // from `CLINE_MODEL`; the same id keys the provider store the overlay
+        // writes.
+        "cline" => {
+            if let Some(provider_id) = cline_provider_id(model) {
+                env.insert("CLINE_PROVIDER".to_string(), provider_id.to_string());
+            }
+            if let Some(model_id) = projection_model_id(model) {
+                env.insert("CLINE_MODEL".to_string(), model_id.to_string());
+            }
+        }
         // `COPILOT_PROVIDER_BASE_URL` alone only switches Copilot CLI into
         // BYOK mode; the wire protocol stays on its `openai` / `completions`
         // default until these are set. Without them an Anthropic or Responses
@@ -1694,6 +1709,12 @@ fn apply_agent_projection_defaults(
         }
         _ => {}
     }
+}
+
+/// Cline's provider id for the selected Model. `None` means the wire protocol
+/// has no base-URL-capable Cline provider, so nothing is projected.
+pub fn cline_provider_id(model: Option<&AgentConfiguredModelBinding>) -> Option<&'static str> {
+    vibex_core::cline_provider_id(projection_wire_protocol(model))
 }
 
 /// Copilot CLI's BYOK provider type. Anthropic Messages is its own type; both
@@ -1782,6 +1803,17 @@ fn build_overlay(
             "yaml",
             structured_yaml_overlay(provider, endpoint, model)?,
             false,
+        ),
+        ConfigOverlayStrategy::ClineProvidersJson => (
+            "settings/providers.json",
+            "json",
+            cline_overlay(
+                binding,
+                endpoint,
+                model,
+                require_secret_env_key(secret_env_key)?,
+            )?,
+            true,
         ),
         ConfigOverlayStrategy::CrowCliYaml => (
             "config.yaml",
@@ -2674,6 +2706,72 @@ fn zcode_overlay(
                 "options": options,
                 "models": models,
             }
+        }
+    }))
+}
+
+/// Cline CLI's provider store.
+///
+/// The bridge keys every entry by provider id and reads `provider`, `apiKey`,
+/// `model`, and `baseUrl` from that entry's `settings` object. The provider id
+/// is one of the two OpenAI-shaped ids Cline accepts a caller-supplied base URL
+/// for, and the same id travels in `CLINE_PROVIDER`.
+///
+/// `version` and `lastUsedProvider` are part of the file Cline itself writes;
+/// the remaining fields (`updatedAt`, `tokenSource`) are omitted because a
+/// timestamp would make the projection fingerprint unstable and Cline falls
+/// back to its own defaults without them.
+fn cline_overlay(
+    binding: &AgentModelProviderBinding,
+    endpoint: Option<&ModelProviderEndpoint>,
+    model: Option<&AgentConfiguredModelBinding>,
+    secret_env_key: &str,
+) -> VibexResult<String> {
+    // The store entry must describe the Model the session will select. A
+    // selected Model whose protocol Cline cannot point at a caller-supplied
+    // endpoint must fail rather than silently store a different provider; the
+    // first enabled Model is only a fallback for a binding with no selection.
+    let provider_id = match model {
+        Some(selected) => cline_provider_id(Some(selected)),
+        None => binding
+            .configured_models
+            .iter()
+            .filter(|configured| configured.enabled)
+            .find_map(|configured| cline_provider_id(Some(configured))),
+    }
+    .ok_or_else(|| {
+        VibexError::validation(
+            "agent_projection_cline_provider_unsupported",
+            "no enabled Model selects a Cline provider that accepts a custom base URL",
+        )
+    })?;
+
+    let mut settings = serde_json::Map::new();
+    settings.insert(
+        "provider".to_string(),
+        serde_json::Value::String(provider_id.to_string()),
+    );
+    settings.insert(
+        "apiKey".to_string(),
+        serde_json::Value::String(overlay_secret_placeholder(secret_env_key)),
+    );
+    if let Some(model_id) = projection_model_id(model) {
+        settings.insert(
+            "model".to_string(),
+            serde_json::Value::String(model_id.to_string()),
+        );
+    }
+    json_string_if_present(
+        &mut settings,
+        "baseUrl",
+        endpoint.map(|endpoint| endpoint.url.as_str()),
+    );
+
+    serialized_json(serde_json::json!({
+        "version": 1,
+        "lastUsedProvider": provider_id,
+        "providers": {
+            provider_id: { "settings": serde_json::Value::Object(settings) }
         }
     }))
 }
@@ -4124,7 +4222,7 @@ fn hex_digest(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use tempfile::tempdir;
     use vibex_core::{
@@ -4551,7 +4649,7 @@ mod tests {
         runtime_home_env_key: Option<&'static str>,
     }
 
-    fn typed_projection_expectations() -> [TypedProjectionExpectation; 19] {
+    fn typed_projection_expectations() -> [TypedProjectionExpectation; 22] {
         [
             TypedProjectionExpectation {
                 agent_id: "antigravity",
@@ -4570,6 +4668,24 @@ mod tests {
                 overlay_path: None,
                 overlay_format: None,
                 runtime_home_env_key: Some("COPILOT_HOME"),
+            },
+            TypedProjectionExpectation {
+                agent_id: "cline",
+                base_url_key: None,
+                secret_env_key: "CLINE_API_KEY",
+                model_env_key: None,
+                overlay_path: Some("settings/providers.json"),
+                overlay_format: Some("json"),
+                runtime_home_env_key: Some("CLINE_DATA_DIR"),
+            },
+            TypedProjectionExpectation {
+                agent_id: "codebuddy-code",
+                base_url_key: Some("CODEBUDDY_BASE_URL"),
+                secret_env_key: "CODEBUDDY_API_KEY",
+                model_env_key: Some("CODEBUDDY_MODEL"),
+                overlay_path: None,
+                overlay_format: None,
+                runtime_home_env_key: None,
             },
             TypedProjectionExpectation {
                 agent_id: "codewhale",
@@ -4624,6 +4740,15 @@ mod tests {
                 overlay_path: None,
                 overlay_format: None,
                 runtime_home_env_key: Some("GEMINI_HOME"),
+            },
+            TypedProjectionExpectation {
+                agent_id: "glm-acp-agent",
+                base_url_key: Some("ACP_GLM_BASE_URL"),
+                secret_env_key: "Z_AI_API_KEY",
+                model_env_key: Some("ACP_GLM_MODEL"),
+                overlay_path: None,
+                overlay_format: None,
+                runtime_home_env_key: None,
             },
             TypedProjectionExpectation {
                 agent_id: "goose",
@@ -5126,7 +5251,25 @@ mod tests {
     fn all_typed_catalog_projectors_map_provider_env_secret_model_and_private_state() {
         let descriptors = vibex_core::catalog_projection_descriptors().unwrap();
         let expectations = typed_projection_expectations();
-        assert_eq!(expectations.len(), 19);
+        assert_eq!(expectations.len(), 22);
+        // Every catalog Agent that owns an automatic projector must be covered
+        // here, so a new Agent cannot silently ship without assertions.
+        let covered = expectations
+            .iter()
+            .map(|expectation| expectation.agent_id)
+            .collect::<BTreeSet<_>>();
+        let projecting = descriptors
+            .iter()
+            .filter(|descriptor| {
+                matches!(
+                    descriptor.provider_control,
+                    AgentProviderControl::Environment { .. }
+                        | AgentProviderControl::ManagedConfigOverlay { .. }
+                )
+            })
+            .map(|descriptor| descriptor.route.agent_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(covered, projecting);
 
         for expected in expectations {
             let descriptor = descriptors
@@ -6475,6 +6618,66 @@ mod tests {
                 "protocol {protocol}"
             );
         }
+    }
+
+    /// Cline's bridge reads a provider store plus `CLINE_PROVIDER` /
+    /// `CLINE_MODEL`, and only its two OpenAI-shaped ids accept a base URL.
+    #[test]
+    fn cline_projection_writes_the_provider_store_and_selects_the_provider_id() {
+        use vibex_core::{
+            WIRE_PROTOCOL_ANTHROPIC_MESSAGES, WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+            WIRE_PROTOCOL_OPENAI_RESPONSES,
+        };
+
+        let descriptor = provider_descriptor("cline");
+        let (provider, _, binding, _) = fixture(ConfigOverlayStrategy::ClineProvidersJson);
+        let endpoint = provider
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.kind == ModelProviderEndpointKind::Api)
+            .unwrap();
+        let base = binding.configured_models[0].clone();
+
+        for (protocol, expected_provider) in [
+            (WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, "openai-compatible"),
+            (WIRE_PROTOCOL_OPENAI_RESPONSES, "openai-native"),
+        ] {
+            let mut model = base.clone();
+            model.wire_protocol_id = protocol.to_string();
+            let overlay =
+                cline_overlay(&binding, Some(endpoint), Some(&model), "CLINE_API_KEY").unwrap();
+            let value: serde_json::Value = serde_json::from_str(&overlay).unwrap();
+            assert_eq!(value["version"], 1);
+            assert_eq!(value["lastUsedProvider"], expected_provider);
+            let settings = &value["providers"][expected_provider]["settings"];
+            assert_eq!(settings["provider"], expected_provider);
+            assert_eq!(settings["baseUrl"], endpoint.url);
+            assert_eq!(settings["model"], "model-a");
+            assert_eq!(
+                settings["apiKey"],
+                overlay_secret_placeholder("CLINE_API_KEY")
+            );
+
+            let mut env = BTreeMap::new();
+            apply_agent_projection_defaults(&descriptor, &provider, Some(&model), None, &mut env);
+            assert_eq!(
+                env.get("CLINE_PROVIDER").map(String::as_str),
+                Some(expected_provider)
+            );
+            assert_eq!(env.get("CLINE_MODEL").map(String::as_str), Some("model-a"));
+        }
+
+        // A protocol Cline cannot point at a caller-supplied endpoint must not
+        // produce a provider id or an overlay.
+        let mut anthropic = base.clone();
+        anthropic.wire_protocol_id = WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string();
+        assert!(cline_provider_id(Some(&anthropic)).is_none());
+        assert_eq!(
+            cline_overlay(&binding, Some(endpoint), Some(&anthropic), "CLINE_API_KEY")
+                .unwrap_err()
+                .code,
+            "agent_projection_cline_provider_unsupported"
+        );
     }
 
     fn provider_descriptor(agent_id: &str) -> AgentProviderProjectionDescriptor {
