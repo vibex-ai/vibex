@@ -35566,14 +35566,12 @@ impl VibexWorkbench {
                     .w(relative(0.78))
                     .items_end()
                     .gap_1()
-                    .child(
-                        render_user_message_bubble(
-                            inline_content,
-                            cx.theme().muted,
-                            cx.theme().foreground,
-                        )
-                        .when(editing, |this| this.w_full()),
-                    )
+                    .child(render_user_message_bubble(
+                        inline_content,
+                        cx.theme().muted,
+                        cx.theme().foreground,
+                        editing,
+                    ))
                     .when(!editing, |this| {
                         this.child(
                             h_flex()
@@ -35688,6 +35686,7 @@ impl VibexWorkbench {
                         inline_content,
                         cx.theme().muted,
                         cx.theme().foreground,
+                        false,
                     )),
             )
             .into_any_element()
@@ -51361,14 +51360,20 @@ fn render_user_message_bubble(
     body: AnyElement,
     background: gpui::Hsla,
     foreground: gpui::Hsla,
+    fill_width: bool,
 ) -> gpui_component::bubble::Bubble {
     // Codex-parity: compact rounded-xl pill rendered by the library Bubble.
     // The 78% width contract stays on the definite-width row wrapper; the
     // bubble hugs its content and shrinks when the wrapper is the constraint.
+    // The inline editor subtree is percentage-width all the way down and has
+    // no intrinsic width, so edit mode must fill the wrapper on both the
+    // Bubble and its visible BubbleContent surface or the hug collapses the
+    // pill.
     Bubble::new()
         .alignment(MessageAlignment::End)
         .flex_shrink(1.0)
         .max_w_full()
+        .when(fill_width, |this| this.w_full())
         .content(
             BubbleContent::new()
                 .bg(background)
@@ -51379,6 +51384,7 @@ fn render_user_message_bubble(
                 .text_sm()
                 .line_height(relative(1.5))
                 .shadow_sm()
+                .when(fill_width, |this| this.w_full())
                 .child(body),
         )
 }
@@ -53173,10 +53179,48 @@ mod tests {
                                 .into_any_element(),
                                 theme::semantic_color("muted", true),
                                 theme::semantic_color("foreground", true),
+                                false,
                             )),
                     )
                     // The hidden hover actions still participate in the row's intrinsic width.
                     .child(div().w(px(132.0)).h(px(24.0))),
+            )
+        }
+    }
+
+    struct UserMessageEditBubbleLayoutProbe {
+        timeline_width: f32,
+        measured_editor_width: Rc<Cell<f32>>,
+    }
+
+    impl Render for UserMessageEditBubbleLayoutProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let measured_editor_width = self.measured_editor_width.clone();
+            h_flex().w(px(self.timeline_width)).justify_end().child(
+                v_flex()
+                    .min_w_0()
+                    .w(relative(0.78))
+                    .items_end()
+                    .child(render_user_message_bubble(
+                        // Mirrors the inline editor: every layer is
+                        // percentage-width and carries no intrinsic width.
+                        v_flex()
+                            .w_full()
+                            .min_w_0()
+                            .child(div().w_full().h(px(24.0)).on_prepaint(move |bounds, _, _| {
+                                measured_editor_width.set(f32::from(bounds.size.width));
+                            }))
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .justify_end()
+                                    .child(div().w(px(60.0)).h(px(24.0))),
+                            )
+                            .into_any_element(),
+                        theme::semantic_color("muted", true),
+                        theme::semantic_color("foreground", true),
+                        true,
+                    )),
             )
         }
     }
@@ -62455,6 +62499,38 @@ mod tests {
             observed_height.get() <= 44.5,
             "single-line bubble height: {}",
             observed_height.get()
+        );
+    }
+
+    #[gpui::test]
+    fn user_message_edit_bubble_keeps_the_timeline_width_contract(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let measured_editor_width = Rc::new(Cell::new(0.0));
+        let observed_editor_width = measured_editor_width.clone();
+        let timeline_width = 720.0;
+        let (_, cx) = cx.add_window_view(|_, _| UserMessageEditBubbleLayoutProbe {
+            timeline_width,
+            measured_editor_width,
+        });
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        // The editing surface fills the same 78% wrapper the rendered bubble
+        // obeys (minus the pill's px(14) padding and 1px library border); a
+        // hug collapse would measure near the button row's intrinsic width.
+        let pill_width = timeline_width * 0.78;
+        assert!(
+            observed_editor_width.get() >= pill_width - 40.0,
+            "editing bubble content width: {}",
+            observed_editor_width.get()
+        );
+        assert!(
+            observed_editor_width.get() <= pill_width - 28.0 + 0.5,
+            "editing bubble content width: {}",
+            observed_editor_width.get()
         );
     }
 
