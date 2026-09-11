@@ -183,6 +183,18 @@ returns stored secrets, so the field opens empty and a typed value replaces
 it). Live updates arrive through the same `BackendEvent` pump mapped onto the
 desktop event pipeline.
 
+Session creation, managed-worktree lifecycle, the usage view, and the live
+per-session token snapshot also resolve on the authority: a reserved session id
+and a deferred runtime materialization travel in the create request, the
+worktree lifecycle and its destructive preflights ride the gateway's Git
+operations, and both usage reads are served by the runtime's usage service.
+Nothing in that list needs the desktop shell, so the headless seat answers
+exactly like a desktop authority.
+
+Operations that do need the desktop shell stay client-side: local CLI-history
+scan/import, the client's own storage usage and cleanup, and the Relay
+status card.
+
 Terminals follow the same rule through a transport seam: `TerminalTransport`
 has an in-process implementation over `TerminalManager` and a remote one over
 the gateway's terminal operations, and the workbench, composer and Agent
@@ -195,8 +207,13 @@ depends on state that only the authority owns: composer command discovery
 by the bridge that lives with the Agent, and the legacy profile-scoped Agent
 sign-out releases credentials where they are stored.
 
-The live per-session token-usage snapshot is the remaining local-only read, so
-the usage indicator does not update against a paired runtime.
+Command execution follows the same rule: a resolved composer command is one
+`execute_composer_command` mutation, so a paired client never runs a command
+against a runtime it does not own.
+
+The live per-session token-usage snapshot and the aggregated usage view are
+served by the runtime's usage service over Remote v2, so the indicators update
+against a paired runtime exactly as they do locally.
 
 Provider credentials belong to the runtime database. In cloud mode the
 operator's own host stores them, which is the accepted single-user threat

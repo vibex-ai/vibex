@@ -174,9 +174,13 @@ A desktop connects to a cloud runtime the same way the phone does:
    A stored credential also reconnects automatically on the next launch;
    set `VIBEX_DISABLE_REMOTE_CLIENT=1` to force the local authority once.
 
-Authority-local features degrade explicitly in remote-client mode: composer
-terminals, worktree rename, project deletion, and message editing require
-the local runtime and say so; the settings management page stays inert.
+Authority-local features degrade explicitly in remote-client mode. The desktop's
+own self-update, remote-access publication setup, and the stored provider
+credential read-back stay on the client machine; a temporary session asks the
+authority for its workspace root, and managed worktree creation/lifecycle,
+usage statistics, and the live per-session token snapshot are served over
+Remote v2. Local CLI-history import and the client's storage usage/cleanup
+remain client-side.
 
 ## Production Notes
 
