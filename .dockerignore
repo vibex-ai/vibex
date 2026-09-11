@@ -28,3 +28,41 @@ crates/core/bindings/
 *.db
 *.db-shm
 *.db-wal
+
+# The docker builds (deploy/server, deploy/relay) compile pure async crates and
+# never build GPUI, but the workspace [patch.crates-io] still points gpui-pre at
+# vendor/zed, so cargo must be able to load that crate family's manifests. Ship
+# only the transitive path-dependency closure of that family (~12 MB) instead of
+# the full 18 GB zed fork working tree.
+vendor/*
+!vendor/zed/
+vendor/zed/*
+!vendor/zed/Cargo.toml
+!vendor/zed/crates/
+vendor/zed/crates/*
+!vendor/zed/crates/gpui/
+!vendor/zed/crates/gpui_macros/
+!vendor/zed/crates/sum_tree/
+!vendor/zed/crates/gpui_platform/
+!vendor/zed/crates/gpui_tokio/
+!vendor/zed/crates/gpui_android/
+!vendor/zed/crates/collections/
+!vendor/zed/crates/gpui_shared_string/
+!vendor/zed/crates/gpui_util/
+!vendor/zed/crates/http_client/
+!vendor/zed/crates/refineable/
+!vendor/zed/crates/scheduler/
+!vendor/zed/crates/util_macros/
+!vendor/zed/crates/ztracing/
+!vendor/zed/crates/ztracing_macro/
+!vendor/zed/crates/zlog/
+!vendor/zed/crates/gpui_linux/
+!vendor/zed/crates/gpui_web/
+!vendor/zed/crates/gpui_ios/
+!vendor/zed/crates/gpui_macos/
+!vendor/zed/crates/gpui_windows/
+!vendor/zed/crates/gpui_wgpu/
+!vendor/zed/crates/gpui_apple/
+!vendor/zed/crates/media/
+!vendor/zed/tooling/
+!vendor/zed/tooling/perf/

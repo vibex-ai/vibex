@@ -8,7 +8,7 @@ FROM ${RUST_BUILDER_IMAGE} AS builder
 ARG RUST_STABLE_TOOLCHAIN=1.97.0
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates clang cmake git libssl-dev pkg-config \
+    && apt-get install -y --no-install-recommends ca-certificates clang cmake git libdbus-1-dev libssl-dev pkg-config \
     && rm -rf /var/lib/apt/lists/* \
     && if ! rustc --version | grep -q '^rustc 1\.97\.'; then \
          rustup toolchain install "${RUST_STABLE_TOOLCHAIN}" --profile minimal \
@@ -26,7 +26,7 @@ RUN cargo build --release -p vibex-server --locked
 FROM ${RUNTIME_IMAGE} AS runtime
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git openssh-client \
+    && apt-get install -y --no-install-recommends ca-certificates curl git libdbus-1-3 openssh-client \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --create-home --home-dir /data --shell /usr/sbin/nologin vibex
 
