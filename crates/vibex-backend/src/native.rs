@@ -9,13 +9,13 @@ use vibex_core::{
     AgentAuthContextMutationResult, AgentAuthContextRefreshModelsRequest,
     AgentAuthContextVerifyRequest, AgentAuthEnvironmentUpdateRequest, AgentAuthenticateRequest,
     AgentAuthenticateResult, AgentAuthenticationCancelRequest, AgentAuthenticationOperation,
-    AgentAuthenticationOperationId, AgentCatalogListResponse, AgentId, AgentListRequest,
-    AgentListResponse, AgentLogoutRequest, AgentManagedInstallState,
-    AgentModelProviderDisplayOrderListRequest, AgentModelProviderDisplayOrderListResponse,
-    AgentModelProviderDisplayOrderSetRequest, AgentModelProviderDisplayOrderSetResponse,
-    AgentModelProviderProfileCreateRequest, AgentModelProviderProfileDeleteRequest,
-    AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
-    AgentModelProviderProfileSecretValueResponse,
+    AgentAuthenticationOperationId, AgentCatalogListResponse, AgentCommandDiscoverRequest,
+    AgentCommandDiscovery, AgentId, AgentListRequest, AgentListResponse, AgentLogoutRequest,
+    AgentManagedInstallState, AgentModelProviderDisplayOrderListRequest,
+    AgentModelProviderDisplayOrderListResponse, AgentModelProviderDisplayOrderSetRequest,
+    AgentModelProviderDisplayOrderSetResponse, AgentModelProviderProfileCreateRequest,
+    AgentModelProviderProfileDeleteRequest, AgentModelProviderProfileFetchModelsRequest,
+    AgentModelProviderProfileFetchModelsResponse, AgentModelProviderProfileSecretValueResponse,
     AgentModelProviderProfileSecretValueUpdateRequest, AgentModelProviderProfileTestRequest,
     AgentModelProviderProfileTestResult, AgentModelProviderProfileUpdateRequest,
     AgentRefreshSnapshotRequest, AgentRefreshSnapshotResponse, AgentRuntimeOptionProbeRequest,
@@ -47,8 +47,8 @@ use vibex_core::{
     McpServerSetAgentMatrixRequest, McpServerUpdateRequest, McpServerValidateRequest,
     McpServerValidationResult, MessageSubmissionState, OpenWorkspaceRequest, ProjectId, Prompt,
     PromptCreateRequest, PromptDeleteRequest, PromptUpdateRequest, PromptValidateRequest,
-    PromptValidationResult, ProviderCapabilitySummary, ProviderHealthSummary,
-    ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
+    PromptValidationResult, ProviderCapabilitySummary, ProviderConfiguredModel,
+    ProviderHealthSummary, ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
     ProviderNativeExportListRequest, ProviderNativeExportPreview,
     ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
     ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
@@ -78,12 +78,12 @@ use vibex_desktop_runtime::{
 };
 
 use crate::{
-    AgentBackend, BackendCapabilitySnapshot, BackendError, BackendEvent, BackendEventStream,
-    BackendEventSubscription, BackendFacade, BackendFuture, BackendOperation, BackendProjection,
-    BackendRefetch, BackendResult, DeviceBackend, FileBackend, GitBackend, ManagementBackend,
-    ManagementProfileSelectionRequest, MutationRequest, RelayConnectionState, RelayStatusSummary,
-    TerminalBackend, TerminalFrame, TerminalFrameBatch, TerminalFrameSubscription,
-    WorkspaceBackend, WorkspaceSummary,
+    AgentBackend, AgentModelOwnedCatalogRequest, BackendCapabilitySnapshot, BackendError,
+    BackendEvent, BackendEventStream, BackendEventSubscription, BackendFacade, BackendFuture,
+    BackendOperation, BackendProjection, BackendRefetch, BackendResult, DeviceBackend, FileBackend,
+    GitBackend, ManagementBackend, ManagementProfileSelectionRequest, MutationRequest,
+    RelayConnectionState, RelayStatusSummary, TerminalBackend, TerminalFrame, TerminalFrameBatch,
+    TerminalFrameSubscription, WorkspaceBackend, WorkspaceSummary,
 };
 
 #[derive(Clone)]
@@ -538,6 +538,40 @@ impl AgentBackend for NativeBackend {
                 .logout(request.payload)
                 .await
                 .map_err(Into::into)
+        })
+    }
+
+    fn discover_agent_owned_model_catalog(
+        &self,
+        request: AgentModelOwnedCatalogRequest,
+    ) -> BackendFuture<'_, Vec<ProviderConfiguredModel>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .runtime_catalog()
+                .discover_agent_owned_model_catalog(&request.agent_id, &request.provider_profile_id)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn discover_agent_commands(
+        &self,
+        request: AgentCommandDiscoverRequest,
+    ) -> BackendFuture<'_, AgentCommandDiscovery> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            vibex_desktop_runtime::discover_composer_commands(
+                &runtime.agent(),
+                &runtime.files(),
+                &runtime.providers(),
+                request,
+            )
+            .await
+            .map_err(BackendError::from)
         })
     }
 

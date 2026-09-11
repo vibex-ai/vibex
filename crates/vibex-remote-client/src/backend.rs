@@ -4,12 +4,12 @@ use std::sync::{Arc, Mutex};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use vibex_backend::{
-    AgentBackend, BACKEND_CAPABILITY_SCHEMA_VERSION, BackendCapabilitySnapshot, BackendError,
-    BackendEvent, BackendEventStream, BackendEventSubscription, BackendFacade, BackendFuture,
-    BackendOperation, BackendRefetch, BackendResult, DeviceBackend, DomainCapabilities,
-    FileBackend, GitBackend, ManagementBackend, ManagementProfileSelectionRequest, MutationRequest,
-    RelayStatusSummary, TerminalBackend, TerminalFrameBatch, TerminalFrameSubscription,
-    WorkspaceBackend, WorkspaceSummary,
+    AgentBackend, AgentModelOwnedCatalogRequest, BACKEND_CAPABILITY_SCHEMA_VERSION,
+    BackendCapabilitySnapshot, BackendError, BackendEvent, BackendEventStream,
+    BackendEventSubscription, BackendFacade, BackendFuture, BackendOperation, BackendRefetch,
+    BackendResult, DeviceBackend, DomainCapabilities, FileBackend, GitBackend, ManagementBackend,
+    ManagementProfileSelectionRequest, MutationRequest, RelayStatusSummary, TerminalBackend,
+    TerminalFrameBatch, TerminalFrameSubscription, WorkspaceBackend, WorkspaceSummary,
 };
 use vibex_core::{
     AcpProviderCatalogListResponse, AcpProviderConfig, AcpProviderProfileUpdateRequest,
@@ -19,9 +19,10 @@ use vibex_core::{
     AgentAuthContextMutationResult, AgentAuthContextRefreshModelsRequest,
     AgentAuthContextVerifyRequest, AgentAuthEnvironmentUpdateRequest, AgentAuthenticateRequest,
     AgentAuthenticateResult, AgentAuthenticationCancelRequest, AgentAuthenticationOperation,
-    AgentAuthenticationOperationId, AgentCatalogListResponse, AgentId, AgentListRequest,
-    AgentListResponse, AgentLogoutRequest, AgentManagedInstallState,
-    AgentModelProviderProfileCreateRequest, AgentModelProviderProfileSecretValueResponse,
+    AgentAuthenticationOperationId, AgentCatalogListResponse, AgentCommandDiscoverRequest,
+    AgentCommandDiscovery, AgentId, AgentListRequest, AgentListResponse, AgentLogoutRequest,
+    AgentManagedInstallState, AgentModelProviderProfileCreateRequest,
+    AgentModelProviderProfileSecretValueResponse,
     AgentModelProviderProfileSecretValueUpdateRequest, AgentModelProviderProfileUpdateRequest,
     AgentNotificationIntent, AgentRefreshSnapshotRequest, AgentRefreshSnapshotResponse,
     AgentRuntimeOptionProbeRequest, AgentRuntimeOptionProbeResult, AgentSession,
@@ -46,8 +47,8 @@ use vibex_core::{
     GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeReadinessRecord,
     GitWorktreeReadinessRequest, GitWorktreeRestoreRequest, ManagementSnapshotPayload,
     MessageSubmissionState, OpenWorkspaceRequest, ProjectId, ProjectWorkspaceSummary,
-    ProviderHealthSummary, ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
-    ProviderNativeExportListRequest, ProviderNativeExportPreview,
+    ProviderConfiguredModel, ProviderHealthSummary, ProviderNativeExportApplyRequest,
+    ProviderNativeExportApplyResult, ProviderNativeExportListRequest, ProviderNativeExportPreview,
     ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
     ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
     ProviderNativeImportCreateRequest, ProviderNativeImportCreateResult,
@@ -1371,6 +1372,57 @@ impl AgentBackend for WebRemoteBackend {
             )
             .await?;
             Ok(())
+        })
+    }
+
+    fn discover_agent_owned_model_catalog(
+        &self,
+        request: AgentModelOwnedCatalogRequest,
+    ) -> BackendFuture<'_, Vec<ProviderConfiguredModel>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::DiscoverOwnedModelCatalog(
+                vibex_core::RemoteAgentOwnedModelCatalogRequest {
+                    auth: this.auth(),
+                    agent_id: request.agent_id,
+                    provider_profile_id: request.provider_profile_id,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentOwnedModelCatalogResponse>(value)?.models)
+        })
+    }
+
+    fn discover_agent_commands(
+        &self,
+        request: AgentCommandDiscoverRequest,
+    ) -> BackendFuture<'_, AgentCommandDiscovery> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteAgentRequest::DiscoverCommands(
+                vibex_core::RemoteAgentDiscoverCommandsRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentDiscoverCommandsResponse>(value)?.discovery)
         })
     }
 

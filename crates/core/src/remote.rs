@@ -1879,6 +1879,7 @@ pub enum RemoteProviderOperationKind {
     UpdateAgentConfig,
     RefreshAgentSnapshot,
     ProbeAgentRuntimeOptions,
+    DiscoverOwnedModelCatalog,
     InstallManagedAgent,
     CheckManagedAgentUpdate,
     UninstallManagedAgent,
@@ -2176,6 +2177,24 @@ pub struct RemoteAgentProbeRuntimeOptionsRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAgentProbeRuntimeOptionsResponse {
     pub result: AgentRuntimeOptionProbeResult,
+}
+
+/// Discovers the model catalogue an Agent's own CLI advertises.
+///
+/// The Agent bridge runs on the authority, so the client asks it for the list
+/// instead of launching a local process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentOwnedModelCatalogRequest {
+    pub auth: RemoteAuthProof,
+    pub agent_id: AgentId,
+    pub provider_profile_id: crate::ProviderProfileId,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentOwnedModelCatalogResponse {
+    pub models: Vec<crate::ProviderConfiguredModel>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3111,6 +3130,7 @@ pub enum RemoteProviderRequest {
     UpdateAgentConfig(RemoteAgentUpdateConfigRequest),
     RefreshAgentSnapshot(RemoteAgentRefreshAgentSnapshotRequest),
     ProbeAgentRuntimeOptions(RemoteAgentProbeRuntimeOptionsRequest),
+    DiscoverOwnedModelCatalog(RemoteAgentOwnedModelCatalogRequest),
     InstallManagedAgent(RemoteAgentInstallManagedAgentRequest),
     CheckManagedAgentUpdate(RemoteAgentCheckManagedAgentUpdateRequest),
     UninstallManagedAgent(RemoteAgentUninstallManagedAgentRequest),
@@ -3239,6 +3259,9 @@ impl RemoteProviderRequest {
             Self::RefreshAgentSnapshot(_) => RemoteProviderOperationKind::RefreshAgentSnapshot,
             Self::ProbeAgentRuntimeOptions(_) => {
                 RemoteProviderOperationKind::ProbeAgentRuntimeOptions
+            }
+            Self::DiscoverOwnedModelCatalog(_) => {
+                RemoteProviderOperationKind::DiscoverOwnedModelCatalog
             }
             Self::InstallManagedAgent(_) => RemoteProviderOperationKind::InstallManagedAgent,
             Self::CheckManagedAgentUpdate(_) => {

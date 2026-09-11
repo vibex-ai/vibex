@@ -963,6 +963,15 @@ impl RemoteRuntimeOptionCatalogSource for RuntimeOptionCatalogService {
         self.list().await
     }
 
+    async fn discover_agent_owned_model_catalog(
+        &self,
+        agent_id: vibex_core::AgentId,
+        provider_profile_id: vibex_core::ProviderProfileId,
+    ) -> Result<Vec<vibex_core::ProviderConfiguredModel>, VibexError> {
+        self.discover_agent_owned_model_catalog(&agent_id, &provider_profile_id)
+            .await
+    }
+
     async fn probe_agent_runtime_options(
         &self,
         agent_id: vibex_core::AgentId,

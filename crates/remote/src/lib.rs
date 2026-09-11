@@ -144,6 +144,14 @@ struct RemoteRouterState {
 pub trait RemoteRuntimeOptionCatalogSource: Send + Sync {
     async fn list_runtime_options(&self) -> VibexResult<SessionRuntimeOptionCatalog>;
 
+    /// Discovers the model catalogue the Agent's own CLI advertises. The
+    /// bridge runs on the authority, so it performs the discovery.
+    async fn discover_agent_owned_model_catalog(
+        &self,
+        agent_id: vibex_core::AgentId,
+        provider_profile_id: vibex_core::ProviderProfileId,
+    ) -> VibexResult<Vec<vibex_core::ProviderConfiguredModel>>;
+
     /// Runs the one-time Agent-owned runtime option probe. The catalog service
     /// owns the probe guard and the snapshot cache, so the authority must
     /// perform it in-process.
@@ -3474,6 +3482,20 @@ async fn dispatch_provider_request(
             serde_json::to_value(vibex_core::RemoteAgentProbeRuntimeOptionsResponse { result })
                 .map_err(remote_payload_encode_error)
         }
+        RemoteProviderRequest::DiscoverOwnedModelCatalog(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let models = remote_runtime_catalog(state)?
+                .discover_agent_owned_model_catalog(request.agent_id, request.provider_profile_id)
+                .await?;
+            serde_json::to_value(vibex_core::RemoteAgentOwnedModelCatalogResponse { models })
+                .map_err(remote_payload_encode_error)
+        }
         RemoteProviderRequest::InstallManagedAgent(request) => {
             let auth = authorize_provider_action(
                 runtime,
@@ -6300,6 +6322,14 @@ mod tests {
         async fn list_runtime_options(&self) -> VibexResult<SessionRuntimeOptionCatalog> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.catalog.clone())
+        }
+
+        async fn discover_agent_owned_model_catalog(
+            &self,
+            _agent_id: vibex_core::AgentId,
+            _provider_profile_id: vibex_core::ProviderProfileId,
+        ) -> VibexResult<Vec<vibex_core::ProviderConfiguredModel>> {
+            Ok(Vec::new())
         }
 
         async fn probe_agent_runtime_options(

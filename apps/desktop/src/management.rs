@@ -33,7 +33,10 @@ use gpui_component::{
     tooltip::Tooltip,
     v_flex,
 };
-use vibex_backend::{BackendFacade, ManagementProfileSelectionRequest, MutationRequest};
+use vibex_backend::{
+    AgentModelOwnedCatalogRequest, BackendFacade, ManagementProfileSelectionRequest,
+    MutationRequest,
+};
 use vibex_core::{
     AgentAuthCatalog, AgentAuthContext, AgentAuthContextAuthenticateRequest,
     AgentAuthContextCancelAuthenticationRequest, AgentAuthContextLogoutPreview,
@@ -4626,10 +4629,10 @@ impl ManagementCenter {
         agent_id: String,
         cx: &mut Context<Self>,
     ) {
-        let (Ok(provider_profile_id), Ok(agent_id), Some(runtime)) = (
+        let (Ok(provider_profile_id), Ok(agent_id), Some(backend)) = (
             vibex_core::ProviderProfileId::parse(profile_id.clone()),
             AgentId::parse(agent_id),
-            self.runtime.clone(),
+            self.backend.clone(),
         ) else {
             self.error = Some(
                 management_error_text(
@@ -4655,24 +4658,23 @@ impl ManagementCenter {
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             if agent_owns_catalog {
                 // The Agent owns the catalogue, so discovery launches the
-                // installed bridge instead of asking a Provider endpoint.
-                runtime
+                // installed bridge on whichever runtime owns it.
+                let models = backend
                     .agent()
-                    .runtime_catalog()
-                    .discover_agent_owned_model_catalog(&agent_id, &provider_profile_id)
+                    .discover_agent_owned_model_catalog(AgentModelOwnedCatalogRequest {
+                        agent_id: agent_id.clone(),
+                        provider_profile_id: provider_profile_id.clone(),
+                    })
                     .await
-                    .map(
-                        |models| vibex_core::AgentModelProviderProfileFetchModelsResponse {
-                            agent_id: agent_id.clone(),
-                            provider_profile_id: provider_profile_id.clone(),
-                            models,
-                            diagnostics: Vec::new(),
-                        },
-                    )
+                    .map_err(crate::app::remote_error_into_vibex)?;
+                Ok::<_, VibexError>(vibex_core::AgentModelProviderProfileFetchModelsResponse {
+                    agent_id: agent_id.clone(),
+                    provider_profile_id: provider_profile_id.clone(),
+                    models,
+                    diagnostics: Vec::new(),
+                })
             } else {
-                runtime
-                    .management()
-                    .providers()
+                backend
                     .management()
                     .fetch_agent_model_provider_profile_models(
                         vibex_core::AgentModelProviderProfileFetchModelsRequest {
@@ -4680,6 +4682,8 @@ impl ManagementCenter {
                             provider_profile_id,
                         },
                     )
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)
             }
         });
         self.mutation_task = Some(cx.spawn(async move |_, cx| {

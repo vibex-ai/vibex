@@ -11,14 +11,22 @@ use vibex_core::{
     AgentSessionRuntimeSelectionState, AgentTimelineDisplaySettings, AgentUsageStatistics,
     AgentUsageStatisticsRequest, CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest,
     CreateAgentSessionRequest, FetchTimelineRequest, ForkAgentSessionRequest,
-    GetMessageSubmissionRequest, MessageSubmissionState, ProviderProfile, RemoteDeepLinkResolution,
-    RenameAgentSessionRequest, ReplaceUserMessagePayload, ResolveElicitationRequest,
-    ResolvePermissionRequest, RuntimeSessionEvent, SendAgentMessageRequest,
-    SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, TimelineItem,
-    TimelineLiveEvent, TimelinePage, VibexSessionId,
+    GetMessageSubmissionRequest, MessageSubmissionState, ProviderConfiguredModel, ProviderProfile,
+    RemoteDeepLinkResolution, RenameAgentSessionRequest, ReplaceUserMessagePayload,
+    ResolveElicitationRequest, ResolvePermissionRequest, RuntimeSessionEvent,
+    SendAgentMessageRequest, SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest,
+    TimelineItem, TimelineLiveEvent, TimelinePage, VibexSessionId,
 };
 
 use crate::{BackendBound, BackendFuture, BackendResult, MutationRequest};
+
+/// Identifies the Agent-owned model catalogue to discover.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelOwnedCatalogRequest {
+    pub agent_id: AgentId,
+    pub provider_profile_id: vibex_core::ProviderProfileId,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendEventStream {
@@ -208,6 +216,17 @@ pub trait AgentBackend: BackendBound {
         &self,
         request: MutationRequest<AgentId>,
     ) -> BackendFuture<'_, AgentAuthCatalog>;
+
+    /// Discovers the model catalogue an Agent's own CLI advertises.
+    ///
+    /// Agents that own their catalogue are not served by a Provider endpoint,
+    /// so the authority launches its bridge instead of the client.
+    fn discover_agent_owned_model_catalog(
+        &self,
+        _request: AgentModelOwnedCatalogRequest,
+    ) -> BackendFuture<'_, Vec<ProviderConfiguredModel>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
 
     /// Releases the credentials stored for one Agent and Provider profile.
     fn logout_agent(&self, _request: MutationRequest<AgentLogoutRequest>) -> BackendFuture<'_, ()> {
