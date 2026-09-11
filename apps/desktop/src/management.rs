@@ -1543,7 +1543,7 @@ impl ManagementCenter {
         {
             return;
         }
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         let Ok(agent_id) = AgentId::parse(scope.0.clone()) else {
@@ -1567,13 +1567,25 @@ impl ManagementCenter {
         }
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let context = Some(runtime.agent().ensure_default_auth_context(&agent_id)?);
+            let context = backend
+                .agent()
+                .ensure_default_agent_auth_context(MutationRequest::new(agent_id.clone()))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)?;
             let catalog = if force {
-                runtime.agent().refresh_auth_methods(agent_id, None).await?
+                backend
+                    .agent()
+                    .refresh_agent_auth_methods(MutationRequest::new(agent_id))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?
             } else {
-                runtime.agent().list_auth_methods(agent_id, None).await?
+                backend
+                    .agent()
+                    .list_agent_auth_methods(agent_id)
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?
             };
-            Ok::<_, VibexError>((catalog, context))
+            Ok::<_, VibexError>((catalog, Some(context)))
         });
         self.agent_auth_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
@@ -2209,7 +2221,7 @@ impl ManagementCenter {
         {
             return;
         }
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         let Ok(parsed_agent_id) = AgentId::parse(agent_id.clone()) else {
@@ -2223,18 +2235,27 @@ impl ManagementCenter {
             agent_id: parsed_agent_id,
         };
         let operation_id_for_runner = operation_id.clone();
+        // The legacy polling fallback below still needs the local runtime; the
+        // context-scoped cancel above rides the backend facade.
+        let runtime_for_legacy_cancel = self.runtime.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             if let Some((auth_context_id, expected_context_revision)) = auth_context {
-                runtime
+                backend
                     .agent()
-                    .cancel_context_authentication(AgentAuthContextCancelAuthenticationRequest {
-                        operation_id: operation_id_for_runner,
-                        auth_context_id,
-                        expected_context_revision,
-                    })
-                    .await?;
+                    .cancel_agent_context_authentication(MutationRequest::new(
+                        AgentAuthContextCancelAuthenticationRequest {
+                            operation_id: operation_id_for_runner,
+                            auth_context_id,
+                            expected_context_revision,
+                        },
+                    ))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?;
                 return Ok::<_, VibexError>(true);
             }
+            let Some(runtime) = runtime_for_legacy_cancel else {
+                return Ok::<_, VibexError>(false);
+            };
             for attempt in 0..40 {
                 if runtime
                     .agent()
@@ -18270,8 +18291,10 @@ mod tests {
 
         assert!(scope.contains("Some((agent_id.clone(), None))"));
         assert!(!scope.contains("selected_provider_profile_id"));
-        assert!(load.contains("refresh_auth_methods(agent_id, None)"));
-        assert!(load.contains("list_auth_methods(agent_id, None)"));
+        // The loader now rides the backend facade, so the probe goes through
+        // the contract rather than the local runtime handle.
+        assert!(load.contains("refresh_agent_auth_methods("));
+        assert!(load.contains("list_agent_auth_methods("));
         assert!(render.contains("method.effect != AgentAuthMethodEffect::RequiresProviderProfile"));
         assert!(render.contains("method.kind != AgentAuthMethodKind::Environment"));
     }
@@ -18295,10 +18318,10 @@ mod tests {
             .map(|(body, _)| body)
             .expect("Agent account lifecycle should remain inspectable");
 
-        assert!(load.contains("ensure_default_auth_context(&agent_id)"));
+        assert!(load.contains("ensure_default_agent_auth_context("));
         assert!(!load.contains("list_auth_contexts()"));
         assert!(!load.contains("agent_auth_context_not_ready"));
-        assert!(load.contains("list_auth_methods("));
+        assert!(load.contains("list_agent_auth_methods("));
         assert!(render.contains("context.as_ref().map(|context| context.status)"));
         assert!(render.contains("shared with the external Agent CLI"));
         assert!(render.contains("context.account_hint.clone()"));

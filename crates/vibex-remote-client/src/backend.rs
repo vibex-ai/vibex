@@ -1218,6 +1218,60 @@ impl AgentBackend for WebRemoteBackend {
         })
     }
 
+    fn ensure_default_agent_auth_context(
+        &self,
+        request: MutationRequest<AgentId>,
+    ) -> BackendFuture<'_, AgentAuthContext> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteAgentRequest::EnsureDefaultAuthContext(
+                vibex_core::RemoteAgentEnsureDefaultAuthContextRequest {
+                    auth: this.auth(),
+                    agent_id: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentEnsureDefaultAuthContextResponse>(value)?.context)
+        })
+    }
+
+    fn refresh_agent_auth_methods(
+        &self,
+        request: MutationRequest<AgentId>,
+    ) -> BackendFuture<'_, AgentAuthCatalog> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteAgentRequest::RefreshAuthMethods(
+                vibex_core::RemoteAgentRefreshAuthMethodsRequest {
+                    auth: this.auth(),
+                    agent_id: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentRefreshAuthMethodsResponse>(value)?.catalog)
+        })
+    }
+
     fn list_agent_auth_methods(&self, agent_id: AgentId) -> BackendFuture<'_, AgentAuthCatalog> {
         let this = self.clone();
         Box::pin(async move {

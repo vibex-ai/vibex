@@ -996,6 +996,20 @@ impl RemoteAgentAuthContextSource for AgentAuthContextService {
         self.list_auth_methods(agent_id).await
     }
 
+    async fn ensure_default_auth_context(
+        &self,
+        agent_id: vibex_core::AgentId,
+    ) -> VibexResult<vibex_core::AgentAuthContext> {
+        self.ensure_default(&agent_id)
+    }
+
+    async fn refresh_auth_methods(
+        &self,
+        agent_id: vibex_core::AgentId,
+    ) -> VibexResult<vibex_core::AgentAuthCatalog> {
+        self.refresh_auth_methods(agent_id).await
+    }
+
     async fn authenticate_context(
         &self,
         request: AgentAuthContextAuthenticateRequest,

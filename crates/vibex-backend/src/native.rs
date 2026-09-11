@@ -457,6 +457,37 @@ impl AgentBackend for NativeBackend {
         })
     }
 
+    fn ensure_default_agent_auth_context(
+        &self,
+        request: MutationRequest<AgentId>,
+    ) -> BackendFuture<'_, AgentAuthContext> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .ensure_default_auth_context(&request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn refresh_agent_auth_methods(
+        &self,
+        request: MutationRequest<AgentId>,
+    ) -> BackendFuture<'_, AgentAuthCatalog> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .refresh_auth_methods(request.payload, None)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
     fn list_agent_auth_methods(&self, agent_id: AgentId) -> BackendFuture<'_, AgentAuthCatalog> {
         let runtime = self.runtime.clone();
         Box::pin(async move {

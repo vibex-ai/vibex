@@ -477,6 +477,8 @@ pub enum RemoteAgentOperationKind {
     ResolveOpaqueLocator,
     ListRuntimeOptions,
     ListAuthContexts,
+    EnsureDefaultAuthContext,
+    RefreshAuthMethods,
     ListAuthMethods,
     AuthenticateContext,
     GetAuthenticationOperation,
@@ -674,6 +676,37 @@ pub struct RemoteAgentRuntimeOptionsRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAgentRuntimeOptionsResponse {
     pub catalog: SessionRuntimeOptionCatalog,
+}
+
+/// Seeds the per-Agent authentication context if the authority has none.
+///
+/// The Config Center needs a context before it can show or change credentials,
+/// and the authority owns that row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentEnsureDefaultAuthContextRequest {
+    pub auth: RemoteAuthProof,
+    pub agent_id: AgentId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentEnsureDefaultAuthContextResponse {
+    pub context: AgentAuthContext,
+}
+
+/// Re-probes the authentication methods an Agent advertises.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentRefreshAuthMethodsRequest {
+    pub auth: RemoteAuthProof,
+    pub agent_id: AgentId,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentRefreshAuthMethodsResponse {
+    pub catalog: AgentAuthCatalog,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -999,6 +1032,8 @@ pub enum RemoteAgentRequest {
     ResolveOpaqueLocator(RemoteAgentDeepLinkResolveRequest),
     ListRuntimeOptions(RemoteAgentRuntimeOptionsRequest),
     ListAuthContexts(RemoteAgentAuthContextListRequest),
+    EnsureDefaultAuthContext(RemoteAgentEnsureDefaultAuthContextRequest),
+    RefreshAuthMethods(RemoteAgentRefreshAuthMethodsRequest),
     ListAuthMethods(RemoteAgentAuthMethodListRequest),
     AuthenticateContext(RemoteAgentAuthenticateContextRequest),
     GetAuthenticationOperation(RemoteAgentAuthenticationOperationRequest),
@@ -1044,6 +1079,8 @@ impl RemoteAgentRequest {
             Self::ResolveOpaqueLocator(_) => RemoteAgentOperationKind::ResolveOpaqueLocator,
             Self::ListRuntimeOptions(_) => RemoteAgentOperationKind::ListRuntimeOptions,
             Self::ListAuthContexts(_) => RemoteAgentOperationKind::ListAuthContexts,
+            Self::EnsureDefaultAuthContext(_) => RemoteAgentOperationKind::EnsureDefaultAuthContext,
+            Self::RefreshAuthMethods(_) => RemoteAgentOperationKind::RefreshAuthMethods,
             Self::ListAuthMethods(_) => RemoteAgentOperationKind::ListAuthMethods,
             Self::AuthenticateContext(_) => RemoteAgentOperationKind::AuthenticateContext,
             Self::GetAuthenticationOperation(_) => {

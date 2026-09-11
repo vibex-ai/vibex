@@ -2,12 +2,12 @@ use std::sync::Arc;
 
 use vibex_core::{
     AcpProviderCatalogListResponse, AcpProviderConfig, AcpProviderProfileUpdateRequest,
-    AgentCatalogListResponse, AgentListRequest, AgentListResponse,
-    AgentModelProviderDisplayOrderListRequest, AgentModelProviderDisplayOrderListResponse,
-    AgentModelProviderDisplayOrderSetRequest, AgentModelProviderDisplayOrderSetResponse,
-    AgentModelProviderProfileCreateRequest, AgentModelProviderProfileDeleteRequest,
-    AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
-    AgentModelProviderProfileSecretValueResponse,
+    AgentAuthCatalog, AgentAuthContext, AgentCatalogListResponse, AgentId, AgentListRequest,
+    AgentListResponse, AgentModelProviderDisplayOrderListRequest,
+    AgentModelProviderDisplayOrderListResponse, AgentModelProviderDisplayOrderSetRequest,
+    AgentModelProviderDisplayOrderSetResponse, AgentModelProviderProfileCreateRequest,
+    AgentModelProviderProfileDeleteRequest, AgentModelProviderProfileFetchModelsRequest,
+    AgentModelProviderProfileFetchModelsResponse, AgentModelProviderProfileSecretValueResponse,
     AgentModelProviderProfileSecretValueUpdateRequest, AgentModelProviderProfileTestRequest,
     AgentModelProviderProfileTestResult, AgentModelProviderProfileUpdateRequest, AgentSession,
     AgentSessionRuntimeSelectionState, AutomationGraph, AutomationGraphCreateRequest,
@@ -156,6 +156,20 @@ impl AgentBackend for DisconnectedBackend {
         &self,
         _request: MutationRequest<ResolveElicitationRequest>,
     ) -> BackendFuture<'_, TimelineItem> {
+        disconnected_future!()
+    }
+
+    fn ensure_default_agent_auth_context(
+        &self,
+        _request: MutationRequest<AgentId>,
+    ) -> BackendFuture<'_, AgentAuthContext> {
+        disconnected_future!()
+    }
+
+    fn refresh_agent_auth_methods(
+        &self,
+        _request: MutationRequest<AgentId>,
+    ) -> BackendFuture<'_, AgentAuthCatalog> {
         disconnected_future!()
     }
 

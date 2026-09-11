@@ -1490,11 +1490,25 @@ mod tests {
         }
     }
 
-    use vibex_core::ReplaceUserMessagePayload;
+    use vibex_core::{AgentAuthCatalog, AgentAuthContext, ReplaceUserMessagePayload};
 
     impl AgentBackend for MockAgentBackend {
         fn subscribe(&self) -> BackendResult<Box<dyn BackendEventSubscription>> {
             Err(BackendError::unsupported("mock", "mock"))
+        }
+
+        fn ensure_default_agent_auth_context(
+            &self,
+            _request: MutationRequest<AgentId>,
+        ) -> BackendFuture<'_, AgentAuthContext> {
+            Box::pin(async { Err(BackendError::unsupported("mock", "mock")) })
+        }
+
+        fn refresh_agent_auth_methods(
+            &self,
+            _request: MutationRequest<AgentId>,
+        ) -> BackendFuture<'_, AgentAuthCatalog> {
+            Box::pin(async { Err(BackendError::unsupported("mock", "mock")) })
         }
 
         fn list_sessions(&self, _include_archived: bool) -> BackendFuture<'_, Vec<AgentSession>> {

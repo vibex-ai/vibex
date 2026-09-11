@@ -186,6 +186,18 @@ pub trait AgentBackend: BackendBound {
         })
     }
 
+    /// Seeds the per-Agent authentication context when the authority has none.
+    fn ensure_default_agent_auth_context(
+        &self,
+        request: MutationRequest<AgentId>,
+    ) -> BackendFuture<'_, AgentAuthContext>;
+
+    /// Re-probes the authentication methods an Agent advertises.
+    fn refresh_agent_auth_methods(
+        &self,
+        request: MutationRequest<AgentId>,
+    ) -> BackendFuture<'_, AgentAuthCatalog>;
+
     fn authenticate_agent_context(
         &self,
         _request: MutationRequest<AgentAuthContextAuthenticateRequest>,

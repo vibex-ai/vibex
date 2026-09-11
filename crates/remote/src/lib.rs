@@ -172,6 +172,16 @@ pub trait RemoteAgentAuthContextSource: Send + Sync {
         agent_id: vibex_core::AgentId,
     ) -> VibexResult<vibex_core::AgentAuthCatalog>;
 
+    async fn ensure_default_auth_context(
+        &self,
+        agent_id: vibex_core::AgentId,
+    ) -> VibexResult<vibex_core::AgentAuthContext>;
+
+    async fn refresh_auth_methods(
+        &self,
+        agent_id: vibex_core::AgentId,
+    ) -> VibexResult<vibex_core::AgentAuthCatalog>;
+
     async fn authenticate_context(
         &self,
         request: vibex_core::AgentAuthContextAuthenticateRequest,
@@ -3644,6 +3654,68 @@ async fn dispatch_agent_request(
             serde_json::to_value(vibex_core::RemoteAgentAuthContextListResponse { contexts })
                 .map_err(remote_payload_encode_error)
         }
+        RemoteAgentRequest::EnsureDefaultAuthContext(request) => {
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentAuthentication,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let source = state.agent_auth_contexts.as_ref().ok_or_else(|| {
+                VibexError::capability(
+                    "remote_agent_account_auth_unavailable",
+                    "Agent account authentication is not available on this service",
+                )
+            })?;
+            let context = source
+                .ensure_default_auth_context(request.agent_id.clone())
+                .await?;
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentSession,
+                request.agent_id.as_str(),
+                "Agent auth context ensured",
+                true,
+                Some(request_id),
+                correlation_id,
+            )?;
+            serde_json::to_value(vibex_core::RemoteAgentEnsureDefaultAuthContextResponse {
+                context,
+            })
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::RefreshAuthMethods(request) => {
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentAuthentication,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let source = state.agent_auth_contexts.as_ref().ok_or_else(|| {
+                VibexError::capability(
+                    "remote_agent_account_auth_unavailable",
+                    "Agent account authentication is not available on this service",
+                )
+            })?;
+            let result = source.refresh_auth_methods(request.agent_id.clone()).await;
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentSession,
+                request.agent_id.as_str(),
+                "Agent auth methods refreshed",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            serde_json::to_value(vibex_core::RemoteAgentRefreshAuthMethodsResponse {
+                catalog: result?,
+            })
+            .map_err(remote_payload_encode_error)
+        }
         RemoteAgentRequest::ListAuthMethods(request) => {
             authorize_agent_action(
                 &manager,
@@ -5820,6 +5892,26 @@ mod tests {
                 supports_logout: true,
                 status: vibex_core::AgentAuthStatus::Authenticated,
                 refreshed_at_ms: 10,
+            })
+        }
+
+        async fn ensure_default_auth_context(
+            &self,
+            _agent_id: AgentId,
+        ) -> VibexResult<vibex_core::AgentAuthContext> {
+            Ok(self.context.clone())
+        }
+
+        async fn refresh_auth_methods(
+            &self,
+            agent_id: AgentId,
+        ) -> VibexResult<vibex_core::AgentAuthCatalog> {
+            Ok(vibex_core::AgentAuthCatalog {
+                agent_id,
+                methods: Vec::new(),
+                supports_logout: true,
+                status: vibex_core::AgentAuthStatus::Authenticated,
+                refreshed_at_ms: 11,
             })
         }
 
