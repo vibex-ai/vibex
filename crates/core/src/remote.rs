@@ -39,14 +39,20 @@ use crate::ids::{
     RuntimeProcessId, TerminalId, VibexSessionId,
 };
 use crate::provider::{
-    McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest, McpServerCreateRequest,
-    McpServerDeleteRequest, McpServerDiscoverRequest, McpServerDiscoveryResponse,
-    McpServerImportRequest, McpServerImportResult, McpServerSetAgentMatrixRequest,
-    McpServerUpdateRequest, McpServerValidateRequest, McpServerValidationResult,
-    ProviderCapabilitySummary, ProviderFailoverRecommendation,
-    ProviderFailoverRecommendationRequest, ProviderHealthSummary, ProviderInjectionPreview,
-    ProviderInjectionPreviewRequest, ProviderProfileSummary, ProviderRunHealthProbesRequest,
-    ProviderRunHealthProbesResult, ProviderUsageListRequest, ProviderUsageSummary,
+    Hook, HookCreateRequest, HookDeleteRequest, HookInstallPreview, HookInstallPreviewRequest,
+    HookUpdateRequest, McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest,
+    McpServerCreateRequest, McpServerDeleteRequest, McpServerDiscoverRequest,
+    McpServerDiscoveryResponse, McpServerImportRequest, McpServerImportResult,
+    McpServerSetAgentMatrixRequest, McpServerUpdateRequest, McpServerValidateRequest,
+    McpServerValidationResult, Prompt, PromptCreateRequest, PromptDeleteRequest,
+    PromptUpdateRequest, PromptValidateRequest, PromptValidationResult, ProviderCapabilitySummary,
+    ProviderFailoverRecommendation, ProviderFailoverRecommendationRequest, ProviderHealthSummary,
+    ProviderInjectionPreview, ProviderInjectionPreviewRequest, ProviderProfileSummary,
+    ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, ProviderUsageListRequest,
+    ProviderUsageSummary, Skill, SkillAgentMatrix, SkillAgentMatrixListRequest, SkillCreateRequest,
+    SkillDeleteRequest, SkillDiscoverRequest, SkillDiscoveryResponse, SkillImportRequest,
+    SkillImportResult, SkillSetAgentMatrixRequest, SkillUpdateRequest, SkillValidateRequest,
+    SkillValidationResult,
 };
 use crate::provider_projection::{
     AgentProviderProjectionCapability, AgentProviderProjectionCapabilityRequest,
@@ -1594,6 +1600,25 @@ pub enum RemoteProviderOperationKind {
     DiscoverMcpSources,
     ImportMcpServers,
     ValidateMcpServer,
+    SkillList,
+    SkillCreate,
+    SkillUpdate,
+    SkillDelete,
+    SkillAgentMatrixSet,
+    SkillAgentMatrixList,
+    SkillDiscover,
+    SkillImport,
+    SkillValidate,
+    PromptList,
+    PromptCreate,
+    PromptUpdate,
+    PromptDelete,
+    PromptValidate,
+    HookList,
+    HookCreate,
+    HookUpdate,
+    HookDelete,
+    HookPreviewInstall,
 }
 
 /// Redacted Agent configuration state for remote management surfaces. Command
@@ -2026,6 +2051,250 @@ pub struct RemoteAgentModelProviderDefaultRequest {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RemoteProviderSkillListRequest {
+    pub auth: RemoteAuthProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderSkillListResponse {
+    pub skills: Vec<Skill>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderSkillCreateRequest {
+    pub auth: RemoteAuthProof,
+    pub request: SkillCreateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderSkillCreateResponse {
+    pub skill: Skill,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderSkillUpdateRequest {
+    pub auth: RemoteAuthProof,
+    pub request: SkillUpdateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderSkillUpdateResponse {
+    pub skill: Skill,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderSkillDeleteRequest {
+    pub auth: RemoteAuthProof,
+    pub request: SkillDeleteRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderSkillDeleteResponse {
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderSkillAgentMatrixSetRequest {
+    pub auth: RemoteAuthProof,
+    pub request: SkillSetAgentMatrixRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderSkillAgentMatrixSetResponse {
+    pub skill: Skill,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderSkillAgentMatrixListRequest {
+    pub auth: RemoteAuthProof,
+    pub request: SkillAgentMatrixListRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderSkillAgentMatrixListResponse {
+    pub matrix: Vec<SkillAgentMatrix>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderSkillDiscoverRequest {
+    pub auth: RemoteAuthProof,
+    pub request: SkillDiscoverRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderSkillDiscoverResponse {
+    pub discovery: SkillDiscoveryResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderSkillImportRequest {
+    pub auth: RemoteAuthProof,
+    pub request: SkillImportRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderSkillImportResponse {
+    pub result: SkillImportResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderSkillValidateRequest {
+    pub auth: RemoteAuthProof,
+    pub request: SkillValidateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderSkillValidateResponse {
+    pub result: SkillValidationResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderPromptListRequest {
+    pub auth: RemoteAuthProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderPromptListResponse {
+    pub prompts: Vec<Prompt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderPromptCreateRequest {
+    pub auth: RemoteAuthProof,
+    pub request: PromptCreateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderPromptCreateResponse {
+    pub prompt: Prompt,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderPromptUpdateRequest {
+    pub auth: RemoteAuthProof,
+    pub request: PromptUpdateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderPromptUpdateResponse {
+    pub prompt: Prompt,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderPromptDeleteRequest {
+    pub auth: RemoteAuthProof,
+    pub request: PromptDeleteRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderPromptDeleteResponse {
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderPromptValidateRequest {
+    pub auth: RemoteAuthProof,
+    pub request: PromptValidateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderPromptValidateResponse {
+    pub result: PromptValidationResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderHookListRequest {
+    pub auth: RemoteAuthProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderHookListResponse {
+    pub hooks: Vec<Hook>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderHookCreateRequest {
+    pub auth: RemoteAuthProof,
+    pub request: HookCreateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderHookCreateResponse {
+    pub hook: Hook,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderHookUpdateRequest {
+    pub auth: RemoteAuthProof,
+    pub request: HookUpdateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderHookUpdateResponse {
+    pub hook: Hook,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderHookDeleteRequest {
+    pub auth: RemoteAuthProof,
+    pub request: HookDeleteRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderHookDeleteResponse {
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderHookPreviewInstallRequest {
+    pub auth: RemoteAuthProof,
+    pub request: HookInstallPreviewRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderHookPreviewInstallResponse {
+    pub preview: HookInstallPreview,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RemoteProviderMcpListRequest {
     pub auth: RemoteAuthProof,
 }
@@ -2270,6 +2539,25 @@ pub enum RemoteProviderRequest {
     DiscoverMcpSources(RemoteProviderMcpDiscoverRequest),
     ImportMcpServers(RemoteProviderMcpImportRequest),
     ValidateMcpServer(RemoteProviderMcpValidateRequest),
+    SkillList(RemoteProviderSkillListRequest),
+    SkillCreate(RemoteProviderSkillCreateRequest),
+    SkillUpdate(RemoteProviderSkillUpdateRequest),
+    SkillDelete(RemoteProviderSkillDeleteRequest),
+    SkillAgentMatrixSet(RemoteProviderSkillAgentMatrixSetRequest),
+    SkillAgentMatrixList(RemoteProviderSkillAgentMatrixListRequest),
+    SkillDiscover(RemoteProviderSkillDiscoverRequest),
+    SkillImport(RemoteProviderSkillImportRequest),
+    SkillValidate(RemoteProviderSkillValidateRequest),
+    PromptList(RemoteProviderPromptListRequest),
+    PromptCreate(RemoteProviderPromptCreateRequest),
+    PromptUpdate(RemoteProviderPromptUpdateRequest),
+    PromptDelete(RemoteProviderPromptDeleteRequest),
+    PromptValidate(RemoteProviderPromptValidateRequest),
+    HookList(RemoteProviderHookListRequest),
+    HookCreate(RemoteProviderHookCreateRequest),
+    HookUpdate(RemoteProviderHookUpdateRequest),
+    HookDelete(RemoteProviderHookDeleteRequest),
+    HookPreviewInstall(RemoteProviderHookPreviewInstallRequest),
 }
 
 impl RemoteProviderRequest {
@@ -2379,6 +2667,25 @@ impl RemoteProviderRequest {
             Self::DiscoverMcpSources(_) => RemoteProviderOperationKind::DiscoverMcpSources,
             Self::ImportMcpServers(_) => RemoteProviderOperationKind::ImportMcpServers,
             Self::ValidateMcpServer(_) => RemoteProviderOperationKind::ValidateMcpServer,
+            Self::SkillList(_) => RemoteProviderOperationKind::SkillList,
+            Self::SkillCreate(_) => RemoteProviderOperationKind::SkillCreate,
+            Self::SkillUpdate(_) => RemoteProviderOperationKind::SkillUpdate,
+            Self::SkillDelete(_) => RemoteProviderOperationKind::SkillDelete,
+            Self::SkillAgentMatrixSet(_) => RemoteProviderOperationKind::SkillAgentMatrixSet,
+            Self::SkillAgentMatrixList(_) => RemoteProviderOperationKind::SkillAgentMatrixList,
+            Self::SkillDiscover(_) => RemoteProviderOperationKind::SkillDiscover,
+            Self::SkillImport(_) => RemoteProviderOperationKind::SkillImport,
+            Self::SkillValidate(_) => RemoteProviderOperationKind::SkillValidate,
+            Self::PromptList(_) => RemoteProviderOperationKind::PromptList,
+            Self::PromptCreate(_) => RemoteProviderOperationKind::PromptCreate,
+            Self::PromptUpdate(_) => RemoteProviderOperationKind::PromptUpdate,
+            Self::PromptDelete(_) => RemoteProviderOperationKind::PromptDelete,
+            Self::PromptValidate(_) => RemoteProviderOperationKind::PromptValidate,
+            Self::HookList(_) => RemoteProviderOperationKind::HookList,
+            Self::HookCreate(_) => RemoteProviderOperationKind::HookCreate,
+            Self::HookUpdate(_) => RemoteProviderOperationKind::HookUpdate,
+            Self::HookDelete(_) => RemoteProviderOperationKind::HookDelete,
+            Self::HookPreviewInstall(_) => RemoteProviderOperationKind::HookPreviewInstall,
         }
     }
 }

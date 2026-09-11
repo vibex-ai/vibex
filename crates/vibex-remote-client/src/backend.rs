@@ -3560,6 +3560,484 @@ impl ManagementBackend for WebRemoteBackend {
         })
     }
 
+    fn skills(&self) -> BackendFuture<'_, Vec<vibex_core::Skill>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload =
+                RemoteProviderRequest::SkillList(vibex_core::RemoteProviderSkillListRequest {
+                    auth: this.auth(),
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderSkillListResponse>(value)?.skills)
+        })
+    }
+
+    fn create_skill(
+        &self,
+        request: MutationRequest<vibex_core::SkillCreateRequest>,
+    ) -> BackendFuture<'_, vibex_core::Skill> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload =
+                RemoteProviderRequest::SkillCreate(vibex_core::RemoteProviderSkillCreateRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderSkillCreateResponse>(value)?.skill)
+        })
+    }
+
+    fn update_skill(
+        &self,
+        request: MutationRequest<vibex_core::SkillUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::Skill> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload =
+                RemoteProviderRequest::SkillUpdate(vibex_core::RemoteProviderSkillUpdateRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderSkillUpdateResponse>(value)?.skill)
+        })
+    }
+
+    fn delete_skill(
+        &self,
+        request: MutationRequest<vibex_core::SkillDeleteRequest>,
+    ) -> BackendFuture<'_, ()> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload =
+                RemoteProviderRequest::SkillDelete(vibex_core::RemoteProviderSkillDeleteRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            let _ = value;
+            Ok(())
+        })
+    }
+
+    fn set_skill_agent_matrix(
+        &self,
+        request: MutationRequest<vibex_core::SkillSetAgentMatrixRequest>,
+    ) -> BackendFuture<'_, vibex_core::Skill> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::SkillAgentMatrixSet(
+                vibex_core::RemoteProviderSkillAgentMatrixSetRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderSkillAgentMatrixSetResponse>(value)?.skill)
+        })
+    }
+
+    fn skill_agent_matrix(
+        &self,
+        request: vibex_core::SkillAgentMatrixListRequest,
+    ) -> BackendFuture<'_, Vec<vibex_core::SkillAgentMatrix>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::SkillAgentMatrixList(
+                vibex_core::RemoteProviderSkillAgentMatrixListRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderSkillAgentMatrixListResponse>(value)?.matrix)
+        })
+    }
+
+    fn discover_skill_sources(
+        &self,
+        request: vibex_core::SkillDiscoverRequest,
+    ) -> BackendFuture<'_, vibex_core::SkillDiscoveryResponse> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::SkillDiscover(
+                vibex_core::RemoteProviderSkillDiscoverRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderSkillDiscoverResponse>(value)?.discovery)
+        })
+    }
+
+    fn import_skills(
+        &self,
+        request: MutationRequest<vibex_core::SkillImportRequest>,
+    ) -> BackendFuture<'_, vibex_core::SkillImportResult> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload =
+                RemoteProviderRequest::SkillImport(vibex_core::RemoteProviderSkillImportRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderSkillImportResponse>(value)?.result)
+        })
+    }
+
+    fn validate_skill(
+        &self,
+        request: vibex_core::SkillValidateRequest,
+    ) -> BackendFuture<'_, vibex_core::SkillValidationResult> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::SkillValidate(
+                vibex_core::RemoteProviderSkillValidateRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderSkillValidateResponse>(value)?.result)
+        })
+    }
+
+    fn prompts(&self) -> BackendFuture<'_, Vec<vibex_core::Prompt>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload =
+                RemoteProviderRequest::PromptList(vibex_core::RemoteProviderPromptListRequest {
+                    auth: this.auth(),
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderPromptListResponse>(value)?.prompts)
+        })
+    }
+
+    fn create_prompt(
+        &self,
+        request: MutationRequest<vibex_core::PromptCreateRequest>,
+    ) -> BackendFuture<'_, vibex_core::Prompt> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::PromptCreate(
+                vibex_core::RemoteProviderPromptCreateRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderPromptCreateResponse>(value)?.prompt)
+        })
+    }
+
+    fn update_prompt(
+        &self,
+        request: MutationRequest<vibex_core::PromptUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::Prompt> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::PromptUpdate(
+                vibex_core::RemoteProviderPromptUpdateRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderPromptUpdateResponse>(value)?.prompt)
+        })
+    }
+
+    fn delete_prompt(
+        &self,
+        request: MutationRequest<vibex_core::PromptDeleteRequest>,
+    ) -> BackendFuture<'_, ()> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::PromptDelete(
+                vibex_core::RemoteProviderPromptDeleteRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            let _ = value;
+            Ok(())
+        })
+    }
+
+    fn validate_prompt(
+        &self,
+        request: vibex_core::PromptValidateRequest,
+    ) -> BackendFuture<'_, vibex_core::PromptValidationResult> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::PromptValidate(
+                vibex_core::RemoteProviderPromptValidateRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderPromptValidateResponse>(value)?.result)
+        })
+    }
+
+    fn hooks(&self) -> BackendFuture<'_, Vec<vibex_core::Hook>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload =
+                RemoteProviderRequest::HookList(vibex_core::RemoteProviderHookListRequest {
+                    auth: this.auth(),
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderHookListResponse>(value)?.hooks)
+        })
+    }
+
+    fn create_hook(
+        &self,
+        request: MutationRequest<vibex_core::HookCreateRequest>,
+    ) -> BackendFuture<'_, vibex_core::Hook> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload =
+                RemoteProviderRequest::HookCreate(vibex_core::RemoteProviderHookCreateRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderHookCreateResponse>(value)?.hook)
+        })
+    }
+
+    fn update_hook(
+        &self,
+        request: MutationRequest<vibex_core::HookUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::Hook> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload =
+                RemoteProviderRequest::HookUpdate(vibex_core::RemoteProviderHookUpdateRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderHookUpdateResponse>(value)?.hook)
+        })
+    }
+
+    fn delete_hook(
+        &self,
+        request: MutationRequest<vibex_core::HookDeleteRequest>,
+    ) -> BackendFuture<'_, ()> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload =
+                RemoteProviderRequest::HookDelete(vibex_core::RemoteProviderHookDeleteRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            let _ = value;
+            Ok(())
+        })
+    }
+
+    fn preview_hook_install(
+        &self,
+        request: vibex_core::HookInstallPreviewRequest,
+    ) -> BackendFuture<'_, vibex_core::HookInstallPreview> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::HookPreviewInstall(
+                vibex_core::RemoteProviderHookPreviewInstallRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderHookPreviewInstallResponse>(value)?.preview)
+        })
+    }
+
     fn relay_status(&self) -> BackendFuture<'_, RelayStatusSummary> {
         self.unsupported(
             "remote_relay_status_unavailable",
@@ -4005,6 +4483,30 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
                 ),
                 (
                     BackendOperation::ManagementMcpMutate,
+                    has_provider_management && permits(RemoteActionClass::MutateProviderSettings),
+                ),
+                (
+                    BackendOperation::ManagementSkillsRead,
+                    permits(RemoteActionClass::ReadProviderSettings),
+                ),
+                (
+                    BackendOperation::ManagementSkillsMutate,
+                    has_provider_management && permits(RemoteActionClass::MutateProviderSettings),
+                ),
+                (
+                    BackendOperation::ManagementPromptsRead,
+                    permits(RemoteActionClass::ReadProviderSettings),
+                ),
+                (
+                    BackendOperation::ManagementPromptsMutate,
+                    has_provider_management && permits(RemoteActionClass::MutateProviderSettings),
+                ),
+                (
+                    BackendOperation::ManagementHooksRead,
+                    permits(RemoteActionClass::ReadProviderSettings),
+                ),
+                (
+                    BackendOperation::ManagementHooksMutate,
                     has_provider_management && permits(RemoteActionClass::MutateProviderSettings),
                 ),
                 (

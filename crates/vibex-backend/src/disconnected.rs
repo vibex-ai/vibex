@@ -18,20 +18,25 @@ use vibex_core::{
     GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
     GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeOperationRecord,
     GitWorktreeOperationRequest, GitWorktreeReadinessRecord, GitWorktreeReadinessRequest,
-    GitWorktreeRestoreRequest, McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest,
-    McpServerCreateRequest, McpServerDeleteRequest, McpServerDiscoverRequest,
-    McpServerDiscoveryResponse, McpServerImportRequest, McpServerImportResult,
-    McpServerSetAgentMatrixRequest, McpServerUpdateRequest, McpServerValidateRequest,
-    McpServerValidationResult, OpenWorkspaceRequest, ProjectId, ProviderCapabilitySummary,
-    ProviderHealthSummary, ProviderProfileSummary, ProviderRunCapabilityProbesRequest,
-    ProviderRunCapabilityProbesResult, ProviderRunHealthProbesRequest,
-    ProviderRunHealthProbesResult, RemoteAuditListRequest, RemoteAuditRecord,
-    RemoteCancelPairingOfferRequest, RemoteCreatePairingCodeRequest,
+    GitWorktreeRestoreRequest, Hook, HookCreateRequest, HookDeleteRequest, HookInstallPreview,
+    HookInstallPreviewRequest, HookUpdateRequest, McpServer, McpServerAgentMatrix,
+    McpServerAgentMatrixListRequest, McpServerCreateRequest, McpServerDeleteRequest,
+    McpServerDiscoverRequest, McpServerDiscoveryResponse, McpServerImportRequest,
+    McpServerImportResult, McpServerSetAgentMatrixRequest, McpServerUpdateRequest,
+    McpServerValidateRequest, McpServerValidationResult, OpenWorkspaceRequest, ProjectId, Prompt,
+    PromptCreateRequest, PromptDeleteRequest, PromptUpdateRequest, PromptValidateRequest,
+    PromptValidationResult, ProviderCapabilitySummary, ProviderHealthSummary,
+    ProviderProfileSummary, ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
+    ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, RemoteAuditListRequest,
+    RemoteAuditRecord, RemoteCancelPairingOfferRequest, RemoteCreatePairingCodeRequest,
     RemoteCreatePairingCodeResponse, RemoteCreatePairingOfferRequest,
     RemoteCreatePairingOfferResponse, RemoteDeviceDetail, RemotePairingOfferSummary,
     RemoteRevokeDeviceRequest, RenameAgentSessionRequest, ReplaceUserMessagePayload,
     ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest,
-    SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest,
+    SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, Skill, SkillAgentMatrix,
+    SkillAgentMatrixListRequest, SkillCreateRequest, SkillDeleteRequest, SkillDiscoverRequest,
+    SkillDiscoveryResponse, SkillImportRequest, SkillImportResult, SkillSetAgentMatrixRequest,
+    SkillUpdateRequest, SkillValidateRequest, SkillValidationResult, TerminalCreateRequest,
     TerminalId, TerminalResizeRequest, TerminalSession, TerminalSnapshot, TerminalWriteRequest,
     TimelineItem, TimelinePage, VibexSessionId, WorkspaceId,
 };
@@ -661,6 +666,118 @@ impl ManagementBackend for DisconnectedBackend {
         &self,
         _request: MutationRequest<ProviderRunHealthProbesRequest>,
     ) -> BackendFuture<'_, ProviderRunHealthProbesResult> {
+        disconnected_future!()
+    }
+
+    fn skills(&self) -> BackendFuture<'_, Vec<Skill>> {
+        disconnected_future!()
+    }
+
+    fn create_skill(
+        &self,
+        _request: MutationRequest<SkillCreateRequest>,
+    ) -> BackendFuture<'_, Skill> {
+        disconnected_future!()
+    }
+
+    fn update_skill(
+        &self,
+        _request: MutationRequest<SkillUpdateRequest>,
+    ) -> BackendFuture<'_, Skill> {
+        disconnected_future!()
+    }
+
+    fn delete_skill(&self, _request: MutationRequest<SkillDeleteRequest>) -> BackendFuture<'_, ()> {
+        disconnected_future!()
+    }
+
+    fn set_skill_agent_matrix(
+        &self,
+        _request: MutationRequest<SkillSetAgentMatrixRequest>,
+    ) -> BackendFuture<'_, Skill> {
+        disconnected_future!()
+    }
+
+    fn skill_agent_matrix(
+        &self,
+        _request: SkillAgentMatrixListRequest,
+    ) -> BackendFuture<'_, Vec<SkillAgentMatrix>> {
+        disconnected_future!()
+    }
+
+    fn discover_skill_sources(
+        &self,
+        _request: SkillDiscoverRequest,
+    ) -> BackendFuture<'_, SkillDiscoveryResponse> {
+        disconnected_future!()
+    }
+
+    fn import_skills(
+        &self,
+        _request: MutationRequest<SkillImportRequest>,
+    ) -> BackendFuture<'_, SkillImportResult> {
+        disconnected_future!()
+    }
+
+    fn validate_skill(
+        &self,
+        _request: SkillValidateRequest,
+    ) -> BackendFuture<'_, SkillValidationResult> {
+        disconnected_future!()
+    }
+
+    fn prompts(&self) -> BackendFuture<'_, Vec<Prompt>> {
+        disconnected_future!()
+    }
+
+    fn create_prompt(
+        &self,
+        _request: MutationRequest<PromptCreateRequest>,
+    ) -> BackendFuture<'_, Prompt> {
+        disconnected_future!()
+    }
+
+    fn update_prompt(
+        &self,
+        _request: MutationRequest<PromptUpdateRequest>,
+    ) -> BackendFuture<'_, Prompt> {
+        disconnected_future!()
+    }
+
+    fn delete_prompt(
+        &self,
+        _request: MutationRequest<PromptDeleteRequest>,
+    ) -> BackendFuture<'_, ()> {
+        disconnected_future!()
+    }
+
+    fn validate_prompt(
+        &self,
+        _request: PromptValidateRequest,
+    ) -> BackendFuture<'_, PromptValidationResult> {
+        disconnected_future!()
+    }
+
+    fn hooks(&self) -> BackendFuture<'_, Vec<Hook>> {
+        disconnected_future!()
+    }
+
+    fn create_hook(&self, _request: MutationRequest<HookCreateRequest>) -> BackendFuture<'_, Hook> {
+        disconnected_future!()
+    }
+
+    fn update_hook(&self, _request: MutationRequest<HookUpdateRequest>) -> BackendFuture<'_, Hook> {
+        disconnected_future!()
+    }
+
+    fn delete_hook(&self, _request: MutationRequest<HookDeleteRequest>) -> BackendFuture<'_, ()> {
+        disconnected_future!()
+    }
+
+    fn preview_hook_install(
+        &self,
+        _request: HookInstallPreviewRequest,
+    ) -> BackendFuture<'_, HookInstallPreview> {
         disconnected_future!()
     }
 

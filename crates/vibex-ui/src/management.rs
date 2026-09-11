@@ -1476,6 +1476,130 @@ mod tests {
         ) -> BackendFuture<'_, McpServerValidationResult> {
             error_future()
         }
+
+        fn skills(&self) -> BackendFuture<'_, Vec<vibex_core::Skill>> {
+            error_future()
+        }
+
+        fn create_skill(
+            &self,
+            _request: MutationRequest<vibex_core::SkillCreateRequest>,
+        ) -> BackendFuture<'_, vibex_core::Skill> {
+            error_future()
+        }
+
+        fn update_skill(
+            &self,
+            _request: MutationRequest<vibex_core::SkillUpdateRequest>,
+        ) -> BackendFuture<'_, vibex_core::Skill> {
+            error_future()
+        }
+
+        fn delete_skill(
+            &self,
+            _request: MutationRequest<vibex_core::SkillDeleteRequest>,
+        ) -> BackendFuture<'_, ()> {
+            error_future()
+        }
+
+        fn set_skill_agent_matrix(
+            &self,
+            _request: MutationRequest<vibex_core::SkillSetAgentMatrixRequest>,
+        ) -> BackendFuture<'_, vibex_core::Skill> {
+            error_future()
+        }
+
+        fn skill_agent_matrix(
+            &self,
+            _request: vibex_core::SkillAgentMatrixListRequest,
+        ) -> BackendFuture<'_, Vec<vibex_core::SkillAgentMatrix>> {
+            error_future()
+        }
+
+        fn discover_skill_sources(
+            &self,
+            _request: vibex_core::SkillDiscoverRequest,
+        ) -> BackendFuture<'_, vibex_core::SkillDiscoveryResponse> {
+            error_future()
+        }
+
+        fn import_skills(
+            &self,
+            _request: MutationRequest<vibex_core::SkillImportRequest>,
+        ) -> BackendFuture<'_, vibex_core::SkillImportResult> {
+            error_future()
+        }
+
+        fn validate_skill(
+            &self,
+            _request: vibex_core::SkillValidateRequest,
+        ) -> BackendFuture<'_, vibex_core::SkillValidationResult> {
+            error_future()
+        }
+
+        fn prompts(&self) -> BackendFuture<'_, Vec<vibex_core::Prompt>> {
+            error_future()
+        }
+
+        fn create_prompt(
+            &self,
+            _request: MutationRequest<vibex_core::PromptCreateRequest>,
+        ) -> BackendFuture<'_, vibex_core::Prompt> {
+            error_future()
+        }
+
+        fn update_prompt(
+            &self,
+            _request: MutationRequest<vibex_core::PromptUpdateRequest>,
+        ) -> BackendFuture<'_, vibex_core::Prompt> {
+            error_future()
+        }
+
+        fn delete_prompt(
+            &self,
+            _request: MutationRequest<vibex_core::PromptDeleteRequest>,
+        ) -> BackendFuture<'_, ()> {
+            error_future()
+        }
+
+        fn validate_prompt(
+            &self,
+            _request: vibex_core::PromptValidateRequest,
+        ) -> BackendFuture<'_, vibex_core::PromptValidationResult> {
+            error_future()
+        }
+
+        fn hooks(&self) -> BackendFuture<'_, Vec<vibex_core::Hook>> {
+            error_future()
+        }
+
+        fn create_hook(
+            &self,
+            _request: MutationRequest<vibex_core::HookCreateRequest>,
+        ) -> BackendFuture<'_, vibex_core::Hook> {
+            error_future()
+        }
+
+        fn update_hook(
+            &self,
+            _request: MutationRequest<vibex_core::HookUpdateRequest>,
+        ) -> BackendFuture<'_, vibex_core::Hook> {
+            error_future()
+        }
+
+        fn delete_hook(
+            &self,
+            _request: MutationRequest<vibex_core::HookDeleteRequest>,
+        ) -> BackendFuture<'_, ()> {
+            error_future()
+        }
+
+        fn preview_hook_install(
+            &self,
+            _request: vibex_core::HookInstallPreviewRequest,
+        ) -> BackendFuture<'_, vibex_core::HookInstallPreview> {
+            error_future()
+        }
     }
 
     struct UnsupportedDeviceBackend;

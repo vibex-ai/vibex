@@ -12,15 +12,21 @@ use vibex_core::{
     AgentRuntimeProbeCancelRequest, AgentRuntimeProbeListRequest, AgentRuntimeProbeRecord,
     AgentRuntimeProbeStartRequest, AgentRuntimeProfile, AgentRuntimeProfileCreateRequest,
     AgentRuntimeProfileUpdateRequest, AgentSnapshotEntry, CustomAgentCreateRequest,
-    CustomAgentDeleteRequest, McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest,
-    McpServerCreateRequest, McpServerDeleteRequest, McpServerDiscoverRequest,
-    McpServerDiscoveryResponse, McpServerImportRequest, McpServerImportResult,
-    McpServerSetAgentMatrixRequest, McpServerUpdateRequest, McpServerValidateRequest,
-    McpServerValidationResult, ModelProviderProfile, ModelProviderProfileCreateRequest,
-    ModelProviderProfileUpdateRequest, ProviderCapabilitySummary,
-    ProviderCredentialSecretMutationRequest, ProviderHealthSummary, ProviderProfileId,
-    ProviderProfileSummary, ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
-    ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, RelayPeerId, RelayRoomId,
+    CustomAgentDeleteRequest, Hook, HookCreateRequest, HookDeleteRequest, HookInstallPreview,
+    HookInstallPreviewRequest, HookUpdateRequest, McpServer, McpServerAgentMatrix,
+    McpServerAgentMatrixListRequest, McpServerCreateRequest, McpServerDeleteRequest,
+    McpServerDiscoverRequest, McpServerDiscoveryResponse, McpServerImportRequest,
+    McpServerImportResult, McpServerSetAgentMatrixRequest, McpServerUpdateRequest,
+    McpServerValidateRequest, McpServerValidationResult, ModelProviderProfile,
+    ModelProviderProfileCreateRequest, ModelProviderProfileUpdateRequest, Prompt,
+    PromptCreateRequest, PromptDeleteRequest, PromptUpdateRequest, PromptValidateRequest,
+    PromptValidationResult, ProviderCapabilitySummary, ProviderCredentialSecretMutationRequest,
+    ProviderHealthSummary, ProviderProfileId, ProviderProfileSummary,
+    ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
+    ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, RelayPeerId, RelayRoomId, Skill,
+    SkillAgentMatrix, SkillAgentMatrixListRequest, SkillCreateRequest, SkillDeleteRequest,
+    SkillDiscoverRequest, SkillDiscoveryResponse, SkillImportRequest, SkillImportResult,
+    SkillSetAgentMatrixRequest, SkillUpdateRequest, SkillValidateRequest, SkillValidationResult,
 };
 
 use crate::{BackendBound, BackendFuture, MutationRequest};
@@ -238,4 +244,76 @@ pub trait ManagementBackend: BackendBound {
         &self,
         request: McpServerValidateRequest,
     ) -> BackendFuture<'_, McpServerValidationResult>;
+
+    fn skills(&self) -> BackendFuture<'_, Vec<Skill>>;
+
+    fn create_skill(
+        &self,
+        request: MutationRequest<SkillCreateRequest>,
+    ) -> BackendFuture<'_, Skill>;
+
+    fn update_skill(
+        &self,
+        request: MutationRequest<SkillUpdateRequest>,
+    ) -> BackendFuture<'_, Skill>;
+
+    fn delete_skill(&self, request: MutationRequest<SkillDeleteRequest>) -> BackendFuture<'_, ()>;
+
+    fn set_skill_agent_matrix(
+        &self,
+        request: MutationRequest<SkillSetAgentMatrixRequest>,
+    ) -> BackendFuture<'_, Skill>;
+
+    fn skill_agent_matrix(
+        &self,
+        request: SkillAgentMatrixListRequest,
+    ) -> BackendFuture<'_, Vec<SkillAgentMatrix>>;
+
+    fn discover_skill_sources(
+        &self,
+        request: SkillDiscoverRequest,
+    ) -> BackendFuture<'_, SkillDiscoveryResponse>;
+
+    fn import_skills(
+        &self,
+        request: MutationRequest<SkillImportRequest>,
+    ) -> BackendFuture<'_, SkillImportResult>;
+
+    fn validate_skill(
+        &self,
+        request: SkillValidateRequest,
+    ) -> BackendFuture<'_, SkillValidationResult>;
+
+    fn prompts(&self) -> BackendFuture<'_, Vec<Prompt>>;
+
+    fn create_prompt(
+        &self,
+        request: MutationRequest<PromptCreateRequest>,
+    ) -> BackendFuture<'_, Prompt>;
+
+    fn update_prompt(
+        &self,
+        request: MutationRequest<PromptUpdateRequest>,
+    ) -> BackendFuture<'_, Prompt>;
+
+    fn delete_prompt(&self, request: MutationRequest<PromptDeleteRequest>)
+    -> BackendFuture<'_, ()>;
+
+    fn validate_prompt(
+        &self,
+        request: PromptValidateRequest,
+    ) -> BackendFuture<'_, PromptValidationResult>;
+
+    fn hooks(&self) -> BackendFuture<'_, Vec<Hook>>;
+
+    fn create_hook(&self, request: MutationRequest<HookCreateRequest>) -> BackendFuture<'_, Hook>;
+
+    fn update_hook(&self, request: MutationRequest<HookUpdateRequest>) -> BackendFuture<'_, Hook>;
+
+    fn delete_hook(&self, request: MutationRequest<HookDeleteRequest>) -> BackendFuture<'_, ()>;
+
+    fn preview_hook_install(
+        &self,
+        request: HookInstallPreviewRequest,
+    ) -> BackendFuture<'_, HookInstallPreview>;
 }

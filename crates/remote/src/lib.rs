@@ -2161,6 +2161,352 @@ async fn dispatch_provider_request(
             serde_json::to_value(vibex_core::RemoteProviderMcpValidateResponse { result })
                 .map_err(remote_payload_encode_error)
         }
+        RemoteProviderRequest::SkillList(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = service.list_skills()?;
+            serde_json::to_value(vibex_core::RemoteProviderSkillListResponse { skills: value })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::SkillCreate(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = service.create_skill(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "skill".to_string(),
+                "Skill created from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = result?;
+            serde_json::to_value(vibex_core::RemoteProviderSkillCreateResponse { skill: value })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::SkillUpdate(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = service.update_skill(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "skill".to_string(),
+                "Skill updated from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = result?;
+            serde_json::to_value(vibex_core::RemoteProviderSkillUpdateResponse { skill: value })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::SkillDelete(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = service.delete_skill(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "skill".to_string(),
+                "Skill deleted from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            result?;
+            serde_json::to_value(vibex_core::RemoteProviderSkillDeleteResponse { deleted: true })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::SkillAgentMatrixSet(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = service.set_skill_agent_matrix(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "skill".to_string(),
+                "Skill Agent matrix updated from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = result?;
+            serde_json::to_value(vibex_core::RemoteProviderSkillAgentMatrixSetResponse {
+                skill: value,
+            })
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::SkillAgentMatrixList(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = service.list_skill_agent_matrix(request.request)?;
+            serde_json::to_value(vibex_core::RemoteProviderSkillAgentMatrixListResponse {
+                matrix: value,
+            })
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::SkillDiscover(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = service.discover_skill_sources(request.request)?;
+            serde_json::to_value(vibex_core::RemoteProviderSkillDiscoverResponse {
+                discovery: value,
+            })
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::SkillImport(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = service.import_skills(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "skill_import".to_string(),
+                "Skills imported from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = result?;
+            serde_json::to_value(vibex_core::RemoteProviderSkillImportResponse { result: value })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::SkillValidate(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = service.validate_skill(request.request)?;
+            serde_json::to_value(vibex_core::RemoteProviderSkillValidateResponse { result: value })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::PromptList(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = service.list_prompts()?;
+            serde_json::to_value(vibex_core::RemoteProviderPromptListResponse { prompts: value })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::PromptCreate(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = service.create_prompt(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "prompt".to_string(),
+                "Prompt created from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = result?;
+            serde_json::to_value(vibex_core::RemoteProviderPromptCreateResponse { prompt: value })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::PromptUpdate(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = service.update_prompt(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "prompt".to_string(),
+                "Prompt updated from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = result?;
+            serde_json::to_value(vibex_core::RemoteProviderPromptUpdateResponse { prompt: value })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::PromptDelete(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = service.delete_prompt(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "prompt".to_string(),
+                "Prompt deleted from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            result?;
+            serde_json::to_value(vibex_core::RemoteProviderPromptDeleteResponse { deleted: true })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::PromptValidate(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = service.validate_prompt(request.request)?;
+            serde_json::to_value(vibex_core::RemoteProviderPromptValidateResponse { result: value })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::HookList(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = service.list_hooks()?;
+            serde_json::to_value(vibex_core::RemoteProviderHookListResponse { hooks: value })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::HookCreate(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = service.create_hook(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "hook".to_string(),
+                "Hook created from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = result?;
+            serde_json::to_value(vibex_core::RemoteProviderHookCreateResponse { hook: value })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::HookUpdate(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = service.update_hook(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "hook".to_string(),
+                "Hook updated from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = result?;
+            serde_json::to_value(vibex_core::RemoteProviderHookUpdateResponse { hook: value })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::HookDelete(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = service.delete_hook(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "hook".to_string(),
+                "Hook deleted from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            result?;
+            serde_json::to_value(vibex_core::RemoteProviderHookDeleteResponse { deleted: true })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::HookPreviewInstall(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = service.preview_hook_install(request.request)?;
+            serde_json::to_value(vibex_core::RemoteProviderHookPreviewInstallResponse {
+                preview: value,
+            })
+            .map_err(remote_payload_encode_error)
+        }
         RemoteProviderRequest::MutateProviderCredentialSecret(request) => {
             let (proof, request) = request.into_request();
             let auth = authorize_provider_action(

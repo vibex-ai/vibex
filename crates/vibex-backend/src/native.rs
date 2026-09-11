@@ -25,18 +25,24 @@ use vibex_core::{
     GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
     GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeOperationRecord,
     GitWorktreeOperationRequest, GitWorktreeReadinessRecord, GitWorktreeReadinessRequest,
-    GitWorktreeRestoreRequest, McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest,
-    McpServerCreateRequest, McpServerDeleteRequest, McpServerDiscoverRequest,
-    McpServerDiscoveryResponse, McpServerImportRequest, McpServerImportResult,
-    McpServerSetAgentMatrixRequest, McpServerUpdateRequest, McpServerValidateRequest,
-    McpServerValidationResult, OpenWorkspaceRequest, ProjectId, ProviderCapabilitySummary,
-    ProviderHealthSummary, ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
+    GitWorktreeRestoreRequest, Hook, HookCreateRequest, HookDeleteRequest, HookInstallPreview,
+    HookInstallPreviewRequest, HookUpdateRequest, McpServer, McpServerAgentMatrix,
+    McpServerAgentMatrixListRequest, McpServerCreateRequest, McpServerDeleteRequest,
+    McpServerDiscoverRequest, McpServerDiscoveryResponse, McpServerImportRequest,
+    McpServerImportResult, McpServerSetAgentMatrixRequest, McpServerUpdateRequest,
+    McpServerValidateRequest, McpServerValidationResult, OpenWorkspaceRequest, ProjectId, Prompt,
+    PromptCreateRequest, PromptDeleteRequest, PromptUpdateRequest, PromptValidateRequest,
+    PromptValidationResult, ProviderCapabilitySummary, ProviderHealthSummary,
+    ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
     ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, RemoteAuditListRequest,
     RemoteAuditRecord, RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
     RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeviceDetail,
     RemoteRevokeDeviceRequest, RenameAgentSessionRequest, ReplaceUserMessagePayload,
     ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest,
-    SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest,
+    SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, Skill, SkillAgentMatrix,
+    SkillAgentMatrixListRequest, SkillCreateRequest, SkillDeleteRequest, SkillDiscoverRequest,
+    SkillDiscoveryResponse, SkillImportRequest, SkillImportResult, SkillSetAgentMatrixRequest,
+    SkillUpdateRequest, SkillValidateRequest, SkillValidationResult, TerminalCreateRequest,
     TerminalId, TerminalResizeRequest, TerminalSession, TerminalSnapshot, TerminalStatus,
     TerminalWriteRequest, TimelineItem, TimelinePage, VibexSessionId, WorkspaceId,
 };
@@ -2009,6 +2015,300 @@ impl ManagementBackend for NativeBackend {
                 .providers()
                 .management()
                 .validate_mcp_server(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn skills(&self) -> BackendFuture<'_, Vec<Skill>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .list_skills()
+                .map_err(Into::into)
+        })
+    }
+
+    fn create_skill(
+        &self,
+        request: MutationRequest<SkillCreateRequest>,
+    ) -> BackendFuture<'_, Skill> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .create_skill(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn update_skill(
+        &self,
+        request: MutationRequest<SkillUpdateRequest>,
+    ) -> BackendFuture<'_, Skill> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .update_skill(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn delete_skill(&self, request: MutationRequest<SkillDeleteRequest>) -> BackendFuture<'_, ()> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .delete_skill(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn set_skill_agent_matrix(
+        &self,
+        request: MutationRequest<SkillSetAgentMatrixRequest>,
+    ) -> BackendFuture<'_, Skill> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .set_skill_agent_matrix(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn skill_agent_matrix(
+        &self,
+        request: SkillAgentMatrixListRequest,
+    ) -> BackendFuture<'_, Vec<SkillAgentMatrix>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .list_skill_agent_matrix(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn discover_skill_sources(
+        &self,
+        request: SkillDiscoverRequest,
+    ) -> BackendFuture<'_, SkillDiscoveryResponse> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .discover_skill_sources(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn import_skills(
+        &self,
+        request: MutationRequest<SkillImportRequest>,
+    ) -> BackendFuture<'_, SkillImportResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .import_skills(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn validate_skill(
+        &self,
+        request: SkillValidateRequest,
+    ) -> BackendFuture<'_, SkillValidationResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .validate_skill(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn prompts(&self) -> BackendFuture<'_, Vec<Prompt>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .list_prompts()
+                .map_err(Into::into)
+        })
+    }
+
+    fn create_prompt(
+        &self,
+        request: MutationRequest<PromptCreateRequest>,
+    ) -> BackendFuture<'_, Prompt> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .create_prompt(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn update_prompt(
+        &self,
+        request: MutationRequest<PromptUpdateRequest>,
+    ) -> BackendFuture<'_, Prompt> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .update_prompt(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn delete_prompt(
+        &self,
+        request: MutationRequest<PromptDeleteRequest>,
+    ) -> BackendFuture<'_, ()> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .delete_prompt(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn validate_prompt(
+        &self,
+        request: PromptValidateRequest,
+    ) -> BackendFuture<'_, PromptValidationResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .validate_prompt(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn hooks(&self) -> BackendFuture<'_, Vec<Hook>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .list_hooks()
+                .map_err(Into::into)
+        })
+    }
+
+    fn create_hook(&self, request: MutationRequest<HookCreateRequest>) -> BackendFuture<'_, Hook> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .create_hook(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn update_hook(&self, request: MutationRequest<HookUpdateRequest>) -> BackendFuture<'_, Hook> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .update_hook(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn delete_hook(&self, request: MutationRequest<HookDeleteRequest>) -> BackendFuture<'_, ()> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .delete_hook(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn preview_hook_install(
+        &self,
+        request: HookInstallPreviewRequest,
+    ) -> BackendFuture<'_, HookInstallPreview> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .preview_hook_install(request)
                 .map_err(Into::into)
         })
     }
