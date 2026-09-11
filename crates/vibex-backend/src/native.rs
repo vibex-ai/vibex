@@ -10,12 +10,13 @@ use vibex_core::{
     AgentAuthContextVerifyRequest, AgentAuthEnvironmentUpdateRequest, AgentAuthenticateRequest,
     AgentAuthenticateResult, AgentAuthenticationCancelRequest, AgentAuthenticationOperation,
     AgentAuthenticationOperationId, AgentCatalogListResponse, AgentCommandDiscoverRequest,
-    AgentCommandDiscovery, AgentId, AgentListRequest, AgentListResponse, AgentLogoutRequest,
-    AgentManagedInstallState, AgentModelProviderDisplayOrderListRequest,
-    AgentModelProviderDisplayOrderListResponse, AgentModelProviderDisplayOrderSetRequest,
-    AgentModelProviderDisplayOrderSetResponse, AgentModelProviderProfileCreateRequest,
-    AgentModelProviderProfileDeleteRequest, AgentModelProviderProfileFetchModelsRequest,
-    AgentModelProviderProfileFetchModelsResponse, AgentModelProviderProfileSecretValueResponse,
+    AgentCommandDiscovery, AgentCommandExecuteRequest, AgentCommandExecuteResult, AgentId,
+    AgentListRequest, AgentListResponse, AgentLogoutRequest, AgentManagedInstallState,
+    AgentModelProviderDisplayOrderListRequest, AgentModelProviderDisplayOrderListResponse,
+    AgentModelProviderDisplayOrderSetRequest, AgentModelProviderDisplayOrderSetResponse,
+    AgentModelProviderProfileCreateRequest, AgentModelProviderProfileDeleteRequest,
+    AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
+    AgentModelProviderProfileSecretValueResponse,
     AgentModelProviderProfileSecretValueUpdateRequest, AgentModelProviderProfileTestRequest,
     AgentModelProviderProfileTestResult, AgentModelProviderProfileUpdateRequest,
     AgentRefreshSnapshotRequest, AgentRefreshSnapshotResponse, AgentRuntimeOptionProbeRequest,
@@ -575,6 +576,36 @@ impl AgentBackend for NativeBackend {
         })
     }
 
+    fn session_token_usage(
+        &self,
+        session_id: VibexSessionId,
+    ) -> BackendFuture<'_, Option<vibex_core::AgentTokenUsage>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent_token_usage_snapshot(&session_id)
+                .map_err(Into::into)
+        })
+    }
+
+    fn execute_agent_command(
+        &self,
+        request: MutationRequest<AgentCommandExecuteRequest>,
+    ) -> BackendFuture<'_, AgentCommandExecuteResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .manager()
+                .execute_command(request.payload)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
     fn agent_message_submission(
         &self,
         request: GetMessageSubmissionRequest,
@@ -878,6 +909,37 @@ impl WorkspaceBackend for NativeBackend {
                 .map_err(Into::into)
         })
     }
+
+    fn ensure_temporary_session_root(&self) -> BackendFuture<'_, String> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            temporary_session_root().map_err(BackendError::from)
+        })
+    }
+}
+
+/// Creates and resolves the authority's temporary session root.
+fn temporary_session_root() -> vibex_core::VibexResult<String> {
+    let root = std::env::temp_dir().join("vibex").join("sessions");
+    std::fs::create_dir_all(&root).map_err(|error| {
+        vibex_core::VibexError::storage(
+            "temporary_workspace_create_failed",
+            "failed to create temporary session workspace",
+        )
+        .with_diagnostic("path", root.display().to_string())
+        .with_diagnostic("error", error.to_string())
+    })?;
+    root.canonicalize()
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|error| {
+            vibex_core::VibexError::storage(
+                "temporary_workspace_canonicalize_failed",
+                "failed to resolve temporary session workspace",
+            )
+            .with_diagnostic("path", root.display().to_string())
+            .with_diagnostic("error", error.to_string())
+        })
 }
 
 impl FileBackend for NativeBackend {

@@ -545,6 +545,8 @@ async fn prepare_workspace_fixture(state: &HarnessState) -> ApiResult<()> {
         .ok_or_else(|| ApiError::internal("fixture_runtime_option_missing"))?;
     manager
         .create_session(vibex_core::CreateAgentSessionRequest {
+            session_id: None,
+            defer_runtime_materialization: false,
             runtime: option.selection.clone(),
             workspace_root: workspace.root_path,
             workspace_mode: workspace.mode,

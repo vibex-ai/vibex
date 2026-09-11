@@ -188,6 +188,8 @@ impl<'a> ScheduledTaskRunner<'a> {
         let session = match self
             .manager
             .create_session(CreateAgentSessionRequest {
+                session_id: None,
+                defer_runtime_materialization: false,
                 runtime: runtime.clone(),
                 workspace_root: task.workspace_root.clone(),
                 workspace_mode: task.workspace_mode,

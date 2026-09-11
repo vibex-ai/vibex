@@ -5,10 +5,11 @@ use vibex_core::{
     AgentAuthContextMutationResult, AgentAuthContextRefreshModelsRequest,
     AgentAuthContextVerifyRequest, AgentAuthEnvironmentUpdateRequest, AgentAuthenticateRequest,
     AgentAuthenticateResult, AgentAuthenticationCancelRequest, AgentAuthenticationOperation,
-    AgentAuthenticationOperationId, AgentCommandDiscoverRequest, AgentCommandDiscovery, AgentId,
-    AgentLogoutRequest, AgentNotificationIntent, AgentRuntimeOptionProbeRequest,
-    AgentRuntimeOptionProbeResult, AgentSession, AgentSessionRuntimeSelectionEvent,
-    AgentSessionRuntimeSelectionState, AgentTimelineDisplaySettings, AgentUsageStatistics,
+    AgentAuthenticationOperationId, AgentCommandDiscoverRequest, AgentCommandDiscovery,
+    AgentCommandExecuteRequest, AgentCommandExecuteResult, AgentId, AgentLogoutRequest,
+    AgentNotificationIntent, AgentRuntimeOptionProbeRequest, AgentRuntimeOptionProbeResult,
+    AgentSession, AgentSessionRuntimeSelectionEvent, AgentSessionRuntimeSelectionState,
+    AgentTimelineDisplaySettings, AgentTokenUsage, AgentUsageStatistics,
     AgentUsageStatisticsRequest, CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest,
     CreateAgentSessionRequest, FetchTimelineRequest, ForkAgentSessionRequest,
     GetMessageSubmissionRequest, MessageSubmissionState, ProviderConfiguredModel, ProviderProfile,
@@ -248,6 +249,35 @@ pub trait AgentBackend: BackendBound {
             Err(crate::BackendError::unsupported(
                 "composer_commands_unavailable",
                 "composer command discovery is unavailable on this backend",
+            ))
+        })
+    }
+
+    /// Reads the live token-usage snapshot for one session.
+    ///
+    /// The counters live with the authority that runs the Agent, so a paired
+    /// client reads them through the facade instead of an in-process handle.
+    fn session_token_usage(
+        &self,
+        _session_id: VibexSessionId,
+    ) -> BackendFuture<'_, Option<AgentTokenUsage>> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_session_token_usage_unavailable",
+                "live session token usage is unavailable on this backend",
+            ))
+        })
+    }
+
+    /// Executes one composer command against the authority's catalogue.
+    fn execute_agent_command(
+        &self,
+        _request: MutationRequest<AgentCommandExecuteRequest>,
+    ) -> BackendFuture<'_, AgentCommandExecuteResult> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_command_execute_unavailable",
+                "Agent command execution is unavailable on this backend",
             ))
         })
     }

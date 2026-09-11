@@ -539,9 +539,23 @@ impl AgentManager {
 
     pub async fn create_session(
         &self,
-        request: CreateAgentSessionRequest,
+        mut request: CreateAgentSessionRequest,
     ) -> VibexResult<AgentSession> {
-        self.create_session_with_timeline(request, Vec::new()).await
+        // A caller-reserved identifier and a deferred materialization are
+        // request options rather than separate entry points, so every caller
+        // (native facade, remote gateway, automation) gets the same behavior.
+        let session_id = request.session_id.take();
+        let deferred = request.defer_runtime_materialization;
+        request.defer_runtime_materialization = false;
+        match (session_id, deferred) {
+            (Some(session_id), true) => {
+                self.create_session_deferred_with_id(request, session_id)
+                    .await
+            }
+            (Some(session_id), false) => self.create_session_with_id(request, session_id).await,
+            (None, true) => self.create_session_deferred(request).await,
+            (None, false) => self.create_session_with_timeline(request, Vec::new()).await,
+        }
     }
 
     /// Creates a session with an identifier reserved by the caller.
@@ -921,6 +935,8 @@ impl AgentManager {
 
         self.create_session_with_timeline_callback(
             CreateAgentSessionRequest {
+                session_id: None,
+                defer_runtime_materialization: false,
                 runtime,
                 workspace_root: source.workspace_root,
                 workspace_mode: source.workspace_mode,
@@ -1077,6 +1093,8 @@ impl AgentManager {
         let child = match self
             .create_session_deferred_with_id(
                 CreateAgentSessionRequest {
+                    session_id: None,
+                    defer_runtime_materialization: false,
                     runtime: selection.clone(),
                     workspace_root: parent.workspace_root.clone(),
                     workspace_mode: parent.workspace_mode,

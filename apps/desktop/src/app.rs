@@ -1012,6 +1012,20 @@ fn initial_message_interrupted_error() -> vibex_core::VibexError {
     )
 }
 
+/// Lifts a facade error into the shell error type used by the new-session
+/// pipeline, which predates the backend facade.
+fn backend_error_to_vibex(error: vibex_backend::BackendError) -> vibex_core::VibexError {
+    let category = match error.kind {
+        vibex_backend::BackendErrorKind::Loading => vibex_core::ErrorCategory::Process,
+        vibex_backend::BackendErrorKind::Offline => vibex_core::ErrorCategory::Remote,
+        vibex_backend::BackendErrorKind::Conflict => vibex_core::ErrorCategory::Conflict,
+        vibex_backend::BackendErrorKind::Permission => vibex_core::ErrorCategory::Permission,
+        vibex_backend::BackendErrorKind::Unsupported => vibex_core::ErrorCategory::Capability,
+        vibex_backend::BackendErrorKind::Failed => vibex_core::ErrorCategory::Process,
+    };
+    vibex_core::VibexError::new(category, error.code, error.message)
+}
+
 fn runtime_token_usage_snapshot(
     runtime: &DesktopRuntime,
     session_id: &VibexSessionId,
@@ -4882,6 +4896,8 @@ pub struct VibexWorkbench {
     runtime_selection_cancellations_in_flight: BTreeSet<String>,
     runtime_preference_write_fence: RuntimePreferenceWriteFence,
     token_usage: Option<AgentTokenUsage>,
+    remote_token_usage_in_flight: Option<VibexSessionId>,
+    remote_token_usage_task: Option<Task<()>>,
     agent_generation_stats: Option<AgentGenerationStats>,
     composer_runtime_menu_open: bool,
     composer_runtime_menu_view: ComposerRuntimeMenuView,
@@ -5655,6 +5671,8 @@ impl VibexWorkbench {
             runtime_selection_cancellations_in_flight: BTreeSet::new(),
             runtime_preference_write_fence: RuntimePreferenceWriteFence::default(),
             token_usage: None,
+            remote_token_usage_in_flight: None,
+            remote_token_usage_task: None,
             agent_generation_stats: None,
             composer_runtime_menu_open: false,
             composer_runtime_menu_view: ComposerRuntimeMenuView::AuthSource,
@@ -9008,6 +9026,8 @@ impl VibexWorkbench {
                             .agent()
                             .create_session(
                                 MutationRequest::new(CreateAgentSessionRequest {
+                                    session_id: None,
+                                    defer_runtime_materialization: false,
                                     runtime: selection,
                                     workspace_root: target_root.clone(),
                                     workspace_mode: target_mode,
@@ -9033,6 +9053,8 @@ impl VibexWorkbench {
                     .agent()
                     .create_session(
                         MutationRequest::new(CreateAgentSessionRequest {
+                            session_id: None,
+                            defer_runtime_materialization: false,
                             runtime: selection,
                             workspace_root: target_root,
                             workspace_mode: target_mode,
@@ -10379,14 +10401,22 @@ impl VibexWorkbench {
         true
     }
 
-    fn refresh_agent_token_usage(&mut self, session_id: &VibexSessionId) -> bool {
+    fn refresh_agent_token_usage(
+        &mut self,
+        session_id: &VibexSessionId,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.selected_session_id.as_ref() != Some(session_id) {
             return false;
         }
-        let Some(runtime) = self.runtime.as_deref() else {
+        let Some(runtime) = self.runtime.clone() else {
+            // A paired runtime serves the same snapshot over Remote v2. The
+            // read is asynchronous, so the indicator updates when it lands
+            // instead of reporting an immediate change.
+            self.request_remote_token_usage(session_id.clone(), cx);
             return false;
         };
-        let Ok(usage) = runtime_token_usage_snapshot(runtime, session_id) else {
+        let Ok(usage) = runtime_token_usage_snapshot(&runtime, session_id) else {
             return false;
         };
         if self.token_usage == usage {
@@ -10394,6 +10424,45 @@ impl VibexWorkbench {
         }
         self.token_usage = usage;
         true
+    }
+
+    /// Reads the live token snapshot from the paired runtime. Only one request
+    /// per session is in flight so a burst of runtime events cannot queue
+    /// duplicate RPCs.
+    fn request_remote_token_usage(&mut self, session_id: VibexSessionId, cx: &mut Context<Self>) {
+        if self.remote_token_usage_in_flight.as_ref() == Some(&session_id) {
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        self.remote_token_usage_in_flight = Some(session_id.clone());
+        let request_session_id = session_id.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .agent()
+                .session_token_usage(request_session_id)
+                .await
+        });
+        self.remote_token_usage_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                this.remote_token_usage_task = None;
+                if this.remote_token_usage_in_flight.as_ref() == Some(&session_id) {
+                    this.remote_token_usage_in_flight = None;
+                }
+                let Ok(Ok(usage)) = outcome else {
+                    return;
+                };
+                if this.selected_session_id.as_ref() != Some(&session_id) {
+                    return;
+                }
+                if this.token_usage != usage {
+                    this.token_usage = usage;
+                    cx.notify();
+                }
+            });
+        }));
     }
 
     fn sync_agent_generation_stats(&mut self, turn: &TimelineConversationTurn) {
@@ -11213,7 +11282,7 @@ impl VibexWorkbench {
             self.timeline_file_changes_expansion.clear();
             self.agent_loading = true;
         }
-        self.refresh_agent_token_usage(&session_id);
+        self.refresh_agent_token_usage(&session_id, cx);
         if navigation_changed {
             self.clear_suggestions();
         } else {
@@ -12342,7 +12411,7 @@ impl VibexWorkbench {
                     .selected_session_id
                     .as_ref()
                     .is_some_and(|selected| selected == &event.session_id)
-                    && self.refresh_agent_token_usage(&event.session_id);
+                    && self.refresh_agent_token_usage(&event.session_id, cx);
                 agent_projection_should_repaint(&self.ui_state.workbench.active_tab, changed)
             }
             DesktopEvent::RuntimeSelection(event) => {
@@ -12391,7 +12460,7 @@ impl VibexWorkbench {
                 if refetch.runtime
                     && let Some(session_id) = self.selected_session_id.clone()
                 {
-                    self.refresh_agent_token_usage(&session_id);
+                    self.refresh_agent_token_usage(&session_id, cx);
                 }
                 if refetch.timeline || refetch.runtime_selection {
                     self.timeline.mark_lagged();
@@ -18835,8 +18904,9 @@ impl VibexWorkbench {
         }) {
             return;
         }
-        let (Some(runtime), Some(catalog), Some(selection)) = (
-            self.runtime.clone(),
+        // Creation is an authority operation: the local runtime is not required
+        // because the backend facade also serves a paired remote runtime.
+        let (Some(catalog), Some(selection)) = (
             self.runtime_catalog.as_ref(),
             self.new_session_runtime_selection.clone(),
         ) else {
@@ -18918,19 +18988,29 @@ impl VibexWorkbench {
         let (text, attachments) =
             composer_submission_payload(&raw_text, &self.new_session_attachments);
         self.sync_composer_command_entry(ComposerTarget::NewSession, cx);
-        let allow_manual_provider_slash = runtime
-            .agent()
-            .manager()
-            .command_discovery_capabilities(&AgentCommandDiscoverRequest {
-                agent_id: Some(selection.agent_id.clone()),
-                provider_profile_id: selection.provider_profile_id().cloned(),
-                session_id: None,
-                workspace_id: None,
-                trigger: Some(AgentCommandTrigger::Slash),
-                query: None,
-                limit: Some(1),
+        // Manual slash expansion reads the authority's discovery capability.
+        // A paired runtime resolves explicit command selections through the
+        // facade below; an unmatched typed `/…` stays verbatim, matching the
+        // remote composer path.
+        let allow_manual_provider_slash = self
+            .runtime
+            .as_ref()
+            .map(|runtime| {
+                runtime
+                    .agent()
+                    .manager()
+                    .command_discovery_capabilities(&AgentCommandDiscoverRequest {
+                        agent_id: Some(selection.agent_id.clone()),
+                        provider_profile_id: selection.provider_profile_id().cloned(),
+                        session_id: None,
+                        workspace_id: None,
+                        trigger: Some(AgentCommandTrigger::Slash),
+                        query: None,
+                        limit: Some(1),
+                    })
+                    .map(|capabilities| capabilities.slash_commands)
+                    .unwrap_or(false)
             })
-            .map(|capabilities| capabilities.slash_commands)
             .unwrap_or(false);
         let command_invocation = resolve_composer_command_invocation(
             &text,
@@ -19013,15 +19093,17 @@ impl VibexWorkbench {
         let backend = self.backend.clone();
         let (created_tx, mut created_rx) = mpsc::unbounded_channel();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            // Every step of new-session creation is an authority operation, so
+            // the flow drives the same facade a paired remote runtime fills.
+            let backend = backend.ok_or_else(|| {
+                vibex_backend::BackendError::offline(
+                    "backend_unavailable",
+                    "the authoritative runtime is unavailable for session creation",
+                )
+            })?;
             let workspace = if let Some(workspace) = selected_workspace {
                 Some(workspace)
             } else if let Some(request) = worktree_mutation {
-                let backend = backend.ok_or_else(|| {
-                    vibex_backend::BackendError::offline(
-                        "backend_unavailable",
-                        "backend is unavailable for Worktree creation",
-                    )
-                })?;
                 let result = backend.git().git_worktree_create(request).await?;
                 let workspace = result.workspace;
                 let _ = created_tx.send(NewSessionCreateSignal::WorkspaceReady(workspace.clone()));
@@ -19029,15 +19111,18 @@ impl VibexWorkbench {
             } else {
                 origin_workspace
             };
-            let (workspace_root, workspace_mode) = workspace
-                .as_ref()
-                .map(|workspace| (workspace.root_path.clone(), workspace.mode))
-                .map(Ok)
-                .unwrap_or_else(|| {
-                    ensure_temporary_session_root()
-                        .map(|root| (root, WorkspaceMode::CurrentCheckout))
-                })?;
+            let (workspace_root, workspace_mode) = match workspace.as_ref() {
+                Some(workspace) => (workspace.root_path.clone(), workspace.mode),
+                // A temporary session has no published workspace, so the
+                // authority creates the root on the machine that runs the Agent.
+                None => (
+                    backend.workspace().ensure_temporary_session_root().await?,
+                    WorkspaceMode::CurrentCheckout,
+                ),
+            };
             let create_request = CreateAgentSessionRequest {
+                session_id: Some(optimistic_session_id.clone()),
+                defer_runtime_materialization: deferred_creation,
                 runtime: selection.clone(),
                 workspace_root,
                 workspace_mode,
@@ -19048,58 +19133,99 @@ impl VibexWorkbench {
                 safety: None,
             };
             let recovery_session_id = optimistic_session_id.clone();
-            let creation = if deferred_creation {
-                runtime
+            let creation =
+                backend
                     .agent()
-                    .manager()
-                    .create_session_deferred_with_id(create_request, optimistic_session_id)
-                    .await
-            } else {
-                runtime
-                    .agent()
-                    .manager()
-                    .create_session_with_id(create_request, optimistic_session_id)
-                    .await
-            };
+                    .create_session(MutationRequest::new(create_request).with_idempotency_key(
+                        format!("gpui:new-session:create:{}", optimistic_session_id.as_str()),
+                    ))
+                    .await;
             let session = match creation {
                 Ok(session) => session,
                 Err(error) => {
-                    // The manager persists the Logical Session before runtime
+                    // The authority persists the Logical Session before runtime
                     // materialization. Surface that durable error session so
                     // the optimistic first message is never discarded when
                     // initialization fails after persistence.
-                    if let Ok(session) = runtime
-                        .agent()
-                        .manager()
-                        .get_session(&recovery_session_id)
-                        .await
-                    {
+                    if let Ok(session) = backend.agent().open_session(recovery_session_id).await {
                         let _ = created_tx.send(NewSessionCreateSignal::SessionReady(
                             session,
-                            runtime.workspace().list().ok(),
+                            list_workspace_records(&backend).await,
                             has_initial_message,
                         ));
                     }
                     return Err(error.into());
                 }
             };
-            let workspaces = runtime.workspace().list().ok();
+            let workspaces = list_workspace_records(&backend).await;
             let session_id = session.id.clone();
-            let message_runtime = runtime.clone();
+            let message_backend = backend.clone();
             let initial_message = if has_initial_message {
                 let initial_attachments = attachments;
                 Some(async move {
-                    let desired_runtime = message_runtime
+                    let desired_runtime = message_backend
                         .agent()
-                        .runtime_selection()
-                        .get_selection_state(&session_id)
+                        .runtime_selection(session_id.clone())
+                        .await
                         .map(|state| state.effective)
                         .unwrap_or_else(|_| selection.clone());
-                    let prepared_submission = if command_invocation.is_none() {
-                        let coordinator = message_runtime.agent().message_submission();
-                        let reasoning_effort = desired_runtime.reasoning_effort.clone();
-                        let submission_id =
-                            coordinator.prepare_submission(SendAgentMessageRequest {
+                    if let Some(invocation) = command_invocation {
+                        if *initial_turn_interrupt_rx.borrow() {
+                            return Err(initial_message_interrupted_error());
+                        }
+                        let command = message_backend.agent().execute_agent_command(
+                            MutationRequest::new(AgentCommandExecuteRequest {
+                                session_id: session_id.clone(),
+                                command_id: invocation.command_id,
+                                trigger: invocation.trigger,
+                                source_kind: invocation.source_kind,
+                                command_text: invocation.command_text,
+                                command_name: invocation.command_name,
+                                arguments: invocation.arguments,
+                                prompt_id: invocation.prompt_id,
+                                attachments: initial_attachments.clone(),
+                                // The newly committed session runtime is authoritative;
+                                // command admission must not compare it with the draft.
+                                reasoning_effort: None,
+                                correlation_id: None,
+                            })
+                            .with_idempotency_key(format!(
+                                "gpui:new-session:command:{}:{}",
+                                session_id.as_str(),
+                                unix_timestamp_ms()
+                            )),
+                        );
+                        tokio::pin!(command);
+                        let mut interrupt_sent = false;
+                        loop {
+                            tokio::select! {
+                                outcome = &mut command => {
+                                    break outcome.map(|_| ()).map_err(backend_error_to_vibex);
+                                }
+                                changed = initial_turn_interrupt_rx.changed(), if !interrupt_sent => {
+                                    if changed.is_err() || !*initial_turn_interrupt_rx.borrow() {
+                                        interrupt_sent = true;
+                                        continue;
+                                    }
+                                    message_backend
+                                        .agent()
+                                        .interrupt(MutationRequest::new(session_id.clone()))
+                                        .await
+                                        .map_err(backend_error_to_vibex)?;
+                                    interrupt_sent = true;
+                                }
+                            }
+                        }
+                    } else {
+                        if *initial_turn_interrupt_rx.borrow() {
+                            message_backend
+                                .agent()
+                                .interrupt(MutationRequest::new(session_id.clone()))
+                                .await
+                                .map_err(backend_error_to_vibex)?;
+                        }
+                        let submission = message_backend.agent().send_message(
+                            MutationRequest::new(SendAgentMessageRequest {
                                 session_id: session_id.clone(),
                                 message_idempotency_key: format!(
                                     "gpui:new-session:{}:{}",
@@ -19109,68 +19235,31 @@ impl VibexWorkbench {
                                 desired_runtime: desired_runtime.clone(),
                                 text: text.clone(),
                                 attachments: initial_attachments.clone(),
-                                reasoning_effort,
+                                reasoning_effort: desired_runtime.reasoning_effort.clone(),
                                 correlation_id: None,
-                            })?;
-                        Some((coordinator, submission_id))
-                    } else {
-                        None
-                    };
-                    if let Some(invocation) = command_invocation {
-                        if *initial_turn_interrupt_rx.borrow() {
-                            return Err(initial_message_interrupted_error());
-                        }
-                        let manager = message_runtime.agent().manager().clone();
-                        let command = manager.execute_command(AgentCommandExecuteRequest {
-                            session_id: session_id.clone(),
-                            command_id: invocation.command_id,
-                            trigger: invocation.trigger,
-                            source_kind: invocation.source_kind,
-                            command_text: invocation.command_text,
-                            command_name: invocation.command_name,
-                            arguments: invocation.arguments,
-                            prompt_id: invocation.prompt_id,
-                            attachments: initial_attachments.clone(),
-                            // The newly committed session runtime is authoritative;
-                            // command admission must not compare it with the draft.
-                            reasoning_effort: None,
-                            correlation_id: None,
-                        });
-                        tokio::pin!(command);
-                        let mut interrupt_sent = false;
-                        loop {
-                            tokio::select! {
-                                outcome = &mut command => break outcome.map(|_| ()),
-                                changed = initial_turn_interrupt_rx.changed(), if !interrupt_sent => {
-                                    if changed.is_err() || !*initial_turn_interrupt_rx.borrow() {
-                                        interrupt_sent = true;
-                                        continue;
-                                    }
-                                    manager.interrupt(&session_id).await?;
-                                    interrupt_sent = true;
-                                }
-                            }
-                        }
-                    } else {
-                        let (coordinator, submission_id) = prepared_submission
-                            .expect("ordinary initial messages must be durably prepared");
-                        let manager = message_runtime.agent().manager().clone();
-                        let mut interrupt_sent = false;
-                        if *initial_turn_interrupt_rx.borrow() {
-                            manager.interrupt(&session_id).await?;
-                            interrupt_sent = true;
-                        }
-                        let submission = coordinator.wait_for_submission(&submission_id);
+                            })
+                            .with_idempotency_key(format!(
+                                "gpui:new-session:message:{}",
+                                session_id.as_str()
+                            )),
+                        );
                         tokio::pin!(submission);
+                        let mut interrupt_sent = false;
                         loop {
                             tokio::select! {
-                                outcome = &mut submission => break outcome.map(|_| ()),
+                                outcome = &mut submission => {
+                                    break outcome.map(|_| ()).map_err(backend_error_to_vibex);
+                                }
                                 changed = initial_turn_interrupt_rx.changed(), if !interrupt_sent => {
                                     if changed.is_err() || !*initial_turn_interrupt_rx.borrow() {
                                         interrupt_sent = true;
                                         continue;
                                     }
-                                    manager.interrupt(&session_id).await?;
+                                    message_backend
+                                        .agent()
+                                        .interrupt(MutationRequest::new(session_id.clone()))
+                                        .await
+                                        .map_err(backend_error_to_vibex)?;
                                     interrupt_sent = true;
                                 }
                             }
@@ -19190,12 +19279,7 @@ impl VibexWorkbench {
                 initial_message,
             )
             .await;
-            let refreshed_session = runtime
-                .agent()
-                .manager()
-                .get_session(&session.id)
-                .await
-                .ok();
+            let refreshed_session = backend.agent().open_session(session.id.clone()).await.ok();
             Ok::<_, vibex_backend::BackendError>((
                 session.id,
                 has_initial_message,
@@ -44179,25 +44263,21 @@ fn worktree_assistance_conflict_kind(kind: GitWorktreeConflictKind) -> &'static 
     }
 }
 
-fn ensure_temporary_session_root() -> vibex_core::VibexResult<String> {
-    let root = std::env::temp_dir().join("vibex").join("sessions");
-    std::fs::create_dir_all(&root).map_err(|error| {
-        vibex_core::VibexError::storage(
-            "temporary_workspace_create_failed",
-            "failed to create temporary session workspace",
-        )
-        .with_diagnostic("path", root.display().to_string())
-        .with_diagnostic("error", error.to_string())
-    })?;
-    root.canonicalize()
-        .map(|path| path.to_string_lossy().into_owned())
-        .map_err(|error| {
-            vibex_core::VibexError::storage(
-                "temporary_workspace_canonicalize_failed",
-                "failed to resolve temporary session workspace",
-            )
-            .with_diagnostic("path", root.display().to_string())
-            .with_diagnostic("error", error.to_string())
+/// Loads the authority's workspaces as the project/workspace pairs the
+/// workbench keeps in memory.
+async fn list_workspace_records(
+    backend: &BackendFacade,
+) -> Option<Vec<(ProjectRecord, WorkspaceRecord)>> {
+    backend
+        .workspace()
+        .list_workspaces()
+        .await
+        .ok()
+        .map(|summaries| {
+            summaries
+                .into_iter()
+                .map(|summary| (summary.project, summary.workspace))
+                .collect()
         })
 }
 
@@ -58687,8 +58767,14 @@ mod tests {
             .expect("authoritative creation should remain asynchronous");
 
         assert!(optimistic_message < open && open < background_creation);
-        assert!(submit.contains("create_session_deferred_with_id("));
-        assert!(submit.contains("create_session_with_id("));
+        assert!(submit.contains("defer_runtime_materialization: deferred_creation"));
+        assert!(submit.contains(".create_session("));
+        assert!(
+            !submit.contains("self.runtime.clone()")
+                && !submit.contains("create_session_with_id(")
+                && !submit.contains("create_session_deferred_with_id("),
+            "new-session creation must drive the authority facade in both modes"
+        );
 
         let pending_open = source
             .split_once("    fn open_pending_new_session(")
@@ -58727,7 +58813,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("new-session submission should remain inspectable");
 
-        assert!(submit.contains("get_session(&recovery_session_id)"));
+        assert!(submit.contains("open_session(recovery_session_id)"));
         assert!(submit.contains("NewSessionCreateSignal::SessionReady("));
         assert!(submit.contains("if created_session_id.is_some()"));
         assert!(submit.contains("runtime initialization failed"));
@@ -58739,8 +58825,10 @@ mod tests {
             .find("announce_created_session_before_initial_message(")
             .expect("durable session should be announced before its initial message runs");
         assert!(initial_message < announce);
-        assert!(submit[initial_message..announce].contains("prepare_submission"));
-        assert!(submit[initial_message..announce].contains("get_selection_state(&session_id)"));
+        assert!(submit[initial_message..announce].contains(".send_message("));
+        assert!(
+            submit[initial_message..announce].contains(".runtime_selection(session_id.clone())")
+        );
     }
 
     #[test]
@@ -61748,11 +61836,11 @@ mod tests {
             .find("NewSessionCreateSignal::WorkspaceReady")
             .expect("authoritative Workspace should be announced immediately");
         let session_create = submit
-            .find(".create_session_deferred_with_id(create_request, optimistic_session_id)")
-            .expect("Session should be created after the Workspace is ready");
+            .find(".create_session(")
+            .expect("Session creation should follow the Workspace announcement");
         assert!(worktree_create < workspace_ready);
         assert!(workspace_ready < session_create);
-        assert!(submit.contains(".create_session_with_id(create_request, optimistic_session_id)"));
+        assert!(submit.contains(".create_session("));
         assert!(submit.contains(".with_idempotency_key("));
         assert!(submit.contains(".with_expected_revision("));
         assert!(submit.contains("mark_workspace_ready(workspace.clone())"));

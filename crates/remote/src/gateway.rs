@@ -5545,6 +5545,9 @@ fn gateway_features(state: &GatewayState) -> Vec<String> {
     if state.dispatcher.has_automation_source() {
         features.push("automation".to_string());
     }
+    if state.dispatcher.has_worktree_lifecycle_source() {
+        features.push("git_worktree_lifecycle".to_string());
+    }
     if state.dispatcher.has_management_snapshot_source() {
         features.push("management_snapshot".to_string());
     }

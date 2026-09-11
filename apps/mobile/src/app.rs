@@ -2797,6 +2797,8 @@ impl MobileApp {
             return;
         };
         let request = MutationRequest::new(CreateAgentSessionRequest {
+            session_id: None,
+            defer_runtime_materialization: false,
             runtime: runtime.clone(),
             workspace_root,
             workspace_mode,

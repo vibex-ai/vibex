@@ -28,4 +28,17 @@ pub trait WorkspaceBackend: BackendBound {
     fn delete_workspace(&self, request: MutationRequest<WorkspaceId>) -> BackendFuture<'_, ()>;
 
     fn delete_project(&self, request: MutationRequest<ProjectId>) -> BackendFuture<'_, ()>;
+
+    /// Creates and resolves the authority's temporary session root.
+    ///
+    /// A temporary session has no published workspace, so the path must belong
+    /// to the authority that will run the Agent rather than to the client.
+    fn ensure_temporary_session_root(&self) -> BackendFuture<'_, String> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "temporary_session_root_unavailable",
+                "temporary session roots are unavailable on this backend",
+            ))
+        })
+    }
 }

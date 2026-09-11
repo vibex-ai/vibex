@@ -20,27 +20,28 @@ use vibex_core::{
     AgentAuthContextVerifyRequest, AgentAuthEnvironmentUpdateRequest, AgentAuthenticateRequest,
     AgentAuthenticateResult, AgentAuthenticationCancelRequest, AgentAuthenticationOperation,
     AgentAuthenticationOperationId, AgentCatalogListResponse, AgentCommandDiscoverRequest,
-    AgentCommandDiscovery, AgentId, AgentListRequest, AgentListResponse, AgentLogoutRequest,
-    AgentManagedInstallState, AgentModelProviderProfileCreateRequest,
-    AgentModelProviderProfileSecretValueResponse,
+    AgentCommandDiscovery, AgentCommandExecuteRequest, AgentCommandExecuteResult, AgentId,
+    AgentListRequest, AgentListResponse, AgentLogoutRequest, AgentManagedInstallState,
+    AgentModelProviderProfileCreateRequest, AgentModelProviderProfileSecretValueResponse,
     AgentModelProviderProfileSecretValueUpdateRequest, AgentModelProviderProfileUpdateRequest,
     AgentNotificationIntent, AgentRefreshSnapshotRequest, AgentRefreshSnapshotResponse,
     AgentRuntimeOptionProbeRequest, AgentRuntimeOptionProbeResult, AgentSession,
     AgentSessionRuntimeSelectionState, AgentSnapshotEntry, AgentTimelineDisplaySettings,
-    AgentUpdateConfigRequest, AutomationGraph, AutomationGraphCreateRequest,
-    AutomationGraphDefinitionUpdateRequest, AutomationGraphId, AutomationGraphListRequest,
-    AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun, AutomationRunCancelRequest,
-    AutomationRunListRequest, AutomationRunResumeRequest, AutomationRunStartRequest,
-    AutomationRunStep, AutomationRunStepListRequest, BackupCreateOutcome, BackupCreatePayload,
-    BackupInspectOutcome, BackupInspectPayload, BackupRestoreOutcome, BackupRestorePayload,
-    CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
-    DiagnosticExportOutcome, DiagnosticExportPayload, FetchTimelineRequest, FileMutationRequest,
-    FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
-    FileTreeRequest, FileWriteRequest, ForkAgentSessionRequest, GetMessageSubmissionRequest,
-    GitBranchListResponse, GitCommitDetail, GitCommitDetailRequest, GitCommitRequest,
-    GitCommitResult, GitDiffRequest, GitDiffResponse, GitHistoryRequest, GitHistoryResponse,
-    GitProjectEligibility, GitRemoteActionRequest, GitRemoteActionResult, GitStageRequest,
-    GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
+    AgentUpdateConfigRequest, AgentUsageStatistics, AgentUsageStatisticsRequest, AutomationGraph,
+    AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest, AutomationGraphId,
+    AutomationGraphListRequest, AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun,
+    AutomationRunCancelRequest, AutomationRunListRequest, AutomationRunResumeRequest,
+    AutomationRunStartRequest, AutomationRunStep, AutomationRunStepListRequest,
+    BackupCreateOutcome, BackupCreatePayload, BackupInspectOutcome, BackupInspectPayload,
+    BackupRestoreOutcome, BackupRestorePayload, CancelAgentSessionRuntimeSwitchRequest,
+    ContinueAgentTurnRequest, CreateAgentSessionRequest, DiagnosticExportOutcome,
+    DiagnosticExportPayload, FetchTimelineRequest, FileMutationRequest, FileReadRequest,
+    FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest,
+    FileWriteRequest, ForkAgentSessionRequest, GetMessageSubmissionRequest, GitBranchListResponse,
+    GitCommitDetail, GitCommitDetailRequest, GitCommitRequest, GitCommitResult, GitDiffRequest,
+    GitDiffResponse, GitHistoryRequest, GitHistoryResponse, GitProjectEligibility,
+    GitRemoteActionRequest, GitRemoteActionResult, GitStageRequest, GitStatusSummary,
+    GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
     GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeCreateRequest,
     GitWorktreeCreateResult, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
     GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
@@ -109,14 +110,16 @@ use vibex_core::{
     RemoteWorkbenchDeleteWorkspaceRequest, RemoteWorkbenchDeleteWorkspaceResponse,
     RemoteWorkbenchListWorkspacesRequest, RemoteWorkbenchListWorkspacesResponse,
     RemoteWorkbenchOpenWorkspaceRequest, RemoteWorkbenchOpenWorkspaceResponse,
-    RemoteWorkbenchRequest, RenameAgentSessionRequest, ReplaceUserMessagePayload,
-    ResolveElicitationRequest, ResolvePermissionRequest, ScheduledTaskAttentionListRequest,
-    ScheduledTaskAttentionSummary, ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord,
-    ScheduledTaskCreateRequest, ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun,
-    ScheduledTaskRunListRequest, ScheduledTaskUpdateRequest, SendAgentMessageRequest,
-    SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest,
-    TerminalId, TerminalResizeRequest, TerminalSession, TerminalSnapshot, TerminalWriteRequest,
-    TimelineItem, TimelineLiveEvent, TimelinePage, VibexSessionId, WorkspaceId,
+    RemoteWorkbenchRequest, RemoteWorkbenchTemporarySessionRootRequest,
+    RemoteWorkbenchTemporarySessionRootResponse, RenameAgentSessionRequest,
+    ReplaceUserMessagePayload, ResolveElicitationRequest, ResolvePermissionRequest,
+    ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
+    ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord, ScheduledTaskCreateRequest,
+    ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun, ScheduledTaskRunListRequest,
+    ScheduledTaskUpdateRequest, SendAgentMessageRequest, SessionRuntimeOptionCatalog,
+    SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest, TerminalId, TerminalResizeRequest,
+    TerminalSession, TerminalSnapshot, TerminalWriteRequest, TimelineItem, TimelineLiveEvent,
+    TimelinePage, VibexSessionId, WorkspaceId,
 };
 
 use crate::binary::{
@@ -1426,6 +1429,82 @@ impl AgentBackend for WebRemoteBackend {
         })
     }
 
+    fn session_token_usage(
+        &self,
+        session_id: VibexSessionId,
+    ) -> BackendFuture<'_, Option<vibex_core::AgentTokenUsage>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteAgentRequest::GetSessionTokenUsage(
+                vibex_core::RemoteAgentSessionTokenUsageRequest {
+                    auth: this.auth(),
+                    session_id,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentSessionTokenUsageResponse>(value)?.usage)
+        })
+    }
+
+    fn usage_statistics(
+        &self,
+        request: AgentUsageStatisticsRequest,
+    ) -> BackendFuture<'_, AgentUsageStatistics> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteAgentRequest::UsageStatistics(
+                vibex_core::RemoteAgentUsageStatisticsRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentUsageStatisticsResponse>(value)?.statistics)
+        })
+    }
+
+    fn execute_agent_command(
+        &self,
+        request: MutationRequest<AgentCommandExecuteRequest>,
+    ) -> BackendFuture<'_, AgentCommandExecuteResult> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload =
+                RemoteAgentRequest::ExecuteCommand(vibex_core::RemoteAgentExecuteCommandRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentExecuteCommandResponse>(value)?.result)
+        })
+    }
+
     fn agent_message_submission(
         &self,
         request: GetMessageSubmissionRequest,
@@ -1787,6 +1866,25 @@ impl WorkspaceBackend for WebRemoteBackend {
                 .into_iter()
                 .map(summary_to_backend)
                 .collect())
+        })
+    }
+
+    fn ensure_temporary_session_root(&self) -> BackendFuture<'_, String> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteWorkbenchRequest::EnsureTemporarySessionRoot(
+                RemoteWorkbenchTemporarySessionRootRequest { auth: this.auth() },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::WorkspaceFile,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<RemoteWorkbenchTemporarySessionRootResponse>(value)?.root)
         })
     }
 
@@ -2188,12 +2286,31 @@ impl GitBackend for WebRemoteBackend {
 
     fn git_worktree_create(
         &self,
-        _request: MutationRequest<GitWorktreeCreateRequest>,
+        request: MutationRequest<GitWorktreeCreateRequest>,
     ) -> BackendFuture<'_, GitWorktreeCreateResult> {
-        self.unsupported(
-            "remote_worktree_mutation_unsupported",
-            "managed worktree creation is available only on the desktop runtime",
-        )
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteWorkbenchRequest::GitWorktreeCreate(
+                vibex_core::RemoteGitWorktreeCreateRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                    expected_revision: request.expected_revision,
+                    idempotency_key: request.idempotency_key,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::Git,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, None, None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteGitWorktreeCreateResponse>(value)?.result)
+        })
     }
 
     fn git_worktree_readiness(
@@ -2212,142 +2329,187 @@ impl GitBackend for WebRemoteBackend {
 
     fn git_worktree_set_readiness(
         &self,
-        _request: MutationRequest<GitWorktreeReadinessRequest>,
+        request: MutationRequest<GitWorktreeReadinessRequest>,
     ) -> BackendFuture<'_, GitWorktreeReadinessRecord> {
-        self.unsupported(
-            "remote_worktree_mutation_unsupported",
-            "worktree readiness mutation is available only on the desktop runtime",
-        )
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteWorkbenchRequest::GitWorktreeSetReadiness(
+                vibex_core::RemoteGitWorktreeReadinessRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::Git,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteGitWorktreeReadinessResponse>(value)?.record)
+        })
     }
 
     fn git_worktree_merge_plan(
         &self,
-        _request: GitWorktreeMergeRequest,
+        request: GitWorktreeMergeRequest,
     ) -> BackendFuture<'_, GitWorktreeMergePlan> {
-        self.unsupported(
-            "remote_worktree_mutation_unsupported",
-            "worktree merge planning is available only on the desktop runtime",
-        )
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteWorkbenchRequest::GitWorktreeMergePlan(
+                vibex_core::RemoteGitWorktreeMergePlanRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::Git,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteGitWorktreeMergePlanResponse>(value)?.plan)
+        })
     }
 
     fn git_worktree_merge(
         &self,
-        _request: MutationRequest<GitWorktreeMergeRequest>,
+        request: MutationRequest<GitWorktreeMergeRequest>,
     ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
-        self.unsupported(
-            "remote_worktree_mutation_unsupported",
-            "worktree merge is available only on the desktop runtime",
-        )
+        self.remote_worktree_mutation(request, |auth, request| {
+            RemoteWorkbenchRequest::GitWorktreeMerge(vibex_core::RemoteGitWorktreeMergeRequest {
+                auth,
+                request,
+            })
+        })
     }
 
     fn git_worktree_resolve_conflict(
         &self,
-        _request: MutationRequest<GitWorktreeConflictResolveRequest>,
+        request: MutationRequest<GitWorktreeConflictResolveRequest>,
     ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
-        self.unsupported(
-            "remote_worktree_mutation_unsupported",
-            "worktree conflict mutation is available only on the desktop runtime",
-        )
+        self.remote_worktree_mutation(request, |auth, request| {
+            RemoteWorkbenchRequest::GitWorktreeResolveConflict(
+                vibex_core::RemoteGitWorktreeConflictResolveRequest { auth, request },
+            )
+        })
     }
 
     fn git_worktree_stage_conflicts(
         &self,
-        _request: MutationRequest<GitWorktreeConflictStageRequest>,
+        request: MutationRequest<GitWorktreeConflictStageRequest>,
     ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
-        self.unsupported(
-            "remote_worktree_mutation_unsupported",
-            "worktree conflict staging is available only on the desktop runtime",
-        )
+        self.remote_worktree_mutation(request, |auth, request| {
+            RemoteWorkbenchRequest::GitWorktreeStageConflicts(
+                vibex_core::RemoteGitWorktreeConflictStageRequest { auth, request },
+            )
+        })
     }
 
     fn git_worktree_bind_assistance_session(
         &self,
-        _request: MutationRequest<GitWorktreeAssistanceSessionRequest>,
+        request: MutationRequest<GitWorktreeAssistanceSessionRequest>,
     ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
-        self.unsupported(
-            "remote_worktree_mutation_unsupported",
-            "worktree assistance Session binding is available only on the desktop runtime",
-        )
+        self.remote_worktree_mutation(request, |auth, request| {
+            RemoteWorkbenchRequest::GitWorktreeBindAssistanceSession(
+                vibex_core::RemoteGitWorktreeAssistanceSessionRequest { auth, request },
+            )
+        })
     }
 
     fn git_worktree_continue_merge(
         &self,
-        _request: MutationRequest<GitWorktreeOperationRequest>,
+        request: MutationRequest<GitWorktreeOperationRequest>,
     ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
-        self.unsupported(
-            "remote_worktree_mutation_unsupported",
-            "worktree merge continue is available only on the desktop runtime",
-        )
+        self.remote_worktree_mutation(request, |auth, request| {
+            RemoteWorkbenchRequest::GitWorktreeContinueMerge(
+                vibex_core::RemoteGitWorktreeOperationRequest { auth, request },
+            )
+        })
     }
 
     fn git_worktree_abort_merge(
         &self,
-        _request: MutationRequest<GitWorktreeOperationRequest>,
+        request: MutationRequest<GitWorktreeOperationRequest>,
     ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
-        self.unsupported(
-            "remote_worktree_mutation_unsupported",
-            "worktree merge abort is available only on the desktop runtime",
-        )
+        self.remote_worktree_mutation(request, |auth, request| {
+            RemoteWorkbenchRequest::GitWorktreeAbortMerge(
+                vibex_core::RemoteGitWorktreeOperationRequest { auth, request },
+            )
+        })
     }
 
     fn git_worktree_archive_preflight(
         &self,
-        _request: GitWorktreeArchiveRequest,
+        request: GitWorktreeArchiveRequest,
     ) -> BackendFuture<'_, GitWorktreeDestructivePreflight> {
-        self.unsupported(
-            "remote_worktree_mutation_unsupported",
-            "worktree archive planning is available only on the desktop runtime",
-        )
+        self.remote_worktree_preflight(request, |auth, request| {
+            RemoteWorkbenchRequest::GitWorktreeArchivePreflight(
+                vibex_core::RemoteGitWorktreeArchiveRequest { auth, request },
+            )
+        })
     }
 
     fn git_worktree_archive(
         &self,
-        _request: MutationRequest<GitWorktreeArchiveRequest>,
+        request: MutationRequest<GitWorktreeArchiveRequest>,
     ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
-        self.unsupported(
-            "remote_worktree_mutation_unsupported",
-            "worktree archive is available only on the desktop runtime",
-        )
+        self.remote_worktree_mutation(request, |auth, request| {
+            RemoteWorkbenchRequest::GitWorktreeArchive(
+                vibex_core::RemoteGitWorktreeArchiveRequest { auth, request },
+            )
+        })
     }
 
     fn git_worktree_restore_preflight(
         &self,
-        _request: GitWorktreeRestoreRequest,
+        request: GitWorktreeRestoreRequest,
     ) -> BackendFuture<'_, GitWorktreeDestructivePreflight> {
-        self.unsupported(
-            "remote_worktree_mutation_unsupported",
-            "worktree restore planning is available only on the desktop runtime",
-        )
+        self.remote_worktree_preflight(request, |auth, request| {
+            RemoteWorkbenchRequest::GitWorktreeRestorePreflight(
+                vibex_core::RemoteGitWorktreeRestoreRequest { auth, request },
+            )
+        })
     }
 
     fn git_worktree_restore(
         &self,
-        _request: MutationRequest<GitWorktreeRestoreRequest>,
+        request: MutationRequest<GitWorktreeRestoreRequest>,
     ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
-        self.unsupported(
-            "remote_worktree_mutation_unsupported",
-            "worktree restore is available only on the desktop runtime",
-        )
+        self.remote_worktree_mutation(request, |auth, request| {
+            RemoteWorkbenchRequest::GitWorktreeRestore(
+                vibex_core::RemoteGitWorktreeRestoreRequest { auth, request },
+            )
+        })
     }
 
     fn git_worktree_discard_preflight(
         &self,
-        _request: GitWorktreeDiscardRequest,
+        request: GitWorktreeDiscardRequest,
     ) -> BackendFuture<'_, GitWorktreeDestructivePreflight> {
-        self.unsupported(
-            "remote_worktree_mutation_unsupported",
-            "worktree discard planning is available only on the desktop runtime",
-        )
+        self.remote_worktree_preflight(request, |auth, request| {
+            RemoteWorkbenchRequest::GitWorktreeDiscardPreflight(
+                vibex_core::RemoteGitWorktreeDiscardRequest { auth, request },
+            )
+        })
     }
 
     fn git_worktree_discard(
         &self,
-        _request: MutationRequest<GitWorktreeDiscardRequest>,
+        request: MutationRequest<GitWorktreeDiscardRequest>,
     ) -> BackendFuture<'_, GitWorktreeOperationRecord> {
-        self.unsupported(
-            "remote_worktree_mutation_unsupported",
-            "worktree discard is available only on the desktop runtime",
-        )
+        self.remote_worktree_mutation(request, |auth, request| {
+            RemoteWorkbenchRequest::GitWorktreeDiscard(
+                vibex_core::RemoteGitWorktreeDiscardRequest { auth, request },
+            )
+        })
     }
 
     fn stage(
@@ -2528,6 +2690,63 @@ impl GitBackend for WebRemoteBackend {
 }
 
 impl WebRemoteBackend {
+    /// Sends one managed-worktree mutation with the operation metadata the
+    /// authority records for a local create, and decodes the shared operation
+    /// record every lifecycle mutation returns.
+    fn remote_worktree_mutation<T, F>(
+        &self,
+        request: MutationRequest<T>,
+        payload: F,
+    ) -> BackendFuture<'_, GitWorktreeOperationRecord>
+    where
+        T: Send + 'static,
+        F: FnOnce(vibex_core::RemoteAuthProof, T) -> RemoteWorkbenchRequest + Send + 'static,
+    {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = payload(this.auth(), request.payload);
+            let value = this
+                .rpc(
+                    RemoteOperationKind::Git,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteGitWorktreeOperationResponse>(value)?.record)
+        })
+    }
+
+    /// Reads one destructive-worktree preflight. Preflights are planning reads,
+    /// so they carry no mutation metadata.
+    fn remote_worktree_preflight<T, F>(
+        &self,
+        request: T,
+        payload: F,
+    ) -> BackendFuture<'_, GitWorktreeDestructivePreflight>
+    where
+        T: Send + 'static,
+        F: FnOnce(vibex_core::RemoteAuthProof, T) -> RemoteWorkbenchRequest + Send + 'static,
+    {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = payload(this.auth(), request);
+            let value = this
+                .rpc(
+                    RemoteOperationKind::Git,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteGitWorktreePreflightResponse>(value)?.preflight)
+        })
+    }
+
     fn git_stage_like(
         &self,
         request: MutationRequest<GitStageRequest>,
@@ -5734,6 +5953,7 @@ fn remote_capabilities_for_grant(
     let has_workbench = features.is_empty() || features.contains("workspace_file");
     let has_git = features.is_empty() || features.contains("git");
     let has_worktree_read = features.contains("git_worktree_read");
+    let has_worktree_lifecycle = features.contains("git_worktree_lifecycle");
     let has_terminal = features.is_empty() || features.contains("terminal");
     let has_provider = features.is_empty() || features.contains("provider_settings");
     let has_provider_management = has_provider && features.contains("provider_management");
@@ -5929,6 +6149,14 @@ fn remote_capabilities_for_grant(
                 (
                     BackendOperation::GitWorktreeRead,
                     has_worktree_read && permits(RemoteActionClass::ReadProject),
+                ),
+                (
+                    BackendOperation::GitWorktreeCreate,
+                    has_worktree_lifecycle && permits(RemoteActionClass::MutateGit),
+                ),
+                (
+                    BackendOperation::GitWorktreeLifecycleMutate,
+                    has_worktree_lifecycle && permits(RemoteActionClass::MutateGit),
                 ),
             ])
         } else {
@@ -6566,14 +6794,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_lifecycle_mutations_fail_with_one_stable_capability_code() {
+    async fn remote_lifecycle_mutations_ride_the_shared_operation_contract() {
+        let transport = Arc::new(MockTransport::with_responses([]));
         let backend = WebRemoteBackend::new(
-            Arc::new(MockTransport::new([])),
+            transport.clone(),
             RemoteAuthProof {
                 device_id: vibex_core::DeviceId::new(),
                 auth_token: "test-token".to_string(),
             },
         );
+        // A failed RPC still proves the call reached the typed Git operation
+        // instead of a client-side unsupported stub.
         let error = backend
             .git_worktree_set_readiness(MutationRequest::new(GitWorktreeReadinessRequest {
                 workspace_id: WorkspaceId::new(),
@@ -6584,7 +6815,7 @@ mod tests {
             }))
             .await
             .unwrap_err();
-        assert_eq!(error.code, "remote_worktree_mutation_unsupported");
+        assert_ne!(error.code, "remote_worktree_mutation_unsupported");
     }
 
     #[tokio::test]
@@ -6897,6 +7128,32 @@ mod tests {
             !snapshot
                 .agent
                 .supports(BackendOperation::AgentRespondElicitation)
+        );
+    }
+
+    #[test]
+    fn worktree_lifecycle_is_advertised_only_when_the_authority_serves_it() {
+        let without = remote_capabilities(Some(&full_control_server_info(&[
+            "git",
+            "git_worktree_read",
+        ])));
+        assert!(!without.git.supports(BackendOperation::GitWorktreeCreate));
+        assert!(
+            !without
+                .git
+                .supports(BackendOperation::GitWorktreeLifecycleMutate)
+        );
+
+        let with = remote_capabilities(Some(&full_control_server_info(&[
+            "git",
+            "git_worktree_read",
+            "git_worktree_lifecycle",
+        ])));
+        assert!(with.git.supports(BackendOperation::GitWorktreeRead));
+        assert!(with.git.supports(BackendOperation::GitWorktreeCreate));
+        assert!(
+            with.git
+                .supports(BackendOperation::GitWorktreeLifecycleMutate)
         );
     }
 

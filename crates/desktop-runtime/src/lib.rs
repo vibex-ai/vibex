@@ -62,10 +62,11 @@ use vibex_db::{
 use vibex_desktop_model::DesktopPollingPolicy;
 use vibex_diagnostics::{DiagnosticBundleService, DiagnosticBundleServiceConfig};
 use vibex_remote::{
-    RemoteAgentRuntimeProbeSource, RemoteDispatcher, RemoteGateway, RemoteGatewayConfig,
-    RemoteGatewayDeploymentMode, RemoteGatewayPeerLimits, RemoteGatewayTlsIdentity,
-    RemoteGatewayTlsPolicy, RemoteRouter, RemoteServiceConfig, RemoteWorkbenchRuntime,
-    RemoteWorktreeSnapshotSource, build_router_with_dispatcher,
+    RemoteAgentRuntimeProbeSource, RemoteAgentUsageSource, RemoteDispatcher, RemoteGateway,
+    RemoteGatewayConfig, RemoteGatewayDeploymentMode, RemoteGatewayPeerLimits,
+    RemoteGatewayTlsIdentity, RemoteGatewayTlsPolicy, RemoteRouter, RemoteServiceConfig,
+    RemoteWorkbenchRuntime, RemoteWorktreeLifecycleSource, RemoteWorktreeSnapshotSource,
+    build_router_with_dispatcher,
 };
 use vibex_terminal::TerminalManager;
 
@@ -1541,6 +1542,127 @@ impl RemoteWorktreeSnapshotSource for GitHandle {
     }
 }
 
+#[async_trait]
+impl RemoteWorktreeLifecycleSource for GitHandle {
+    async fn create_worktree(
+        &self,
+        request: vibex_core::GitWorktreeCreateRequest,
+        expected_revision: Option<String>,
+        request_id: vibex_core::RequestId,
+        idempotency_key: Option<String>,
+    ) -> VibexResult<vibex_core::GitWorktreeCreateResult> {
+        if let Some(expected_revision) = expected_revision.as_deref() {
+            let eligibility = self.project_git_eligibility(&request.workspace_id)?;
+            if eligibility.revision != expected_revision {
+                return Err(vibex_core::VibexError::conflict(
+                    "worktree_eligibility_stale",
+                    "project Git eligibility changed before worktree creation",
+                ));
+            }
+        }
+        let context = WorktreeCreateContext::new(request_id, idempotency_key);
+        self.worktree_create_with_context(&request, context)
+    }
+
+    async fn set_readiness(
+        &self,
+        request: vibex_core::GitWorktreeReadinessRequest,
+    ) -> VibexResult<vibex_core::GitWorktreeReadinessRecord> {
+        self.worktree_set_readiness(&request)
+    }
+
+    async fn merge_plan(
+        &self,
+        request: vibex_core::GitWorktreeMergeRequest,
+    ) -> VibexResult<vibex_core::GitWorktreeMergePlan> {
+        self.worktree_merge_plan(&request)
+    }
+
+    async fn merge(
+        &self,
+        request: vibex_core::GitWorktreeMergeRequest,
+    ) -> VibexResult<vibex_core::GitWorktreeOperationRecord> {
+        self.worktree_merge(&request)
+    }
+
+    async fn resolve_conflict(
+        &self,
+        request: vibex_core::GitWorktreeConflictResolveRequest,
+    ) -> VibexResult<vibex_core::GitWorktreeOperationRecord> {
+        self.worktree_resolve_conflict(&request)
+    }
+
+    async fn stage_conflicts(
+        &self,
+        request: vibex_core::GitWorktreeConflictStageRequest,
+    ) -> VibexResult<vibex_core::GitWorktreeOperationRecord> {
+        self.worktree_stage_conflicts(&request)
+    }
+
+    async fn bind_assistance_session(
+        &self,
+        request: vibex_core::GitWorktreeAssistanceSessionRequest,
+    ) -> VibexResult<vibex_core::GitWorktreeOperationRecord> {
+        self.worktree_bind_assistance_session(&request)
+    }
+
+    async fn continue_merge(
+        &self,
+        request: vibex_core::GitWorktreeOperationRequest,
+    ) -> VibexResult<vibex_core::GitWorktreeOperationRecord> {
+        self.worktree_continue_merge(&request)
+    }
+
+    async fn abort_merge(
+        &self,
+        request: vibex_core::GitWorktreeOperationRequest,
+    ) -> VibexResult<vibex_core::GitWorktreeOperationRecord> {
+        self.worktree_abort_merge(&request)
+    }
+
+    async fn archive_preflight(
+        &self,
+        request: vibex_core::GitWorktreeArchiveRequest,
+    ) -> VibexResult<vibex_core::GitWorktreeDestructivePreflight> {
+        self.worktree_archive_preflight(&request)
+    }
+
+    async fn archive(
+        &self,
+        request: vibex_core::GitWorktreeArchiveRequest,
+    ) -> VibexResult<vibex_core::GitWorktreeOperationRecord> {
+        self.worktree_archive(&request)
+    }
+
+    async fn restore_preflight(
+        &self,
+        request: vibex_core::GitWorktreeRestoreRequest,
+    ) -> VibexResult<vibex_core::GitWorktreeDestructivePreflight> {
+        self.worktree_restore_preflight(&request)
+    }
+
+    async fn restore(
+        &self,
+        request: vibex_core::GitWorktreeRestoreRequest,
+    ) -> VibexResult<vibex_core::GitWorktreeOperationRecord> {
+        self.worktree_restore(&request)
+    }
+
+    async fn discard_preflight(
+        &self,
+        request: vibex_core::GitWorktreeDiscardRequest,
+    ) -> VibexResult<vibex_core::GitWorktreeDestructivePreflight> {
+        self.worktree_discard_preflight(&request)
+    }
+
+    async fn discard(
+        &self,
+        request: vibex_core::GitWorktreeDiscardRequest,
+    ) -> VibexResult<vibex_core::GitWorktreeOperationRecord> {
+        self.worktree_discard(&request)
+    }
+}
+
 #[derive(Clone)]
 pub struct TerminalHandle {
     db_path: PathBuf,
@@ -2017,7 +2139,8 @@ impl DesktopRuntime {
             runtime_lifecycle.clone(),
             message_submission.clone(),
             RemoteWorkbenchRuntime::new(db_path.clone(), terminals.clone())
-                .with_worktree_snapshot_source(Arc::new(git.clone())),
+                .with_worktree_snapshot_source(Arc::new(git.clone()))
+                .with_worktree_lifecycle_source(Arc::new(git.clone())),
         );
         let management_snapshot_cell;
         let recovery_cell;
@@ -2072,6 +2195,10 @@ impl DesktopRuntime {
                 mutation_guard: ManagementMutationGuard::default(),
             })))
             .with_agent_runtime_probe_source(Arc::new(providers.clone()))
+            .with_agent_usage_source(Arc::new(AgentUsageSource {
+                usage: usage.clone(),
+                lifecycle: runtime_lifecycle.clone(),
+            }))
             .with_sidebar_organization_source(sidebar_organization.clone())
             .with_timeline_display_settings_source(timeline_display_settings.clone());
         let remote_gateway = RemoteGateway::new(
@@ -3173,6 +3300,50 @@ fn merge_token_usage_snapshots(
         usage.context_window_size_tokens = live.context_window_size_tokens;
     }
     Some(usage)
+}
+
+/// Serves the runtime's own usage service over Remote v2.
+///
+/// The live snapshot merges the persisted usage facts with the currently
+/// attached runtime, which is exactly what the local workbench reads, so a
+/// paired client and the desktop authority report the same numbers.
+struct AgentUsageSource {
+    usage: AgentUsageService,
+    lifecycle: Arc<RuntimeLifecycleService>,
+}
+
+#[async_trait]
+impl RemoteAgentUsageSource for AgentUsageSource {
+    async fn session_token_usage(
+        &self,
+        session_id: &vibex_core::VibexSessionId,
+    ) -> VibexResult<Option<AgentTokenUsage>> {
+        let attachment = self
+            .lifecycle
+            .get_session_attachment_snapshot(session_id)?
+            .attachment;
+        let binding_id = attachment.as_ref().map(|attachment| &attachment.binding_id);
+        let persisted = self.usage.latest_token_usage(session_id, binding_id)?;
+        Ok(merge_token_usage_snapshots(
+            persisted,
+            attachment.and_then(|attachment| attachment.usage),
+        ))
+    }
+
+    async fn usage_statistics(
+        &self,
+        request: vibex_core::AgentUsageStatisticsRequest,
+    ) -> VibexResult<vibex_core::AgentUsageStatistics> {
+        let usage = self.usage.clone();
+        tokio::task::spawn_blocking(move || usage.query_statistics(request))
+            .await
+            .map_err(|_| {
+                VibexError::process(
+                    "agent_usage_query_task_failed",
+                    "Agent usage query task did not complete",
+                )
+            })?
+    }
 }
 
 fn update_channel_for_mode(mode: DesktopRuntimeMode) -> UpdateChannel {

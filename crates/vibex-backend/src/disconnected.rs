@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use vibex_core::{
     AcpProviderCatalogListResponse, AcpProviderConfig, AcpProviderProfileUpdateRequest,
-    AgentAuthCatalog, AgentAuthContext, AgentCatalogListResponse, AgentId, AgentListRequest,
-    AgentListResponse, AgentManagedInstallState, AgentModelProviderDisplayOrderListRequest,
+    AgentAuthCatalog, AgentAuthContext, AgentCatalogListResponse, AgentCommandExecuteRequest,
+    AgentCommandExecuteResult, AgentId, AgentListRequest, AgentListResponse,
+    AgentManagedInstallState, AgentModelProviderDisplayOrderListRequest,
     AgentModelProviderDisplayOrderListResponse, AgentModelProviderDisplayOrderSetRequest,
     AgentModelProviderDisplayOrderSetResponse, AgentModelProviderProfileCreateRequest,
     AgentModelProviderProfileDeleteRequest, AgentModelProviderProfileFetchModelsRequest,
@@ -230,6 +231,20 @@ impl AgentBackend for DisconnectedBackend {
     ) -> BackendFuture<'_, AgentSessionRuntimeSelectionState> {
         disconnected_future!()
     }
+
+    fn session_token_usage(
+        &self,
+        _session_id: VibexSessionId,
+    ) -> BackendFuture<'_, Option<vibex_core::AgentTokenUsage>> {
+        disconnected_future!()
+    }
+
+    fn execute_agent_command(
+        &self,
+        _request: MutationRequest<AgentCommandExecuteRequest>,
+    ) -> BackendFuture<'_, AgentCommandExecuteResult> {
+        disconnected_future!()
+    }
 }
 
 impl WorkspaceBackend for DisconnectedBackend {
@@ -253,6 +268,10 @@ impl WorkspaceBackend for DisconnectedBackend {
     }
 
     fn delete_project(&self, _request: MutationRequest<ProjectId>) -> BackendFuture<'_, ()> {
+        disconnected_future!()
+    }
+
+    fn ensure_temporary_session_root(&self) -> BackendFuture<'_, String> {
         disconnected_future!()
     }
 }

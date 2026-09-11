@@ -25780,6 +25780,8 @@ for line in sys.stdin:
         }
         let session = manager
             .create_session(CreateAgentSessionRequest {
+                session_id: None,
+                defer_runtime_materialization: false,
                 runtime: selection.clone(),
                 workspace_root: fixture.workspace.display().to_string(),
                 workspace_mode: WorkspaceMode::CurrentCheckout,
@@ -34271,6 +34273,8 @@ for line in sys.stdin:
         };
         let session = manager
             .create_session(CreateAgentSessionRequest {
+                session_id: None,
+                defer_runtime_materialization: false,
                 runtime: selection.clone(),
                 workspace_root: fixture.workspace.display().to_string(),
                 workspace_mode: WorkspaceMode::CurrentCheckout,

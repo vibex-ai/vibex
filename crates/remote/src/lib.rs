@@ -20,7 +20,8 @@ use vibex_core::{
     RemoteAgentAttachRuntimeResponse, RemoteAgentCancelRuntimeSwitchResponse,
     RemoteAgentCatchUpRequest, RemoteAgentCatchUpResponse, RemoteAgentContinueTurnResponse,
     RemoteAgentCreateSessionResponse, RemoteAgentDeepLinkResolveResponse,
-    RemoteAgentDetachRuntimeResponse, RemoteAgentForkSessionResponse, RemoteAgentInterruptResponse,
+    RemoteAgentDetachRuntimeResponse, RemoteAgentExecuteCommandResponse,
+    RemoteAgentForkSessionResponse, RemoteAgentInterruptResponse,
     RemoteAgentMessageSubmissionResponse, RemoteAgentProjectionCapabilityResponse,
     RemoteAgentProjectionPreviewResponse, RemoteAgentRenameSessionResponse,
     RemoteAgentReplaceUserMessageResponse, RemoteAgentRequest,
@@ -31,9 +32,10 @@ use vibex_core::{
     RemoteAgentRuntimeProcessSnapshotResponse, RemoteAgentRuntimeSelectionResponse,
     RemoteAgentRuntimeSnapshotResponse, RemoteAgentSendMessageResponse,
     RemoteAgentSessionActionResponse, RemoteAgentSessionDetailResponse,
-    RemoteAgentSessionListResponse, RemoteAgentSetDesiredRuntimeResponse,
-    RemoteAgentTimelineCursor, RemoteAgentTimelineDisplaySettingsResponse,
-    RemoteAgentTimelineFetchResponse, RemoteAuditAction, RemoteAuditOutcome, RemoteAuditRecord,
+    RemoteAgentSessionListResponse, RemoteAgentSessionTokenUsageResponse,
+    RemoteAgentSetDesiredRuntimeResponse, RemoteAgentTimelineCursor,
+    RemoteAgentTimelineDisplaySettingsResponse, RemoteAgentTimelineFetchResponse,
+    RemoteAgentUsageStatisticsResponse, RemoteAuditAction, RemoteAuditOutcome, RemoteAuditRecord,
     RemoteAuditTargetKind, RemoteAuthContext, RemoteAuthProof, RemoteCapabilitySummary,
     RemoteClaimPairingCodeRequest, RemoteClaimPairingCodeResponse, RemoteCreatePairingCodeRequest,
     RemoteCreatePairingCodeResponse, RemoteDeepLinkResolution, RemoteDeepLinkResolutionStatus,
@@ -43,7 +45,9 @@ use vibex_core::{
     RemoteFileWriteResponse, RemoteGitBlameResponse, RemoteGitBranchListResponse,
     RemoteGitCommitDetailResponse, RemoteGitCommitResponse, RemoteGitDiffResponse,
     RemoteGitHistoryResponse, RemoteGitRemoteActionResponse, RemoteGitStatusMutationResponse,
-    RemoteGitStatusResponse, RemoteGitWorktreeEligibilityResponse,
+    RemoteGitStatusResponse, RemoteGitWorktreeCreateResponse, RemoteGitWorktreeEligibilityResponse,
+    RemoteGitWorktreeMergePlanResponse, RemoteGitWorktreeOperationResponse,
+    RemoteGitWorktreePreflightResponse, RemoteGitWorktreeReadinessResponse,
     RemoteGitWorktreeRenameBranchResponse, RemoteGitWorktreeSnapshotResponse,
     RemoteHandshakeResponse, RemoteHealthState, RemoteHealthStatus, RemoteLiveEventChannel,
     RemoteLiveEventEnvelope, RemoteOperationKind, RemotePairingCode, RemoteProtocolVersion,
@@ -57,10 +61,10 @@ use vibex_core::{
     RemoteTerminalResizeResponse, RemoteTerminalSnapshotResponse, RemoteTerminalWriteResponse,
     RemoteWorkbenchDeleteProjectResponse, RemoteWorkbenchDeleteWorkspaceResponse,
     RemoteWorkbenchListWorkspacesResponse, RemoteWorkbenchOpenWorkspaceResponse,
-    RemoteWorkbenchRequest, RequestId, ResolveElicitationRequest, ResolvePermissionRequest,
-    RuntimeLeaseRole, SessionRuntimeOptionCatalog, TerminalSession, TerminalStatus,
-    TimelineLiveEvent, VibexError, VibexResult, WorkspaceAggregateStatus, WorkspaceId,
-    WorkspaceMode, unix_timestamp_ms,
+    RemoteWorkbenchRequest, RemoteWorkbenchTemporarySessionRootResponse, RequestId,
+    ResolveElicitationRequest, ResolvePermissionRequest, RuntimeLeaseRole,
+    SessionRuntimeOptionCatalog, TerminalSession, TerminalStatus, TimelineLiveEvent, VibexError,
+    VibexResult, WorkspaceAggregateStatus, WorkspaceId, WorkspaceMode, unix_timestamp_ms,
 };
 use vibex_db::{
     DbConnection, GitSnapshotRepository, RecentFileRepository, RemoteAuditRepository,
@@ -128,6 +132,7 @@ struct RemoteRouterState {
     message_submission: Option<Arc<MessageSubmissionCoordinator>>,
     runtime_catalog: Option<Arc<dyn RemoteRuntimeOptionCatalogSource>>,
     runtime_probes: Option<Arc<dyn RemoteAgentRuntimeProbeSource>>,
+    agent_usage: Option<Arc<dyn RemoteAgentUsageSource>>,
     agent_auth_contexts: Option<Arc<dyn RemoteAgentAuthContextSource>>,
     scheduled_tasks: Option<Arc<dyn RemoteScheduledTaskSource>>,
     automation: Option<Arc<dyn RemoteAutomationSource>>,
@@ -264,6 +269,25 @@ pub trait RemoteAgentRuntimeProbeSource: Send + Sync {
         &self,
         request: vibex_core::AgentRuntimeProbeCancelRequest,
     ) -> VibexResult<vibex_core::AgentRuntimeProbeRecord>;
+}
+
+/// Authority-side Agent usage consumed by the gateway.
+///
+/// The live per-session snapshot merges the runtime attachment with persisted
+/// usage facts, and the Usage view reads aggregated statistics. Both live in
+/// the runtime's usage service, so the runtime installs this source and the
+/// headless seat serves exactly the same data as a desktop authority.
+#[async_trait]
+pub trait RemoteAgentUsageSource: Send + Sync {
+    async fn session_token_usage(
+        &self,
+        session_id: &vibex_core::VibexSessionId,
+    ) -> VibexResult<Option<vibex_core::AgentTokenUsage>>;
+
+    async fn usage_statistics(
+        &self,
+        request: vibex_core::AgentUsageStatisticsRequest,
+    ) -> VibexResult<vibex_core::AgentUsageStatistics>;
 }
 
 /// Authority-side scheduled-task management consumed by the gateway.
@@ -459,6 +483,92 @@ pub trait RemoteManagementSnapshotSource: Send + Sync {
     ) -> VibexResult<vibex_core::RemoteProviderManagementSnapshot>;
 }
 
+/// Managed-worktree lifecycle consumed by the gateway.
+///
+/// `vibex-remote` sits below `vibex-desktop-runtime`, so it cannot construct
+/// the worktree coordinator itself. The runtime installs this source, which
+/// keeps one implementation for the local and headless seats.
+#[async_trait]
+pub trait RemoteWorktreeLifecycleSource: Send + Sync {
+    async fn create_worktree(
+        &self,
+        request: vibex_core::GitWorktreeCreateRequest,
+        expected_revision: Option<String>,
+        request_id: vibex_core::RequestId,
+        idempotency_key: Option<String>,
+    ) -> VibexResult<vibex_core::GitWorktreeCreateResult>;
+
+    async fn set_readiness(
+        &self,
+        request: vibex_core::GitWorktreeReadinessRequest,
+    ) -> VibexResult<vibex_core::GitWorktreeReadinessRecord>;
+
+    async fn merge_plan(
+        &self,
+        request: vibex_core::GitWorktreeMergeRequest,
+    ) -> VibexResult<vibex_core::GitWorktreeMergePlan>;
+
+    async fn merge(
+        &self,
+        request: vibex_core::GitWorktreeMergeRequest,
+    ) -> VibexResult<vibex_core::GitWorktreeOperationRecord>;
+
+    async fn resolve_conflict(
+        &self,
+        request: vibex_core::GitWorktreeConflictResolveRequest,
+    ) -> VibexResult<vibex_core::GitWorktreeOperationRecord>;
+
+    async fn stage_conflicts(
+        &self,
+        request: vibex_core::GitWorktreeConflictStageRequest,
+    ) -> VibexResult<vibex_core::GitWorktreeOperationRecord>;
+
+    async fn bind_assistance_session(
+        &self,
+        request: vibex_core::GitWorktreeAssistanceSessionRequest,
+    ) -> VibexResult<vibex_core::GitWorktreeOperationRecord>;
+
+    async fn continue_merge(
+        &self,
+        request: vibex_core::GitWorktreeOperationRequest,
+    ) -> VibexResult<vibex_core::GitWorktreeOperationRecord>;
+
+    async fn abort_merge(
+        &self,
+        request: vibex_core::GitWorktreeOperationRequest,
+    ) -> VibexResult<vibex_core::GitWorktreeOperationRecord>;
+
+    async fn archive_preflight(
+        &self,
+        request: vibex_core::GitWorktreeArchiveRequest,
+    ) -> VibexResult<vibex_core::GitWorktreeDestructivePreflight>;
+
+    async fn archive(
+        &self,
+        request: vibex_core::GitWorktreeArchiveRequest,
+    ) -> VibexResult<vibex_core::GitWorktreeOperationRecord>;
+
+    async fn restore_preflight(
+        &self,
+        request: vibex_core::GitWorktreeRestoreRequest,
+    ) -> VibexResult<vibex_core::GitWorktreeDestructivePreflight>;
+
+    async fn restore(
+        &self,
+        request: vibex_core::GitWorktreeRestoreRequest,
+    ) -> VibexResult<vibex_core::GitWorktreeOperationRecord>;
+
+    async fn discard_preflight(
+        &self,
+        request: vibex_core::GitWorktreeDiscardRequest,
+    ) -> VibexResult<vibex_core::GitWorktreeDestructivePreflight>;
+
+    async fn discard(
+        &self,
+        request: vibex_core::GitWorktreeDiscardRequest,
+    ) -> VibexResult<vibex_core::GitWorktreeOperationRecord>;
+}
+
 #[async_trait]
 pub trait RemoteWorktreeSnapshotSource: Send + Sync {
     async fn worktree_eligibility(
@@ -488,6 +598,7 @@ pub struct RemoteWorkbenchRuntime {
     db_path: PathBuf,
     terminals: TerminalManager,
     worktrees: Option<Arc<dyn RemoteWorktreeSnapshotSource>>,
+    worktree_lifecycle: Option<Arc<dyn RemoteWorktreeLifecycleSource>>,
 }
 
 impl RemoteWorkbenchRuntime {
@@ -496,6 +607,7 @@ impl RemoteWorkbenchRuntime {
             db_path: db_path.into(),
             terminals,
             worktrees: None,
+            worktree_lifecycle: None,
         }
     }
 
@@ -504,6 +616,14 @@ impl RemoteWorkbenchRuntime {
         source: Arc<dyn RemoteWorktreeSnapshotSource>,
     ) -> Self {
         self.worktrees = Some(source);
+        self
+    }
+
+    pub fn with_worktree_lifecycle_source(
+        mut self,
+        source: Arc<dyn RemoteWorktreeLifecycleSource>,
+    ) -> Self {
+        self.worktree_lifecycle = Some(source);
         self
     }
 }
@@ -549,6 +669,7 @@ impl RemoteRouterState {
             message_submission: None,
             runtime_catalog: None,
             runtime_probes: None,
+            agent_usage: None,
             agent_auth_contexts: None,
             scheduled_tasks: None,
             automation: None,
@@ -573,6 +694,7 @@ impl RemoteRouterState {
             message_submission: None,
             runtime_catalog: None,
             runtime_probes: None,
+            agent_usage: None,
             agent_auth_contexts: None,
             scheduled_tasks: None,
             automation: None,
@@ -602,6 +724,7 @@ impl RemoteRouterState {
             message_submission: None,
             runtime_catalog: None,
             runtime_probes: None,
+            agent_usage: None,
             agent_auth_contexts: None,
             scheduled_tasks: None,
             automation: None,
@@ -633,6 +756,7 @@ impl RemoteRouterState {
             message_submission: Some(message_submission),
             runtime_catalog: None,
             runtime_probes: None,
+            agent_usage: None,
             agent_auth_contexts: None,
             scheduled_tasks: None,
             automation: None,
@@ -792,6 +916,13 @@ impl RemoteDispatcher {
         self.state.scheduled_tasks.is_some()
     }
 
+    pub fn has_worktree_lifecycle_source(&self) -> bool {
+        self.state
+            .workbench
+            .as_ref()
+            .is_some_and(|workbench| workbench.worktree_lifecycle.is_some())
+    }
+
     pub fn has_automation_source(&self) -> bool {
         self.state.automation.is_some()
     }
@@ -838,6 +969,11 @@ impl RemoteDispatcher {
         source: Arc<dyn RemoteAgentRuntimeProbeSource>,
     ) -> Self {
         self.state.runtime_probes = Some(source);
+        self
+    }
+
+    pub fn with_agent_usage_source(mut self, source: Arc<dyn RemoteAgentUsageSource>) -> Self {
+        self.state.agent_usage = Some(source);
         self
     }
 
@@ -4117,6 +4253,30 @@ async fn dispatch_agent_request(
             serde_json::to_value(vibex_core::RemoteAgentDiscoverCommandsResponse { discovery })
                 .map_err(remote_payload_encode_error)
         }
+        RemoteAgentRequest::ExecuteCommand(request) => {
+            let session_id = request.request.session_id.clone();
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentSession,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = manager.execute_command(request.request).await;
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentSession,
+                session_id.as_str(),
+                "Agent command execution",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let result = result?;
+            serde_json::to_value(RemoteAgentExecuteCommandResponse { result })
+                .map_err(remote_payload_encode_error)
+        }
         RemoteAgentRequest::UpdateAuthEnvironment(request) => {
             let agent_id = request.agent_id.clone();
             let auth = authorize_agent_action(
@@ -4421,6 +4581,33 @@ async fn dispatch_agent_request(
             serde_json::to_value(RemoteAgentRuntimeSnapshotResponse { snapshot })
                 .map_err(remote_payload_encode_error)
         }
+        RemoteAgentRequest::GetSessionTokenUsage(request) => {
+            authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::ReadAgentSession,
+                Some(request_id),
+                correlation_id,
+            )?;
+            manager.get_session(&request.session_id).await?;
+            let source = remote_agent_usage(state)?;
+            let usage = source.session_token_usage(&request.session_id).await?;
+            serde_json::to_value(RemoteAgentSessionTokenUsageResponse { usage })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::UsageStatistics(request) => {
+            authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::ReadAgentSession,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let source = remote_agent_usage(state)?;
+            let statistics = source.usage_statistics(request.request).await?;
+            serde_json::to_value(RemoteAgentUsageStatisticsResponse { statistics })
+                .map_err(remote_payload_encode_error)
+        }
         RemoteAgentRequest::GetRuntimeProcessSnapshot(request) => {
             authorize_agent_action(
                 &manager,
@@ -4718,6 +4905,32 @@ async fn dispatch_agent_request(
     }
 }
 
+/// Creates and resolves the authority's temporary session root.
+///
+/// A remote client without a published workspace asks for this instead of
+/// proposing a path that only exists on the machine in front of the user.
+fn ensure_temporary_session_root() -> VibexResult<String> {
+    let root = std::env::temp_dir().join("vibex").join("sessions");
+    std::fs::create_dir_all(&root).map_err(|error| {
+        VibexError::storage(
+            "temporary_workspace_create_failed",
+            "failed to create temporary session workspace",
+        )
+        .with_diagnostic("path", root.display().to_string())
+        .with_diagnostic("error", error.to_string())
+    })?;
+    root.canonicalize()
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|error| {
+            VibexError::storage(
+                "temporary_workspace_canonicalize_failed",
+                "failed to resolve temporary session workspace",
+            )
+            .with_diagnostic("path", root.display().to_string())
+            .with_diagnostic("error", error.to_string())
+        })
+}
+
 fn published_agent_session_request(
     manager: &AgentManager,
     mut request: vibex_core::CreateAgentSessionRequest,
@@ -4802,6 +5015,15 @@ fn remote_agent_auth_contexts(
     })
 }
 
+fn remote_agent_usage(state: &RemoteRouterState) -> VibexResult<&Arc<dyn RemoteAgentUsageSource>> {
+    state.agent_usage.as_ref().ok_or_else(|| {
+        VibexError::capability(
+            "remote_agent_usage_unavailable",
+            "Agent usage is not available on this service",
+        )
+    })
+}
+
 fn remote_runtime_lifecycle(
     state: &RemoteRouterState,
 ) -> VibexResult<&Arc<RuntimeLifecycleService>> {
@@ -4858,6 +5080,22 @@ async fn dispatch_workbench_request(
             )?;
             let summary = open_workspace_summary(runtime, request.request)?;
             serde_json::to_value(RemoteWorkbenchOpenWorkspaceResponse { summary })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteWorkbenchRequest::EnsureTemporarySessionRoot(request) => {
+            authorize_workbench_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateFile,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let root = ensure_temporary_session_root()?;
+            // Publish the root before a create can target it: a remote client
+            // may only create sessions in workspaces the authority knows.
+            let connection = open_migrated_database(&runtime.db_path)?;
+            WorkspaceRepository::ensure(&connection, &root, WorkspaceMode::CurrentCheckout)?;
+            serde_json::to_value(RemoteWorkbenchTemporarySessionRootResponse { root })
                 .map_err(remote_payload_encode_error)
         }
         RemoteWorkbenchRequest::DeleteWorkspace(request) => {
@@ -5308,6 +5546,208 @@ async fn dispatch_workbench_request(
             serde_json::to_value(RemoteGitWorktreeEligibilityResponse { eligibility })
                 .map_err(remote_payload_encode_error)
         }
+        RemoteWorkbenchRequest::GitWorktreeCreate(request) => {
+            authorize_workbench_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateGit,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let source = remote_worktree_lifecycle(runtime)?;
+            let result = source
+                .create_worktree(
+                    request.request,
+                    request.expected_revision,
+                    request_id,
+                    request.idempotency_key,
+                )
+                .await?;
+            serde_json::to_value(RemoteGitWorktreeCreateResponse { result })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteWorkbenchRequest::GitWorktreeSetReadiness(request) => {
+            authorize_workbench_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateGit,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let source = remote_worktree_lifecycle(runtime)?;
+            let record = source.set_readiness(request.request).await?;
+            serde_json::to_value(RemoteGitWorktreeReadinessResponse { record })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteWorkbenchRequest::GitWorktreeMergePlan(request) => {
+            authorize_workbench_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProject,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let source = remote_worktree_lifecycle(runtime)?;
+            let plan = source.merge_plan(request.request).await?;
+            serde_json::to_value(RemoteGitWorktreeMergePlanResponse { plan })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteWorkbenchRequest::GitWorktreeMerge(request) => {
+            authorize_workbench_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateGit,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let source = remote_worktree_lifecycle(runtime)?;
+            let record = source.merge(request.request).await?;
+            serde_json::to_value(RemoteGitWorktreeOperationResponse { record })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteWorkbenchRequest::GitWorktreeResolveConflict(request) => {
+            authorize_workbench_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateGit,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let source = remote_worktree_lifecycle(runtime)?;
+            let record = source.resolve_conflict(request.request).await?;
+            serde_json::to_value(RemoteGitWorktreeOperationResponse { record })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteWorkbenchRequest::GitWorktreeStageConflicts(request) => {
+            authorize_workbench_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateGit,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let source = remote_worktree_lifecycle(runtime)?;
+            let record = source.stage_conflicts(request.request).await?;
+            serde_json::to_value(RemoteGitWorktreeOperationResponse { record })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteWorkbenchRequest::GitWorktreeBindAssistanceSession(request) => {
+            authorize_workbench_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateGit,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let source = remote_worktree_lifecycle(runtime)?;
+            let record = source.bind_assistance_session(request.request).await?;
+            serde_json::to_value(RemoteGitWorktreeOperationResponse { record })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteWorkbenchRequest::GitWorktreeContinueMerge(request) => {
+            authorize_workbench_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateGit,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let source = remote_worktree_lifecycle(runtime)?;
+            let record = source.continue_merge(request.request).await?;
+            serde_json::to_value(RemoteGitWorktreeOperationResponse { record })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteWorkbenchRequest::GitWorktreeAbortMerge(request) => {
+            authorize_workbench_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateGit,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let source = remote_worktree_lifecycle(runtime)?;
+            let record = source.abort_merge(request.request).await?;
+            serde_json::to_value(RemoteGitWorktreeOperationResponse { record })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteWorkbenchRequest::GitWorktreeArchivePreflight(request) => {
+            authorize_workbench_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProject,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let source = remote_worktree_lifecycle(runtime)?;
+            let preflight = source.archive_preflight(request.request).await?;
+            serde_json::to_value(RemoteGitWorktreePreflightResponse { preflight })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteWorkbenchRequest::GitWorktreeArchive(request) => {
+            authorize_workbench_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateGit,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let source = remote_worktree_lifecycle(runtime)?;
+            let record = source.archive(request.request).await?;
+            serde_json::to_value(RemoteGitWorktreeOperationResponse { record })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteWorkbenchRequest::GitWorktreeRestorePreflight(request) => {
+            authorize_workbench_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProject,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let source = remote_worktree_lifecycle(runtime)?;
+            let preflight = source.restore_preflight(request.request).await?;
+            serde_json::to_value(RemoteGitWorktreePreflightResponse { preflight })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteWorkbenchRequest::GitWorktreeRestore(request) => {
+            authorize_workbench_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateGit,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let source = remote_worktree_lifecycle(runtime)?;
+            let record = source.restore(request.request).await?;
+            serde_json::to_value(RemoteGitWorktreeOperationResponse { record })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteWorkbenchRequest::GitWorktreeDiscardPreflight(request) => {
+            authorize_workbench_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProject,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let source = remote_worktree_lifecycle(runtime)?;
+            let preflight = source.discard_preflight(request.request).await?;
+            serde_json::to_value(RemoteGitWorktreePreflightResponse { preflight })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteWorkbenchRequest::GitWorktreeDiscard(request) => {
+            authorize_workbench_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateGit,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let source = remote_worktree_lifecycle(runtime)?;
+            let record = source.discard(request.request).await?;
+            serde_json::to_value(RemoteGitWorktreeOperationResponse { record })
+                .map_err(remote_payload_encode_error)
+        }
         RemoteWorkbenchRequest::GitWorktreeRenameBranch(request) => {
             let auth = authorize_workbench_action(
                 runtime,
@@ -5493,6 +5933,17 @@ async fn dispatch_workbench_request(
                 .map_err(remote_payload_encode_error)
         }
     }
+}
+
+fn remote_worktree_lifecycle(
+    runtime: &RemoteWorkbenchRuntime,
+) -> VibexResult<&Arc<dyn RemoteWorktreeLifecycleSource>> {
+    runtime.worktree_lifecycle.as_ref().ok_or_else(|| {
+        VibexError::capability(
+            "remote_worktree_lifecycle_unavailable",
+            "managed worktree lifecycle is not available on this service",
+        )
+    })
 }
 
 fn authorize_workbench_action(
@@ -7087,6 +7538,8 @@ mod tests {
         let normalized = published_agent_session_request(
             &manager,
             vibex_core::CreateAgentSessionRequest {
+                session_id: None,
+                defer_runtime_materialization: false,
                 runtime: remote_test_selection(&rename_target),
                 workspace_root: format!("{}/.", rename_target.workspace_root),
                 workspace_mode: rename_target.workspace_mode,
@@ -7102,6 +7555,8 @@ mod tests {
             RemoteAgentRequest::CreateSession(vibex_core::RemoteAgentCreateSessionRequest {
                 auth: controller.clone(),
                 request: vibex_core::CreateAgentSessionRequest {
+                    session_id: None,
+                    defer_runtime_materialization: false,
                     runtime: remote_test_selection(&rename_target),
                     workspace_root: "/tmp/private-create-workspace-sentinel".to_string(),
                     workspace_mode: WorkspaceMode::CurrentCheckout,
@@ -7575,6 +8030,7 @@ mod tests {
                 message_submission: None,
                 runtime_catalog: None,
                 runtime_probes: None,
+                agent_usage: None,
                 agent_auth_contexts: None,
                 scheduled_tasks: None,
                 automation: None,

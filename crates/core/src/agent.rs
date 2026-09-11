@@ -210,6 +210,16 @@ pub struct CreateAgentSessionRequest {
     pub workspace_mode: WorkspaceMode,
     pub title: Option<String>,
     pub safety: Option<AgentSessionSafety>,
+    /// Identifier reserved by the caller so an optimistic view and the
+    /// authoritative session share one route. The authority persists and
+    /// validates it exactly like a generated identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<VibexSessionId>,
+    /// Queue the initial ACP runtime materialization instead of waiting for the
+    /// provider runtime to become ready. Callers that submit a first message
+    /// rely on the durable message queue, which waits for the runtime selection.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub defer_runtime_materialization: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -498,6 +498,7 @@ pub enum RemoteAgentOperationKind {
     CancelRuntimeSwitch,
     GetMessageSubmission,
     DiscoverCommands,
+    ExecuteCommand,
     LogoutAgent,
     ReplaceUserMessage,
     SendMessage,
@@ -508,6 +509,8 @@ pub enum RemoteAgentOperationKind {
     CatchUp,
     GetRuntimeSnapshot,
     GetRuntimeProcessSnapshot,
+    GetSessionTokenUsage,
+    UsageStatistics,
     GetRuntimeEvents,
     AttachRuntime,
     DetachRuntime,
@@ -1036,6 +1039,36 @@ pub struct RemoteAgentRuntimeSnapshotResponse {
     pub snapshot: AgentSessionRuntimeSnapshot,
 }
 
+/// Live token counters for one session. The authority merges its persisted
+/// usage facts with the currently attached runtime, so a paired client sees
+/// the same snapshot the local workbench does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentSessionTokenUsageRequest {
+    pub auth: RemoteAuthProof,
+    pub session_id: VibexSessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentSessionTokenUsageResponse {
+    pub usage: Option<crate::AgentTokenUsage>,
+}
+
+/// Aggregated Agent usage for the Usage view.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentUsageStatisticsRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::AgentUsageStatisticsRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentUsageStatisticsResponse {
+    pub statistics: crate::AgentUsageStatistics,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAgentRuntimeProcessSnapshotRequest {
@@ -1117,6 +1150,21 @@ pub struct RemoteAgentDiscoverCommandsRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAgentDiscoverCommandsResponse {
     pub discovery: crate::AgentCommandDiscovery,
+}
+
+/// Executes one composer command resolved against the authority's catalogue,
+/// so a remote client never runs a command against a runtime it does not own.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentExecuteCommandRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::AgentCommandExecuteRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentExecuteCommandResponse {
+    pub result: crate::AgentCommandExecuteResult,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1271,6 +1319,7 @@ pub enum RemoteAgentRequest {
     CancelRuntimeSwitch(RemoteAgentCancelRuntimeSwitchRequest),
     GetMessageSubmission(RemoteAgentMessageSubmissionRequest),
     DiscoverCommands(RemoteAgentDiscoverCommandsRequest),
+    ExecuteCommand(RemoteAgentExecuteCommandRequest),
     LogoutAgent(RemoteAgentLogoutRequest),
     ReplaceUserMessage(RemoteAgentReplaceUserMessageRequest),
     SendMessage(RemoteAgentSendMessageRequest),
@@ -1281,6 +1330,8 @@ pub enum RemoteAgentRequest {
     CatchUp(RemoteAgentCatchUpRequest),
     GetRuntimeSnapshot(RemoteAgentRuntimeSnapshotRequest),
     GetRuntimeProcessSnapshot(RemoteAgentRuntimeProcessSnapshotRequest),
+    GetSessionTokenUsage(RemoteAgentSessionTokenUsageRequest),
+    UsageStatistics(RemoteAgentUsageStatisticsRequest),
     GetRuntimeEvents(RemoteAgentRuntimeEventsRequest),
     AttachRuntime(RemoteAgentAttachRuntimeRequest),
     DetachRuntime(RemoteAgentDetachRuntimeRequest),
@@ -1327,6 +1378,7 @@ impl RemoteAgentRequest {
             Self::CancelRuntimeSwitch(_) => RemoteAgentOperationKind::CancelRuntimeSwitch,
             Self::GetMessageSubmission(_) => RemoteAgentOperationKind::GetMessageSubmission,
             Self::DiscoverCommands(_) => RemoteAgentOperationKind::DiscoverCommands,
+            Self::ExecuteCommand(_) => RemoteAgentOperationKind::ExecuteCommand,
             Self::LogoutAgent(_) => RemoteAgentOperationKind::LogoutAgent,
             Self::ReplaceUserMessage(_) => RemoteAgentOperationKind::ReplaceUserMessage,
             Self::SendMessage(_) => RemoteAgentOperationKind::SendMessage,
@@ -1339,6 +1391,8 @@ impl RemoteAgentRequest {
             Self::GetRuntimeProcessSnapshot(_) => {
                 RemoteAgentOperationKind::GetRuntimeProcessSnapshot
             }
+            Self::GetSessionTokenUsage(_) => RemoteAgentOperationKind::GetSessionTokenUsage,
+            Self::UsageStatistics(_) => RemoteAgentOperationKind::UsageStatistics,
             Self::GetRuntimeEvents(_) => RemoteAgentOperationKind::GetRuntimeEvents,
             Self::AttachRuntime(_) => RemoteAgentOperationKind::AttachRuntime,
             Self::DetachRuntime(_) => RemoteAgentOperationKind::DetachRuntime,
@@ -1355,6 +1409,7 @@ impl RemoteAgentRequest {
 pub enum RemoteWorkbenchOperationKind {
     ListWorkspaces,
     OpenWorkspace,
+    EnsureTemporarySessionRoot,
     DeleteWorkspace,
     DeleteProject,
     FileListTree,
@@ -1381,6 +1436,7 @@ pub enum RemoteWorkbenchOperationKind {
     GitWorktreeEligibility,
     GitWorktreeSnapshot,
     GitWorktreeRenameBranch,
+    GitWorktreeLifecycle,
     TerminalList,
     TerminalCreate,
     TerminalSnapshot,
@@ -1399,6 +1455,21 @@ pub struct RemoteWorkbenchListWorkspacesRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RemoteWorkbenchListWorkspacesResponse {
     pub workspaces: Vec<ProjectWorkspaceSummary>,
+}
+
+/// Asks the authority to create and resolve its own temporary session root, so
+/// a client without a published workspace never proposes a path that only
+/// exists on the client machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteWorkbenchTemporarySessionRootRequest {
+    pub auth: RemoteAuthProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteWorkbenchTemporarySessionRootResponse {
+    pub root: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1559,6 +1630,123 @@ pub struct RemoteGitWorktreeRenameBranchRequest {
     pub auth: RemoteAuthProof,
     pub workspace_id: crate::ids::WorkspaceId,
     pub new_branch: String,
+}
+
+/// Managed-worktree lifecycle over Remote v2.
+///
+/// `expected_revision` and `idempotency_key` travel in the create payload
+/// because the v2 envelope's mutation metadata is not visible to the workbench
+/// dispatcher, and the authority records the same operation journal entry a
+/// local create would.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteGitWorktreeCreateRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::GitWorktreeCreateRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteGitWorktreeCreateResponse {
+    pub result: crate::GitWorktreeCreateResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteGitWorktreeReadinessRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::GitWorktreeReadinessRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteGitWorktreeReadinessResponse {
+    pub record: crate::GitWorktreeReadinessRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteGitWorktreeMergePlanRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::GitWorktreeMergeRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteGitWorktreeMergePlanResponse {
+    pub plan: crate::GitWorktreeMergePlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteGitWorktreeMergeRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::GitWorktreeMergeRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteGitWorktreeConflictResolveRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::GitWorktreeConflictResolveRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteGitWorktreeConflictStageRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::GitWorktreeConflictStageRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteGitWorktreeAssistanceSessionRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::GitWorktreeAssistanceSessionRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteGitWorktreeOperationRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::GitWorktreeOperationRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteGitWorktreeOperationResponse {
+    pub record: crate::GitWorktreeOperationRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteGitWorktreeArchiveRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::GitWorktreeArchiveRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteGitWorktreeRestoreRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::GitWorktreeRestoreRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteGitWorktreeDiscardRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::GitWorktreeDiscardRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteGitWorktreePreflightResponse {
+    pub preflight: crate::GitWorktreeDestructivePreflight,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1782,6 +1970,7 @@ pub struct RemoteTerminalKillResponse {
 pub enum RemoteWorkbenchRequest {
     ListWorkspaces(RemoteWorkbenchListWorkspacesRequest),
     OpenWorkspace(RemoteWorkbenchOpenWorkspaceRequest),
+    EnsureTemporarySessionRoot(RemoteWorkbenchTemporarySessionRootRequest),
     DeleteWorkspace(RemoteWorkbenchDeleteWorkspaceRequest),
     DeleteProject(RemoteWorkbenchDeleteProjectRequest),
     FileListTree(RemoteFileTreeRequest),
@@ -1808,6 +1997,21 @@ pub enum RemoteWorkbenchRequest {
     GitWorktreeEligibility(RemoteGitWorktreeEligibilityRequest),
     GitWorktreeSnapshot(RemoteGitWorktreeSnapshotRequest),
     GitWorktreeRenameBranch(RemoteGitWorktreeRenameBranchRequest),
+    GitWorktreeCreate(RemoteGitWorktreeCreateRequest),
+    GitWorktreeSetReadiness(RemoteGitWorktreeReadinessRequest),
+    GitWorktreeMergePlan(RemoteGitWorktreeMergePlanRequest),
+    GitWorktreeMerge(RemoteGitWorktreeMergeRequest),
+    GitWorktreeResolveConflict(RemoteGitWorktreeConflictResolveRequest),
+    GitWorktreeStageConflicts(RemoteGitWorktreeConflictStageRequest),
+    GitWorktreeBindAssistanceSession(RemoteGitWorktreeAssistanceSessionRequest),
+    GitWorktreeContinueMerge(RemoteGitWorktreeOperationRequest),
+    GitWorktreeAbortMerge(RemoteGitWorktreeOperationRequest),
+    GitWorktreeArchivePreflight(RemoteGitWorktreeArchiveRequest),
+    GitWorktreeArchive(RemoteGitWorktreeArchiveRequest),
+    GitWorktreeRestorePreflight(RemoteGitWorktreeRestoreRequest),
+    GitWorktreeRestore(RemoteGitWorktreeRestoreRequest),
+    GitWorktreeDiscardPreflight(RemoteGitWorktreeDiscardRequest),
+    GitWorktreeDiscard(RemoteGitWorktreeDiscardRequest),
     TerminalList(RemoteTerminalListRequest),
     TerminalCreate(RemoteTerminalCreateRequest),
     TerminalSnapshot(RemoteTerminalSnapshotRequest),
@@ -1821,6 +2025,9 @@ impl RemoteWorkbenchRequest {
         match self {
             Self::ListWorkspaces(_) => RemoteWorkbenchOperationKind::ListWorkspaces,
             Self::OpenWorkspace(_) => RemoteWorkbenchOperationKind::OpenWorkspace,
+            Self::EnsureTemporarySessionRoot(_) => {
+                RemoteWorkbenchOperationKind::EnsureTemporarySessionRoot
+            }
             Self::DeleteWorkspace(_) => RemoteWorkbenchOperationKind::DeleteWorkspace,
             Self::DeleteProject(_) => RemoteWorkbenchOperationKind::DeleteProject,
             Self::FileListTree(_) => RemoteWorkbenchOperationKind::FileListTree,
@@ -1849,6 +2056,21 @@ impl RemoteWorkbenchRequest {
             Self::GitWorktreeRenameBranch(_) => {
                 RemoteWorkbenchOperationKind::GitWorktreeRenameBranch
             }
+            Self::GitWorktreeCreate(_)
+            | Self::GitWorktreeSetReadiness(_)
+            | Self::GitWorktreeMergePlan(_)
+            | Self::GitWorktreeMerge(_)
+            | Self::GitWorktreeResolveConflict(_)
+            | Self::GitWorktreeStageConflicts(_)
+            | Self::GitWorktreeBindAssistanceSession(_)
+            | Self::GitWorktreeContinueMerge(_)
+            | Self::GitWorktreeAbortMerge(_)
+            | Self::GitWorktreeArchivePreflight(_)
+            | Self::GitWorktreeArchive(_)
+            | Self::GitWorktreeRestorePreflight(_)
+            | Self::GitWorktreeRestore(_)
+            | Self::GitWorktreeDiscardPreflight(_)
+            | Self::GitWorktreeDiscard(_) => RemoteWorkbenchOperationKind::GitWorktreeLifecycle,
             Self::TerminalList(_) => RemoteWorkbenchOperationKind::TerminalList,
             Self::TerminalCreate(_) => RemoteWorkbenchOperationKind::TerminalCreate,
             Self::TerminalSnapshot(_) => RemoteWorkbenchOperationKind::TerminalSnapshot,
@@ -4403,6 +4625,8 @@ mod tests {
                 RemoteAgentRequest::CreateSession(RemoteAgentCreateSessionRequest {
                     auth: auth.clone(),
                     request: CreateAgentSessionRequest {
+                        session_id: None,
+                        defer_runtime_materialization: false,
                         runtime: SessionRuntimeSelection::provider(
                             AgentId::parse("codex").unwrap(),
                             ProviderProfileId::new(),

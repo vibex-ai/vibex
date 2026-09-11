@@ -428,6 +428,8 @@ async fn fixture_setup(State(state): State<Arc<HarnessState>>) -> Json<Value> {
             .agent()
             .manager()
             .create_session(vibex_core::CreateAgentSessionRequest {
+                session_id: None,
+                defer_runtime_materialization: false,
                 runtime: option.selection.clone(),
                 workspace_root: workspace.root_path.clone(),
                 workspace_mode: workspace.mode,
