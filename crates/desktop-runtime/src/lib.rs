@@ -5,6 +5,7 @@ mod agent_auth_context;
 mod agent_install;
 mod auth_catalog;
 mod catalog;
+pub mod composer;
 mod events;
 mod fixture;
 mod home_lock;
@@ -77,6 +78,7 @@ pub use catalog::{
     ProviderModelRuntimeOptionKey, ProviderModelRuntimeOptionProbeResult,
     RuntimeOptionCatalogService, RuntimeOptionProbeResult, RuntimeOptionSnapshotSummary,
 };
+pub use composer::{ComposerCommandSource, discover_composer_commands};
 pub use events::{
     AuthoritativeRefetch, DesktopEvent, DesktopEventReceiver, DesktopEventReceiverClosed,
     DesktopEventStream, ProviderConfigChangePhase, ProviderConfigChangedEvent,
@@ -2043,6 +2045,22 @@ impl DesktopRuntime {
                 management_snapshot_cell = cell;
                 Arc::new(source)
             })
+            .with_composer_command_source(Arc::new(ComposerCommandSource::new(
+                AgentHandle {
+                    manager: manager.clone(),
+                    runtime_selection: runtime_selection.clone(),
+                    runtime_lifecycle: runtime_lifecycle.clone(),
+                    message_submission: message_submission.clone(),
+                    runtime_catalog: runtime_catalog.clone(),
+                    auth_catalog: auth_catalog.clone(),
+                    auth_contexts: auth_contexts.clone(),
+                    install_service: install_service.clone(),
+                },
+                FileHandle {
+                    db_path: db_path.clone(),
+                },
+                providers.clone(),
+            )))
             .with_recovery_source({
                 let (source, cell) = RecoverySource::new();
                 recovery_cell = cell;

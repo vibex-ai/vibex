@@ -1,6 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs,
     future::Future,
     hash::{Hash as _, Hasher as _},
@@ -71,37 +71,35 @@ use vibex_backend::{
     AgentBackend as _, BackendError, BackendEvent, BackendEventStream, BackendFacade,
     BackendOperation, BackendProjection, BackendResult, MutationRequest, NativeBackend,
 };
-use vibex_config_switch::skills::LocalSkillScanRequest;
 use vibex_core::{
     AgentAuthCatalog, AgentAuthContext, AgentAuthContextAuthenticateRequest,
     AgentAuthContextStatus, AgentAuthContextVerifyRequest, AgentAuthMethodEffect,
     AgentAuthMethodKind, AgentAuthenticationOperationId, AgentCommandDiscoverRequest,
     AgentCommandDiscoverResponse, AgentCommandEntry, AgentCommandExecuteRequest,
-    AgentCommandExecutionBehavior, AgentCommandSelectionBehavior, AgentCommandSourceKind,
-    AgentCommandTrigger, AgentId, AgentListRequest, AgentMessagePhase, AgentSession,
-    AgentSessionRuntimeSelectionState, AgentSessionSafety, AgentSessionState, AgentSnapshotEntry,
-    AgentTimelineDisplaySettings, AgentTimelineReasoningDisplayMode, AgentTokenUsage,
-    AttachRuntimeRequest, CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest,
-    CreateAgentSessionRequest, DetachRuntimeRequest, ElicitationField, ElicitationFieldKind,
-    ElicitationRequest, ElicitationResolutionAction, FetchTimelineRequest, FileEntryKind,
-    FileOperationKind, FileOperationPatchFormat, FileTreeRequest, ForkAgentSessionRequest,
+    AgentCommandSourceKind, AgentCommandTrigger, AgentId, AgentListRequest, AgentMessagePhase,
+    AgentSession, AgentSessionRuntimeSelectionState, AgentSessionSafety, AgentSessionState,
+    AgentSnapshotEntry, AgentTimelineDisplaySettings, AgentTimelineReasoningDisplayMode,
+    AgentTokenUsage, AttachRuntimeRequest, CancelAgentSessionRuntimeSwitchRequest,
+    ContinueAgentTurnRequest, CreateAgentSessionRequest, DetachRuntimeRequest, ElicitationField,
+    ElicitationFieldKind, ElicitationRequest, ElicitationResolutionAction, FetchTimelineRequest,
+    FileEntryKind, FileOperationKind, FileOperationPatchFormat, ForkAgentSessionRequest,
     GetMessageSubmissionRequest, GitProjectEligibilityState, GitProjectIneligibleReason,
     GitStatusSummary, GitWorktreeAssistanceSessionRequest, GitWorktreeConflictKind,
     GitWorktreeDiscardRequest, GitWorktreeOperationRecord, GitWorktreeOperationStatus,
     MessageAttachment, MessageSubmissionState, MessageSubmissionStatus, OpenWorkspaceRequest,
     PermissionResolution, PermissionResponseKind, PlanStepStatus, ProjectId, ProjectRecord,
-    PromptId, ProviderBindingMetadata, ProviderKind, ProviderProfileSummary,
-    RenameAgentSessionRequest, ReplaceUserMessagePayload, RequestId, ResolvePermissionRequest,
-    RuntimeAuthSource, RuntimeAuthSourceAvailability, RuntimeAuthSourceKind,
-    RuntimeAuthSourceSummary, RuntimeClientId, RuntimeLeaseRole, RuntimeModelSelection,
-    RuntimeSelectionInteraction, SendAgentMessageRequest, SessionRuntimeFeature,
-    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
-    SessionRuntimeSelection, SessionRuntimeSelectionStatus, SetDesiredAgentSessionRuntimeRequest,
-    TerminalCreateRequest, TerminalId, TerminalSession, TerminalStatus, TerminalSwitchShellRequest,
-    TimelineItem, TimelineItemId, TimelineLiveEvent, TimelinePage, TimelinePayload,
-    TimelineRedactionState, TimelineSource, UserMessagePayload, VibexSessionId, WorkspaceMode,
-    WorkspaceRecord, agent_session_turn_requires_continuation, latest_timeline_turn_ended_normally,
-    managed_worktree_name_slug, normalize_agent_session_title, unix_timestamp_ms,
+    PromptId, ProviderProfileSummary, RenameAgentSessionRequest, ReplaceUserMessagePayload,
+    RequestId, ResolvePermissionRequest, RuntimeAuthSource, RuntimeAuthSourceAvailability,
+    RuntimeAuthSourceKind, RuntimeAuthSourceSummary, RuntimeClientId, RuntimeLeaseRole,
+    RuntimeModelSelection, RuntimeSelectionInteraction, SendAgentMessageRequest,
+    SessionRuntimeFeature, SessionRuntimeFeatureKind, SessionRuntimeOption,
+    SessionRuntimeOptionCatalog, SessionRuntimeSelection, SessionRuntimeSelectionStatus,
+    SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest, TerminalId, TerminalSession,
+    TerminalStatus, TerminalSwitchShellRequest, TimelineItem, TimelineItemId, TimelineLiveEvent,
+    TimelinePage, TimelinePayload, TimelineRedactionState, TimelineSource, UserMessagePayload,
+    VibexSessionId, WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation,
+    latest_timeline_turn_ended_normally, managed_worktree_name_slug, normalize_agent_session_title,
+    unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     AgentOrderEntry, AgentOrdering, AgentPlanProjection, AgentSortStrategy, AppearanceUiState,
@@ -13381,7 +13379,7 @@ impl VibexWorkbench {
         }
         self.suggestion_loading = true;
 
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             self.suggestions.clear();
             self.suggestion_selection.dismiss();
             self.suggestion_loading = false;
@@ -13390,7 +13388,7 @@ impl VibexWorkbench {
         };
 
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            discover_desktop_composer_commands(runtime, request).await
+            discover_desktop_composer_commands(backend, request).await
         });
         self.suggestion_task = Some(cx.spawn(
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
@@ -43444,171 +43442,27 @@ fn is_new_session_agent_available(agent: &AgentSnapshotEntry) -> bool {
         && agent.deleted_at_ms.is_none()
 }
 
+/// Resolves a composer trigger through the authority.
+///
+/// The Agent catalogue, the workspace file tree and the workspace Skills all
+/// live with whichever runtime owns the workspace, so the composite is one
+/// backend read instead of three local ones.
 async fn discover_desktop_composer_commands(
-    runtime: Arc<DesktopRuntime>,
+    backend: BackendFacade,
     request: AgentCommandDiscoverRequest,
 ) -> vibex_core::VibexResult<AgentCommandDiscoverResponse> {
-    let manager = runtime.agent().manager();
-    let mut response = manager.discover_commands(request.clone()).await?;
-    let provider_supports_skills = manager.command_discovery_capabilities(&request)?.skills;
-    append_file_reference_commands(&runtime, &request, &mut response)?;
-    append_local_skill_commands(&runtime, &request, &mut response, provider_supports_skills)?;
-    Ok(response)
-}
-
-fn append_file_reference_commands(
-    runtime: &DesktopRuntime,
-    request: &AgentCommandDiscoverRequest,
-    response: &mut AgentCommandDiscoverResponse,
-) -> vibex_core::VibexResult<()> {
-    if request
-        .trigger
-        .is_some_and(|trigger| trigger != AgentCommandTrigger::Mention)
-    {
-        return Ok(());
-    }
-    let Some(workspace_id) = request.workspace_id.clone() else {
-        return Ok(());
-    };
-
-    let entries = runtime.files().list_tree(&FileTreeRequest {
-        workspace_id: workspace_id.clone(),
-        path: None,
-        max_depth: Some(8),
-        include_hidden: true,
-    })?;
-    let query = request.query.as_deref().map(str::trim).unwrap_or("");
-    let query_lower = query.to_lowercase();
-    let limit = request.limit.unwrap_or(50) as usize;
-    let remaining = limit.saturating_sub(response.entries.len());
-    if remaining == 0 {
-        return Ok(());
-    }
-
-    response.entries.extend(
-        entries
-            .into_iter()
-            .filter(|entry| {
-                query_lower.is_empty()
-                    || entry.path.to_lowercase().contains(&query_lower)
-                    || entry.name.to_lowercase().contains(&query_lower)
-            })
-            .take(remaining)
-            .map(|entry| AgentCommandEntry {
-                id: format!("reference:file:{}", entry.path),
-                trigger: AgentCommandTrigger::Mention,
-                source_kind: AgentCommandSourceKind::Reference,
-                label: format!("@{}", entry.name),
-                description: None,
-                insertion_text: format!("@{} ", entry.path),
-                command_name: None,
-                provider_kind: Some(ProviderKind::Acp),
-                prompt_id: None,
-                skill_id: None,
-                reference_path: Some(entry.path),
-                selection_behavior: AgentCommandSelectionBehavior::Insert,
-                execution_behavior: AgentCommandExecutionBehavior::None,
-                destructive: false,
-                metadata: Vec::new(),
-            }),
-    );
-
-    Ok(())
-}
-
-fn append_local_skill_commands(
-    runtime: &DesktopRuntime,
-    request: &AgentCommandDiscoverRequest,
-    response: &mut AgentCommandDiscoverResponse,
-    provider_supports_skills: bool,
-) -> vibex_core::VibexResult<()> {
-    if request
-        .trigger
-        .is_some_and(|trigger| trigger != AgentCommandTrigger::Dollar)
-        || !provider_supports_skills
-    {
-        return Ok(());
-    }
-
-    let limit = request.limit.unwrap_or(50) as usize;
-    let mut remaining = limit.saturating_sub(response.entries.len());
-    if remaining == 0 {
-        return Ok(());
-    }
-
-    let query = request
-        .query
-        .as_deref()
-        .map(str::trim)
-        .unwrap_or("")
-        .to_lowercase();
-    let mut existing_labels = response
-        .entries
-        .iter()
-        .map(|entry| entry.label.to_lowercase())
-        .collect::<HashSet<_>>();
-    let local_entries = runtime
-        .providers()
-        .service()
-        .scan_local_skills(LocalSkillScanRequest {
-            source_agent_id: request.agent_id.clone(),
-            workspace_id: request.workspace_id.clone(),
+    let discovery = backend
+        .agent()
+        .discover_agent_commands(request)
+        .await
+        .map_err(|error| {
+            vibex_core::VibexError::new(
+                vibex_core::ErrorCategory::Storage,
+                error.code,
+                error.message,
+            )
         })?;
-
-    for entry in local_entries {
-        if remaining == 0 {
-            break;
-        }
-        let command_entry = AgentCommandEntry {
-            id: format!("skill:local:{}:{}", entry.root_source, entry.source_hash),
-            trigger: AgentCommandTrigger::Dollar,
-            source_kind: AgentCommandSourceKind::Skill,
-            label: format!("${}", entry.command_name),
-            description: entry.description,
-            insertion_text: format!("${} ", entry.command_name),
-            command_name: Some(entry.command_name),
-            provider_kind: Some(ProviderKind::Acp),
-            prompt_id: None,
-            skill_id: None,
-            reference_path: Some(entry.manifest_path.display().to_string()),
-            selection_behavior: AgentCommandSelectionBehavior::Insert,
-            execution_behavior: AgentCommandExecutionBehavior::None,
-            destructive: false,
-            metadata: vec![
-                ProviderBindingMetadata {
-                    key: "skillSource".to_string(),
-                    value: entry.root_source,
-                },
-                ProviderBindingMetadata {
-                    key: "manifestPathHash".to_string(),
-                    value: entry.source_hash,
-                },
-                ProviderBindingMetadata {
-                    key: "sourceAgentId".to_string(),
-                    value: entry.source_agent_id.into_string(),
-                },
-            ],
-        };
-        if !query.is_empty() && !command_entry_matches_query(&command_entry, &query) {
-            continue;
-        }
-        if !existing_labels.insert(command_entry.label.to_lowercase()) {
-            continue;
-        }
-        response.entries.push(command_entry);
-        remaining -= 1;
-    }
-
-    Ok(())
-}
-
-fn command_entry_matches_query(entry: &AgentCommandEntry, query: &str) -> bool {
-    entry.label.to_lowercase().contains(query)
-        || entry.insertion_text.to_lowercase().contains(query)
-        || entry
-            .description
-            .as_deref()
-            .is_some_and(|description| description.to_lowercase().contains(query))
+    Ok(discovery.response)
 }
 
 fn floor_char_boundary(text: &str, offset: usize) -> usize {
@@ -54142,7 +53996,7 @@ mod tests {
         ProviderProfileSummary {
             id: ProviderProfileId::new(),
             agent_id,
-            kind: ProviderKind::Acp,
+            kind: vibex_core::ProviderKind::Acp,
             display_name: "Test provider".into(),
             status: ProviderProfileStatus::Enabled,
             account_alias: None,

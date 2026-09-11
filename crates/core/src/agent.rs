@@ -579,6 +579,16 @@ pub struct AgentCommandDiscoverResponse {
     pub diagnostics: Vec<ProviderBindingMetadata>,
 }
 
+/// One composer discovery result plus the capabilities that decide whether a
+/// typed command resolves locally.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentCommandDiscovery {
+    pub response: AgentCommandDiscoverResponse,
+    pub slash_commands: bool,
+    pub skills: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentCommandExecuteRequest {

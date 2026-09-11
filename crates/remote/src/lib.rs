@@ -133,6 +133,7 @@ struct RemoteRouterState {
     automation: Option<Arc<dyn RemoteAutomationSource>>,
     management_snapshot: Option<Arc<dyn RemoteManagementSnapshotSource>>,
     agent_install: Option<Arc<dyn RemoteAgentInstallSource>>,
+    composer_commands: Option<Arc<dyn RemoteAgentCommandDiscoverySource>>,
     recovery: Option<Arc<dyn RemoteRecoverySource>>,
     sidebar_organization: Option<Arc<dyn RemoteSidebarOrganizationSource>>,
     workbench: Option<RemoteWorkbenchRuntime>,
@@ -401,6 +402,19 @@ pub trait RemoteAgentInstallSource: Send + Sync {
     async fn delete_agent_auth_catalog(&self, agent_id: vibex_core::AgentId) -> VibexResult<()>;
 }
 
+/// Authority-side composer command discovery.
+///
+/// The Agent catalogue, the workspace file tree and the Skills all live with
+/// the authority, so the client asks it to resolve a trigger instead of
+/// re-deriving the list.
+#[async_trait]
+pub trait RemoteAgentCommandDiscoverySource: Send + Sync {
+    async fn discover_commands(
+        &self,
+        request: vibex_core::AgentCommandDiscoverRequest,
+    ) -> VibexResult<vibex_core::AgentCommandDiscovery>;
+}
+
 /// Authority-side diagnostic export and database backup.
 ///
 /// Both operations write to the authority's home directory, which the gateway
@@ -531,6 +545,7 @@ impl RemoteRouterState {
             scheduled_tasks: None,
             automation: None,
             agent_install: None,
+            composer_commands: None,
             recovery: None,
             management_snapshot: None,
             sidebar_organization: None,
@@ -554,6 +569,7 @@ impl RemoteRouterState {
             scheduled_tasks: None,
             automation: None,
             agent_install: None,
+            composer_commands: None,
             recovery: None,
             management_snapshot: None,
             sidebar_organization: None,
@@ -582,6 +598,7 @@ impl RemoteRouterState {
             scheduled_tasks: None,
             automation: None,
             agent_install: None,
+            composer_commands: None,
             recovery: None,
             management_snapshot: None,
             sidebar_organization: None,
@@ -612,6 +629,7 @@ impl RemoteRouterState {
             scheduled_tasks: None,
             automation: None,
             agent_install: None,
+            composer_commands: None,
             recovery: None,
             management_snapshot: None,
             sidebar_organization: None,
@@ -776,6 +794,18 @@ impl RemoteDispatcher {
 
     pub fn has_recovery_source(&self) -> bool {
         self.state.recovery.is_some()
+    }
+
+    pub fn has_composer_command_source(&self) -> bool {
+        self.state.composer_commands.is_some()
+    }
+
+    pub fn with_composer_command_source(
+        mut self,
+        source: Arc<dyn RemoteAgentCommandDiscoverySource>,
+    ) -> Self {
+        self.state.composer_commands = Some(source);
+        self
     }
 
     pub fn recovery_source(&self) -> Option<&Arc<dyn RemoteRecoverySource>> {
@@ -4017,6 +4047,24 @@ async fn dispatch_agent_request(
                 cancelled: result?,
             })
             .map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::DiscoverCommands(request) => {
+            authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::ReadAgentSession,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let source = state.composer_commands.as_ref().ok_or_else(|| {
+                VibexError::capability(
+                    "remote_composer_commands_unavailable",
+                    "composer command discovery is not available on this service",
+                )
+            })?;
+            let discovery = source.discover_commands(request.request).await?;
+            serde_json::to_value(vibex_core::RemoteAgentDiscoverCommandsResponse { discovery })
+                .map_err(remote_payload_encode_error)
         }
         RemoteAgentRequest::UpdateAuthEnvironment(request) => {
             let agent_id = request.agent_id.clone();
@@ -7473,6 +7521,7 @@ mod tests {
                 automation: None,
                 management_snapshot: None,
                 agent_install: None,
+                composer_commands: None,
                 recovery: None,
                 sidebar_organization: None,
                 workbench: None,
@@ -9064,5 +9113,91 @@ mod tests {
         });
 
         format!("ws://{addr}/ws")
+    }
+    /// Composer discovery must resolve on the authority: the client only knows
+    /// the trigger and the query.
+    #[tokio::test]
+    async fn composer_command_discovery_runs_on_the_authority() {
+        struct TestComposerSource {
+            requests: Mutex<Vec<String>>,
+        }
+
+        #[async_trait::async_trait]
+        impl RemoteAgentCommandDiscoverySource for TestComposerSource {
+            async fn discover_commands(
+                &self,
+                request: vibex_core::AgentCommandDiscoverRequest,
+            ) -> VibexResult<vibex_core::AgentCommandDiscovery> {
+                self.requests
+                    .lock()
+                    .map_err(|_| {
+                        VibexError::process("test_lock_poisoned", "test lock is poisoned")
+                    })?
+                    .push(request.query.clone().unwrap_or_default());
+                Ok(vibex_core::AgentCommandDiscovery {
+                    response: vibex_core::AgentCommandDiscoverResponse {
+                        entries: Vec::new(),
+                        diagnostics: Vec::new(),
+                    },
+                    slash_commands: true,
+                    skills: false,
+                })
+            }
+        }
+
+        let (db_path, manager) = test_agent_manager("composer-discovery");
+        let reader = pair_device(&db_path, RemoteDevicePermissionLevel::ReadOnly, "Reader");
+        let source = Arc::new(TestComposerSource {
+            requests: Mutex::new(Vec::new()),
+        });
+        let dispatcher =
+            RemoteDispatcher::with_agent_manager(RemoteServiceConfig::loopback_disabled(), manager)
+                .with_composer_command_source(source.clone());
+        let router = build_router_with_dispatcher(dispatcher);
+
+        let discovered = post_agent(
+            router.clone(),
+            RemoteAgentRequest::DiscoverCommands(vibex_core::RemoteAgentDiscoverCommandsRequest {
+                auth: reader,
+                request: vibex_core::AgentCommandDiscoverRequest {
+                    agent_id: None,
+                    provider_profile_id: None,
+                    session_id: None,
+                    workspace_id: None,
+                    trigger: Some(vibex_core::AgentCommandTrigger::Slash),
+                    query: Some("/pl".to_string()),
+                    limit: Some(5),
+                },
+            }),
+        )
+        .await;
+        let payload: vibex_core::RemoteAgentDiscoverCommandsResponse =
+            serde_json::from_value(discovered.payload.unwrap()).unwrap();
+        assert!(payload.discovery.slash_commands);
+        assert!(!payload.discovery.skills);
+        assert_eq!(*source.requests.lock().unwrap(), vec!["/pl".to_string()]);
+
+        // A service without the source must say so instead of answering an
+        // empty catalogue that looks like "no commands".
+        let bare = build_router_with_dispatcher(RemoteDispatcher::new(
+            RemoteServiceConfig::loopback_disabled(),
+        ));
+        let unavailable = post_agent(
+            bare,
+            RemoteAgentRequest::DiscoverCommands(vibex_core::RemoteAgentDiscoverCommandsRequest {
+                auth: pair_device(&db_path, RemoteDevicePermissionLevel::ReadOnly, "Reader2"),
+                request: vibex_core::AgentCommandDiscoverRequest {
+                    agent_id: None,
+                    provider_profile_id: None,
+                    session_id: None,
+                    workspace_id: None,
+                    trigger: Some(vibex_core::AgentCommandTrigger::Slash),
+                    query: None,
+                    limit: None,
+                },
+            }),
+        )
+        .await;
+        assert!(unavailable.payload.is_none());
     }
 }

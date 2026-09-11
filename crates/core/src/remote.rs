@@ -497,6 +497,7 @@ pub enum RemoteAgentOperationKind {
     SetDesiredRuntime,
     CancelRuntimeSwitch,
     GetMessageSubmission,
+    DiscoverCommands,
     ReplaceUserMessage,
     SendMessage,
     ContinueTurn,
@@ -1086,6 +1087,21 @@ pub struct RemoteAgentDetachRuntimeResponse {
     pub response: DetachRuntimeResponse,
 }
 
+/// Resolves one composer trigger against the authority's Agent catalogue,
+/// workspace file tree and Skills.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentDiscoverCommandsRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::AgentCommandDiscoverRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentDiscoverCommandsResponse {
+    pub discovery: crate::AgentCommandDiscovery,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAgentMessageSubmissionRequest {
@@ -1237,6 +1253,7 @@ pub enum RemoteAgentRequest {
     SetDesiredRuntime(RemoteAgentSetDesiredRuntimeRequest),
     CancelRuntimeSwitch(RemoteAgentCancelRuntimeSwitchRequest),
     GetMessageSubmission(RemoteAgentMessageSubmissionRequest),
+    DiscoverCommands(RemoteAgentDiscoverCommandsRequest),
     ReplaceUserMessage(RemoteAgentReplaceUserMessageRequest),
     SendMessage(RemoteAgentSendMessageRequest),
     ContinueTurn(RemoteAgentContinueTurnRequest),
@@ -1291,6 +1308,7 @@ impl RemoteAgentRequest {
             Self::SetDesiredRuntime(_) => RemoteAgentOperationKind::SetDesiredRuntime,
             Self::CancelRuntimeSwitch(_) => RemoteAgentOperationKind::CancelRuntimeSwitch,
             Self::GetMessageSubmission(_) => RemoteAgentOperationKind::GetMessageSubmission,
+            Self::DiscoverCommands(_) => RemoteAgentOperationKind::DiscoverCommands,
             Self::ReplaceUserMessage(_) => RemoteAgentOperationKind::ReplaceUserMessage,
             Self::SendMessage(_) => RemoteAgentOperationKind::SendMessage,
             Self::ContinueTurn(_) => RemoteAgentOperationKind::ContinueTurn,

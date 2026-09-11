@@ -5,9 +5,9 @@ use vibex_core::{
     AgentAuthContextMutationResult, AgentAuthContextRefreshModelsRequest,
     AgentAuthContextVerifyRequest, AgentAuthEnvironmentUpdateRequest, AgentAuthenticateRequest,
     AgentAuthenticateResult, AgentAuthenticationCancelRequest, AgentAuthenticationOperation,
-    AgentAuthenticationOperationId, AgentId, AgentNotificationIntent,
-    AgentRuntimeOptionProbeRequest, AgentRuntimeOptionProbeResult, AgentSession,
-    AgentSessionRuntimeSelectionEvent, AgentSessionRuntimeSelectionState,
+    AgentAuthenticationOperationId, AgentCommandDiscoverRequest, AgentCommandDiscovery, AgentId,
+    AgentNotificationIntent, AgentRuntimeOptionProbeRequest, AgentRuntimeOptionProbeResult,
+    AgentSession, AgentSessionRuntimeSelectionEvent, AgentSessionRuntimeSelectionState,
     AgentTimelineDisplaySettings, AgentUsageStatistics, AgentUsageStatisticsRequest,
     CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
     FetchTimelineRequest, ForkAgentSessionRequest, GetMessageSubmissionRequest,
@@ -208,6 +208,20 @@ pub trait AgentBackend: BackendBound {
         &self,
         request: MutationRequest<AgentId>,
     ) -> BackendFuture<'_, AgentAuthCatalog>;
+
+    /// Resolves one composer trigger against the authority's Agent catalogue,
+    /// workspace file tree and Skills.
+    fn discover_agent_commands(
+        &self,
+        _request: AgentCommandDiscoverRequest,
+    ) -> BackendFuture<'_, AgentCommandDiscovery> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "composer_commands_unavailable",
+                "composer command discovery is unavailable on this backend",
+            ))
+        })
+    }
 
     /// Reads the durable state of one submitted message.
     ///
